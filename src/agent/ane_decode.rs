@@ -10,13 +10,133 @@
 
 use super::ane_forward::{cpu_matmul, cpu_quantized_matmul, rmsnorm, vec_add_inplace};
 use super::ane_mil::MilConfig;
-use super::ane_weights::{GdnLayerWeights, ModelWeights, QuantizedTensor};
+use super::ane_weights::{GdnLayerWeights, MoeLayerWeights, ModelWeights, QuantizedTensor};
+
+/// Cast &[f32] to &[u8] for ANE IO.
+fn f32_as_bytes(data: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) }
+}
+
+/// Cast &[u8] to &[f32] for ANE IO.
+fn bytes_as_f32(data: &[u8]) -> &[f32] {
+    assert_eq!(data.len() % 4, 0);
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) }
+}
 
 /// SiLU activation in-place: x[i] = x[i] * sigmoid(x[i]).
 fn silu_inplace(x: &mut [f32]) {
     for v in x.iter_mut() {
         *v = *v * (1.0 / (1.0 + (-*v).exp()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// MoE Forward
+// ---------------------------------------------------------------------------
+
+/// MoE FFN forward: router gate → top-k expert selection → weighted expert sum.
+///
+/// Replaces the dense FFN (w1/w2/w3) for MoE layers. Expert weights stay
+/// quantized; only the top-k active experts are dequantized per token.
+fn moe_forward(
+    moe: &MoeLayerWeights,
+    x: &mut Vec<f32>,
+    rms_ffn: &[f32],
+    cfg: &MilConfig,
+) {
+    let dim = cfg.dim;
+    let hidden = moe.moe_hidden;
+
+    // RMSNorm
+    let mut xnorm = vec![0.0f32; dim];
+    rmsnorm(&mut xnorm, x, rms_ffn, dim, 1, cfg.rms_eps);
+
+    // Router: logits = router[num_experts, dim] @ xnorm[dim]
+    let router_logits = cpu_matmul(&moe.router, &xnorm, moe.num_experts, dim, 1);
+
+    // Top-k selection + softmax
+    let k = moe.num_experts_per_tok;
+    let mut indexed: Vec<(usize, f32)> = router_logits.iter().copied().enumerate().collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top_k = &indexed[..k.min(indexed.len())];
+
+    // Softmax over top-k logits
+    let max_logit = top_k[0].1;
+    let mut exp_sum = 0.0f32;
+    let mut weights = Vec::with_capacity(k);
+    for &(_, logit) in top_k {
+        let e = (logit - max_logit).exp();
+        weights.push(e);
+        exp_sum += e;
+    }
+    for w in &mut weights {
+        *w /= exp_sum;
+    }
+
+    // Parallel expert FFN — 8 experts run on 8 cores simultaneously.
+    // Gate and up projections are independent per expert → full parallelism.
+    #[cfg(feature = "ane")]
+    let expert_outputs: Vec<(f32, Vec<f32>)> = {
+        use rayon::prelude::*;
+        top_k
+            .par_iter()
+            .enumerate()
+            .map(|(i, &(expert_idx, _))| {
+                let w = weights[i];
+                // SwiGLU: down(SiLU(gate(x)) * up(x))
+                let mut h1 = moe.packed_experts.gate_matmul(expert_idx, &xnorm);
+                let h3 = moe.packed_experts.up_matmul(expert_idx, &xnorm);
+                silu_inplace(&mut h1);
+                for j in 0..hidden {
+                    h1[j] *= h3[j];
+                }
+                let expert_out = moe.packed_experts.down_matmul(expert_idx, &h1);
+                (w, expert_out)
+            })
+            .collect()
+    };
+
+    #[cfg(not(feature = "ane"))]
+    let expert_outputs: Vec<(f32, Vec<f32>)> = top_k
+        .iter()
+        .enumerate()
+        .map(|(i, &(expert_idx, _))| {
+            let w = weights[i];
+            let mut h1 = moe.packed_experts.gate_matmul(expert_idx, &xnorm);
+            let h3 = moe.packed_experts.up_matmul(expert_idx, &xnorm);
+            silu_inplace(&mut h1);
+            for j in 0..hidden {
+                h1[j] *= h3[j];
+            }
+            let expert_out = moe.packed_experts.down_matmul(expert_idx, &h1);
+            (w, expert_out)
+        })
+        .collect();
+
+    // Weighted sum of expert outputs
+    let mut ffn_out = vec![0.0f32; dim];
+    for (w, expert_out) in &expert_outputs {
+        for j in 0..dim {
+            ffn_out[j] += w * expert_out[j];
+        }
+    }
+
+    // Shared expert (always active, weight=1.0, no gating)
+    if let Some(ref shared) = moe.shared_expert {
+        let mut h1 = cpu_quantized_matmul(&shared.gate_proj, &xnorm, 1);
+        let h3 = cpu_quantized_matmul(&shared.up_proj, &xnorm, 1);
+        silu_inplace(&mut h1);
+        for j in 0..hidden {
+            h1[j] *= h3[j];
+        }
+        let shared_out = cpu_quantized_matmul(&shared.down_proj, &h1, 1);
+        for j in 0..dim {
+            ffn_out[j] += shared_out[j];
+        }
+    }
+
+    // Residual
+    vec_add_inplace(x, &ffn_out);
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +277,15 @@ impl KvCache {
 /// Apply RoPE to Q and K vectors at a specific position.
 ///
 /// `q`: `[n_q_heads * head_dim]`, `k`: `[n_kv_heads * head_dim]`.
-fn rope_at_pos(q: &mut [f32], k: &mut [f32], n_q_heads: usize, n_kv_heads: usize, head_dim: usize, pos: usize, theta: f64) {
+fn rope_at_pos(
+    q: &mut [f32],
+    k: &mut [f32],
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    theta: f64,
+) {
     let half_hd = head_dim / 2;
 
     // Apply to Q heads
@@ -370,7 +498,11 @@ fn gdn_decode_single(
     let mut beta_vals = vec![0.0f32; h_v];
     for h in 0..h_v {
         let a_val = a_raw[h] + gdn_w.dt_bias[h];
-        let sp = if a_val > 20.0 { a_val } else { a_val.exp().ln_1p() };
+        let sp = if a_val > 20.0 {
+            a_val
+        } else {
+            a_val.exp().ln_1p()
+        };
         g_vals[h] = (-gdn_w.a_log[h].exp() * sp).exp();
         beta_vals[h] = 1.0 / (1.0 + (-b_raw[h]).exp());
     }
@@ -434,11 +566,7 @@ fn gdn_decode_single(
 /// - `model`: loaded model weights
 /// - `token`: input token ID
 /// - `kv_cache`: mutable KV cache (appended to during this call)
-pub fn decode_step(
-    model: &ModelWeights,
-    token: u32,
-    kv_cache: &mut KvCache,
-) -> DecodeResult {
+pub fn decode_step(model: &ModelWeights, token: u32, kv_cache: &mut KvCache) -> DecodeResult {
     let cfg = &model.cfg;
     let dim = cfg.dim;
     let n_layers = model.layers.len();
@@ -468,18 +596,22 @@ pub fn decode_step(
                 let attn_out = gdn_decode_single(gdn_w, gdn_state, &xnorm, cfg);
                 vec_add_inplace(&mut x, &attn_out);
             }
-            // FFN (always runs, with or without GDN attention)
-            let mut x2norm = vec![0.0f32; dim];
-            rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
-            let hidden = cfg.hidden_dim;
-            let mut h1 = cpu_matmul(&lw.w1, &x2norm, hidden, dim, 1);
-            let h3 = cpu_matmul(&lw.w3, &x2norm, hidden, dim, 1);
-            silu_inplace(&mut h1);
-            for i in 0..hidden {
-                h1[i] *= h3[i];
+            // FFN: MoE or dense (always runs, with or without GDN attention)
+            if let Some(ref moe_w) = lw.moe {
+                moe_forward(moe_w, &mut x, &lw.rms_ffn, cfg);
+            } else {
+                let mut x2norm = vec![0.0f32; dim];
+                rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
+                let hidden = cfg.hidden_dim;
+                let mut h1 = cpu_matmul(&lw.w1, &x2norm, hidden, dim, 1);
+                let h3 = cpu_matmul(&lw.w3, &x2norm, hidden, dim, 1);
+                silu_inplace(&mut h1);
+                for i in 0..hidden {
+                    h1[i] *= h3[i];
+                }
+                let ffn_out = cpu_matmul(&lw.w2, &h1, dim, hidden, 1);
+                vec_add_inplace(&mut x, &ffn_out);
             }
-            let ffn_out = cpu_matmul(&lw.w2, &h1, dim, hidden, 1);
-            vec_add_inplace(&mut x, &ffn_out);
             continue;
         }
 
@@ -540,7 +672,15 @@ pub fn decode_step(
         };
 
         // RoPE at current position
-        rope_at_pos(&mut q, &mut k, n_q_heads, n_kv_heads, head_dim, pos, cfg.rope_theta);
+        rope_at_pos(
+            &mut q,
+            &mut k,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            pos,
+            cfg.rope_theta,
+        );
 
         // Append K, V to cache
         kv_cache.append(l, &k, &v);
@@ -568,23 +708,22 @@ pub fn decode_step(
         // Residual 1
         vec_add_inplace(&mut x, &o);
 
-        // RMSNorm (FFN)
-        let mut x2norm = vec![0.0f32; dim];
-        rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
-
-        // FFN: SiLU(W1 @ x) * (W3 @ x) → W2 @ gate
-        let hidden = cfg.hidden_dim;
-        let mut h1 = cpu_matmul(&lw.w1, &x2norm, hidden, dim, 1);
-        let h3 = cpu_matmul(&lw.w3, &x2norm, hidden, dim, 1);
-        silu_inplace(&mut h1);
-        // Element-wise gate
-        for i in 0..hidden {
-            h1[i] *= h3[i];
+        // FFN: MoE or dense
+        if let Some(ref moe_w) = lw.moe {
+            moe_forward(moe_w, &mut x, &lw.rms_ffn, cfg);
+        } else {
+            let mut x2norm = vec![0.0f32; dim];
+            rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
+            let hidden = cfg.hidden_dim;
+            let mut h1 = cpu_matmul(&lw.w1, &x2norm, hidden, dim, 1);
+            let h3 = cpu_matmul(&lw.w3, &x2norm, hidden, dim, 1);
+            silu_inplace(&mut h1);
+            for i in 0..hidden {
+                h1[i] *= h3[i];
+            }
+            let ffn_out = cpu_matmul(&lw.w2, &h1, dim, hidden, 1);
+            vec_add_inplace(&mut x, &ffn_out);
         }
-        let ffn_out = cpu_matmul(&lw.w2, &h1, dim, hidden, 1);
-
-        // Residual 2
-        vec_add_inplace(&mut x, &ffn_out);
     }
 
     // Advance KV cache position
@@ -597,7 +736,11 @@ pub fn decode_step(
     // 4. Classifier: logits = cls_w @ x_final via SGEMM
     let vocab = model.vocab_size;
     let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
-    let logits = cpu_matmul(cls_w, &x_final, vocab, dim, 1);
+    let logits = if let Some(ref clusters) = model.vocab_clusters {
+        super::factored_vocab::factored_project(&x_final, cls_w, clusters, 3).logits
+    } else {
+        cpu_matmul(cls_w, &x_final, vocab, dim, 1)
+    };
 
     DecodeResult { logits }
 }
@@ -696,10 +839,13 @@ impl DecodeKernels {
 
         let mut ffn_layers = Vec::with_capacity(model.layers.len());
         for (l, lw) in model.layers.iter().enumerate() {
-            let k = kernel.clone_kernel().map_err(|e| {
-                tracing::warn!("DecodeKernels: layer {l} clone failed: {e}");
-                e
-            }).ok()?;
+            let k = kernel
+                .clone_kernel()
+                .map_err(|e| {
+                    tracing::warn!("DecodeKernels: layer {l} clone failed: {e}");
+                    e
+                })
+                .ok()?;
 
             // Pack weights into IOSurface. Activation columns [0..seq) are zero-padded;
             // only column 0 is patched per decode step.
@@ -729,7 +875,10 @@ impl DecodeKernels {
 
         tracing::info!(
             "DecodeKernels: compiled {} per-layer FFN kernels (padded_seq={}, dim={}, hidden={})",
-            ffn_layers.len(), seq, dim, hidden
+            ffn_layers.len(),
+            seq,
+            dim,
+            hidden
         );
 
         Some(DecodeKernels { ffn_layers, cfg })
@@ -747,17 +896,16 @@ impl DecodeKernels {
         // Strided write: patch column 0 of activation in each row.
         // Each row has `padded_seq` activation slots followed by weight data.
         // We write 1 float (4 bytes) per row, at offset 0.
-        let xnorm_bytes = unsafe {
-            std::slice::from_raw_parts(xnorm.as_ptr() as *const u8, xnorm.len() * 4)
-        };
+        let xnorm_bytes =
+            unsafe { std::slice::from_raw_parts(xnorm.as_ptr() as *const u8, xnorm.len() * 4) };
         flk.kernel.write_input_strided(
-            0,                  // input idx
-            0,                  // dst_offset (column 0)
-            flk.row_stride,     // dst_stride (bytes per row)
+            0,              // input idx
+            0,              // dst_offset (column 0)
+            flk.row_stride, // dst_stride (bytes per row)
             xnorm_bytes,
-            4,                  // src_stride (1 float = 4 bytes)
-            4,                  // chunk_bytes (1 float)
-            dim,                // n_chunks (number of rows)
+            4,   // src_stride (1 float = 4 bytes)
+            4,   // chunk_bytes (1 float)
+            dim, // n_chunks (number of rows)
         );
 
         flk.kernel.eval()?;
@@ -791,7 +939,7 @@ impl DecodeKernels {
 // ---------------------------------------------------------------------------
 
 use super::ane_bridge;
-use super::ane_mil::{gen_fused_ffn_conv_blob, gen_fused_attn_proj_conv_blob, gen_conv1x1_blob};
+use super::ane_mil::{gen_conv1x1_blob, gen_fused_attn_proj_conv_blob, gen_fused_ffn_conv_blob};
 use super::ane_weights::build_fp16_blob;
 
 /// Per-layer ANE kernels for one transformer layer's decode.
@@ -870,12 +1018,19 @@ impl BlobDecodeKernels {
                     let names: Vec<&str> = attn_spec.weight_names.iter().copied().collect();
                     let datas: Vec<&[u8]> = vec![&rms_blob, &wq_blob, &wk_blob, &wv_blob];
                     AneKernel::compile_multi_weights(
-                        &attn_spec.mil_text, &names, &datas,
-                        &[attn_spec.input_bytes], &[attn_spec.output_bytes],
-                    ).map_err(|e| {
-                        tracing::warn!("BlobDecodeKernels: layer {l} attn_proj compile failed: {e}");
+                        &attn_spec.mil_text,
+                        &names,
+                        &datas,
+                        &[attn_spec.input_bytes],
+                        &[attn_spec.output_bytes],
+                    )
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "BlobDecodeKernels: layer {l} attn_proj compile failed: {e}"
+                        );
                         e
-                    }).ok()?
+                    })
+                    .ok()?
                 };
 
                 // --- Wo projection kernel ---
@@ -884,12 +1039,17 @@ impl BlobDecodeKernels {
                     let names: Vec<&str> = wo_spec.weight_names.iter().copied().collect();
                     let datas: Vec<&[u8]> = vec![&wo_blob];
                     AneKernel::compile_multi_weights(
-                        &wo_spec.mil_text, &names, &datas,
-                        &[wo_spec.input_bytes], &[wo_spec.output_bytes],
-                    ).map_err(|e| {
+                        &wo_spec.mil_text,
+                        &names,
+                        &datas,
+                        &[wo_spec.input_bytes],
+                        &[wo_spec.output_bytes],
+                    )
+                    .map_err(|e| {
                         tracing::warn!("BlobDecodeKernels: layer {l} wo compile failed: {e}");
                         e
-                    }).ok()?
+                    })
+                    .ok()?
                 };
 
                 // Validate eval on first MHA layer
@@ -897,7 +1057,9 @@ impl BlobDecodeKernels {
                     let test_input = vec![0u8; attn_spec.input_bytes];
                     ap.write_input(0, &test_input);
                     if let Err(e) = ap.eval() {
-                        tracing::warn!("BlobDecodeKernels: seq={seq_len} attn eval validation failed: {e}");
+                        tracing::warn!(
+                            "BlobDecodeKernels: seq={seq_len} attn eval validation failed: {e}"
+                        );
                         return None;
                     }
                     first_mha_validated = true;
@@ -915,15 +1077,24 @@ impl BlobDecodeKernels {
                 let names: Vec<&str> = ffn_spec.weight_names.iter().copied().collect();
                 let datas: Vec<&[u8]> = vec![&rms_blob, &w1_blob, &w3_blob, &w2_blob];
                 AneKernel::compile_multi_weights(
-                    &ffn_spec.mil_text, &names, &datas,
-                    &[ffn_spec.input_bytes], &[ffn_spec.output_bytes],
-                ).map_err(|e| {
+                    &ffn_spec.mil_text,
+                    &names,
+                    &datas,
+                    &[ffn_spec.input_bytes],
+                    &[ffn_spec.output_bytes],
+                )
+                .map_err(|e| {
                     tracing::warn!("BlobDecodeKernels: layer {l} ffn compile failed: {e}");
                     e
-                }).ok()?
+                })
+                .ok()?
             };
 
-            layers.push(LayerKernels { attn_proj, wo_proj, ffn });
+            layers.push(LayerKernels {
+                attn_proj,
+                wo_proj,
+                ffn,
+            });
         }
 
         tracing::info!(
@@ -931,7 +1102,14 @@ impl BlobDecodeKernels {
             layers.len(), seq_len, dim, hidden
         );
 
-        Some(BlobDecodeKernels { layers, seq_len, dim, q_proj_dim, kv_dim, attn_dim })
+        Some(BlobDecodeKernels {
+            layers,
+            seq_len,
+            dim,
+            q_proj_dim,
+            kv_dim,
+            attn_dim,
+        })
     }
 
     /// Compile a single conv1x1 BLOBFILE FFN kernel for testing (no model needed).
@@ -941,9 +1119,9 @@ impl BlobDecodeKernels {
     pub fn compile_single(
         cfg: &MilConfig,
         rms_ffn: &[f32],
-        w1: &[f32],  // [hidden, dim] row-major (OIHW)
-        w3: &[f32],  // [hidden, dim] row-major (OIHW)
-        w2: &[f32],  // [dim, hidden] row-major (OIHW)
+        w1: &[f32], // [hidden, dim] row-major (OIHW)
+        w3: &[f32], // [hidden, dim] row-major (OIHW)
+        w2: &[f32], // [dim, hidden] row-major (OIHW)
     ) -> Option<AneKernel> {
         ane_bridge::ane_init().ok()?;
 
@@ -964,7 +1142,8 @@ impl BlobDecodeKernels {
             &datas,
             &[mil_spec.input_bytes],
             &[mil_spec.output_bytes],
-        ).ok()
+        )
+        .ok()
     }
 
     /// Write a vector `x` of length `n_ch` into an ANE kernel's input IOSurface
@@ -986,9 +1165,16 @@ impl BlobDecodeKernels {
     /// Evaluate fused attention projections: RMSNorm + Wq + Wk + Wv.
     ///
     /// Input `x`: `[dim]`. Returns `(q_raw, k, v)`.
-    pub fn eval_attn_proj(&self, layer: usize, x: &[f32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+    pub fn eval_attn_proj(
+        &self,
+        layer: usize,
+        x: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
         let lk = &self.layers[layer];
-        let ap = lk.attn_proj.as_ref().ok_or_else(|| "GDN layer: no attn_proj".to_string())?;
+        let ap = lk
+            .attn_proj
+            .as_ref()
+            .ok_or_else(|| "GDN layer: no attn_proj".to_string())?;
         let seq = self.seq_len;
         let out_ch = self.q_proj_dim + 2 * self.kv_dim;
 
@@ -1008,7 +1194,10 @@ impl BlobDecodeKernels {
     /// Input `attn_out`: `[attn_dim]`. Returns `[dim]`.
     pub fn eval_wo(&self, layer: usize, attn_out: &[f32]) -> Result<Vec<f32>, String> {
         let lk = &self.layers[layer];
-        let wp = lk.wo_proj.as_ref().ok_or_else(|| "GDN layer: no wo_proj".to_string())?;
+        let wp = lk
+            .wo_proj
+            .as_ref()
+            .ok_or_else(|| "GDN layer: no wo_proj".to_string())?;
         let seq = self.seq_len;
 
         Self::write_padded(wp, attn_out, self.attn_dim, seq);
@@ -1040,6 +1229,27 @@ pub fn decode_step_blob(
     token: u32,
     kv_cache: &mut KvCache,
 ) -> DecodeResult {
+    decode_step_blob_inner(model, kernels, None, token, kv_cache)
+}
+
+/// Decode with ANE FFN kernels + optional ANE GDN projection kernels.
+pub fn decode_step_blob_gdn(
+    model: &ModelWeights,
+    kernels: &BlobDecodeKernels,
+    gdn_ane: &GdnAneKernels,
+    token: u32,
+    kv_cache: &mut KvCache,
+) -> DecodeResult {
+    decode_step_blob_inner(model, kernels, Some(gdn_ane), token, kv_cache)
+}
+
+fn decode_step_blob_inner(
+    model: &ModelWeights,
+    kernels: &BlobDecodeKernels,
+    gdn_ane: Option<&GdnAneKernels>,
+    token: u32,
+    kv_cache: &mut KvCache,
+) -> DecodeResult {
     let cfg = &model.cfg;
     let dim = cfg.dim;
     let n_layers = model.layers.len();
@@ -1064,10 +1274,13 @@ pub fn decode_step_blob(
         // GDN (linear attention) layers
         if let Some(ref gdn_w) = lw.gdn {
             if let Some(ref mut gdn_state) = kv_cache.gdn[l] {
-                // Full GDN decode: attention (CPU) + FFN (ANE)
+                // Full GDN decode: attention + FFN (ANE projections if available)
                 let mut xnorm = vec![0.0f32; dim];
                 rmsnorm(&mut xnorm, &x, &lw.rms_att, dim, 1, cfg.rms_eps);
-                let attn_out = gdn_decode_single(gdn_w, gdn_state, &xnorm, cfg);
+                let attn_out = match gdn_ane.and_then(|g| g.layers[l].as_ref()) {
+                    Some(gdn_k) => gdn_decode_single_ane(gdn_w, gdn_k, gdn_state, &xnorm, cfg),
+                    None => gdn_decode_single(gdn_w, gdn_state, &xnorm, cfg),
+                };
                 vec_add_inplace(&mut x, &attn_out);
             }
             // FFN (ANE with CPU fallback)
@@ -1079,7 +1292,9 @@ pub fn decode_step_blob(
                 let mut h1 = cpu_matmul(&lw.w1, &x2norm, hidden, dim, 1);
                 let h3 = cpu_matmul(&lw.w3, &x2norm, hidden, dim, 1);
                 silu_inplace(&mut h1);
-                for i in 0..hidden { h1[i] *= h3[i]; }
+                for i in 0..hidden {
+                    h1[i] *= h3[i];
+                }
                 let ffn_out = cpu_matmul(&lw.w2, &h1, dim, hidden, 1);
                 let mut x_out = x.clone();
                 vec_add_inplace(&mut x_out, &ffn_out);
@@ -1089,16 +1304,15 @@ pub fn decode_step_blob(
         }
 
         // --- Attention projections (ANE): RMSNorm + Wq + Wk + Wv ---
-        let (q_raw, mut k, v) = kernels.eval_attn_proj(l, &x)
-            .unwrap_or_else(|e| {
-                tracing::warn!("ANE attn_proj layer {l} failed: {e}, CPU fallback");
-                let mut xnorm = vec![0.0f32; dim];
-                rmsnorm(&mut xnorm, &x, &lw.rms_att, dim, 1, cfg.rms_eps);
-                let q = cpu_matmul(&lw.wq, &xnorm, q_proj_dim, dim, 1);
-                let k = cpu_matmul(&lw.wk, &xnorm, kv_dim, dim, 1);
-                let v = cpu_matmul(&lw.wv, &xnorm, kv_dim, dim, 1);
-                (q, k, v)
-            });
+        let (q_raw, mut k, v) = kernels.eval_attn_proj(l, &x).unwrap_or_else(|e| {
+            tracing::warn!("ANE attn_proj layer {l} failed: {e}, CPU fallback");
+            let mut xnorm = vec![0.0f32; dim];
+            rmsnorm(&mut xnorm, &x, &lw.rms_att, dim, 1, cfg.rms_eps);
+            let q = cpu_matmul(&lw.wq, &xnorm, q_proj_dim, dim, 1);
+            let k = cpu_matmul(&lw.wk, &xnorm, kv_dim, dim, 1);
+            let v = cpu_matmul(&lw.wv, &xnorm, kv_dim, dim, 1);
+            (q, k, v)
+        });
 
         // Split Q and gate (CPU — cheap, just memcpy)
         let (mut q, attn_gate) = if cfg.attn_output_gate {
@@ -1118,7 +1332,15 @@ pub fn decode_step_blob(
         };
 
         // RoPE (CPU — positional encoding, must be per-position)
-        rope_at_pos(&mut q, &mut k, n_q_heads, n_kv_heads, head_dim, pos, cfg.rope_theta);
+        rope_at_pos(
+            &mut q,
+            &mut k,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            pos,
+            cfg.rope_theta,
+        );
 
         // KV cache + SDPA (CPU — sequential cache access)
         kv_cache.append(l, &k, &v);
@@ -1136,11 +1358,10 @@ pub fn decode_step_blob(
         }
 
         // --- Wo projection (ANE) ---
-        let o = kernels.eval_wo(l, &attn_out)
-            .unwrap_or_else(|e| {
-                tracing::warn!("ANE wo layer {l} failed: {e}, CPU fallback");
-                cpu_matmul(&lw.wo, &attn_out, dim, attn_dim, 1)
-            });
+        let o = kernels.eval_wo(l, &attn_out).unwrap_or_else(|e| {
+            tracing::warn!("ANE wo layer {l} failed: {e}, CPU fallback");
+            cpu_matmul(&lw.wo, &attn_out, dim, attn_dim, 1)
+        });
         vec_add_inplace(&mut x, &o);
 
         // --- FFN (ANE): RMSNorm + W1*SiLU*W3 + W2 + residual ---
@@ -1152,7 +1373,9 @@ pub fn decode_step_blob(
             let mut h1 = cpu_matmul(&lw.w1, &x2norm, hidden, dim, 1);
             let h3 = cpu_matmul(&lw.w3, &x2norm, hidden, dim, 1);
             silu_inplace(&mut h1);
-            for i in 0..hidden { h1[i] *= h3[i]; }
+            for i in 0..hidden {
+                h1[i] *= h3[i];
+            }
             let ffn_out = cpu_matmul(&lw.w2, &h1, dim, hidden, 1);
             let mut x_out = x.clone();
             vec_add_inplace(&mut x_out, &ffn_out);
@@ -1172,6 +1395,318 @@ pub fn decode_step_blob(
     let logits = cpu_matmul(cls_w, &x_final, vocab, dim, 1);
 
     DecodeResult { logits }
+}
+
+// ---------------------------------------------------------------------------
+// GDN ANE kernels — move GDN projections from CPU to ANE conv1x1
+// ---------------------------------------------------------------------------
+
+/// Per-layer ANE kernels for GDN projection matmuls.
+struct GdnLayerAneKernels {
+    /// Fused input projection: xnorm → qkv_raw (conv1x1, [qkv_dim, dim]).
+    qkv: AneKernel,
+    /// Decay projection: xnorm → a_raw (conv1x1, [h_v, dim]).
+    a_proj: AneKernel,
+    /// Write gate projection: xnorm → b_raw (conv1x1, [h_v, dim]).
+    b_proj: AneKernel,
+    /// Output gate projection: xnorm → z (conv1x1, [value_dim, dim]).
+    z_proj: AneKernel,
+    /// Output projection: gated → out (conv1x1, [dim, value_dim]).
+    o_proj: AneKernel,
+    /// Input dims for packing/unpacking.
+    qkv_dim: usize,
+    h_v: usize,
+    value_dim: usize,
+}
+
+/// ANE kernels for GDN layer projections (all layers).
+///
+/// Replaces 5 `cpu_matmul` calls per GDN layer with ANE conv1x1 dispatches.
+/// Recurrence, conv1d, normalization, and gating stay on CPU (tiny, sequential).
+pub struct GdnAneKernels {
+    layers: Vec<Option<GdnLayerAneKernels>>,
+    seq_len: usize,
+    dim: usize,
+}
+
+impl GdnAneKernels {
+    /// Compile GDN projection kernels for all GDN layers.
+    /// Returns None if ANE init or any kernel compilation fails.
+    pub fn compile(model: &ModelWeights) -> Option<Self> {
+        ane_bridge::ane_init().ok()?;
+
+        let cfg = &model.cfg;
+        let dim = cfg.dim;
+        let h_v = cfg.linear_n_value_heads;
+        let d_k = cfg.linear_head_dim;
+        let d_v = cfg.linear_value_head_dim;
+        let key_dim = cfg.linear_n_heads * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+        let seq_len = 16; // Bug 14 minimum
+
+        // Generate MIL specs for each projection shape
+        let qkv_spec = gen_conv1x1_blob(dim, qkv_dim, seq_len);
+        let a_spec = gen_conv1x1_blob(dim, h_v, seq_len);
+        let b_spec = gen_conv1x1_blob(dim, h_v, seq_len);
+        let z_spec = gen_conv1x1_blob(dim, value_dim, seq_len);
+        let o_spec = gen_conv1x1_blob(value_dim, dim, seq_len);
+
+        let compile_one = |spec: &super::ane_mil::FusedLayerMil,
+                           w: &[f32],
+                           label: &str,
+                           l: usize|
+         -> Option<AneKernel> {
+            let blob = build_fp16_blob(w);
+            let names: Vec<&str> = spec.weight_names.iter().copied().collect();
+            AneKernel::compile_multi_weights(
+                &spec.mil_text,
+                &names,
+                &[&blob],
+                &[spec.input_bytes],
+                &[spec.output_bytes],
+            )
+            .map_err(|e| tracing::warn!("GdnAneKernels: L{l} {label} compile failed: {e}"))
+            .ok()
+        };
+
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for (l, lw) in model.layers.iter().enumerate() {
+            if let Some(ref gdn_w) = lw.gdn {
+                let qkv = compile_one(&qkv_spec, &gdn_w.qkv_proj, "qkv", l)?;
+                let a = compile_one(&a_spec, &gdn_w.a_proj, "a", l)?;
+                let b = compile_one(&b_spec, &gdn_w.b_proj, "b", l)?;
+                let z = compile_one(&z_spec, &gdn_w.z_proj, "z", l)?;
+                let o = compile_one(&o_spec, &gdn_w.o_proj, "o", l)?;
+                layers.push(Some(GdnLayerAneKernels {
+                    qkv,
+                    a_proj: a,
+                    b_proj: b,
+                    z_proj: z,
+                    o_proj: o,
+                    qkv_dim,
+                    h_v,
+                    value_dim,
+                }));
+            } else {
+                layers.push(None);
+            }
+        }
+
+        Some(GdnAneKernels {
+            layers,
+            seq_len,
+            dim,
+        })
+    }
+}
+
+/// ANE-accelerated GDN decode: projections on ANE, recurrence on CPU.
+///
+/// Same computation as `gdn_decode_single` but replaces 5 `cpu_matmul` calls
+/// with ANE conv1x1 dispatches. The recurrence, conv1d, normalization, and
+/// gating logic remain on CPU (they're sequential and tiny).
+fn gdn_decode_single_ane(
+    gdn_w: &GdnLayerWeights,
+    kernels: &GdnLayerAneKernels,
+    state: &mut GdnLayerDecodeState,
+    xnorm: &[f32],
+    cfg: &MilConfig,
+) -> Vec<f32> {
+    let dim = cfg.dim;
+    let h_k = cfg.linear_n_heads;
+    let d_k = cfg.linear_head_dim;
+    let h_v = cfg.linear_n_value_heads;
+    let d_v = cfg.linear_value_head_dim;
+    let key_dim = h_k * d_k;
+    let value_dim = h_v * d_v;
+    let qkv_dim = 2 * key_dim + value_dim;
+    let kernel = cfg.conv_kernel_size;
+    let kv_repeat = h_v / h_k.max(1);
+    let seq_len = 16; // padded
+
+    // ── ANE input projections (replace 4 cpu_matmul calls) ──
+    // Pack xnorm into ANE layout [1, dim, 1, 16] — pad position 0, rest zeros
+    // Pack xnorm into ANE layout [1, dim, 1, 16] — channel-first, position 0
+    let mut ane_input = vec![0.0f32; dim * seq_len];
+    for d in 0..dim {
+        ane_input[d * seq_len] = xnorm[d];
+    }
+    let input_bytes = f32_as_bytes(&ane_input);
+
+    /// Evaluate a projection kernel: write input, eval, read position 0 from output.
+    fn ane_read_proj(k: &AneKernel, input: &[u8], c_out: usize, seq: usize) -> Option<Vec<f32>> {
+        k.write_input(0, input);
+        k.eval().ok()?;
+        let mut out_buf = vec![0u8; c_out * seq * 4];
+        k.read_output(0, &mut out_buf);
+        let out_all = bytes_as_f32(&out_buf);
+        let mut result = vec![0.0f32; c_out];
+        for c in 0..c_out {
+            result[c] = out_all[c * seq];
+        }
+        Some(result)
+    }
+
+    let qkv_raw = match ane_read_proj(&kernels.qkv, input_bytes, qkv_dim, seq_len) {
+        Some(v) => v,
+        None => return gdn_decode_single(gdn_w, state, xnorm, cfg),
+    };
+    let a_raw = match ane_read_proj(&kernels.a_proj, input_bytes, h_v, seq_len) {
+        Some(v) => v,
+        None => return gdn_decode_single(gdn_w, state, xnorm, cfg),
+    };
+    let b_raw = match ane_read_proj(&kernels.b_proj, input_bytes, h_v, seq_len) {
+        Some(v) => v,
+        None => return gdn_decode_single(gdn_w, state, xnorm, cfg),
+    };
+    let z = match ane_read_proj(&kernels.z_proj, input_bytes, value_dim, seq_len) {
+        Some(v) => v,
+        None => return gdn_decode_single(gdn_w, state, xnorm, cfg),
+    };
+
+    // ── Steps 2-8: identical to CPU path ──
+
+    // 2. Causal conv1d + SiLU
+    let buf_stride = kernel - 1;
+    let mut qkv_conv = vec![0.0f32; qkv_dim];
+    for c in 0..qkv_dim {
+        let mut acc = qkv_raw[c] * gdn_w.conv_weight[c * kernel];
+        for ki in 1..kernel {
+            acc += state.conv_buf[c * buf_stride + ki - 1] * gdn_w.conv_weight[c * kernel + ki];
+        }
+        if c < gdn_w.conv_bias.len() {
+            acc += gdn_w.conv_bias[c];
+        }
+        qkv_conv[c] = acc / (1.0 + (-acc).exp());
+    }
+    for c in 0..qkv_dim {
+        for lag in (1..buf_stride).rev() {
+            state.conv_buf[c * buf_stride + lag] = state.conv_buf[c * buf_stride + lag - 1];
+        }
+        state.conv_buf[c * buf_stride] = qkv_raw[c];
+    }
+
+    // 3. Split Q, K, V
+    let q_raw = &qkv_conv[0..key_dim];
+    let k_raw = &qkv_conv[key_dim..2 * key_dim];
+    let v_raw = &qkv_conv[2 * key_dim..qkv_dim];
+
+    // 4. Weight-free per-head RMSNorm on Q and K
+    let inv_scale = (d_k as f32).powf(-0.5);
+    let mut q = vec![0.0f32; key_dim];
+    let mut k = vec![0.0f32; key_dim];
+    for h in 0..h_k {
+        let base = h * d_k;
+        let mut q_ss = 0.0f32;
+        let mut k_ss = 0.0f32;
+        for d in 0..d_k {
+            q_ss += q_raw[base + d] * q_raw[base + d];
+            k_ss += k_raw[base + d] * k_raw[base + d];
+        }
+        let q_rms = (q_ss / d_k as f32 + 1e-6).sqrt();
+        let k_rms = (k_ss / d_k as f32 + 1e-6).sqrt();
+        for d in 0..d_k {
+            q[base + d] = q_raw[base + d] / q_rms * inv_scale * inv_scale;
+            k[base + d] = k_raw[base + d] / k_rms * inv_scale;
+        }
+    }
+
+    // 5. GQA expansion
+    let (q_exp, k_exp) = if kv_repeat > 1 {
+        let mut qe = vec![0.0f32; h_v * d_k];
+        let mut ke = vec![0.0f32; h_v * d_k];
+        for hk in 0..h_k {
+            for r in 0..kv_repeat {
+                let hv = hk * kv_repeat + r;
+                qe[hv * d_k..(hv + 1) * d_k].copy_from_slice(&q[hk * d_k..(hk + 1) * d_k]);
+                ke[hv * d_k..(hv + 1) * d_k].copy_from_slice(&k[hk * d_k..(hk + 1) * d_k]);
+            }
+        }
+        (qe, ke)
+    } else {
+        (q, k)
+    };
+
+    // 6. Decay and write gate
+    let mut g_vals = vec![0.0f32; h_v];
+    let mut beta_vals = vec![0.0f32; h_v];
+    for h in 0..h_v {
+        let a_val = a_raw[h] + gdn_w.dt_bias[h];
+        let sp = if a_val > 20.0 {
+            a_val
+        } else {
+            a_val.exp().ln_1p()
+        };
+        g_vals[h] = (-gdn_w.a_log[h].exp() * sp).exp();
+        beta_vals[h] = 1.0 / (1.0 + (-b_raw[h]).exp());
+    }
+
+    // 7. Single-step recurrence
+    let mut y = vec![0.0f32; value_dim];
+    for h in 0..h_v {
+        let g_t = g_vals[h];
+        let beta_t = beta_vals[h];
+        let state_base = h * d_v * d_k;
+        for dv in 0..d_v {
+            let row = state_base + dv * d_k;
+            let mut kv_mem = 0.0f32;
+            for dk in 0..d_k {
+                state.recurrence[row + dk] *= g_t;
+                kv_mem += state.recurrence[row + dk] * k_exp[h * d_k + dk];
+            }
+            let delta = (v_raw[h * d_v + dv] - kv_mem) * beta_t;
+            for dk in 0..d_k {
+                state.recurrence[row + dk] += k_exp[h * d_k + dk] * delta;
+            }
+            let mut y_val = 0.0f32;
+            for dk in 0..d_k {
+                y_val += state.recurrence[row + dk] * q_exp[h * d_k + dk];
+            }
+            y[h * d_v + dv] = y_val;
+        }
+    }
+
+    // 8. Output gate: SiLU(z) * RMSNorm(y)
+    let shared_norm = gdn_w.norm_weight.len() == d_v;
+    let mut gated = vec![0.0f32; value_dim];
+    for h in 0..h_v {
+        let mut ss = 0.0f32;
+        for d in 0..d_v {
+            let val = y[h * d_v + d];
+            ss += val * val;
+        }
+        let rms = (ss / d_v as f32 + 1e-6).sqrt();
+        for d in 0..d_v {
+            let norm_w = if shared_norm {
+                gdn_w.norm_weight[d]
+            } else {
+                gdn_w.norm_weight[h * d_v + d]
+            };
+            let z_val = z[h * d_v + d];
+            let silu_z = z_val / (1.0 + (-z_val).exp());
+            gated[h * d_v + d] = silu_z * (y[h * d_v + d] / rms * norm_w);
+        }
+    }
+
+    // ── 9. O projection on ANE ──
+    let mut o_input = vec![0.0f32; value_dim * seq_len];
+    for c in 0..value_dim {
+        o_input[c * seq_len] = gated[c];
+    }
+    kernels.o_proj.write_input(0, f32_as_bytes(&o_input));
+    if let Err(e) = kernels.o_proj.eval() {
+        tracing::warn!("GDN ANE o_proj eval failed: {e}, CPU fallback");
+        return cpu_matmul(&gdn_w.o_proj, &gated, dim, value_dim, 1);
+    }
+    let mut o_buf = vec![0u8; dim * seq_len * 4];
+    kernels.o_proj.read_output(0, &mut o_buf);
+    let o_all = bytes_as_f32(&o_buf);
+    let mut result = vec![0.0f32; dim];
+    for d in 0..dim {
+        result[d] = o_all[d * seq_len];
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,7 +1755,8 @@ pub fn compile_via_coremltools(
         .map_err(|e| format!("Failed to write weights: {e}"))?;
 
     // Generate Python compile script (Orion pattern)
-    let script = format!(r#"
+    let script = format!(
+        r#"
 import numpy as np
 import coremltools as ct
 from coremltools.converters.mil.mil import Builder as mb
@@ -1244,8 +1780,7 @@ print("OK")
         model_name = model_name,
     );
 
-    std::fs::write(&script_path, &script)
-        .map_err(|e| format!("Failed to write script: {e}"))?;
+    std::fs::write(&script_path, &script).map_err(|e| format!("Failed to write script: {e}"))?;
 
     // Execute the Python script
     let output = std::process::Command::new("python3")
@@ -1263,8 +1798,8 @@ print("OK")
     let mil_path = compiled_dir.join("model.mil");
     let weight_path = compiled_dir.join("weights/weight.bin");
 
-    let mil_bytes = std::fs::read(&mil_path)
-        .map_err(|e| format!("Failed to read compiled MIL: {e}"))?;
+    let mil_bytes =
+        std::fs::read(&mil_path).map_err(|e| format!("Failed to read compiled MIL: {e}"))?;
 
     let weight_blob = std::fs::read(&weight_path).ok();
 
@@ -1274,7 +1809,10 @@ print("OK")
     let _ = std::fs::remove_dir_all(tmp_dir.join(format!("{model_name}.mlpackage")));
     let _ = std::fs::remove_dir_all(&compiled_dir);
 
-    Ok(CoremlCompiledKernel { mil_bytes, weight_blob })
+    Ok(CoremlCompiledKernel {
+        mil_bytes,
+        weight_blob,
+    })
 }
 
 /// Compile a conv1x1 kernel via coremltools and load it onto ANE.
@@ -1305,15 +1843,13 @@ pub fn compile_ane_via_coremltools(
                 &[out_bytes],
             )
         }
-        None => {
-            AneKernel::compile(
-                std::str::from_utf8(&compiled.mil_bytes)
-                    .map_err(|e| format!("MIL is not UTF-8: {e}"))?,
-                None,
-                &[in_bytes],
-                &[out_bytes],
-            )
-        }
+        None => AneKernel::compile(
+            std::str::from_utf8(&compiled.mil_bytes)
+                .map_err(|e| format!("MIL is not UTF-8: {e}"))?,
+            None,
+            &[in_bytes],
+            &[out_bytes],
+        ),
     }
 }
 
@@ -1361,13 +1897,13 @@ fn quantized_gemv(w: &QuantizedTensor, x: &[f32], out: &mut [f32]) {
             let mut i = 0;
             while i + 8 <= group_size {
                 dot += row_data[qbase + i] as f32 * x[xbase + i]
-                     + row_data[qbase + i + 1] as f32 * x[xbase + i + 1]
-                     + row_data[qbase + i + 2] as f32 * x[xbase + i + 2]
-                     + row_data[qbase + i + 3] as f32 * x[xbase + i + 3]
-                     + row_data[qbase + i + 4] as f32 * x[xbase + i + 4]
-                     + row_data[qbase + i + 5] as f32 * x[xbase + i + 5]
-                     + row_data[qbase + i + 6] as f32 * x[xbase + i + 6]
-                     + row_data[qbase + i + 7] as f32 * x[xbase + i + 7];
+                    + row_data[qbase + i + 1] as f32 * x[xbase + i + 1]
+                    + row_data[qbase + i + 2] as f32 * x[xbase + i + 2]
+                    + row_data[qbase + i + 3] as f32 * x[xbase + i + 3]
+                    + row_data[qbase + i + 4] as f32 * x[xbase + i + 4]
+                    + row_data[qbase + i + 5] as f32 * x[xbase + i + 5]
+                    + row_data[qbase + i + 6] as f32 * x[xbase + i + 6]
+                    + row_data[qbase + i + 7] as f32 * x[xbase + i + 7];
                 i += 8;
             }
             while i < group_size {
@@ -1456,7 +1992,10 @@ struct F16Mat {
 impl F16Mat {
     fn from_f32(w: &[f32], rows: usize, cols: usize) -> Self {
         debug_assert_eq!(w.len(), rows * cols);
-        let data: Vec<u16> = w.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        let data: Vec<u16> = w
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
         F16Mat { data, rows, cols }
     }
 
@@ -1487,13 +2026,13 @@ impl F16Mat {
         // Process 8 elements at a time — compiler should auto-vectorize with NEON
         while i + 8 <= self.cols {
             acc += half::f16::from_bits(row[i]).to_f32() * x[i]
-                 + half::f16::from_bits(row[i+1]).to_f32() * x[i+1]
-                 + half::f16::from_bits(row[i+2]).to_f32() * x[i+2]
-                 + half::f16::from_bits(row[i+3]).to_f32() * x[i+3]
-                 + half::f16::from_bits(row[i+4]).to_f32() * x[i+4]
-                 + half::f16::from_bits(row[i+5]).to_f32() * x[i+5]
-                 + half::f16::from_bits(row[i+6]).to_f32() * x[i+6]
-                 + half::f16::from_bits(row[i+7]).to_f32() * x[i+7];
+                + half::f16::from_bits(row[i + 1]).to_f32() * x[i + 1]
+                + half::f16::from_bits(row[i + 2]).to_f32() * x[i + 2]
+                + half::f16::from_bits(row[i + 3]).to_f32() * x[i + 3]
+                + half::f16::from_bits(row[i + 4]).to_f32() * x[i + 4]
+                + half::f16::from_bits(row[i + 5]).to_f32() * x[i + 5]
+                + half::f16::from_bits(row[i + 6]).to_f32() * x[i + 6]
+                + half::f16::from_bits(row[i + 7]).to_f32() * x[i + 7];
             i += 8;
         }
         while i < self.cols {
@@ -1540,8 +2079,10 @@ impl F16DecodeWeights {
         let kv_dim = cfg.n_kv_heads * cfg.head_dim();
         let attn_dim = cfg.n_heads * cfg.head_dim();
 
-        let layers = model.layers.iter().map(|lw| {
-            F16LayerDecode {
+        let layers = model
+            .layers
+            .iter()
+            .map(|lw| F16LayerDecode {
                 wq: F16Mat::from_f32(&lw.wq, q_proj_dim, dim),
                 wk: F16Mat::from_f32(&lw.wk, kv_dim, dim),
                 wv: F16Mat::from_f32(&lw.wv, kv_dim, dim),
@@ -1551,8 +2092,8 @@ impl F16DecodeWeights {
                 w2: F16Mat::from_f32(&lw.w2, dim, hidden),
                 rms_att: lw.rms_att.clone(),
                 rms_ffn: lw.rms_ffn.clone(),
-            }
-        }).collect();
+            })
+            .collect();
 
         let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
 
@@ -1568,11 +2109,7 @@ impl F16DecodeWeights {
 }
 
 /// fp16 parallel GEMV decode: halves bandwidth, parallelizes across cores.
-pub fn decode_step_f16(
-    fw: &F16DecodeWeights,
-    token: u32,
-    kv_cache: &mut KvCache,
-) -> DecodeResult {
+pub fn decode_step_f16(fw: &F16DecodeWeights, token: u32, kv_cache: &mut KvCache) -> DecodeResult {
     let cfg = &fw.cfg;
     let dim = cfg.dim;
     let n_layers = fw.layers.len();
@@ -1612,7 +2149,15 @@ pub fn decode_step_f16(
             (q_raw, None)
         };
 
-        rope_at_pos(&mut q, &mut k, n_q_heads, n_kv_heads, head_dim, pos, cfg.rope_theta);
+        rope_at_pos(
+            &mut q,
+            &mut k,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            pos,
+            cfg.rope_theta,
+        );
 
         kv_cache.append(l, &k, &v);
         let save_pos = kv_cache.pos;
@@ -1635,7 +2180,9 @@ pub fn decode_step_f16(
         let mut h1 = fl.w1.gemv(&x2norm);
         let h3 = fl.w3.gemv(&x2norm);
         silu_inplace(&mut h1);
-        for i in 0..cfg.hidden_dim { h1[i] *= h3[i]; }
+        for i in 0..cfg.hidden_dim {
+            h1[i] *= h3[i];
+        }
         let ffn_out = fl.w2.gemv(&h1);
         vec_add_inplace(&mut x, &ffn_out);
     }
@@ -1706,7 +2253,15 @@ pub fn decode_step_ane(
         };
 
         // RoPE — CPU
-        rope_at_pos(&mut q, &mut k, n_q_heads, n_kv_heads, head_dim, pos, cfg.rope_theta);
+        rope_at_pos(
+            &mut q,
+            &mut k,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            pos,
+            cfg.rope_theta,
+        );
 
         // KV cache
         kv_cache.append(l, &k, &v);
@@ -1732,17 +2287,18 @@ pub fn decode_step_ane(
         rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
 
         // FFN — ANE!
-        let ffn_out = kernels.eval_ffn(l, &x2norm)
-            .unwrap_or_else(|e| {
-                tracing::warn!("ANE FFN layer {l} failed: {e}, falling back to CPU");
-                // CPU fallback
-                let hidden = cfg.hidden_dim;
-                let mut h1 = cpu_matmul(&lw.w1, &x2norm, hidden, dim, 1);
-                let h3 = cpu_matmul(&lw.w3, &x2norm, hidden, dim, 1);
-                silu_inplace(&mut h1);
-                for i in 0..hidden { h1[i] *= h3[i]; }
-                cpu_matmul(&lw.w2, &h1, dim, hidden, 1)
-            });
+        let ffn_out = kernels.eval_ffn(l, &x2norm).unwrap_or_else(|e| {
+            tracing::warn!("ANE FFN layer {l} failed: {e}, falling back to CPU");
+            // CPU fallback
+            let hidden = cfg.hidden_dim;
+            let mut h1 = cpu_matmul(&lw.w1, &x2norm, hidden, dim, 1);
+            let h3 = cpu_matmul(&lw.w3, &x2norm, hidden, dim, 1);
+            silu_inplace(&mut h1);
+            for i in 0..hidden {
+                h1[i] *= h3[i];
+            }
+            cpu_matmul(&lw.w2, &h1, dim, hidden, 1)
+        });
 
         vec_add_inplace(&mut x, &ffn_out);
     }
@@ -1767,9 +2323,9 @@ pub fn decode_step_ane(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ane_mil::MilConfig;
     use super::super::ane_weights::{LayerWeights, ModelWeights};
+    use super::*;
 
     /// Build a tiny random model for testing decode correctness.
     /// dim=64, hidden=128, n_heads=4, n_kv_heads=2, head_dim=16, 2 layers, vocab=32.
@@ -1789,16 +2345,17 @@ mod tests {
         // Deterministic pseudo-random weights
         let mut seed = 42u64;
         let mut rand = || -> f32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) as f32 / (1u64 << 31) as f32) * 0.02 - 0.01
         };
 
-        let make_vec = |n: usize, r: &mut dyn FnMut() -> f32| -> Vec<f32> {
-            (0..n).map(|_| r()).collect()
-        };
+        let make_vec =
+            |n: usize, r: &mut dyn FnMut() -> f32| -> Vec<f32> { (0..n).map(|_| r()).collect() };
 
         let q_proj_dim = n_heads * head_dim; // 64
-        let kv_dim = n_kv_heads * head_dim;  // 32
+        let kv_dim = n_kv_heads * head_dim; // 32
 
         let layers: Vec<LayerWeights> = (0..n_layers)
             .map(|_| LayerWeights {
@@ -1809,21 +2366,32 @@ mod tests {
                 w1: make_vec(hidden * dim, &mut rand),
                 w2: make_vec(dim * hidden, &mut rand),
                 w3: make_vec(hidden * dim, &mut rand),
-                rms_att: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
-                rms_ffn: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+                rms_att: make_vec(dim, &mut rand)
+                    .iter()
+                    .map(|x| x.abs() + 0.1)
+                    .collect(),
+                rms_ffn: make_vec(dim, &mut rand)
+                    .iter()
+                    .map(|x| x.abs() + 0.1)
+                    .collect(),
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             })
             .collect();
 
         ModelWeights {
             cfg,
             layers,
-            rms_final: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+            rms_final: make_vec(dim, &mut rand)
+                .iter()
+                .map(|x| x.abs() + 0.1)
+                .collect(),
             embed: make_vec(vocab * dim, &mut rand),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         }
     }
 
@@ -1875,7 +2443,10 @@ mod tests {
         let mut cache2 = KvCache::new(&model.cfg, model.layers.len(), 64);
         let r2 = decode_step(&model, 7, &mut cache2);
 
-        assert_ne!(r1.logits, r2.logits, "different input tokens produce identical logits");
+        assert_ne!(
+            r1.logits, r2.logits,
+            "different input tokens produce identical logits"
+        );
     }
 
     #[test]
@@ -1890,7 +2461,10 @@ mod tests {
 
         // All draft tokens should be valid vocab indices
         for &t in &drafts {
-            assert!((t as usize) < model.vocab_size, "draft token {t} out of vocab range");
+            assert!(
+                (t as usize) < model.vocab_size,
+                "draft token {t} out of vocab range"
+            );
         }
     }
 
@@ -1947,7 +2521,7 @@ mod tests {
         let d_k = 16;
         let h_v = 4;
         let d_v = 16;
-        let key_dim = h_k * d_k;  // 32
+        let key_dim = h_k * d_k; // 32
         let value_dim = h_v * d_v; // 64
         let qkv_dim = 2 * key_dim + value_dim; // 128
         let conv_kernel = 4;
@@ -1963,12 +2537,13 @@ mod tests {
 
         let mut seed = 42u64;
         let mut rand = || -> f32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) as f32 / (1u64 << 31) as f32) * 0.02 - 0.01
         };
-        let make_vec = |n: usize, r: &mut dyn FnMut() -> f32| -> Vec<f32> {
-            (0..n).map(|_| r()).collect()
-        };
+        let make_vec =
+            |n: usize, r: &mut dyn FnMut() -> f32| -> Vec<f32> { (0..n).map(|_| r()).collect() };
 
         let q_proj_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
@@ -1999,11 +2574,22 @@ mod tests {
                     w1: make_vec(hidden * dim, &mut rand),
                     w2: make_vec(dim * hidden, &mut rand),
                     w3: make_vec(hidden * dim, &mut rand),
-                    rms_att: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
-                    rms_ffn: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+                    rms_att: make_vec(dim, &mut rand)
+                        .iter()
+                        .map(|x| x.abs() + 0.1)
+                        .collect(),
+                    rms_ffn: make_vec(dim, &mut rand)
+                        .iter()
+                        .map(|x| x.abs() + 0.1)
+                        .collect(),
                     q_norm: None,
                     k_norm: None,
-                    gdn: if is_gdn { Some(make_gdn(&mut rand)) } else { None },
+                    gdn: if is_gdn {
+                        Some(make_gdn(&mut rand))
+                    } else {
+                        None
+                    },
+                    moe: None,
                 }
             })
             .collect();
@@ -2011,10 +2597,14 @@ mod tests {
         ModelWeights {
             cfg,
             layers,
-            rms_final: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+            rms_final: make_vec(dim, &mut rand)
+                .iter()
+                .map(|x| x.abs() + 0.1)
+                .collect(),
             embed: make_vec(vocab * dim, &mut rand),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         }
     }
 
@@ -2080,10 +2670,14 @@ mod tests {
         // Generate per-token xnorm inputs (post-embedding, post-RMSNorm)
         let mut seed = 99u64;
         let mut rand = || -> f32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) as f32 / (1u64 << 31) as f32) * 0.1 - 0.05
         };
-        let xnorm_tokens: Vec<Vec<f32>> = (0..seq).map(|_| (0..dim).map(|_| rand()).collect()).collect();
+        let xnorm_tokens: Vec<Vec<f32>> = (0..seq)
+            .map(|_| (0..dim).map(|_| rand()).collect())
+            .collect();
 
         // Test GDN layer 0 (first GDN layer)
         let gdn_layer_idx = 0;
@@ -2154,6 +2748,446 @@ mod tests {
     // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
+    // MoE forward tests
+    // -----------------------------------------------------------------------
+
+    /// Build a tiny MoE model: 2 layers, 4 experts top-2, shared expert.
+    fn make_tiny_moe_model() -> ModelWeights {
+        let dim = 32;
+        let hidden = 64;
+        let moe_hidden = 16;
+        let num_experts = 4;
+        let num_experts_per_tok = 2;
+        let vocab = 16;
+
+        let mut seed = 77u64;
+        let mut rand = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 0.02 - 0.01
+        };
+        let make_vec = |n: usize, r: &mut dyn FnMut() -> f32| -> Vec<f32> {
+            (0..n).map(|_| r()).collect()
+        };
+
+        let make_quantized_identity = |rows: usize, cols: usize, r: &mut dyn FnMut() -> f32| -> QuantizedTensor {
+            // Store as "8-bit quantized" with scale=1, bias=0 for simplicity in tests.
+            // Actually just use dequantized f32 wrapped in a fake QuantizedTensor.
+            // For testing, we use group_size=cols, bits=8.
+            let data_f32 = make_vec(rows * cols, r);
+            // Pack as 8-bit: each f32 → u8 via scale/bias
+            let n_groups = rows; // one group per row with group_size=cols
+            let mut scales = vec![1.0f32; n_groups];
+            let mut biases = vec![0.0f32; n_groups];
+            let mut data_u8 = vec![0u8; rows * cols];
+
+            for row in 0..rows {
+                let row_data = &data_f32[row * cols..(row + 1) * cols];
+                let min_val = row_data.iter().cloned().fold(f32::MAX, f32::min);
+                let max_val = row_data.iter().cloned().fold(f32::MIN, f32::max);
+                let scale = (max_val - min_val).max(1e-10) / 255.0;
+                let bias = min_val;
+                scales[row] = scale;
+                biases[row] = bias;
+                for col in 0..cols {
+                    let val = ((data_f32[row * cols + col] - bias) / scale).round().clamp(0.0, 255.0) as u8;
+                    data_u8[row * cols + col] = val;
+                }
+            }
+
+            QuantizedTensor {
+                data: data_u8,
+                scales,
+                biases,
+                rows,
+                cols,
+                group_size: cols,
+                bits: 8,
+            }
+        };
+
+        let make_expert = |r: &mut dyn FnMut() -> f32| -> super::super::ane_weights::MoeExpert {
+            super::super::ane_weights::MoeExpert {
+                gate_proj: make_quantized_identity(moe_hidden, dim, r),
+                up_proj: make_quantized_identity(moe_hidden, dim, r),
+                down_proj: make_quantized_identity(dim, moe_hidden, r),
+            }
+        };
+
+        let make_packed_experts = |r: &mut dyn FnMut() -> f32| -> super::super::ane_weights::PackedMoeExperts {
+            // Build individual experts then pack into contiguous arrays
+            let experts: Vec<_> = (0..num_experts).map(|_| {
+                (make_quantized_identity(moe_hidden, dim, r),  // gate
+                 make_quantized_identity(moe_hidden, dim, r),  // up
+                 make_quantized_identity(dim, moe_hidden, r))  // down
+            }).collect();
+
+            let mut gate_data = Vec::new();
+            let mut gate_scales = Vec::new();
+            let mut gate_biases = Vec::new();
+            let mut up_data = Vec::new();
+            let mut up_scales = Vec::new();
+            let mut up_biases = Vec::new();
+            let mut down_data = Vec::new();
+            let mut down_scales = Vec::new();
+            let mut down_biases = Vec::new();
+
+            for (g, u, d) in &experts {
+                gate_data.extend_from_slice(&g.data);
+                gate_scales.extend_from_slice(&g.scales);
+                gate_biases.extend_from_slice(&g.biases);
+                up_data.extend_from_slice(&u.data);
+                up_scales.extend_from_slice(&u.scales);
+                up_biases.extend_from_slice(&u.biases);
+                down_data.extend_from_slice(&d.data);
+                down_scales.extend_from_slice(&d.scales);
+                down_biases.extend_from_slice(&d.biases);
+            }
+
+            super::super::ane_weights::PackedMoeExperts {
+                gate_data, gate_scales, gate_biases,
+                up_data, up_scales, up_biases,
+                down_data, down_scales, down_biases,
+                n_experts: num_experts,
+                gate_rows: moe_hidden,
+                gate_cols: dim,
+                down_rows: dim,
+                down_cols: moe_hidden,
+                group_size: dim, // matches make_quantized_identity group_size=cols=dim
+                bits: 8,
+            }
+        };
+
+        let make_moe = |r: &mut dyn FnMut() -> f32| -> super::super::ane_weights::MoeLayerWeights {
+            super::super::ane_weights::MoeLayerWeights {
+                router: make_vec(num_experts * dim, r),
+                packed_experts: make_packed_experts(r),
+                shared_expert: Some(make_expert(r)),
+                num_experts,
+                num_experts_per_tok,
+                moe_hidden,
+            }
+        };
+
+        let cfg = MilConfig::mha(dim, hidden, 4, 1);
+
+        let layers = (0..2).map(|_| {
+            LayerWeights {
+                wq: make_vec(dim * dim, &mut rand),
+                wk: make_vec(dim * dim, &mut rand),
+                wv: make_vec(dim * dim, &mut rand),
+                wo: make_vec(dim * dim, &mut rand),
+                w1: vec![], // unused — MoE replaces dense FFN
+                w2: vec![],
+                w3: vec![],
+                rms_att: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+                rms_ffn: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+                q_norm: None,
+                k_norm: None,
+                gdn: None,
+                moe: Some(make_moe(&mut rand)),
+            }
+        }).collect();
+
+        ModelWeights {
+            cfg,
+            layers,
+            rms_final: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+            embed: make_vec(vocab * dim, &mut rand),
+            vocab_size: vocab,
+            lm_head: None,
+            vocab_clusters: None,
+        }
+    }
+
+    #[test]
+    fn test_moe_decode_produces_valid_logits() {
+        let model = make_tiny_moe_model();
+        let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
+        let r = decode_step(&model, 3, &mut cache);
+
+        assert_eq!(r.logits.len(), model.vocab_size);
+        // Logits should be non-zero (MoE is producing output)
+        let max_logit = r.logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_logit = r.logits.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            (max_logit - min_logit).abs() > 1e-10,
+            "MoE logits are all identical — routing may be broken"
+        );
+    }
+
+    /// Load real 35B-A3B model with MoE experts and run a decode step.
+    ///
+    /// cargo test --features ane --release --lib -- "test_moe_35b_real" --nocapture --test-threads=1 --ignored
+    #[test]
+    #[ignore]
+    fn test_moe_35b_real() {
+        // Try 3-bit first (smaller, faster), fall back to 4-bit
+        let model_dir_3b = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit");
+        let model_dir_4b = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit");
+        let model_dir = if model_dir_3b.exists() { &model_dir_3b }
+            else if model_dir_4b.exists() { &model_dir_4b }
+            else {
+                eprintln!("SKIP: no 35B model found");
+                return;
+            };
+        eprintln!("Using: {}", model_dir.display());
+
+        // 35B-A3B config: dim=2048, moe_hidden=512, 16 heads (2 KV), head_dim=256
+        // 40 layers: 30 GDN + 10 full attention (every 4th)
+        // 256 experts, top-8, shared_expert_intermediate_size=512
+        // GDN: 16 key heads × 128 dim, 32 value heads × 128 dim, conv kernel=4
+        let config_str = std::fs::read_to_string(model_dir.join("config.json")).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let tc = config.get("text_config").unwrap_or(&config);
+
+        let layer_types: Vec<String> = tc.get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let linear_indices: Vec<usize> = layer_types.iter().enumerate()
+            .filter(|(_, t)| t.as_str() == "linear_attention")
+            .map(|(i, _)| i).collect();
+
+        let cfg = MilConfig {
+            dim: 2048,
+            hidden_dim: 512, // moe_intermediate_size (used for shared expert dense FFN)
+            n_heads: 16,
+            seq_len: 1,
+            n_kv_heads: 2,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: 256,
+            linear_attn_indices: linear_indices,
+            linear_n_heads: 16,
+            linear_head_dim: 128,
+            linear_n_value_heads: 32,
+            linear_value_head_dim: 128,
+            conv_kernel_size: 4,
+            attn_output_gate: true,
+        };
+
+        eprintln!("Loading 35B base weights (skip experts)...");
+        let t0 = std::time::Instant::now();
+        let mut model = ModelWeights::from_mlx_safetensors(&model_dir, &cfg)
+            .expect("base load failed");
+        eprintln!("  Base loaded in {:.1}s", t0.elapsed().as_secs_f64());
+
+        let num_experts = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
+        let experts_per_tok = tc.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+        let moe_hidden = tc.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
+
+        eprintln!("Loading MoE experts ({num_experts} experts, top-{experts_per_tok})...");
+        let t1 = std::time::Instant::now();
+        model.load_moe_experts(&model_dir, num_experts, experts_per_tok, moe_hidden)
+            .expect("MoE expert load failed");
+        eprintln!("  Experts loaded in {:.1}s", t1.elapsed().as_secs_f64());
+
+        let moe_layers = model.layers.iter().filter(|l| l.moe.is_some()).count();
+        let gdn_layers = model.layers.iter().filter(|l| l.gdn.is_some()).count();
+        eprintln!("  Layers: {} total, {} MoE, {} GDN", model.layers.len(), moe_layers, gdn_layers);
+
+        // Decode tokens and time
+        eprintln!("Running decode_step...");
+        let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache.init_gdn(&model);
+
+        // First token (cold — page faults for expert weights)
+        let t2 = std::time::Instant::now();
+        let result = decode_step(&model, 1, &mut cache);
+        let cold_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  Token 1 (cold): {cold_ms:.1}ms");
+
+        // Second token (warm — expert data already paged in)
+        let t3 = std::time::Instant::now();
+        let result2 = decode_step(&model, result.logits.iter()
+            .enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32).unwrap_or(1), &mut cache);
+        let warm_ms = t3.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  Token 2 (warm): {warm_ms:.1}ms");
+
+        // Third token
+        let t4 = std::time::Instant::now();
+        let _ = decode_step(&model, 2, &mut cache);
+        let warm2_ms = t4.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  Token 3 (warm): {warm2_ms:.1}ms");
+
+        eprintln!("  Logits: {} (vocab_size={})", result.logits.len(), model.vocab_size);
+        let top = sample_argmax(&result.logits);
+        eprintln!("  Top token: {top}");
+        eprintln!("  Warm tok/s: {:.1}", 1000.0 / warm_ms);
+
+        // Profile: time MoE vs attention vs GDN separately
+        eprintln!("\n  ── Per-component profiling (1 token) ──");
+        let dim = cfg.dim;
+        let n_layers = model.layers.len();
+        let mut moe_us = 0u128;
+        let mut gdn_us = 0u128;
+        let mut attn_us = 0u128;
+        let mut cls_us = 0u128;
+
+        // Manual decode_step with timing
+        let mut x = vec![0.0f32; dim];
+        for d in 0..dim { x[d] = model.embed[3_usize * dim + d]; }
+
+        for l in 0..n_layers {
+            let lw = &model.layers[l];
+
+            // Attention / GDN
+            let t = std::time::Instant::now();
+            if let Some(ref gdn_w) = lw.gdn {
+                if let Some(ref mut gdn_state) = cache.gdn[l] {
+                    let mut xnorm = vec![0.0f32; dim];
+                    rmsnorm(&mut xnorm, &x, &lw.rms_att, dim, 1, cfg.rms_eps);
+                    let attn_out = gdn_decode_single(gdn_w, gdn_state, &xnorm, &cfg);
+                    vec_add_inplace(&mut x, &attn_out);
+                }
+                gdn_us += t.elapsed().as_micros();
+            } else {
+                // Skip full attention for profiling — just measure MoE
+                attn_us += t.elapsed().as_micros();
+            }
+
+            // FFN (MoE)
+            if let Some(ref moe_w) = lw.moe {
+                let t = std::time::Instant::now();
+                moe_forward(moe_w, &mut x, &lw.rms_ffn, &cfg);
+                moe_us += t.elapsed().as_micros();
+            }
+        }
+
+        // Classifier
+        let t = std::time::Instant::now();
+        let mut x_final = vec![0.0f32; dim];
+        rmsnorm(&mut x_final, &x, &model.rms_final, dim, 1, cfg.rms_eps);
+        let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
+        let _logits = cpu_matmul(cls_w, &x_final, model.vocab_size, dim, 1);
+        cls_us = t.elapsed().as_micros();
+
+        let total_ms = (moe_us + gdn_us + attn_us + cls_us) as f64 / 1000.0;
+        eprintln!("  MoE (experts):  {:>7.1}ms ({:.0}%)", moe_us as f64 / 1000.0,
+                  moe_us as f64 / (moe_us + gdn_us + attn_us + cls_us).max(1) as f64 * 100.0);
+        eprintln!("  GDN (linear):   {:>7.1}ms ({:.0}%)", gdn_us as f64 / 1000.0,
+                  gdn_us as f64 / (moe_us + gdn_us + attn_us + cls_us).max(1) as f64 * 100.0);
+        eprintln!("  Attention:      {:>7.1}ms ({:.0}%)", attn_us as f64 / 1000.0,
+                  attn_us as f64 / (moe_us + gdn_us + attn_us + cls_us).max(1) as f64 * 100.0);
+        eprintln!("  Classifier:     {:>7.1}ms ({:.0}%)", cls_us as f64 / 1000.0,
+                  cls_us as f64 / (moe_us + gdn_us + attn_us + cls_us).max(1) as f64 * 100.0);
+        eprintln!("  Total:          {:>7.1}ms → {:.1} tok/s", total_ms, 1000.0 / total_ms);
+
+        assert_eq!(result.logits.len(), model.vocab_size);
+        assert_eq!(result2.logits.len(), model.vocab_size);
+    }
+
+    #[test]
+    fn test_moe_different_tokens_give_different_logits() {
+        let model = make_tiny_moe_model();
+        let mut cache1 = KvCache::new(&model.cfg, model.layers.len(), 64);
+        let mut cache2 = KvCache::new(&model.cfg, model.layers.len(), 64);
+
+        let r1 = decode_step(&model, 1, &mut cache1);
+        let r2 = decode_step(&model, 7, &mut cache2);
+
+        assert_ne!(r1.logits, r2.logits, "Different tokens should produce different logits");
+    }
+
+    // -----------------------------------------------------------------------
+    // GDN ANE projection kernel tests
+    // -----------------------------------------------------------------------
+
+    /// Test that GDN ANE kernels compile for the tiny model.
+    ///
+    /// cargo test --features ane --lib -- "test_gdn_ane_kernels_compile" --test-threads=1
+    #[test]
+    fn test_gdn_ane_kernels_compile() {
+        use super::super::ane_bridge;
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        let model = make_tiny_gdn_model();
+        let gdn_kernels = GdnAneKernels::compile(&model);
+
+        // Should compile successfully (or return None if ANE unavailable)
+        if let Some(ref gk) = gdn_kernels {
+            assert_eq!(gk.layers.len(), model.layers.len());
+            // Layers 0, 2 are GDN → should have kernels
+            assert!(gk.layers[0].is_some(), "GDN layer 0 should have kernels");
+            assert!(gk.layers[2].is_some(), "GDN layer 2 should have kernels");
+            // Layers 1, 3 are MHA → should be None
+            assert!(gk.layers[1].is_none(), "MHA layer 1 should have no GDN kernels");
+            assert!(gk.layers[3].is_none(), "MHA layer 3 should have no GDN kernels");
+            eprintln!("GDN ANE kernels compiled: {} layers", gk.layers.len());
+        } else {
+            eprintln!("SKIP: GDN ANE kernel compilation returned None (expected on some hardware)");
+        }
+    }
+
+    /// Test GDN ANE projection output matches CPU baseline within fp16 tolerance.
+    ///
+    /// cargo test --features ane --lib -- "test_gdn_ane_matches_cpu" --test-threads=1
+    #[test]
+    fn test_gdn_ane_matches_cpu() {
+        use super::super::ane_bridge;
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        let model = make_tiny_gdn_model();
+        let gdn_kernels = match GdnAneKernels::compile(&model) {
+            Some(k) => k,
+            None => {
+                eprintln!("SKIP: GDN ANE kernel compilation failed");
+                return;
+            }
+        };
+
+        // Run decode with CPU path
+        let mut cache_cpu = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache_cpu.init_gdn(&model);
+        let r_cpu = decode_step(&model, 5, &mut cache_cpu);
+
+        // Run decode with ANE GDN path
+        let blob_kernels = match BlobDecodeKernels::compile(&model, 16) {
+            Some(k) => k,
+            None => {
+                eprintln!("SKIP: BlobDecodeKernels compilation failed");
+                return;
+            }
+        };
+        let mut cache_ane = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache_ane.init_gdn(&model);
+        let r_ane = decode_step_blob_gdn(&model, &blob_kernels, &gdn_kernels, 5, &mut cache_ane);
+
+        // Compare logits — fp16 tolerance (ANE runs in fp16 internally)
+        // Use absolute + relative hybrid: max(|a-b|, |a-b|/max(|a|,|b|,1e-3))
+        assert_eq!(r_cpu.logits.len(), r_ane.logits.len());
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (i, (a, b)) in r_cpu.logits.iter().zip(&r_ane.logits).enumerate() {
+            let abs_err = (a - b).abs();
+            let denom = a.abs().max(b.abs()).max(1e-3);
+            let rel = abs_err / denom;
+            max_abs = max_abs.max(abs_err);
+            max_rel = max_rel.max(rel);
+            if abs_err > 0.01 {
+                eprintln!("  logit[{i}]: cpu={a:.6} ane={b:.6} abs={abs_err:.6}");
+            }
+        }
+        eprintln!("  max absolute error: {max_abs:.6}");
+        eprintln!("  max relative error: {max_rel:.6}");
+        // fp16 through 4 layers: allow 1% relative or 0.01 absolute
+        assert!(
+            max_abs < 0.01 || max_rel < 0.01,
+            "GDN ANE vs CPU: abs={max_abs:.4} rel={max_rel:.4} — both exceed tolerance"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // BLOBFILE decode kernel tests
     // -----------------------------------------------------------------------
 
@@ -2174,7 +3208,9 @@ mod tests {
         let dim = 64;
         let hidden = 128;
 
-        let w_data: Vec<f32> = (0..hidden * dim).map(|i| ((i + 1) as f32 * 0.003).sin() * 0.1).collect();
+        let w_data: Vec<f32> = (0..hidden * dim)
+            .map(|i| ((i + 1) as f32 * 0.003).sin() * 0.1)
+            .collect();
         let w_blob = build_fp16_blob(&w_data);
 
         // Test single conv1x1 via compile_multi_weights at various seq
@@ -2182,8 +3218,12 @@ mod tests {
             let spec = gen_conv1x1_blob(dim, hidden, seq);
             let names: Vec<&str> = spec.weight_names.iter().copied().collect();
             let r = AneKernel::compile_multi_weights(
-                &spec.mil_text, &names, &[&w_blob],
-                &[spec.input_bytes], &[spec.output_bytes]);
+                &spec.mil_text,
+                &names,
+                &[&w_blob],
+                &[spec.input_bytes],
+                &[spec.output_bytes],
+            );
             match r {
                 Ok(k) => {
                     let input = vec![0.5f32; dim * seq];
@@ -2194,7 +3234,9 @@ mod tests {
                             let mut out = vec![0u8; spec.output_bytes];
                             k.read_output(0, &mut out);
                             let first = f32::from_le_bytes([out[0], out[1], out[2], out[3]]);
-                            eprintln!("  conv1x1 seq={seq}: COMPILE OK, EVAL OK (first={first:.6})");
+                            eprintln!(
+                                "  conv1x1 seq={seq}: COMPILE OK, EVAL OK (first={first:.6})"
+                            );
                         }
                         Err(e) => eprintln!("  conv1x1 seq={seq}: COMPILE OK, EVAL FAIL ({e})"),
                     }
@@ -2248,7 +3290,9 @@ mod tests {
                             let first_val = f32::from_le_bytes([
                                 out_buf[0], out_buf[1], out_buf[2], out_buf[3],
                             ]);
-                            eprintln!("  BLOB seq={seq}: COMPILE OK, EVAL OK (first={first_val:.6})");
+                            eprintln!(
+                                "  BLOB seq={seq}: COMPILE OK, EVAL OK (first={first_val:.6})"
+                            );
                         }
                         Err(e) => {
                             eprintln!("  BLOB seq={seq}: COMPILE OK, EVAL FAILED ({e})");
@@ -2308,7 +3352,9 @@ mod tests {
                             let first = f32::from_le_bytes([out[0], out[1], out[2], out[3]]);
                             eprintln!("  BLOB 0.8B seq={seq}: OK (compile={compile_ms}ms, eval={eval_us}us, first={first:.6})");
                         }
-                        Err(e) => eprintln!("  BLOB 0.8B seq={seq}: EVAL FAILED ({e}) (compile={compile_ms}ms)"),
+                        Err(e) => eprintln!(
+                            "  BLOB 0.8B seq={seq}: EVAL FAILED ({e}) (compile={compile_ms}ms)"
+                        ),
                     }
                 }
                 None => eprintln!("  BLOB 0.8B seq={seq}: COMPILE FAILED (took {compile_ms}ms)"),
@@ -2348,7 +3394,10 @@ mod tests {
                 let t0 = std::time::Instant::now();
                 match BlobDecodeKernels::compile(&model, 16) {
                     Some(k) => {
-                        eprintln!("BlobDecodeKernels compile (seq=16): {}ms", t0.elapsed().as_millis());
+                        eprintln!(
+                            "BlobDecodeKernels compile (seq=16): {}ms",
+                            t0.elapsed().as_millis()
+                        );
                         k
                     }
                     None => {
@@ -2391,8 +3440,14 @@ mod tests {
         let speedup = cpu_us / blob_us;
 
         eprintln!("\n=== BLOBFILE Decode Benchmark (0.8B synthetic) ===");
-        eprintln!("  CPU:  {cpu_ms:.2}ms/step ({:.1} tok/sec)", 1_000_000.0 / cpu_us);
-        eprintln!("  BLOB: {blob_ms:.2}ms/step ({:.1} tok/sec)", 1_000_000.0 / blob_us);
+        eprintln!(
+            "  CPU:  {cpu_ms:.2}ms/step ({:.1} tok/sec)",
+            1_000_000.0 / cpu_us
+        );
+        eprintln!(
+            "  BLOB: {blob_ms:.2}ms/step ({:.1} tok/sec)",
+            1_000_000.0 / blob_us
+        );
         eprintln!("  Speedup: {speedup:.2}x");
         eprintln!();
 
@@ -2409,11 +3464,17 @@ mod tests {
         let mut cache_c = KvCache::new(&model.cfg, n_layers, 64);
         let r_blob = decode_step_blob(&model, &blob_kernels, 42, &mut cache_b);
         let r_cpu = decode_step(&model, 42, &mut cache_c);
-        let max_diff = r_blob.logits.iter().zip(r_cpu.logits.iter())
+        let max_diff = r_blob
+            .logits
+            .iter()
+            .zip(r_cpu.logits.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         eprintln!("  BLOB vs CPU max logit diff: {max_diff:.6}");
-        assert!(max_diff < 2.0, "BLOB vs CPU divergence too large: {max_diff}");
+        assert!(
+            max_diff < 2.0,
+            "BLOB vs CPU divergence too large: {max_diff}"
+        );
 
         // --- Profiled breakdown ---
         eprintln!("\n=== Per-Component Breakdown (single step, pos=0) ===");
@@ -2427,7 +3488,9 @@ mod tests {
         let attn_dim = n_q_heads * head_dim;
 
         let mut x = vec![0.0f32; dim];
-        for d in 0..dim { x[d] = model.embed[42usize * dim + d]; }
+        for d in 0..dim {
+            x[d] = model.embed[42usize * dim + d];
+        }
 
         let mut t_attn_ane = 0u128;
         let mut t_rope_sdpa = 0u128;
@@ -2447,12 +3510,23 @@ mod tests {
                 for h in 0..n_q_heads {
                     let sb = h * 2 * head_dim;
                     let db = h * head_dim;
-                    q[db..db+head_dim].copy_from_slice(&q_raw[sb..sb+head_dim]);
-                    gate[db..db+head_dim].copy_from_slice(&q_raw[sb+head_dim..sb+2*head_dim]);
+                    q[db..db + head_dim].copy_from_slice(&q_raw[sb..sb + head_dim]);
+                    gate[db..db + head_dim]
+                        .copy_from_slice(&q_raw[sb + head_dim..sb + 2 * head_dim]);
                 }
                 (q, Some(gate))
-            } else { (q_raw, None) };
-            rope_at_pos(&mut q, &mut k, n_q_heads, n_kv_heads, head_dim, cache_prof.pos(), model.cfg.rope_theta);
+            } else {
+                (q_raw, None)
+            };
+            rope_at_pos(
+                &mut q,
+                &mut k,
+                n_q_heads,
+                n_kv_heads,
+                head_dim,
+                cache_prof.pos(),
+                model.cfg.rope_theta,
+            );
             cache_prof.append(l, &k, &v);
             let sp = cache_prof.pos;
             cache_prof.pos = cache_prof.pos() + 1;
@@ -2479,16 +3553,39 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         let mut x_final = vec![0.0f32; dim];
-        rmsnorm(&mut x_final, &x, &model.rms_final, dim, 1, model.cfg.rms_eps);
+        rmsnorm(
+            &mut x_final,
+            &x,
+            &model.rms_final,
+            dim,
+            1,
+            model.cfg.rms_eps,
+        );
         let vocab = model.vocab_size;
         let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
         let _ = cpu_matmul(cls_w, &x_final, vocab, dim, 1);
         let t_cls = t0.elapsed().as_micros();
 
-        eprintln!("  ANE attn_proj: {:.2}ms ({} layers)", t_attn_ane as f64 / 1000.0, n_layers);
-        eprintln!("  CPU rope+sdpa: {:.2}ms ({} layers)", t_rope_sdpa as f64 / 1000.0, n_layers);
-        eprintln!("  ANE wo_proj:   {:.2}ms ({} layers)", t_wo_ane as f64 / 1000.0, n_layers);
-        eprintln!("  ANE ffn:       {:.2}ms ({} layers)", t_ffn_ane as f64 / 1000.0, n_layers);
+        eprintln!(
+            "  ANE attn_proj: {:.2}ms ({} layers)",
+            t_attn_ane as f64 / 1000.0,
+            n_layers
+        );
+        eprintln!(
+            "  CPU rope+sdpa: {:.2}ms ({} layers)",
+            t_rope_sdpa as f64 / 1000.0,
+            n_layers
+        );
+        eprintln!(
+            "  ANE wo_proj:   {:.2}ms ({} layers)",
+            t_wo_ane as f64 / 1000.0,
+            n_layers
+        );
+        eprintln!(
+            "  ANE ffn:       {:.2}ms ({} layers)",
+            t_ffn_ane as f64 / 1000.0,
+            n_layers
+        );
         eprintln!("  CPU classifier: {:.2}ms", t_cls as f64 / 1000.0);
         let total = t_attn_ane + t_rope_sdpa + t_wo_ane + t_ffn_ane + t_cls as u128;
         eprintln!("  Total:         {:.2}ms", total as f64 / 1000.0);
@@ -2542,8 +3639,14 @@ mod tests {
         let speedup = cpu_us / f16_us;
 
         eprintln!("\n=== fp16 Decode Benchmark (0.8B synthetic) ===");
-        eprintln!("  FP32 SGEMM: {cpu_ms:.2}ms/step ({:.1} tok/sec)", 1_000_000.0 / cpu_us);
-        eprintln!("  FP16 GEMV:  {f16_ms:.2}ms/step ({:.1} tok/sec)", 1_000_000.0 / f16_us);
+        eprintln!(
+            "  FP32 SGEMM: {cpu_ms:.2}ms/step ({:.1} tok/sec)",
+            1_000_000.0 / cpu_us
+        );
+        eprintln!(
+            "  FP16 GEMV:  {f16_ms:.2}ms/step ({:.1} tok/sec)",
+            1_000_000.0 / f16_us
+        );
         eprintln!("  Speedup: {speedup:.2}x");
         eprintln!();
 
@@ -2560,7 +3663,10 @@ mod tests {
         let mut cache_c2 = KvCache::new(&model.cfg, n_layers, 64);
         let r_f = decode_step_f16(&fw, 42, &mut cache_f2);
         let r_c = decode_step(&model, 42, &mut cache_c2);
-        let max_diff = r_f.logits.iter().zip(r_c.logits.iter())
+        let max_diff = r_f
+            .logits
+            .iter()
+            .zip(r_c.logits.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         eprintln!("  fp16 vs fp32 max logit diff: {max_diff:.6}");
@@ -2598,16 +3704,22 @@ mod tests {
         let n_layers = 2;
 
         let spec = gen_conv1x1_blob(dim, dim, seq);
-        let w_data: Vec<f32> = (0..dim*dim).map(|i| ((i+1) as f32 * 0.001).sin() * 0.1).collect();
+        let w_data: Vec<f32> = (0..dim * dim)
+            .map(|i| ((i + 1) as f32 * 0.001).sin() * 0.1)
+            .collect();
         let w_blob = build_fp16_blob(&w_data);
         let names: Vec<&str> = spec.weight_names.iter().copied().collect();
         let datas: Vec<&[u8]> = vec![&w_blob];
 
         eprintln!("[2] MIL generated, compiling 1 kernel...");
         let k0 = AneKernel::compile_multi_weights(
-            &spec.mil_text, &names, &datas,
-            &[spec.input_bytes], &[spec.output_bytes],
-        ).unwrap_or_else(|e| panic!("compile failed: {e}"));
+            &spec.mil_text,
+            &names,
+            &datas,
+            &[spec.input_bytes],
+            &[spec.output_bytes],
+        )
+        .unwrap_or_else(|e| panic!("compile failed: {e}"));
         eprintln!("[3] kernel 0 compiled OK");
 
         // Test single eval
@@ -2619,9 +3731,13 @@ mod tests {
 
         // Compile second kernel
         let k1 = AneKernel::compile_multi_weights(
-            &spec.mil_text, &names, &datas,
-            &[spec.input_bytes], &[spec.output_bytes],
-        ).unwrap_or_else(|e| panic!("compile k1 failed: {e}"));
+            &spec.mil_text,
+            &names,
+            &datas,
+            &[spec.input_bytes],
+            &[spec.output_bytes],
+        )
+        .unwrap_or_else(|e| panic!("compile k1 failed: {e}"));
         eprintln!("[5] kernel 1 compiled OK");
 
         // Test eval_chain WITHOUT sharing (separate IOSurfaces, just sequential eval)
@@ -2653,9 +3769,13 @@ mod tests {
         // Undo sharing first — recompile k1 to get fresh IOSurfaces
         drop(k1);
         let k1 = AneKernel::compile_multi_weights(
-            &spec.mil_text, &names, &datas,
-            &[spec.input_bytes], &[spec.output_bytes],
-        ).unwrap();
+            &spec.mil_text,
+            &names,
+            &datas,
+            &[spec.input_bytes],
+            &[spec.output_bytes],
+        )
+        .unwrap();
 
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
@@ -2692,8 +3812,16 @@ mod tests {
 
         eprintln!("\n=== Chained ANE Eval Benchmark ({n_layers} conv1x1 layers, dim={dim}, seq={seq}) ===");
         eprintln!("  Single dispatch:   {single_us:.0}µs/eval");
-        eprintln!("  Separate (memcpy): {:.2}ms/step ({:.0}µs/layer)", separate_us / 1000.0, separate_us / n_layers as f64);
-        eprintln!("  Chained (no copy): {:.2}ms/step ({:.0}µs/layer)", chained_us / 1000.0, chained_us / n_layers as f64);
+        eprintln!(
+            "  Separate (memcpy): {:.2}ms/step ({:.0}µs/layer)",
+            separate_us / 1000.0,
+            separate_us / n_layers as f64
+        );
+        eprintln!(
+            "  Chained (no copy): {:.2}ms/step ({:.0}µs/layer)",
+            chained_us / 1000.0,
+            chained_us / n_layers as f64
+        );
         eprintln!("  Speedup: {:.2}x", separate_us / chained_us);
 
         // --- Scale test: realistic 0.8B dimensions ---
@@ -2721,7 +3849,9 @@ mod tests {
             } else {
                 gen_conv1x1_blob(c_in, c_out, s)
             };
-            let wd: Vec<f32> = (0..c_in*c_out).map(|i| ((i+1) as f32 * 0.001).sin() * 0.1).collect();
+            let wd: Vec<f32> = (0..c_in * c_out)
+                .map(|i| ((i + 1) as f32 * 0.001).sin() * 0.1)
+                .collect();
             let wb = build_fp16_blob(&wd);
             let nm: Vec<&str> = sp.weight_names.iter().copied().collect();
             let dt: Vec<&[u8]> = vec![&wb];
@@ -2732,14 +3862,24 @@ mod tests {
             let mut compile_ok = true;
             for _ in 0..nl {
                 match AneKernel::compile_multi_weights(
-                    &sp.mil_text, &nm, &dt,
-                    &[sp.input_bytes], &[sp.output_bytes],
+                    &sp.mil_text,
+                    &nm,
+                    &dt,
+                    &[sp.input_bytes],
+                    &[sp.output_bytes],
                 ) {
                     Ok(k) => kerns.push(k),
-                    Err(e) => { eprintln!("  [{label}] compile failed: {e}"); compile_ok = false; break; }
+                    Err(e) => {
+                        eprintln!("  [{label}] compile failed: {e}");
+                        compile_ok = false;
+                        break;
+                    }
                 }
             }
-            if !compile_ok { ane_bridge::set_quiet(false); continue; }
+            if !compile_ok {
+                ane_bridge::set_quiet(false);
+                continue;
+            }
 
             let inp = vec![0.5f32; c_in * s];
             let inp_b = ane_weights::f32_slice_to_bytes(&inp);
@@ -2754,7 +3894,10 @@ mod tests {
                     break;
                 }
             }
-            if !eval_ok { ane_bridge::set_quiet(false); continue; }
+            if !eval_ok {
+                ane_bridge::set_quiet(false);
+                continue;
+            }
 
             // Baseline: separate with memcpy
             let nb = 20;
@@ -2822,17 +3965,29 @@ mod tests {
             AneKernel::end_realtime();
 
             eprintln!("  [{label}] {nl} layers:");
-            eprintln!("    Separate (memcpy):  {:.2}ms ({:.0}µs/layer)",
-                sep_us / 1000.0, sep_us / nl as f64);
-            eprintln!("    Chained (shared):   {:.2}ms ({:.0}µs/layer)",
-                ch_us / 1000.0, ch_us / nl as f64);
+            eprintln!(
+                "    Separate (memcpy):  {:.2}ms ({:.0}µs/layer)",
+                sep_us / 1000.0,
+                sep_us / nl as f64
+            );
+            eprintln!(
+                "    Chained (shared):   {:.2}ms ({:.0}µs/layer)",
+                ch_us / 1000.0,
+                ch_us / nl as f64
+            );
             if rt_us > 0.0 {
-                eprintln!("    RealTime (shared):  {:.2}ms ({:.0}µs/layer)",
-                    rt_us / 1000.0, rt_us / nl as f64);
+                eprintln!(
+                    "    RealTime (shared):  {:.2}ms ({:.0}µs/layer)",
+                    rt_us / 1000.0,
+                    rt_us / nl as f64
+                );
             }
             if pc_us > 0.0 {
-                eprintln!("    Prepared+Chain:     {:.2}ms ({:.0}µs/layer)",
-                    pc_us / 1000.0, pc_us / nl as f64);
+                eprintln!(
+                    "    Prepared+Chain:     {:.2}ms ({:.0}µs/layer)",
+                    pc_us / 1000.0,
+                    pc_us / nl as f64
+                );
             }
             let best = if rt_us > 0.0 { ch_us.min(rt_us) } else { ch_us };
             eprintln!("    Best speedup vs separate: {:.2}x", sep_us / best);
@@ -2883,14 +4038,19 @@ mod tests {
 
         // Now try conv1x1 at dim=64
         let spec = gen_conv1x1_blob(64, 64, 16);
-        let w_data: Vec<f32> = (0..64*64).map(|i| ((i+1) as f32 * 0.001).sin() * 0.1).collect();
+        let w_data: Vec<f32> = (0..64 * 64)
+            .map(|i| ((i + 1) as f32 * 0.001).sin() * 0.1)
+            .collect();
         let w_blob = build_fp16_blob(&w_data);
         let names: Vec<&str> = spec.weight_names.iter().copied().collect();
         let datas: Vec<&[u8]> = vec![&w_blob];
 
         match AneKernel::compile_direct(
-            &spec.mil_text, &names, &datas,
-            &[spec.input_bytes], &[spec.output_bytes],
+            &spec.mil_text,
+            &names,
+            &datas,
+            &[spec.input_bytes],
+            &[spec.output_bytes],
         ) {
             Ok(k) => {
                 eprintln!("[2] conv1x1 64x64 compile_direct: OK");
@@ -2904,15 +4064,22 @@ mod tests {
             }
             Err(e) => {
                 eprintln!("[2] conv1x1 64x64 compile_direct: FAILED: {e}");
-                eprintln!("MIL text:\n{}", &spec.mil_text[..200.min(spec.mil_text.len())]);
+                eprintln!(
+                    "MIL text:\n{}",
+                    &spec.mil_text[..200.min(spec.mil_text.len())]
+                );
             }
         }
 
         // Try with compile_multi_weights as baseline
         let k = AneKernel::compile_multi_weights(
-            &spec.mil_text, &names, &datas,
-            &[spec.input_bytes], &[spec.output_bytes],
-        ).unwrap();
+            &spec.mil_text,
+            &names,
+            &datas,
+            &[spec.input_bytes],
+            &[spec.output_bytes],
+        )
+        .unwrap();
         let input = vec![0.5f32; 64 * 16];
         let input_b = ane_weights::f32_slice_to_bytes(&input);
         k.write_input(0, &input_b);
@@ -2958,11 +4125,38 @@ mod tests {
                     super::super::ane_forward::FfnKernels::Tiled { .. } => "tiled",
                 };
                 eprintln!("ANE seq_len=1 FFN: COMPILED ({ffn_type})");
-                eprintln!("  SDPA fwd: {}", if k.sdpa_fwd.is_some() { "YES" } else { "no" });
-                eprintln!("  SDPA core GQA: {}", if k.sdpa_core_gqa.is_some() { "YES" } else { "no" });
-                eprintln!("  MHA proj: {}", if k.mha_proj_fwd.is_some() { "YES" } else { "no" });
-                eprintln!("  Fused attn GQA: {}", if k.fused_attn_gqa.is_some() { "YES" } else { "no" });
-                eprintln!("  RMSNorm: {}", if k.rmsnorm_fwd.is_some() { "YES" } else { "no" });
+                eprintln!(
+                    "  SDPA fwd: {}",
+                    if k.sdpa_fwd.is_some() { "YES" } else { "no" }
+                );
+                eprintln!(
+                    "  SDPA core GQA: {}",
+                    if k.sdpa_core_gqa.is_some() {
+                        "YES"
+                    } else {
+                        "no"
+                    }
+                );
+                eprintln!(
+                    "  MHA proj: {}",
+                    if k.mha_proj_fwd.is_some() {
+                        "YES"
+                    } else {
+                        "no"
+                    }
+                );
+                eprintln!(
+                    "  Fused attn GQA: {}",
+                    if k.fused_attn_gqa.is_some() {
+                        "YES"
+                    } else {
+                        "no"
+                    }
+                );
+                eprintln!(
+                    "  RMSNorm: {}",
+                    if k.rmsnorm_fwd.is_some() { "YES" } else { "no" }
+                );
 
                 // Try actually running the FFN kernel at seq=1 and seq=2 to isolate Bug 13
                 if let super::super::ane_forward::FfnKernels::FullyFused { ref kernel } = k.ffn {
@@ -2973,9 +4167,17 @@ mod tests {
                     let w3_t = vec![0.01f32; dim * hidden];
                     let w2 = vec![0.01f32; dim * hidden];
 
-                    let input = super::super::ane_weights::pack_fused_ffn(&xnorm, &w1_t, &w3_t, &w2, &cfg);
-                    let spec = super::super::ane_mil::KernelSpec::for_kernel(&cfg, super::super::ane_mil::KernelType::FusedFfn);
-                    eprintln!("  seq=1 FFN input: {} bytes, output: {} bytes", input.len(), spec.output_bytes);
+                    let input =
+                        super::super::ane_weights::pack_fused_ffn(&xnorm, &w1_t, &w3_t, &w2, &cfg);
+                    let spec = super::super::ane_mil::KernelSpec::for_kernel(
+                        &cfg,
+                        super::super::ane_mil::KernelType::FusedFfn,
+                    );
+                    eprintln!(
+                        "  seq=1 FFN input: {} bytes, output: {} bytes",
+                        input.len(),
+                        spec.output_bytes
+                    );
                     kernel.write_input(0, &input);
                     match kernel.eval() {
                         Ok(()) => eprintln!("  seq=1 FFN eval: OK!"),
@@ -2987,7 +4189,8 @@ mod tests {
                 let mut cfg2 = cfg.clone();
                 cfg2.seq_len = 2;
                 if let Ok(k2) = CompiledKernels::compile_forward(&cfg2) {
-                    if let super::super::ane_forward::FfnKernels::FullyFused { ref kernel } = k2.ffn {
+                    if let super::super::ane_forward::FfnKernels::FullyFused { ref kernel } = k2.ffn
+                    {
                         let dim = 1024usize;
                         let hidden = 3584usize;
                         let xnorm2 = vec![0.01f32; dim * 2];
@@ -2995,9 +4198,18 @@ mod tests {
                         let w3_t = vec![0.01f32; dim * hidden];
                         let w2 = vec![0.01f32; dim * hidden];
 
-                        let input = super::super::ane_weights::pack_fused_ffn(&xnorm2, &w1_t, &w3_t, &w2, &cfg2);
-                        let spec = super::super::ane_mil::KernelSpec::for_kernel(&cfg2, super::super::ane_mil::KernelType::FusedFfn);
-                        eprintln!("  seq=2 FFN input: {} bytes, output: {} bytes", input.len(), spec.output_bytes);
+                        let input = super::super::ane_weights::pack_fused_ffn(
+                            &xnorm2, &w1_t, &w3_t, &w2, &cfg2,
+                        );
+                        let spec = super::super::ane_mil::KernelSpec::for_kernel(
+                            &cfg2,
+                            super::super::ane_mil::KernelType::FusedFfn,
+                        );
+                        eprintln!(
+                            "  seq=2 FFN input: {} bytes, output: {} bytes",
+                            input.len(),
+                            spec.output_bytes
+                        );
                         kernel.write_input(0, &input);
                         match kernel.eval() {
                             Ok(()) => eprintln!("  seq=2 FFN eval: OK!"),
@@ -3013,17 +4225,24 @@ mod tests {
                     let mut cfg_s = cfg.clone();
                     cfg_s.seq_len = seq_try;
                     if let Ok(ks) = CompiledKernels::compile_forward(&cfg_s) {
-                        if let super::super::ane_forward::FfnKernels::FullyFused { ref kernel } = ks.ffn {
+                        if let super::super::ane_forward::FfnKernels::FullyFused { ref kernel } =
+                            ks.ffn
+                        {
                             let dim = 1024usize;
                             let hidden = 3584usize;
                             let xnorm_s = vec![0.01f32; dim * seq_try];
                             let w1_t = vec![0.01f32; dim * hidden];
                             let w3_t = vec![0.01f32; dim * hidden];
                             let w2 = vec![0.01f32; dim * hidden];
-                            let input = super::super::ane_weights::pack_fused_ffn(&xnorm_s, &w1_t, &w3_t, &w2, &cfg_s);
+                            let input = super::super::ane_weights::pack_fused_ffn(
+                                &xnorm_s, &w1_t, &w3_t, &w2, &cfg_s,
+                            );
                             kernel.write_input(0, &input);
                             match kernel.eval() {
-                                Ok(()) => { eprintln!("  seq={seq_try} FFN eval: OK!"); break; },
+                                Ok(()) => {
+                                    eprintln!("  seq={seq_try} FFN eval: OK!");
+                                    break;
+                                }
                                 Err(_) => eprintln!("  seq={seq_try} FFN eval: FAILED"),
                             }
                         }
@@ -3106,9 +4325,16 @@ mod tests {
             eprintln!("  FFN W1+W3:    {ffn_w13_us:.0}us");
             eprintln!("  FFN W2:       {ffn_w2_us:.0}us");
             eprintln!("  Layer total:  {layer_total:.0}us");
-            eprintln!("  × 24 layers:  {:.0}us ({:.1}ms)", layer_total * 24.0, layer_total * 24.0 / 1000.0);
+            eprintln!(
+                "  × 24 layers:  {:.0}us ({:.1}ms)",
+                layer_total * 24.0,
+                layer_total * 24.0 / 1000.0
+            );
             eprintln!("  Classifier:   {cls_us:.0}us ({:.1}ms)", cls_us / 1000.0);
-            eprintln!("  Projected total: {:.1}ms", (layer_total * 24.0 + cls_us) / 1000.0);
+            eprintln!(
+                "  Projected total: {:.1}ms",
+                (layer_total * 24.0 + cls_us) / 1000.0
+            );
         }
 
         let n_layers = model.layers.len();
@@ -3134,7 +4360,12 @@ mod tests {
         eprintln!("\n=== Phase 1c: Decode Step Benchmark (0.8B, CPU-only) ===");
         eprintln!("  Layers: {n_layers}");
         eprintln!("  Dim: {}, Hidden: {}", model.cfg.dim, model.cfg.hidden_dim);
-        eprintln!("  Heads: {} Q, {} KV, head_dim={}", model.cfg.n_heads, model.cfg.n_kv_heads, model.cfg.head_dim());
+        eprintln!(
+            "  Heads: {} Q, {} KV, head_dim={}",
+            model.cfg.n_heads,
+            model.cfg.n_kv_heads,
+            model.cfg.head_dim()
+        );
         eprintln!("  Iters: {n_iters} (after 5 warmup)");
         eprintln!("  KV cache pos at end: {}", cache.pos());
         eprintln!("  Per-step: {per_step_ms:.2}ms ({per_step_us:.0}us)");
@@ -3144,7 +4375,9 @@ mod tests {
         if per_step_ms < 5.0 {
             eprintln!("  VERDICT: PASS (<5ms) — ANE draft model is viable!");
         } else if per_step_ms < 10.0 {
-            eprintln!("  VERDICT: MARGINAL (5-10ms) — may still be useful with ANE FFN acceleration");
+            eprintln!(
+                "  VERDICT: MARGINAL (5-10ms) — may still be useful with ANE FFN acceleration"
+            );
         } else {
             eprintln!("  VERDICT: FAIL (>10ms) — pivot to GPU fallback (mlx-lm --draft-model)");
         }
@@ -3174,8 +4407,8 @@ mod tests {
         cfg.attn_output_gate = true;
 
         let attn_dim = n_heads * head_dim; // 2048
-        let q_proj_dim = 2 * attn_dim;   // 4096 (doubled for gate)
-        let kv_dim = n_kv_heads * head_dim;  // 512
+        let q_proj_dim = 2 * attn_dim; // 4096 (doubled for gate)
+        let kv_dim = n_kv_heads * head_dim; // 512
 
         let layers: Vec<LayerWeights> = (0..n_layers)
             .map(|_| LayerWeights {
@@ -3191,6 +4424,7 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             })
             .collect();
 
@@ -3201,6 +4435,7 @@ mod tests {
             embed: vec![0.01f32; vocab * dim],
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         }
     }
 
@@ -3269,8 +4504,14 @@ mod tests {
         let speedup = cpu_us / ane_us;
 
         eprintln!("\n=== Phase 1c: ANE vs CPU Decode Step (0.8B synthetic) ===");
-        eprintln!("  CPU:  {cpu_ms:.2}ms/step ({:.1} tok/sec)", 1_000_000.0 / cpu_us);
-        eprintln!("  ANE:  {ane_ms:.2}ms/step ({:.1} tok/sec)", 1_000_000.0 / ane_us);
+        eprintln!(
+            "  CPU:  {cpu_ms:.2}ms/step ({:.1} tok/sec)",
+            1_000_000.0 / cpu_us
+        );
+        eprintln!(
+            "  ANE:  {ane_ms:.2}ms/step ({:.1} tok/sec)",
+            1_000_000.0 / ane_us
+        );
         eprintln!("  Speedup: {speedup:.2}x");
         eprintln!();
 
@@ -3287,19 +4528,27 @@ mod tests {
         let mut cache_c = KvCache::new(&model.cfg, n_layers, 64);
         let r_ane = decode_step_ane(&model, &kernels, 42, &mut cache_a);
         let r_cpu = decode_step(&model, 42, &mut cache_c);
-        let max_diff = r_ane.logits.iter().zip(r_cpu.logits.iter())
+        let max_diff = r_ane
+            .logits
+            .iter()
+            .zip(r_cpu.logits.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         eprintln!("  ANE vs CPU max logit diff: {max_diff:.6}");
         // ANE fp16 intermediate precision → some divergence expected
-        assert!(max_diff < 1.0, "ANE vs CPU divergence too large: {max_diff}");
+        assert!(
+            max_diff < 1.0,
+            "ANE vs CPU divergence too large: {max_diff}"
+        );
     }
 
     #[test]
     fn test_kv_cache_rollback() {
         let model = make_tiny_model();
         let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
-        for i in 0..5u32 { decode_step(&model, i, &mut cache); }
+        for i in 0..5u32 {
+            decode_step(&model, i, &mut cache);
+        }
         assert_eq!(cache.pos(), 5);
         cache.rollback_to(3);
         assert_eq!(cache.pos(), 3);
@@ -3321,7 +4570,9 @@ mod tests {
         let adapter = super::super::ane_lora::LoraAdapter {
             a: vec![1.0, 0.0, 0.0, 1.0],
             b: vec![0.5, 0.0, 0.0, 0.5],
-            rank: 2, d_in: 2, d_out: 2,
+            rank: 2,
+            d_in: 2,
+            d_out: 2,
         };
         let merged = super::merge_lora_weight(&base, Some(&adapter), 1.0, 2, 2);
         assert!((merged[0] - 1.5).abs() < 1e-6);
@@ -3333,9 +4584,158 @@ mod tests {
     #[test]
     fn test_acceptance_stats() {
         let mut stats = super::AcceptanceStats::new();
-        for _ in 0..10 { stats.update(4, 3); }
+        for _ in 0..10 {
+            stats.update(4, 3);
+        }
         let rate = stats.recent_rate();
         assert!((rate - 0.75).abs() < 0.01, "expected ~0.75, got {rate}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Benchmark: GDN ANE projection vs CPU at realistic model dimensions
+    // -----------------------------------------------------------------------
+
+    /// Benchmark GDN layer projection: ANE conv1x1 vs CPU matmul at real dims.
+    ///
+    /// Sweeps across Qwen3.5 model scales:
+    ///   0.6B: dim=1024, h_k=4, d_k=64, h_v=8, d_v=64, key=256, value=512, qkv=1024
+    ///   2B:   dim=1536, h_k=8, d_k=64, h_v=16, d_v=64, key=512, value=1024, qkv=2048
+    ///   4B:   dim=2048, h_k=8, d_k=64, h_v=16, d_v=64, key=512, value=1024, qkv=2048
+    ///   35B:  dim=2560, h_k=8, d_k=64, h_v=16, d_v=128, key=512, value=2048, qkv=3072
+    ///
+    /// cargo test --features ane --release --lib -- "bench_gdn_ane_vs_cpu" --nocapture --test-threads=1
+    #[test]
+    fn bench_gdn_ane_vs_cpu() {
+        use super::super::ane_bridge;
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        struct GdnDims {
+            label: &'static str,
+            dim: usize,
+            hidden: usize,
+            h_k: usize,
+            d_k: usize,
+            h_v: usize,
+            d_v: usize,
+            conv_kernel: usize,
+        }
+
+        let configs = [
+            GdnDims { label: "0.6B", dim: 1024, hidden: 2816, h_k: 4, d_k: 64, h_v: 8, d_v: 64, conv_kernel: 4 },
+            GdnDims { label: "2B",   dim: 1536, hidden: 4096, h_k: 8, d_k: 64, h_v: 16, d_v: 64, conv_kernel: 4 },
+            GdnDims { label: "4B",   dim: 2048, hidden: 5632, h_k: 8, d_k: 64, h_v: 16, d_v: 64, conv_kernel: 4 },
+            GdnDims { label: "35B",  dim: 2560, hidden: 9216, h_k: 8, d_k: 64, h_v: 16, d_v: 128, conv_kernel: 4 },
+        ];
+
+        eprintln!("\n{}", "=".repeat(70));
+        eprintln!("  BENCHMARK: GDN layer projection — ANE conv1x1 vs CPU matmul");
+        eprintln!("{}\n", "=".repeat(70));
+
+        for c in &configs {
+            let key_dim = c.h_k * c.d_k;
+            let value_dim = c.h_v * c.d_v;
+            let qkv_dim = 2 * key_dim + value_dim;
+
+            let mut cfg = MilConfig::mha(c.dim, c.hidden, c.h_k * 2, 1);
+            cfg.n_kv_heads = c.h_k;
+            cfg.head_dim_explicit = c.d_k;
+            cfg.linear_n_heads = c.h_k;
+            cfg.linear_head_dim = c.d_k;
+            cfg.linear_n_value_heads = c.h_v;
+            cfg.linear_value_head_dim = c.d_v;
+            cfg.conv_kernel_size = c.conv_kernel;
+
+            // Create synthetic weights
+            let mut seed = 42u64;
+            let mut rand = || -> f32 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((seed >> 33) as f32 / (1u64 << 31) as f32) * 0.02 - 0.01
+            };
+            let make_vec = |n: usize, r: &mut dyn FnMut() -> f32| -> Vec<f32> {
+                (0..n).map(|_| r()).collect()
+            };
+
+            let gdn_w = GdnLayerWeights {
+                qkv_proj: make_vec(qkv_dim * c.dim, &mut rand),
+                a_proj: make_vec(c.h_v * c.dim, &mut rand),
+                b_proj: make_vec(c.h_v * c.dim, &mut rand),
+                z_proj: make_vec(value_dim * c.dim, &mut rand),
+                o_proj: make_vec(c.dim * value_dim, &mut rand),
+                a_log: make_vec(c.h_v, &mut rand),
+                dt_bias: make_vec(c.h_v, &mut rand),
+                norm_weight: make_vec(c.d_v, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+                conv_weight: make_vec(qkv_dim * c.conv_kernel, &mut rand),
+                conv_bias: make_vec(qkv_dim, &mut rand),
+            };
+
+            let xnorm: Vec<f32> = make_vec(c.dim, &mut rand);
+            let mut state = GdnLayerDecodeState::new(&cfg);
+
+            // ── CPU benchmark ──
+            let n_iters = 100;
+            let cpu_start = std::time::Instant::now();
+            for _ in 0..n_iters {
+                let _ = gdn_decode_single(&gdn_w, &mut state, &xnorm, &cfg);
+            }
+            let cpu_us = cpu_start.elapsed().as_micros() as f64 / n_iters as f64;
+
+            // ── ANE benchmark ──
+            // Build a 1-layer model just for compilation
+            let layer = LayerWeights {
+                wq: vec![], wk: vec![], wv: vec![], wo: vec![],
+                w1: make_vec(c.hidden * c.dim, &mut rand),
+                w2: make_vec(c.dim * c.hidden, &mut rand),
+                w3: make_vec(c.hidden * c.dim, &mut rand),
+                rms_att: make_vec(c.dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+                rms_ffn: make_vec(c.dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+                q_norm: None, k_norm: None,
+                gdn: Some(gdn_w.clone()),
+                moe: None,
+            };
+            let model = ModelWeights {
+                cfg: cfg.clone(),
+                layers: vec![layer],
+                rms_final: vec![1.0; c.dim],
+                embed: vec![0.0; 32 * c.dim],
+                vocab_size: 32,
+                lm_head: None,
+                vocab_clusters: None,
+            };
+
+            let gdn_kernels = match GdnAneKernels::compile(&model) {
+                Some(k) => k,
+                None => {
+                    eprintln!("  {}: ANE compile FAILED — skipping", c.label);
+                    continue;
+                }
+            };
+
+            let ane_layer = gdn_kernels.layers[0].as_ref().unwrap();
+            state = GdnLayerDecodeState::new(&cfg);
+
+            let ane_start = std::time::Instant::now();
+            for _ in 0..n_iters {
+                let _ = gdn_decode_single_ane(
+                    &model.layers[0].gdn.as_ref().unwrap(),
+                    ane_layer, &mut state, &xnorm, &cfg,
+                );
+            }
+            let ane_us = ane_start.elapsed().as_micros() as f64 / n_iters as f64;
+
+            let speedup = cpu_us / ane_us;
+            let weight_mb = (qkv_dim * c.dim + c.h_v * c.dim * 2 + value_dim * c.dim + c.dim * value_dim) as f64 * 4.0 / 1e6;
+
+            eprintln!(
+                "  {:>4}: dim={:<4} qkv={:<4} | CPU {:>7.0}µs  ANE {:>7.0}µs  {:>5.2}x  weights={:.1}MB",
+                c.label, c.dim, qkv_dim, cpu_us, ane_us, speedup, weight_mb
+            );
+        }
+
+        eprintln!("\n  Bug 14 note: ANE pads to seq=16, wastes 15/16 compute.");
+        eprintln!("  If ANE > 1x speedup despite padding, SRAM bandwidth wins over DRAM.\n");
     }
 }
 
@@ -3351,7 +4751,9 @@ fn merge_lora_weight(
     d_out: usize,
     d_in: usize,
 ) -> Vec<f32> {
-    let Some(a) = adapter else { return base.to_vec() };
+    let Some(a) = adapter else {
+        return base.to_vec();
+    };
     debug_assert_eq!(base.len(), d_out * d_in);
     let mut merged = base.to_vec();
     for i in 0..a.d_out {
@@ -3405,43 +4807,85 @@ impl BlobDecodeKernels {
 
                 let ap = {
                     let blobs: Vec<Vec<u8>> = vec![
-                        build_fp16_blob(&lw.rms_att), build_fp16_blob(&wq_m),
-                        build_fp16_blob(&lw.wk), build_fp16_blob(&wv_m),
+                        build_fp16_blob(&lw.rms_att),
+                        build_fp16_blob(&wq_m),
+                        build_fp16_blob(&lw.wk),
+                        build_fp16_blob(&wv_m),
                     ];
                     let names: Vec<&str> = attn_spec.weight_names.iter().copied().collect();
                     let datas: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
                     AneKernel::compile_multi_weights(
-                        &attn_spec.mil_text, &names, &datas,
-                        &[attn_spec.input_bytes], &[attn_spec.output_bytes],
-                    ).map_err(|e| { tracing::warn!("recompile_with_lora: layer {l} attn: {e}"); e }).ok()?
+                        &attn_spec.mil_text,
+                        &names,
+                        &datas,
+                        &[attn_spec.input_bytes],
+                        &[attn_spec.output_bytes],
+                    )
+                    .map_err(|e| {
+                        tracing::warn!("recompile_with_lora: layer {l} attn: {e}");
+                        e
+                    })
+                    .ok()?
                 };
                 let wp = {
                     let wo_blob = build_fp16_blob(&wo_m);
                     let names: Vec<&str> = wo_spec.weight_names.iter().copied().collect();
                     AneKernel::compile_multi_weights(
-                        &wo_spec.mil_text, &names, &[wo_blob.as_slice()],
-                        &[wo_spec.input_bytes], &[wo_spec.output_bytes],
-                    ).map_err(|e| { tracing::warn!("recompile_with_lora: layer {l} wo: {e}"); e }).ok()?
+                        &wo_spec.mil_text,
+                        &names,
+                        &[wo_blob.as_slice()],
+                        &[wo_spec.input_bytes],
+                        &[wo_spec.output_bytes],
+                    )
+                    .map_err(|e| {
+                        tracing::warn!("recompile_with_lora: layer {l} wo: {e}");
+                        e
+                    })
+                    .ok()?
                 };
                 (Some(ap), Some(wp))
             };
 
             let ffn = {
                 let blobs: Vec<Vec<u8>> = vec![
-                    build_fp16_blob(&lw.rms_ffn), build_fp16_blob(&lw.w1),
-                    build_fp16_blob(&lw.w3), build_fp16_blob(&w2_m),
+                    build_fp16_blob(&lw.rms_ffn),
+                    build_fp16_blob(&lw.w1),
+                    build_fp16_blob(&lw.w3),
+                    build_fp16_blob(&w2_m),
                 ];
                 let names: Vec<&str> = ffn_spec.weight_names.iter().copied().collect();
                 let datas: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
                 AneKernel::compile_multi_weights(
-                    &ffn_spec.mil_text, &names, &datas,
-                    &[ffn_spec.input_bytes], &[ffn_spec.output_bytes],
-                ).map_err(|e| { tracing::warn!("recompile_with_lora: layer {l} ffn: {e}"); e }).ok()?
+                    &ffn_spec.mil_text,
+                    &names,
+                    &datas,
+                    &[ffn_spec.input_bytes],
+                    &[ffn_spec.output_bytes],
+                )
+                .map_err(|e| {
+                    tracing::warn!("recompile_with_lora: layer {l} ffn: {e}");
+                    e
+                })
+                .ok()?
             };
-            layers.push(LayerKernels { attn_proj, wo_proj, ffn });
+            layers.push(LayerKernels {
+                attn_proj,
+                wo_proj,
+                ffn,
+            });
         }
-        tracing::info!("recompile_with_lora: rebuilt {} layers at seq={seq_len}", layers.len());
-        Some(BlobDecodeKernels { layers, seq_len, dim, q_proj_dim, kv_dim, attn_dim })
+        tracing::info!(
+            "recompile_with_lora: rebuilt {} layers at seq={seq_len}",
+            layers.len()
+        );
+        Some(BlobDecodeKernels {
+            layers,
+            seq_len,
+            dim,
+            q_proj_dim,
+            kv_dim,
+            attn_dim,
+        })
     }
 }
 
@@ -3460,10 +4904,7 @@ pub fn load_draft_model(dir: &std::path::Path) -> Result<ModelWeights, String> {
 }
 
 /// Build `MilConfig` from a model directory's `config.json`.
-pub fn mil_config_from_dir(
-    dir: &std::path::Path,
-    seq_len: usize,
-) -> Result<MilConfig, String> {
+pub fn mil_config_from_dir(dir: &std::path::Path, seq_len: usize) -> Result<MilConfig, String> {
     let config_path = dir.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("read {}: {e}", config_path.display()))?;
@@ -3471,57 +4912,91 @@ pub fn mil_config_from_dir(
         .map_err(|e| format!("parse {}: {e}", config_path.display()))?;
     let tc = root.get("text_config").unwrap_or(&root);
 
-    let dim = tc["hidden_size"].as_u64()
-        .ok_or("missing hidden_size")? as usize;
-    let hidden_dim = tc.get("intermediate_size")
+    let dim = tc["hidden_size"].as_u64().ok_or("missing hidden_size")? as usize;
+    let hidden_dim = tc
+        .get("intermediate_size")
         .or_else(|| tc.get("moe_intermediate_size"))
         .and_then(|v| v.as_u64())
         .ok_or("missing intermediate_size")? as usize;
-    let n_heads = tc["num_attention_heads"].as_u64()
+    let n_heads = tc["num_attention_heads"]
+        .as_u64()
         .ok_or("missing num_attention_heads")? as usize;
-    let n_kv_heads = tc.get("num_key_value_heads")
+    let n_kv_heads = tc
+        .get("num_key_value_heads")
         .and_then(|v| v.as_u64())
         .unwrap_or(n_heads as u64) as usize;
-    let head_dim = tc.get("head_dim")
+    let head_dim = tc
+        .get("head_dim")
         .and_then(|v| v.as_u64())
         .unwrap_or((dim / n_heads) as u64) as usize;
-    let rope_theta = tc.get("rope_parameters")
+    let rope_theta = tc
+        .get("rope_parameters")
         .and_then(|rp| rp.get("rope_theta"))
         .and_then(|v| v.as_f64())
         .or_else(|| tc.get("rope_theta").and_then(|v| v.as_f64()))
         .or_else(|| root.get("rope_theta").and_then(|v| v.as_f64()))
         .unwrap_or(1_000_000.0);
-    let rms_eps = tc.get("rms_norm_eps")
+    let rms_eps = tc
+        .get("rms_norm_eps")
         .and_then(|v| v.as_f64())
         .unwrap_or(1e-6) as f32;
-    let attn_output_gate = tc.get("attn_output_gate")
+    let attn_output_gate = tc
+        .get("attn_output_gate")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let layer_types: Vec<String> = tc.get("layer_types")
+    let layer_types: Vec<String> = tc
+        .get("layer_types")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    let linear_attn_indices: Vec<usize> = layer_types.iter().enumerate()
+    let linear_attn_indices: Vec<usize> = layer_types
+        .iter()
+        .enumerate()
         .filter(|(_, t)| t.as_str() == "linear_attention")
-        .map(|(i, _)| i).collect();
-    let linear_n_heads = tc.get("linear_num_key_heads")
-        .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let linear_head_dim = tc.get("linear_key_head_dim")
-        .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let linear_n_value_heads = tc.get("linear_num_value_heads")
-        .and_then(|v| v.as_u64()).unwrap_or(linear_n_heads as u64) as usize;
-    let linear_value_head_dim = tc.get("linear_value_head_dim")
-        .and_then(|v| v.as_u64()).unwrap_or(linear_head_dim as u64) as usize;
-    let conv_kernel_size = tc.get("linear_conv_kernel_dim")
-        .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        .map(|(i, _)| i)
+        .collect();
+    let linear_n_heads = tc
+        .get("linear_num_key_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let linear_head_dim = tc
+        .get("linear_key_head_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let linear_n_value_heads = tc
+        .get("linear_num_value_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(linear_n_heads as u64) as usize;
+    let linear_value_head_dim = tc
+        .get("linear_value_head_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(linear_head_dim as u64) as usize;
+    let conv_kernel_size = tc
+        .get("linear_conv_kernel_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
 
     Ok(MilConfig {
-        dim, hidden_dim, n_heads, seq_len, n_kv_heads,
-        rope_theta, rms_eps, has_lm_head: false,
+        dim,
+        hidden_dim,
+        n_heads,
+        seq_len,
+        n_kv_heads,
+        rope_theta,
+        rms_eps,
+        has_lm_head: false,
         head_dim_explicit: head_dim,
-        linear_attn_indices, linear_n_heads, linear_head_dim,
-        linear_n_value_heads, linear_value_head_dim,
-        conv_kernel_size, attn_output_gate,
+        linear_attn_indices,
+        linear_n_heads,
+        linear_head_dim,
+        linear_n_value_heads,
+        linear_value_head_dim,
+        conv_kernel_size,
+        attn_output_gate,
     })
 }
 
@@ -3542,23 +5017,39 @@ const ACCEPTANCE_WINDOW: usize = 100;
 
 impl AcceptanceStats {
     pub fn new() -> Self {
-        Self { total_drafted: 0, total_accepted: 0, window: VecDeque::with_capacity(ACCEPTANCE_WINDOW) }
+        Self {
+            total_drafted: 0,
+            total_accepted: 0,
+            window: VecDeque::with_capacity(ACCEPTANCE_WINDOW),
+        }
     }
 
     pub fn update(&mut self, drafted: usize, accepted: usize) {
         self.total_drafted += drafted as u64;
         self.total_accepted += accepted as u64;
-        if self.window.len() >= ACCEPTANCE_WINDOW { self.window.pop_front(); }
+        if self.window.len() >= ACCEPTANCE_WINDOW {
+            self.window.pop_front();
+        }
         self.window.push_back((drafted, accepted));
     }
 
     pub fn recent_rate(&self) -> f64 {
-        let (d, a) = self.window.iter().fold((0u64, 0u64), |(d, a), &(dd, aa)| (d + dd as u64, a + aa as u64));
-        if d == 0 { 0.5 } else { a as f64 / d as f64 }
+        let (d, a) = self.window.iter().fold((0u64, 0u64), |(d, a), &(dd, aa)| {
+            (d + dd as u64, a + aa as u64)
+        });
+        if d == 0 {
+            0.5
+        } else {
+            a as f64 / d as f64
+        }
     }
 
     pub fn lifetime_rate(&self) -> f64 {
-        if self.total_drafted == 0 { 0.5 } else { self.total_accepted as f64 / self.total_drafted as f64 }
+        if self.total_drafted == 0 {
+            0.5
+        } else {
+            self.total_accepted as f64 / self.total_drafted as f64
+        }
     }
 }
 
@@ -3585,26 +5076,37 @@ impl SpeculativeDecoder {
         let n_layers = draft_model.layers.len();
         let mut kv_cache = KvCache::new(&draft_model.cfg, n_layers, max_seq);
         kv_cache.init_gdn(&draft_model);
-        let decode_kernels = BlobDecodeKernels::compile(&draft_model, 1)
-            .or_else(|| {
-                tracing::info!("SpeculativeDecoder: seq=1 failed, trying seq=16");
-                BlobDecodeKernels::compile(&draft_model, 16)
-            });
+        let decode_kernels = BlobDecodeKernels::compile(&draft_model, 1).or_else(|| {
+            tracing::info!("SpeculativeDecoder: seq=1 failed, trying seq=16");
+            BlobDecodeKernels::compile(&draft_model, 16)
+        });
         if decode_kernels.is_some() {
             tracing::info!("SpeculativeDecoder: ANE decode kernels compiled");
         } else {
             tracing::info!("SpeculativeDecoder: CPU-only decode (ANE unavailable)");
         }
-        Self { draft_model, kv_cache, decode_kernels, lora_reload_rx }
+        Self {
+            draft_model,
+            kv_cache,
+            decode_kernels,
+            lora_reload_rx,
+        }
     }
 
     fn try_reload_lora(&mut self) {
-        let Ok(new_lora) = self.lora_reload_rx.try_recv() else { return };
+        let Ok(new_lora) = self.lora_reload_rx.try_recv() else {
+            return;
+        };
         tracing::info!("SpeculativeDecoder: reloading LoRA into decode kernels");
         let seq_len = self.decode_kernels.as_ref().map_or(1, |k| k.seq_len);
         match BlobDecodeKernels::recompile_with_lora(&self.draft_model, &new_lora, seq_len) {
-            Some(k) => { self.decode_kernels = Some(k); tracing::info!("SpeculativeDecoder: LoRA reload done"); }
-            None => tracing::warn!("SpeculativeDecoder: LoRA recompile failed, keeping old kernels"),
+            Some(k) => {
+                self.decode_kernels = Some(k);
+                tracing::info!("SpeculativeDecoder: LoRA reload done");
+            }
+            None => {
+                tracing::warn!("SpeculativeDecoder: LoRA recompile failed, keeping old kernels")
+            }
         }
     }
 
@@ -3640,9 +5142,13 @@ impl SpeculativeDecoder {
         self.kv_cache.rollback_to(pre_draft_pos + n_accepted);
     }
 
-    fn reset(&mut self) { self.kv_cache.rollback_to(0); }
+    fn reset(&mut self) {
+        self.kv_cache.rollback_to(0);
+    }
 
-    fn kv_pos(&self) -> usize { self.kv_cache.pos() }
+    fn kv_pos(&self) -> usize {
+        self.kv_cache.pos()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3682,12 +5188,19 @@ pub fn run_spec_decode_worker(
 ) {
     while let Ok(req) = rx.recv() {
         match req {
-            SpecDecodeRequest::Draft { last_token, n, reply } => {
+            SpecDecodeRequest::Draft {
+                last_token,
+                n,
+                reply,
+            } => {
                 let pos = decoder.kv_pos();
                 let drafts = decoder.draft(last_token, n);
                 let _ = reply.send((pos, drafts));
             }
-            SpecDecodeRequest::Accept { pre_draft_pos, n_accepted } => {
+            SpecDecodeRequest::Accept {
+                pre_draft_pos,
+                n_accepted,
+            } => {
                 decoder.accept(pre_draft_pos, n_accepted);
             }
             SpecDecodeRequest::Reset => decoder.reset(),

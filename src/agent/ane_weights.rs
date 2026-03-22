@@ -8,6 +8,18 @@ use crate::agent::ane_mil::MilConfig;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+fn bench_trace_enabled() -> bool {
+    std::env::var("NANOBOT_ANE_BENCH_TRACE_PHASES")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn bench_trace_weights(message: impl AsRef<str>) {
+    if bench_trace_enabled() {
+        eprintln!("[ANE_BENCH_TRACE] {}", message.as_ref());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-layer and full-model weight storage
 // ---------------------------------------------------------------------------
@@ -30,6 +42,184 @@ pub struct GdnLayerWeights {
     pub conv_bias: Vec<f32>,   // [qkv_dim] causal conv bias
 }
 
+/// Single MoE expert FFN weights (quantized to minimize memory).
+#[derive(Debug, Clone)]
+pub struct MoeExpert {
+    pub gate_proj: QuantizedTensor, // [moe_hidden, dim]
+    pub up_proj: QuantizedTensor,   // [moe_hidden, dim]
+    pub down_proj: QuantizedTensor, // [dim, moe_hidden]
+}
+
+/// Packed MoE expert weights — stores all experts as contiguous 3D tensors.
+///
+/// Instead of 256 individual `MoeExpert` structs (which caused 52 GB OOM when loading
+/// the 35B model), this stores the raw packed data for ALL experts per projection type.
+/// Individual experts are sliced on-demand during `moe_forward()`.
+///
+/// Memory: 3 contiguous `Vec<u8>` per layer (~400 MB total for 35B) instead of
+/// 256×3 individual QuantizedTensors (~16 GB + allocation overhead).
+#[derive(Debug, Clone)]
+pub struct PackedMoeExperts {
+    // Raw quantized data: [n_experts * rows * packed_cols] contiguous
+    pub gate_data: Vec<u8>,
+    pub gate_scales: Vec<f32>,
+    pub gate_biases: Vec<f32>,
+    pub up_data: Vec<u8>,
+    pub up_scales: Vec<f32>,
+    pub up_biases: Vec<f32>,
+    pub down_data: Vec<u8>,
+    pub down_scales: Vec<f32>,
+    pub down_biases: Vec<f32>,
+    // Dimensions (per expert)
+    pub n_experts: usize,
+    pub gate_rows: usize,  // moe_hidden (512 for 35B)
+    pub gate_cols: usize,  // dim (2048 for 35B) — logical (unpacked)
+    pub down_rows: usize,  // dim (2048 for 35B)
+    pub down_cols: usize,  // moe_hidden (512 for 35B) — logical
+    pub group_size: usize,
+    pub bits: usize,
+}
+
+impl PackedMoeExperts {
+    /// Compute byte/element offsets for expert `idx` into a packed projection.
+    fn expert_offsets(
+        expert_idx: usize,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        bits: usize,
+    ) -> (usize, usize, usize, usize) {
+        let packed_cols = cols * bits / 32;
+        let n_groups_per_row = (cols + group_size - 1) / group_size;
+        let w_per_expert = rows * packed_cols * 4;
+        let sb_per_expert = rows * n_groups_per_row;
+        (
+            expert_idx * w_per_expert,  // w_start (bytes)
+            w_per_expert,                // w_len (bytes)
+            expert_idx * sb_per_expert, // sb_start (elements)
+            sb_per_expert,               // sb_len (elements)
+        )
+    }
+
+    /// Dispatch to the fastest fused dequant-dot path for the quantization width.
+    fn dispatch_matvec(
+        data: &[u8], scales: &[f32], biases: &[f32],
+        rows: usize, cols: usize, group_size: usize, bits: usize, x: &[f32],
+    ) -> Vec<f32> {
+        match bits {
+            4 => super::ane_forward::cpu_quantized_matvec_4bit(
+                data, scales, biases, rows, cols, group_size, x),
+            3 => super::ane_forward::cpu_quantized_matvec_3bit(
+                data, scales, biases, rows, cols, group_size, x),
+            _ => super::ane_forward::cpu_quantized_matmul_raw(
+                data, scales, biases, rows, cols, group_size, bits, x, 1),
+        }
+    }
+
+    /// Compute gate_proj @ x for expert `idx`. Fused dequant-dot, zero allocation.
+    pub fn gate_matmul(&self, expert_idx: usize, x: &[f32]) -> Vec<f32> {
+        let (w_start, w_len, sb_start, sb_len) =
+            Self::expert_offsets(expert_idx, self.gate_rows, self.gate_cols, self.group_size, self.bits);
+        Self::dispatch_matvec(
+            &self.gate_data[w_start..w_start + w_len],
+            &self.gate_scales[sb_start..sb_start + sb_len],
+            &self.gate_biases[sb_start..sb_start + sb_len],
+            self.gate_rows, self.gate_cols, self.group_size, self.bits, x)
+    }
+
+    /// Compute up_proj @ x for expert `idx`. Fused dequant-dot, zero allocation.
+    pub fn up_matmul(&self, expert_idx: usize, x: &[f32]) -> Vec<f32> {
+        let (w_start, w_len, sb_start, sb_len) =
+            Self::expert_offsets(expert_idx, self.gate_rows, self.gate_cols, self.group_size, self.bits);
+        Self::dispatch_matvec(
+            &self.up_data[w_start..w_start + w_len],
+            &self.up_scales[sb_start..sb_start + sb_len],
+            &self.up_biases[sb_start..sb_start + sb_len],
+            self.gate_rows, self.gate_cols, self.group_size, self.bits, x)
+    }
+
+    /// Compute down_proj @ x for expert `idx`. Fused dequant-dot, zero allocation.
+    pub fn down_matmul(&self, expert_idx: usize, x: &[f32]) -> Vec<f32> {
+        let (w_start, w_len, sb_start, sb_len) =
+            Self::expert_offsets(expert_idx, self.down_rows, self.down_cols, self.group_size, self.bits);
+        Self::dispatch_matvec(
+            &self.down_data[w_start..w_start + w_len],
+            &self.down_scales[sb_start..sb_start + sb_len],
+            &self.down_biases[sb_start..sb_start + sb_len],
+            self.down_rows, self.down_cols, self.group_size, self.bits, x)
+    }
+
+    /// Dequantize gate+up projections for one expert into pre-allocated f32 buffers.
+    /// Returns (gate_f32, up_f32) each of length [gate_rows * gate_cols].
+    /// The cost is O(expert_size) but done once, then cblas_sgemv gets AMX acceleration.
+    pub fn dequant_expert_gate_up(&self, expert_idx: usize) -> (Vec<f32>, Vec<f32>) {
+        let (w_start, w_len, sb_start, sb_len) =
+            Self::expert_offsets(expert_idx, self.gate_rows, self.gate_cols, self.group_size, self.bits);
+
+        let gate_qt = QuantizedTensor {
+            data: self.gate_data[w_start..w_start + w_len].to_vec(),
+            scales: self.gate_scales[sb_start..sb_start + sb_len].to_vec(),
+            biases: self.gate_biases[sb_start..sb_start + sb_len].to_vec(),
+            rows: self.gate_rows,
+            cols: self.gate_cols,
+            group_size: self.group_size,
+            bits: self.bits,
+        };
+
+        let up_qt = QuantizedTensor {
+            data: self.up_data[w_start..w_start + w_len].to_vec(),
+            scales: self.up_scales[sb_start..sb_start + sb_len].to_vec(),
+            biases: self.up_biases[sb_start..sb_start + sb_len].to_vec(),
+            rows: self.gate_rows,
+            cols: self.gate_cols,
+            group_size: self.group_size,
+            bits: self.bits,
+        };
+
+        (gate_qt.dequantize(), up_qt.dequantize())
+    }
+
+    /// Dequantize down_proj for one expert.
+    pub fn dequant_expert_down(&self, expert_idx: usize) -> Vec<f32> {
+        let (w_start, w_len, sb_start, sb_len) =
+            Self::expert_offsets(expert_idx, self.down_rows, self.down_cols, self.group_size, self.bits);
+
+        let down_qt = QuantizedTensor {
+            data: self.down_data[w_start..w_start + w_len].to_vec(),
+            scales: self.down_scales[sb_start..sb_start + sb_len].to_vec(),
+            biases: self.down_biases[sb_start..sb_start + sb_len].to_vec(),
+            rows: self.down_rows,
+            cols: self.down_cols,
+            group_size: self.group_size,
+            bits: self.bits,
+        };
+
+        down_qt.dequantize()
+    }
+
+    /// Memory footprint in bytes (quantized storage).
+    pub fn quantized_bytes(&self) -> usize {
+        self.gate_data.len() + self.up_data.len() + self.down_data.len()
+            + (self.gate_scales.len() + self.gate_biases.len()
+               + self.up_scales.len() + self.up_biases.len()
+               + self.down_scales.len() + self.down_biases.len()) * 4
+    }
+}
+
+/// MoE layer: router gate + packed experts + optional shared expert.
+#[derive(Debug, Clone)]
+pub struct MoeLayerWeights {
+    /// Router gate: [num_experts, dim] — produces expert logits (dequantized).
+    pub router: Vec<f32>,
+    /// All routed experts packed as contiguous 3D tensors (zero-copy slicing).
+    pub packed_experts: PackedMoeExperts,
+    /// Shared expert (always active, not gated). Single expert, always in memory.
+    pub shared_expert: Option<MoeExpert>,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_hidden: usize,
+}
+
 /// Per-layer weight storage for a transformer layer.
 #[derive(Debug, Clone)]
 pub struct LayerWeights {
@@ -46,6 +236,8 @@ pub struct LayerWeights {
     pub k_norm: Option<Vec<f32>>, // [head_dim] per-head K RMSNorm (Qwen)
     /// GDN weights — `Some` for linear attention layers, `None` for MHA layers.
     pub gdn: Option<GdnLayerWeights>,
+    /// MoE weights — `Some` for MoE layers, `None` for dense FFN layers.
+    pub moe: Option<MoeLayerWeights>,
 }
 
 /// Full model weights.
@@ -57,6 +249,9 @@ pub struct ModelWeights {
     pub embed: Vec<f32>,     // [vocab * dim]
     pub vocab_size: usize,
     pub lm_head: Option<Vec<f32>>, // [vocab * dim] untied classifier (Qwen)
+    /// Factored vocabulary clusters for fast lm_head projection.
+    /// Loaded from sidecar file `vocab_clusters.bin` next to model weights.
+    pub vocab_clusters: Option<super::factored_vocab::VocabClusters>,
 }
 
 impl ModelWeights {
@@ -560,11 +755,11 @@ pub fn unpack_fused_ffn(
 
 /// Unpacked output from fused attention GQA kernel.
 pub struct FusedAttnGqaOutput {
-    pub o_out: Vec<f32>,            // [dim, seq]
-    pub q: Vec<f32>,                // [attn_dim, seq] post-RoPE
-    pub k: Vec<f32>,                // [kv_dim, seq] post-RoPE
-    pub v: Vec<f32>,                // [kv_dim, seq]
-    pub attn_out: Vec<f32>,         // [attn_dim, seq] post-gate
+    pub o_out: Vec<f32>,                 // [dim, seq]
+    pub q: Vec<f32>,                     // [attn_dim, seq] post-RoPE
+    pub k: Vec<f32>,                     // [kv_dim, seq] post-RoPE
+    pub v: Vec<f32>,                     // [kv_dim, seq]
+    pub attn_out: Vec<f32>,              // [attn_dim, seq] post-gate
     pub attn_pre_gate: Option<Vec<f32>>, // [attn_dim, seq] (if has_gate)
     pub attn_gate: Option<Vec<f32>>,     // [attn_dim, seq] raw gate (if has_gate)
     pub q_pre_norm: Option<Vec<f32>>,    // [attn_dim, seq] (if has_qk_norm)
@@ -587,9 +782,7 @@ pub fn unpack_fused_attn_gqa(
     let floats = bytes_to_f32_vec(output);
 
     let mut off = 0;
-    let slice = |start: usize, ch: usize| -> Vec<f32> {
-        floats[start..start + ch * seq].to_vec()
-    };
+    let slice = |start: usize, ch: usize| -> Vec<f32> { floats[start..start + ch * seq].to_vec() };
 
     let o_out = slice(off, dim);
     off += dim * seq;
@@ -968,6 +1161,7 @@ impl ModelWeights {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             })
             .collect();
 
@@ -1010,6 +1204,7 @@ impl ModelWeights {
             embed,
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         })
     }
 
@@ -1226,6 +1421,7 @@ impl ModelWeights {
                 q_norm,
                 k_norm,
                 gdn,
+                moe: None, // MoE loaded separately
             });
 
             if l == 0 {
@@ -1250,7 +1446,214 @@ impl ModelWeights {
             embed: embed_raw,
             vocab_size,
             lm_head: None, // tied embeddings
+            vocab_clusters: None,
         })
+    }
+
+    /// Load MoE expert weights from safetensors into existing model.
+    ///
+    /// Opens the safetensors WITH expert weights (skip_experts=false) and
+    /// populates each layer's `moe` field with the router gate, all experts
+    /// (as QuantizedTensor — NOT dequantized), and shared expert.
+    ///
+    /// # Arguments
+    /// - `dir`: model directory with safetensors files
+    /// - `num_experts`: total experts per layer (e.g. 64)
+    /// - `num_experts_per_tok`: active experts per token (e.g. 8)
+    /// - `moe_hidden`: MoE intermediate dimension (from moe_intermediate_size)
+    pub fn load_moe_experts(
+        &mut self,
+        dir: &Path,
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        moe_hidden: usize,
+    ) -> io::Result<()> {
+        let store = MmapTensorStore::open(dir, false)?; // DO NOT skip experts
+
+        let config_path = dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)?;
+        let config: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        let meta = parse_mlx_checkpoint_meta(&config)?;
+        let default_group_size = meta.group_size;
+        let default_bits = meta.bits;
+
+        // Parse per-tensor quantization overrides from config.json.
+        // E.g. "language_model.model.layers.0.mlp.gate": {"bits": 8, "group_size": 64}
+        let tc = config.get("text_config").unwrap_or(&config);
+        let quant_section = tc.get("quantization").or_else(|| config.get("quantization"));
+        let get_tensor_bits = |tensor_key: &str| -> (usize, usize) {
+            if let Some(qs) = quant_section {
+                // Try exact key, then with language_model. prefix
+                for key in &[tensor_key.to_string(), format!("language_model.{tensor_key}")] {
+                    if let Some(override_obj) = qs.get(key) {
+                        let b = override_obj.get("bits").and_then(|v| v.as_u64())
+                            .unwrap_or(default_bits as u64) as usize;
+                        let g = override_obj.get("group_size").and_then(|v| v.as_u64())
+                            .unwrap_or(default_group_size as u64) as usize;
+                        return (b, g);
+                    }
+                }
+            }
+            (default_bits, default_group_size)
+        };
+
+        fn bf16_to_f32(data: &[u8]) -> Vec<f32> {
+            data.chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect()
+        }
+
+        let load_quantized = |base: &str, bits: usize, group_size: usize| -> io::Result<QuantizedTensor> {
+            let base = store.resolve_weight_base(base);
+            let w_key = format!("{base}.weight");
+            let s_key = format!("{base}.scales");
+            let b_key = format!("{base}.biases");
+            if let (Some(w), Some(s), Some(b)) =
+                (store.get(&w_key), store.get(&s_key), store.get(&b_key))
+            {
+                let (_, shape) = store.meta(&w_key).unwrap();
+                let rows = shape[0];
+                let cols = shape[1] * 32 / bits;
+                Ok(QuantizedTensor {
+                    data: w.to_vec(),
+                    scales: bf16_to_f32(s),
+                    biases: bf16_to_f32(b),
+                    rows,
+                    cols,
+                    group_size,
+                    bits,
+                })
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing quantized: {base}"),
+                ))
+            }
+        };
+
+        /// Load a packed 3D tensor as contiguous data + dequantized scales/biases.
+        /// Returns (data_bytes, scales_f32, biases_f32, rows_per_expert, cols_logical).
+        fn load_packed_projection(
+            store: &MmapTensorStore,
+            key_base: &str,
+            group_size: usize,
+            bits: usize,
+        ) -> io::Result<(Vec<u8>, Vec<f32>, Vec<f32>, usize, usize)> {
+            let base = store.resolve_weight_base(key_base);
+            let w_key = format!("{base}.weight");
+            let s_key = format!("{base}.scales");
+            let b_key = format!("{base}.biases");
+
+            let (w, s, b) = match (store.get(&w_key), store.get(&s_key), store.get(&b_key)) {
+                (Some(w), Some(s), Some(b)) => (w, s, b),
+                _ => return Err(io::Error::new(io::ErrorKind::NotFound, format!("missing: {base}"))),
+            };
+
+            let (_, shape) = store.meta(&w_key).unwrap();
+            // shape = [n_experts, rows_per_expert, packed_cols]
+            let rows = shape[1];
+            let packed_cols = shape[2];
+            let cols = packed_cols * 32 / bits;
+
+            Ok((w.to_vec(), bf16_to_f32(s), bf16_to_f32(b), rows, cols))
+        }
+
+        let load_expert_individual = |prefix: &str| -> io::Result<MoeExpert> {
+            Ok(MoeExpert {
+                gate_proj: load_quantized(&format!("{prefix}.gate_proj"), default_bits, default_group_size)?,
+                up_proj: load_quantized(&format!("{prefix}.up_proj"), default_bits, default_group_size)?,
+                down_proj: load_quantized(&format!("{prefix}.down_proj"), default_bits, default_group_size)?,
+            })
+        };
+
+        let dim = self.cfg.dim;
+        let mut total_expert_bytes = 0usize;
+
+        for l in 0..self.layers.len() {
+            let prefix = format!("model.layers.{l}");
+
+            // Router gate: quantized "mlp.gate" (Qwen3.5 MLX format)
+            // Router often has per-tensor override (8-bit in 3-bit models)
+            let gate_key = format!("{prefix}.mlp.gate");
+            let (gate_bits, gate_gs) = get_tensor_bits(&gate_key);
+            let router = if let Ok(qt) = load_quantized(&gate_key, gate_bits, gate_gs) {
+                qt.dequantize()
+            } else {
+                continue; // No router → not an MoE layer
+            };
+
+            if router.len() != num_experts * dim {
+                tracing::warn!(
+                    "L{l}: router size {} != expected {} — skipping MoE",
+                    router.len(), num_experts * dim
+                );
+                continue;
+            }
+
+            // Load packed experts: ONE copy per projection (not 256 individual copies)
+            // Expert weights use default bits (3-bit for 3-bit model), NOT router bits
+            let switch_prefix = format!("{prefix}.mlp.switch_mlp");
+            let expert_bits = default_bits;
+            let expert_gs = default_group_size;
+
+            let packed = if let Ok((gate_data, gate_scales, gate_biases, gate_rows, gate_cols)) =
+                load_packed_projection(&store, &format!("{switch_prefix}.gate_proj"), expert_gs, expert_bits)
+            {
+                let (up_data, up_scales, up_biases, _, _) =
+                    load_packed_projection(&store, &format!("{switch_prefix}.up_proj"), expert_gs, expert_bits)?;
+                let (down_data, down_scales, down_biases, down_rows, down_cols) =
+                    load_packed_projection(&store, &format!("{switch_prefix}.down_proj"), expert_gs, expert_bits)?;
+
+                let bytes = gate_data.len() + up_data.len() + down_data.len();
+                total_expert_bytes += bytes;
+
+                PackedMoeExperts {
+                    gate_data, gate_scales, gate_biases,
+                    up_data, up_scales, up_biases,
+                    down_data, down_scales, down_biases,
+                    n_experts: num_experts,
+                    gate_rows, gate_cols,
+                    down_rows, down_cols,
+                    group_size: expert_gs, bits: expert_bits,
+                }
+            } else {
+                // Fallback: individual experts → pack them
+                tracing::warn!("L{l}: no switch_mlp, falling back to individual experts");
+                continue; // TODO: implement individual-to-packed conversion
+            };
+
+            // Shared expert (optional, always in memory — small)
+            let shared = load_expert_individual(&format!("{prefix}.mlp.shared_expert")).ok();
+
+            self.layers[l].moe = Some(MoeLayerWeights {
+                router,
+                packed_experts: packed,
+                shared_expert: shared,
+                num_experts,
+                num_experts_per_tok,
+                moe_hidden,
+            });
+
+            if l == 0 {
+                tracing::info!(
+                    "MoE L0: {num_experts} experts loaded, {num_experts_per_tok} active/token, \
+                     moe_hidden={moe_hidden}"
+                );
+            }
+        }
+
+        let moe_layers = self.layers.iter().filter(|l| l.moe.is_some()).count();
+        tracing::info!(
+            "MoE loaded: {moe_layers}/{} layers, {:.1} MB quantized expert storage",
+            self.layers.len(),
+            total_expert_bytes as f64 / 1e6
+        );
+
+        Ok(())
     }
 }
 
@@ -1763,6 +2166,7 @@ impl QuantizedModelWeights {
                     conv_weight: gdn_q.conv_weight.clone(),
                     conv_bias: gdn_q.conv_bias.clone(),
                 }),
+                moe: None, // MoE handled separately
             };
         }
 
@@ -1793,6 +2197,7 @@ impl QuantizedModelWeights {
             q_norm: ql.q_norm.clone(),
             k_norm: ql.k_norm.clone(),
             gdn: None,
+            moe: None,
         }
     }
 
@@ -1847,6 +2252,7 @@ impl QuantizedModelWeights {
             embed: self.embed.clone(),
             vocab_size: self.vocab_size,
             lm_head: self.lm_head.clone(),
+            vocab_clusters: None, // not cloned — reclustered if needed
         }
     }
 
@@ -2368,8 +2774,11 @@ impl PrePackedWeights {
         let mut layers = Vec::with_capacity(n_layers);
 
         for l in 0..n_layers {
+            let layer_t0 = std::time::Instant::now();
             let lw_cow = model.layer(l);
+            let fetch_ms = layer_t0.elapsed().as_millis();
             let lw = &*lw_cow;
+            let pack_t0 = std::time::Instant::now();
 
             let fwd_fused = if fused_ffn {
                 // Pre-transpose W1, W3 and pack weights into fused FFN layout.
@@ -2435,6 +2844,14 @@ impl PrePackedWeights {
                 bwd_w2t,
                 bwd_w13t,
             });
+            bench_trace_weights(format!(
+                "prepacked_build:layer layer={} cached={} fetch_ms={} pack_ms={} total_ms={}",
+                l,
+                model.cache[l].is_some(),
+                fetch_ms,
+                pack_t0.elapsed().as_millis(),
+                layer_t0.elapsed().as_millis()
+            ));
         }
 
         tracing::info!(
@@ -2843,9 +3260,7 @@ impl PrePackedWeights {
         };
         let mut buf = vec![0u8; out_ch * cfg.seq_len * 4];
         kernel.read_output(0, &mut buf);
-        Some(Ok(unpack_fused_attn_gqa(
-            &buf, cfg, has_gate, false,
-        )))
+        Some(Ok(unpack_fused_attn_gqa(&buf, cfg, has_gate, false)))
     }
 
     /// Prime per-layer fused backward attention GQA kernels with real weights.
@@ -3010,9 +3425,8 @@ impl PrePackedWeights {
             }
         }
 
-        let input_bytes = unsafe {
-            std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4)
-        };
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
         kernel.write_input(0, input_bytes);
 
         if let Err(e) = kernel.eval() {
@@ -3071,22 +3485,34 @@ impl PrePackedWeights {
             let blob = build_fp16_blob(&wot);
             let names: Vec<&str> = result.weight_names.iter().copied().collect();
             let k = super::ane_bridge::AneKernel::compile_multi_weights(
-                &result.mil_text, &names, &[&blob],
-                &[result.input_bytes], &[result.output_bytes],
-            ).map_err(|e| format!("layer {l} bwd_wot compile: {e}"))?;
+                &result.mil_text,
+                &names,
+                &[&blob],
+                &[result.input_bytes],
+                &[result.output_bytes],
+            )
+            .map_err(|e| format!("layer {l} bwd_wot compile: {e}"))?;
             kernels.push(Some(k));
         }
 
         let elapsed = t0.elapsed();
         let count = kernels.iter().filter(|k| k.is_some()).count();
-        tracing::info!("primed {count}/{n_layers} per-layer Wot backward kernels in {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+        tracing::info!(
+            "primed {count}/{n_layers} per-layer Wot backward kernels in {:.1}ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
         self.bwd_wot_kernels = Some(kernels);
         Ok(())
     }
 
     /// Evaluate per-layer Wot backward: da = Wo^T @ dx2.
     /// Returns None if not primed.
-    pub fn eval_bwd_wot(&self, layer: usize, dx2: &[f32], cfg: &super::ane_mil::MilConfig) -> Option<Result<Vec<f32>, String>> {
+    pub fn eval_bwd_wot(
+        &self,
+        layer: usize,
+        dx2: &[f32],
+        cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<Vec<f32>, String>> {
         let kernels = self.bwd_wot_kernels.as_ref()?;
         let kernel = kernels[layer].as_ref()?;
         let bytes = unsafe { std::slice::from_raw_parts(dx2.as_ptr() as *const u8, dx2.len() * 4) };
@@ -3098,7 +3524,10 @@ impl PrePackedWeights {
         let seq = cfg.seq_len;
         let mut buf = vec![0u8; ad * seq * 4];
         kernel.read_output(0, &mut buf);
-        Some(Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
+        Some(Ok(buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()))
     }
 
     /// Prime per-layer fused Wot+SDPA backward kernels (2 BLOBFILEs: Wo + mask).
@@ -3151,8 +3580,11 @@ impl PrePackedWeights {
             let wo_blob = build_fp16_blob(&wo_ad_dim);
             let names: Vec<&str> = result.weight_names.iter().copied().collect();
             match super::ane_bridge::AneKernel::compile_multi_weights(
-                &result.mil_text, &names, &[&wo_blob, &mask_blob],
-                &[result.input_bytes], &[result.output_bytes],
+                &result.mil_text,
+                &names,
+                &[&wo_blob, &mask_blob],
+                &[result.input_bytes],
+                &[result.output_bytes],
             ) {
                 Ok(k) => kernels.push(Some(k)),
                 Err(e) => {
@@ -3164,7 +3596,10 @@ impl PrePackedWeights {
 
         let elapsed = t0.elapsed();
         let count = kernels.iter().filter(|k| k.is_some()).count();
-        tracing::info!("primed {count}/{n_layers} per-layer Wot+SDPA backward kernels in {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+        tracing::info!(
+            "primed {count}/{n_layers} per-layer Wot+SDPA backward kernels in {:.1}ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
         self.bwd_wot_sdpa_kernels = Some(kernels);
         Ok(())
     }
@@ -3186,11 +3621,15 @@ impl PrePackedWeights {
     ///   N=3 (non-gated) or N=4 (gated, 4th block is d_gate).
     /// Returns None if not primed.
     pub fn eval_bwd_wot_sdpa(
-        &self, layer: usize, input: &[f32], cfg: &super::ane_mil::MilConfig,
+        &self,
+        layer: usize,
+        input: &[f32],
+        cfg: &super::ane_mil::MilConfig,
     ) -> Option<Result<Vec<f32>, String>> {
         let kernels = self.bwd_wot_sdpa_kernels.as_ref()?;
         let kernel = kernels[layer].as_ref()?;
-        let bytes = unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
         kernel.write_input(0, bytes);
         if let Err(e) = kernel.eval() {
             return Some(Err(format!("bwd_wot_sdpa eval layer {layer}: {e}")));
@@ -3202,7 +3641,10 @@ impl PrePackedWeights {
         let out_elems = n_blocks * heads * seq * hd;
         let mut buf = vec![0u8; out_elems * 4];
         kernel.read_output(0, &mut buf);
-        Some(Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
+        Some(Ok(buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()))
     }
 
     /// Prime per-layer QKV backward kernels with BLOBFILE weights.
@@ -3260,11 +3702,13 @@ impl PrePackedWeights {
                 }
                 // WQ^T = [dim, qpd], split into [dim, half_qpd] halves
                 let wqt = transpose_weight(&lw.wq, qpd, dim);
-                let wqt_h0: Vec<f32> = wqt.chunks_exact(qpd)
+                let wqt_h0: Vec<f32> = wqt
+                    .chunks_exact(qpd)
                     .flat_map(|row| &row[..half_qpd])
                     .copied()
                     .collect();
-                let wqt_h1: Vec<f32> = wqt.chunks_exact(qpd)
+                let wqt_h1: Vec<f32> = wqt
+                    .chunks_exact(qpd)
                     .flat_map(|row| &row[half_qpd..])
                     .copied()
                     .collect();
@@ -3279,18 +3723,27 @@ impl PrePackedWeights {
                 // Compile kernel A: Wq_h0 + Wk
                 let names_a: Vec<&str> = mil_a.weight_names.iter().copied().collect();
                 let ka = super::ane_bridge::AneKernel::compile_multi_weights(
-                    &mil_a.mil_text, &names_a, &[&wqt_h0_blob, &wkt_blob],
-                    &[mil_a.input_bytes], &[mil_a.output_bytes],
+                    &mil_a.mil_text,
+                    &names_a,
+                    &[&wqt_h0_blob, &wkt_blob],
+                    &[mil_a.input_bytes],
+                    &[mil_a.output_bytes],
                 );
                 // Compile kernel B: Wq_h1 + Wv
                 let names_b: Vec<&str> = mil_b.weight_names.iter().copied().collect();
                 let kb = super::ane_bridge::AneKernel::compile_multi_weights(
-                    &mil_b.mil_text, &names_b, &[&wqt_h1_blob, &wvt_blob],
-                    &[mil_b.input_bytes], &[mil_b.output_bytes],
+                    &mil_b.mil_text,
+                    &names_b,
+                    &[&wqt_h1_blob, &wvt_blob],
+                    &[mil_b.input_bytes],
+                    &[mil_b.output_bytes],
                 );
 
                 match (ka, kb) {
-                    (Ok(a), Ok(b)) => kernels.push(Some(QkvbKernel::Split { half_a: a, half_b: b })),
+                    (Ok(a), Ok(b)) => kernels.push(Some(QkvbKernel::Split {
+                        half_a: a,
+                        half_b: b,
+                    })),
                     (Err(e), _) | (_, Err(e)) => {
                         tracing::debug!("layer {l} bwd_qkvb split compile failed: {e}");
                         kernels.push(None);
@@ -3315,8 +3768,11 @@ impl PrePackedWeights {
 
                 let names: Vec<&str> = result.weight_names.iter().copied().collect();
                 match super::ane_bridge::AneKernel::compile_multi_weights(
-                    &result.mil_text, &names, &[&wqt_blob, &wkt_blob, &wvt_blob],
-                    &[result.input_bytes], &[result.output_bytes],
+                    &result.mil_text,
+                    &names,
+                    &[&wqt_blob, &wkt_blob, &wvt_blob],
+                    &[result.input_bytes],
+                    &[result.output_bytes],
                 ) {
                     Ok(k) => kernels.push(Some(QkvbKernel::Single(k))),
                     Err(e) => {
@@ -3330,7 +3786,10 @@ impl PrePackedWeights {
         let elapsed = t0.elapsed();
         let count = kernels.iter().filter(|k| k.is_some()).count();
         let mode = if needs_split { "split" } else { "single" };
-        tracing::info!("primed {count}/{n_layers} per-layer QKV backward kernels ({mode}) in {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+        tracing::info!(
+            "primed {count}/{n_layers} per-layer QKV backward kernels ({mode}) in {:.1}ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
         self.bwd_qkvb_kernels = Some(kernels);
         Ok(())
     }
@@ -3340,7 +3799,12 @@ impl PrePackedWeights {
     /// Returns None if not primed.
     ///
     /// Dispatches `QkvbKernel::Single` (1 eval) or `QkvbKernel::Split` (2 evals + sum).
-    pub fn eval_bwd_qkvb(&self, layer: usize, dqkv: &[f32], cfg: &super::ane_mil::MilConfig) -> Option<Result<Vec<f32>, String>> {
+    pub fn eval_bwd_qkvb(
+        &self,
+        layer: usize,
+        dqkv: &[f32],
+        cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<Vec<f32>, String>> {
         let kernels = self.bwd_qkvb_kernels.as_ref()?;
         let qkvb = kernels[layer].as_ref()?;
         let dim = cfg.dim;
@@ -3349,14 +3813,19 @@ impl PrePackedWeights {
 
         match qkvb {
             QkvbKernel::Single(kernel) => {
-                let bytes = unsafe { std::slice::from_raw_parts(dqkv.as_ptr() as *const u8, dqkv.len() * 4) };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(dqkv.as_ptr() as *const u8, dqkv.len() * 4)
+                };
                 kernel.write_input(0, bytes);
                 if let Err(e) = kernel.eval() {
                     return Some(Err(format!("bwd_qkvb eval layer {layer}: {e}")));
                 }
                 let mut buf = vec![0u8; out_floats * 4];
                 kernel.read_output(0, &mut buf);
-                Some(Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
+                Some(Ok(buf
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()))
             }
             QkvbKernel::Split { half_a, half_b } => {
                 let qpd = cfg.q_proj_dim();
@@ -3374,10 +3843,14 @@ impl PrePackedWeights {
                 input_a.extend_from_slice(&dqkv[dq_offset..dq_offset + half_qpd * seq]);
                 input_a.extend_from_slice(&dqkv[dk_offset..dk_offset + ad * seq]);
 
-                let bytes_a = unsafe { std::slice::from_raw_parts(input_a.as_ptr() as *const u8, input_a.len() * 4) };
+                let bytes_a = unsafe {
+                    std::slice::from_raw_parts(input_a.as_ptr() as *const u8, input_a.len() * 4)
+                };
                 half_a.write_input(0, bytes_a);
                 if let Err(e) = half_a.eval() {
-                    return Some(Err(format!("bwd_qkvb split half_a eval layer {layer}: {e}")));
+                    return Some(Err(format!(
+                        "bwd_qkvb split half_a eval layer {layer}: {e}"
+                    )));
                 }
 
                 // Build input B: dQ[half_qpd..qpd] | dV
@@ -3386,10 +3859,14 @@ impl PrePackedWeights {
                 input_b.extend_from_slice(&dqkv[dq_offset + half_qpd * seq..dq_offset + qpd * seq]);
                 input_b.extend_from_slice(&dqkv[dv_offset..dv_offset + ad * seq]);
 
-                let bytes_b = unsafe { std::slice::from_raw_parts(input_b.as_ptr() as *const u8, input_b.len() * 4) };
+                let bytes_b = unsafe {
+                    std::slice::from_raw_parts(input_b.as_ptr() as *const u8, input_b.len() * 4)
+                };
                 half_b.write_input(0, bytes_b);
                 if let Err(e) = half_b.eval() {
-                    return Some(Err(format!("bwd_qkvb split half_b eval layer {layer}: {e}")));
+                    return Some(Err(format!(
+                        "bwd_qkvb split half_b eval layer {layer}: {e}"
+                    )));
                 }
 
                 // Read both outputs and sum
@@ -3398,11 +3875,12 @@ impl PrePackedWeights {
                 half_a.read_output(0, &mut buf_a);
                 half_b.read_output(0, &mut buf_b);
 
-                let dx: Vec<f32> = buf_a.chunks_exact(4)
+                let dx: Vec<f32> = buf_a
+                    .chunks_exact(4)
                     .zip(buf_b.chunks_exact(4))
                     .map(|(a, b)| {
                         f32::from_le_bytes([a[0], a[1], a[2], a[3]])
-                        + f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                            + f32::from_le_bytes([b[0], b[1], b[2], b[3]])
                     })
                     .collect();
 
@@ -3430,10 +3908,14 @@ impl PrePackedWeights {
         let t0 = std::time::Instant::now();
 
         for l in 0..n_layers {
+            let fetch_t0 = std::time::Instant::now();
             let lw_cow = model.layer(l);
+            let fetch_ms = fetch_t0.elapsed().as_millis();
             let lw = &*lw_cow;
+            let layer_t0 = std::time::Instant::now();
 
             // Attention RMSNorm weight
+            let att_t0 = std::time::Instant::now();
             let att_blob = build_fp16_blob(&lw.rms_att);
             let names: Vec<&str> = result.weight_names.iter().copied().collect();
             let k = super::ane_bridge::AneKernel::compile_multi_weights(
@@ -3445,8 +3927,15 @@ impl PrePackedWeights {
             )
             .map_err(|e| format!("layer {l} rmsnorm_att compile: {e}"))?;
             att_kernels.push(k);
+            bench_trace_weights(format!(
+                "prime_rmsnorm_fwd:att layer={} fetch_ms={} elapsed_ms={}",
+                l,
+                fetch_ms,
+                att_t0.elapsed().as_millis()
+            ));
 
             // FFN RMSNorm weight
+            let ffn_t0 = std::time::Instant::now();
             let ffn_blob = build_fp16_blob(&lw.rms_ffn);
             let k = super::ane_bridge::AneKernel::compile_multi_weights(
                 &result.mil_text,
@@ -3457,6 +3946,12 @@ impl PrePackedWeights {
             )
             .map_err(|e| format!("layer {l} rmsnorm_ffn compile: {e}"))?;
             ffn_kernels.push(k);
+            bench_trace_weights(format!(
+                "prime_rmsnorm_fwd:ffn layer={} elapsed_ms={} layer_total_ms={}",
+                l,
+                ffn_t0.elapsed().as_millis(),
+                layer_t0.elapsed().as_millis()
+            ));
         }
 
         let elapsed = t0.elapsed();
@@ -3487,9 +3982,13 @@ impl PrePackedWeights {
         let t0 = std::time::Instant::now();
 
         for l in 0..n_layers {
+            let fetch_t0 = std::time::Instant::now();
             let lw_cow = model.layer(l);
+            let fetch_ms = fetch_t0.elapsed().as_millis();
             let lw = &*lw_cow;
+            let layer_t0 = std::time::Instant::now();
 
+            let att_t0 = std::time::Instant::now();
             let att_blob = build_fp16_blob(&lw.rms_att);
             let names: Vec<&str> = result.weight_names.iter().copied().collect();
             let k = super::ane_bridge::AneKernel::compile_multi_weights(
@@ -3501,7 +4000,14 @@ impl PrePackedWeights {
             )
             .map_err(|e| format!("layer {l} rmsnorm_bwd_att compile: {e}"))?;
             att_kernels.push(k);
+            bench_trace_weights(format!(
+                "prime_rmsnorm_bwd:att layer={} fetch_ms={} elapsed_ms={}",
+                l,
+                fetch_ms,
+                att_t0.elapsed().as_millis()
+            ));
 
+            let ffn_t0 = std::time::Instant::now();
             let ffn_blob = build_fp16_blob(&lw.rms_ffn);
             let k = super::ane_bridge::AneKernel::compile_multi_weights(
                 &result.mil_text,
@@ -3512,6 +4018,12 @@ impl PrePackedWeights {
             )
             .map_err(|e| format!("layer {l} rmsnorm_bwd_ffn compile: {e}"))?;
             ffn_kernels.push(k);
+            bench_trace_weights(format!(
+                "prime_rmsnorm_bwd:ffn layer={} elapsed_ms={} layer_total_ms={}",
+                l,
+                ffn_t0.elapsed().as_millis(),
+                layer_t0.elapsed().as_millis()
+            ));
         }
 
         let elapsed = t0.elapsed();
@@ -3618,8 +4130,11 @@ impl PrePackedWeights {
         let t0 = std::time::Instant::now();
 
         for l in 0..n_layers {
+            let fetch_t0 = std::time::Instant::now();
             let lw_cow = model.layer(l);
+            let fetch_ms = fetch_t0.elapsed().as_millis();
             let lw = &*lw_cow;
+            let layer_t0 = std::time::Instant::now();
 
             // W2 is stored [dim, hidden] row-major. MIL kernel expects W2^T = [hidden, dim].
             let w2t = transpose_weight(&lw.w2, dim, hidden);
@@ -3630,10 +4145,17 @@ impl PrePackedWeights {
             // W3 is [hidden, dim]. MIL expects W3^T = [dim, hidden].
             let w3t = transpose_weight(&lw.w3, hidden, dim);
             let w3t_blob = build_fp16_blob(&w3t);
+            bench_trace_weights(format!(
+                "prime_fused_ffn_bwd:blobs layer={} fetch_ms={} elapsed_ms={}",
+                l,
+                fetch_ms,
+                layer_t0.elapsed().as_millis()
+            ));
 
             let names: Vec<&str> = result.weight_names.iter().copied().collect();
             let datas: Vec<&[u8]> = vec![&w2t_blob, &w1t_blob, &w3t_blob];
 
+            let compile_t0 = std::time::Instant::now();
             let k = super::ane_bridge::AneKernel::compile_multi_weights(
                 &result.mil_text,
                 &names,
@@ -3644,6 +4166,12 @@ impl PrePackedWeights {
             .map_err(|e| format!("layer {l} fused_ffn_bwd compile: {e}"))?;
 
             kernels.push(k);
+            bench_trace_weights(format!(
+                "prime_fused_ffn_bwd:compile layer={} elapsed_ms={} layer_total_ms={}",
+                l,
+                compile_t0.elapsed().as_millis(),
+                layer_t0.elapsed().as_millis()
+            ));
         }
 
         let elapsed = t0.elapsed();
@@ -3741,7 +4269,9 @@ impl PrePackedWeights {
         kernel.write_input(0, input_bytes);
 
         if let Err(e) = kernel.eval() {
-            return Some(Err(format!("fused_ffn_bwd hotswap eval layer {layer}: {e}")));
+            return Some(Err(format!(
+                "fused_ffn_bwd hotswap eval layer {layer}: {e}"
+            )));
         }
 
         let out_ch = dim + hidden;
@@ -3786,9 +4316,7 @@ impl PrePackedWeights {
         kernel.write_input(0, input_bytes);
 
         if let Err(e) = kernel.eval() {
-            return Some(Err(format!(
-                "fused_ffn_bwd eval layer {layer}: {e}"
-            )));
+            return Some(Err(format!("fused_ffn_bwd eval layer {layer}: {e}")));
         }
 
         let out_ch = dim + hidden;
@@ -3984,9 +4512,9 @@ impl PrePackedWeights {
 
             // Build weight blobs: transpose to [in, out] layout for matmul pattern
             // Derive dims from actual weight sizes to handle attn_output_gate (Wq doubles)
-            let qpd = lw.wq.len() / dim;   // q_proj_dim (attn_dim or 2*attn_dim with gate)
-            let kvd = lw.wk.len() / dim;   // kv_dim
-            let ad = lw.wo.len() / dim;    // attn_dim
+            let qpd = lw.wq.len() / dim; // q_proj_dim (attn_dim or 2*attn_dim with gate)
+            let kvd = lw.wk.len() / dim; // kv_dim
+            let ad = lw.wo.len() / dim; // attn_dim
             let wq = build_fp16_blob(&transpose_weight(&lw.wq, qpd, dim));
             let wk = build_fp16_blob(&transpose_weight(&lw.wk, kvd, dim));
             let wv = build_fp16_blob(&transpose_weight(&lw.wv, kvd, dim));
@@ -4063,9 +4591,8 @@ impl PrePackedWeights {
         let seq = cfg.seq_len;
 
         // Write input
-        let input_bytes = unsafe {
-            std::slice::from_raw_parts(x_cur.as_ptr() as *const u8, x_cur.len() * 4)
-        };
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(x_cur.as_ptr() as *const u8, x_cur.len() * 4) };
         kernel.write_input(0, input_bytes);
 
         if let Err(e) = kernel.eval() {
@@ -4107,7 +4634,9 @@ impl PrePackedWeights {
         for l in 0..n_layers {
             let lw_cow = model.layer(l);
             let lw = &*lw_cow;
-            if lw.gdn.is_some() { continue; } // GDN layers use separate path
+            if lw.gdn.is_some() {
+                continue;
+            } // GDN layers use separate path
 
             let rms = build_fp16_blob(&lw.rms_ffn);
             let w1 = build_fp16_blob(&transpose_weight(&lw.w1, hidden, dim));
@@ -4116,16 +4645,21 @@ impl PrePackedWeights {
 
             let datas: Vec<&[u8]> = vec![&rms, &w1, &w3, &w2];
             let kernel = super::ane_bridge::AneKernel::compile_multi_weights(
-                &result.mil_text, &names, &datas,
-                &[result.input_bytes], &[result.output_bytes],
-            ).map_err(|e| format!("fused_ffn_fwd layer {l}: {e}"))?;
+                &result.mil_text,
+                &names,
+                &datas,
+                &[result.input_bytes],
+                &[result.output_bytes],
+            )
+            .map_err(|e| format!("fused_ffn_fwd layer {l}: {e}"))?;
             kernels.push(kernel);
         }
 
         let elapsed = t0.elapsed();
         tracing::info!(
             "primed {} fused FFN fwd kernels ({}) in {:.1}ms",
-            kernels.len(), if train { "train" } else { "infer" },
+            kernels.len(),
+            if train { "train" } else { "infer" },
             elapsed.as_secs_f64() * 1000.0,
         );
         self.fused_ffn_fwd_output_bytes = result.output_bytes;
@@ -4135,10 +4669,15 @@ impl PrePackedWeights {
 
     /// Evaluate fused FFN forward for an MHA layer.
     pub fn eval_fused_ffn_fwd(
-        &self, layer: usize, x2: &[f32], cfg: &super::ane_mil::MilConfig,
+        &self,
+        layer: usize,
+        x2: &[f32],
+        cfg: &super::ane_mil::MilConfig,
     ) -> Option<Result<(Vec<f32>, Vec<f32>), String>> {
         let kernels = self.fused_ffn_fwd_kernels.as_ref()?;
-        if layer >= kernels.len() { return None; }
+        if layer >= kernels.len() {
+            return None;
+        }
         let kernel = &kernels[layer];
         let dim = cfg.dim;
         let seq = cfg.seq_len;
@@ -4151,7 +4690,8 @@ impl PrePackedWeights {
 
         let mut buf = vec![0u8; self.fused_ffn_fwd_output_bytes];
         kernel.read_output(0, &mut buf);
-        let full: Vec<f32> = buf.chunks_exact(4)
+        let full: Vec<f32> = buf
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -4213,8 +4753,11 @@ impl PrePackedWeights {
             let names: Vec<&str> = proj_result.weight_names.iter().copied().collect();
             let datas: Vec<&[u8]> = vec![&wqkv_blob, &wa_blob, &wb_blob, &wz_blob];
             match super::ane_bridge::AneKernel::compile_multi_weights(
-                &proj_result.mil_text, &names, &datas,
-                &[proj_result.input_bytes], &[proj_result.output_bytes],
+                &proj_result.mil_text,
+                &names,
+                &datas,
+                &[proj_result.input_bytes],
+                &[proj_result.output_bytes],
             ) {
                 Ok(k) => proj_kernels.push(Some(k)),
                 Err(_) => {
@@ -4328,10 +4871,7 @@ impl PrePackedWeights {
                 let (blobs, names): (Vec<Vec<u8>>, Vec<&str>) = if chunked {
                     // Post-conv kernel: only a_log + dt_bias
                     (
-                        vec![
-                            build_fp16_blob(&gdn.a_log),
-                            build_fp16_blob(&gdn.dt_bias),
-                        ],
+                        vec![build_fp16_blob(&gdn.a_log), build_fp16_blob(&gdn.dt_bias)],
                         pre_r.weight_names.iter().copied().collect(),
                     )
                 } else {
@@ -4354,8 +4894,11 @@ impl PrePackedWeights {
 
                 let datas: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
                 match super::ane_bridge::AneKernel::compile_multi_weights(
-                    &pre_r.mil_text, &names, &datas,
-                    &[pre_r.input_bytes], &[pre_r.output_bytes],
+                    &pre_r.mil_text,
+                    &names,
+                    &datas,
+                    &[pre_r.input_bytes],
+                    &[pre_r.output_bytes],
                 ) {
                     Ok(k) => kernels.push(Some(k)),
                     Err(e) => {
@@ -4373,14 +4916,20 @@ impl PrePackedWeights {
 
         let count = kernels.iter().filter(|k| k.is_some()).count();
         let elapsed = t0.elapsed();
-        tracing::info!("GDN pre-recurrence: {count}/{n_layers} per-layer kernels in {:.1}ms",
-            elapsed.as_secs_f64() * 1000.0);
+        tracing::info!(
+            "GDN pre-recurrence: {count}/{n_layers} per-layer kernels in {:.1}ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
         self.gdn_pre_recur_output_bytes = pre_r.output_bytes;
         self.gdn_pre_recur_input_bytes = pre_r.input_bytes;
         self.gdn_pre_recur_chunk = chunk_size;
         self.gdn_pre_recur_overlap = overlap;
         self.gdn_pre_recur_per_layer = Some(kernels);
-        self.gdn_pre_recur_conv_weights = if chunked { Some(conv_weights_per_layer) } else { None };
+        self.gdn_pre_recur_conv_weights = if chunked {
+            Some(conv_weights_per_layer)
+        } else {
+            None
+        };
     }
 
     /// Evaluate fused GDN pre-recurrence on ANE.
@@ -4536,7 +5085,11 @@ impl PrePackedWeights {
             for ch in 0..h_v {
                 for t in 0..chunk {
                     let global_t = chunk_start + t;
-                    let val = if global_t < seq { a[ch * seq + global_t] } else { 0.0 };
+                    let val = if global_t < seq {
+                        a[ch * seq + global_t]
+                    } else {
+                        0.0
+                    };
                     chunk_input.push(val);
                 }
             }
@@ -4544,7 +5097,11 @@ impl PrePackedWeights {
             for ch in 0..h_v {
                 for t in 0..chunk {
                     let global_t = chunk_start + t;
-                    let val = if global_t < seq { b[ch * seq + global_t] } else { 0.0 };
+                    let val = if global_t < seq {
+                        b[ch * seq + global_t]
+                    } else {
+                        0.0
+                    };
                     chunk_input.push(val);
                 }
             }
@@ -4553,10 +5110,7 @@ impl PrePackedWeights {
 
             // 3. ANE: post-conv kernel (RMSNorm + GQA + decay/gate)
             let input_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    chunk_input.as_ptr() as *const u8,
-                    chunk_input.len() * 4,
-                )
+                std::slice::from_raw_parts(chunk_input.as_ptr() as *const u8, chunk_input.len() * 4)
             };
             kernel.write_input(0, input_bytes);
 
@@ -4603,7 +5157,6 @@ impl PrePackedWeights {
             beta,
         }))
     }
-
 
     /// Evaluate fused GDN projections on per-layer kernel.
     /// Returns (qkv_raw, a_raw, b_raw, z) or None if not primed.
@@ -4986,6 +5539,7 @@ impl LayerWeights {
             q_norm: None,
             k_norm: None,
             gdn: None, // GDN weights are frozen, not fine-tuned via delta
+            moe: None,
         }
     }
 
@@ -5004,6 +5558,7 @@ impl LayerWeights {
             q_norm: base.q_norm.clone(),
             k_norm: base.k_norm.clone(),
             gdn: base.gdn.clone(), // GDN weights are frozen, preserved from base
+            moe: None,
         }
     }
 }
@@ -5094,6 +5649,7 @@ impl ModelWeights {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             };
             layers.push(LayerWeights::apply_delta(&base.layers[l], &delta));
         }
@@ -5111,6 +5667,7 @@ impl ModelWeights {
             embed,
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         })
     }
 }
@@ -5604,20 +6161,32 @@ mod tests {
         cfg.seq_len = 16;
 
         let dim = cfg.dim;
-        let ad = cfg.attn_dim();   // 4 * 32 = 128
+        let ad = cfg.attn_dim(); // 4 * 32 = 128
         let qpd = cfg.q_proj_dim(); // 4 * 32 = 128 (same here, but split logic works regardless)
         let seq = cfg.seq_len;
         let half_qpd = qpd / 2;
 
         // Random-ish weights (non-identity to test real matmul)
-        let wqt: Vec<f32> = (0..dim * qpd).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
-        let wkt: Vec<f32> = (0..dim * ad).map(|i| ((i % 83) as f32 - 41.0) * 0.01).collect();
-        let wvt: Vec<f32> = (0..dim * ad).map(|i| ((i % 71) as f32 - 35.0) * 0.01).collect();
+        let wqt: Vec<f32> = (0..dim * qpd)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let wkt: Vec<f32> = (0..dim * ad)
+            .map(|i| ((i % 83) as f32 - 41.0) * 0.01)
+            .collect();
+        let wvt: Vec<f32> = (0..dim * ad)
+            .map(|i| ((i % 71) as f32 - 35.0) * 0.01)
+            .collect();
 
         // Gradients
-        let dq: Vec<f32> = (0..qpd * seq).map(|i| ((i % 61) as f32 - 30.0) * 0.001).collect();
-        let dk: Vec<f32> = (0..ad * seq).map(|i| ((i % 47) as f32 - 23.0) * 0.001).collect();
-        let dv: Vec<f32> = (0..ad * seq).map(|i| ((i % 53) as f32 - 26.0) * 0.001).collect();
+        let dq: Vec<f32> = (0..qpd * seq)
+            .map(|i| ((i % 61) as f32 - 30.0) * 0.001)
+            .collect();
+        let dk: Vec<f32> = (0..ad * seq)
+            .map(|i| ((i % 47) as f32 - 23.0) * 0.001)
+            .collect();
+        let dv: Vec<f32> = (0..ad * seq)
+            .map(|i| ((i % 53) as f32 - 26.0) * 0.001)
+            .collect();
 
         // --- Single kernel path ---
         let single_mil = gen_qkvb_blob(&cfg);
@@ -5626,9 +6195,13 @@ mod tests {
         let wvt_blob = build_fp16_blob(&wvt);
         let names: Vec<&str> = single_mil.weight_names.iter().copied().collect();
         let single_kernel = AneKernel::compile_multi_weights(
-            &single_mil.mil_text, &names, &[&wqt_blob, &wkt_blob, &wvt_blob],
-            &[single_mil.input_bytes], &[single_mil.output_bytes],
-        ).expect("single qkvb compile failed");
+            &single_mil.mil_text,
+            &names,
+            &[&wqt_blob, &wkt_blob, &wvt_blob],
+            &[single_mil.input_bytes],
+            &[single_mil.output_bytes],
+        )
+        .expect("single qkvb compile failed");
 
         let mut single_input = Vec::with_capacity((qpd + 2 * ad) * seq);
         single_input.extend_from_slice(&dq);
@@ -5641,7 +6214,8 @@ mod tests {
         single_kernel.eval().expect("single qkvb eval failed");
         let mut single_out = vec![0u8; dim * seq * 4];
         single_kernel.read_output(0, &mut single_out);
-        let dx_single: Vec<f32> = single_out.chunks_exact(4)
+        let dx_single: Vec<f32> = single_out
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -5650,11 +6224,13 @@ mod tests {
         let mil_b = gen_qkvb_blob_split_half(&cfg, 1);
 
         // Split Wq^T into halves along reduction axis (columns)
-        let wqt_h0: Vec<f32> = wqt.chunks_exact(qpd)
+        let wqt_h0: Vec<f32> = wqt
+            .chunks_exact(qpd)
             .flat_map(|row| &row[..half_qpd])
             .copied()
             .collect();
-        let wqt_h1: Vec<f32> = wqt.chunks_exact(qpd)
+        let wqt_h1: Vec<f32> = wqt
+            .chunks_exact(qpd)
             .flat_map(|row| &row[half_qpd..])
             .copied()
             .collect();
@@ -5664,24 +6240,31 @@ mod tests {
         // Kernel A: Wq_h0 + Wk
         let names_a: Vec<&str> = mil_a.weight_names.iter().copied().collect();
         let kernel_a = AneKernel::compile_multi_weights(
-            &mil_a.mil_text, &names_a, &[&wqt_h0_blob, &wkt_blob],
-            &[mil_a.input_bytes], &[mil_a.output_bytes],
-        ).expect("split kernel A compile failed");
+            &mil_a.mil_text,
+            &names_a,
+            &[&wqt_h0_blob, &wkt_blob],
+            &[mil_a.input_bytes],
+            &[mil_a.output_bytes],
+        )
+        .expect("split kernel A compile failed");
 
         // Kernel B: Wq_h1 + Wv
         let names_b: Vec<&str> = mil_b.weight_names.iter().copied().collect();
         let kernel_b = AneKernel::compile_multi_weights(
-            &mil_b.mil_text, &names_b, &[&wqt_h1_blob, &wvt_blob],
-            &[mil_b.input_bytes], &[mil_b.output_bytes],
-        ).expect("split kernel B compile failed");
+            &mil_b.mil_text,
+            &names_b,
+            &[&wqt_h1_blob, &wvt_blob],
+            &[mil_b.input_bytes],
+            &[mil_b.output_bytes],
+        )
+        .expect("split kernel B compile failed");
 
         // Input A: dQ[0..half_qpd] | dK
         let mut input_a = Vec::with_capacity((half_qpd + ad) * seq);
         input_a.extend_from_slice(&dq[..half_qpd * seq]);
         input_a.extend_from_slice(&dk);
-        let bytes_a = unsafe {
-            std::slice::from_raw_parts(input_a.as_ptr() as *const u8, input_a.len() * 4)
-        };
+        let bytes_a =
+            unsafe { std::slice::from_raw_parts(input_a.as_ptr() as *const u8, input_a.len() * 4) };
         kernel_a.write_input(0, bytes_a);
         kernel_a.eval().expect("split kernel A eval failed");
 
@@ -5689,9 +6272,8 @@ mod tests {
         let mut input_b = Vec::with_capacity((half_qpd + ad) * seq);
         input_b.extend_from_slice(&dq[half_qpd * seq..]);
         input_b.extend_from_slice(&dv);
-        let bytes_b = unsafe {
-            std::slice::from_raw_parts(input_b.as_ptr() as *const u8, input_b.len() * 4)
-        };
+        let bytes_b =
+            unsafe { std::slice::from_raw_parts(input_b.as_ptr() as *const u8, input_b.len() * 4) };
         kernel_b.write_input(0, bytes_b);
         kernel_b.eval().expect("split kernel B eval failed");
 
@@ -5700,17 +6282,20 @@ mod tests {
         let mut out_b = vec![0u8; dim * seq * 4];
         kernel_a.read_output(0, &mut out_a);
         kernel_b.read_output(0, &mut out_b);
-        let dx_split: Vec<f32> = out_a.chunks_exact(4)
+        let dx_split: Vec<f32> = out_a
+            .chunks_exact(4)
             .zip(out_b.chunks_exact(4))
             .map(|(a, b)| {
                 f32::from_le_bytes([a[0], a[1], a[2], a[3]])
-                + f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    + f32::from_le_bytes([b[0], b[1], b[2], b[3]])
             })
             .collect();
 
         // Verify equivalence (fp16 quantization allows small error)
         assert_eq!(dx_single.len(), dx_split.len());
-        let max_err = dx_single.iter().zip(dx_split.iter())
+        let max_err = dx_single
+            .iter()
+            .zip(dx_split.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         let max_val = dx_single.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -5943,6 +6528,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             gdn: None,
+            moe: None,
         };
 
         let base_layer = make_layer(0.0);
@@ -5980,6 +6566,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             gdn: None,
+            moe: None,
         };
 
         let base = ModelWeights {
@@ -5989,6 +6576,7 @@ mod tests {
             embed: (0..vocab * dim).map(|i| i as f32 * 0.001).collect(),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let current = ModelWeights {
@@ -5998,6 +6586,7 @@ mod tests {
             embed: (0..vocab * dim).map(|i| 0.01 + i as f32 * 0.001).collect(),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
