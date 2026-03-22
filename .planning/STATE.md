@@ -1,13 +1,13 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.3.0
-milestone_name: Inference Speed + Cache Prefill
+milestone: v0.4.0
+milestone_name: Lean Runtime Refactor
 status: in_progress
-stopped_at: CACHE shipped, roadmap created for remaining 2 phases
-last_updated: "2026-03-17"
-last_activity: 2026-03-17 — v0.3.0 progress review, CACHE-01/02 validated, roadmap created
+stopped_at: roadmap created, ready for phase planning
+last_updated: "2026-03-21"
+last_activity: 2026-03-21 — milestone v0.4.0 started, requirements defined, roadmap created
 progress:
-  total_phases: 2
+  total_phases: 6
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -17,17 +17,17 @@ progress:
 
 ## Current Position
 
-Milestone v0.3.0 Inference Speed + Cache Prefill — IN PROGRESS
-Phase: 07 (Streaming Telemetry + TTFT Validation) — not yet planned
-Status: Roadmap created, ready for phase planning
-Last activity: 2026-03-17 — v0.3.0 progress review
+Milestone v0.4.0 Lean Runtime Refactor — IN PROGRESS
+Phase: 09 (Runtime Mode Spine) — not yet planned
+Status: Roadmap updated with shared-backend phases (11a/11b) and conditional MoE (12), ready for phase planning
+Last activity: 2026-03-21 — roadmap expanded: Phase 11 split into 11a (SharedLoraState), 11b (ModelDef), 11c (boundary cleanup); conditional Phase 12 (in-process MoE) added
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-03-17)
+See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** Personal AI substrate across any model backend with persistent, adaptive memory
-**Current focus:** Streaming telemetry + accurate token counting (cache infra already shipped)
+**Current focus:** Typed runtime boundaries, smaller orchestration seams, shared compute backend state (ANE+MLX), and a cleaner local-backend boundary
 
 ## Accumulated Context
 
@@ -41,3 +41,7 @@ See: .planning/PROJECT.md (updated 2026-03-17)
 - **Two token counters**: `token_budget.rs` uses tiktoken (accurate), `filters.rs` uses chars/4 (drifts 60%) — unification is Phase 08
 - Streaming path has `llm_stream_started` with `ttfb_ms` but NO completion telemetry — Phase 07 target
 - **Performance baseline (2026-03-15):** 9B dense 0.5-3.4 w/s, 35B MoE 6-9.7 w/s
+- Phase 06 state-driven refactor audit identified `is_local` cascades, wide runtime surfaces, and MLX coupling as the best refactor leverage
+- Current hotspot sizes: `agent_loop.rs` 845 LOC, `agent_core.rs` 772 LOC, `agent_shared.rs` 1,799 LOC, `providers/mlx.rs` 1,833 LOC
+- v0.4.0 intentionally prioritizes seam extraction and behavior preservation over broad cleanup
+- Remaining v0.3.0 performance work is deferred until the core runtime paths are simpler to reason about and test
