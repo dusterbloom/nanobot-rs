@@ -2088,6 +2088,11 @@ fn persistent_trainer_worker(
             } => {
                 use std::sync::atomic::Ordering::Relaxed;
 
+                // Suppress ANE compile/load error output for the entire training
+                // run. Large models (35B) have kernels that exceed ANE limits —
+                // fallback to CPU is graceful, but the errors pollute the TUI.
+                super::ane_bridge::set_quiet(true);
+
                 stats.reset_last_run();
                 let bucket_compiles_before = stats.bucket_compiles.load(Relaxed);
                 let prepacked_builds_before = stats.prepacked_builds.load(Relaxed);
@@ -2153,6 +2158,7 @@ fn persistent_trainer_worker(
                 if ok {
                     stats.completed_runs.fetch_add(1, Relaxed);
                 }
+                super::ane_bridge::set_quiet(false);
                 let _ = reply.send(ok);
             }
         }

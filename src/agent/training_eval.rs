@@ -56,20 +56,26 @@ mod tests {
     fn grade_prompt(client: &reqwest::blocking::Client, base_url: &str, prompt: &str, expected: &str) -> (bool, String) {
         let url = format!("{}/v1/chat/completions", base_url);
 
-        // Detect model name from oMLX /v1/models endpoint
-        let model_name = client
-            .get(&format!("{}/v1/models", base_url))
-            .header("Authorization", "Bearer omlx")
-            .send()
-            .ok()
-            .and_then(|r| r.json::<serde_json::Value>().ok())
-            .and_then(|j| {
-                j["data"]
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(|m| m["id"].as_str().map(String::from))
-            })
-            .unwrap_or_else(|| "Qwen3.5-35B-A3B-3bit".to_string());
+        // Use model name from env or detect from oMLX /v1/models.
+        // Prefer Qwen3.5-35B variants over other models.
+        let model_name = std::env::var("NANOBOT_EVAL_MODEL").unwrap_or_else(|_| {
+            client
+                .get(&format!("{}/v1/models", base_url))
+                .header("Authorization", "Bearer omlx")
+                .send()
+                .ok()
+                .and_then(|r| r.json::<serde_json::Value>().ok())
+                .and_then(|j| {
+                    let models = j["data"].as_array()?;
+                    // Prefer 35B, then any Qwen, then first available
+                    models.iter()
+                        .find(|m| m["id"].as_str().map_or(false, |s| s.contains("35B")))
+                        .or_else(|| models.iter().find(|m| m["id"].as_str().map_or(false, |s| s.contains("Qwen"))))
+                        .or_else(|| models.first())
+                        .and_then(|m| m["id"].as_str().map(String::from))
+                })
+                .unwrap_or_else(|| "Qwen3.5-35B-A3B-3bit".to_string())
+        });
 
         let body = serde_json::json!({
             "model": model_name,
