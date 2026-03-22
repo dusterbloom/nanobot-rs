@@ -23,6 +23,50 @@ import numpy as np
 ROUTING_FILE = os.path.expanduser("~/.nanobot/routing_targets.bin")
 HEADER_SIZE = 32
 
+# Same probes as training_eval.rs HARD_PROBES
+HARD_PROBES = [
+    ("What is 7893 × 4567? Just the number.", "36047331"),
+    ("What is 123456 + 789012 + 345678? Just the number.", "1258146"),
+    ("What is 17^4? Just the number.", "83521"),
+    ("What is 2^23 - 2^20? Just the number.", "7340032"),
+    ("What is the remainder when 2^100 is divided by 7?", "2"),
+    ("What is the last two digits of 3^200?", "01"),
+    ("How many integers between 1 and 1000 are divisible by 3 but not by 5?", "267"),
+    ("What is the sum of divisors of 360?", "1170"),
+    ("How many 5-card poker hands contain exactly one pair?", "1098240"),
+    ("How many surjective functions from a 5-element set to a 3-element set?", "150"),
+    ("In how many ways can 12 people be divided into 3 groups of 4?", "5775"),
+    ("How many lattice paths from (0,0) to (6,4) using only right and up steps?", "210"),
+    ("A projectile launched at 45 degrees with speed 50m/s. How far does it land in meters? Use g=10.", "250"),
+    ("What is the escape velocity from Earth's surface in km/s? Use R=6400km, g=9.8.", "11.2"),
+    ("A capacitor of 10uF charged to 100V is connected to a 1kOhm resistor. What is the current in mA after 15ms?", "22"),
+    ("Two masses 3kg and 5kg connected by a string over a frictionless pulley. What is the acceleration in m/s^2? Use g=10.", "2.5"),
+    ("If a DNA sequence is 5'-ATGCGATCG-3', what is the mRNA sequence?", "AUGCGAUCG"),
+    ("A star has luminosity 100 times the Sun and temperature 2 times the Sun. What is its radius relative to the Sun?", "2.5"),
+    ("In information theory, a source emits A with probability 0.5, B with 0.25, C and D with 0.125 each. What is the entropy in bits?", "1.75"),
+    ("What is the pH of a buffer solution containing 0.1M acetic acid (Ka=1.8e-5) and 0.1M sodium acetate?", "4.74"),
+    ("If A→B, B→C, not C. What can we conclude about A? Answer 'not A' or 'A'.", "not A"),
+    ("A says 'B is a liar'. B says 'A and C are both liars'. C says 'A is truthful'. If exactly one is a liar, who is it?", "B"),
+    ("In a room of 23 people, what is the approximate probability that two share a birthday? Answer as a percentage.", "50"),
+    ("Five pirates divide 100 gold coins by voting. The most senior proposes and needs majority. How many coins does pirate 1 (most senior) keep?", "98"),
+    ("What does this print: x=1; for i in range(5): x = x*2+1; print(x)", "63"),
+    ("In Python: len(set('mississippi')). What is the answer?", "4"),
+    ("What is the output: x=[1,2,3]; x.append(x); len(x)?", "4"),
+    ("In Python: sum(1 for x in range(100) if x%3==0 or x%5==0). Answer?", "47"),
+    ("You have 2 coins: fair and double-headed. Pick one at random, flip it, get heads. What is the probability the coin is fair?", "1/3"),
+    ("Three doors, one has a prize. You pick door 1, host opens door 3 (no prize). Should you switch? What is the probability of winning if you switch?", "2/3"),
+    ("A test is 99% accurate. Disease prevalence is 1%. You test positive. What is the probability you have the disease? Answer as approximate percentage.", "50"),
+    ("Roll two dice. Given that their sum is 7, what is the probability that one die shows 3?", "1/3"),
+    ("A snail climbs 3m each day and slides back 2m each night. How many days to reach the top of a 10m well?", "8"),
+    ("If 5 machines make 5 widgets in 5 minutes, how many minutes do 100 machines take to make 100 widgets?", "5"),
+    ("A lily pad doubles in size each day. It covers the whole pond on day 30. On what day does it cover half the pond?", "29"),
+    ("You have 12 balls, one weighs differently. Using a balance scale, what is the minimum number of weighings to find it?", "3"),
+    ("What is the maximum number of nodes in a binary tree of height 5?", "63"),
+    ("How many comparisons does merge sort need in the worst case for 8 elements?", "17"),
+    ("What is the output of: (lambda f: f(f))(lambda x: 42)?", "42"),
+    ("In a graph with 6 vertices and 15 edges, how many triangles at most?", "20"),
+]
+
 
 def record_size(dim, k):
     return 4 + k * 2 + k * 4 + dim * 4
@@ -159,6 +203,8 @@ def main():
     parser.add_argument("--model-dir", type=str, default=None)
     parser.add_argument("--output", type=str, default=ROUTING_FILE)
     parser.add_argument("--monitor", action="store_true")
+    parser.add_argument("--eval", action="store_true",
+                        help="Run hard probes, grade, save results + routing data")
     parser.add_argument("--tokens", type=int, default=30)
     args = parser.parse_args()
 
@@ -209,29 +255,88 @@ def main():
     n_hooked = patch_model(model, collector, dim, k)
     print(f"  Hooked {n_hooked}/{n_layers} MoE gates")
 
-    prompt = "Explain the concept of quantum entanglement in simple terms."
-    print(f"\nGenerating {args.tokens} tokens...")
-    t0 = time.time()
-    result = generate(model, tokenizer, prompt=prompt,
-                      max_tokens=args.tokens, verbose=True)
-    elapsed = time.time() - t0
+    if args.eval:
+        # Eval mode: run hard probes, grade, write rewards to a JSON file
+        print(f"\n{'='*60}")
+        print(f"  EVAL MODE — grading {len(HARD_PROBES)} hard probes")
+        print(f"{'='*60}")
 
-    # Flush remaining records
-    flushed = collector.flush()
+        results = []
+        correct = 0
+        t0 = time.time()
 
-    print(f"\n{'='*60}")
-    print(f"  ROUTING HOOK RESULTS")
-    print(f"{'='*60}")
-    print(f"  Tokens:     ~{args.tokens}")
-    print(f"  Records:    {collector.write_pos} ({flushed} flushed)")
-    rpt = collector.write_pos / max(args.tokens, 1)
-    print(f"  Rec/token:  {rpt:.1f} (expect {n_hooked})")
-    print(f"  Speed:      {args.tokens/elapsed:.1f} tok/s")
-    if collector.write_pos > 0:
-        print(f"\n  SUCCESS — {collector.write_pos} routing decisions captured!")
+        for i, (prompt, expected) in enumerate(HARD_PROBES):
+            # Reset buffer positions for per-probe drain
+            collector.flush()
+
+            full_prompt = f"Answer in one word or number only. No explanation. {prompt}"
+            response = generate(model, tokenizer, prompt=full_prompt,
+                               max_tokens=30, verbose=False)
+            collector.flush()
+
+            # Grade
+            answer = response.strip().lower()
+            hit = expected.lower() in answer
+            if hit:
+                correct += 1
+            reward = 1.0 if hit else -1.0
+
+            mark = "+" if hit else "-"
+            if i < 5 or i >= len(HARD_PROBES) - 2:
+                print(f"  [{mark}] {prompt[:50]:<50} → {answer[:30]}")
+
+            results.append({
+                "prompt": prompt,
+                "expected": expected,
+                "response": answer[:100],
+                "hit": hit,
+                "reward": reward,
+                "records_in_buffer": collector.write_pos,
+            })
+
+        elapsed = time.time() - t0
+        pct = 100 * correct / len(HARD_PROBES)
+        print(f"\n  Score: {correct}/{len(HARD_PROBES)} ({pct:.0f}%)")
+        print(f"  Time: {elapsed:.1f}s ({elapsed/len(HARD_PROBES):.1f}s/probe)")
+        print(f"  Records: {collector.write_pos}")
+
+        # Save results + routing buffer path for Rust eval to consume
+        eval_output = os.path.expanduser("~/.nanobot/eval_results.json")
+        import json
+        with open(eval_output, "w") as f:
+            json.dump({
+                "score": correct,
+                "total": len(HARD_PROBES),
+                "pct": pct,
+                "results": results,
+                "routing_file": args.output,
+            }, f, indent=2)
+        print(f"  Results: {eval_output}")
+        print(f"{'='*60}")
     else:
-        print(f"\n  FAILURE — no records")
-    print(f"{'='*60}")
+        prompt = "Explain the concept of quantum entanglement in simple terms."
+        print(f"\nGenerating {args.tokens} tokens...")
+        t0 = time.time()
+        result = generate(model, tokenizer, prompt=prompt,
+                          max_tokens=args.tokens, verbose=True)
+        elapsed = time.time() - t0
+
+        # Flush remaining records
+        flushed = collector.flush()
+
+        print(f"\n{'='*60}")
+        print(f"  ROUTING HOOK RESULTS")
+        print(f"{'='*60}")
+        print(f"  Tokens:     ~{args.tokens}")
+        print(f"  Records:    {collector.write_pos} ({flushed} flushed)")
+        rpt = collector.write_pos / max(args.tokens, 1)
+        print(f"  Rec/token:  {rpt:.1f} (expect {n_hooked})")
+        print(f"  Speed:      {args.tokens/elapsed:.1f} tok/s")
+        if collector.write_pos > 0:
+            print(f"\n  SUCCESS — {collector.write_pos} routing decisions captured!")
+        else:
+            print(f"\n  FAILURE — no records")
+        print(f"{'='*60}")
 
 
 if __name__ == "__main__":
