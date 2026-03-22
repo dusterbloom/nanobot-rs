@@ -513,9 +513,15 @@ pub fn merge_router_into_safetensors(
     let mut backup_created = false;
 
     for file_path in &st_files {
-        // Parse header to find mlp.gate tensors in this file
-        let raw = std::fs::read(file_path)
-            .with_context(|| format!("read {}", file_path.display()))?;
+        // Always read from the pristine .premrg backup if it exists
+        let premrg = premrg_path(file_path);
+        let read_from = if premrg.exists() { &premrg } else { file_path };
+
+        // Parse header from pristine source (mmap for >2GB)
+        let raw_file = std::fs::File::open(read_from)
+            .with_context(|| format!("open {}", read_from.display()))?;
+        let raw = unsafe { memmap2::Mmap::map(&raw_file)
+            .with_context(|| format!("mmap {}", read_from.display()))? };
         if raw.len() < 8 {
             continue;
         }
@@ -570,18 +576,22 @@ pub fn merge_router_into_safetensors(
             continue;
         }
 
-        // Backup original
-        let premrg = premrg_path(file_path);
-        let source_path = if premrg.exists() { &premrg } else { file_path };
+        // Backup if needed
         if !premrg.exists() {
             std::fs::copy(file_path, &premrg)
                 .with_context(|| format!("backup {}", file_path.display()))?;
             backup_created = true;
         }
-
-        // Read from pristine backup
-        let mut data = std::fs::read(source_path)
-            .with_context(|| format!("read {}", source_path.display()))?;
+        // Read original values from pristine source (read-only mmap)
+        let source_file = std::fs::File::open(read_from)
+            .with_context(|| format!("open source {}", read_from.display()))?;
+        let source_data = unsafe { memmap2::Mmap::map(&source_file)
+            .with_context(|| format!("mmap source {}", read_from.display()))? };
+        // Open output file for in-place edits (mmap-mut, no copy needed)
+        let out_file = std::fs::OpenOptions::new().read(true).write(true).open(file_path)
+            .with_context(|| format!("open for write {}", file_path.display()))?;
+        let mut data = unsafe { memmap2::MmapMut::map_mut(&out_file)
+            .with_context(|| format!("mmap mut {}", file_path.display()))? };
 
         for (l, key, entry) in &gate_entries {
             let delta = &layer_deltas[l];
@@ -589,7 +599,7 @@ pub fn merge_router_into_safetensors(
             let abs_end = data_start + entry.data_end;
 
             // Dequantize the gate tensor
-            let tensor_bytes = &data[abs_start..abs_end];
+            let tensor_bytes = &source_data[abs_start..abs_end];
 
             // Need scales and biases from the same file
             let base_name = key.trim_end_matches(".weight");
@@ -613,8 +623,8 @@ pub fn merge_router_into_safetensors(
                 .map(|a| (a[0].as_u64().unwrap() as usize, a[1].as_u64().unwrap() as usize))
                 .unwrap();
 
-            let scales_bytes = &data[data_start + s_offsets.0..data_start + s_offsets.1];
-            let biases_bytes = &data[data_start + b_offsets.0..data_start + b_offsets.1];
+            let scales_bytes = &source_data[data_start + s_offsets.0..data_start + s_offsets.1];
+            let biases_bytes = &source_data[data_start + b_offsets.0..data_start + b_offsets.1];
 
             // BF16 → f32
             let scales: Vec<f32> = scales_bytes.chunks_exact(2)
@@ -625,8 +635,16 @@ pub fn merge_router_into_safetensors(
                 .collect();
 
             let rows = entry.shape[0]; // num_experts
-            let packed_cols = entry.shape[1];
-            let cols = packed_cols * 32 / bits;
+            // For 3-bit: packed_cols * 32 / 3 is not integer.
+            // Derive cols from scales count: n_scales_per_row * group_size.
+            let n_groups_per_row = scales.len() / rows;
+            let cols = n_groups_per_row * group_size;
+
+            // Sanity: cols should match dim from function args
+            if cols != dim {
+                debug!("Router L{l}: cols={cols} != dim={dim}, skipping (wrong tensor?)");
+                continue;
+            }
 
             // Dequantize
             let mut weight_f32 = super::ane_weights::dequant_nbit(
@@ -646,6 +664,15 @@ pub fn merge_router_into_safetensors(
             );
 
             // Write back weight data
+            let orig_size = abs_end - abs_start;
+            if new_data.len() != orig_size {
+                tracing::warn!(
+                    "Router L{l}: requantized size {} != original {}, skipping write-back",
+                    new_data.len(), orig_size
+                );
+                tensors_merged += 1;
+                continue;
+            }
             data[abs_start..abs_end].copy_from_slice(&new_data);
 
             // Write back scales (f32 → bf16)
@@ -668,9 +695,9 @@ pub fn merge_router_into_safetensors(
             debug!("Router L{l}: merged delta into {key}");
         }
 
-        // Write modified file
-        std::fs::write(file_path, &data)
-            .with_context(|| format!("write {}", file_path.display()))?;
+        // Flush mmap writes to disk
+        data.flush()
+            .with_context(|| format!("flush {}", file_path.display()))?;
         files_modified += 1;
     }
 
@@ -1315,10 +1342,11 @@ mod tests {
         let mut original_weights: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
         let mut trained_weights: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
 
-        // Read original gate weights from safetensors
+        // Read original gate weights from safetensors (mmap for >2GB files)
         let st_files = list_safetensors(model_path).expect("list safetensors");
         for file_path in &st_files {
-            let raw = std::fs::read(file_path).expect("read safetensors");
+            let file = std::fs::File::open(file_path).expect("open safetensors");
+            let raw = unsafe { memmap2::Mmap::map(&file).expect("mmap safetensors") };
             if raw.len() < 8 { continue; }
             let header_len = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
             let header_json: serde_json::Value =
