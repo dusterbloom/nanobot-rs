@@ -490,6 +490,49 @@ pub fn gen_dyn_matmul_mil(ic: usize, oc: usize, seq: usize) -> String {
     m
 }
 
+/// Split-input dynamic matmul: y = act @ W with separate IOSurfaces.
+///
+/// Input 0: `[1, ic, 1, seq]` fp32 — activations (chainable from previous kernel output).
+/// Input 1: `[1, ic, 1, oc]` fp32 — weights (persistent, updated only on optimizer step).
+/// Output:  `[1, oc, 1, seq]` fp32.
+///
+/// Unlike `gen_dyn_matmul_mil` which packs act+weight into one IOSurface,
+/// this variant keeps them separate so output→input[0] chaining works across
+/// kernels (output shape `[1, oc, 1, seq]` matches next input[0] shape).
+pub fn gen_dyn_matmul_split_mil(ic: usize, oc: usize, seq: usize) -> String {
+    let mut m = String::with_capacity(4096);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {ic}, 1, {seq}]> act, tensor<fp32, [1, {ic}, 1, {oc}]> w) {{"
+    );
+    // Cast both to fp16
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{ic},1,{seq}]> ah = cast(dtype=to16,x=act)[name=string(\"cin_a\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{ic},1,{oc}]> wh = cast(dtype=to16,x=w)[name=string(\"cin_w\")];");
+    // Reshape act: [1,ic,1,seq] → [1,1,ic,seq] → transpose → [1,1,seq,ic]
+    let _ = writeln!(m, "        tensor<int32, [4]> ra = const()[name=string(\"ra\"), val=tensor<int32, [4]>([1,1,{ic},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{ic},{seq}]> a2 = reshape(shape=ra,x=ah)[name=string(\"a2\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{ic}]> a3 = transpose(perm=pm,x=a2)[name=string(\"a3\")];");
+    // Reshape weight: [1,ic,1,oc] → [1,1,ic,oc]
+    let _ = writeln!(m, "        tensor<int32, [4]> rw = const()[name=string(\"rw\"), val=tensor<int32, [4]>([1,1,{ic},{oc}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{ic},{oc}]> W = reshape(shape=rw,x=wh)[name=string(\"W\")];");
+    // matmul: [1,1,seq,ic] @ [1,1,ic,oc] → [1,1,seq,oc]
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{oc}]> yh = matmul(transpose_x=bF,transpose_y=bF,x=a3,y=W)[name=string(\"yh\")];");
+    // Transpose back + reshape: [1,1,seq,oc] → [1,1,oc,seq] → [1,oc,1,seq]
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{oc},{seq}]> yt = transpose(perm=pm,x=yh)[name=string(\"yt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{oc},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{oc},1,{seq}]> yf = reshape(shape=ro,x=yt)[name=string(\"yf\")];");
+    // Cast back to fp32
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{oc},1,{seq}]> y = cast(dtype=to32,x=yf)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (y);");
+    m.push_str("}\n");
+    m
+}
+
 /// SDPA forward (dynamic weights): QKV matmul + scaled dot-product attention + Wo matmul.
 ///
 /// Input: `[1, dim, 1, seq + 4*dim]` fp32.

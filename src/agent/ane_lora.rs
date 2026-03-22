@@ -1897,6 +1897,147 @@ pub fn lora_backward_ane(
     Ok((dx_lora, da, db))
 }
 
+// ---------------------------------------------------------------------------
+// Chained LoRA backward (zero intermediate DRAM round-trips)
+// ---------------------------------------------------------------------------
+
+/// Chained LoRA backward pass using split-input DynMatmul kernels.
+///
+/// Instead of separate eval + CPU read + eval for B^T and A^T matmuls,
+/// this chains them via IOSurface sharing: bt_bwd output stays on-device
+/// and feeds directly into at_bwd input[0]. Weights live in persistent
+/// IOSurfaces (input[1]) updated only on optimizer steps.
+///
+/// Chain: d_out_grad → [bt_bwd] → dh (on IOSurface) → [at_bwd] → dx_lora
+pub struct LoraBackwardChain {
+    bt_bwd: AneKernel,
+    at_bwd: AneKernel,
+    d_out: usize,
+    rank: usize,
+    d_in: usize,
+    seq: usize,
+}
+
+impl LoraBackwardChain {
+    /// Compile the chained backward kernels and wire IOSurface sharing.
+    pub fn compile(d_in: usize, d_out: usize, rank: usize, seq: usize) -> Result<Self, String> {
+        ane_bridge::ane_init()?;
+
+        // bt_bwd: B^T @ d_out_grad → dh [rank, seq]
+        let bt_mil = super::ane_mil::gen_dyn_matmul_split_mil(d_out, rank, seq);
+        let bt_bwd = AneKernel::compile(
+            &bt_mil,
+            None,
+            &[d_out * seq * 4, d_out * rank * 4],
+            &[rank * seq * 4],
+        )?;
+
+        // at_bwd: A^T @ dh → dx_lora [d_in, seq]
+        let at_mil = super::ane_mil::gen_dyn_matmul_split_mil(rank, d_in, seq);
+        let at_bwd = AneKernel::compile(
+            &at_mil,
+            None,
+            &[rank * seq * 4, rank * d_in * 4],
+            &[d_in * seq * 4],
+        )?;
+
+        // Wire chain: bt_bwd output[0] → at_bwd input[0]
+        bt_bwd.share_output_to(0, &at_bwd, 0)?;
+
+        Ok(Self {
+            bt_bwd,
+            at_bwd,
+            d_out,
+            rank,
+            d_in,
+            seq,
+        })
+    }
+
+    /// Pre-load adapter weights into persistent IOSurfaces.
+    /// Call once after optimizer step, not every backward pass.
+    pub fn load_weights(&self, adapter: &LoraAdapter) {
+        // bt_bwd input[1] = B [d_out, rank] (B^T weight for DynMatmulSplit(ic=d_out, oc=rank))
+        let b_bytes = ane_weights::f32_slice_to_bytes(&adapter.b);
+        self.bt_bwd.write_input(1, &b_bytes);
+
+        // at_bwd input[1] = A [rank, d_in] (A^T weight for DynMatmulSplit(ic=rank, oc=d_in))
+        let a_bytes = ane_weights::f32_slice_to_bytes(&adapter.a);
+        self.at_bwd.write_input(1, &a_bytes);
+    }
+
+    /// Run chained backward: returns (dx_lora, dh).
+    ///
+    /// dh is read from bt_bwd's output IOSurface (persists after chain eval)
+    /// and is needed for CPU weight gradient computation (dA = dh @ x^T).
+    pub fn eval(&self, d_out_grad: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
+        assert_eq!(
+            d_out_grad.len(),
+            self.d_out * self.seq,
+            "d_out_grad shape mismatch"
+        );
+
+        // Write activations to bt_bwd input[0]
+        let grad_bytes = ane_weights::f32_slice_to_bytes(d_out_grad);
+        self.bt_bwd.write_input(0, &grad_bytes);
+
+        // Chain eval: bt_bwd → at_bwd (dh stays on IOSurface between them)
+        AneKernel::eval_chain(&[&self.bt_bwd, &self.at_bwd])?;
+
+        // Read dx_lora from at_bwd output[0]
+        let mut dx_bytes = vec![0u8; self.d_in * self.seq * 4];
+        self.at_bwd.read_output(0, &mut dx_bytes);
+        let dx_lora = ane_weights::bytes_to_f32_vec(&dx_bytes);
+
+        // Read dh from bt_bwd output[0] (IOSurface persists after chain)
+        let mut dh_bytes = vec![0u8; self.rank * self.seq * 4];
+        self.bt_bwd.read_output(0, &mut dh_bytes);
+        let dh = ane_weights::bytes_to_f32_vec(&dh_bytes);
+
+        Ok((dx_lora, dh))
+    }
+
+    /// Full LoRA backward: chained input grads on ANE + CPU weight grads.
+    /// Returns (dx_lora, dA, dB).
+    pub fn backward(
+        &self,
+        adapter: &LoraAdapter,
+        d_out_grad: &[f32],
+        x: &[f32],
+        h: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let (dx_lora, dh) = self.eval(d_out_grad)?;
+        let seq = self.seq;
+
+        // CPU weight gradients (small outer products)
+        // dB[o, r] = sum_t d_out_grad[o, t] * h[r, t]
+        let mut db = vec![0.0f32; adapter.d_out * adapter.rank];
+        for o in 0..adapter.d_out {
+            for r in 0..adapter.rank {
+                let mut acc = 0.0f32;
+                for t in 0..seq {
+                    acc += d_out_grad[o * seq + t] * h[r * seq + t];
+                }
+                db[o * adapter.rank + r] = acc;
+            }
+        }
+
+        // dA[r, i] = sum_t dh[r, t] * x[i, t]
+        let mut da = vec![0.0f32; adapter.rank * adapter.d_in];
+        for r in 0..adapter.rank {
+            for i in 0..adapter.d_in {
+                let mut acc = 0.0f32;
+                for t in 0..seq {
+                    acc += dh[r * seq + t] * x[i * seq + t];
+                }
+                da[r * adapter.d_in + i] = acc;
+            }
+        }
+
+        Ok((dx_lora, da, db))
+    }
+}
+
 /// Add scaled vector: dst[i] += scale * src[i].
 pub fn vec_add_scaled(dst: &mut [f32], src: &[f32], scale: f32) {
     debug_assert_eq!(dst.len(), src.len());
@@ -3232,6 +3373,357 @@ mod tests {
         eprintln!("LoRA CPU training benchmark (dim={dim}, rank={rank}, seq={seq}):");
         eprintln!("  {steps} steps in {total_ms}ms ({per_step_ms:.2}ms/step)");
         eprintln!("  JIT LoRA reference: ~390ms/step on M4 Max (full model, ANE)");
+    }
+
+    // --- Chained backward tests (require ANE hardware) ---
+
+    #[test]
+    fn ane_split_matmul_compiles() {
+        if let Err(e) = ane_bridge::ane_init() {
+            eprintln!("Skipping (ANE unavailable): {e}");
+            return;
+        }
+        let ic = 64;
+        let oc = 32;
+        let seq = 16;
+        let mil = super::super::ane_mil::gen_dyn_matmul_split_mil(ic, oc, seq);
+        match ane_bridge::AneKernel::compile(
+            &mil,
+            None,
+            &[ic * seq * 4, ic * oc * 4],
+            &[oc * seq * 4],
+        ) {
+            Ok(_) => eprintln!("DynMatmulSplit compiled (ic={ic}, oc={oc}, seq={seq})"),
+            Err(e) => eprintln!("Skipping split matmul test (ANE unavailable): {e}"),
+        }
+    }
+
+    #[test]
+    fn ane_split_matmul_matches_packed() {
+        if let Err(e) = ane_bridge::ane_init() {
+            eprintln!("Skipping (ANE unavailable): {e}");
+            return;
+        }
+        let ic = 64;
+        let oc = 32;
+        let seq = 16;
+
+        // Compile split-input kernel
+        let mil_split = super::super::ane_mil::gen_dyn_matmul_split_mil(ic, oc, seq);
+        let k_split = match ane_bridge::AneKernel::compile(
+            &mil_split,
+            None,
+            &[ic * seq * 4, ic * oc * 4],
+            &[oc * seq * 4],
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping: {e}");
+                return;
+            }
+        };
+
+        // Compile packed kernel (reference)
+        let mil_packed = super::super::ane_mil::gen_dyn_matmul_mil(ic, oc, seq);
+        let k_packed = match ane_bridge::AneKernel::compile(
+            &mil_packed,
+            None,
+            &[(ic * (seq + oc)) * 4],
+            &[oc * seq * 4],
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping: {e}");
+                return;
+            }
+        };
+
+        let act: Vec<f32> = (0..ic * seq).map(|i| (i as f32 * 0.01).sin()).collect();
+        let w: Vec<f32> = (0..ic * oc).map(|i| (i as f32 * 0.007).cos() * 0.1).collect();
+
+        // Split eval
+        let act_bytes = ane_weights::f32_slice_to_bytes(&act);
+        let w_bytes = ane_weights::f32_slice_to_bytes(&w);
+        k_split.write_input(0, &act_bytes);
+        k_split.write_input(1, &w_bytes);
+        k_split.eval().expect("split eval failed");
+        let mut out_split = vec![0u8; oc * seq * 4];
+        k_split.read_output(0, &mut out_split);
+        let y_split = ane_weights::bytes_to_f32_vec(&out_split);
+
+        // Packed eval (reference)
+        let packed = ane_weights::pack_dyn_matmul(&act, &w, ic, oc, seq);
+        k_packed.write_input(0, &packed);
+        k_packed.eval().expect("packed eval failed");
+        let mut out_packed = vec![0u8; oc * seq * 4];
+        k_packed.read_output(0, &mut out_packed);
+        let y_packed = ane_weights::bytes_to_f32_vec(&out_packed);
+
+        let max_err = y_split
+            .iter()
+            .zip(y_packed.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("split vs packed max error: {max_err}");
+        assert!(
+            max_err < 1e-3,
+            "split and packed DynMatmul must agree (max_err={max_err})"
+        );
+    }
+
+    #[test]
+    fn ane_split_matmul_chain() {
+        if let Err(e) = ane_bridge::ane_init() {
+            eprintln!("Skipping (ANE unavailable): {e}");
+            return;
+        }
+        let d_out = 64;
+        let rank = 32;
+        let d_in = 64;
+        let seq = 16;
+
+        // Compile separate kernels (reference — no chaining)
+        let mil1 = super::super::ane_mil::gen_dyn_matmul_split_mil(d_out, rank, seq);
+        let k1_ref = match ane_bridge::AneKernel::compile(
+            &mil1,
+            None,
+            &[d_out * seq * 4, d_out * rank * 4],
+            &[rank * seq * 4],
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping chain test: {e}");
+                return;
+            }
+        };
+        let mil2 = super::super::ane_mil::gen_dyn_matmul_split_mil(rank, d_in, seq);
+        let k2_ref = match ane_bridge::AneKernel::compile(
+            &mil2,
+            None,
+            &[rank * seq * 4, rank * d_in * 4],
+            &[d_in * seq * 4],
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping chain test: {e}");
+                return;
+            }
+        };
+
+        // Compile chained kernels
+        let k1_chain = ane_bridge::AneKernel::compile(
+            &mil1,
+            None,
+            &[d_out * seq * 4, d_out * rank * 4],
+            &[rank * seq * 4],
+        )
+        .unwrap();
+        let k2_chain = ane_bridge::AneKernel::compile(
+            &mil2,
+            None,
+            &[rank * seq * 4, rank * d_in * 4],
+            &[d_in * seq * 4],
+        )
+        .unwrap();
+        k1_chain
+            .share_output_to(0, &k2_chain, 0)
+            .expect("share_output_to failed");
+
+        let act: Vec<f32> = (0..d_out * seq).map(|i| (i as f32 * 0.01).sin()).collect();
+        let w1: Vec<f32> = (0..d_out * rank)
+            .map(|i| (i as f32 * 0.007).cos() * 0.1)
+            .collect();
+        let w2: Vec<f32> = (0..rank * d_in)
+            .map(|i| (i as f32 * 0.013).sin() * 0.1)
+            .collect();
+        let act_bytes = ane_weights::f32_slice_to_bytes(&act);
+        let w1_bytes = ane_weights::f32_slice_to_bytes(&w1);
+        let w2_bytes = ane_weights::f32_slice_to_bytes(&w2);
+
+        // Reference: sequential separate evals
+        k1_ref.write_input(0, &act_bytes);
+        k1_ref.write_input(1, &w1_bytes);
+        k1_ref.eval().expect("k1_ref eval failed");
+        let mut dh_bytes = vec![0u8; rank * seq * 4];
+        k1_ref.read_output(0, &mut dh_bytes);
+        let dh_ref = ane_weights::bytes_to_f32_vec(&dh_bytes);
+
+        k2_ref.write_input(0, &ane_weights::f32_slice_to_bytes(&dh_ref));
+        k2_ref.write_input(1, &w2_bytes);
+        k2_ref.eval().expect("k2_ref eval failed");
+        let mut y_ref_bytes = vec![0u8; d_in * seq * 4];
+        k2_ref.read_output(0, &mut y_ref_bytes);
+        let y_ref = ane_weights::bytes_to_f32_vec(&y_ref_bytes);
+
+        // Chained eval
+        k1_chain.write_input(0, &act_bytes);
+        k1_chain.write_input(1, &w1_bytes);
+        k2_chain.write_input(1, &w2_bytes);
+        ane_bridge::AneKernel::eval_chain(&[&k1_chain, &k2_chain]).expect("eval_chain failed");
+
+        let mut y_chain_bytes = vec![0u8; d_in * seq * 4];
+        k2_chain.read_output(0, &mut y_chain_bytes);
+        let y_chain = ane_weights::bytes_to_f32_vec(&y_chain_bytes);
+
+        // Read intermediate dh from k1 output (should persist after chain)
+        let mut dh_chain_bytes = vec![0u8; rank * seq * 4];
+        k1_chain.read_output(0, &mut dh_chain_bytes);
+        let dh_chain = ane_weights::bytes_to_f32_vec(&dh_chain_bytes);
+
+        let max_dh_err = dh_chain
+            .iter()
+            .zip(dh_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_y_err = y_chain
+            .iter()
+            .zip(y_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        eprintln!("chain vs separate: dh_err={max_dh_err}, y_err={max_y_err}");
+        assert!(max_dh_err < 1e-3, "dh mismatch: {max_dh_err}");
+        assert!(max_y_err < 1e-3, "chain output mismatch: {max_y_err}");
+    }
+
+    #[test]
+    fn ane_lora_backward_chain_matches_separate() {
+        let dim = 64;
+        let rank = 16;
+        let seq = 16;
+
+        // Compile chained backward
+        let chain = match LoraBackwardChain::compile(dim, dim, rank, seq) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping chain backward test: {e}");
+                return;
+            }
+        };
+
+        // Compile separate kernels (existing path)
+        let mil_cfg = MilConfig::mha(dim, 128, 4, seq);
+        let kernels = match LoraKernels::compile(&mil_cfg, rank) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping: {e}");
+                return;
+            }
+        };
+
+        let mut adapter = LoraAdapter::new(rank, dim, dim);
+        for v in adapter.b.iter_mut() {
+            *v = 0.01;
+        }
+
+        let x: Vec<f32> = (0..dim * seq).map(|i| (i as f32 * 0.01).sin()).collect();
+        let (_, h) = adapter.forward_cpu(&x, seq);
+        let d_out_grad: Vec<f32> = (0..dim * seq).map(|i| (i as f32 * 0.03).cos()).collect();
+
+        // Separate backward (reference)
+        let (dx_sep, da_sep, db_sep) = lora_backward_ane(
+            &kernels.attn_bt_bwd,
+            &kernels.attn_at_bwd,
+            &adapter,
+            &d_out_grad,
+            &x,
+            &h,
+            seq,
+        )
+        .expect("separate backward failed");
+
+        // Chained backward
+        chain.load_weights(&adapter);
+        let (dx_chain, da_chain, db_chain) = chain
+            .backward(&adapter, &d_out_grad, &x, &h)
+            .expect("chain backward failed");
+
+        let max_dx = dx_sep
+            .iter()
+            .zip(dx_chain.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_da = da_sep
+            .iter()
+            .zip(da_chain.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_db = db_sep
+            .iter()
+            .zip(db_chain.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        eprintln!("chain vs separate: dx={max_dx}, dA={max_da}, dB={max_db}");
+        assert!(max_dx < 0.5, "dx mismatch: {max_dx}");
+        assert!(max_da < 0.5, "dA mismatch: {max_da}");
+        assert!(max_db < 0.5, "dB mismatch: {max_db}");
+    }
+
+    #[test]
+    #[ignore] // benchmark — run with --nocapture
+    fn bench_lora_backward_chain_vs_separate() {
+        use std::time::Instant;
+        let dim = 64;
+        let rank = 32;
+        let seq = 128;
+
+        let chain = match LoraBackwardChain::compile(dim, dim, rank, seq) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping benchmark: {e}");
+                return;
+            }
+        };
+        let mil_cfg = MilConfig::mha(dim, 128, 4, seq);
+        let kernels = match LoraKernels::compile(&mil_cfg, rank) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping benchmark: {e}");
+                return;
+            }
+        };
+
+        let mut adapter = LoraAdapter::new(rank, dim, dim);
+        for v in adapter.b.iter_mut() {
+            *v = 0.01;
+        }
+
+        let x: Vec<f32> = (0..dim * seq).map(|i| (i as f32 * 0.01).sin()).collect();
+        let (_, h) = adapter.forward_cpu(&x, seq);
+        let d_out_grad: Vec<f32> = (0..dim * seq).map(|i| (i as f32 * 0.03).cos()).collect();
+
+        let iters = 100;
+
+        // Benchmark separate
+        chain.load_weights(&adapter);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = lora_backward_ane(
+                &kernels.attn_bt_bwd,
+                &kernels.attn_at_bwd,
+                &adapter,
+                &d_out_grad,
+                &x,
+                &h,
+                seq,
+            );
+        }
+        let sep_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        // Benchmark chain
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            let _ = chain.eval(&d_out_grad);
+        }
+        let chain_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+        let speedup = sep_us / chain_us;
+        eprintln!("\nLoRA backward (dim={dim}, rank={rank}, seq={seq}):");
+        eprintln!("  separate: {sep_us:.1}µs/iter");
+        eprintln!("  chain:    {chain_us:.1}µs/iter");
+        eprintln!("  speedup:  {speedup:.2}x");
+        eprintln!("  savings:  no intermediate dh DRAM round-trip, persistent weight IOSurfaces");
     }
 }
 
