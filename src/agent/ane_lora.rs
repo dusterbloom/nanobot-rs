@@ -2527,11 +2527,13 @@ impl RouterBackwardChain {
     /// Run backward: returns dx [dim, seq].
     /// Weight grad (dW) is computed on CPU by the caller.
     pub fn eval_input_grad(&self, d_logits: &[f32]) -> Result<Vec<f32>, String> {
-        assert_eq!(
-            d_logits.len(),
-            self.num_experts * self.seq,
-            "d_logits shape mismatch"
-        );
+        if d_logits.len() != self.num_experts * self.seq {
+            return Err(format!(
+                "d_logits shape mismatch: got {} expected {} ({}×{})",
+                d_logits.len(), self.num_experts * self.seq,
+                self.num_experts, self.seq
+            ));
+        }
 
         self.kernel.write_input(0, &ane_weights::f32_slice_to_bytes(d_logits));
         self.kernel.eval()?;
