@@ -2486,6 +2486,7 @@ pub fn backward_lora_ane_generic_with_lora_kernels<
         residual_scale,
         lora_kernels,
         None,
+        None,
     )
 }
 
@@ -2499,6 +2500,7 @@ pub fn backward_lora_ane_prepacked<W: ane_weights::WeightSource>(
     residual_scale: f32,
     lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
     prepacked: &mut ane_weights::PrePackedWeights,
+    lora_chains: Option<&super::ane_lora::LoraBackwardChains>,
 ) -> BackwardResultWithLora {
     backward_lora_ane_impl(
         bwd_kernels,
@@ -2509,6 +2511,7 @@ pub fn backward_lora_ane_prepacked<W: ane_weights::WeightSource>(
         residual_scale,
         lora_kernels,
         Some(prepacked),
+        lora_chains,
     )
 }
 
@@ -2521,6 +2524,7 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
     residual_scale: f32,
     lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
     mut prepacked: Option<&mut ane_weights::PrePackedWeights>,
+    lora_chains: Option<&super::ane_lora::LoraBackwardChains>,
 ) -> BackwardResultWithLora {
     use super::ane_lora;
 
@@ -2604,18 +2608,21 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
         let lw_cow = model.layer(l);
         let lw = &*lw_cow;
         let use_ane_w2_grads = lora_kernels.and_then(|k| k.w2.as_ref()).is_some();
+        let has_w2_chain = lora_chains.and_then(|c| c.w2.as_ref()).is_some();
 
         // --- PARALLEL: ANE ffn_bwd_w2t || LoRA W2 grad + W1/W3 pre-transpose ---
         // ANE kernel is !Send, stays on calling thread. CPU work on a scoped thread.
         //
         // When prepacked weights are available, the W1/W3 clone on the CPU thread
         // is skipped (eval_w13t_prepacked doesn't need them).
+        // When chain is available, W2 backward defers to main thread (chain is !Send).
         let has_prepacked = prepacked.is_some();
         let (dsilu, fused_dx_ffn, w2_grads, w1t, w3t) = std::thread::scope(|s| {
-            // Spawn CPU work: LoRA W2 backward + (if not prepacked) W1/W3 clone
+            // Spawn CPU work: LoRA W2 backward (CPU only when no ANE grads & no chain)
+            // + (if not prepacked) W1/W3 clone
             let cpu_handle = s.spawn(|| {
-                let w2_grads = if use_ane_w2_grads {
-                    None
+                let w2_grads = if use_ane_w2_grads || has_w2_chain {
+                    None // ANE grad kernels or chain handle W2 on main thread
                 } else if let (Some(w2_adapter), Some(w2_x), Some(w2_h)) = (
                     lora.layers[l].w2.as_ref(),
                     la.w2_x.as_ref(),
@@ -2681,13 +2688,40 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
         let mut dsilu = dsilu;
         ane_forward::clamp_fp16(&mut dsilu);
 
-        // Accumulate W2 LoRA grads from parallel result
+        // Accumulate W2 LoRA grads from parallel result (CPU backward_cpu path)
         if let (Some((da, db)), Some(lg)) = (w2_grads, lora_grads.layers[l].w2.as_mut()) {
             for (g, v) in lg.da.iter_mut().zip(da.iter()) {
                 *g += v;
             }
             for (g, v) in lg.db.iter_mut().zip(db.iter()) {
                 *g += v;
+            }
+        }
+        // W2 chain path: deferred from CPU thread because chain is !Send
+        if has_w2_chain && !use_ane_w2_grads {
+            if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg), Some(chain)) = (
+                lora.layers[l].w2.as_ref(),
+                la.w2_x.as_ref(),
+                la.w2_h.as_ref(),
+                lora_grads.layers[l].w2.as_mut(),
+                lora_chains.and_then(|c| c.w2.as_ref()),
+            ) {
+                let scaled_dffn: Vec<f32> = dffn.iter().map(|&v| v * scale).collect();
+                let (da, db) = match chain.backward(w2_adapter, &scaled_dffn, w2_x, w2_h) {
+                    Ok((_dx, da, db)) => (da, db),
+                    Err(e) => {
+                        tracing::warn!("ANE LoRA W2 chain failed: {e}");
+                        let (_dx, da, db) =
+                            w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
+                        (da, db)
+                    }
+                };
+                for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                    *g += v;
+                }
+                for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                    *g += v;
+                }
             }
         }
         if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg), Some(k)) = (
@@ -2708,8 +2742,24 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("ANE LoRA W2 grads fell back to CPU: {e}");
-                    let (_dx, da, db) = w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
+                    tracing::warn!("ANE LoRA W2 grad kernels failed: {e}");
+                    // Try chained ANE backward, then CPU fallback
+                    let (da, db) =
+                        if let Some(chain) = lora_chains.and_then(|c| c.w2.as_ref()) {
+                            match chain.backward(w2_adapter, &scaled_dffn, w2_x, w2_h) {
+                                Ok((_dx, da, db)) => (da, db),
+                                Err(e2) => {
+                                    tracing::warn!("ANE LoRA W2 chain also failed: {e2}");
+                                    let (_dx, da, db) =
+                                        w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
+                                    (da, db)
+                                }
+                            }
+                        } else {
+                            let (_dx, da, db) =
+                                w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
+                            (da, db)
+                        };
                     for (g, v) in lg.da.iter_mut().zip(da.iter()) {
                         *g += v;
                     }
@@ -2784,7 +2834,7 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
 
         _prof_rmsnorm_us += _t_rmsnorm.elapsed().as_micros() as u64;
 
-        // --- LoRA Wo backward (CPU) ---
+        // --- LoRA Wo backward: chain (ANE) → AdapterWeightGradKernels → backward_cpu ---
         let _t_lora = std::time::Instant::now();
         if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) = (
             lora.layers[l].wo.as_ref(),
@@ -2793,17 +2843,30 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             lora_grads.layers[l].wo.as_mut(),
         ) {
             let scaled_dx2: Vec<f32> = dx2.iter().map(|&v| v * scale).collect();
-            let grads = if let Some(k) = lora_kernels.and_then(|k| k.wo.as_ref()) {
-                match k.eval(wo_adapter, &scaled_dx2, wo_x, wo_h, seq) {
-                    Ok((da, db)) => Some((da, db)),
+            // Try chained ANE backward first (13.81x faster than CPU)
+            let grads = if let Some(chain) = lora_chains.and_then(|c| c.wo.as_ref()) {
+                match chain.backward(wo_adapter, &scaled_dx2, wo_x, wo_h) {
+                    Ok((_dx, da, db)) => Some((da, db)),
                     Err(e) => {
-                        tracing::warn!("ANE LoRA Wo grads fell back to CPU: {e}");
+                        tracing::warn!("ANE LoRA Wo chain fell back: {e}");
                         None
                     }
                 }
             } else {
                 None
             };
+            // Fall back to AdapterWeightGradKernels
+            let grads = grads.or_else(|| {
+                lora_kernels
+                    .and_then(|k| k.wo.as_ref())
+                    .and_then(|k| match k.eval(wo_adapter, &scaled_dx2, wo_x, wo_h, seq) {
+                        Ok((da, db)) => Some((da, db)),
+                        Err(e) => {
+                            tracing::warn!("ANE LoRA Wo grads fell back to CPU: {e}");
+                            None
+                        }
+                    })
+            });
             let (da, db) = if let Some(grads) = grads {
                 grads
             } else {

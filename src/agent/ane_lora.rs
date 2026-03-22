@@ -1918,27 +1918,36 @@ pub struct LoraBackwardChain {
     seq: usize,
 }
 
+/// ANE minimum dimension for matmul output (Bug 14 — applies to oc, not just spatial).
+const ANE_MIN_OC: usize = 16;
+
 impl LoraBackwardChain {
     /// Compile the chained backward kernels and wire IOSurface sharing.
+    /// Pads oc to ANE_MIN_OC when rank < 16 (Bug 14: matmul output dim minimum).
     pub fn compile(d_in: usize, d_out: usize, rank: usize, seq: usize) -> Result<Self, String> {
         ane_bridge::ane_init()?;
 
-        // bt_bwd: B^T @ d_out_grad → dh [rank, seq]
-        let bt_mil = super::ane_mil::gen_dyn_matmul_split_mil(d_out, rank, seq);
+        // Pad oc dimensions to ANE minimum
+        let bt_oc = rank.max(ANE_MIN_OC);
+        let at_oc = d_in.max(ANE_MIN_OC);
+
+        // bt_bwd: B^T @ d_out_grad → dh [bt_oc, seq] (padded)
+        let bt_mil = super::ane_mil::gen_dyn_matmul_split_mil(d_out, bt_oc, seq);
         let bt_bwd = AneKernel::compile(
             &bt_mil,
             None,
-            &[d_out * seq * 4, d_out * rank * 4],
-            &[rank * seq * 4],
+            &[d_out * seq * 4, d_out * bt_oc * 4],
+            &[bt_oc * seq * 4],
         )?;
 
-        // at_bwd: A^T @ dh → dx_lora [d_in, seq]
-        let at_mil = super::ane_mil::gen_dyn_matmul_split_mil(rank, d_in, seq);
+        // at_bwd: A^T @ dh → dx_lora [at_oc, seq] (padded)
+        // ic = bt_oc (padded rank), to match bt_bwd output
+        let at_mil = super::ane_mil::gen_dyn_matmul_split_mil(bt_oc, at_oc, seq);
         let at_bwd = AneKernel::compile(
             &at_mil,
             None,
-            &[rank * seq * 4, rank * d_in * 4],
-            &[d_in * seq * 4],
+            &[bt_oc * seq * 4, bt_oc * at_oc * 4],
+            &[at_oc * seq * 4],
         )?;
 
         // Wire chain: bt_bwd output[0] → at_bwd input[0]
@@ -1956,14 +1965,38 @@ impl LoraBackwardChain {
 
     /// Pre-load adapter weights into persistent IOSurfaces.
     /// Call once after optimizer step, not every backward pass.
+    /// Handles padding to ANE_MIN_OC when rank < 16.
     pub fn load_weights(&self, adapter: &LoraAdapter) {
-        // bt_bwd input[1] = B [d_out, rank] (B^T weight for DynMatmulSplit(ic=d_out, oc=rank))
-        let b_bytes = ane_weights::f32_slice_to_bytes(&adapter.b);
-        self.bt_bwd.write_input(1, &b_bytes);
+        let bt_oc = self.rank.max(ANE_MIN_OC);
+        let at_oc = self.d_in.max(ANE_MIN_OC);
 
-        // at_bwd input[1] = A [rank, d_in] (A^T weight for DynMatmulSplit(ic=rank, oc=d_in))
-        let a_bytes = ane_weights::f32_slice_to_bytes(&adapter.a);
-        self.at_bwd.write_input(1, &a_bytes);
+        // bt_bwd input[1] = B padded [d_out, bt_oc]
+        if bt_oc == self.rank {
+            let b_bytes = ane_weights::f32_slice_to_bytes(&adapter.b);
+            self.bt_bwd.write_input(1, &b_bytes);
+        } else {
+            // Pad: copy B [d_out, rank] into [d_out, bt_oc] with zero padding
+            let mut padded = vec![0.0f32; self.d_out * bt_oc];
+            for row in 0..self.d_out {
+                padded[row * bt_oc..row * bt_oc + self.rank]
+                    .copy_from_slice(&adapter.b[row * self.rank..(row + 1) * self.rank]);
+            }
+            self.bt_bwd.write_input(1, &ane_weights::f32_slice_to_bytes(&padded));
+        }
+
+        // at_bwd input[1] = A padded [bt_oc, at_oc]
+        // A is [rank, d_in], pad to [bt_oc, at_oc]
+        if bt_oc == self.rank && at_oc == self.d_in {
+            let a_bytes = ane_weights::f32_slice_to_bytes(&adapter.a);
+            self.at_bwd.write_input(1, &a_bytes);
+        } else {
+            let mut padded = vec![0.0f32; bt_oc * at_oc];
+            for row in 0..self.rank {
+                padded[row * at_oc..row * at_oc + self.d_in]
+                    .copy_from_slice(&adapter.a[row * self.d_in..(row + 1) * self.d_in]);
+            }
+            self.at_bwd.write_input(1, &ane_weights::f32_slice_to_bytes(&padded));
+        }
     }
 
     /// Run chained backward: returns (dx_lora, dh).
@@ -1984,15 +2017,39 @@ impl LoraBackwardChain {
         // Chain eval: bt_bwd → at_bwd (dh stays on IOSurface between them)
         AneKernel::eval_chain(&[&self.bt_bwd, &self.at_bwd])?;
 
-        // Read dx_lora from at_bwd output[0]
-        let mut dx_bytes = vec![0u8; self.d_in * self.seq * 4];
-        self.at_bwd.read_output(0, &mut dx_bytes);
-        let dx_lora = ane_weights::bytes_to_f32_vec(&dx_bytes);
+        let bt_oc = self.rank.max(ANE_MIN_OC);
+        let at_oc = self.d_in.max(ANE_MIN_OC);
 
-        // Read dh from bt_bwd output[0] (IOSurface persists after chain)
-        let mut dh_bytes = vec![0u8; self.rank * self.seq * 4];
+        // Read dx_lora from at_bwd output[0], slice off padding
+        let mut dx_bytes = vec![0u8; at_oc * self.seq * 4];
+        self.at_bwd.read_output(0, &mut dx_bytes);
+        let dx_full = ane_weights::bytes_to_f32_vec(&dx_bytes);
+        let dx_lora = if at_oc == self.d_in {
+            dx_full
+        } else {
+            // Slice [at_oc, seq] → [d_in, seq]
+            let mut dx = vec![0.0f32; self.d_in * self.seq];
+            for ch in 0..self.d_in {
+                dx[ch * self.seq..(ch + 1) * self.seq]
+                    .copy_from_slice(&dx_full[ch * self.seq..(ch + 1) * self.seq]);
+            }
+            dx
+        };
+
+        // Read dh from bt_bwd output[0], slice off padding
+        let mut dh_bytes = vec![0u8; bt_oc * self.seq * 4];
         self.bt_bwd.read_output(0, &mut dh_bytes);
-        let dh = ane_weights::bytes_to_f32_vec(&dh_bytes);
+        let dh_full = ane_weights::bytes_to_f32_vec(&dh_bytes);
+        let dh = if bt_oc == self.rank {
+            dh_full
+        } else {
+            let mut dh = vec![0.0f32; self.rank * self.seq];
+            for ch in 0..self.rank {
+                dh[ch * self.seq..(ch + 1) * self.seq]
+                    .copy_from_slice(&dh_full[ch * self.seq..(ch + 1) * self.seq]);
+            }
+            dh
+        };
 
         Ok((dx_lora, dh))
     }
@@ -2036,6 +2093,214 @@ impl LoraBackwardChain {
 
         Ok((dx_lora, da, db))
     }
+}
+
+/// Per-adapter-type backward chains for the full model.
+/// Compiled once per bucket seq_len, `reload_weights()` called after each optimizer step.
+pub struct LoraBackwardChains {
+    pub wo: Option<LoraBackwardChain>,
+    pub w2: Option<LoraBackwardChain>,
+}
+
+impl LoraBackwardChains {
+    /// Compile chained backward kernels matching the LoRA model's adapter shapes.
+    pub fn compile(lora: &LoraModel, seq: usize) -> Result<Self, String> {
+        let first_layer = &lora.layers[0];
+        let wo = if let Some(ref adapter) = first_layer.wo {
+            Some(LoraBackwardChain::compile(
+                adapter.d_in,
+                adapter.d_out,
+                adapter.rank,
+                seq,
+            )?)
+        } else {
+            None
+        };
+        let w2 = if let Some(ref adapter) = first_layer.w2 {
+            Some(LoraBackwardChain::compile(
+                adapter.d_in,
+                adapter.d_out,
+                adapter.rank,
+                seq,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self { wo, w2 })
+    }
+
+    /// Reload adapter weights into persistent IOSurfaces for all chains.
+    /// Call once after each optimizer step, not every backward pass.
+    pub fn reload_weights(&self, lora: &LoraModel, layer: usize) {
+        if let (Some(chain), Some(adapter)) = (&self.wo, lora.layers[layer].wo.as_ref()) {
+            chain.load_weights(adapter);
+        }
+        if let (Some(chain), Some(adapter)) = (&self.w2, lora.layers[layer].w2.as_ref()) {
+            chain.load_weights(adapter);
+        }
+    }
+
+    /// Reload weights for all layers after optimizer step.
+    pub fn reload_all_weights(&self, lora: &LoraModel) {
+        for l in 0..lora.layers.len() {
+            self.reload_weights(lora, l);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Router backward chain (full-weight MoE router training on ANE)
+// ---------------------------------------------------------------------------
+
+/// Single-kernel backward for MoE router gate: W^T @ d_logits → dx.
+///
+/// The router weight is [num_experts, dim]. For backward:
+///   input grad: dx = W^T @ d_logits  (ANE DynMatmulSplit)
+///   weight grad: dW = d_logits @ x^T  (CPU outer product)
+///
+/// Unlike LoraBackwardChain (2 chained kernels for B^T then A^T),
+/// this is a single dispatch — the router is full-rank, not decomposed.
+pub struct RouterBackwardChain {
+    kernel: AneKernel,
+    num_experts: usize,
+    dim: usize,
+    seq: usize,
+}
+
+impl RouterBackwardChain {
+    /// Compile the router backward kernel.
+    /// ic = num_experts, oc = dim (the matmul is W^T @ d_logits).
+    pub fn compile(num_experts: usize, dim: usize, seq: usize) -> Result<Self, String> {
+        ane_bridge::ane_init()?;
+
+        let ic = num_experts;
+        let oc = dim.max(ANE_MIN_OC);
+
+        let mil = super::ane_mil::gen_dyn_matmul_split_mil(ic, oc, seq);
+        let kernel = AneKernel::compile(
+            &mil,
+            None,
+            &[ic * seq * 4, ic * oc * 4],
+            &[oc * seq * 4],
+        )?;
+
+        Ok(Self { kernel, num_experts, dim, seq })
+    }
+
+    /// Load router weights (transposed) into persistent IOSurface.
+    /// Router is [num_experts, dim], but the kernel expects W^T = [num_experts, dim]
+    /// packed as [ic=num_experts, oc=dim] — which is the same layout.
+    /// Call once after optimizer step.
+    pub fn load_weights(&self, router: &[f32]) {
+        assert_eq!(
+            router.len(),
+            self.num_experts * self.dim,
+            "router weight size mismatch"
+        );
+        let oc = self.dim.max(ANE_MIN_OC);
+        if oc == self.dim {
+            self.kernel.write_input(1, &ane_weights::f32_slice_to_bytes(router));
+        } else {
+            // Pad [num_experts, dim] → [num_experts, oc]
+            let mut padded = vec![0.0f32; self.num_experts * oc];
+            for row in 0..self.num_experts {
+                padded[row * oc..row * oc + self.dim]
+                    .copy_from_slice(&router[row * self.dim..(row + 1) * self.dim]);
+            }
+            self.kernel.write_input(1, &ane_weights::f32_slice_to_bytes(&padded));
+        }
+    }
+
+    /// Run backward: returns dx [dim, seq].
+    /// Weight grad (dW) is computed on CPU by the caller.
+    pub fn eval_input_grad(&self, d_logits: &[f32]) -> Result<Vec<f32>, String> {
+        assert_eq!(
+            d_logits.len(),
+            self.num_experts * self.seq,
+            "d_logits shape mismatch"
+        );
+
+        self.kernel.write_input(0, &ane_weights::f32_slice_to_bytes(d_logits));
+        self.kernel.eval()?;
+
+        let oc = self.dim.max(ANE_MIN_OC);
+        let mut out_bytes = vec![0u8; oc * self.seq * 4];
+        self.kernel.read_output(0, &mut out_bytes);
+        let out_full = ane_weights::bytes_to_f32_vec(&out_bytes);
+
+        if oc == self.dim {
+            Ok(out_full)
+        } else {
+            let mut dx = vec![0.0f32; self.dim * self.seq];
+            for ch in 0..self.dim {
+                dx[ch * self.seq..(ch + 1) * self.seq]
+                    .copy_from_slice(&out_full[ch * self.seq..(ch + 1) * self.seq]);
+            }
+            Ok(dx)
+        }
+    }
+
+    /// Full router backward: ANE input grad + CPU weight grad.
+    /// Returns (dx, dW) where dx=[dim, seq], dW=[num_experts, dim].
+    pub fn backward(
+        &self,
+        router_weight: &[f32],
+        d_logits: &[f32],
+        x: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let _ = router_weight; // weight is pre-loaded via load_weights()
+        let dx = self.eval_input_grad(d_logits)?;
+
+        // CPU weight grad: dW[e, d] = sum_t d_logits[e, t] * x[d, t]
+        let mut dw = vec![0.0f32; self.num_experts * self.dim];
+        for e in 0..self.num_experts {
+            for d in 0..self.dim {
+                let mut acc = 0.0f32;
+                for t in 0..self.seq {
+                    acc += d_logits[e * self.seq + t] * x[d * self.seq + t];
+                }
+                dw[e * self.dim + d] = acc;
+            }
+        }
+
+        Ok((dx, dw))
+    }
+}
+
+/// CPU-only router backward for comparison/fallback.
+/// Returns (dx, dW) where dx=[dim, seq], dW=[num_experts, dim].
+pub fn router_backward_cpu(
+    router: &[f32],
+    d_logits: &[f32],
+    x: &[f32],
+    num_experts: usize,
+    dim: usize,
+    seq: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    // dx[d, t] = sum_e router[e, d] * d_logits[e, t]
+    let mut dx = vec![0.0f32; dim * seq];
+    for e in 0..num_experts {
+        for d in 0..dim {
+            let w = router[e * dim + d];
+            for t in 0..seq {
+                dx[d * seq + t] += w * d_logits[e * seq + t];
+            }
+        }
+    }
+
+    // dW[e, d] = sum_t d_logits[e, t] * x[d, t]
+    let mut dw = vec![0.0f32; num_experts * dim];
+    for e in 0..num_experts {
+        for d in 0..dim {
+            let mut acc = 0.0f32;
+            for t in 0..seq {
+                acc += d_logits[e * seq + t] * x[d * seq + t];
+            }
+            dw[e * dim + d] = acc;
+        }
+    }
+
+    (dx, dw)
 }
 
 /// Add scaled vector: dst[i] += scale * src[i].
@@ -3587,6 +3852,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn probe_dyn_matmul_split_max_ic() {
+        let _ = ane_bridge::ane_init();
+        for (oc, seq) in [(8, 16), (16, 16), (16, 64), (16, 128)] {
+            eprintln!("\noc={oc}, seq={seq}:");
+            for ic in [64, 256, 512, 1024, 1536, 2048, 4096, 8192] {
+                let mil = super::super::ane_mil::gen_dyn_matmul_split_mil(ic, oc, seq);
+                let ok = AneKernel::compile(&mil, None, &[ic*seq*4, ic*oc*4], &[oc*seq*4]).is_ok();
+                eprintln!("  ic={ic:>5} → {}", if ok {"OK"} else {"FAIL"});
+            }
+        }
+    }
+
+    #[test]
     fn ane_lora_backward_chain_matches_separate() {
         let dim = 64;
         let rank = 16;
@@ -3724,6 +4003,223 @@ mod tests {
         eprintln!("  chain:    {chain_us:.1}µs/iter");
         eprintln!("  speedup:  {speedup:.2}x");
         eprintln!("  savings:  no intermediate dh DRAM round-trip, persistent weight IOSurfaces");
+    }
+
+    /// Production-scale benchmark: chain.backward() vs backward_cpu() at 35B dims.
+    #[test]
+    #[ignore]
+    fn bench_lora_backward_chain_vs_cpu_production() {
+        use std::time::Instant;
+
+        // 35B Wo: d_in=2048 (attn_dim), d_out=2048 (dim), rank=8
+        // 35B W2: d_in=8192 (hidden_dim), d_out=2048 (dim), rank=8
+        let configs: Vec<(&str, usize, usize, usize, usize)> = vec![
+            // Small model (0.8B): fits ANE at all seq
+            ("0.8B Wo (1536→1536, r=8, seq=16)", 1536, 1536, 8, 16),
+            ("0.8B W2 (4096→1536, r=8, seq=16)", 4096, 1536, 8, 16),
+            ("0.8B Wo (1536→1536, r=8, seq=64)", 1536, 1536, 8, 64),
+            ("0.8B W2 (4096→1536, r=8, seq=64)", 4096, 1536, 8, 64),
+            // 35B: test at training seq lengths
+            ("35B Wo (2048→2048, r=8, seq=16)", 2048, 2048, 8, 16),
+            ("35B W2 (8192→2048, r=8, seq=16)", 8192, 2048, 8, 16),
+            ("35B Wo (2048→2048, r=8, seq=64)", 2048, 2048, 8, 64),
+            ("35B W2 (8192→2048, r=8, seq=64)", 8192, 2048, 8, 64),
+            ("35B Wo (2048→2048, r=8, seq=128)", 2048, 2048, 8, 128),
+        ];
+        let iters = 50;
+
+        for (label, d_in, d_out, rank, seq) in &configs {
+            let chain = match LoraBackwardChain::compile(*d_in, *d_out, *rank, *seq) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  {label}: skip chain compile: {e}");
+                    continue;
+                }
+            };
+
+            let mut adapter = LoraAdapter::new(*rank, *d_in, *d_out);
+            for v in adapter.a.iter_mut() {
+                *v = 0.001;
+            }
+            for v in adapter.b.iter_mut() {
+                *v = 0.001;
+            }
+            chain.load_weights(&adapter);
+
+            let x: Vec<f32> = (0..d_in * seq).map(|i| (i as f32 * 0.01).sin()).collect();
+            let (_, h) = adapter.forward_cpu(&x, *seq);
+            let grad: Vec<f32> = (0..d_out * seq).map(|i| (i as f32 * 0.03).cos()).collect();
+
+            // Warm up
+            let _ = adapter.backward_cpu(&grad, &x, &h, *seq);
+            let _ = chain.backward(&adapter, &grad, &x, &h);
+
+            // Benchmark backward_cpu
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let _ = adapter.backward_cpu(&grad, &x, &h, *seq);
+            }
+            let cpu_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            // Benchmark chain.backward()
+            let t1 = Instant::now();
+            for _ in 0..iters {
+                let _ = chain.backward(&adapter, &grad, &x, &h);
+            }
+            let chain_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+            let speedup = cpu_us / chain_us;
+            eprintln!("\n{label}:");
+            eprintln!("  backward_cpu:    {cpu_us:.1}µs/iter");
+            eprintln!("  chain.backward:  {chain_us:.1}µs/iter");
+            eprintln!("  speedup:         {speedup:.2}x");
+        }
+    }
+
+    #[test]
+    fn test_router_backward_chain_correctness() {
+        let _ = ane_bridge::ane_init();
+        // Small dims for correctness check
+        let (num_experts, dim, seq) = (32, 64, 16);
+        let chain = match RouterBackwardChain::compile(num_experts, dim, seq) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("RouterBackwardChain compile skip: {e}");
+                return;
+            }
+        };
+
+        let router: Vec<f32> = (0..num_experts * dim)
+            .map(|i| (i as f32 * 0.007).sin() * 0.1)
+            .collect();
+        let x: Vec<f32> = (0..dim * seq)
+            .map(|i| (i as f32 * 0.013).cos() * 0.5)
+            .collect();
+        let d_logits: Vec<f32> = (0..num_experts * seq)
+            .map(|i| (i as f32 * 0.019).sin() * 0.2)
+            .collect();
+
+        chain.load_weights(&router);
+        let (dx_ane, dw_ane) = chain.backward(&router, &d_logits, &x).unwrap();
+        let (dx_cpu, dw_cpu) = router_backward_cpu(&router, &d_logits, &x, num_experts, dim, seq);
+
+        // Check dx (input grad) — fp16 precision on ANE
+        let max_dx_err = dx_ane
+            .iter()
+            .zip(dx_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let dx_scale = dx_cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+        let rel_dx = max_dx_err / dx_scale;
+        eprintln!("Router dx: max_err={max_dx_err:.6}, scale={dx_scale:.6}, rel={rel_dx:.6}");
+        assert!(rel_dx < 0.02, "router dx relative error too high: {rel_dx}");
+
+        // Check dW (weight grad) — both CPU, should be exact
+        let max_dw_err = dw_ane
+            .iter()
+            .zip(dw_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_dw_err < 1e-5, "router dW mismatch: {max_dw_err}");
+    }
+
+    #[test]
+    #[ignore] // benchmark — run with --nocapture --test-threads=1
+    fn bench_router_backward_ane_vs_cpu() {
+        use std::time::Instant;
+
+        let configs: Vec<(&str, usize, usize, usize)> = vec![
+            // 35B MoE router: 256 experts, dim=2048
+            ("35B router (256×2048, seq=16)", 256, 2048, 16),
+            ("35B router (256×2048, seq=32)", 256, 2048, 32),
+            ("35B router (256×2048, seq=64)", 256, 2048, 64),
+            // Smaller MoE configs for comparison
+            ("8-expert (8×2048, seq=16)", 8, 2048, 16),
+            ("64-expert (64×2048, seq=16)", 64, 2048, 16),
+            // Input grad only (isolate ANE vs CPU matmul)
+            ("35B input_grad only (256×2048, seq=16)", 256, 2048, 16),
+        ];
+        let iters = 100;
+
+        for (idx, (label, num_experts, dim, seq)) in configs.iter().enumerate() {
+            let chain = match RouterBackwardChain::compile(*num_experts, *dim, *seq) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  {label}: skip compile: {e}");
+                    continue;
+                }
+            };
+
+            let router: Vec<f32> = (0..num_experts * dim)
+                .map(|i| (i as f32 * 0.007).sin() * 0.1)
+                .collect();
+            let x: Vec<f32> = (0..dim * seq)
+                .map(|i| (i as f32 * 0.013).cos() * 0.5)
+                .collect();
+            let d_logits: Vec<f32> = (0..num_experts * seq)
+                .map(|i| (i as f32 * 0.019).sin() * 0.2)
+                .collect();
+
+            chain.load_weights(&router);
+
+            // Warm up
+            let _ = router_backward_cpu(&router, &d_logits, &x, *num_experts, *dim, *seq);
+            let _ = chain.backward(&router, &d_logits, &x);
+
+            let is_input_grad_only = idx == configs.len() - 1;
+
+            if is_input_grad_only {
+                // Benchmark input grad only (ANE eval vs CPU matmul)
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    // CPU input grad only: dx[d,t] = sum_e W[e,d] * dy[e,t]
+                    let mut dx = vec![0.0f32; dim * seq];
+                    for e in 0..*num_experts {
+                        for d in 0..*dim {
+                            let w = router[e * dim + d];
+                            for t in 0..*seq {
+                                dx[d * seq + t] += w * d_logits[e * seq + t];
+                            }
+                        }
+                    }
+                    std::hint::black_box(&dx);
+                }
+                let cpu_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+                let t1 = Instant::now();
+                for _ in 0..iters {
+                    let _ = chain.eval_input_grad(&d_logits);
+                }
+                let ane_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+                let speedup = cpu_us / ane_us;
+                let flops = 2.0 * (*num_experts as f64) * (*dim as f64) * (*seq as f64);
+                eprintln!("\n{label}:");
+                eprintln!("  CPU input_grad:  {cpu_us:.1}µs ({:.1} GFLOPS)", flops / cpu_us / 1e3);
+                eprintln!("  ANE input_grad:  {ane_us:.1}µs ({:.1} GFLOPS)", flops / ane_us / 1e3);
+                eprintln!("  speedup:         {speedup:.2}x");
+            } else {
+                // Full backward (input grad + weight grad)
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    let _ = router_backward_cpu(&router, &d_logits, &x, *num_experts, *dim, *seq);
+                }
+                let cpu_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+                let t1 = Instant::now();
+                for _ in 0..iters {
+                    let _ = chain.backward(&router, &d_logits, &x);
+                }
+                let ane_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+                let speedup = cpu_us / ane_us;
+                let flops = 4.0 * (*num_experts as f64) * (*dim as f64) * (*seq as f64);
+                eprintln!("\n{label}:");
+                eprintln!("  CPU full bwd:    {cpu_us:.1}µs ({:.1} GFLOPS)", flops / cpu_us / 1e3);
+                eprintln!("  ANE full bwd:    {ane_us:.1}µs ({:.1} GFLOPS)", flops / ane_us / 1e3);
+                eprintln!("  speedup:         {speedup:.2}x");
+            }
+        }
     }
 }
 
