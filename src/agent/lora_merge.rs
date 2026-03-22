@@ -86,7 +86,8 @@ pub fn merge_lora_into_base(
 
     // 3. Index safetensors files and group deltas by file.
     let st_files = list_safetensors(model_dir)?;
-    let file_deltas = assign_deltas_to_files(&st_files, &deltas)?;
+    let mut deltas = deltas;
+    let file_deltas = assign_deltas_to_files(&st_files, &mut deltas)?;
 
     let mut tensors_merged = 0usize;
     let mut files_modified = 0usize;
@@ -289,9 +290,13 @@ fn parse_safetensors_header(buf: &[u8]) -> Result<(usize, HashMap<String, Tensor
 
 /// Find which safetensors file contains each delta's target tensors.
 /// Returns file_path → [delta indices].
+///
+/// For MoE models, `mlp.down_proj` may be stored as `mlp.shared_expert.down_proj`.
+/// When the plain name isn't found, we try the `shared_expert` fallback and update
+/// the delta's `base_name` so `apply_delta_to_buffer` finds the right tensor.
 fn assign_deltas_to_files(
     files: &[PathBuf],
-    deltas: &[PendingDelta],
+    deltas: &mut [PendingDelta],
 ) -> Result<Vec<(PathBuf, Vec<usize>)>> {
     // Build index: tensor_name → file_index
     let mut tensor_to_file: HashMap<String, usize> = HashMap::new();
@@ -304,12 +309,25 @@ fn assign_deltas_to_files(
     }
 
     let mut file_deltas: Vec<Vec<usize>> = vec![Vec::new(); files.len()];
-    for (di, delta) in deltas.iter().enumerate() {
+    for (di, delta) in deltas.iter_mut().enumerate() {
         let w_key = format!("{}.weight", delta.base_name);
-        let fi = tensor_to_file.get(&w_key).copied().ok_or_else(|| {
-            anyhow::anyhow!("tensor {} not found in any safetensors file", w_key)
-        })?;
-        file_deltas[fi].push(di);
+        if let Some(&fi) = tensor_to_file.get(&w_key) {
+            file_deltas[fi].push(di);
+        } else {
+            // MoE fallback: mlp.down_proj → mlp.shared_expert.down_proj
+            let moe_name = delta.base_name.replace("mlp.", "mlp.shared_expert.");
+            let moe_key = format!("{moe_name}.weight");
+            if let Some(&fi) = tensor_to_file.get(&moe_key) {
+                debug!(
+                    "LoRA merge: {} → {} (MoE shared_expert fallback)",
+                    delta.base_name, moe_name
+                );
+                delta.base_name = moe_name;
+                file_deltas[fi].push(di);
+            } else {
+                bail!("tensor {} not found in any safetensors file (also tried shared_expert)", w_key);
+            }
+        }
     }
 
     Ok(files
@@ -844,6 +862,88 @@ mod tests {
         );
 
         eprintln!("E2E merge verified: delta applied to real 0.8B model weights");
+    }
+
+    #[test]
+    fn test_merge_35b_moe_shared_expert_in_memory() {
+        // Qwen3.5-35B-A3B: 4-bit, group_size=64, MoE with shared_expert.down_proj
+        // Tests MoE fallback path + 4-bit quantization without copying 19GB to disk.
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-35B not found, skipping 35B merge test");
+            return;
+        }
+
+        let bits = 4usize;
+        let group_size = 64usize;
+        // shared_expert.down_proj: d_out=2048 (dim), d_in=512 (moe_hidden)
+        let d_out = 2048usize;
+        let d_in = 512usize;
+        let base_name = "language_model.model.layers.0.mlp.shared_expert.down_proj";
+
+        // Read shard 1 (contains layer 0).
+        let shard = model_dir.join("model-00001-of-00004.safetensors");
+        let buf = std::fs::read(&shard).expect("read shard 1");
+        let (header_size, entries) = parse_safetensors_header(&buf).unwrap();
+        let data_start = 8 + header_size;
+
+        // Verify tensor exists.
+        let w_key = format!("{base_name}.weight");
+        assert!(entries.contains_key(&w_key), "missing {w_key}");
+
+        // Dequantize original weight.
+        let w_e = &entries[&w_key];
+        let s_e = &entries[&format!("{base_name}.scales")];
+        let b_e = &entries[&format!("{base_name}.biases")];
+        let rows = w_e.shape[0];
+        let cols = w_e.shape[1] * 32 / bits;
+        assert_eq!(rows, d_out);
+        assert_eq!(cols, d_in);
+
+        let orig_w = dequant_nbit(
+            &buf[data_start + w_e.data_start..data_start + w_e.data_end],
+            &bf16_to_f32_slice(&buf[data_start + s_e.data_start..data_start + s_e.data_end]),
+            &bf16_to_f32_slice(&buf[data_start + b_e.data_start..data_start + b_e.data_end]),
+            rows, cols, group_size, bits,
+        );
+
+        // Create LoRA delta: B[0,0]=1.0, A = small signal in first row.
+        let rank = 4usize;
+        let a: Vec<f32> = (0..rank * d_in).map(|j| if j < d_in { 0.05 } else { 0.0 }).collect();
+        let mut b = vec![0.0f32; d_out * rank];
+        b[0] = 1.0; // Only row 0 of delta is non-zero
+
+        let pending = PendingDelta {
+            base_name: base_name.to_string(),
+            adapter: DeltaAdapter { a, b, rank, d_in, d_out, scale: 1.0 },
+        };
+
+        // Apply delta to a copy of the buffer.
+        let mut buf_copy = buf.clone();
+        apply_delta_to_buffer(&mut buf_copy, data_start, &entries, &pending, bits, group_size)
+            .expect("apply delta failed");
+
+        // Dequantize merged weight.
+        let merged_w = dequant_nbit(
+            &buf_copy[data_start + w_e.data_start..data_start + w_e.data_end],
+            &bf16_to_f32_slice(&buf_copy[data_start + s_e.data_start..data_start + s_e.data_end]),
+            &bf16_to_f32_slice(&buf_copy[data_start + b_e.data_start..data_start + b_e.data_end]),
+            rows, cols, group_size, bits,
+        );
+
+        // Row 0: delta = B[0,0]*A[0,:] = 1.0 * [0.05, 0.05, ...] → shift of 0.05 per element.
+        let row0_diff: f32 = (0..cols).map(|c| (merged_w[c] - orig_w[c]).abs()).sum();
+        let row1_diff: f32 = (0..cols).map(|c| (merged_w[cols + c] - orig_w[cols + c]).abs()).sum();
+
+        eprintln!("35B shared_expert.down_proj: {rows}x{cols}, 4-bit");
+        eprintln!("Row 0 total diff: {row0_diff:.4} (expected ~{:.1})", 0.05 * cols as f32);
+        eprintln!("Row 1 total diff: {row1_diff:.4}");
+
+        assert!(row0_diff > 1.0, "row 0 should show delta: {row0_diff}");
+        assert!(row1_diff < row0_diff * 0.05, "row 1 should be ~unchanged: {row1_diff} vs {row0_diff}");
+
+        eprintln!("35B MoE 4-bit merge verified in-memory");
     }
 
     /// Build a minimal safetensors buffer with weight/scales/biases tensors.
