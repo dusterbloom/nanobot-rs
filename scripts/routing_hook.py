@@ -187,6 +187,159 @@ class GateWrapper:
         return getattr(self._original, name)
 
 
+def merge_router_deltas_to_disk(model_dir, trained_gates, original_gates, ne, dim):
+    """Merge REINFORCE router deltas into quantized safetensors on disk.
+
+    Same approach as Rust lora_merge.rs: dequant original → add delta → requant → write back.
+    This preserves quantization fidelity (no lossy dense replacement).
+    """
+    import glob, json, shutil
+
+    st_files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+    merged = 0
+
+    for st_path in st_files:
+        # Read header
+        with open(st_path, "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_len))
+        data_start = 8 + header_len
+
+        # Find gate tensors in this file
+        gate_keys = []
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            if "mlp.gate" not in key or not key.endswith(".weight"):
+                continue
+            # Extract layer index
+            parts = key.split("layers.")
+            if len(parts) < 2:
+                continue
+            try:
+                layer_idx = int(parts[1].split(".")[0])
+            except ValueError:
+                continue
+            if layer_idx not in trained_gates:
+                continue
+            gate_keys.append((layer_idx, key, meta))
+
+        if not gate_keys:
+            continue
+
+        # Use existing .premrg backup from LoRA merge, or the original file
+        premrg = st_path.replace(".safetensors", ".premrg.safetensors")
+        if ".premrg." in st_path:
+            # Already a backup file — skip
+            continue
+        source = premrg if os.path.exists(premrg) else st_path
+        # Don't create new backups — reuse LoRA merge backups or modify in-place
+
+        # Read from pristine backup
+        with open(source, "rb") as f:
+            data = bytearray(f.read())
+
+        for layer_idx, w_key, w_meta in gate_keys:
+            base_name = w_key.rsplit(".weight", 1)[0]
+            s_key = f"{base_name}.scales"
+            b_key = f"{base_name}.biases"
+
+            if s_key not in header or b_key not in header:
+                continue
+
+            w_off = w_meta["data_offsets"]
+            s_off = header[s_key]["data_offsets"]
+            b_off = header[b_key]["data_offsets"]
+            shape = w_meta["shape"]
+
+            rows = shape[0]
+            packed_cols = shape[1]
+            bits = 4  # default for Qwen3.5
+            # Detect bits from shape: packed_cols * 32 / bits = dim
+            for b in [3, 4, 8]:
+                if packed_cols * 32 // b == dim:
+                    bits = b
+                    break
+            cols = packed_cols * 32 // bits
+
+            group_size = 64  # default
+            n_groups = cols // group_size
+
+            # Extract weight/scales/biases bytes
+            w_bytes = bytes(data[data_start + w_off[0]:data_start + w_off[1]])
+            s_bytes = bytes(data[data_start + s_off[0]:data_start + s_off[1]])
+            b_bytes = bytes(data[data_start + b_off[0]:data_start + b_off[1]])
+
+            # BF16 → f32
+            scales = np.array([
+                np.frombuffer(s_bytes[i*2:i*2+2], dtype=np.uint16)[0]
+                for i in range(len(s_bytes) // 2)
+            ], dtype=np.uint16).view(np.uint16)
+            scales_f32 = np.array([(int(s) << 16) for s in scales], dtype=np.uint32).view(np.float32)
+
+            biases = np.array([
+                np.frombuffer(b_bytes[i*2:i*2+2], dtype=np.uint16)[0]
+                for i in range(len(b_bytes) // 2)
+            ], dtype=np.uint16)
+            biases_f32 = np.array([(int(b) << 16) for b in biases], dtype=np.uint32).view(np.float32)
+
+            # Dequantize using the actual gate module (avoids 3-bit packing complexity)
+            gate = layers[layer_idx].mlp.gate._original
+            eye = mx.eye(dim)
+            weight_f32 = np.array(gate(eye).astype(mx.float32).T)  # [ne, dim]
+
+            # Add delta
+            delta = trained_gates[layer_idx] - original_gates[layer_idx]
+            weight_f32 += delta
+
+            # Requantize
+            new_w_u32 = np.zeros((rows, packed_cols), dtype=np.uint32)
+            new_scales = np.zeros(rows * n_groups, dtype=np.float32)
+            new_biases = np.zeros(rows * n_groups, dtype=np.float32)
+
+            for row in range(rows):
+                for g in range(n_groups):
+                    col_start = g * group_size
+                    group_vals = weight_f32[row, col_start:col_start + group_size]
+                    vmin = group_vals.min()
+                    vmax = group_vals.max()
+                    max_quant = (1 << bits) - 1
+                    scale = (vmax - vmin) / max_quant if vmax > vmin else 1e-10
+                    bias = vmin
+
+                    new_scales[row * n_groups + g] = scale
+                    new_biases[row * n_groups + g] = bias
+
+                    for w_idx in range(group_size // (32 // bits)):
+                        word = 0
+                        for bit_idx in range(32 // bits):
+                            col = col_start + w_idx * (32 // bits) + bit_idx
+                            if col < cols:
+                                qval = int(np.clip(np.round((weight_f32[row, col] - bias) / scale), 0, max_quant))
+                                word |= (qval << (bit_idx * bits))
+                        new_w_u32[row, col_start * bits // 32 + w_idx] = word
+
+            # Write back weight
+            new_w_bytes = new_w_u32.tobytes()
+            data[data_start + w_off[0]:data_start + w_off[1]] = new_w_bytes
+
+            # Write back scales (f32 → bf16)
+            new_s_u16 = (new_scales.view(np.uint32) >> 16).astype(np.uint16)
+            data[data_start + s_off[0]:data_start + s_off[1]] = new_s_u16.tobytes()
+
+            # Write back biases (f32 → bf16)
+            new_b_u16 = (new_biases.view(np.uint32) >> 16).astype(np.uint16)
+            data[data_start + b_off[0]:data_start + b_off[1]] = new_b_u16.tobytes()
+
+            merged += 1
+
+        # Write modified file
+        with open(st_path, "wb") as f:
+            f.write(bytes(data))
+
+    return merged
+
+
 def patch_model(model, collector, dim, k):
     layers = model.language_model.layers
     n_hooked = 0
@@ -357,10 +510,9 @@ def main():
             total_targets = sum(len(v) for v in layer_targets.values())
             print(f"  Collected {total_targets} routing targets across {len(original_gates)} layers")
 
-            # REINFORCE training: conservative — the original router was trained
-            # on trillions of tokens. We're nudging it, not replacing it.
-            lr = 0.0  # Zero LR = no training, just test dequant→dense replacement
-            n_steps = 1
+            # REINFORCE training: conservative nudge, not replacement.
+            lr = 5e-4
+            n_steps = 10
             trained_gates = {}
 
             for layer_idx, targets in sorted(layer_targets.items()):
@@ -416,18 +568,27 @@ def main():
                     delta = np.abs(w - original_gates[layer_idx]).max()
                     print(f"  L{layer_idx}: max_delta={delta:.6f}, {len(targets)} targets")
 
-            # Apply trained weights: replace quantized gate with dense Linear
-            print(f"\n  Applying trained router weights...")
+            # Save deltas to file for Rust merge (handles 3-bit packing correctly)
+            deltas_path = os.path.expanduser("~/.nanobot/router_deltas.npz")
+            delta_arrays = {}
+            for layer_idx, trained_w in trained_gates.items():
+                delta = trained_w - original_gates[layer_idx]
+                delta_arrays[f"layer_{layer_idx}"] = delta.astype(np.float32)
+            np.savez(deltas_path, **delta_arrays)
+            print(f"\n  Saved {len(delta_arrays)} layer deltas to {deltas_path}")
+            print(f"  To merge: cargo test --features ane,mlx --release --lib -- 'merge_router_deltas_from_npz' --nocapture --ignored")
+
+            # For now, apply trained weights directly (lossy but instant feedback)
+            # The merge-on-disk path through Rust is the production path.
+            print(f"\n  Applying trained router weights (in-memory, lossy)...")
+            import mlx.nn as nn_mod
             for layer_idx, trained_w in trained_gates.items():
                 layer = layers[layer_idx]
-                # Create a dense Linear to replace the quantized gate
-                import mlx.nn as nn
-                dense_gate = nn.Linear(dim, ne, bias=False)
+                dense_gate = nn_mod.Linear(dim, ne, bias=False)
                 dense_gate.weight = mx.array(trained_w.astype(np.float32))
-                # Replace the GateWrapper's original with the dense gate
                 layer.mlp.gate._original = dense_gate
             mx.eval(*[layers[l].mlp.gate._original.weight for l in trained_gates])
-            print(f"  {len(trained_gates)} layers updated (quantized → dense)")
+            print(f"  {len(trained_gates)} layers updated")
 
             # Re-eval with trained router
             print(f"\n{'='*60}")
