@@ -82,7 +82,7 @@ mod tests {
             "messages": [
                 {"role": "user", "content": format!("Answer in one word or number only. No explanation. {}", prompt)}
             ],
-            "max_tokens": 30,
+            "max_tokens": 200,
             "temperature": 0.0,
         });
 
