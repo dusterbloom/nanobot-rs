@@ -2149,6 +2149,319 @@ impl LoraBackwardChains {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-layer chained LoRA backward (N layers in one ANE dispatch)
+// ---------------------------------------------------------------------------
+
+/// Chains N layers' LoRA backward into a single ANE dispatch.
+///
+/// Current cost: N dispatches × 400µs overhead + N × 3µs compute = ~4ms for 10 layers.
+/// Chained cost: 1 dispatch × 400µs overhead + N × 3µs compute = ~430µs for 10 layers.
+///
+/// Each layer has a (B^T, A^T) kernel pair wired via IOSurface sharing.
+/// All layers' d_out_grads are pre-loaded before one `eval_chain` call.
+/// Weight IOSurfaces are persistent — loaded once per optimizer step.
+///
+/// Pipeline: [bt_0, at_0, bt_1, at_1, ..., bt_{N-1}, at_{N-1}]
+///   Within layer l: bt_l output[0] → at_l input[0] (IOSurface sharing)
+///   Across layers:  independent — each bt_l.input[0] loaded from CPU
+pub struct LoraMultiLayerChain {
+    stages: Vec<(AneKernel, AneKernel)>,
+    d_out: usize,
+    rank: usize,
+    d_in: usize,
+    seq: usize,
+}
+
+impl LoraMultiLayerChain {
+    /// Compile 2*n_layers kernels and wire IOSurface within each pair.
+    pub fn compile(
+        n_layers: usize,
+        d_in: usize,
+        d_out: usize,
+        rank: usize,
+        seq: usize,
+    ) -> Result<Self, String> {
+        ane_bridge::ane_init()?;
+
+        let bt_oc = rank.max(ANE_MIN_OC);
+        let at_oc = d_in.max(ANE_MIN_OC);
+        let bt_mil = super::ane_mil::gen_dyn_matmul_split_mil(d_out, bt_oc, seq);
+        let at_mil = super::ane_mil::gen_dyn_matmul_split_mil(bt_oc, at_oc, seq);
+
+        let mut stages = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let bt = AneKernel::compile(
+                &bt_mil,
+                None,
+                &[d_out * seq * 4, d_out * bt_oc * 4],
+                &[bt_oc * seq * 4],
+            )
+            .map_err(|e| format!("bt compile layer {l}: {e}"))?;
+
+            let at = AneKernel::compile(
+                &at_mil,
+                None,
+                &[bt_oc * seq * 4, bt_oc * at_oc * 4],
+                &[at_oc * seq * 4],
+            )
+            .map_err(|e| format!("at compile layer {l}: {e}"))?;
+
+            bt.share_output_to(0, &at, 0)
+                .map_err(|e| format!("share_output_to layer {l}: {e}"))?;
+
+            stages.push((bt, at));
+        }
+
+        Ok(Self {
+            stages,
+            d_out,
+            rank,
+            d_in,
+            seq,
+        })
+    }
+
+    pub fn n_layers(&self) -> usize {
+        self.stages.len()
+    }
+
+    /// Load adapter weights for one layer into its persistent IOSurfaces.
+    pub fn load_weights(&self, layer: usize, adapter: &LoraAdapter) {
+        let (ref bt, ref at) = self.stages[layer];
+        let bt_oc = self.rank.max(ANE_MIN_OC);
+        let at_oc = self.d_in.max(ANE_MIN_OC);
+
+        // bt input[1] = B [d_out, bt_oc]
+        if bt_oc == self.rank {
+            bt.write_input(1, &ane_weights::f32_slice_to_bytes(&adapter.b));
+        } else {
+            let mut padded = vec![0.0f32; self.d_out * bt_oc];
+            for row in 0..self.d_out {
+                padded[row * bt_oc..row * bt_oc + self.rank]
+                    .copy_from_slice(&adapter.b[row * self.rank..(row + 1) * self.rank]);
+            }
+            bt.write_input(1, &ane_weights::f32_slice_to_bytes(&padded));
+        }
+
+        // at input[1] = A [bt_oc, at_oc]
+        if bt_oc == self.rank && at_oc == self.d_in {
+            at.write_input(1, &ane_weights::f32_slice_to_bytes(&adapter.a));
+        } else {
+            let mut padded = vec![0.0f32; bt_oc * at_oc];
+            for row in 0..self.rank {
+                padded[row * at_oc..row * at_oc + self.d_in]
+                    .copy_from_slice(&adapter.a[row * self.d_in..(row + 1) * self.d_in]);
+            }
+            at.write_input(1, &ane_weights::f32_slice_to_bytes(&padded));
+        }
+    }
+
+    /// Load weights for all layers from adapters (call after optimizer step).
+    pub fn load_all_weights(&self, adapters: &[&LoraAdapter]) {
+        for (l, adapter) in adapters.iter().enumerate() {
+            self.load_weights(l, adapter);
+        }
+    }
+
+    /// Run one layer's backward: write grad, dispatch 2-kernel chain, read back.
+    /// Weights are persistent — no reload needed per call.
+    pub fn eval_single(
+        &self,
+        layer: usize,
+        d_out_grad: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        assert_eq!(
+            d_out_grad.len(),
+            self.d_out * self.seq,
+            "d_out_grad shape mismatch"
+        );
+        let (ref bt, ref at) = self.stages[layer];
+        bt.write_input(0, &ane_weights::f32_slice_to_bytes(d_out_grad));
+        AneKernel::eval_chain(&[bt, at])?;
+        self.read_layer_output(layer)
+    }
+
+    /// Run all N layers in one dispatch. Returns per-layer (dx_lora, dh).
+    pub fn eval_all(
+        &self,
+        d_out_grads: &[&[f32]],
+    ) -> Result<Vec<(Vec<f32>, Vec<f32>)>, String> {
+        assert_eq!(d_out_grads.len(), self.stages.len());
+
+        // Load all d_out_grads into bt kernels' input[0]
+        for (l, grad) in d_out_grads.iter().enumerate() {
+            assert_eq!(
+                grad.len(),
+                self.d_out * self.seq,
+                "d_out_grad[{l}] shape mismatch"
+            );
+            self.stages[l]
+                .0
+                .write_input(0, &ane_weights::f32_slice_to_bytes(grad));
+        }
+
+        // Single dispatch for all 2N kernels
+        let refs: Vec<&AneKernel> = self
+            .stages
+            .iter()
+            .flat_map(|(bt, at)| [bt, at])
+            .collect();
+        AneKernel::eval_chain(&refs)?;
+
+        // Read back results
+        let mut results = Vec::with_capacity(self.stages.len());
+        for l in 0..self.stages.len() {
+            results.push(self.read_layer_output(l)?);
+        }
+        Ok(results)
+    }
+
+    /// Run all N layers with real-time dispatch mode (lower per-dispatch latency).
+    pub fn eval_all_realtime(
+        &self,
+        d_out_grads: &[&[f32]],
+    ) -> Result<Vec<(Vec<f32>, Vec<f32>)>, String> {
+        assert_eq!(d_out_grads.len(), self.stages.len());
+        for (l, grad) in d_out_grads.iter().enumerate() {
+            self.stages[l]
+                .0
+                .write_input(0, &ane_weights::f32_slice_to_bytes(grad));
+        }
+        let refs: Vec<&AneKernel> = self
+            .stages
+            .iter()
+            .flat_map(|(bt, at)| [bt, at])
+            .collect();
+        AneKernel::eval_chain_realtime(&refs)?;
+        let mut results = Vec::with_capacity(self.stages.len());
+        for l in 0..self.stages.len() {
+            results.push(self.read_layer_output(l)?);
+        }
+        Ok(results)
+    }
+
+    /// Read dx_lora and dh from a layer's output IOSurfaces.
+    fn read_layer_output(&self, layer: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let bt_oc = self.rank.max(ANE_MIN_OC);
+        let at_oc = self.d_in.max(ANE_MIN_OC);
+        let (ref bt, ref at) = self.stages[layer];
+
+        // dx_lora from at output[0]
+        let mut dx_bytes = vec![0u8; at_oc * self.seq * 4];
+        at.read_output(0, &mut dx_bytes);
+        let dx_full = ane_weights::bytes_to_f32_vec(&dx_bytes);
+        let dx_lora = if at_oc == self.d_in {
+            dx_full
+        } else {
+            let mut dx = vec![0.0f32; self.d_in * self.seq];
+            for ch in 0..self.d_in {
+                dx[ch * self.seq..(ch + 1) * self.seq]
+                    .copy_from_slice(&dx_full[ch * self.seq..(ch + 1) * self.seq]);
+            }
+            dx
+        };
+
+        // dh from bt output[0]
+        let mut dh_bytes = vec![0u8; bt_oc * self.seq * 4];
+        bt.read_output(0, &mut dh_bytes);
+        let dh_full = ane_weights::bytes_to_f32_vec(&dh_bytes);
+        let dh = if bt_oc == self.rank {
+            dh_full
+        } else {
+            let mut dh = vec![0.0f32; self.rank * self.seq];
+            for ch in 0..self.rank {
+                dh[ch * self.seq..(ch + 1) * self.seq]
+                    .copy_from_slice(&dh_full[ch * self.seq..(ch + 1) * self.seq]);
+            }
+            dh
+        };
+
+        Ok((dx_lora, dh))
+    }
+
+    /// Full backward for one layer: ANE input grads + CPU weight grads.
+    /// Returns (dx_lora, dA, dB). Weights are persistent — no reload needed.
+    pub fn backward_single(
+        &self,
+        layer: usize,
+        adapter: &LoraAdapter,
+        d_out_grad: &[f32],
+        x: &[f32],
+        h: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let (dx_lora, dh) = self.eval_single(layer, d_out_grad)?;
+        let seq = self.seq;
+
+        // dB[o, r] = sum_t d_out_grad[o, t] * h[r, t]
+        let mut db = vec![0.0f32; adapter.d_out * adapter.rank];
+        for o in 0..adapter.d_out {
+            for r in 0..adapter.rank {
+                let mut acc = 0.0f32;
+                for t in 0..seq {
+                    acc += d_out_grad[o * seq + t] * h[r * seq + t];
+                }
+                db[o * adapter.rank + r] = acc;
+            }
+        }
+
+        // dA[r, i] = sum_t dh[r, t] * x[i, t]
+        let mut da = vec![0.0f32; adapter.rank * adapter.d_in];
+        for r in 0..adapter.rank {
+            for i in 0..adapter.d_in {
+                let mut acc = 0.0f32;
+                for t in 0..seq {
+                    acc += dh[r * seq + t] * x[i * seq + t];
+                }
+                da[r * adapter.d_in + i] = acc;
+            }
+        }
+
+        Ok((dx_lora, da, db))
+    }
+}
+
+/// Multi-layer chains for both adapter types, compiled once per bucket.
+pub struct LoraMultiLayerChains {
+    pub wo: Option<LoraMultiLayerChain>,
+    pub w2: Option<LoraMultiLayerChain>,
+}
+
+impl LoraMultiLayerChains {
+    /// Compile multi-layer chains for all adapter types.
+    pub fn compile(lora: &LoraModel, seq: usize) -> Result<Self, String> {
+        let n_layers = lora.layers.len();
+        let first = &lora.layers[0];
+        let wo = if let Some(ref a) = first.wo {
+            Some(LoraMultiLayerChain::compile(
+                n_layers, a.d_in, a.d_out, a.rank, seq,
+            )?)
+        } else {
+            None
+        };
+        let w2 = if let Some(ref a) = first.w2 {
+            Some(LoraMultiLayerChain::compile(
+                n_layers, a.d_in, a.d_out, a.rank, seq,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self { wo, w2 })
+    }
+
+    /// Reload all adapter weights after optimizer step.
+    pub fn reload_all_weights(&self, lora: &LoraModel) {
+        for l in 0..lora.layers.len() {
+            if let (Some(chain), Some(adapter)) = (&self.wo, lora.layers[l].wo.as_ref()) {
+                chain.load_weights(l, adapter);
+            }
+            if let (Some(chain), Some(adapter)) = (&self.w2, lora.layers[l].w2.as_ref()) {
+                chain.load_weights(l, adapter);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router backward chain (full-weight MoE router training on ANE)
 // ---------------------------------------------------------------------------
 
@@ -4484,6 +4797,236 @@ mod tests {
             eprintln!("  backward_cpu:    {cpu_us:.1}µs/iter");
             eprintln!("  chain.backward:  {chain_us:.1}µs/iter");
             eprintln!("  speedup:         {speedup:.2}x");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-layer chain tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_layer_chain_matches_separate() {
+        let n_layers = 10;
+        let dim = 64;
+        let rank = 8;
+        let seq = 16;
+
+        let multi = match LoraMultiLayerChain::compile(n_layers, dim, dim, rank, seq) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping multi-layer chain test: {e}");
+                return;
+            }
+        };
+
+        // Create per-layer adapters with non-zero B
+        let adapters: Vec<LoraAdapter> = (0..n_layers)
+            .map(|l| {
+                let mut a = LoraAdapter::new(rank, dim, dim);
+                for (i, v) in a.b.iter_mut().enumerate() {
+                    *v = ((l * 1000 + i) as f32 * 0.003).sin() * 0.01;
+                }
+                a
+            })
+            .collect();
+        let adapter_refs: Vec<&LoraAdapter> = adapters.iter().collect();
+
+        let grads: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| {
+                (0..dim * seq)
+                    .map(|i| ((l * 500 + i) as f32 * 0.03).cos())
+                    .collect()
+            })
+            .collect();
+        let xs: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| {
+                (0..dim * seq)
+                    .map(|i| ((l * 700 + i) as f32 * 0.01).sin())
+                    .collect()
+            })
+            .collect();
+        let hs: Vec<Vec<f32>> = adapters
+            .iter()
+            .zip(xs.iter())
+            .map(|(a, x)| a.forward_cpu(x, seq).1)
+            .collect();
+
+        // Reference: shared LoraBackwardChain (reload per layer)
+        let single = LoraBackwardChain::compile(dim, dim, rank, seq).unwrap();
+        let mut ref_results = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            single.load_weights(&adapters[l]);
+            let (dx, da, db) = single
+                .backward(&adapters[l], &grads[l], &xs[l], &hs[l])
+                .unwrap();
+            ref_results.push((dx, da, db));
+        }
+
+        // Multi-layer: persistent weights + backward_single per layer
+        multi.load_all_weights(&adapter_refs);
+        let mut chain_results = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let (dx, da, db) = multi
+                .backward_single(l, &adapters[l], &grads[l], &xs[l], &hs[l])
+                .expect("backward_single failed");
+            chain_results.push((dx, da, db));
+        }
+
+        // Compare all layers
+        let mut max_dx_all = 0.0f32;
+        let mut max_da_all = 0.0f32;
+        let mut max_db_all = 0.0f32;
+        for l in 0..n_layers {
+            let max_dx = ref_results[l]
+                .0
+                .iter()
+                .zip(chain_results[l].0.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let max_da = ref_results[l]
+                .1
+                .iter()
+                .zip(chain_results[l].1.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let max_db = ref_results[l]
+                .2
+                .iter()
+                .zip(chain_results[l].2.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            max_dx_all = max_dx_all.max(max_dx);
+            max_da_all = max_da_all.max(max_da);
+            max_db_all = max_db_all.max(max_db);
+        }
+        eprintln!(
+            "multi-layer ({n_layers}L) persistent vs shared: dx={max_dx_all}, dA={max_da_all}, dB={max_db_all}"
+        );
+        assert!(max_dx_all < 0.5, "dx mismatch across layers: {max_dx_all}");
+        assert!(max_da_all < 0.5, "dA mismatch across layers: {max_da_all}");
+        assert!(max_db_all < 0.5, "dB mismatch across layers: {max_db_all}");
+    }
+
+    #[test]
+    #[ignore] // benchmark — run with --nocapture --test-threads=1
+    fn bench_multi_layer_chain_vs_separate() {
+        use std::time::Instant;
+
+        let configs: Vec<(&str, usize, usize, usize, usize, usize)> = vec![
+            ("10L small (64, r=8, seq=16)", 10, 64, 64, 8, 16),
+            ("10L 0.8B Wo (1536, r=8, seq=16)", 10, 1536, 1536, 8, 16),
+            ("10L 35B Wo (2048, r=8, seq=16)", 10, 2048, 2048, 8, 16),
+            ("28L 0.8B Wo (1536, r=8, seq=16)", 28, 1536, 1536, 8, 16),
+        ];
+        let iters = 50;
+
+        for (label, n_layers, d_in, d_out, rank, seq) in &configs {
+            let multi = match LoraMultiLayerChain::compile(*n_layers, *d_in, *d_out, *rank, *seq)
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  {label}: skip: {e}");
+                    continue;
+                }
+            };
+            let single = match LoraBackwardChain::compile(*d_in, *d_out, *rank, *seq) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  {label}: skip single: {e}");
+                    continue;
+                }
+            };
+
+            let adapters: Vec<LoraAdapter> = (0..*n_layers)
+                .map(|l| {
+                    let mut a = LoraAdapter::new(*rank, *d_in, *d_out);
+                    for (i, v) in a.b.iter_mut().enumerate() {
+                        *v = ((l * 1000 + i) as f32 * 0.003).sin() * 0.01;
+                    }
+                    a
+                })
+                .collect();
+            let adapter_refs: Vec<&LoraAdapter> = adapters.iter().collect();
+            let grads: Vec<Vec<f32>> = (0..*n_layers)
+                .map(|l| {
+                    (0..d_out * seq)
+                        .map(|i| ((l * 500 + i) as f32 * 0.03).cos())
+                        .collect()
+                })
+                .collect();
+            let grad_refs: Vec<&[f32]> = grads.iter().map(|g| g.as_slice()).collect();
+
+            // Pre-load all weights
+            multi.load_all_weights(&adapter_refs);
+
+            // Warm up all paths
+            let _ = multi.eval_all(&grad_refs);
+            for l in 0..*n_layers {
+                let _ = multi.eval_single(l, &grads[l]);
+            }
+            for l in 0..*n_layers {
+                single.load_weights(&adapters[l]);
+                let _ = single.eval(&grads[l]);
+            }
+
+            // (A) Shared chain + weight reload per layer (current production path)
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                for l in 0..*n_layers {
+                    single.load_weights(&adapters[l]);
+                    let _ = single.eval(&grads[l]);
+                }
+            }
+            let shared_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            // (B) Per-layer persistent kernels, N × eval_chain(2)
+            let t1 = Instant::now();
+            for _ in 0..iters {
+                for l in 0..*n_layers {
+                    let _ = multi.eval_single(l, &grads[l]);
+                }
+            }
+            let persistent_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+            // (C) Per-layer persistent kernels, 1 × eval_chain(2N)
+            let t2 = Instant::now();
+            for _ in 0..iters {
+                let _ = multi.eval_all(&grad_refs);
+            }
+            let batch_us = t2.elapsed().as_micros() as f64 / iters as f64;
+
+            // (D) Real-time dispatch: 1 × eval_chain_realtime(2N)
+            let rt_ok = AneKernel::begin_realtime();
+            let t3 = Instant::now();
+            for _ in 0..iters {
+                let _ = multi.eval_all_realtime(&grad_refs);
+            }
+            let rt_us = t3.elapsed().as_micros() as f64 / iters as f64;
+            if rt_ok {
+                AneKernel::end_realtime();
+            }
+
+            let kernels = n_layers * 2;
+            eprintln!("\n{label} ({kernels} kernels):");
+            eprintln!(
+                "  (A) shared+reload:     {shared_us:>8.1}µs  ({:.1}µs/layer)",
+                shared_us / *n_layers as f64
+            );
+            eprintln!(
+                "  (B) persistent+N×2:    {persistent_us:>8.1}µs  ({:.1}µs/layer)  {:.2}x vs A",
+                persistent_us / *n_layers as f64,
+                shared_us / persistent_us
+            );
+            eprintln!(
+                "  (C) persistent+1×{kernels:<3}:  {batch_us:>8.1}µs  ({:.1}µs/layer)  {:.2}x vs A",
+                batch_us / *n_layers as f64,
+                shared_us / batch_us
+            );
+            eprintln!(
+                "  (D) realtime+1×{kernels:<3}:    {rt_us:>8.1}µs  ({:.1}µs/layer)  {:.2}x vs A",
+                rt_us / *n_layers as f64,
+                shared_us / rt_us
+            );
         }
     }
 

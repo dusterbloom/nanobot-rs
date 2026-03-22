@@ -2487,6 +2487,7 @@ pub fn backward_lora_ane_generic_with_lora_kernels<
         lora_kernels,
         None,
         None,
+        None,
     )
 }
 
@@ -2512,6 +2513,34 @@ pub fn backward_lora_ane_prepacked<W: ane_weights::WeightSource>(
         lora_kernels,
         Some(prepacked),
         lora_chains,
+        None,
+    )
+}
+
+/// Backward with multi-layer chains (persistent weights, 1.4x faster).
+pub fn backward_lora_ane_prepacked_multi<W: ane_weights::WeightSource>(
+    bwd_kernels: &BackwardKernels,
+    model: &W,
+    fwd: &ane_forward::ForwardResultWithLora,
+    lora: &super::ane_lora::LoraModel,
+    loss_scale: f32,
+    residual_scale: f32,
+    lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
+    prepacked: &mut ane_weights::PrePackedWeights,
+    lora_chains: Option<&super::ane_lora::LoraBackwardChains>,
+    multi_chains: Option<&super::ane_lora::LoraMultiLayerChains>,
+) -> BackwardResultWithLora {
+    backward_lora_ane_impl(
+        bwd_kernels,
+        model,
+        fwd,
+        lora,
+        loss_scale,
+        residual_scale,
+        lora_kernels,
+        Some(prepacked),
+        lora_chains,
+        multi_chains,
     )
 }
 
@@ -2525,6 +2554,7 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
     lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
     mut prepacked: Option<&mut ane_weights::PrePackedWeights>,
     lora_chains: Option<&super::ane_lora::LoraBackwardChains>,
+    multi_chains: Option<&super::ane_lora::LoraMultiLayerChains>,
 ) -> BackwardResultWithLora {
     use super::ane_lora;
 
@@ -2609,6 +2639,7 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
         let lw = &*lw_cow;
         let use_ane_w2_grads = lora_kernels.and_then(|k| k.w2.as_ref()).is_some();
         let has_w2_chain = lora_chains.and_then(|c| c.w2.as_ref()).is_some();
+        let has_w2_multi = multi_chains.and_then(|c| c.w2.as_ref()).is_some();
 
         // --- PARALLEL: ANE ffn_bwd_w2t || LoRA W2 grad + W1/W3 pre-transpose ---
         // ANE kernel is !Send, stays on calling thread. CPU work on a scoped thread.
@@ -2621,7 +2652,7 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             // Spawn CPU work: LoRA W2 backward (CPU only when no ANE grads & no chain)
             // + (if not prepacked) W1/W3 clone
             let cpu_handle = s.spawn(|| {
-                let w2_grads = if use_ane_w2_grads || has_w2_chain {
+                let w2_grads = if use_ane_w2_grads || has_w2_chain || has_w2_multi {
                     None // ANE grad kernels or chain handle W2 on main thread
                 } else if let (Some(w2_adapter), Some(w2_x), Some(w2_h)) = (
                     lora.layers[l].w2.as_ref(),
@@ -2697,8 +2728,39 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                 *g += v;
             }
         }
-        // W2 chain path: deferred from CPU thread because chain is !Send
-        if has_w2_chain && !use_ane_w2_grads {
+        // W2 multi-layer chain (persistent weights, no reload — 1.4x faster)
+        let w2_grads_done = if has_w2_multi && !use_ane_w2_grads {
+            if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg), Some(chain)) = (
+                lora.layers[l].w2.as_ref(),
+                la.w2_x.as_ref(),
+                la.w2_h.as_ref(),
+                lora_grads.layers[l].w2.as_mut(),
+                multi_chains.and_then(|c| c.w2.as_ref()),
+            ) {
+                let scaled_dffn: Vec<f32> = dffn.iter().map(|&v| v * scale).collect();
+                match chain.backward_single(l, w2_adapter, &scaled_dffn, w2_x, w2_h) {
+                    Ok((_dx, da, db)) => {
+                        for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                            *g += v;
+                        }
+                        for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                            *g += v;
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!("ANE LoRA W2 multi-chain failed: {e}");
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // W2 shared chain fallback (reload weights per layer)
+        if !w2_grads_done && has_w2_chain && !use_ane_w2_grads {
             if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg), Some(chain)) = (
                 lora.layers[l].w2.as_ref(),
                 la.w2_x.as_ref(),
@@ -2834,7 +2896,7 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
 
         _prof_rmsnorm_us += _t_rmsnorm.elapsed().as_micros() as u64;
 
-        // --- LoRA Wo backward: chain (ANE) → AdapterWeightGradKernels → backward_cpu ---
+        // --- LoRA Wo backward: multi-chain → chain → AdapterWeightGradKernels → CPU ---
         let _t_lora = std::time::Instant::now();
         if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) = (
             lora.layers[l].wo.as_ref(),
@@ -2843,18 +2905,30 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             lora_grads.layers[l].wo.as_mut(),
         ) {
             let scaled_dx2: Vec<f32> = dx2.iter().map(|&v| v * scale).collect();
-            // Try chained ANE backward first (13.81x faster than CPU)
-            let grads = if let Some(chain) = lora_chains.and_then(|c| c.wo.as_ref()) {
-                match chain.backward(wo_adapter, &scaled_dx2, wo_x, wo_h) {
+            // Try multi-layer chain first (persistent weights, 1.4x faster)
+            let grads = if let Some(chain) = multi_chains.and_then(|c| c.wo.as_ref()) {
+                match chain.backward_single(l, wo_adapter, &scaled_dx2, wo_x, wo_h) {
                     Ok((_dx, da, db)) => Some((da, db)),
                     Err(e) => {
-                        tracing::warn!("ANE LoRA Wo chain fell back: {e}");
+                        tracing::warn!("ANE LoRA Wo multi-chain fell back: {e}");
                         None
                     }
                 }
             } else {
                 None
             };
+            // Fall back to shared chain (reload weights per layer)
+            let grads = grads.or_else(|| {
+                lora_chains.and_then(|c| c.wo.as_ref()).and_then(|chain| {
+                    match chain.backward(wo_adapter, &scaled_dx2, wo_x, wo_h) {
+                        Ok((_dx, da, db)) => Some((da, db)),
+                        Err(e) => {
+                            tracing::warn!("ANE LoRA Wo chain fell back: {e}");
+                            None
+                        }
+                    }
+                })
+            });
             // Fall back to AdapterWeightGradKernels
             let grads = grads.or_else(|| {
                 lora_kernels

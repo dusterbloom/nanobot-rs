@@ -762,6 +762,8 @@ struct AneTrainerSession {
     bucket_lora_grad_kernels: Vec<(usize, super::ane_lora::LoraWeightGradKernels)>,
     /// Chained LoRA backward kernels per bucket seq_len (13.81x faster than backward_cpu).
     bucket_lora_bwd_chains: Vec<(usize, super::ane_lora::LoraBackwardChains)>,
+    /// Multi-layer chained backward (persistent weights, 1.4x faster than shared chains).
+    bucket_lora_multi_chains: Vec<(usize, super::ane_lora::LoraMultiLayerChains)>,
     /// Pre-packed weight buffers per bucket seq_len (Orion delta patching).
     prepacked_weights: Vec<(usize, super::ane_weights::PrePackedWeights)>,
     /// BLOBFILE classifier kernel for fused CE (1 ANE slot, per-tile hotswap).
@@ -881,6 +883,7 @@ impl AneTrainerSession {
             bucket_kernels: BucketKernels::empty(),
             bucket_lora_grad_kernels: Vec::new(),
             bucket_lora_bwd_chains: Vec::new(),
+            bucket_lora_multi_chains: Vec::new(),
             prepacked_weights: Vec::new(),
             cls_blob: None,
             pre_recur_primed: false,
@@ -1430,7 +1433,7 @@ impl AneTrainerSession {
     }
 
     fn ensure_lora_bwd_chains(&mut self) -> Result<(), String> {
-        use super::ane_lora::LoraBackwardChains;
+        use super::ane_lora::{LoraBackwardChains, LoraMultiLayerChains};
 
         for (bucket_seq, _, _) in &self.bucket_kernels.buckets {
             if self
@@ -1443,8 +1446,27 @@ impl AneTrainerSession {
             let chains = LoraBackwardChains::compile(&self.lora, *bucket_seq)?;
             chains.reload_all_weights(&self.lora);
             self.bucket_lora_bwd_chains.push((*bucket_seq, chains));
+
+            // Multi-layer chains (persistent weights per layer, 1.4x faster)
+            if !self
+                .bucket_lora_multi_chains
+                .iter()
+                .any(|(s, _)| *s == *bucket_seq)
+            {
+                match LoraMultiLayerChains::compile(&self.lora, *bucket_seq) {
+                    Ok(mc) => {
+                        mc.reload_all_weights(&self.lora);
+                        self.bucket_lora_multi_chains.push((*bucket_seq, mc));
+                    }
+                    Err(e) => {
+                        tracing::debug!("multi-layer chains compile skip (seq={bucket_seq}): {e}");
+                    }
+                }
+            }
         }
         self.bucket_lora_bwd_chains
+            .sort_by_key(|(seq_len, _)| *seq_len);
+        self.bucket_lora_multi_chains
             .sort_by_key(|(seq_len, _)| *seq_len);
         Ok(())
     }
@@ -1767,6 +1789,7 @@ impl AneTrainerSession {
 
         let bucket_lora_grad_kernels = &self.bucket_lora_grad_kernels;
         let bucket_lora_bwd_chains = &self.bucket_lora_bwd_chains;
+        let bucket_lora_multi_chains = &self.bucket_lora_multi_chains;
         let muon_kernels = self.muon_kernels.as_ref();
         let prepacked_weights = &mut self.prepacked_weights;
         let cls_blob = &self.cls_blob;
@@ -1860,6 +1883,10 @@ impl AneTrainerSession {
                                     .iter()
                                     .find(|(seq_len, _)| *seq_len == sample.bucket_seq)
                                     .map(|(_, chains)| chains);
+                                let multi_chains = bucket_lora_multi_chains
+                                    .iter()
+                                    .find(|(seq_len, _)| *seq_len == sample.bucket_seq)
+                                    .map(|(_, chains)| chains);
                                 let bwd = if cfg.optimizer == AneTrainingOptimizer::AneMuon {
                                     let Some(grad_kernels) = bucket_lora_grad_kernels
                                         .iter()
@@ -1874,7 +1901,7 @@ impl AneTrainerSession {
                                         continue;
                                     };
                                     if let Some(pp) = pp_bwd {
-                                        ane_backward::backward_lora_ane_prepacked(
+                                        ane_backward::backward_lora_ane_prepacked_multi(
                                             bwd_k,
                                             model,
                                             &fwd,
@@ -1884,6 +1911,7 @@ impl AneTrainerSession {
                                             Some(grad_kernels),
                                             pp,
                                             bwd_chains,
+                                            multi_chains,
                                         )
                                     } else {
                                         ane_backward::backward_lora_ane_generic_with_lora_kernels(
@@ -1899,7 +1927,7 @@ impl AneTrainerSession {
                                         )
                                     }
                                 } else if let Some(pp) = pp_bwd {
-                                    ane_backward::backward_lora_ane_prepacked(
+                                    ane_backward::backward_lora_ane_prepacked_multi(
                                         bwd_k,
                                         model,
                                         &fwd,
@@ -1909,6 +1937,7 @@ impl AneTrainerSession {
                                         None,
                                         pp,
                                         bwd_chains,
+                                        multi_chains,
                                     )
                                 } else {
                                     ane_backward::backward_lora_ane_generic(
@@ -2048,6 +2077,9 @@ impl AneTrainerSession {
                 // Reload chain weights after optimizer updated LoRA params
                 for (_, chains) in bucket_lora_bwd_chains.iter() {
                     chains.reload_all_weights(lora);
+                }
+                for (_, mc) in bucket_lora_multi_chains.iter() {
+                    mc.reload_all_weights(lora);
                 }
 
                 // Router training: consume buffered inference routing decisions
