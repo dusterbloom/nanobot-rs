@@ -3439,10 +3439,16 @@ mod tests {
         eprintln!("  Initializing MoE expert cache (32/layer on Metal)...");
         let t_moe = std::time::Instant::now();
         let mut moe_cache = match super::super::candle_moe_cache::MoeExpertCache::new(
-            &model, 32, candle_gqa.device(),
+            &model, 16, candle_gqa.device(),
         ) {
-            Ok(c) => {
+            Ok(mut c) => {
                 eprintln!("  MoE cache: {} layers, 32 experts/layer", c.n_moe_layers());
+                // Pre-warm: compile top-32 experts per layer to Metal Q4_1
+                eprintln!("  Pre-warming cache (8 experts × {} layers)...", c.n_moe_layers());
+                let t_warm = std::time::Instant::now();
+                let compiled = c.pre_warm(&model, 8);
+                let warm_s = t_warm.elapsed().as_secs_f64();
+                eprintln!("  Pre-warmed {compiled} experts in {warm_s:.1}s");
                 Some(c)
             }
             Err(e) => {
@@ -3451,7 +3457,7 @@ mod tests {
             }
         };
         let moe_compile_s = t_moe.elapsed().as_secs_f64();
-        eprintln!("  MoE init: {moe_compile_s:.1}s");
+        eprintln!("  MoE total init: {moe_compile_s:.1}s");
 
         // KV cache
         let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
