@@ -3619,6 +3619,151 @@ pub fn gen_gdn_post_conv_fwd(cfg: &MilConfig) -> FusedLayerMil {
     }
 }
 
+/// Generate GDN single-step recurrence kernel for ANE (Experiment 3).
+///
+/// Computes one timestep of the Gated Delta Network recurrence in fp16 on ANE:
+///   S_new = g * S + beta * (v - g*S @ k) ⊗ k
+///
+/// Per-head loop-unrolled (batch=1 matmul — ANE hangs on batch>1).
+/// y = S_new @ q is computed on CPU after reading back S_new (ANE IOSurface
+/// width constraint prevents W=1 output tensors).
+///
+/// No BLOBFILEs — all weights arrive through IOSurface inputs at runtime.
+///
+/// # Tensor layout
+/// Input 0 (state): `[1, h_v*d_v, 1, d_k]` fp32
+/// Input 1 (vecs):  `[1, h_v*per_head_ch, 1, 16]` fp32
+///   per_head_ch = d_k + d_v + 2*pad_s  (pad_s=16 to keep all channel offsets 16-aligned)
+///   head h at channel h*per_head_ch: [k(d_k) | v(d_v) | g(1, at pad_s boundary) | beta(1)]
+/// Output: `[1, h_v*d_v, 1, d_k]` fp32 — new state S_new
+pub fn gen_gdn_recurrence_step(cfg: &MilConfig) -> KernelSpec {
+    let h_v = cfg.linear_n_value_heads;
+    let d_k = cfg.linear_head_dim;
+    let d_v = cfg.linear_value_head_dim;
+    let state_ch = h_v * d_v;
+    // Per-head layout (no q — y readout done on CPU): [k(d_k) | v(d_v) | g(pad_s) | beta(pad_s)]
+    // pad_s=16: all slice offsets divisible by 16 (ANE channel-alignment constraint).
+    // d_k and d_v are always multiples of 16, so per_head_ch is always a multiple of 16.
+    let pad_s: usize = 16;
+    let per_head_ch = d_k + d_v + 2 * pad_s;
+    let vec_ch = h_v * per_head_ch;
+    let vec_w = 16usize; // ANE minimum IOSurface width
+
+    let mut m = String::with_capacity(16384);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {state_ch}, 1, {d_k}]> state_in, tensor<fp32, [1, {vec_ch}, 1, {vec_w}]> vecs_in) {{"
+    );
+
+    // --- Constants ---
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+
+    // --- Cast inputs to fp16 ---
+    let _ = writeln!(m, "        tensor<fp16, [1,{state_ch},1,{d_k}]> sh = cast(dtype=to16,x=state_in)[name=string(\"sh\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{vec_ch},1,{vec_w}]> vh = cast(dtype=to16,x=vecs_in)[name=string(\"vh\")];");
+
+    // --- Slice vectors (W=0 column only) ---
+    // Per-head layout: head h at channel h*per_head_ch:
+    //   k: [0..d_k)            (16-aligned since d_k is multiple of 16)
+    //   v: [d_k..d_k+d_v)      (16-aligned since d_k is multiple of 16)
+    //   g: [d_k+d_v..+1)       — 16-aligned (pad_s=16)
+    //   b: [d_k+d_v+pad_s..+1) — 16-aligned
+    let _ = writeln!(m, "        tensor<int32, [4]> vslb = const()[name=string(\"vslb\"), val=tensor<int32, [4]>([0,0,0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> vsle = const()[name=string(\"vsle\"), val=tensor<int32, [4]>([1,{vec_ch},1,1])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{vec_ch},1,1]> vecs = slice_by_index(begin=vslb,end=vsle,x=vh)[name=string(\"vecs\")];");
+
+    // --- Per-head loop unroll ---
+    let mut state_parts: Vec<String> = Vec::with_capacity(h_v);
+
+    for h in 0..h_v {
+        let s_off = h * d_v;
+        let s_end = s_off + d_v;
+        let head_base = h * per_head_ch;
+        let k_off = head_base;
+        let k_e = k_off + d_k;
+        let v_off = head_base + d_k;
+        let v_e = v_off + d_v;
+        let g_off = head_base + d_k + d_v;
+        let g_e = g_off + 1;
+        let b_off = head_base + d_k + d_v + pad_s;
+        let b_e = b_off + 1;
+
+        // Slice state_h: [1, d_v, 1, d_k]
+        let _ = writeln!(m, "        tensor<int32, [4]> sb{h} = const()[name=string(\"sb{h}\"), val=tensor<int32, [4]>([0,{s_off},0,0])];");
+        let _ = writeln!(m, "        tensor<int32, [4]> se{h} = const()[name=string(\"se{h}\"), val=tensor<int32, [4]>([1,{s_end},1,{d_k}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{d_v},1,{d_k}]> Sh{h} = slice_by_index(begin=sb{h},end=se{h},x=sh)[name=string(\"Sh{h}\")];");
+
+        // Reshape state to matmul-ready: [1,1,d_v,d_k]
+        let _ = writeln!(m, "        tensor<int32, [4]> mr{h} = const()[name=string(\"mr{h}\"), val=tensor<int32, [4]>([1,1,{d_v},{d_k}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{d_v},{d_k}]> Sm{h} = reshape(shape=mr{h},x=Sh{h})[name=string(\"Sm{h}\")];");
+
+        // Slice k_h: [1,d_k,1,1] → [1,1,d_k,1] (column), [1,1,1,d_k] (row)
+        let _ = writeln!(m, "        tensor<int32, [4]> kb{h} = const()[name=string(\"kb{h}\"), val=tensor<int32, [4]>([0,{k_off},0,0])];");
+        let _ = writeln!(m, "        tensor<int32, [4]> ke{h} = const()[name=string(\"ke{h}\"), val=tensor<int32, [4]>([1,{k_e},1,1])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{d_k},1,1]> ks{h} = slice_by_index(begin=kb{h},end=ke{h},x=vecs)[name=string(\"ks{h}\")];");
+        let _ = writeln!(m, "        tensor<int32, [4]> cvr{h} = const()[name=string(\"cvr{h}\"), val=tensor<int32, [4]>([1,1,{d_k},1])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{d_k},1]> kc{h} = reshape(shape=cvr{h},x=ks{h})[name=string(\"kc{h}\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,1,{d_k}]> kr{h} = transpose(perm=pm,x=kc{h})[name=string(\"kr{h}\")];");
+
+        // Slice v_h: [1,d_v,1,1] → [1,1,d_v,1]
+        let _ = writeln!(m, "        tensor<int32, [4]> vb{h} = const()[name=string(\"vb{h}\"), val=tensor<int32, [4]>([0,{v_off},0,0])];");
+        let _ = writeln!(m, "        tensor<int32, [4]> ve{h} = const()[name=string(\"ve{h}\"), val=tensor<int32, [4]>([1,{v_e},1,1])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{d_v},1,1]> vs{h} = slice_by_index(begin=vb{h},end=ve{h},x=vecs)[name=string(\"vs{h}\")];");
+        let _ = writeln!(m, "        tensor<int32, [4]> dvr{h} = const()[name=string(\"dvr{h}\"), val=tensor<int32, [4]>([1,1,{d_v},1])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{d_v},1]> vc{h} = reshape(shape=dvr{h},x=vs{h})[name=string(\"vc{h}\")];");
+
+        // Slice g_h and beta_h: scalars [1,1,1,1]
+        let _ = writeln!(m, "        tensor<int32, [4]> gb{h} = const()[name=string(\"gb{h}\"), val=tensor<int32, [4]>([0,{g_off},0,0])];");
+        let _ = writeln!(m, "        tensor<int32, [4]> ge{h} = const()[name=string(\"ge{h}\"), val=tensor<int32, [4]>([1,{g_e},1,1])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,1,1]> gv{h} = slice_by_index(begin=gb{h},end=ge{h},x=vecs)[name=string(\"gv{h}\")];");
+        let _ = writeln!(m, "        tensor<int32, [4]> bb{h} = const()[name=string(\"bb{h}\"), val=tensor<int32, [4]>([0,{b_off},0,0])];");
+        let _ = writeln!(m, "        tensor<int32, [4]> be{h} = const()[name=string(\"be{h}\"), val=tensor<int32, [4]>([1,{b_e},1,1])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,1,1]> bv{h} = slice_by_index(begin=bb{h},end=be{h},x=vecs)[name=string(\"bv{h}\")];");
+
+        // ===== Recurrence: S_new = g*S + beta*(v - g*S@k) ⊗ k =====
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{d_v},{d_k}]> S1_{h} = mul(x=Sm{h},y=gv{h})[name=string(\"S1_{h}\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{d_v},1]> kvm{h} = matmul(transpose_x=bF,transpose_y=bF,x=S1_{h},y=kc{h})[name=string(\"kvm{h}\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{d_v},1]> df{h} = sub(x=vc{h},y=kvm{h})[name=string(\"df{h}\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{d_v},1]> dl{h} = mul(x=df{h},y=bv{h})[name=string(\"dl{h}\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{d_v},{d_k}]> ot{h} = matmul(transpose_x=bF,transpose_y=bF,x=dl{h},y=kr{h})[name=string(\"ot{h}\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{d_v},{d_k}]> Sn{h} = add(x=S1_{h},y=ot{h})[name=string(\"Sn{h}\")];");
+
+        // Reshape back to [1,d_v,1,d_k] for concat/output
+        let _ = writeln!(m, "        tensor<int32, [4]> dvdk{h} = const()[name=string(\"dvdk{h}\"), val=tensor<int32, [4]>([1,{d_v},1,{d_k}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{d_v},1,{d_k}]> snf{h} = reshape(shape=dvdk{h},x=Sn{h})[name=string(\"snf{h}\")];");
+
+        state_parts.push(format!("snf{h}"));
+    }
+
+    // ===== Concatenate all heads into full state =====
+    if h_v == 1 {
+        let _ = writeln!(m, "        tensor<int32, [4]> sna_r = const()[name=string(\"snar\"), val=tensor<int32, [4]>([1,{state_ch},1,{d_k}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{state_ch},1,{d_k}]> sn_all = reshape(shape=sna_r,x=snf0)[name=string(\"sna\")];");
+    } else {
+        let state_vals = state_parts.join(",");
+        let _ = writeln!(m, "        tensor<fp16, [1,{state_ch},1,{d_k}]> sn_all = concat(values=({state_vals}),axis=cax,interleave=bF)[name=string(\"sna\")];");
+    }
+
+    // Single output: updated state [1, state_ch, 1, d_k] fp32
+    let _ = writeln!(m, "        tensor<fp32, [1,{state_ch},1,{d_k}]> s_out = cast(dtype=to32,x=sn_all)[name=string(\"sout\")];");
+    let _ = writeln!(m, "    }} -> (s_out);");
+    m.push_str("}\n");
+
+    let state_bytes = state_ch * d_k * 4;
+    let vecs_bytes = vec_ch * vec_w * 4;
+
+    KernelSpec {
+        mil_text: m,
+        input_bytes: state_bytes + vecs_bytes,
+        output_bytes: state_bytes,
+    }
+}
+
 /// Generate a single BLOBFILE matmul kernel: out = x @ W.
 ///
 /// Input: `[1, in_dim, 1, seq]` fp32.
