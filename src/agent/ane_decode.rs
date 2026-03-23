@@ -724,7 +724,7 @@ pub fn decode_step(model: &ModelWeights, token: u32, kv_cache: &mut KvCache) -> 
 /// Routes each layer to the optimal hardware:
 ///   30 GDN layers → ANE conv1x1 projections + CPU recurrence
 ///   10 GQA layers → Candle Metal attention with KV cache
-///   40 MoE FFN   → Candle Metal QMatMul (pre-compiled Q4_1, zero CPU dequant)
+///   40 MoE FFN   → Candle Metal QMatMul (lazy cached Q4_1, zero CPU dequant)
 #[cfg(feature = "candle")]
 pub fn decode_step_hybrid(
     model: &ModelWeights,
@@ -732,7 +732,7 @@ pub fn decode_step_hybrid(
     kv_cache: &mut KvCache,
     gdn_ane: Option<&GdnAneKernels>,
     candle_gqa: &mut super::candle_attn::CandleGqaLayers,
-    candle_moe: Option<&[super::candle_moe::CandleMoeExperts]>,
+    mut moe_cache: Option<&mut super::candle_moe_cache::MoeExpertCache>,
 ) -> DecodeResult {
     let cfg = &model.cfg;
     let dim = cfg.dim;
@@ -791,15 +791,11 @@ pub fn decode_step_hybrid(
             }
         }
 
-        // ── MoE FFN: Candle Metal QMatMul (pre-compiled, zero CPU dequant) ──
+        // ── MoE FFN: Candle Metal QMatMul (lazy cached Q4_1) ──
         if let Some(ref moe_w) = lw.moe {
             let adapter_gate = model.router_adapter.as_ref().and_then(|a| a.gate_for_layer(l));
-            if let Some(moe_layers) = candle_moe {
-                if let Some(moe_expert_cache) = moe_layers.get(l) {
-                    moe_expert_cache.forward(moe_w, &mut x, &lw.rms_ffn, cfg.rms_eps, l, adapter_gate);
-                } else {
-                    moe_forward_with_adapter(moe_w, &mut x, &lw.rms_ffn, cfg, l, model.router_adapter.as_ref());
-                }
+            if let Some(ref mut cache) = moe_cache {
+                cache.forward(l, moe_w, &mut x, &lw.rms_ffn, cfg.rms_eps, adapter_gate);
             } else {
                 moe_forward_with_adapter(moe_w, &mut x, &lw.rms_ffn, cfg, l, model.router_adapter.as_ref());
             }
@@ -3438,17 +3434,24 @@ mod tests {
         };
 
         // Compile MoE experts to Metal QMatMul (one-time, ~60s for 256 experts × 40 layers)
-        // Compile MoE experts for first MoE layer only (proof of concept).
-        // Full compilation of 256×40 layers = 46 GB — exceeds unified memory.
-        // Production path: lazy cache of top-32 popular experts per layer.
-        eprintln!("  Compiling MoE experts to Metal Q4_1 (layer 0 only)...");
+        // Lazy MoE expert cache: 32 experts/layer on Metal, LRU eviction.
+        // Memory: 32 × 3 × 1.5 MB × 40 layers ≈ 5.6 GB (fits in unified memory).
+        eprintln!("  Initializing MoE expert cache (32/layer on Metal)...");
         let t_moe = std::time::Instant::now();
-        let candle_moe: Option<&[super::super::candle_moe::CandleMoeExperts]> = None;
-        // For now, use CPU MoE fallback — Metal QMatMul MoE needs lazy expert cache
-        // to avoid OOM (256 experts × 3 projections × 40 layers = 46 GB).
-        // The architecture is correct; the memory management needs work.
+        let mut moe_cache = match super::super::candle_moe_cache::MoeExpertCache::new(
+            &model, 32, candle_gqa.device(),
+        ) {
+            Ok(c) => {
+                eprintln!("  MoE cache: {} layers, 32 experts/layer", c.n_moe_layers());
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("  MoE cache FAILED: {e} — CPU fallback");
+                None
+            }
+        };
         let moe_compile_s = t_moe.elapsed().as_secs_f64();
-        eprintln!("  MoE: CPU fallback (Metal QMatMul needs lazy expert cache)");
+        eprintln!("  MoE init: {moe_compile_s:.1}s");
 
         // KV cache
         let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
@@ -3456,7 +3459,7 @@ mod tests {
 
         // Warmup
         eprintln!("\n── Hybrid decode benchmark ──");
-        let _ = decode_step_hybrid(&model, 1, &mut cache, gdn_ane.as_ref(), &mut candle_gqa, candle_moe);
+        let _ = decode_step_hybrid(&model, 1, &mut cache, gdn_ane.as_ref(), &mut candle_gqa, moe_cache.as_mut());
 
         // Reset
         cache = KvCache::new(&model.cfg, model.layers.len(), 64);
@@ -3469,7 +3472,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for i in 0..n_tokens {
             let t_start = std::time::Instant::now();
-            let result = decode_step_hybrid(&model, token, &mut cache, gdn_ane.as_ref(), &mut candle_gqa, candle_moe);
+            let result = decode_step_hybrid(&model, token, &mut cache, gdn_ane.as_ref(), &mut candle_gqa, moe_cache.as_mut());
             let ms = t_start.elapsed().as_secs_f64() * 1000.0;
             token = sample_argmax(&result.logits);
             eprintln!("  Token {}: {ms:.1}ms → id={token}", i + 1);

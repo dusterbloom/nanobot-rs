@@ -37,6 +37,8 @@ pub mod audit;
 pub mod candle_attn;
 #[cfg(feature = "candle")]
 pub mod candle_moe;
+#[cfg(feature = "candle")]
+pub mod candle_moe_cache;
 #[cfg(feature = "ane")]
 pub mod router_adapter;
 #[cfg(test)]
