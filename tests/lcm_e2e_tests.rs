@@ -189,10 +189,24 @@ async fn test_compaction_creates_summary_node() {
 
     engine.ingest(json!({"role": "system", "content": "System"}));
     for i in 0..10 {
-        engine.ingest(
-            json!({"role": "user", "content": format!("Question {} about Rust ownership", i)}),
-        );
-        engine.ingest(json!({"role": "assistant", "content": format!("Answer {} explains borrowing rules", i)}));
+        engine.ingest(json!({
+            "role": "user",
+            "content": format!(
+                "Tell me about Rust ownership, borrowing, and lifetimes in detail. Turn {}. \
+                 I need a comprehensive explanation with examples and edge cases.",
+                i
+            )
+        }));
+        engine.ingest(json!({
+            "role": "assistant",
+            "content": format!(
+                "Rust ownership is a memory safety feature. Each value has exactly one owner. \
+                 When the owner goes out of scope, the value is dropped. Borrowing allows \
+                 temporary references. Lifetimes annotate how long references are valid. \
+                 This is turn {} of our conversation about memory management in Rust.",
+                i
+            )
+        }));
     }
 
     let budget = TokenBudget::new(4096, 2048);

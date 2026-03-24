@@ -576,6 +576,7 @@ mod tests {
     /// # Step 2: Run eval (sends probes to oMLX, drains routing file, trains)
     /// cargo test --features ane,mlx --release --lib -- "eval_reinforce" --nocapture --ignored --test-threads=1
     /// ```
+    #[cfg(feature = "ane")]
     #[test]
     #[ignore]
     fn eval_reinforce() {
@@ -665,8 +666,11 @@ mod tests {
         for (layer, target) in all_targets {
             if layer < n_layers { per_layer[layer].push(target); }
         }
-        let moe_layers: Vec<usize> = per_layer.iter().enumerate()
-            .filter(|(_, v)| !v.is_empty()).map(|(i, _)| i).collect();
+        let moe_layers: Vec<usize> = per_layer
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| (!v.is_empty()).then_some(i))
+            .collect();
         eprintln!("  {ne} experts, dim={dim}, {} MoE layers", moe_layers.len());
 
         // Load real router weights from model safetensors
@@ -683,7 +687,7 @@ mod tests {
         // need to be exact — the gradient will push weights in the right
         // direction regardless of starting point.
         eprintln!("  Initializing router from routing target statistics...");
-        let std_dev = (2.0 / (ne + dim) as f32).sqrt();
+        let std_dev = (2.0f32 / (ne + dim) as f32).sqrt();
         let router_weights: Vec<Option<Vec<f32>>> = (0..n_layers).map(|l| {
             if per_layer[l].is_empty() { None }
             else {
@@ -714,7 +718,7 @@ mod tests {
 
         let max_delta: f32 = moe_layers.iter().map(|&l| {
             rt.weights[l].iter().zip(original_weights[l].iter())
-                .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+                .map(|(a, b)| (*a - *b).abs()).fold(0.0f32, f32::max)
         }).fold(0.0f32, f32::max);
         eprintln!("  Max weight delta: {max_delta:.6}");
 

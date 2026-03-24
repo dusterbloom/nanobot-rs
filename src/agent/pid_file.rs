@@ -148,8 +148,13 @@ pub fn release_agent_singleton() {
 mod tests {
     use super::*;
 
+    static AGENT_SINGLETON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_agent_singleton_acquire_release() {
+        let _guard = AGENT_SINGLETON_TEST_LOCK.lock().unwrap();
+        let _ = std::fs::remove_file(agent_pid_path());
+
         // acquire writes our PID, release removes it.
         acquire_agent_singleton();
         let contents = std::fs::read_to_string(agent_pid_path()).unwrap();
@@ -161,6 +166,9 @@ mod tests {
 
     #[test]
     fn test_agent_singleton_stale_pid_cleaned() {
+        let _guard = AGENT_SINGLETON_TEST_LOCK.lock().unwrap();
+        let _ = std::fs::remove_file(agent_pid_path());
+
         // Write a dead PID, acquire should overwrite it with ours.
         let _ = std::fs::write(agent_pid_path(), "4000000");
         acquire_agent_singleton();
