@@ -387,9 +387,12 @@ impl AgentLoop {
     }
 
     /// Spawn a background reflection task if observations exceed threshold.
+    ///
+    /// Skipped in local mode — the reflection would compete with the main
+    /// request for the single-model GPU, causing OOM or stalls.
     fn spawn_background_reflection(shared: &Arc<AgentLoopShared>) {
         let core = shared.core_handle.swappable();
-        if !core.memory_enabled {
+        if !core.memory_enabled || core.is_local {
             return;
         }
         let reflector = Reflector::new(
