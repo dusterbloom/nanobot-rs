@@ -7961,6 +7961,7 @@ mod tests {
     ///
     /// cargo test --features ane,mlx --release --lib -- "test_router_self_improve_from_omlx" --nocapture --ignored --test-threads=1
     #[test]
+    #[cfg(feature = "mlx")]
     #[ignore = "requires 35B checkpoint + routing_targets.bin from routing_hook.py"]
     fn test_router_self_improve_from_omlx() {
         use crate::agent::ane_lora::RouterTrainer;
