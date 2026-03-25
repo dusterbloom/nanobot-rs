@@ -296,10 +296,14 @@ pub struct AgentDefaults {
     #[serde(default = "default_inference_engine")]
     pub inference_engine: String,
     /// Local backend for `-l` mode: "lmstudio" (default, HTTP to LM Studio),
-    /// "mlx" (MLX model dir + managed/external mlx-lm inference), or
-    /// "omlx" (external oMLX server at `localApiBase`, no managed spawn).
+    /// "mlx" (MLX model dir + managed/external mlx-lm inference),
+    /// "omlx" (external oMLX server at `localApiBase`, no managed spawn), or
+    /// "higgs" (managed Higgs Rust MLX server, auto-started on `higgsPort`).
     #[serde(default = "default_local_backend")]
     pub local_backend: String,
+    /// Port for the managed Higgs server (default: 8091).
+    #[serde(default = "default_higgs_port")]
+    pub higgs_port: u16,
     /// Path to MLX model directory (containing .safetensors + tokenizer.json).
     /// Default: ~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -415,6 +419,10 @@ fn default_lms_port() -> u16 {
     1234
 }
 
+fn default_higgs_port() -> u16 {
+    8091
+}
+
 fn default_local_model() -> String {
     "gemma-3n-e4b-it-Q4_K_M.gguf".to_string()
 }
@@ -429,6 +437,18 @@ fn default_local_api_key() -> String {
 
 fn default_local_backend() -> String {
     "lmstudio".to_string()
+}
+
+/// Whether the local backend is an externally managed server (oMLX).
+/// These skip LM Studio spawn, peer probing, and in-process MLX setup.
+pub fn is_external_server_backend(backend: &str) -> bool {
+    backend == "omlx"
+}
+
+/// Whether the local backend is a managed Higgs server.
+/// Skips LM Studio spawn but auto-starts Higgs as a sidecar.
+pub fn is_higgs_backend(backend: &str) -> bool {
+    backend == "higgs"
 }
 
 fn default_mlx_preset() -> String {
@@ -485,6 +505,7 @@ impl Default for AgentDefaults {
             max_continuations: default_max_continuations(),
             lms_main_model: String::new(),
             lms_port: default_lms_port(),
+            higgs_port: default_higgs_port(),
             inference_engine: default_inference_engine(),
             local_backend: default_local_backend(),
             mlx_model_dir: None,

@@ -13,6 +13,7 @@ mod config;
 mod cron;
 mod errors;
 mod heartbeat;
+mod higgs;
 mod lms;
 mod providers;
 #[cfg(feature = "voice")]

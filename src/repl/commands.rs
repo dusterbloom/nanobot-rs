@@ -459,7 +459,11 @@ impl ReplContext {
             #[cfg(not(feature = "cluster"))]
             let covered_by_cluster = false;
 
-            let is_omlx = self.config.agents.defaults.local_backend == "omlx";
+            let is_omlx = crate::config::schema::is_external_server_backend(
+                &self.config.agents.defaults.local_backend,
+            ) || crate::config::schema::is_higgs_backend(
+                &self.config.agents.defaults.local_backend,
+            );
 
             if !base.is_empty() && !already_covered && !covered_by_cluster {
                 let models_url = {

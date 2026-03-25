@@ -916,6 +916,8 @@ pub(crate) enum InferenceEngine {
     None,
     /// LM Studio via `lms` CLI (daemon mode).
     Lms,
+    /// Higgs Rust MLX server (managed sidecar).
+    Higgs,
 }
 
 pub(crate) struct ServerState {
@@ -964,7 +966,8 @@ impl ServerState {
 /// Resolve which inference engine to use based on config preference.
 ///
 /// Returns `(engine_kind, binary_path)` for the first available engine.
-/// Currently only LM Studio is supported.
+/// Currently only resolves LM Studio. Higgs is handled separately via
+/// `use_higgs` / `is_higgs_backend` in the startup and `/l` paths.
 pub(crate) fn resolve_inference_engine(
     _preference: &str,
 ) -> Option<(InferenceEngine, std::path::PathBuf)> {
@@ -1082,23 +1085,75 @@ pub(crate) fn cmd_agent(
         // When localBackend is "mlx" and we're in local mode, skip all LM Studio
         // setup and use in-process MLX inference instead.
         let use_mlx_local = is_local && config.agents.defaults.local_backend == "mlx";
-        // When localBackend is "omlx", skip LM Studio spawn and peer probing —
-        // the user manages oMLX externally at localApiBase.
-        let use_omlx = is_local && config.agents.defaults.local_backend == "omlx";
+        // When localBackend is "omlx", skip LM Studio spawn and
+        // peer probing — the user manages the server externally at localApiBase.
+        let use_omlx = is_local
+            && crate::config::schema::is_external_server_backend(
+                &config.agents.defaults.local_backend,
+            );
+        // When localBackend is "higgs", auto-start Higgs as a managed sidecar.
+        let use_higgs = is_local
+            && crate::config::schema::is_higgs_backend(
+                &config.agents.defaults.local_backend,
+            );
         // True when the backend requires LM Studio management (spawn, probe, trio, JIT warmup).
-        // False for MLX (in-process) and oMLX (externally managed).
-        let needs_lms = is_local && !use_mlx_local && !use_omlx;
+        // False for MLX (in-process), oMLX (externally managed), and Higgs (managed sidecar).
+        let needs_lms = is_local && !use_mlx_local && !use_omlx && !use_higgs;
         #[cfg(feature = "mlx")]
         if use_mlx_local {
             // Force inference_engine to "mlx" so the MLX provider path activates below.
             config.agents.defaults.inference_engine = "mlx".to_string();
         }
 
+        // Higgs sidecar: auto-start when backend is "higgs" (single-message or interactive).
+        // Start even when localApiBase is set — it may point to the managed Higgs port
+        // from a previous session (Higgs survives nanobot exit but may have been stopped).
+        if use_higgs {
+            let higgs_port = config.agents.defaults.higgs_port;
+            match crate::higgs::resolve_model_dir(&config) {
+                Ok(model_dir) => {
+                    if let Some(bin) = crate::higgs::find_binary() {
+                        match crate::higgs::server_start(&bin, higgs_port, &model_dir).await {
+                            Ok(()) => {
+                                if config.agents.defaults.local_api_base.is_empty() {
+                                    config.agents.defaults.local_api_base =
+                                        format!("http://127.0.0.1:{higgs_port}/v1");
+                                }
+                                config.agents.defaults.skip_jit_gate = true;
+                                // Update model name from running server
+                                if let Some(name) = crate::higgs::get_model_name(higgs_port).await
+                                {
+                                    if config.agents.defaults.lms_main_model.is_empty() {
+                                        config.agents.defaults.lms_main_model = name.clone();
+                                    }
+                                    local_model_name = name;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: failed to start Higgs: {e}");
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "Error: Higgs binary not found. Install with: cargo install higgs"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         // In local mode with single-message (-m), just start main server.
         // Trio is for interactive sessions - single messages use inline tools.
         // When localApiBase is set, skip all local server spawning — use remote server.
         let mut trio_state: Option<ServerState> = None;
-        if !use_mlx_local && !has_remote_local && is_local && message.is_some() {
+        // Recompute has_remote_local — Higgs auto-start may have filled local_api_base.
+        let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
+        if !use_mlx_local && !use_higgs && !has_remote_local && is_local && message.is_some() {
             // Single-message local mode: start LMS if available.
             let mut srv = ServerState::new(local_port.clone());
             let preference = &config.agents.defaults.inference_engine;
@@ -1182,7 +1237,7 @@ pub(crate) fn cmd_agent(
                     }
                 }
             } else {
-                eprintln!("Error: No local inference engine found. Install LM Studio (lms CLI).");
+                eprintln!("Error: No local inference engine found. Install LM Studio (lms CLI) or Higgs (cargo install higgs).");
                 std::process::exit(1);
             }
             trio_state = Some(srv);
@@ -1207,6 +1262,11 @@ pub(crate) fn cmd_agent(
             tui::register_resize_handler();
             let base = &config.agents.defaults.local_api_base;
             tui::print_omlx_splash(base);
+        }
+        if is_interactive && use_higgs {
+            tui::register_resize_handler();
+            let higgs_port = config.agents.defaults.higgs_port;
+            tui::print_higgs_splash(&local_model_name, higgs_port);
         }
         if is_interactive && needs_lms && !has_remote_local {
             tui::register_resize_handler();
@@ -1435,7 +1495,12 @@ pub(crate) fn cmd_agent(
         #[cfg(feature = "mlx")]
         let mlx_handle: Option<cli::MlxHandle> =
             if config.agents.defaults.inference_engine == "mlx"
-                && config.agents.defaults.local_backend != "omlx"
+                && !crate::config::schema::is_external_server_backend(
+                    &config.agents.defaults.local_backend,
+                )
+                && !crate::config::schema::is_higgs_backend(
+                    &config.agents.defaults.local_backend,
+                )
             {
                 match cli::start_mlx_provider(&config) {
                     Ok(h) => Some(h),

@@ -610,19 +610,31 @@ impl ReplContext {
                 println!("  MLX support not compiled in (--features mlx).");
             }
             ModelSource::Omlx { ref endpoint } => {
-                // oMLX uses LRU auto-eviction — just update config, no load/unload.
+                // oMLX/Higgs uses LRU auto-eviction — just update config, no load/unload.
                 // Switch backend away from "mlx" (in-process) so rebuild uses HTTP.
+                // Preserve "higgs" backend if already set (managed sidecar), else use "omlx".
                 self.config.agents.defaults.local_api_base = endpoint.clone();
                 self.config.agents.defaults.local_model = selected.id.clone();
                 self.config.agents.defaults.lms_main_model = selected.id.clone();
-                self.config.agents.defaults.local_backend = "omlx".to_string();
+                if !crate::config::schema::is_higgs_backend(
+                    &self.config.agents.defaults.local_backend,
+                ) {
+                    self.config.agents.defaults.local_backend = "omlx".to_string();
+                }
                 // No longer managed by LM Studio — prevent watchdog auto-restart.
                 self.srv.lms_managed = false;
                 self.current_model_path = PathBuf::from(&selected.id);
                 self.persist_local_config();
                 self.apply_and_rebuild_with(true);
+                let backend_label = if crate::config::schema::is_higgs_backend(
+                    &self.config.agents.defaults.local_backend,
+                ) {
+                    "Higgs"
+                } else {
+                    "oMLX"
+                };
                 println!(
-                    "  Switched to {} (oMLX will load on first request).",
+                    "  Switched to {} ({backend_label} will load on first request).",
                     selected.id
                 );
             }
@@ -1109,120 +1121,204 @@ impl ReplContext {
             // overlapping servers).
             crate::agent::pid_file::cleanup_stale_pids();
 
-            // Try to start LM Studio if no engine is active.
+            // Try to start a local inference engine if none is active.
             if self.config.agents.defaults.local_api_base.is_empty()
                 && !self.srv.lms_managed
                 && self.srv.engine == super::super::InferenceEngine::None
             {
-                let preference = &self.config.agents.defaults.inference_engine;
-                if let Some((super::super::InferenceEngine::Lms, bin)) =
-                    super::super::resolve_inference_engine(preference)
-                {
-                    let lms_port = self.config.agents.defaults.lms_port;
-                    println!(
-                        "\n  {}{}LM Studio{} detected, starting server on port {}...",
-                        tui::BOLD,
-                        tui::YELLOW,
-                        tui::RESET,
-                        lms_port
-                    );
-                    match crate::lms::server_start(&bin, lms_port).await {
-                        Ok(()) => {
-                            let main_model =
-                                if !self.config.agents.defaults.lms_main_model.is_empty() {
-                                    self.config.agents.defaults.lms_main_model.clone()
-                                } else {
-                                    let mn = self
-                                        .current_model_path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(&self.config.agents.defaults.local_model);
-                                    cli::strip_gguf_suffix(mn).to_string()
-                                };
-                            let main_ctx =
-                                Some(self.config.agents.defaults.local_max_context_tokens);
-                            print!("  Loading {}... ", main_model);
-                            io::stdout().flush().ok();
-                            match crate::lms::load_model(
-                                "",
-                                lms_port,
-                                &main_model,
-                                main_ctx,
-                                self.config.timeouts.lms_load_secs,
-                            )
-                            .await
-                            {
-                                Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                                Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                            }
-                            if self.config.trio.enabled {
-                                if !self.config.trio.router_model.is_empty() {
-                                    print!("  Loading {}... ", self.config.trio.router_model);
-                                    io::stdout().flush().ok();
-                                    match crate::lms::load_model(
-                                        "",
-                                        lms_port,
-                                        &self.config.trio.router_model,
-                                        Some(self.config.trio.router_ctx_tokens),
-                                        self.config.timeouts.lms_load_secs,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                                        Err(e) => {
-                                            println!("{}FAILED: {}{}", tui::RED, e, tui::RESET)
+                let is_higgs = crate::config::schema::is_higgs_backend(
+                    &self.config.agents.defaults.local_backend,
+                );
+
+                if is_higgs {
+                    // Higgs managed sidecar
+                    match crate::higgs::resolve_model_dir(&self.config) {
+                        Ok(model_dir) => {
+                            if let Some(bin) = crate::higgs::find_binary() {
+                                let port = self.config.agents.defaults.higgs_port;
+                                println!(
+                                    "\n  {}{}Higgs{} starting on port {port}...",
+                                    tui::BOLD, tui::YELLOW, tui::RESET,
+                                );
+                                match crate::higgs::server_start(&bin, port, &model_dir).await {
+                                    Ok(()) => {
+                                        self.srv.engine = super::super::InferenceEngine::Higgs;
+                                        self.srv.local_port = port.to_string();
+                                        if self.config.agents.defaults.local_api_base.is_empty() {
+                                            self.config.agents.defaults.local_api_base =
+                                                format!("http://127.0.0.1:{port}/v1");
+                                        }
+                                        self.config.agents.defaults.skip_jit_gate = true;
+                                        if let Some(name) =
+                                            crate::higgs::get_model_name(port).await
+                                        {
+                                            println!(
+                                                "  {}OK{} · {name}",
+                                                tui::GREEN, tui::RESET
+                                            );
+                                        } else {
+                                            println!("  {}OK{}", tui::GREEN, tui::RESET);
                                         }
                                     }
-                                }
-                                if !self.config.trio.specialist_model.is_empty() {
-                                    print!("  Loading {}... ", self.config.trio.specialist_model);
-                                    io::stdout().flush().ok();
-                                    match crate::lms::load_model(
-                                        "",
-                                        lms_port,
-                                        &self.config.trio.specialist_model,
-                                        Some(self.config.trio.specialist_ctx_tokens),
-                                        self.config.timeouts.lms_load_secs,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                                        Err(e) => {
-                                            println!("{}FAILED: {}{}", tui::RED, e, tui::RESET)
-                                        }
+                                    Err(e) => {
+                                        println!(
+                                            "  {}{}Higgs start failed:{} {e}",
+                                            tui::BOLD, tui::YELLOW, tui::RESET,
+                                        );
+                                        println!(
+                                            "  {}Remaining in cloud mode{}\n",
+                                            tui::DIM, tui::RESET
+                                        );
+                                        return;
                                     }
                                 }
+                            } else {
+                                println!(
+                                    "\n  {}{}Higgs not found.{} Install with: cargo install higgs",
+                                    tui::BOLD, tui::YELLOW, tui::RESET,
+                                );
+                                return;
                             }
-                            self.srv.lms_managed = true;
-                            self.srv.lms_binary = Some(bin);
-                            self.srv.engine = super::super::InferenceEngine::Lms;
-                            self.srv.local_port = lms_port.to_string();
-                            if self.config.agents.defaults.local_api_base.is_empty() {
-                                self.config.agents.defaults.local_api_base =
-                                    format!("http://{}:{}/v1", crate::lms::api_host(), lms_port);
-                            }
-                            self.config.agents.defaults.skip_jit_gate = true;
                         }
                         Err(e) => {
                             println!(
-                                "  {}{}lms server start failed:{} {}",
-                                tui::BOLD,
-                                tui::YELLOW,
-                                tui::RESET,
-                                e
+                                "\n  {}{}Higgs config error:{} {e}",
+                                tui::BOLD, tui::YELLOW, tui::RESET,
                             );
-                            println!("  {}Remaining in cloud mode{}\n", tui::DIM, tui::RESET);
                             return;
                         }
                     }
                 } else {
-                    println!(
-                        "\n  {}{}No local inference engine found.{} Install LM Studio (lms CLI).",
-                        tui::BOLD,
-                        tui::YELLOW,
-                        tui::RESET
-                    );
-                    return;
+                    // LM Studio path
+                    let preference = &self.config.agents.defaults.inference_engine;
+                    if let Some((super::super::InferenceEngine::Lms, bin)) =
+                        super::super::resolve_inference_engine(preference)
+                    {
+                        let lms_port = self.config.agents.defaults.lms_port;
+                        println!(
+                            "\n  {}{}LM Studio{} detected, starting server on port {}...",
+                            tui::BOLD,
+                            tui::YELLOW,
+                            tui::RESET,
+                            lms_port
+                        );
+                        match crate::lms::server_start(&bin, lms_port).await {
+                            Ok(()) => {
+                                let main_model =
+                                    if !self.config.agents.defaults.lms_main_model.is_empty() {
+                                        self.config.agents.defaults.lms_main_model.clone()
+                                    } else {
+                                        let mn = self
+                                            .current_model_path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or(
+                                                &self.config.agents.defaults.local_model,
+                                            );
+                                        cli::strip_gguf_suffix(mn).to_string()
+                                    };
+                                let main_ctx =
+                                    Some(self.config.agents.defaults.local_max_context_tokens);
+                                print!("  Loading {}... ", main_model);
+                                io::stdout().flush().ok();
+                                match crate::lms::load_model(
+                                    "",
+                                    lms_port,
+                                    &main_model,
+                                    main_ctx,
+                                    self.config.timeouts.lms_load_secs,
+                                )
+                                .await
+                                {
+                                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                                    Err(e) => {
+                                        println!("{}FAILED: {}{}", tui::RED, e, tui::RESET)
+                                    }
+                                }
+                                if self.config.trio.enabled {
+                                    if !self.config.trio.router_model.is_empty() {
+                                        print!(
+                                            "  Loading {}... ",
+                                            self.config.trio.router_model
+                                        );
+                                        io::stdout().flush().ok();
+                                        match crate::lms::load_model(
+                                            "",
+                                            lms_port,
+                                            &self.config.trio.router_model,
+                                            Some(self.config.trio.router_ctx_tokens),
+                                            self.config.timeouts.lms_load_secs,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                println!("{}OK{}", tui::GREEN, tui::RESET)
+                                            }
+                                            Err(e) => println!(
+                                                "{}FAILED: {}{}",
+                                                tui::RED, e, tui::RESET
+                                            ),
+                                        }
+                                    }
+                                    if !self.config.trio.specialist_model.is_empty() {
+                                        print!(
+                                            "  Loading {}... ",
+                                            self.config.trio.specialist_model
+                                        );
+                                        io::stdout().flush().ok();
+                                        match crate::lms::load_model(
+                                            "",
+                                            lms_port,
+                                            &self.config.trio.specialist_model,
+                                            Some(self.config.trio.specialist_ctx_tokens),
+                                            self.config.timeouts.lms_load_secs,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                println!("{}OK{}", tui::GREEN, tui::RESET)
+                                            }
+                                            Err(e) => println!(
+                                                "{}FAILED: {}{}",
+                                                tui::RED, e, tui::RESET
+                                            ),
+                                        }
+                                    }
+                                }
+                                self.srv.lms_managed = true;
+                                self.srv.lms_binary = Some(bin);
+                                self.srv.engine = super::super::InferenceEngine::Lms;
+                                self.srv.local_port = lms_port.to_string();
+                                if self.config.agents.defaults.local_api_base.is_empty() {
+                                    self.config.agents.defaults.local_api_base = format!(
+                                        "http://{}:{}/v1",
+                                        crate::lms::api_host(),
+                                        lms_port
+                                    );
+                                }
+                                self.config.agents.defaults.skip_jit_gate = true;
+                            }
+                            Err(e) => {
+                                println!(
+                                    "  {}{}lms server start failed:{} {}",
+                                    tui::BOLD, tui::YELLOW, tui::RESET, e
+                                );
+                                println!(
+                                    "  {}Remaining in cloud mode{}\n",
+                                    tui::DIM, tui::RESET
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        println!(
+                            "\n  {}{}No local inference engine found.{} Install LM Studio (lms CLI) or Higgs (cargo install higgs).",
+                            tui::BOLD,
+                            tui::YELLOW,
+                            tui::RESET
+                        );
+                        return;
+                    }
                 }
             }
 
@@ -1258,10 +1354,15 @@ impl ReplContext {
                 self.srv.lms_managed = false;
                 self.srv.lms_binary = None;
             }
-            // Clear local endpoint and backend so next /l doesn't inherit stale
-            // oMLX backend when LM Studio should start instead.
+            // Clear local endpoint so next /l re-discovers.
+            // Preserve "higgs" backend (managed sidecar) so next /l re-starts it.
+            // Reset oMLX → lmstudio since oMLX has no auto-start.
             self.config.agents.defaults.local_api_base.clear();
-            self.config.agents.defaults.local_backend = "lmstudio".to_string();
+            if !crate::config::schema::is_higgs_backend(
+                &self.config.agents.defaults.local_backend,
+            ) {
+                self.config.agents.defaults.local_backend = "lmstudio".to_string();
+            }
             self.config.agents.defaults.skip_jit_gate = false;
             self.srv.engine = super::super::InferenceEngine::None;
             self.stop_watchdog();

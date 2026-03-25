@@ -674,6 +674,20 @@ pub(crate) fn print_omlx_splash(api_base: &str) {
     print!("\r\n");
 }
 
+/// Startup splash for Higgs managed sidecar.
+pub(crate) fn print_higgs_splash(model_name: &str, port: u16) {
+    print!("{CLEAR_SCREEN}");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+    print_logo();
+    print!("  {BOLD}{YELLOW}Higgs{RESET} {DIM}{model_name} · :{port}{RESET}\r\n");
+    print!(
+        "  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}\r\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    print!("\r\n");
+}
+
 /// Full startup splash: clear screen, ASCII logo, mode info, hints.
 pub(crate) fn print_startup_splash(local_port: &str, is_local: bool) {
     // Clear the terminal for a fresh start.
