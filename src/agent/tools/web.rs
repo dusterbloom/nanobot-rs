@@ -9,7 +9,7 @@ use reqwest::Client;
 use std::sync::LazyLock;
 use url::Url;
 
-use super::base::{Tool, ToolExecutionContext};
+use super::base::{PermissionLevel, Tool, ToolExecutionContext};
 use crate::agent::audit::ToolEvent;
 
 /// Shared user-agent string.
@@ -156,6 +156,10 @@ impl Tool for WebSearchTool {
 
     fn description(&self) -> &str {
         "Search the web. Returns titles, URLs, and snippets. Use web_fetch to read full content from URLs."
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::Network
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -407,6 +411,10 @@ impl Tool for WebFetchTool {
 
     fn description(&self) -> &str {
         "Fetch URL and extract readable content (HTML -> text)."
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::Network
     }
 
     fn parameters(&self) -> serde_json::Value {

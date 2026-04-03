@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::Tool;
+use super::base::{PermissionLevel, Tool};
 use crate::bus::events::OutboundMessage;
 
 /// Type alias for the send callback.
@@ -54,6 +54,10 @@ impl MessageTool {
 impl Tool for MessageTool {
     fn name(&self) -> &str {
         "message"
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::System
     }
 
     fn description(&self) -> &str {

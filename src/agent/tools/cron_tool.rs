@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::Tool;
+use super::base::{PermissionLevel, Tool};
 use crate::cron::service::CronService;
 
 /// Tool to schedule reminders and recurring tasks.
@@ -102,6 +102,10 @@ impl CronScheduleTool {
 impl Tool for CronScheduleTool {
     fn name(&self) -> &str {
         "cron"
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::System
     }
 
     fn description(&self) -> &str {

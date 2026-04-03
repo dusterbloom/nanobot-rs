@@ -3,9 +3,29 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::audit::ToolEvent;
+
+/// Permission level required to execute a tool.
+///
+/// Ordered from least to most privileged. A registry's `max_permission`
+/// ceiling blocks any tool whose level exceeds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionLevel {
+    /// Read-only tools: read_file, list_dir, recall, read_skill, session_search
+    ReadOnly,
+    /// Network access: web_search, web_fetch, browser
+    Network,
+    /// Write tools: write_file, edit_file, remember
+    Write,
+    /// Code execution: exec, execute_code
+    Execute,
+    /// System-level: spawn, message, cron_schedule, send_email
+    System,
+}
 
 /// Structured outcome for a tool invocation.
 #[derive(Debug, Clone)]
@@ -127,6 +147,14 @@ pub trait Tool: Send + Sync {
         ctx: &ToolExecutionContext,
     ) -> ToolExecutionResult {
         ToolExecutionResult::from_output(self.execute_with_context(params, ctx).await)
+    }
+
+    /// The permission level required to execute this tool.
+    ///
+    /// The registry checks this against its `max_permission` ceiling before
+    /// executing. Default is `ReadOnly` (least privileged).
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::ReadOnly
     }
 
     /// Whether this tool is currently available for use.
@@ -400,6 +428,20 @@ mod tests {
         assert!(!ctx.cancellation_token.is_cancelled());
         token.cancel();
         assert!(ctx.cancellation_token.is_cancelled());
+    }
+
+    #[test]
+    fn test_permission_level_ordering() {
+        assert!(PermissionLevel::ReadOnly < PermissionLevel::Network);
+        assert!(PermissionLevel::Network < PermissionLevel::Write);
+        assert!(PermissionLevel::Write < PermissionLevel::Execute);
+        assert!(PermissionLevel::Execute < PermissionLevel::System);
+    }
+
+    #[test]
+    fn test_default_permission_is_read_only() {
+        let tool = MockTool;
+        assert_eq!(tool.permission(), PermissionLevel::ReadOnly);
     }
 
     #[test]

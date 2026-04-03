@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::Command;
 
-use super::base::Tool;
+use super::base::{PermissionLevel, Tool};
 
 /// Default command timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -69,6 +69,10 @@ impl Tool for BrowserTool {
          get_text (extract element text), get_html (get element HTML), \
          screenshot (save screenshot), eval (run JavaScript), wait (wait for element/time), \
          close (end session)."
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::Network
     }
 
     fn parameters(&self) -> Value {

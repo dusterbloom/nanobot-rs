@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use super::base::Tool;
+use super::base::{PermissionLevel, Tool};
 
 /// Extract a required string parameter, returning an error string on missing.
 fn require_param<'a>(
@@ -112,6 +112,10 @@ impl Tool for WriteFileTool {
         "Write content to a file at the given path. Creates parent directories if needed."
     }
 
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -176,6 +180,10 @@ impl Tool for EditFileTool {
 
     fn description(&self) -> &str {
         "Edit a file by replacing old_text with new_text. The old_text must exist exactly in the file."
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::Write
     }
 
     fn parameters(&self) -> serde_json::Value {

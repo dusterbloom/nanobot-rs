@@ -8,7 +8,7 @@ use chrono::Local;
 use serde_json::{json, Value};
 use tokio::fs;
 
-use super::base::Tool;
+use super::base::{PermissionLevel, Tool};
 
 /// Tool that writes a single fact into MEMORY.md under a dated section.
 pub struct RememberTool {
@@ -59,6 +59,10 @@ pub fn append_fact(current: &str, fact: &str, date: &str) -> String {
 impl Tool for RememberTool {
     fn name(&self) -> &str {
         "remember"
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::Write
     }
 
     fn description(&self) -> &str {

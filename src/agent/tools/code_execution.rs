@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::task;
 
-use super::base::Tool;
+use super::base::{PermissionLevel, Tool};
 use super::registry::{ToolConfig, ToolRegistry};
 
 // ---------------------------------------------------------------------------
@@ -226,6 +226,10 @@ impl CodeExecutionTool {
 impl Tool for CodeExecutionTool {
     fn name(&self) -> &str {
         "execute_code"
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::Execute
     }
 
     fn description(&self) -> &str {

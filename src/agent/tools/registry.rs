@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
+use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolExecutionResult};
 use super::{
     BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, ListDirTool, ReadFileTool,
     ReadSkillTool, RecallTool, RememberTool, SessionSearchTool, WebFetchTool, WebSearchTool,
@@ -70,6 +70,8 @@ impl ToolConfig {
 /// Allows dynamic registration and execution of tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    /// Maximum permission level allowed. Tools above this ceiling are denied.
+    max_permission: PermissionLevel,
 }
 
 impl ToolRegistry {
@@ -213,7 +215,24 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            max_permission: PermissionLevel::System,
         }
+    }
+
+    /// Create a registry with a permission ceiling.
+    ///
+    /// Tools whose [`PermissionLevel`] exceeds `max` will be denied at
+    /// execution time.
+    pub fn with_max_permission(max: PermissionLevel) -> Self {
+        Self {
+            tools: HashMap::new(),
+            max_permission: max,
+        }
+    }
+
+    /// Set the maximum permission level for this registry.
+    pub fn set_max_permission(&mut self, max: PermissionLevel) {
+        self.max_permission = max;
     }
 
     /// Create a registry pre-populated with standard stateless tools.
@@ -437,6 +456,15 @@ impl ToolRegistry {
             }
         };
 
+        if tool.permission() > self.max_permission {
+            return ToolExecutionResult::failure(format!(
+                "Permission denied: tool '{}' requires {:?} but max allowed is {:?}",
+                name,
+                tool.permission(),
+                self.max_permission
+            ));
+        }
+
         let fut = std::panic::AssertUnwindSafe(tool.execute_with_result(params));
         match futures_util::FutureExt::catch_unwind(fut).await {
             Ok(result) => result,
@@ -481,6 +509,15 @@ impl ToolRegistry {
                 return ToolExecutionResult::failure(format!("Tool '{}' not found", name));
             }
         };
+
+        if tool.permission() > self.max_permission {
+            return ToolExecutionResult::failure(format!(
+                "Permission denied: tool '{}' requires {:?} but max allowed is {:?}",
+                name,
+                tool.permission(),
+                self.max_permission
+            ));
+        }
 
         let fut = std::panic::AssertUnwindSafe(tool.execute_with_result_and_context(params, ctx));
         match futures_util::FutureExt::catch_unwind(fut).await {
@@ -2257,5 +2294,67 @@ mod tests {
             .values()
             .any(|v| v.get("description").is_some());
         assert!(has_desc, "Full defs should retain param descriptions");
+    }
+
+    // -----------------------------------------------------------------------
+    // Permission enforcement tests
+    // -----------------------------------------------------------------------
+
+    struct ExecuteTool;
+
+    #[async_trait]
+    impl Tool for ExecuteTool {
+        fn name(&self) -> &str {
+            "exec_mock"
+        }
+        fn description(&self) -> &str {
+            "mock execute-level tool"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn permission(&self) -> PermissionLevel {
+            PermissionLevel::Execute
+        }
+        async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
+            "executed".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_permission_denied_when_above_ceiling() {
+        let mut registry = ToolRegistry::with_max_permission(PermissionLevel::ReadOnly);
+        registry.register(Box::new(ExecuteTool));
+
+        let result = registry.execute("exec_mock", HashMap::new()).await;
+        assert!(!result.ok);
+        assert!(result.data.contains("Permission denied"));
+    }
+
+    #[tokio::test]
+    async fn test_permission_allowed_at_ceiling() {
+        let mut registry = ToolRegistry::with_max_permission(PermissionLevel::Execute);
+        registry.register(Box::new(ExecuteTool));
+
+        let result = registry.execute("exec_mock", HashMap::new()).await;
+        assert!(result.ok);
+        assert_eq!(result.data, "executed");
+    }
+
+    #[tokio::test]
+    async fn test_permission_allowed_above_ceiling() {
+        let mut registry = ToolRegistry::with_max_permission(PermissionLevel::System);
+        registry.register(Box::new(ExecuteTool));
+
+        let result = registry.execute("exec_mock", HashMap::new()).await;
+        assert!(result.ok);
+    }
+
+    #[test]
+    fn test_set_max_permission() {
+        let mut registry = ToolRegistry::new();
+        assert_eq!(registry.max_permission, PermissionLevel::System);
+        registry.set_max_permission(PermissionLevel::Write);
+        assert_eq!(registry.max_permission, PermissionLevel::Write);
     }
 }

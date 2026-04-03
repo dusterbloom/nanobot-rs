@@ -17,7 +17,7 @@ static RE_POSIX_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/[^\s"']+
 static RE_WIN_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap());
 
-use super::base::{Tool, ToolExecutionContext};
+use super::base::{PermissionLevel, Tool, ToolExecutionContext};
 use crate::agent::audit::ToolEvent;
 
 /// Default deny patterns for dangerous shell commands.
@@ -321,6 +321,10 @@ impl Tool for ExecTool {
          Safe: ls, pwd, cat, grep, find, python, cargo, git, echo, curl.\n\
          Blocked: rm -rf, sudo, eval, shred (destructive commands are rejected).\n\
          Prefer read_file over cat, list_dir over ls when available."
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::Execute
     }
 
     fn parameters(&self) -> serde_json::Value {

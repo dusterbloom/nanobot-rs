@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::Tool;
+use super::base::{PermissionLevel, Tool};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::email::{poll_inbox, poll_inbox_api, send_email};
 use crate::config::schema::EmailConfig;
@@ -29,6 +29,10 @@ impl Tool for CheckInboxTool {
 
     fn description(&self) -> &str {
         "Check the email inbox for new/unread messages. Returns a list of unread emails with sender, subject, and body."
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::System
     }
 
     fn is_available(&self) -> bool {
@@ -99,6 +103,10 @@ impl SendEmailTool {
 impl Tool for SendEmailTool {
     fn name(&self) -> &str {
         "send_email"
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::System
     }
 
     fn description(&self) -> &str {

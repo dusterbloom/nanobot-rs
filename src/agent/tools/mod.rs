@@ -17,7 +17,7 @@ pub mod shell;
 pub mod spawn;
 pub mod web;
 
-pub use base::Tool;
+pub use base::{PermissionLevel, Tool};
 pub use browser::BrowserTool;
 pub use code_execution::CodeExecutionTool;
 pub use cron_tool::CronScheduleTool;

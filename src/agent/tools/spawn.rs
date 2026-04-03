@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::Tool;
+use super::base::{PermissionLevel, Tool};
 
 /// Type alias for the spawn callback.
 ///
@@ -161,6 +161,10 @@ impl Tool for SpawnToolLite {
         "spawn"
     }
 
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::System
+    }
+
     fn description(&self) -> &str {
         "Run a background task, list tasks, check results, wait, or cancel.\n\
          spawn: start task (needs 'task'). list: show all tasks. check: get result (needs 'task_id').\n\
@@ -198,6 +202,10 @@ impl Tool for SpawnToolLite {
 impl Tool for SpawnTool {
     fn name(&self) -> &str {
         "spawn"
+    }
+
+    fn permission(&self) -> PermissionLevel {
+        PermissionLevel::System
     }
 
     fn description(&self) -> &str {
