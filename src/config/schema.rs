@@ -2267,6 +2267,26 @@ impl Default for MonitoringConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Hooks config
+// ---------------------------------------------------------------------------
+
+/// Configuration for PreToolUse / PostToolUse hook scripts.
+///
+/// Hook scripts are shell executables that run before and after every tool call.
+/// They receive context via environment variables (`NANOBOT_TOOL_NAME`, etc.).
+/// A PreToolUse hook that exits non-zero blocks the tool call.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HooksConfig {
+    /// Path to a script run before every tool call. Exit non-zero to block.
+    #[serde(default)]
+    pub pre_tool_use: Option<String>,
+    /// Path to a script run after every tool call (observational only).
+    #[serde(default)]
+    pub post_tool_use: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
 
@@ -2315,6 +2335,8 @@ pub struct Config {
     pub monitoring: MonitoringConfig,
     #[serde(default)]
     pub perplexity_gate: PerplexityGateConfig,
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 impl Config {

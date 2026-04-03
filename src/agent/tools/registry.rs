@@ -72,6 +72,8 @@ pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
     /// Maximum permission level allowed. Tools above this ceiling are denied.
     max_permission: PermissionLevel,
+    /// Optional hook scripts that run before/after tool calls.
+    hooks: Option<crate::config::schema::HooksConfig>,
 }
 
 impl ToolRegistry {
@@ -216,6 +218,7 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             max_permission: PermissionLevel::System,
+            hooks: None,
         }
     }
 
@@ -227,12 +230,18 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             max_permission: max,
+            hooks: None,
         }
     }
 
     /// Set the maximum permission level for this registry.
     pub fn set_max_permission(&mut self, max: PermissionLevel) {
         self.max_permission = max;
+    }
+
+    /// Configure hook scripts that run before/after tool calls.
+    pub fn set_hooks(&mut self, hooks: crate::config::schema::HooksConfig) {
+        self.hooks = Some(hooks);
     }
 
     /// Create a registry pre-populated with standard stateless tools.
@@ -437,6 +446,54 @@ impl ToolRegistry {
         self.execute_inner(name, params).await
     }
 
+    /// Run the pre-tool-use hook if configured. Returns `Some(result)` to
+    /// short-circuit execution when the hook blocks.
+    async fn run_pre_hook(
+        &self,
+        name: &str,
+        params: &HashMap<String, serde_json::Value>,
+    ) -> Option<ToolExecutionResult> {
+        let script = self.hooks.as_ref()?.pre_tool_use.as_ref()?;
+        let path = std::path::Path::new(script);
+        let hook_result = crate::agent::hooks::run_hook(
+            path,
+            crate::agent::hooks::HookPhase::PreToolUse,
+            name,
+            params,
+            None,
+        )
+        .await?;
+        if !hook_result.allowed {
+            return Some(ToolExecutionResult::failure(format!(
+                "Blocked by PreToolUse hook: {}",
+                hook_result.output.trim()
+            )));
+        }
+        None
+    }
+
+    /// Run the post-tool-use hook if configured (fire-and-forget semantics).
+    async fn run_post_hook(
+        &self,
+        name: &str,
+        params: &HashMap<String, serde_json::Value>,
+        result: &ToolExecutionResult,
+    ) {
+        let script = match self.hooks.as_ref().and_then(|h| h.post_tool_use.as_ref()) {
+            Some(s) => s,
+            None => return,
+        };
+        let path = std::path::Path::new(script);
+        let _ = crate::agent::hooks::run_hook(
+            path,
+            crate::agent::hooks::HookPhase::PostToolUse,
+            name,
+            params,
+            Some((&result.data, result.ok)),
+        )
+        .await;
+    }
+
     /// Core execute logic (no proxy intercept). Called by both `execute()`
     /// and `execute_proxy()` dispatch mode.
     async fn execute_inner(
@@ -465,13 +522,20 @@ impl ToolRegistry {
             ));
         }
 
-        let fut = std::panic::AssertUnwindSafe(tool.execute_with_result(params));
-        match futures_util::FutureExt::catch_unwind(fut).await {
+        if let Some(blocked) = self.run_pre_hook(&name, &params).await {
+            return blocked;
+        }
+
+        let fut = std::panic::AssertUnwindSafe(tool.execute_with_result(params.clone()));
+        let result = match futures_util::FutureExt::catch_unwind(fut).await {
             Ok(result) => result,
             Err(_) => {
                 ToolExecutionResult::failure(format!("Tool '{}' panicked during execution", name))
             }
-        }
+        };
+
+        self.run_post_hook(&name, &params, &result).await;
+        result
     }
 
     /// Execute a tool by name with a [`ToolExecutionContext`] for progress
@@ -519,13 +583,21 @@ impl ToolRegistry {
             ));
         }
 
-        let fut = std::panic::AssertUnwindSafe(tool.execute_with_result_and_context(params, ctx));
-        match futures_util::FutureExt::catch_unwind(fut).await {
+        if let Some(blocked) = self.run_pre_hook(&name, &params).await {
+            return blocked;
+        }
+
+        let fut =
+            std::panic::AssertUnwindSafe(tool.execute_with_result_and_context(params.clone(), ctx));
+        let result = match futures_util::FutureExt::catch_unwind(fut).await {
             Ok(result) => result,
             Err(_) => {
                 ToolExecutionResult::failure(format!("Tool '{}' panicked during execution", name))
             }
-        }
+        };
+
+        self.run_post_hook(&name, &params, &result).await;
+        result
     }
 
     /// Core tools that are always included in tool definitions.

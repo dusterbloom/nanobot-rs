@@ -57,6 +57,7 @@ pub mod embedder;
 pub mod eval;
 pub mod finalize_response;
 pub(crate) mod gateway_commands;
+pub mod hooks;
 pub mod instructions;
 pub mod knowledge_graph;
 pub mod knowledge_store;
