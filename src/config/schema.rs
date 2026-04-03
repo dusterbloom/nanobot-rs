@@ -1882,9 +1882,11 @@ fn default_lcm_compaction_context_size() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LcmSchemaConfig {
-    /// Enable LCM (default: false for backward compatibility).
-    #[serde(default)]
-    pub enabled: bool,
+    /// Enable LCM. When `None` (field absent from JSON), auto-resolves to
+    /// `true` if `compaction_endpoint` is configured. Explicit `false`
+    /// always wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// Soft threshold as fraction of available context (0.0-1.0).
     /// Triggers async (non-blocking) compaction. Default: 0.5 (50%).
     #[serde(default = "default_lcm_tau_soft")]
@@ -1911,10 +1913,19 @@ pub struct LcmSchemaConfig {
     pub api_key: String,
 }
 
+impl LcmSchemaConfig {
+    /// Whether LCM is active. If `enabled` was not explicitly set in config,
+    /// defaults to `true` when a `compaction_endpoint` is configured.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+            .unwrap_or(self.compaction_endpoint.is_some())
+    }
+}
+
 impl Default for LcmSchemaConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
             tau_soft: default_lcm_tau_soft(),
             tau_hard: default_lcm_tau_hard(),
             deterministic_target: default_lcm_deterministic_target(),
@@ -2946,7 +2957,8 @@ mod tests {
     #[test]
     fn test_lcm_config_defaults() {
         let lcm = LcmSchemaConfig::default();
-        assert!(!lcm.enabled);
+        assert!(lcm.enabled.is_none());
+        assert!(!lcm.is_enabled()); // no endpoint → disabled
         assert!((lcm.tau_soft - 0.5).abs() < f64::EPSILON);
         assert!((lcm.tau_hard - 0.85).abs() < f64::EPSILON);
         assert_eq!(lcm.deterministic_target, 512);
@@ -2957,23 +2969,39 @@ mod tests {
     #[test]
     fn test_lcm_config_roundtrip() {
         let mut lcm = LcmSchemaConfig::default();
-        lcm.enabled = true;
+        lcm.enabled = Some(true);
         lcm.tau_soft = 0.6;
         lcm.tau_hard = 0.9;
         lcm.deterministic_target = 256;
         let json = serde_json::to_string(&lcm).unwrap();
         let lcm2: LcmSchemaConfig = serde_json::from_str(&json).unwrap();
-        assert!(lcm2.enabled);
+        assert!(lcm2.is_enabled());
         assert!((lcm2.tau_soft - 0.6).abs() < f64::EPSILON);
         assert!((lcm2.tau_hard - 0.9).abs() < f64::EPSILON);
         assert_eq!(lcm2.deterministic_target, 256);
     }
 
     #[test]
+    fn test_lcm_auto_enabled_with_endpoint() {
+        let json = r#"{"compactionEndpoint": {"url": "http://localhost:1234/v1", "model": "qwen3-0.6b"}}"#;
+        let lcm: LcmSchemaConfig = serde_json::from_str(json).unwrap();
+        assert!(lcm.enabled.is_none(), "enabled was not set in JSON");
+        assert!(lcm.is_enabled(), "auto-enables when endpoint is configured");
+    }
+
+    #[test]
+    fn test_lcm_explicit_disable_overrides_endpoint() {
+        let json = r#"{"enabled": false, "compactionEndpoint": {"url": "http://localhost:1234/v1", "model": "qwen3-0.6b"}}"#;
+        let lcm: LcmSchemaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(lcm.enabled, Some(false));
+        assert!(!lcm.is_enabled(), "explicit false overrides auto-enable");
+    }
+
+    #[test]
     fn test_lcm_config_from_root_json() {
         let json = r#"{"lcm": {"enabled": true, "tauSoft": 0.7, "tauHard": 0.9}}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(cfg.lcm.enabled);
+        assert!(cfg.lcm.is_enabled());
         assert!((cfg.lcm.tau_soft - 0.7).abs() < f64::EPSILON);
         assert!((cfg.lcm.tau_hard - 0.9).abs() < f64::EPSILON);
         assert_eq!(cfg.lcm.deterministic_target, 512); // default
@@ -2983,7 +3011,7 @@ mod tests {
     fn test_lcm_absent_defaults_to_disabled() {
         let json = r#"{}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(!cfg.lcm.enabled);
+        assert!(!cfg.lcm.is_enabled());
     }
 
     #[test]
@@ -3027,7 +3055,7 @@ mod tests {
             }
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(cfg.lcm.enabled);
+        assert!(cfg.lcm.is_enabled());
         let ep = cfg.lcm.compaction_endpoint.as_ref().unwrap();
         assert_eq!(ep.url, "http://192.168.1.22:1234/v1");
         assert_eq!(ep.model, "qwen3-0.6b");

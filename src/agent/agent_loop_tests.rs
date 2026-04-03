@@ -719,7 +719,7 @@ async fn test_real_lcm_e2e_compact_and_expand() {
     let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
 
     let lcm_config = LcmSchemaConfig {
-        enabled: true,
+        enabled: Some(true),
         tau_soft: 0.3, // Trigger early.
         tau_hard: 0.6,
         deterministic_target: 128,

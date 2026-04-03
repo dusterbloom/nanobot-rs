@@ -188,7 +188,7 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
         }
     }
 
-    if config.lcm.enabled {
+    if config.lcm.is_enabled() {
         if let Some(ref ep) = config.lcm.compaction_endpoint {
             if !ep.model.trim().is_empty() {
                 models.push((
@@ -1341,7 +1341,7 @@ pub(crate) fn cmd_agent(
                         }
 
                         // Load LCM compaction model when configured.
-                        if config.lcm.enabled {
+                        if config.lcm.is_enabled() {
                             if let Some(ref ep) = config.lcm.compaction_endpoint {
                                 print!("  Loading {} (LCM compactor)... ", ep.model);
                                 io::stdout().flush().ok();
@@ -1728,7 +1728,7 @@ pub(crate) fn cmd_agent(
 
                 // LCM compaction model when configured.
                 if let Some(ref ep) = ctx.config.lcm.compaction_endpoint {
-                    if ctx.config.lcm.enabled {
+                    if ctx.config.lcm.is_enabled() {
                         models_to_warm.push(&ep.model);
                     }
                 }

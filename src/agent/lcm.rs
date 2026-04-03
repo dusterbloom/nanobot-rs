@@ -176,7 +176,7 @@ impl Default for LcmConfig {
 impl From<&LcmSchemaConfig> for LcmConfig {
     fn from(schema: &LcmSchemaConfig) -> Self {
         Self {
-            enabled: schema.enabled,
+            enabled: schema.is_enabled(),
             tau_soft: schema.tau_soft,
             tau_hard: schema.tau_hard,
             deterministic_target: schema.deterministic_target,

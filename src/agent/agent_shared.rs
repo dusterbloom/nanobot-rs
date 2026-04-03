@@ -79,6 +79,9 @@ pub(crate) struct AgentLoopShared {
     pub(crate) lcm_engines: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<LcmEngine>>>>>,
     /// LCM configuration.
     pub(crate) lcm_config: LcmSchemaConfig,
+    /// Runtime toggle for LCM (initialised from `lcm_config.is_enabled()`).
+    /// Allows `/lcm` to flip without rebuilding the agent loop.
+    pub(crate) lcm_enabled: AtomicBool,
     /// Dedicated LCM compactor (when `lcm.compaction_endpoint` is configured).
     pub(crate) lcm_compactor: Option<Arc<ContextCompactor>>,
     /// Health probe registry — used to gate LCM compaction when endpoint is degraded.
@@ -1057,7 +1060,7 @@ impl AgentLoopShared {
     /// summary persistence, and auto-expand). Otherwise falls back to core
     /// compaction (gradient/audience-aware/simple).
     async fn manage_compaction(&self, ctx: &mut TurnContext, tool_def_tokens: usize) {
-        if self.lcm_config.enabled {
+        if self.lcm_enabled.load(Ordering::Relaxed) {
             // LCM path: get or create per-session engine, check thresholds.
             //
             // The engine starts EMPTY and ingests only the filtered messages

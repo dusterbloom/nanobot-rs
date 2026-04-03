@@ -33,6 +33,7 @@ pub(crate) async fn dispatch(shared: &AgentLoopShared, msg: &InboundMessage) -> 
         "/long" => Some(cmd_long(shared, arg)),
         "/context" => Some(cmd_context(shared)),
         "/memory" => Some(cmd_memory(shared, &msg.session_key())),
+        "/lcm" => Some(cmd_lcm(shared)),
         _ => None, // Unknown — forward to LLM
     }
 }
@@ -57,6 +58,7 @@ fn cmd_help() -> String {
         "  /long [N] - Set long-response mode",
         "  /context - Context token breakdown",
         "  /memory  - Show working memory contents",
+        "  /lcm     - Toggle Lossless Context Management",
     ]
     .join("\n")
 }
@@ -194,6 +196,17 @@ fn cmd_context(shared: &AgentLoopShared) -> String {
     .join("\n")
 }
 
+fn cmd_lcm(shared: &AgentLoopShared) -> String {
+    let prev = shared.lcm_enabled.load(Ordering::Relaxed);
+    let next = !prev;
+    shared.lcm_enabled.store(next, Ordering::Relaxed);
+    if next {
+        "LCM enabled — compaction active.".to_string()
+    } else {
+        "LCM disabled.".to_string()
+    }
+}
+
 fn cmd_memory(shared: &AgentLoopShared, session_key: &str) -> String {
     let core = shared.core_handle.swappable();
     let content = core.working_memory.get_context(session_key, 4000);
@@ -289,6 +302,7 @@ mod tests {
                 | "/long"
                 | "/context"
                 | "/memory"
+                | "/lcm"
         );
         assert!(!matched, "/unknown should not be handled by dispatch");
     }

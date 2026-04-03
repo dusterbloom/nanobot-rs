@@ -129,6 +129,16 @@ impl ReplContext {
         }
     }
 
+    /// /lcm — toggle Lossless Context Management on/off.
+    pub(super) fn cmd_lcm(&self) {
+        let enabled = self.agent_loop.toggle_lcm();
+        if enabled {
+            println!("\n  LCM \x1b[32menabled\x1b[0m — compaction active.\n");
+        } else {
+            println!("\n  LCM \x1b[33mdisabled\x1b[0m.\n");
+        }
+    }
+
     /// /kill <id> — cancel a background subagent.
     pub(super) async fn cmd_kill(&self, arg: &str) {
         let id = arg.trim();

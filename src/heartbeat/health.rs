@@ -331,7 +331,7 @@ impl HealthProbe for TrioEndpointProbe {
 
 pub fn build_registry(config: &crate::config::schema::Config) -> HealthRegistry {
     let mut reg = HealthRegistry::new_with_threshold(config.monitoring.degraded_threshold);
-    if config.lcm.enabled {
+    if config.lcm.is_enabled() {
         if let Some(ref ep) = config.lcm.compaction_endpoint {
             reg.register(Box::new(LcmCompactionProbe::new(&ep.url)));
         }
@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn test_build_registry_lcm_disabled() {
         let mut config = crate::config::schema::Config::default();
-        config.lcm.enabled = false;
+        config.lcm.enabled = Some(false);
         config.lcm.compaction_endpoint = Some(crate::config::schema::ModelEndpoint {
             url: "http://localhost:1234/v1".to_string(),
             model: "qwen3-0.6b".to_string(),
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn test_build_registry_with_lcm_endpoint() {
         let mut config = crate::config::schema::Config::default();
-        config.lcm.enabled = true;
+        config.lcm.enabled = Some(true);
         config.lcm.compaction_endpoint = Some(crate::config::schema::ModelEndpoint {
             url: "http://localhost:1234/v1".to_string(),
             model: "qwen3-0.6b".to_string(),
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn test_build_registry_lcm_no_endpoint() {
         let mut config = crate::config::schema::Config::default();
-        config.lcm.enabled = true;
+        config.lcm.enabled = Some(true);
         // No compaction_endpoint set
         let reg = build_registry(&config);
         assert_eq!(reg.probe_count(), 0);

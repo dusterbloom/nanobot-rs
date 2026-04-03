@@ -207,6 +207,7 @@ impl AgentLoop {
             aha_tx,
             session_policies: Arc::new(Mutex::new(HashMap::new())),
             lcm_engines: Arc::new(Mutex::new(HashMap::new())),
+            lcm_enabled: AtomicBool::new(lcm_config.is_enabled()),
             lcm_config,
             lcm_compactor,
             health_registry,
@@ -337,6 +338,19 @@ impl AgentLoop {
     /// Check whether the perplexity gate is enabled on this agent loop.
     pub fn has_perplexity_gate(&self) -> bool {
         self.shared.perplexity_gate_config.enabled
+    }
+
+    /// Toggle LCM on/off at runtime. Returns the new state.
+    pub fn toggle_lcm(&self) -> bool {
+        let prev = self.shared.lcm_enabled.load(Ordering::Relaxed);
+        let next = !prev;
+        self.shared.lcm_enabled.store(next, Ordering::Relaxed);
+        next
+    }
+
+    /// Whether LCM is currently enabled.
+    pub fn lcm_enabled(&self) -> bool {
+        self.shared.lcm_enabled.load(Ordering::Relaxed)
     }
 
     /// Check whether the in-process MLX provider is set.

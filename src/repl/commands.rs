@@ -714,6 +714,9 @@ impl ReplContext {
             "/cluster" => {
                 self.cmd_cluster(arg).await;
             }
+            "/lcm" => {
+                self.cmd_lcm();
+            }
             "/adapt" => {
                 self.cmd_adapt(arg).await;
             }

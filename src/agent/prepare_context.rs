@@ -31,7 +31,7 @@ impl AgentLoopShared {
         let mut blocks = Vec::new();
 
         // LCM context awareness for local models.
-        if self.lcm_config.enabled {
+        if self.lcm_enabled.load(Ordering::Relaxed) {
             let has_summaries = {
                 let engines = self.lcm_engines.lock().await;
                 engines
@@ -119,7 +119,7 @@ impl AgentLoopShared {
         let mut sections = Vec::new();
 
         // LCM context awareness: tell the model about summarized context.
-        if self.lcm_config.enabled {
+        if self.lcm_enabled.load(Ordering::Relaxed) {
             let has_summaries = {
                 let engines = self.lcm_engines.lock().await;
                 engines
@@ -324,7 +324,7 @@ impl AgentLoopShared {
         // Register lcm_expand tool when LCM is enabled.
         // Eagerly create the engine here (with DB-persisted DAG if available)
         // so the tool is available from the very first turn.
-        if self.lcm_config.enabled {
+        if self.lcm_enabled.load(Ordering::Relaxed) {
             let lcm_engine = {
                 let mut engines = self.lcm_engines.lock().await;
                 if !engines.contains_key(&session_key) {
