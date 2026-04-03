@@ -4,7 +4,6 @@
 //! Functions are extracted here to keep main.rs focused on argument parsing and routing.
 
 mod core_builder;
-mod eval;
 mod provider;
 mod skills;
 mod voice;
@@ -17,21 +16,14 @@ pub(crate) use core_builder::{
 };
 #[cfg(feature = "mlx")]
 pub(crate) use core_builder::{
-    build_core_handle_mlx, create_agent_loop_mlx, find_mlx_dir_for_model, model_config_from_preset,
+    build_core_handle_mlx, find_mlx_dir_for_model, model_config_from_preset,
     preset_from_model_dir, rebuild_core_mlx, resolve_mlx_inference_url, resolve_mlx_model_dir,
     start_mlx_provider, MlxHandle,
-};
-pub(crate) use eval::{
-    cmd_eval_hanoi, cmd_eval_haystack, cmd_eval_learn, cmd_eval_report, cmd_eval_sprint,
-    eval_model_name, make_eval_provider,
 };
 pub(crate) use provider::{check_api_key, create_provider};
 pub(crate) use skills::{cmd_skill_add, cmd_skill_remove};
 #[cfg(feature = "voice")]
-pub(crate) use voice::{
-    cmd_realtime, cmd_realtime_server, cmd_voice_clone, cmd_voice_config, cmd_voice_list,
-    parse_input_mode,
-};
+pub(crate) use voice::{cmd_voice_clone, cmd_voice_config, cmd_voice_list, parse_input_mode};
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -328,55 +320,6 @@ mod tests {
         assert_eq!(cfg.agents.defaults.local_backend, "lmstudio");
     }
 
-    #[test]
-    fn test_gateway_uses_create_agent_loop_for_perplexity_gate() {
-        // Verify that create_agent_loop respects perplexity_gate config
-        let mut cfg = Config::default();
-        cfg.perplexity_gate.enabled = true;
-        cfg.perplexity_gate.surprise_threshold = 5.0;
-
-        let handle = build_core_handle(&cfg, "8080", None, None, None, None, false);
-        let agent_loop = create_agent_loop(handle, &cfg, None, None, None, None);
-
-        // The agent loop's shared state should have perplexity gate enabled.
-        // We verify through the public accessor that exists on AgentLoop.
-        assert!(
-            agent_loop.has_perplexity_gate(),
-            "create_agent_loop should enable perplexity gate when config says so"
-        );
-    }
-
-    #[test]
-    fn test_create_agent_loop_without_perplexity_gate() {
-        let cfg = Config::default();
-        assert!(!cfg.perplexity_gate.enabled);
-
-        let handle = build_core_handle(&cfg, "8080", None, None, None, None, false);
-        let agent_loop = create_agent_loop(handle, &cfg, None, None, None, None);
-
-        assert!(
-            !agent_loop.has_perplexity_gate(),
-            "perplexity gate should be off when config says disabled"
-        );
-    }
-
-    #[test]
-    fn test_rebuild_agent_loop_preserves_perplexity_gate() {
-        // Simulate what rebuild_agent_loop does: create_agent_loop with same config.
-        let mut cfg = Config::default();
-        cfg.perplexity_gate.enabled = true;
-
-        let handle = build_core_handle(&cfg, "8080", None, None, None, None, false);
-        let first = create_agent_loop(handle.clone(), &cfg, None, None, None, None);
-        assert!(first.has_perplexity_gate());
-
-        // Rebuild with same config should preserve gate.
-        let second = create_agent_loop(handle, &cfg, None, None, None, None);
-        assert!(
-            second.has_perplexity_gate(),
-            "rebuilt agent loop should still have perplexity gate enabled"
-        );
-    }
 
     // -- effective_max_iterations tests --
 
@@ -461,18 +404,6 @@ mod tests {
             Some("http://localhost:18080/v1"),
             "memory provider should also stay local in local mode"
         );
-    }
-
-    #[test]
-    fn test_make_eval_provider_local_uses_local_endpoint() {
-        let provider = make_eval_provider(true, 18081);
-        assert_eq!(provider.get_default_model(), "local-model");
-        assert_eq!(provider.get_api_base(), Some("http://localhost:18081/v1"));
-    }
-
-    #[test]
-    fn test_eval_model_name_local_is_port_scoped() {
-        assert_eq!(eval_model_name(true, 18082), "local:18082");
     }
 
     #[test]
@@ -725,18 +656,10 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
         );
     }
 
-    // MLX in-process provider (when inference_engine == "mlx" or localBackend == "mlx").
-    // Skip when localBackend is "omlx"/"higgs" — external server, no in-process MLX needed.
     #[cfg(feature = "mlx")]
-    let mlx_handle: Option<MlxHandle> = if (config.agents.defaults.inference_engine == "mlx"
-        || config.agents.defaults.local_backend == "mlx")
-        && !crate::config::schema::is_external_server_backend(
-            &config.agents.defaults.local_backend,
-        )
-        && !crate::config::schema::is_higgs_backend(
-            &config.agents.defaults.local_backend,
-        )
-    {
+    let mlx_handle: Option<MlxHandle> = if crate::config::schema::needs_mlx_inprocess(
+        &config.agents.defaults,
+    ) {
         match start_mlx_provider(&config) {
             Ok(h) => Some(h),
             Err(e) => {
@@ -763,21 +686,6 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
     };
 
     // Build setup closure that wires MLX provider into the agent loop.
-    #[cfg(feature = "mlx")]
-    let setup: Option<Box<dyn FnOnce(&mut AgentLoop) + Send>> = mlx_handle.map(|mlx| {
-        let provider = mlx.provider.clone();
-        let gate_config = {
-            let mut g = config.perplexity_gate.clone();
-            g.enabled = true;
-            g
-        };
-        Box::new(move |loop_: &mut AgentLoop| {
-            loop_.set_mlx_provider(provider);
-            loop_.set_perplexity_gate(gate_config);
-            tracing::info!("gateway: MLX provider wired, perplexity gate auto-enabled");
-        }) as Box<dyn FnOnce(&mut AgentLoop) + Send>
-    });
-    #[cfg(not(feature = "mlx"))]
     let setup: Option<Box<dyn FnOnce(&mut AgentLoop) + Send>> = None;
 
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -844,9 +752,6 @@ pub(crate) async fn run_gateway_async(
         Some(health_registry.clone()),
     );
 
-    if config.perplexity_gate.enabled {
-        agent_loop.set_perplexity_gate(config.perplexity_gate.clone());
-    }
 
     // Apply optional setup (e.g. MLX provider wiring).
     if let Some(f) = setup_fn {
@@ -989,11 +894,6 @@ pub(crate) async fn run_gateway_async(
         }
     }
 
-    // Signal training to stop so it doesn't block shutdown.
-    shutdown_counters
-        .training_cancel
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-
     agent_loop.stop();
     heartbeat.stop().await;
     channel_manager.stop_all().await;
@@ -1014,10 +914,7 @@ pub(crate) fn cmd_whatsapp() {
     let mut config = load_config(None);
     check_api_key(&config);
 
-    config.channels.whatsapp.enabled = true;
-    config.channels.telegram.enabled = false;
-    config.channels.feishu.enabled = false;
-    config.channels.email.enabled = false;
+    config.channels.enable_exclusive("whatsapp");
 
     println!("  Scan the QR code when it appears");
     println!("  Press Ctrl+C to stop\n");
@@ -1079,10 +976,7 @@ pub(crate) fn cmd_telegram(token_arg: Option<String>) {
     };
 
     config.channels.telegram.token = token;
-    config.channels.telegram.enabled = true;
-    config.channels.whatsapp.enabled = false;
-    config.channels.feishu.enabled = false;
-    config.channels.email.enabled = false;
+    config.channels.enable_exclusive("telegram");
 
     println!("  Press Ctrl+C to stop\n");
 
@@ -1200,10 +1094,7 @@ pub(crate) fn cmd_email(
     config.channels.email.smtp_host = smtp_host;
     config.channels.email.username = username;
     config.channels.email.password = password;
-    config.channels.email.enabled = true;
-    config.channels.whatsapp.enabled = false;
-    config.channels.telegram.enabled = false;
-    config.channels.feishu.enabled = false;
+    config.channels.enable_exclusive("email");
 
     println!("  Press Ctrl+C to stop\n");
 
@@ -1405,14 +1296,6 @@ pub(crate) fn cmd_channels_status() {
             "disabled"
         },
         tg_info
-    );
-    println!(
-        "  Feishu: {}",
-        if config.channels.feishu.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        }
     );
     let email_info = if config.channels.email.imap_host.is_empty() {
         "not configured".to_string()

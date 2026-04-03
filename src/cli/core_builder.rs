@@ -543,10 +543,6 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
         "MLX inference forced to external server"
     );
 
-    for warning in config.agents.defaults.validate_speculative_config() {
-        tracing::warn!("{warning}");
-    }
-
     let draft_model = config
         .agents
         .defaults
@@ -929,52 +925,6 @@ pub(crate) fn create_agent_loop(
     repl_display_tx: Option<mpsc::UnboundedSender<String>>,
     health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 ) -> AgentLoop {
-    create_agent_loop_inner(
-        core_handle,
-        config,
-        cron_service,
-        email_config,
-        repl_display_tx,
-        health_registry,
-        None,
-    )
-}
-
-/// Create an agent loop wired to an in-process MLX provider.
-///
-/// The MLX provider is set as the perplexity + training backend on the agent
-/// loop, and the perplexity gate is auto-enabled.
-#[cfg(feature = "mlx")]
-pub(crate) fn create_agent_loop_mlx(
-    core_handle: SharedCoreHandle,
-    config: &Config,
-    cron_service: Option<Arc<CronService>>,
-    email_config: Option<crate::config::schema::EmailConfig>,
-    repl_display_tx: Option<mpsc::UnboundedSender<String>>,
-    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
-    mlx: &MlxHandle,
-) -> AgentLoop {
-    create_agent_loop_inner(
-        core_handle,
-        config,
-        cron_service,
-        email_config,
-        repl_display_tx,
-        health_registry,
-        Some(mlx),
-    )
-}
-
-fn create_agent_loop_inner(
-    core_handle: SharedCoreHandle,
-    config: &Config,
-    cron_service: Option<Arc<CronService>>,
-    email_config: Option<crate::config::schema::EmailConfig>,
-    repl_display_tx: Option<mpsc::UnboundedSender<String>>,
-    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
-    #[cfg(feature = "mlx")] mlx: Option<&MlxHandle>,
-    #[cfg(not(feature = "mlx"))] _mlx: Option<&()>,
-) -> AgentLoop {
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
@@ -1000,76 +950,6 @@ fn create_agent_loop_inner(
         lcm_config,
         health_registry,
     );
-
-    // Wire MLX provider for in-process perplexity + training.
-    #[cfg(feature = "mlx")]
-    if let Some(mlx) = mlx {
-        agent_loop.set_mlx_provider(mlx.provider.clone());
-        // Auto-enable perplexity gate when using MLX engine.
-        let mut gate_config = config.perplexity_gate.clone();
-        gate_config.enabled = true;
-        agent_loop.set_perplexity_gate(gate_config);
-        tracing::info!("MLX provider wired: perplexity gate auto-enabled");
-    } else if config.perplexity_gate.enabled {
-        agent_loop.set_perplexity_gate(config.perplexity_gate.clone());
-    }
-
-    #[cfg(not(feature = "mlx"))]
-    if config.perplexity_gate.enabled {
-        agent_loop.set_perplexity_gate(config.perplexity_gate.clone());
-    }
-
-    // Resolve model dir for standalone ANE training (oMLX/LM Studio mode).
-    // When no in-process MLX is active, ANE training needs a model dir for
-    // weights + tokenizer. Also auto-enable perplexity gate so training fires.
-    #[cfg(all(feature = "ane", feature = "mlx"))]
-    {
-        let has_mlx_provider = {
-            #[cfg(feature = "mlx")]
-            {
-                mlx.is_some()
-            }
-            #[cfg(not(feature = "mlx"))]
-            {
-                false
-            }
-        };
-        if !has_mlx_provider {
-            let model_dir = resolve_mlx_model_dir(config);
-            if model_dir.join("config.json").exists() && model_dir.join("tokenizer.json").exists() {
-                tracing::info!(
-                    model_dir = %model_dir.display(),
-                    "ANE standalone training: model dir resolved"
-                );
-                agent_loop.set_ane_model_dir(Some(model_dir));
-                // Wire separate training model if configured.
-                if let Some(ref training_model) = config.agents.defaults.training_model {
-                    let training_dir = crate::utils::helpers::expand_tilde(training_model);
-                    if training_dir.join("config.json").exists()
-                        && training_dir.join("tokenizer.json").exists()
-                    {
-                        tracing::info!(
-                            training_model_dir = %training_dir.display(),
-                            "ANE training: separate training model configured"
-                        );
-                        agent_loop.set_ane_training_model_dir(Some(training_dir));
-                    } else {
-                        tracing::warn!(
-                            training_model = %training_model,
-                            "ANE training: trainingModel dir missing config.json/tokenizer.json, ignoring"
-                        );
-                    }
-                }
-                // Auto-enable perplexity gate if not already enabled.
-                if !agent_loop.has_perplexity_gate() {
-                    let mut gate_config = config.perplexity_gate.clone();
-                    gate_config.enabled = true;
-                    agent_loop.set_perplexity_gate(gate_config);
-                    tracing::info!("ANE standalone: perplexity gate auto-enabled");
-                }
-            }
-        }
-    }
 
     agent_loop
 }

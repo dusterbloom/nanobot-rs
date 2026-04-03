@@ -89,7 +89,7 @@ pub(crate) fn cmd_realtime(
 
     #[cfg(feature = "mlx")]
     let mlx_handle: Option<super::MlxHandle> =
-        if nanobot_config.agents.defaults.inference_engine == "mlx" {
+        if crate::config::schema::needs_mlx_inprocess(&nanobot_config.agents.defaults) {
             match super::start_mlx_provider(&nanobot_config) {
                 Ok(h) => Some(h),
                 Err(e) => {
@@ -126,13 +126,6 @@ pub(crate) fn cmd_realtime(
         is_local,
     );
 
-    #[cfg(feature = "mlx")]
-    let agent_loop = if let Some(ref mlx) = mlx_handle {
-        super::create_agent_loop_mlx(core_handle, &nanobot_config, None, None, None, None, mlx)
-    } else {
-        create_agent_loop(core_handle, &nanobot_config, None, None, None, None)
-    };
-    #[cfg(not(feature = "mlx"))]
     let agent_loop = create_agent_loop(core_handle, &nanobot_config, None, None, None, None);
     let agent_loop = Arc::new(agent_loop);
 

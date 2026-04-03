@@ -1,12 +1,9 @@
-#![allow(dead_code)]
 //! Command dispatch and handlers for the REPL.
 //!
 //! Contains `ReplContext`, `normalize_alias()`, `dispatch()`, and all
 //! `cmd_xxx()` command handlers (split across submodules).
 
-use std::io::{self, Write as _};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,6 +53,7 @@ pub(crate) struct ReplContext {
     pub core_handle: SharedCoreHandle,
     pub agent_loop: AgentLoop,
     pub session_id: String,
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
     pub lang: Option<String>,
     pub srv: super::ServerState,
     pub current_model_path: PathBuf,
@@ -104,6 +102,7 @@ enum ModelSource {
     /// Filesystem GGUF file.
     File { path: PathBuf },
     /// MLX model directory (safetensors, served via managed mlx-lm server).
+    #[cfg_attr(not(feature = "mlx"), allow(dead_code))]
     Mlx { path: PathBuf },
     /// oMLX server (external, auto-discovery via LRU eviction).
     Omlx { endpoint: String },
@@ -128,24 +127,7 @@ struct ModelEntry {
 
 impl ReplContext {
     /// Rebuild the agent loop after a server or config change.
-    ///
-    /// Replaces the 8x copy-pasted `agent_loop = cli::create_agent_loop(...)` pattern.
-    /// When an MLX handle is active, the rebuilt loop inherits the in-process
-    /// provider and auto-enabled perplexity gate.
     pub fn rebuild_agent_loop(&mut self) {
-        #[cfg(feature = "mlx")]
-        if let Some(ref mlx) = self.mlx_handle {
-            self.agent_loop = cli::create_agent_loop_mlx(
-                self.core_handle.clone(),
-                &self.config,
-                Some(self.cron_service.clone()),
-                self.email_config.clone(),
-                Some(self.display_tx.clone()),
-                self.health_registry.clone(),
-                mlx,
-            );
-            return;
-        }
         self.agent_loop = cli::create_agent_loop(
             self.core_handle.clone(),
             &self.config,
@@ -304,6 +286,7 @@ impl ReplContext {
     ///
     /// Replaces the 3x copy-pasted block that gets subagent count, retains
     /// finished channels, collects channel names, and calls `tui::print_status_bar`.
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
     pub async fn print_status_bar(&mut self) {
         let sa_count = self.agent_loop.subagent_manager().get_running_count().await;
         self.active_channels.retain(|ch| !ch.handle.is_finished());
@@ -603,7 +586,6 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
         "/c" => "/clear",
         "/cl" => "/cluster",
         "/sk" => "/skill",
-        "/fb" => "/feedback",
         other => other,
     }
 }
@@ -716,21 +698,6 @@ impl ReplContext {
             }
             "/lcm" => {
                 self.cmd_lcm();
-            }
-            "/adapt" => {
-                self.cmd_adapt(arg).await;
-            }
-            "/train" => match arg.trim() {
-                "" | "status" => self.cmd_train_status(),
-                "run" => self.cmd_train_run().await,
-                "enable" => self.cmd_train_toggle(true),
-                "disable" => self.cmd_train_toggle(false),
-                "list" => self.cmd_train_list(),
-                "merge" => self.cmd_train_merge().await,
-                _ => println!("\n  Usage: /train [status|run|enable|disable|list|merge]\n"),
-            },
-            "/feedback" => {
-                self.cmd_feedback(arg.trim());
             }
             "/skill" | "/skills" => {
                 self.cmd_skill(arg).await;

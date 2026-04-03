@@ -1,4 +1,4 @@
-//! Slash command dispatch for gateway mode (Telegram/WhatsApp/Feishu).
+//! Slash command dispatch for gateway mode (Telegram/WhatsApp/Email).
 //!
 //! All output is plain text — no ANSI escape codes, because channels render
 //! them as garbled characters.

@@ -530,7 +530,10 @@ impl ReplContext {
             }
             ModelSource::Remote {
                 ref endpoint,
+                #[cfg(feature = "cluster")]
                 ref peer_type,
+                #[cfg(not(feature = "cluster"))]
+                peer_type: _,
             } => {
                 // Determine if this is an LM Studio peer that supports load/unload
                 #[cfg(feature = "cluster")]

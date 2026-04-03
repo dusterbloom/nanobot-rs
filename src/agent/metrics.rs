@@ -33,30 +33,6 @@ pub struct RequestMetrics {
     pub validation_result: Option<String>,
 }
 
-/// Lightweight LearnLoop event written to the same JSONL stream.
-#[derive(Debug, Clone, Serialize)]
-pub struct LearnMetrics {
-    pub timestamp: String,
-    pub role: String,
-    pub event: String,
-    pub backend: String,
-    pub status: String,
-    pub model: String,
-    pub session_key: String,
-    pub turn_count: u64,
-    pub experience_count: u32,
-    pub new_experience_count: u32,
-    pub replay_experience_count: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idle_target_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idle_wait_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub train_elapsed_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reload_wait_ms: Option<u64>,
-}
-
 /// Return the metrics file path (`~/.nanobot/metrics.jsonl`).
 pub fn metrics_path() -> PathBuf {
     dirs::home_dir()
@@ -103,10 +79,6 @@ fn emit_line<T: Serialize>(value: &T) {
 }
 
 pub fn emit(metrics: &RequestMetrics) {
-    emit_line(metrics);
-}
-
-pub fn emit_learn(metrics: &LearnMetrics) {
     emit_line(metrics);
 }
 
@@ -175,36 +147,6 @@ mod tests {
         assert_eq!(parsed["status"], "error:reasoning_config_rejected");
         assert_eq!(parsed["error_detail"], "reasoning_budget not supported");
         assert_eq!(parsed["role"], "router");
-    }
-
-    #[test]
-    fn test_learn_metrics_serialization() {
-        let m = LearnMetrics {
-            timestamp: "2026-03-17T14:00:00+01:00".into(),
-            role: "learn".into(),
-            event: "train_end".into(),
-            backend: "ane".into(),
-            status: "finished".into(),
-            model: "local:Qwen3.5-35B-A3B-3bit".into(),
-            session_key: "cli:test".into(),
-            turn_count: 42,
-            experience_count: 20,
-            new_experience_count: 10,
-            replay_experience_count: 10,
-            idle_target_ms: Some(30_000),
-            idle_wait_ms: Some(4_200),
-            train_elapsed_ms: Some(120_000),
-            reload_wait_ms: Some(2_000),
-        };
-
-        let json = serde_json::to_string(&m).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["role"], "learn");
-        assert_eq!(parsed["event"], "train_end");
-        assert_eq!(parsed["backend"], "ane");
-        assert_eq!(parsed["experience_count"], 20);
-        assert_eq!(parsed["idle_wait_ms"], 4200);
     }
 
     #[test]

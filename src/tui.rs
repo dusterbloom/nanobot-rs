@@ -351,23 +351,6 @@ pub(crate) fn render_input_bar(
         hints.push(format!("{CYAN}{}{RESET}", channel_names.join(" ")));
     }
 
-    // Training progress (persistent — always visible while training runs)
-    if counters.training_active.load(Ordering::Relaxed) {
-        let cur = counters.training_current_step.load(Ordering::Relaxed);
-        let total = counters.training_total_steps.load(Ordering::Relaxed);
-        let loss_x10k = counters.training_loss_x10k.load(Ordering::Relaxed);
-        let loss = loss_x10k as f64 / 10000.0;
-        let completed_runs = counters.training_steps_total.load(Ordering::Relaxed);
-        if total > 0 {
-            let pct = (cur * 100).checked_div(total).unwrap_or(0);
-            hints.push(format!(
-                "{YELLOW}train:{BOLD}{pct}%{RESET}{DIM} {cur}/{total} L={loss:.2} done={completed_runs}{RESET}",
-            ));
-        } else {
-            hints.push(format!("{YELLOW}train:starting{RESET}"));
-        }
-    }
-
     if max > 0 {
         let pct = (used * 100) / max;
         let ctx_color = match pct {
@@ -528,41 +511,6 @@ pub(crate) fn print_status_bar(
     // Thinking mode indicator
     if core_handle.counters.thinking_budget.load(Ordering::Relaxed) > 0 {
         parts.push(format!("{GREY}T{RESET}"));
-    }
-
-    // Training status indicator
-    let completed_runs = core_handle
-        .counters
-        .training_steps_total
-        .load(Ordering::Relaxed);
-    if core_handle.counters.training_active.load(Ordering::Relaxed) {
-        let cur = core_handle
-            .counters
-            .training_current_step
-            .load(Ordering::Relaxed);
-        let total = core_handle
-            .counters
-            .training_total_steps
-            .load(Ordering::Relaxed);
-        let loss_x10k = core_handle
-            .counters
-            .training_loss_x10k
-            .load(Ordering::Relaxed);
-        let loss = loss_x10k as f64 / 10000.0;
-        if total > 0 {
-            let pct = (cur * 100).checked_div(total).unwrap_or(0);
-            parts.push(format!(
-                "{YELLOW}train:{BOLD}{pct}%{RESET}{DIM} ({cur}/{total} loss={loss:.3} done={completed_runs}){}",
-                RESET
-            ));
-        } else {
-            parts.push(format!(
-                "{YELLOW}train:{BOLD}starting{RESET}{DIM} (done={completed_runs}){}",
-                RESET
-            ));
-        }
-    } else if completed_runs > 0 {
-        parts.push(format!("{DIM}train:done={completed_runs}{RESET}"));
     }
 
     parts.push(format!("t:{}", turn));

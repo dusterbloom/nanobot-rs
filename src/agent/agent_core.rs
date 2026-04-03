@@ -206,21 +206,6 @@ pub struct RuntimeCounters {
     pub trio_state: AtomicU8,
     /// Per-domain ring buffer memory for specialist multi-turn context.
     pub specialist_memory: parking_lot::Mutex<crate::agent::router::SpecialistMemory>,
-    // --- Training observability ---
-    /// True while an ANE or HTTP training step is in progress.
-    pub training_active: AtomicBool,
-    /// Total successful training runs completed in this process (ANE + HTTP combined).
-    pub training_steps_total: AtomicU64,
-    /// Timestamp (epoch ms) when the current training step started. 0 = idle.
-    pub training_started_ms: AtomicU64,
-    /// Current optimizer step within the active training run (1-based).
-    pub training_current_step: AtomicU64,
-    /// Total optimizer steps planned for the active training run.
-    pub training_total_steps: AtomicU64,
-    /// Current loss value × 10000 (stored as integer for atomic access).
-    pub training_loss_x10k: AtomicU64,
-    /// Set to true to request the training loop to stop early (e.g. on shutdown).
-    pub training_cancel: AtomicBool,
     /// Lazy auxiliary mlx-lm server for delegation/compaction/memory.
     /// Spawned on first use, killed on drop.
     #[cfg(feature = "mlx")]
@@ -256,13 +241,6 @@ impl RuntimeCounters {
             specialist_memory: parking_lot::Mutex::new(
                 crate::agent::router::SpecialistMemory::default(),
             ),
-            training_active: AtomicBool::new(false),
-            training_steps_total: AtomicU64::new(0),
-            training_started_ms: AtomicU64::new(0),
-            training_current_step: AtomicU64::new(0),
-            training_total_steps: AtomicU64::new(0),
-            training_loss_x10k: AtomicU64::new(0),
-            training_cancel: AtomicBool::new(false),
             #[cfg(feature = "mlx")]
             auxiliary_server: None,
         }
@@ -279,19 +257,12 @@ impl RuntimeCounters {
 
     pub fn mark_inference_started(&self) {
         self.inference_active.store(true, Ordering::Relaxed);
-        // Only cancel training if it's actually running — avoids leaving
-        // training_cancel stuck at true when no training is active.
-        if self.training_active.load(Ordering::Relaxed) {
-            self.training_cancel.store(true, Ordering::Relaxed);
-        }
     }
 
     pub fn mark_inference_finished(&self) {
         self.inference_active.store(false, Ordering::Relaxed);
         self.last_inference_finished_ms
             .store(Self::now_epoch_ms(), Ordering::Relaxed);
-        // Reset training_cancel so the next idle window can start training.
-        self.training_cancel.store(false, Ordering::Relaxed);
     }
 
     /// Update trio state, logging only on transitions.

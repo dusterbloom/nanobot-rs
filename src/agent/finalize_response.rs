@@ -2,9 +2,6 @@
 //!
 //! Extracted from `agent_loop.rs` to keep that file focused on the iteration
 //! state machine. This module contains only the response-finalization logic.
-//!
-//! All learning/metrics observations are dispatched through [`LearnLoop`]
-//! (see `learn_loop.rs`). Zero direct audit/calibrator/perplexity writes here.
 
 use std::sync::atomic::Ordering;
 
@@ -14,7 +11,6 @@ use tracing::{debug, instrument, warn};
 
 use crate::agent::agent_core::provenance_warning_role;
 use crate::agent::agent_loop::{AgentLoopShared, TurnContext};
-use crate::agent::learn_loop::TurnOutcome;
 use crate::agent::token_budget::TokenBudget;
 use crate::bus::events::OutboundMessage;
 
@@ -249,39 +245,6 @@ impl AgentLoopShared {
         };
 
         ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
-
-        // Construct TurnOutcome AFTER all post-processing (rescue, provenance,
-        // sanitization) so observers see the content the user actually receives.
-        let outcome = TurnOutcome {
-            user_content: ctx.user_content.clone(),
-            final_content: ctx.final_content.clone(),
-            reasoning_trace,
-            turn_messages: new_messages.clone(),
-            model: ctx.core.model.clone(),
-            session_key: ctx.session_key.clone(),
-            workspace: ctx.core.workspace.clone(),
-            used_tools: ctx.used_tools.clone(),
-            turn_tool_entries,
-            iterations_used: ctx.iterations_used,
-            max_iterations: ctx.core.max_iterations,
-            turn_count: ctx.turn_count,
-            turn_start_elapsed_ms: ctx.turn_start.elapsed().as_millis() as u64,
-            context_tokens: final_tokens,
-            message_count: ctx.messages.len(),
-            working_memory_tokens: wm_tokens,
-            provenance_audit_enabled: ctx.core.provenance_config.enabled
-                && ctx.core.provenance_config.audit_log,
-            is_local: ctx.core.is_local,
-            cost_usd,
-            prompt_tokens,
-            completion_tokens,
-        };
-
-        // Synchronous observers: audit log, budget calibrator, structured logging.
-        self.learn_loop.observe_immediate(&outcome);
-
-        // Async observers: perplexity gate, LoRA training (fire-and-forget).
-        self.learn_loop.observe_async(outcome);
 
         if ctx.final_content.is_empty() {
             None

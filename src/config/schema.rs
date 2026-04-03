@@ -103,58 +103,6 @@ impl Default for TelegramConfig {
     }
 }
 
-/// Feishu/Lark channel configuration using WebSocket long connection.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FeishuConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub app_id: String,
-    #[serde(default)]
-    pub app_secret: String,
-    #[serde(default)]
-    pub encrypt_key: String,
-    #[serde(default)]
-    pub verification_token: String,
-    #[serde(default)]
-    pub allow_from: Vec<String>,
-    /// Optional toolset name from `tools.toolsets` to restrict available tools.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toolset: Option<String>,
-}
-
-impl fmt::Debug for FeishuConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FeishuConfig")
-            .field("enabled", &self.enabled)
-            .field("app_id", &self.app_id)
-            .field("app_secret", &crate::config::redact(&self.app_secret))
-            .field("encrypt_key", &crate::config::redact(&self.encrypt_key))
-            .field(
-                "verification_token",
-                &crate::config::redact(&self.verification_token),
-            )
-            .field("allow_from", &self.allow_from)
-            .field("toolset", &self.toolset)
-            .finish()
-    }
-}
-
-impl Default for FeishuConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            app_id: String::new(),
-            app_secret: String::new(),
-            encrypt_key: String::new(),
-            verification_token: String::new(),
-            allow_from: Vec::new(),
-            toolset: None,
-        }
-    }
-}
-
 /// Email channel configuration (IMAP polling + SMTP sending).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,9 +185,16 @@ pub struct ChannelsConfig {
     #[serde(default)]
     pub telegram: TelegramConfig,
     #[serde(default)]
-    pub feishu: FeishuConfig,
-    #[serde(default)]
     pub email: EmailConfig,
+}
+
+impl ChannelsConfig {
+    /// Enable exactly one channel, disabling all others.
+    pub fn enable_exclusive(&mut self, channel: &str) {
+        self.whatsapp.enabled = channel == "whatsapp";
+        self.telegram.enabled = channel == "telegram";
+        self.email.enabled = channel == "email";
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,11 +272,6 @@ pub struct AgentDefaults {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_draft_tokens: Option<u32>,
     /// Path to model used for ANE training (e.g. 0.8B for 32GB machines).
-    /// When set, ANE training targets this model instead of the inference model.
-    /// LoRA is applied to the draft model (if draft_model matches) or saved separately.
-    /// Default: same as inference model (backward compatible).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub training_model: Option<String>,
     /// MLX model config preset: "qwen3-1.7b" or "qwen3.5-2b". Default: "qwen3.5-2b".
     #[serde(default = "default_mlx_preset")]
     pub mlx_preset: String,
@@ -451,6 +401,16 @@ pub fn is_higgs_backend(backend: &str) -> bool {
     backend == "higgs"
 }
 
+/// Whether the config requests an in-process MLX provider.
+/// True when inference_engine or local_backend is "mlx" and the backend
+/// is not an external server (oMLX) or Higgs sidecar.
+#[cfg_attr(not(feature = "mlx"), allow(dead_code))]
+pub fn needs_mlx_inprocess(defaults: &AgentDefaults) -> bool {
+    (defaults.inference_engine == "mlx" || defaults.local_backend == "mlx")
+        && !is_external_server_backend(&defaults.local_backend)
+        && !is_higgs_backend(&defaults.local_backend)
+}
+
 fn default_mlx_preset() -> String {
     "qwen3.5-2b".to_string()
 }
@@ -511,7 +471,6 @@ impl Default for AgentDefaults {
             mlx_model_dir: None,
             draft_model: None,
             num_draft_tokens: None,
-            training_model: None,
             mlx_preset: default_mlx_preset(),
             mlx_lm_url: None,
             instructions_path: None,
@@ -528,22 +487,6 @@ impl Default for AgentDefaults {
     }
 }
 
-impl AgentDefaults {
-    /// Validate speculative decoding + training config consistency.
-    /// Returns a list of human-readable warnings (empty = all good).
-    pub fn validate_speculative_config(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
-        if let (Some(draft), Some(train)) = (&self.draft_model, &self.training_model) {
-            if draft != train {
-                warnings.push(format!(
-                    "training_model ({train}) differs from draft_model ({draft}); \
-                     trained LoRA adapters won't apply to the speculative decoding draft model"
-                ));
-            }
-        }
-        warnings
-    }
-}
 
 /// Agent configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2147,97 +2090,6 @@ pub struct MonitoringConfig {
     pub tool_heartbeat_secs: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Perplexity gate config
-// ---------------------------------------------------------------------------
-
-/// Configuration for the perplexity gate — automatic online learning from
-/// surprising conversations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PerplexityGateConfig {
-    /// Whether the perplexity gate is enabled.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Heuristic surprise threshold (0.0–1.0) above which a conversation is
-    /// considered "surprising" and worth recording for LoRA training.
-    /// Default: 0.3. Higher = fewer but more novel experiences collected.
-    #[serde(default = "default_surprise_threshold")]
-    pub surprise_threshold: f32,
-    /// Minimum number of unexported high-surprise experiences before triggering
-    /// a training run. Default: 5.
-    #[serde(default = "default_min_experiences")]
-    pub min_experiences: usize,
-    /// Automatically spawn training after accumulating enough surprising
-    /// experiences.  Default: false — training only runs when explicitly
-    /// triggered via `/train` or `--train`.
-    #[serde(default)]
-    pub auto_train: bool,
-    /// URL of the MLX LoRA training server (Ex0bit /train endpoint).
-    /// Default: "http://127.0.0.1:8766".
-    #[serde(default = "default_mlx_server_url")]
-    pub mlx_server_url: String,
-    /// Number of training epochs when triggering. Default: 15.
-    #[serde(default = "default_train_epochs")]
-    pub train_epochs: usize,
-    /// Train every Nth observe call. Higher values reduce DRAM bandwidth
-    /// contention during concurrent inference+training. Gradients accumulate
-    /// over the skipped steps (effective batch size = train_frequency).
-    /// Default: 1 (every call, no throttling).
-    #[serde(default = "default_train_frequency")]
-    pub train_frequency: usize,
-    /// Training scheduling mode:
-    /// - "sustained": training ticks continuously at 1/trainFrequency duty cycle.
-    ///   Gives constant ~34 tok/s with no dips. Default.
-    /// - "idle": training waits for 5s of inference silence before firing.
-    ///   Gives 41.7 tok/s during chat, ~15 tok/s if you message during training.
-    #[serde(default = "default_train_mode")]
-    pub train_mode: TrainMode,
-}
-
-/// Training scheduling mode for concurrent inference+training.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TrainMode {
-    /// Training ticks continuously at reduced frequency. Constant throughput.
-    Sustained,
-    /// Training waits for inference idle window. Peak throughput with dips.
-    Idle,
-}
-
-fn default_surprise_threshold() -> f32 {
-    0.3
-}
-fn default_min_experiences() -> usize {
-    5
-}
-fn default_mlx_server_url() -> String {
-    "http://127.0.0.1:8766".to_string()
-}
-fn default_train_epochs() -> usize {
-    3
-}
-fn default_train_frequency() -> usize {
-    1
-}
-fn default_train_mode() -> TrainMode {
-    TrainMode::Sustained
-}
-
-impl Default for PerplexityGateConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            surprise_threshold: default_surprise_threshold(),
-            min_experiences: default_min_experiences(),
-            auto_train: false,
-            mlx_server_url: default_mlx_server_url(),
-            train_epochs: default_train_epochs(),
-            train_frequency: default_train_frequency(),
-            train_mode: default_train_mode(),
-        }
-    }
-}
 
 fn default_degraded_threshold() -> u32 {
     3
@@ -2333,8 +2185,6 @@ pub struct Config {
     pub retry: RetryConfig,
     #[serde(default)]
     pub monitoring: MonitoringConfig,
-    #[serde(default)]
-    pub perplexity_gate: PerplexityGateConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
 }
@@ -3180,7 +3030,6 @@ mod tests {
         cfg.providers.openrouter.api_key = fake_key.to_string();
         cfg.providers.anthropic.api_key = "anthropic-secret".to_string();
         cfg.channels.telegram.token = "bot-token-secret".to_string();
-        cfg.channels.feishu.app_secret = "feishu-secret".to_string();
         cfg.channels.email.password = "email-password".to_string();
         cfg.tools.web.search.api_key = "search-key".to_string();
 
@@ -3200,10 +3049,6 @@ mod tests {
             "telegram token leaked"
         );
         assert!(
-            !debug_output.contains("feishu-secret"),
-            "feishu app_secret leaked"
-        );
-        assert!(
             !debug_output.contains("email-password"),
             "email password leaked"
         );
@@ -3219,41 +3064,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_speculative_config_warns_when_training_model_differs_from_draft() {
-        let mut defaults = AgentDefaults::default();
-        defaults.draft_model = Some("~/.cache/models/Qwen3.5-0.6B".to_string());
-        defaults.training_model = Some("~/.cache/models/Qwen3-1.7B".to_string());
-        let warnings = defaults.validate_speculative_config();
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("training_model") && w.contains("draft_model")),
-            "expected warning about training_model != draft_model mismatch, got: {:?}",
-            warnings,
-        );
-    }
-
-    #[test]
-    fn test_speculative_config_no_warning_when_same_model() {
-        let mut defaults = AgentDefaults::default();
-        let model = "~/.cache/models/Qwen3.5-0.6B".to_string();
-        defaults.draft_model = Some(model.clone());
-        defaults.training_model = Some(model);
-        let warnings = defaults.validate_speculative_config();
-        assert!(
-            warnings.is_empty(),
-            "expected no warnings when training_model == draft_model, got: {:?}",
-            warnings,
-        );
-    }
-
-    #[test]
-    fn test_speculative_config_no_warning_when_only_one_set() {
-        let mut defaults = AgentDefaults::default();
-        defaults.draft_model = Some("~/.cache/models/Qwen3.5-0.6B".to_string());
-        defaults.training_model = None;
-        let warnings = defaults.validate_speculative_config();
-        assert!(warnings.is_empty());
-    }
 }

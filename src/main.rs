@@ -16,8 +16,6 @@ mod heartbeat;
 mod higgs;
 mod lms;
 mod providers;
-#[cfg(feature = "voice")]
-mod realtime;
 mod repl;
 mod searxng;
 mod server;
@@ -157,69 +155,11 @@ enum Commands {
         #[command(subcommand)]
         action: SkillsAction,
     },
-    /// Run evaluation benchmarks.
-    Eval {
-        #[command(subcommand)]
-        action: EvalAction,
-    },
-    /// Start realtime voice session with LLM agent.
-    #[cfg(feature = "voice")]
-    Realtime {
-        /// TTS engine: pocket, kokoro, qwen, qwenLarge, qwenOnnx, qwenOnnxInt8.
-        #[arg(long, default_value = "pocket")]
-        engine: String,
-        /// Voice name for Qwen engines (e.g., ryan, serena).
-        #[arg(long, default_value = "ryan")]
-        voice: String,
-        /// Session ID.
-        #[arg(short, long, default_value = "realtime:default")]
-        session: String,
-        /// Use local LLM instead of cloud API.
-        #[arg(short, long)]
-        local: bool,
-        /// Input mode: "continuous" (hands-free VAD) or "ptt" (push-to-talk with Space).
-        #[arg(long, default_value = "continuous")]
-        mode: String,
-    },
-    /// Start WebSocket server for OpenAI-compatible realtime API.
-    #[cfg(feature = "voice")]
-    #[command(name = "realtime-server")]
-    RealtimeServer {
-        /// Port to listen on.
-        #[arg(short, long, default_value_t = 8080)]
-        port: u16,
-        /// TTS engine: pocket, kokoro, qwen, qwenLarge.
-        #[arg(long, default_value = "pocket")]
-        engine: String,
-        /// Voice name for TTS.
-        #[arg(long, default_value = "ryan")]
-        voice: String,
-        /// Host to bind to.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-    },
     /// Manage voice profiles and voice cloning.
     #[cfg(feature = "voice")]
     Voice {
         #[command(subcommand)]
         action: VoiceAction,
-    },
-    /// Start OpenAI-compatible MLX inference server for local LoRA models.
-    #[cfg(feature = "mlx")]
-    #[command(name = "mlx-serve")]
-    MlxServe {
-        /// Path to MLX model directory (containing .safetensors + tokenizer.json).
-        #[arg(short, long)]
-        model_dir: Option<String>,
-        /// Model config preset: auto | qwen3-0.6b | qwen3-1.7b | qwen3-4b | qwen3-8b | qwen3.5-2b.
-        #[arg(long, default_value = "auto")]
-        preset: String,
-        /// Host to bind to.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Port to listen on.
-        #[arg(short, long, default_value_t = 8766)]
-        port: u16,
     },
 }
 
@@ -244,90 +184,6 @@ enum VoiceAction {
     },
     /// Show voice configuration help.
     Config,
-}
-
-#[derive(Subcommand)]
-enum EvalAction {
-    /// Run Towers of Hanoi benchmark (MAKER replication).
-    Hanoi {
-        /// Number of disks. Default: 5.
-        #[arg(short, long, default_value_t = 5)]
-        disks: u8,
-        /// Run calibration (measure model accuracy on sampled steps).
-        #[arg(long)]
-        calibrate: bool,
-        /// Number of calibration samples. Default: 100.
-        #[arg(long, default_value_t = 100)]
-        samples: usize,
-        /// Run full solve with MAKER voting.
-        #[arg(long)]
-        solve: bool,
-        /// Enable CATTS confidence gating.
-        #[arg(long)]
-        catts: bool,
-        /// Ahead-by-k margin for voting. Default: 1.
-        #[arg(short, long, default_value_t = 1)]
-        k: usize,
-        /// Use local LLM.
-        #[arg(short, long)]
-        local: bool,
-        /// Local server port. Default: 8080.
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
-    },
-    /// Run Aggregation Haystack benchmark (Oolong-inspired).
-    Haystack {
-        /// Number of synthetic facts. Default: 50.
-        #[arg(long, default_value_t = 50)]
-        facts: usize,
-        /// Total document length in characters. Default: 100000.
-        #[arg(long, default_value_t = 100_000)]
-        length: usize,
-        /// Run Tier 2: aggregation tasks with LLM.
-        #[arg(long)]
-        aggregate: bool,
-        /// Use local LLM.
-        #[arg(short, long)]
-        local: bool,
-        /// Local server port. Default: 8080.
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
-    },
-    /// Run Learning Curve benchmark (SWE-Bench-CL inspired).
-    Learn {
-        /// Task family: arithmetic, fact-retrieval, tool-chain.
-        #[arg(long, default_value = "arithmetic")]
-        family: String,
-        /// Number of tasks in the curriculum. Default: 50.
-        #[arg(long, default_value_t = 50)]
-        tasks: usize,
-        /// Depth/complexity parameter. Default: 3.
-        #[arg(long, default_value_t = 3)]
-        depth: usize,
-        /// Use local LLM.
-        #[arg(short, long)]
-        local: bool,
-        /// Local server port. Default: 8080.
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
-    },
-    /// Run Research Sprint compound benchmark.
-    Sprint {
-        /// Corpus size in characters. Default: 500000.
-        #[arg(long, default_value_t = 500_000)]
-        corpus_size: usize,
-        /// Number of questions. Default: 20.
-        #[arg(long, default_value_t = 20)]
-        questions: usize,
-        /// Use local LLM.
-        #[arg(short, long)]
-        local: bool,
-        /// Local server port. Default: 8080.
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
-    },
-    /// Show saved evaluation results.
-    Report,
 }
 
 #[derive(Subcommand)]
@@ -724,39 +580,6 @@ fn main() {
             username,
             password,
         } => cli::cmd_email(imap_host, smtp_host, username, password),
-        Commands::Eval { action } => match action {
-            EvalAction::Hanoi {
-                disks,
-                calibrate,
-                samples,
-                solve,
-                catts,
-                k,
-                local,
-                port,
-            } => cli::cmd_eval_hanoi(disks, calibrate, samples, solve, catts, k, local, port),
-            EvalAction::Haystack {
-                facts,
-                length,
-                aggregate,
-                local,
-                port,
-            } => cli::cmd_eval_haystack(facts, length, aggregate, local, port),
-            EvalAction::Learn {
-                family,
-                tasks,
-                depth,
-                local,
-                port,
-            } => cli::cmd_eval_learn(family, tasks, depth, local, port),
-            EvalAction::Sprint {
-                corpus_size,
-                questions,
-                local,
-                port,
-            } => cli::cmd_eval_sprint(corpus_size, questions, local, port),
-            EvalAction::Report => cli::cmd_eval_report(),
-        },
         Commands::Sessions { action } => match action {
             SessionsAction::List => sessions_cmd::cmd_sessions_list(),
             SessionsAction::Resume { id, local } => repl::cmd_agent(
@@ -790,21 +613,6 @@ fn main() {
             }
         },
         #[cfg(feature = "voice")]
-        Commands::Realtime {
-            engine,
-            voice,
-            session,
-            local,
-            mode,
-        } => cli::cmd_realtime(engine, voice, session, local, mode),
-        #[cfg(feature = "voice")]
-        Commands::RealtimeServer {
-            port,
-            engine,
-            voice,
-            host,
-        } => cli::cmd_realtime_server(port, engine, voice, host),
-        #[cfg(feature = "voice")]
         Commands::Voice { action } => match action {
             VoiceAction::List { engine } => cli::cmd_voice_list(engine),
             VoiceAction::Clone {
@@ -814,57 +622,6 @@ fn main() {
             } => cli::cmd_voice_clone(name, audio, transcript),
             VoiceAction::Config => cli::cmd_voice_config(),
         },
-        #[cfg(feature = "mlx")]
-        Commands::MlxServe {
-            model_dir,
-            preset,
-            host,
-            port,
-        } => {
-            let model_dir = model_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
-                let home = std::env::var("HOME").expect("HOME not set");
-                std::path::PathBuf::from(home)
-                    .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit")
-            });
-            // Auto-detect from config.json first, then fall back to named preset.
-            let effective_preset = if preset == "auto" {
-                crate::cli::preset_from_model_dir(&model_dir).to_string()
-            } else {
-                preset
-            };
-            let Some(model_config) =
-                crate::agent::mlx_lora::ModelConfig::from_config_json(&model_dir)
-                    .or_else(|| crate::cli::model_config_from_preset(&effective_preset))
-            else {
-                let has_config = model_dir.join("config.json").exists();
-                let detail = if has_config {
-                    "config.json exists but could not be parsed (missing required fields)"
-                } else {
-                    "no config.json found in model directory"
-                };
-                eprintln!(
-                    "Cannot determine model config for '{}': {}. Preset '{}' is also unknown.",
-                    model_dir.display(),
-                    detail,
-                    effective_preset,
-                );
-                return;
-            };
-            let server_cfg = crate::agent::mlx_server::MlxServerConfig {
-                model_dir,
-                model_config,
-                lora_config: crate::agent::mlx_lora::LoraConfig {
-                    lr: 1e-5, // mlx_lm default; 5e-4 causes NaN on real sequences
-                    ..crate::agent::mlx_lora::LoraConfig::default()
-                },
-                host,
-                port,
-            };
-            let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            if let Err(e) = runtime.block_on(crate::agent::mlx_server::serve(server_cfg)) {
-                eprintln!("MLX server error: {e}");
-            }
-        }
     }
 }
 

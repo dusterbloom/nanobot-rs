@@ -15,7 +15,6 @@ use tracing::{error, info, warn};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::Channel;
 use crate::channels::email::EmailChannel;
-use crate::channels::feishu::FeishuChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::whatsapp::WhatsAppChannel;
 use crate::config::schema::Config;
@@ -69,16 +68,6 @@ impl ChannelManager {
                 Arc::new(TokioMutex::new(Box::new(ch))),
             );
             info!("WhatsApp channel enabled");
-        }
-
-        // Feishu.
-        if config.channels.feishu.enabled {
-            let ch = FeishuChannel::new(config.channels.feishu.clone(), bus_inbound_tx.clone());
-            channels.insert(
-                "feishu".to_string(),
-                Arc::new(TokioMutex::new(Box::new(ch))),
-            );
-            info!("Feishu channel enabled");
         }
 
         // Email.

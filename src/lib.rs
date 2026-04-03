@@ -12,8 +12,6 @@ pub mod errors;
 pub mod heartbeat;
 pub mod lms;
 pub mod providers;
-#[cfg(feature = "voice")]
-pub mod realtime;
 pub mod searxng;
 pub mod server;
 pub mod session;

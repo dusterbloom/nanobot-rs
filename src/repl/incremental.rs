@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Incremental line renderer for streaming LLM responses.
 //!
 //! Replaces the old progress-line display with live formatted text.
@@ -20,7 +19,7 @@ enum StreamState {
     Prose,
     /// Inside a fenced code block — highlight with syntect.
     CodeBlock {
-        lang: String,
+        _lang: String,
         highlighter: HighlightLines<'static>,
     },
     /// Thinking deltas (dimmed). Transition in when we see `\x1b[90m`,
@@ -241,7 +240,7 @@ impl IncrementalRenderer {
                     let theme = &THEME_SET.themes["base16-ocean.dark"];
                     let highlighter = HighlightLines::new(syntax, theme);
 
-                    self.state = StreamState::CodeBlock { lang, highlighter };
+                    self.state = StreamState::CodeBlock { _lang: lang, highlighter };
                     return;
                 }
             }
@@ -339,11 +338,6 @@ impl IncrementalRenderer {
             elapsed, self.total_words, rate, reason_suffix
         );
         std::io::stdout().flush().ok();
-    }
-
-    /// Whether the renderer hasn't printed any text yet (still on first line).
-    pub fn is_first_line(&self) -> bool {
-        self.first_line
     }
 
     /// Emit the И marker now (used when tool events arrive before any text).

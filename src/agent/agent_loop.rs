@@ -196,7 +196,6 @@ impl AgentLoop {
             core_handle,
             subagents,
             bus_outbound_tx,
-            bus_inbound_tx,
             cron_service,
             email_config,
             repl_display_tx,
@@ -225,51 +224,12 @@ impl AgentLoop {
                     };
                 cal
             },
-            // Placeholder — rebuilt below once shared fields are accessible.
-            learn_loop: Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
-                calibrator: None,
-                experience_buffer: None,
-                perplexity_gate_config: Default::default(),
-                #[cfg(feature = "mlx")]
-                mlx_provider: None,
-                training_counters: None,
-                ane_model_dir: None,
-                ane_training_model_dir: None,
-                #[cfg(all(feature = "ane", feature = "mlx"))]
-                ane_trainer: None,
-                #[cfg(all(feature = "ane", feature = "mlx"))]
-                ane_optimizer_override: None,
-                #[cfg(all(feature = "ane", feature = "mlx"))]
-                ane_lr_override: None,
-                #[cfg(all(feature = "ane", feature = "mlx"))]
-                ane_strict_ane: false,
-                #[cfg(all(feature = "ane", feature = "mlx"))]
-                draft_reload_tx: None,
-                observe_count: std::sync::atomic::AtomicUsize::new(0),
-            }),
             #[cfg(feature = "cluster")]
             cluster_router: None,
             knowledge_store: crate::agent::knowledge_store::KnowledgeStore::open_default()
                 .ok()
                 .map(|ks| Arc::new(parking_lot::Mutex::new(ks))),
-            experience_buffer: crate::agent::lora_bridge::ExperienceBuffer::open_default()
-                .ok()
-                .map(|eb| Arc::new(parking_lot::Mutex::new(eb))),
-            perplexity_gate_config: Default::default(),
-            #[cfg(feature = "mlx")]
-            mlx_provider: None,
-            ane_model_dir: None,
-            ane_training_model_dir: None,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_trainer: Some(Arc::new(
-                crate::agent::ane_mlx_bridge::PersistentAneTrainer::new(),
-            )),
         });
-        // Rebuild learn_loop now that shared fields are accessible.
-        {
-            let s = Arc::get_mut(&mut shared).expect("learn_loop init: shared Arc not yet cloned");
-            s.rebuild_learn_loop();
-        }
 
         Self {
             shared,
@@ -278,46 +238,6 @@ impl AgentLoop {
             max_concurrent_chats,
             reflection_spawned: AtomicBool::new(false),
         }
-    }
-
-    /// Configure the perplexity gate for automatic online learning.
-    ///
-    /// Must be called before `run()` or `process_direct()` to take effect.
-    pub fn set_perplexity_gate(&mut self, config: crate::config::schema::PerplexityGateConfig) {
-        let shared = Arc::get_mut(&mut self.shared)
-            .expect("set_perplexity_gate called after shared Arc was cloned");
-        shared.perplexity_gate_config = config;
-        shared.rebuild_learn_loop();
-    }
-
-    /// Set the in-process MLX provider for direct perplexity + training.
-    #[cfg(feature = "mlx")]
-    pub fn set_mlx_provider(&mut self, provider: Arc<crate::providers::mlx::MlxProvider>) {
-        let shared = Arc::get_mut(&mut self.shared)
-            .expect("set_mlx_provider called after shared Arc was cloned");
-        shared.mlx_provider = Some(provider);
-        shared.rebuild_learn_loop();
-    }
-
-    /// Set the model directory for standalone ANE training (no in-process MLX).
-    pub fn set_ane_model_dir(&mut self, dir: Option<std::path::PathBuf>) {
-        let shared = Arc::get_mut(&mut self.shared)
-            .expect("set_ane_model_dir called after shared Arc was cloned");
-        shared.ane_model_dir = dir;
-        shared.rebuild_learn_loop();
-    }
-
-    /// Set a separate training model dir (e.g. 0.8B for 32GB machines).
-    pub fn set_ane_training_model_dir(&mut self, dir: Option<std::path::PathBuf>) {
-        let shared = Arc::get_mut(&mut self.shared)
-            .expect("set_ane_training_model_dir called after shared Arc was cloned");
-        shared.ane_training_model_dir = dir;
-        shared.rebuild_learn_loop();
-    }
-
-    #[cfg(all(feature = "ane", feature = "mlx"))]
-    pub fn ane_trainer(&self) -> Option<Arc<crate::agent::ane_mlx_bridge::PersistentAneTrainer>> {
-        self.shared.ane_trainer.clone()
     }
 
     /// Set the cluster router for distributed inference routing.
@@ -333,11 +253,6 @@ impl AgentLoop {
         let subagents = Arc::get_mut(&mut shared.subagents)
             .expect("set_cluster_router: subagents Arc already shared");
         subagents.cluster_router = Some(router);
-    }
-
-    /// Check whether the perplexity gate is enabled on this agent loop.
-    pub fn has_perplexity_gate(&self) -> bool {
-        self.shared.perplexity_gate_config.enabled
     }
 
     /// Toggle LCM on/off at runtime. Returns the new state.

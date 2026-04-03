@@ -1,7 +1,7 @@
 //! Channel REPL commands: /whatsapp, /telegram, /email, /voice.
 
 use std::io::{self, Write as _};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::*;
@@ -16,10 +16,7 @@ impl ReplContext {
         }
         let mut gw_config = load_config(None);
         cli::check_api_key(&gw_config);
-        gw_config.channels.whatsapp.enabled = true;
-        gw_config.channels.telegram.enabled = false;
-        gw_config.channels.feishu.enabled = false;
-        gw_config.channels.email.enabled = false;
+        gw_config.channels.enable_exclusive("whatsapp");
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let dtx = self.display_tx.clone();
@@ -85,10 +82,7 @@ impl ReplContext {
             t
         };
         gw_config.channels.telegram.token = token;
-        gw_config.channels.telegram.enabled = true;
-        gw_config.channels.whatsapp.enabled = false;
-        gw_config.channels.feishu.enabled = false;
-        gw_config.channels.email.enabled = false;
+        gw_config.channels.enable_exclusive("telegram");
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let dtx = self.display_tx.clone();
@@ -124,10 +118,7 @@ impl ReplContext {
         }
         println!("  Starting Email channel...");
         println!("  Polling {}", email_cfg.imap_host);
-        gw_config.channels.email.enabled = true;
-        gw_config.channels.whatsapp.enabled = false;
-        gw_config.channels.telegram.enabled = false;
-        gw_config.channels.feishu.enabled = false;
+        gw_config.channels.enable_exclusive("email");
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let dtx = self.display_tx.clone();

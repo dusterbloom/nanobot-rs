@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! REPL loop and interactive command dispatch for `nanobot agent`.
 //!
 //! Contains the main agent REPL, slash-command handlers, voice recording
@@ -30,7 +29,6 @@ use crate::cron::service::CronService;
 use crate::heartbeat::service::{
     HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS,
 };
-use crate::server;
 use crate::syntax;
 use crate::tui;
 
@@ -270,55 +268,6 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
     }
 }
 
-/// Fetch the list of currently-loaded model IDs from an LM Studio server.
-///
-/// `native_base` must be the root URL without a trailing slash and without `/v1`
-/// (e.g. `http://host:1234`). Returns an empty vec on any error.
-async fn fetch_lms_loaded_models(native_base: &str, api_key: &str) -> Vec<String> {
-    let list_url = format!("{}/api/v1/models", native_base);
-    let client = reqwest::Client::new();
-    let resp = match client
-        .get(&list_url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return Vec::new(),
-    };
-    let json: serde_json::Value = match resp.json().await {
-        Ok(j) => j,
-        Err(_) => return Vec::new(),
-    };
-    let models = match json.get("models").and_then(|m| m.as_array()) {
-        Some(arr) => arr,
-        None => return Vec::new(),
-    };
-    models
-        .iter()
-        .filter_map(|m| {
-            let key = m.get("key")?.as_str()?.to_string();
-            let loaded = m
-                .get("loaded_instances")
-                .and_then(|v| v.as_array())
-                .map(|a| !a.is_empty())
-                .unwrap_or(false);
-            if loaded {
-                Some(key)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Fuzzy model identity check: matches if either ID contains the other.
-///
-/// Mirrors `lms::model_matches` without depending on the private function.
-fn lms_model_matches(loaded: &str, model: &str) -> bool {
-    loaded == model || loaded.contains(model) || model.contains(loaded)
-}
-
 /// Parse a `/ctx` argument into a byte count.
 ///
 /// Accepts:
@@ -419,9 +368,6 @@ pub(crate) fn print_help() {
     println!("  /verify         - Re-verify claims in last response");
     println!("  /provenance     - Toggle provenance display on/off");
     println!("  /cluster, /cl   - Show cluster peers, models, and routing status");
-    println!("  /adapt          - LoRA adapter management (status, run, scale)");
-    println!("  /train          - Training status, /train run|enable|disable|list|merge");
-    println!("  /feedback, /fb  - Rate last response good|bad for training quality");
     println!("  /skill, /sk     - Manage skills (list, add, remove)");
     println!("  /help, /h       - Show this help");
     println!("  Ctrl+C          - Exit\n");
@@ -941,6 +887,7 @@ impl ServerState {
     }
 
     /// Unload models from the current LMS-managed server.
+    #[cfg(test)]
     pub async fn kill_current(&mut self, lms_port: u16, unload_timeout_secs: u64) {
         if self.lms_managed {
             crate::lms::unload_all("", lms_port, unload_timeout_secs)
@@ -1498,18 +1445,9 @@ pub(crate) fn cmd_agent(
             "delegation_config_at_core_build"
         );
 
-        // When inference_engine is "mlx", start the in-process MLX provider
-        // which serves as both the main LLM and the perplexity/training backend.
         #[cfg(feature = "mlx")]
         let mlx_handle: Option<cli::MlxHandle> =
-            if config.agents.defaults.inference_engine == "mlx"
-                && !crate::config::schema::is_external_server_backend(
-                    &config.agents.defaults.local_backend,
-                )
-                && !crate::config::schema::is_higgs_backend(
-                    &config.agents.defaults.local_backend,
-                )
-            {
+            if crate::config::schema::needs_mlx_inprocess(&config.agents.defaults) {
                 match cli::start_mlx_provider(&config) {
                     Ok(h) => Some(h),
                     Err(e) => {
@@ -1582,29 +1520,7 @@ pub(crate) fn cmd_agent(
 
         let health_registry = std::sync::Arc::new(crate::heartbeat::health::build_registry(&config));
 
-        #[cfg(feature = "mlx")]
-        let mut agent_loop = if let Some(ref mlx) = mlx_handle {
-            cli::create_agent_loop_mlx(
-                core_handle.clone(),
-                &config,
-                Some(cron_service.clone()),
-                email_config.clone(),
-                Some(display_tx.clone()),
-                Some(health_registry.clone()),
-                mlx,
-            )
-        } else {
-            cli::create_agent_loop(
-                core_handle.clone(),
-                &config,
-                Some(cron_service.clone()),
-                email_config.clone(),
-                Some(display_tx.clone()),
-                Some(health_registry.clone()),
-            )
-        };
-        #[cfg(not(feature = "mlx"))]
-        let mut agent_loop = cli::create_agent_loop(
+        let agent_loop = cli::create_agent_loop(
             core_handle.clone(),
             &config,
             Some(cron_service.clone()),

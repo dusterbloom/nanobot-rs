@@ -58,8 +58,6 @@ pub(crate) struct AgentLoopShared {
     pub(crate) core_handle: SharedCoreHandle,
     pub(crate) subagents: Arc<SubagentManager>,
     pub(crate) bus_outbound_tx: UnboundedSender<OutboundMessage>,
-    #[allow(dead_code)]
-    pub(crate) bus_inbound_tx: UnboundedSender<crate::bus::events::InboundMessage>,
     pub(crate) cron_service: Option<Arc<CronService>>,
     pub(crate) email_config: Option<EmailConfig>,
     pub(crate) repl_display_tx: Option<UnboundedSender<String>>,
@@ -89,63 +87,12 @@ pub(crate) struct AgentLoopShared {
     /// Budget calibrator for recording execution stats (append-only SQLite).
     pub(crate) calibrator:
         Option<Arc<parking_lot::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>>,
-    /// Unified learning dispatch for turn observations.
-    pub(crate) learn_loop: Arc<dyn crate::agent::learn_loop::LearnLoop>,
     /// Cluster router for distributed inference (feature-gated).
     #[cfg(feature = "cluster")]
     pub(crate) cluster_router: Option<Arc<crate::cluster::router::ClusterRouter>>,
     /// Knowledge store for proactive grounding retrieval.
     pub(crate) knowledge_store:
         Option<Arc<parking_lot::Mutex<crate::agent::knowledge_store::KnowledgeStore>>>,
-    /// Experience buffer for perplexity gate (online learning).
-    pub(crate) experience_buffer:
-        Option<Arc<parking_lot::Mutex<crate::agent::lora_bridge::ExperienceBuffer>>>,
-    /// Perplexity gate configuration.
-    pub(crate) perplexity_gate_config: crate::config::schema::PerplexityGateConfig,
-    /// In-process MLX provider for direct perplexity scoring + training (no HTTP).
-    #[cfg(feature = "mlx")]
-    pub(crate) mlx_provider: Option<std::sync::Arc<crate::providers::mlx::MlxProvider>>,
-    /// Resolved model directory for standalone ANE training.
-    /// Set when inference backend is oMLX/LM Studio (no in-process MLX).
-    pub(crate) ane_model_dir: Option<std::path::PathBuf>,
-    /// Separate model directory for ANE training (e.g. 0.8B on 32GB machines).
-    pub(crate) ane_training_model_dir: Option<std::path::PathBuf>,
-    #[cfg(all(feature = "ane", feature = "mlx"))]
-    pub(crate) ane_trainer:
-        Option<std::sync::Arc<crate::agent::ane_mlx_bridge::PersistentAneTrainer>>,
-}
-
-impl AgentLoopShared {
-    /// Build a `LearnLoop` from the current state of shared fields.
-    ///
-    /// Called after construction and whenever a learn-loop-affecting field
-    /// changes (perplexity gate, MLX provider, ANE model dir).
-    pub(crate) fn rebuild_learn_loop(&mut self) {
-        self.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
-            calibrator: self.calibrator.clone(),
-            experience_buffer: self.experience_buffer.clone(),
-            perplexity_gate_config: self.perplexity_gate_config.clone(),
-            #[cfg(feature = "mlx")]
-            mlx_provider: self.mlx_provider.clone(),
-            training_counters: Some(self.core_handle.counters.clone()),
-            ane_model_dir: self.ane_model_dir.clone(),
-            ane_training_model_dir: self.ane_training_model_dir.clone(),
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_trainer: self.ane_trainer.clone(),
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_optimizer_override: None,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_lr_override: None,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_strict_ane: false,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            draft_reload_tx: self
-                .mlx_provider
-                .as_ref()
-                .and_then(|mlx| mlx.draft_reload_tx()),
-            observe_count: std::sync::atomic::AtomicUsize::new(0),
-        });
-    }
 }
 
 /// Per-message state that flows through the three processing phases.
