@@ -3185,6 +3185,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 [[package]]
 name = "jack-voice"
 version = "0.1.0"
+source = "git+https://github.com/dusterbloom/jack-voice.git?rev=3a650c3bb9291dc70a735e4a1672acb30b7d2309#3a650c3bb9291dc70a735e4a1672acb30b7d2309"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -6283,6 +6284,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "supertonic"
 version = "0.1.0"
+source = "git+https://github.com/dusterbloom/jack-voice.git?rev=3a650c3bb9291dc70a735e4a1672acb30b7d2309#3a650c3bb9291dc70a735e4a1672acb30b7d2309"
 dependencies = [
  "anyhow",
  "hound",

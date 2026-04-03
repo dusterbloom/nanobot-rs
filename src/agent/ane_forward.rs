@@ -1102,7 +1102,7 @@ impl FfnKernels {
 /// All kernels share the same hexId prefix (same MIL text) so only the first
 /// triggers a real `compileWithQoS`; subsequent tiles hit the delta cache.
 pub(crate) struct ClassifierBlobKernel {
-    kernels: Vec<AneKernel>,
+    pub(crate) kernels: Vec<AneKernel>,
     /// fp16 embed weights [vocab, dim] row-major, for CPU fallback path.
     /// Halves memory bandwidth vs fp32 cblas_sgemm.
     embed_f16: Vec<u16>,
@@ -5934,8 +5934,10 @@ mod tests {
             };
             layers.push(ane_weights::LayerWeights {
                 wq: gen(qpd * dim),
-                wk: gen(kv_dim * dim),
-                wv: gen(kv_dim * dim),
+                // LayerWeights stores GQA K/V expanded to attention width; the
+                // prepacked helper compacts them internally.
+                wk: gen(attn_dim * dim),
+                wv: gen(attn_dim * dim),
                 wo: gen(dim * attn_dim),
                 w1: gen(cfg.hidden_dim * dim),
                 w2: gen(dim * cfg.hidden_dim),

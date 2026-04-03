@@ -47,8 +47,58 @@ impl ReplContext {
         }
     }
 
+    /// Point config at a running Higgs instance and refresh the model name.
+    ///
+    /// Shared by `/restart`, `/m` model switch, and auto-start so the
+    /// "update local_api_base + refresh model name" sequence lives in one place.
+    /// Returns the model name if the server responded, or None.
+    async fn apply_higgs_endpoint(&mut self, port: u16) -> Option<String> {
+        self.config.agents.defaults.local_api_base = format!("http://127.0.0.1:{port}/v1");
+        if let Some(name) = crate::higgs::get_model_name(port).await {
+            self.config.agents.defaults.lms_main_model = name.clone();
+            self.config.agents.defaults.local_model = name.clone();
+            Some(name)
+        } else {
+            None
+        }
+    }
+
     /// /restart — restart local servers and reload models.
     pub async fn cmd_restart(&mut self) {
+        // Higgs managed sidecar: stop → restart with current model dir.
+        if self.srv.engine == super::super::InferenceEngine::Higgs {
+            let port = self.config.agents.defaults.higgs_port;
+            match crate::higgs::resolve_model_dir(&self.config) {
+                Ok(model_dir) => {
+                    if let Some(bin) = crate::higgs::find_binary() {
+                        print!("  Restarting Higgs server... ");
+                        io::stdout().flush().ok();
+                        match crate::higgs::server_restart(&bin, port, &model_dir).await {
+                            Ok(()) => {
+                                println!("{}OK{}", tui::GREEN, tui::RESET);
+                                if let Some(name) = self.apply_higgs_endpoint(port).await {
+                                    println!("  Model: {name}");
+                                }
+                            }
+                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                        }
+                    } else {
+                        println!(
+                            "  {}Higgs binary not found.{} Install with: cargo install higgs",
+                            tui::YELLOW, tui::RESET,
+                        );
+                    }
+                }
+                Err(e) => println!("  {}Config error:{} {e}", tui::YELLOW, tui::RESET),
+            }
+            self.apply_and_rebuild();
+            println!(
+                "  {}{}Rebuilt{} agent core.",
+                tui::BOLD, tui::GREEN, tui::RESET
+            );
+            return;
+        }
+
         if self.srv.lms_managed {
             if let Some(ref bin) = self.srv.lms_binary.clone() {
                 let lms_port = self.config.agents.defaults.lms_port;
@@ -457,14 +507,24 @@ impl ReplContext {
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
                 // Persist — switch backend away from "mlx" to LM Studio HTTP.
+                // Do NOT overwrite "higgs" backend: Higgs is a managed sidecar
+                // that happens to list models via the LM Studio protocol on its port.
                 self.config.agents.defaults.local_model = selected.id.clone();
                 self.config.agents.defaults.lms_main_model = selected.id.clone();
-                self.config.agents.defaults.local_backend = "lmstudio".to_string();
+                if !crate::config::schema::is_higgs_backend(
+                    &self.config.agents.defaults.local_backend,
+                ) {
+                    self.config.agents.defaults.local_backend = "lmstudio".to_string();
+                }
                 self.current_model_path = PathBuf::from(&selected.id);
                 let mut disk_cfg = load_config(None);
                 disk_cfg.agents.defaults.local_model = selected.id.clone();
                 disk_cfg.agents.defaults.lms_main_model = selected.id;
-                disk_cfg.agents.defaults.local_backend = "lmstudio".to_string();
+                if !crate::config::schema::is_higgs_backend(
+                    &disk_cfg.agents.defaults.local_backend,
+                ) {
+                    disk_cfg.agents.defaults.local_backend = "lmstudio".to_string();
+                }
                 save_config(&disk_cfg, None);
                 self.apply_and_rebuild();
             }
@@ -518,10 +578,16 @@ impl ReplContext {
                 // Set endpoint + model (same as /cl use logic).
                 // Switch backend away from "mlx" (in-process) so rebuild uses
                 // the HTTP provider for this remote/oMLX endpoint.
+                // Do NOT overwrite "higgs" backend: a Higgs-managed endpoint may
+                // appear as a Remote source when the cluster peer list includes it.
                 self.config.agents.defaults.local_api_base = endpoint.clone();
                 self.config.agents.defaults.lms_main_model = selected.id.clone();
                 self.config.agents.defaults.local_model = selected.id.clone();
-                self.config.agents.defaults.local_backend = "omlx".to_string();
+                if !crate::config::schema::is_higgs_backend(
+                    &self.config.agents.defaults.local_backend,
+                ) {
+                    self.config.agents.defaults.local_backend = "omlx".to_string();
+                }
                 // No longer managed by LM Studio — prevent watchdog auto-restart.
                 self.srv.lms_managed = false;
                 self.current_model_path = PathBuf::from(&selected.id);
@@ -545,65 +611,115 @@ impl ReplContext {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
 
-                // Snapshot old config so we can restore on failure
-                let old_model_dir = self.config.agents.defaults.mlx_model_dir.clone();
-                let old_preset = self.config.agents.defaults.mlx_preset.clone();
-
-                // Update config first
-                self.config.agents.defaults.mlx_model_dir = Some(dir_str.clone());
-                self.config.agents.defaults.inference_engine = "mlx".to_string();
-                self.config.agents.defaults.local_backend = "mlx".to_string();
-                let preset = cli::preset_from_model_dir(path).to_string();
-                self.config.agents.defaults.mlx_preset = preset;
-
-                // Kill the old managed mlx-lm server to free port 8090 before starting new one
-                let old_handle = self.mlx_handle.take();
-                if let Some(ref h) = old_handle {
-                    h.provider.kill_managed_server();
-                }
-
-                // Rebuild MLX provider from scratch with the new model
-                print!("  Loading {}... ", name);
-                io::stdout().flush().ok();
-                match cli::start_mlx_provider(&self.config) {
-                    Ok(h) => {
-                        // Success — persist config to disk now
-                        let mut disk_cfg = load_config(None);
-                        disk_cfg.agents.defaults.mlx_model_dir = Some(dir_str);
-                        disk_cfg.agents.defaults.inference_engine = "mlx".to_string();
-                        disk_cfg.agents.defaults.local_backend = "mlx".to_string();
-                        disk_cfg.agents.defaults.mlx_preset =
-                            self.config.agents.defaults.mlx_preset.clone();
-                        save_config(&disk_cfg, None);
-                        self.mlx_handle = Some(h);
-                        println!("{}OK{}", tui::GREEN, tui::RESET);
-                    }
-                    Err(e) => {
-                        println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
-                        // Restore previous config
-                        self.config.agents.defaults.mlx_model_dir = old_model_dir;
-                        self.config.agents.defaults.mlx_preset = old_preset;
-                        // Try to restore the old provider
-                        match old_handle {
-                            Some(_) => {
-                                print!("  Restoring previous model... ");
-                                io::stdout().flush().ok();
-                                match cli::start_mlx_provider(&self.config) {
-                                    Ok(h) => {
-                                        self.mlx_handle = Some(h);
-                                        println!("{}OK{}", tui::GREEN, tui::RESET);
-                                    }
-                                    Err(e2) => {
-                                        println!("{}FAILED: {}{}", tui::RED, e2, tui::RESET);
-                                    }
+                // When Higgs is the active backend, restart it with the new
+                // model dir instead of switching to in-process MLX.
+                if self.srv.engine == super::super::InferenceEngine::Higgs {
+                    let port = self.config.agents.defaults.higgs_port;
+                    if let Some(bin) = crate::higgs::find_binary() {
+                        print!("  Restarting Higgs with {}... ", name);
+                        io::stdout().flush().ok();
+                        match crate::higgs::server_restart(&bin, port, &dir_str).await {
+                            Ok(()) => {
+                                self.config.agents.defaults.mlx_model_dir =
+                                    Some(dir_str.clone());
+                                if let Some(model_name) =
+                                    self.apply_higgs_endpoint(port).await
+                                {
+                                    println!("{}OK{} · {model_name}", tui::GREEN, tui::RESET);
+                                } else {
+                                    self.config.agents.defaults.local_model = name.clone();
+                                    self.config.agents.defaults.lms_main_model = name;
+                                    println!("{}OK{}", tui::GREEN, tui::RESET);
                                 }
+                                self.current_model_path = path.clone();
+                                // Persist updated model dir to disk.
+                                let mut disk_cfg = load_config(None);
+                                disk_cfg.agents.defaults.mlx_model_dir = Some(dir_str);
+                                disk_cfg.agents.defaults.lms_main_model =
+                                    self.config.agents.defaults.lms_main_model.clone();
+                                disk_cfg.agents.defaults.local_model =
+                                    self.config.agents.defaults.local_model.clone();
+                                save_config(&disk_cfg, None);
+                                self.apply_and_rebuild();
                             }
-                            None => {}
+                            Err(e) => {
+                                println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
+                                return;
+                            }
                         }
+                    } else {
+                        println!(
+                            "  {}Higgs binary not found.{} Install with: cargo install higgs",
+                            tui::YELLOW, tui::RESET,
+                        );
                         return;
                     }
+                } else {
+                    // In-process MLX path (original behavior).
+
+                    // Snapshot old config so we can restore on failure
+                    let old_model_dir = self.config.agents.defaults.mlx_model_dir.clone();
+                    let old_preset = self.config.agents.defaults.mlx_preset.clone();
+
+                    // Update config first
+                    self.config.agents.defaults.mlx_model_dir = Some(dir_str.clone());
+                    self.config.agents.defaults.inference_engine = "mlx".to_string();
+                    self.config.agents.defaults.local_backend = "mlx".to_string();
+                    let preset = cli::preset_from_model_dir(path).to_string();
+                    self.config.agents.defaults.mlx_preset = preset;
+
+                    // Kill the old managed mlx-lm server to free port 8090 before starting new one
+                    let old_handle = self.mlx_handle.take();
+                    if let Some(ref h) = old_handle {
+                        h.provider.kill_managed_server();
+                    }
+
+                    // Rebuild MLX provider from scratch with the new model
+                    print!("  Loading {}... ", name);
+                    io::stdout().flush().ok();
+                    match cli::start_mlx_provider(&self.config) {
+                        Ok(h) => {
+                            // Success — persist config to disk now
+                            let mut disk_cfg = load_config(None);
+                            disk_cfg.agents.defaults.mlx_model_dir = Some(dir_str);
+                            disk_cfg.agents.defaults.inference_engine = "mlx".to_string();
+                            disk_cfg.agents.defaults.local_backend = "mlx".to_string();
+                            disk_cfg.agents.defaults.mlx_preset =
+                                self.config.agents.defaults.mlx_preset.clone();
+                            save_config(&disk_cfg, None);
+                            self.mlx_handle = Some(h);
+                            println!("{}OK{}", tui::GREEN, tui::RESET);
+                        }
+                        Err(e) => {
+                            println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
+                            // Restore previous config
+                            self.config.agents.defaults.mlx_model_dir = old_model_dir;
+                            self.config.agents.defaults.mlx_preset = old_preset;
+                            // Try to restore the old provider
+                            match old_handle {
+                                Some(_) => {
+                                    print!("  Restoring previous model... ");
+                                    io::stdout().flush().ok();
+                                    match cli::start_mlx_provider(&self.config) {
+                                        Ok(h) => {
+                                            self.mlx_handle = Some(h);
+                                            println!("{}OK{}", tui::GREEN, tui::RESET);
+                                        }
+                                        Err(e2) => {
+                                            println!(
+                                                "{}FAILED: {}{}",
+                                                tui::RED, e2, tui::RESET
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {}
+                            }
+                            return;
+                        }
+                    }
+                    self.apply_and_rebuild();
                 }
-                self.apply_and_rebuild();
             }
             #[cfg(not(feature = "mlx"))]
             ModelSource::Mlx { .. } => {
@@ -1105,6 +1221,7 @@ impl ReplContext {
         disk_cfg.agents.defaults.local_backend = self.config.agents.defaults.local_backend.clone();
         disk_cfg.agents.defaults.skip_jit_gate = self.config.agents.defaults.skip_jit_gate;
         disk_cfg.agents.defaults.lms_port = self.config.agents.defaults.lms_port;
+        disk_cfg.agents.defaults.higgs_port = self.config.agents.defaults.higgs_port;
         disk_cfg.agents.defaults.lms_main_model =
             self.config.agents.defaults.lms_main_model.clone();
         disk_cfg.agents.defaults.local_model = self.config.agents.defaults.local_model.clone();
@@ -1122,14 +1239,15 @@ impl ReplContext {
             crate::agent::pid_file::cleanup_stale_pids();
 
             // Try to start a local inference engine if none is active.
-            if self.config.agents.defaults.local_api_base.is_empty()
+            // For Higgs: always attempt start regardless of local_api_base — it may
+            // be stale from a previous session and Higgs may have stopped.
+            let is_higgs = crate::config::schema::is_higgs_backend(
+                &self.config.agents.defaults.local_backend,
+            );
+            if (self.config.agents.defaults.local_api_base.is_empty() || is_higgs)
                 && !self.srv.lms_managed
                 && self.srv.engine == super::super::InferenceEngine::None
             {
-                let is_higgs = crate::config::schema::is_higgs_backend(
-                    &self.config.agents.defaults.local_backend,
-                );
-
                 if is_higgs {
                     // Higgs managed sidecar
                     match crate::higgs::resolve_model_dir(&self.config) {
@@ -1144,13 +1262,9 @@ impl ReplContext {
                                     Ok(()) => {
                                         self.srv.engine = super::super::InferenceEngine::Higgs;
                                         self.srv.local_port = port.to_string();
-                                        if self.config.agents.defaults.local_api_base.is_empty() {
-                                            self.config.agents.defaults.local_api_base =
-                                                format!("http://127.0.0.1:{port}/v1");
-                                        }
                                         self.config.agents.defaults.skip_jit_gate = true;
                                         if let Some(name) =
-                                            crate::higgs::get_model_name(port).await
+                                            self.apply_higgs_endpoint(port).await
                                         {
                                             println!(
                                                 "  {}OK{} · {name}",

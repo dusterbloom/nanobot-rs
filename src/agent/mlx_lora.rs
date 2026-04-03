@@ -1204,6 +1204,100 @@ fn compiled_plain_kv_decode_step(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Compiled GDN recurrence decode
+// ---------------------------------------------------------------------------
+
+/// Inputs to compiled GDN recurrence: `[q, k, v, g, beta, z]` as `&[Array]`.
+/// - q: `[B, 1, H_v, D_k]` — post-norm, post-GQA expanded queries
+/// - k: `[B, 1, H_v, D_k]` — post-norm, post-GQA expanded keys
+/// - v: `[B, 1, H_v, D_v]` — values
+/// - g: `[B, 1, H_v]` — decay gate
+/// - beta: `[B, 1, H_v]` — write gate
+/// - z: `[B, 1, H_v, D_v]` — output gate input
+///
+/// State (`GdnCache`):
+/// - state: `[B, H_v, D_v, D_k]` — recurrent memory (mutated)
+/// - compiled_norm_weight: `[D_v]` — RMSNorm weight (read-only)
+/// - compiled_o_proj_weight: `[dim, value_dim]` — O projection weight (read-only)
+///
+/// Returns: `[B, 1, dim]` — attention output
+type CompiledGdnDecodeFn =
+    dyn for<'a> FnMut(&mut GdnCache, &'a [Array]) -> Result<Vec<Array>, Exception>;
+
+fn make_compiled_gdn_decode() -> Box<CompiledGdnDecodeFn> {
+    Box::new(compile_with_state(
+        move |cache: &mut GdnCache, inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+            compiled_gdn_recurrence_step(cache, inputs)
+        },
+        true,
+    ))
+}
+
+/// Pure recurrence + output gate + O-projection for a single decode step.
+///
+/// All projections (QKV, a, b, z) and conv1d happen *before* this call.
+/// This function only does the stateful recurrence and output computation,
+/// which is the part that benefits from `compile_with_state`.
+fn compiled_gdn_recurrence_step(
+    cache: &mut GdnCache,
+    inputs: &[Array],
+) -> Result<Vec<Array>, Exception> {
+    let q = &inputs[0]; // [B, 1, H_v, D_k]
+    let k = &inputs[1]; // [B, 1, H_v, D_k]
+    let v = &inputs[2]; // [B, 1, H_v, D_v]
+    let g = &inputs[3]; // [B, 1, H_v]
+    let beta = &inputs[4]; // [B, 1, H_v]
+    let z = &inputs[5]; // [B, 1, H_v, D_v]
+
+    let state = cache
+        .state
+        .as_ref()
+        .ok_or_else(|| Exception::custom("compiled GDN decode requires initialized state"))?;
+    let norm_weight = cache
+        .compiled_norm_weight
+        .as_ref()
+        .ok_or_else(|| Exception::custom("compiled GDN decode requires norm weight"))?;
+
+    // Squeeze seq dim (axis=1) for recurrence: [B, H_v, D_k/D_v]
+    let q_t = q.squeeze_axes(&[1])?;
+    let k_t = k.squeeze_axes(&[1])?;
+    let v_t = v.squeeze_axes(&[1])?;
+    let g_t = g.squeeze_axes(&[1])?.expand_dims(-1)?.expand_dims(-1)?; // [B, H_v, 1, 1]
+    let beta_t = beta.squeeze_axes(&[1])?.expand_dims(-1)?; // [B, H_v, 1]
+
+    // Recurrence: state = state * g + k * (v - state @ k) * beta
+    let new_state = state.multiply(&g_t)?;
+    let k_expanded = k_t.expand_dims(-2)?; // [B, H_v, 1, D_k]
+    let kv_mem = new_state.multiply(&k_expanded)?.sum_axes(&[-1], false)?; // [B, H_v, D_v]
+    let delta = v_t.subtract(&kv_mem)?.multiply(&beta_t)?; // [B, H_v, D_v]
+    let delta_expanded = delta.expand_dims(-1)?; // [B, H_v, D_v, 1]
+    let new_state = new_state.add(&k_expanded.multiply(&delta_expanded)?)?;
+
+    // y = state @ q
+    let q_expanded = q_t.expand_dims(-2)?; // [B, H_v, 1, D_k]
+    let y_t = new_state.multiply(&q_expanded)?.sum_axes(&[-1], false)?; // [B, H_v, D_v]
+
+    // Write updated state back
+    *cache.state.as_mut().ok_or_else(|| {
+        Exception::custom("compiled GDN decode: state disappeared during recurrence")
+    })? = new_state;
+
+    // Output gate: silu(z) * rms_norm(y)
+    let z_t = z.squeeze_axes(&[1])?; // [B, H_v, D_v]
+    let y_flat = y_t.reshape(&[-1, y_t.shape()[2]])?; // [B*H_v, D_v]
+    let y_normed = mlx_rs::fast::rms_norm(&y_flat, norm_weight, 1e-6)?;
+    let y_normed = y_normed.reshape(y_t.shape())?; // [B, H_v, D_v]
+    let gated = nn::silu(&z_t)?.multiply(&y_normed)?; // [B, H_v, D_v]
+
+    // Return gated as [B, 1, value_dim] — O projection done outside (quantized weight)
+    let batch = gated.shape()[0];
+    let value_dim = gated.shape()[1] * gated.shape()[2];
+    let gated_flat = gated.reshape(&[batch, 1, value_dim])?;
+
+    Ok(vec![gated_flat])
+}
+
 impl MlxLoraAttention {
     pub fn load(
         weights: &mut HashMap<String, Array>,
@@ -2160,6 +2254,102 @@ impl MlxLinearAttention {
     }
 }
 
+/// Intermediate arrays from GDN projection phase, ready for compiled recurrence.
+pub(crate) struct GdnProjectionResult {
+    /// `[B, 1, H_v, D_k]` — post-norm, post-GQA queries
+    pub q: Array,
+    /// `[B, 1, H_v, D_k]` — post-norm, post-GQA keys
+    pub k: Array,
+    /// `[B, 1, H_v, D_v]` — values
+    pub v: Array,
+    /// `[B, 1, H_v]` — decay gate
+    pub g: Array,
+    /// `[B, 1, H_v]` — write gate
+    pub beta: Array,
+    /// `[B, 1, H_v, D_v]` — output gate input (z projection, reshaped)
+    pub z: Array,
+}
+
+impl MlxLinearAttention {
+    /// Run projection phase only (QKV, a, b, z, conv, norm, GQA, gates).
+    /// Returns intermediate arrays for the compiled recurrence step.
+    /// Only valid for decode (seq_len == 1).
+    pub fn project_for_compiled_decode(
+        &mut self,
+        x: &Array,
+        cache: &mut GdnCache,
+    ) -> Result<GdnProjectionResult, Exception> {
+        let shape = x.shape();
+        let (batch, seq_len) = (shape[0], shape[1]);
+        debug_assert_eq!(seq_len, 1, "compiled decode only for single-token");
+        let h_k = self.n_heads;
+        let d_k = self.head_dim;
+        let h_v = self.n_value_heads;
+        let d_v = self.value_head_dim;
+        let key_dim = h_k * d_k;
+        let kv_repeat = h_v / h_k;
+
+        // 1. Project
+        let qkv = self.in_proj_qkv.forward(x)?;
+        let a = self.in_proj_a.forward(x)?;
+        let b = self.in_proj_b.forward(x)?;
+        let z = self
+            .in_proj_z
+            .forward(x)?
+            .reshape(&[batch, seq_len, h_v, d_v])?;
+
+        // 2. Conv1d
+        let qkv_conv = self.apply_decode_conv1d_step(&qkv, cache)?;
+
+        // 3. Split Q, K, V + normalize + GQA repeat
+        let parts = qkv_conv.split_axis(&[key_dim, 2 * key_dim], -1)?;
+        let q = parts[0].reshape(&[batch, seq_len, h_k, d_k])?;
+        let k = parts[1].reshape(&[batch, seq_len, h_k, d_k])?;
+        let v = parts[2].reshape(&[batch, seq_len, h_v, d_v])?;
+
+        let inv_scale = (d_k as f32).powf(-0.5);
+        let ones_d = mlx_rs::ops::ones::<f32>(&[d_k])?;
+        let q_flat = q.reshape(&[-1, d_k])?;
+        let k_flat = k.reshape(&[-1, d_k])?;
+        let q_norm =
+            mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h_k, d_k])?;
+        let k_norm =
+            mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h_k, d_k])?;
+
+        let (q, k) = if kv_repeat > 1 {
+            let q_exp = mlx_rs::ops::broadcast_to(
+                &q_norm.expand_dims(3)?,
+                &[batch, seq_len, h_k, kv_repeat, d_k],
+            )?
+            .reshape(&[batch, seq_len, h_v, d_k])?;
+            let k_exp = mlx_rs::ops::broadcast_to(
+                &k_norm.expand_dims(3)?,
+                &[batch, seq_len, h_k, kv_repeat, d_k],
+            )?
+            .reshape(&[batch, seq_len, h_v, d_k])?;
+            (q_exp, k_exp)
+        } else {
+            (q_norm, k_norm)
+        };
+        let q = q.multiply(Array::from_f32(inv_scale * inv_scale))?;
+        let k = k.multiply(Array::from_f32(inv_scale))?;
+
+        // 4. Decay and beta gates
+        let a_plus_bias = a.add(&*self.dt_bias)?;
+        let sp = nn::softplus(&a_plus_bias)?;
+        let decay_rate = mlx_rs::ops::exp(&*self.a_log)?.multiply(&sp)?;
+        let g = mlx_rs::ops::exp(&decay_rate.negative()?)?;
+        let beta = nn::sigmoid(&b)?;
+
+        Ok(GdnProjectionResult { q, k, v, g, beta, z })
+    }
+
+    /// Get the norm weight for compiled decode snapshot.
+    pub fn norm_weight(&self) -> &Array {
+        &*self.norm.weight
+    }
+}
+
 fn apply_decode_conv1d_step_with_weight(
     conv1d_weight: &Array,
     conv_kernel: i32,
@@ -2442,6 +2632,7 @@ impl MlxLoraDecoderLayer {
         mask: Option<&Array>,
         cache: Option<&mut LayerCache>,
         compiled_plain_kv_decode: Option<&mut CompiledPlainKvDecodeFn>,
+        compiled_gdn_decode: Option<&mut CompiledGdnDecodeFn>,
         mut linear_profile: Option<&mut LinearDecodeSubProfile>,
     ) -> Result<Array, Exception> {
         let residual = x;
@@ -2454,6 +2645,20 @@ impl MlxLoraDecoderLayer {
         let h = match (&mut self.attn, cache) {
             (AttentionKind::Full(attn), Some(LayerCache::FullAttn(c))) => {
                 attn.forward_with_cache(&h, mask, c, compiled_plain_kv_decode)?
+            }
+            (AttentionKind::Linear(attn), Some(LayerCache::LinearAttn(c)))
+                if compiled_gdn_decode.is_some() && c.compiled_decode_ready() =>
+            {
+                // Compiled GDN decode: projections outside compile, recurrence inside
+                let proj = attn.project_for_compiled_decode(&h, c)?;
+                let inputs = [proj.q, proj.k, proj.v, proj.g, proj.beta, proj.z];
+                let gated = compiled_gdn_decode.unwrap()(c, &inputs)?;
+                let gated = gated.into_iter().next().ok_or_else(|| {
+                    Exception::custom("compiled GDN decode returned empty result")
+                })?;
+                // O projection outside compile (quantized weight)
+                let out = attn.out_proj.forward(&gated)?;
+                mlx_rs::stop_gradient(&out)?
             }
             (AttentionKind::Linear(attn), Some(LayerCache::LinearAttn(c))) => {
                 mlx_rs::stop_gradient(&attn.forward_with_cache_internal(
@@ -2894,10 +3099,21 @@ impl MlxLoraModel {
     {
         self.ensure_prefill_capacity(&mut state, max_tokens)?;
         let compiled_decode = compiled_decode_enabled();
+        let has_gdn_layers = self.layers.iter().any(|l| !l.is_full_attention());
         if compiled_decode {
-            for cache in &mut state.caches {
-                if let LayerCache::FullAttn(KvCache::Plain(kv)) = cache {
-                    kv.prepare_compiled_decode_state()?;
+            for (layer, cache) in self.layers.iter().zip(state.caches.iter_mut()) {
+                match cache {
+                    LayerCache::FullAttn(KvCache::Plain(kv)) => {
+                        kv.prepare_compiled_decode_state()?;
+                    }
+                    LayerCache::LinearAttn(gdn) if has_gdn_layers => {
+                        if let Some(attn) = layer.linear_attention() {
+                            gdn.prepare_compiled_decode(
+                                attn.norm_weight(),
+                            )?;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2918,6 +3134,11 @@ impl MlxLoraModel {
         } else {
             None
         };
+        let mut compiled_gdn_decode = if compiled_decode && has_gdn_layers {
+            Some(make_compiled_gdn_decode())
+        } else {
+            None
+        };
 
         let mut current_token = sample_next_token(&state.last_logits, temperature)?;
 
@@ -2928,6 +3149,7 @@ impl MlxLoraModel {
                     &input,
                     &mut caches,
                     &mut compiled_plain_kv_decode,
+                    &mut compiled_gdn_decode,
                 )?;
                 let last_logits = logits.index((.., -1, ..));
                 let token = sample_next_token(&last_logits, temperature)?;
@@ -2983,7 +3205,7 @@ impl MlxLoraModel {
         tokens: &Array,
         caches: &mut [LayerCache],
     ) -> Result<Array, Exception> {
-        self.forward_logits_cached_internal(tokens, caches, &mut None, None)
+        self.forward_logits_cached_internal(tokens, caches, &mut None, &mut None, None)
     }
 
     pub fn profile_forward_logits_cached_step(
@@ -2992,10 +3214,21 @@ impl MlxLoraModel {
         caches: &mut [LayerCache],
     ) -> Result<(Array, CachedDecodeProfile), Exception> {
         let compiled_decode = compiled_decode_enabled();
+        let has_gdn_layers = self.layers.iter().any(|l| !l.is_full_attention());
         if compiled_decode {
-            for cache in caches.iter_mut() {
-                if let LayerCache::FullAttn(KvCache::Plain(kv)) = cache {
-                    kv.prepare_compiled_decode_state()?;
+            for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+                match cache {
+                    LayerCache::FullAttn(KvCache::Plain(kv)) => {
+                        kv.prepare_compiled_decode_state()?;
+                    }
+                    LayerCache::LinearAttn(gdn) if has_gdn_layers => {
+                        if let Some(attn) = layer.linear_attention() {
+                            gdn.prepare_compiled_decode(
+                                attn.norm_weight(),
+                            )?;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -3011,12 +3244,18 @@ impl MlxLoraModel {
         } else {
             None
         };
+        let mut compiled_gdn_decode = if compiled_decode && has_gdn_layers {
+            Some(make_compiled_gdn_decode())
+        } else {
+            None
+        };
 
         let mut profile = CachedDecodeProfile::default();
         let logits = self.forward_logits_cached_internal(
             tokens,
             caches,
             &mut compiled_plain_kv_decode,
+            &mut compiled_gdn_decode,
             Some(&mut profile),
         )?;
         Ok((logits, profile))
@@ -3027,8 +3266,15 @@ impl MlxLoraModel {
         tokens: &Array,
         caches: &mut [LayerCache],
         compiled_plain_kv_decode: &mut Option<Box<CompiledPlainKvDecodeFn>>,
+        compiled_gdn_decode: &mut Option<Box<CompiledGdnDecodeFn>>,
     ) -> Result<Array, Exception> {
-        self.forward_logits_cached_internal(tokens, caches, compiled_plain_kv_decode, None)
+        self.forward_logits_cached_internal(
+            tokens,
+            caches,
+            compiled_plain_kv_decode,
+            compiled_gdn_decode,
+            None,
+        )
     }
 
     fn forward_logits_cached_internal(
@@ -3036,6 +3282,7 @@ impl MlxLoraModel {
         tokens: &Array,
         caches: &mut [LayerCache],
         compiled_plain_kv_decode: &mut Option<Box<CompiledPlainKvDecodeFn>>,
+        compiled_gdn_decode: &mut Option<Box<CompiledGdnDecodeFn>>,
         mut profile: Option<&mut CachedDecodeProfile>,
     ) -> Result<Array, Exception> {
         let total_t0 = std::time::Instant::now();
@@ -3101,6 +3348,7 @@ impl MlxLoraModel {
                 mask.as_ref(),
                 Some(cache),
                 compiled_plain_kv_decode.as_deref_mut(),
+                compiled_gdn_decode.as_deref_mut(),
                 linear_decode.as_mut(),
             )?;
             if let Some(profile) = profile.as_deref_mut() {
@@ -3383,6 +3631,8 @@ pub enum KvCache {
 /// GDN (Gated Delta Net) recurrent state for incremental generation.
 ///
 /// Stores the recurrent state matrix and conv1d circular buffer.
+/// When compiled decode is enabled, also holds weight snapshots for
+/// norm and O-projection so the compiled closure can access them.
 #[derive(Clone, Debug)]
 pub struct GdnCache {
     /// Recurrent state: `[B, H, D_v, D_k]`
@@ -3391,6 +3641,38 @@ pub struct GdnCache {
     pub conv_buf: Option<Array>,
     /// Index of the most recent token in `conv_buf` when present.
     pub conv_pos: i32,
+    // --- Compiled decode weight snapshot (set once, read-only during decode) ---
+    /// Group norm weight: `[d_v]` for compiled decode RMSNorm.
+    pub compiled_norm_weight: Option<Array>,
+}
+
+impl Updatable for GdnCache {
+    fn updatable_states_len(&self) -> usize {
+        usize::from(self.state.is_some())
+            + usize::from(self.compiled_norm_weight.is_some())
+    }
+
+    fn updatable_states(&self) -> impl IntoIterator<Item = &Array> {
+        let mut states = Vec::with_capacity(self.updatable_states_len());
+        if let Some(s) = self.state.as_ref() {
+            states.push(s);
+        }
+        if let Some(w) = self.compiled_norm_weight.as_ref() {
+            states.push(w);
+        }
+        states
+    }
+
+    fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array> {
+        let mut states = Vec::with_capacity(self.updatable_states_len());
+        if let Some(s) = self.state.as_mut() {
+            states.push(s);
+        }
+        if let Some(w) = self.compiled_norm_weight.as_mut() {
+            states.push(w);
+        }
+        states
+    }
 }
 
 fn quantized_layout_dims(
@@ -4096,7 +4378,26 @@ impl GdnCache {
             state: None,
             conv_buf: None,
             conv_pos: -1,
+            compiled_norm_weight: None,
         }
+    }
+}
+
+impl GdnCache {
+    /// Snapshot layer weights into the cache for compiled decode.
+    /// Must be called after prefill, before the first compiled decode step.
+    pub fn prepare_compiled_decode(
+        &mut self,
+        norm_weight: &Array,
+    ) -> Result<(), Exception> {
+        self.compiled_norm_weight = Some(norm_weight.clone());
+        Ok(())
+    }
+
+    /// Returns true if compiled decode weights are snapshotted.
+    pub fn compiled_decode_ready(&self) -> bool {
+        self.state.is_some()
+            && self.compiled_norm_weight.is_some()
     }
 }
 
@@ -5730,11 +6031,13 @@ mod tests {
             state: None,
             conv_buf: Some(prefill_tail.clone()),
             conv_pos: kernel - 2,
+            compiled_norm_weight: None,
         };
         let mut reference_cache = GdnCache {
             state: None,
             conv_buf: Some(prefill_tail),
             conv_pos: -1,
+            compiled_norm_weight: None,
         };
 
         for (step_idx, qkv) in decode_steps.iter().enumerate() {
@@ -6013,5 +6316,163 @@ mod tests {
             max_pct < 60.0,
             "excessive repetition ({max_pct:.0}%) suggests KV cache bug"
         );
+    }
+
+    /// Benchmark: compiled GDN decode vs uncompiled on Qwen3.5-0.8B.
+    ///
+    /// Measures per-token decode latency with and without `compile_with_state`
+    /// for GDN (linear attention) layers.
+    ///
+    /// cargo test --release --lib -- "bench_compiled_gdn_decode" --nocapture --ignored --test-threads=1
+    #[test]
+    #[ignore]
+    fn bench_compiled_gdn_decode() {
+        // Try models in order: 35B-A3B-3bit > 35B-A3B-4bit > 0.8B > 2B
+        let home = std::env::var("HOME").unwrap();
+        let candidates = [
+            ".cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit",
+            ".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit",
+            ".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit",
+            ".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit",
+        ];
+        let model_dir = candidates.iter()
+            .map(|p| std::path::PathBuf::from(&home).join(p))
+            .find(|p| p.exists());
+        let Some(model_dir) = model_dir.as_ref() else {
+            eprintln!("No Qwen3.5 model found, skipping");
+            return;
+        };
+
+        let cfg = ModelConfig::from_config_json(model_dir)
+            .expect("could not parse config.json");
+        let lora_cfg = LoraConfig::default();
+
+        let n_gdn = cfg.linear_attn_indices.len();
+        let n_full = cfg.n_layers - n_gdn;
+        eprintln!("Model: {} ({}L: {} GDN + {} full attn)",
+            model_dir.file_name().unwrap().to_string_lossy(),
+            cfg.n_layers, n_gdn, n_full);
+
+        let prompt = &[760i32, 6511, 314, 9338, 369]; // "The capital of France is"
+        let n_warmup = 5;
+        let n_bench = 20;
+
+        // --- Baseline: compiled KV only, no compiled GDN ---
+        std::env::set_var("NANOBOT_MLX_COMPILED_DECODE", "1");
+        let mut model = MlxLoraModel::load(model_dir, &cfg, &lora_cfg).expect("load");
+        let state = model.prefill(prompt, n_warmup + n_bench).expect("prefill");
+        let mut caches = state.caches;
+
+        // Prepare compiled KV decode for full-attn layers only
+        for cache in caches.iter_mut() {
+            if let LayerCache::FullAttn(KvCache::Plain(kv)) = cache {
+                kv.prepare_compiled_decode_state().expect("prep kv");
+            }
+        }
+        let first_full_attn_scale = model.layers.iter().find_map(|layer| match &layer.attn {
+            AttentionKind::Full(attn) => Some(attn.attn_scale),
+            AttentionKind::Linear(_) => None,
+        });
+        let mut baseline_compiled_kv = first_full_attn_scale
+            .map(make_compiled_plain_kv_decode);
+        let mut no_gdn: Option<Box<CompiledGdnDecodeFn>> = None;
+
+        let mut token = sample_next_token(&state.last_logits, 0.0)
+            .expect("sample")
+            .reshape(&[1, 1])
+            .expect("reshape");
+
+        for _ in 0..n_warmup {
+            let logits = model.forward_logits_cached_with_compiled(
+                &token, &mut caches, &mut baseline_compiled_kv, &mut no_gdn,
+            ).expect("fwd");
+            token = sample_next_token(&logits.index((.., -1, ..)), 0.0)
+                .expect("sample")
+                .reshape(&[1, 1])
+                .expect("reshape");
+        }
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_bench {
+            let logits = model.forward_logits_cached_with_compiled(
+                &token, &mut caches, &mut baseline_compiled_kv, &mut no_gdn,
+            ).expect("fwd");
+            token = sample_next_token(&logits.index((.., -1, ..)), 0.0)
+                .expect("sample")
+                .reshape(&[1, 1])
+                .expect("reshape");
+        }
+        let baseline_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let baseline_per_tok = baseline_ms / n_bench as f64;
+
+        // Free baseline model before loading compiled version
+        drop(caches);
+        drop(baseline_compiled_kv);
+        drop(model);
+
+        // --- Compiled decode: compiled KV + compiled GDN ---
+        let mut model = MlxLoraModel::load(model_dir, &cfg, &lora_cfg).expect("reload");
+        let state = model.prefill(prompt, n_warmup + n_bench).expect("prefill");
+        let mut caches = state.caches;
+
+        // Prepare compiled decode state for all cache types
+        for (layer, cache) in model.layers.iter().zip(caches.iter_mut()) {
+            match cache {
+                LayerCache::FullAttn(KvCache::Plain(kv)) => {
+                    kv.prepare_compiled_decode_state().expect("prep kv");
+                }
+                LayerCache::LinearAttn(gdn) => {
+                    if let Some(attn) = layer.linear_attention() {
+                        gdn.prepare_compiled_decode(
+                            attn.norm_weight(),
+                        ).expect("prep gdn");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let first_full_attn_scale = model.layers.iter().find_map(|layer| match &layer.attn {
+            AttentionKind::Full(attn) => Some(attn.attn_scale),
+            AttentionKind::Linear(_) => None,
+        });
+        let mut compiled_plain_kv = first_full_attn_scale
+            .map(make_compiled_plain_kv_decode);
+        let mut compiled_gdn = Some(make_compiled_gdn_decode());
+
+        let mut token = sample_next_token(&state.last_logits, 0.0)
+            .expect("sample")
+            .reshape(&[1, 1])
+            .expect("reshape");
+
+        // Warmup
+        for _ in 0..n_warmup {
+            let logits = model.forward_logits_cached_with_compiled(
+                &token, &mut caches, &mut compiled_plain_kv, &mut compiled_gdn,
+            ).expect("fwd");
+            token = sample_next_token(&logits.index((.., -1, ..)), 0.0)
+                .expect("sample")
+                .reshape(&[1, 1])
+                .expect("reshape");
+        }
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_bench {
+            let logits = model.forward_logits_cached_with_compiled(
+                &token, &mut caches, &mut compiled_plain_kv, &mut compiled_gdn,
+            ).expect("fwd");
+            token = sample_next_token(&logits.index((.., -1, ..)), 0.0)
+                .expect("sample")
+                .reshape(&[1, 1])
+                .expect("reshape");
+        }
+        let compiled_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let compiled_per_tok = compiled_ms / n_bench as f64;
+
+        let speedup = baseline_per_tok / compiled_per_tok;
+        eprintln!("\n  ── Compiled GDN Decode Benchmark ({n_bench} tokens) ──");
+        eprintln!("  Baseline:  {baseline_per_tok:.2} ms/tok ({:.1} tok/s)", 1000.0 / baseline_per_tok);
+        eprintln!("  Compiled:  {compiled_per_tok:.2} ms/tok ({:.1} tok/s)", 1000.0 / compiled_per_tok);
+        eprintln!("  Speedup:   {speedup:.2}x");
     }
 }

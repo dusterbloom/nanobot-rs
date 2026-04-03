@@ -950,7 +950,7 @@ impl ServerState {
         self.engine = InferenceEngine::None;
     }
 
-    /// Full shutdown: stop LM Studio server.
+    /// Full shutdown: stop LM Studio or Higgs server.
     pub fn shutdown(&mut self) {
         if self.lms_managed {
             if let Some(ref bin) = self.lms_binary {
@@ -958,6 +958,10 @@ impl ServerState {
                 crate::lms::server_stop(bin).ok();
             }
             self.lms_managed = false;
+        }
+        if self.engine == InferenceEngine::Higgs {
+            println!("Stopping Higgs server...");
+            crate::higgs::server_stop().ok();
         }
         self.engine = InferenceEngine::None;
     }
@@ -1115,22 +1119,26 @@ pub(crate) fn cmd_agent(
                     if let Some(bin) = crate::higgs::find_binary() {
                         match crate::higgs::server_start(&bin, higgs_port, &model_dir).await {
                             Ok(()) => {
-                                if config.agents.defaults.local_api_base.is_empty() {
-                                    config.agents.defaults.local_api_base =
-                                        format!("http://127.0.0.1:{higgs_port}/v1");
-                                }
+                                // Always point at the managed Higgs port — overwrite any
+                                // stale localApiBase from a previous session that may point
+                                // at a different port or a dead endpoint.
+                                config.agents.defaults.local_api_base =
+                                    format!("http://127.0.0.1:{higgs_port}/v1");
                                 config.agents.defaults.skip_jit_gate = true;
-                                // Update model name from running server
+                                // Always refresh model name from the running server so
+                                // display and routing use the actual loaded model, not a
+                                // stale value from a previous /m switch.
                                 if let Some(name) = crate::higgs::get_model_name(higgs_port).await
                                 {
-                                    if config.agents.defaults.lms_main_model.is_empty() {
-                                        config.agents.defaults.lms_main_model = name.clone();
-                                    }
+                                    config.agents.defaults.lms_main_model = name.clone();
                                     local_model_name = name;
                                 }
                             }
                             Err(e) => {
                                 eprintln!("Warning: failed to start Higgs: {e}");
+                                // Clear any stale local_api_base so we don't send
+                                // requests to a dead endpoint from a previous session.
+                                config.agents.defaults.local_api_base.clear();
                             }
                         }
                     } else {
@@ -1753,9 +1761,11 @@ pub(crate) fn cmd_agent(
             heartbeat.start().await;
 
             // Start health watchdog for local servers (if any are running).
-            // Skip when using a remote local server (e.g. LM Studio) — there is
+            // Skip when using a remote local server (e.g. oMLX) — there is
             // no local server to monitor and the watchdog would spam the remote.
-            if is_local && !has_remote_local {
+            // Higgs is a managed sidecar so it DOES need the watchdog despite
+            // setting local_api_base.
+            if is_local && (!has_remote_local || use_higgs) {
                 ctx.restart_watchdog();
             }
 

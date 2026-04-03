@@ -4010,6 +4010,7 @@ mod tests {
     #[cfg(feature = "mlx")]
     #[test]
     fn test_bucket_kernels_compile_qwen3_5() {
+        let _test_guard = crate::agent::ane_bridge::lock_ane_test_runtime();
         if skip_if_no_qwen3_5() {
             eprintln!("SKIP: Qwen3.5-0.8B not found");
             return;
@@ -4055,7 +4056,7 @@ mod tests {
         assert!(
             matches!(
                 &fwd.ffn,
-                FfnKernels::Fused { .. } | FfnKernels::Tiled { .. }
+                FfnKernels::FullyFused { .. } | FfnKernels::Fused { .. } | FfnKernels::Tiled { .. }
             ),
             "FFN should compile on ANE"
         );
@@ -7963,6 +7964,7 @@ mod tests {
     #[test]
     #[cfg(feature = "mlx")]
     #[ignore = "requires 35B checkpoint + routing_targets.bin from routing_hook.py"]
+    #[cfg(feature = "mlx")]
     fn test_router_self_improve_from_omlx() {
         use crate::agent::ane_lora::RouterTrainer;
         use crate::agent::ane_weights::{QuantizedModelWeights, WeightSource};

@@ -170,7 +170,8 @@ mlx = ["dep:mlx-rs", "dep:tokenizers", "dep:axum"]  # MLX GPU LoRA training (mac
 candle = ["dep:candle-core", "dep:candle-nn"]  # Candle Metal GPU inference (GQA attention layers)
 
 [dependencies.jack-voice]
-path = "../jack-voice/jack-voice"
+git = "https://github.com/dusterbloom/jack-voice.git"
+rev = "3a650c3bb9291dc70a735e4a1672acb30b7d2309"
 optional = true
 
 [dependencies.crossterm]

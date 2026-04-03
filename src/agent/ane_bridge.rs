@@ -4,8 +4,13 @@
 //! The bridge compiles MIL programs into ANE kernels, evaluates them,
 //! and manages IOSurface-backed input/output tensors.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void, CString};
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::ptr;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Raw FFI declarations (mirrors ane_bridge.h)
@@ -204,8 +209,104 @@ extern "C" {
 // Safe wrappers
 // ---------------------------------------------------------------------------
 
+struct AneRuntimeGuard {
+    #[cfg(test)]
+    _test_guard: AneTestGuard,
+    file: MutexGuard<'static, File>,
+}
+
+impl Drop for AneRuntimeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ANE_TEST_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) struct AneTestGuard {
+    _guard: Option<MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl Drop for AneTestGuard {
+    fn drop(&mut self) {
+        ANE_TEST_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn ane_runtime_lock() -> &'static Mutex<File> {
+    static LOCK: OnceLock<Mutex<File>> = OnceLock::new();
+    LOCK.get_or_init(|| {
+        let path = std::env::temp_dir().join("nanobot-ane-runtime.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|err| panic!("failed to open ANE runtime lock {path:?}: {err}"));
+        Mutex::new(file)
+    })
+}
+
+#[cfg(test)]
+fn maybe_lock_ane_test_runtime() -> AneTestGuard {
+    ANE_TEST_LOCK_DEPTH.with(|depth| {
+        let current = depth.get();
+        depth.set(current + 1);
+        if current == 0 {
+            AneTestGuard {
+                _guard: Some(
+                    ane_test_runtime_lock()
+                        .lock()
+                        .expect("ANE test runtime mutex poisoned"),
+                ),
+            }
+        } else {
+            AneTestGuard { _guard: None }
+        }
+    })
+}
+
+fn lock_ane_runtime() -> Result<AneRuntimeGuard, String> {
+    #[cfg(test)]
+    let test_guard = maybe_lock_ane_test_runtime();
+    let file = ane_runtime_lock()
+        .lock()
+        .map_err(|_| "ANE runtime mutex poisoned".to_string())?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(format!(
+            "failed to lock ANE runtime: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(AneRuntimeGuard {
+        #[cfg(test)]
+        _test_guard: test_guard,
+        file,
+    })
+}
+
+#[cfg(test)]
+fn ane_test_runtime_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
+pub(crate) fn lock_ane_test_runtime() -> AneTestGuard {
+    maybe_lock_ane_test_runtime()
+}
+
 /// Initialize the ANE runtime. Must be called once before any compilation.
 pub fn ane_init() -> Result<(), String> {
+    let _guard = lock_ane_runtime()?;
     let rc = unsafe { ane_bridge_init() };
     if rc == 0 {
         Ok(())
@@ -226,17 +327,20 @@ pub fn load_count() -> i32 {
 
 /// Reset the global compile counter.
 pub fn reset_compile_count() {
+    let _guard = lock_ane_runtime().expect("failed to lock ANE runtime");
     unsafe { ane_bridge_reset_compile_count() }
 }
 
 /// Clear the persistent compilation cache (~/.nanobot/ane_cache/).
 pub fn clear_cache() {
+    let _guard = lock_ane_runtime().expect("failed to lock ANE runtime");
     unsafe { ane_bridge_clear_cache() }
 }
 
 /// Suppress compile/load error output to stderr.
 /// Use around expected-fail compilation attempts to keep TUI clean.
 pub fn set_quiet(quiet: bool) {
+    let _guard = lock_ane_runtime().expect("failed to lock ANE runtime");
     unsafe { ane_bridge_set_quiet(quiet) }
 }
 
@@ -377,6 +481,7 @@ impl AneKernel {
         input_sizes: &[usize],
         output_sizes: &[usize],
     ) -> Result<Self, String> {
+        let _guard = lock_ane_runtime()?;
         let (w_ptr, w_len) = match weights {
             Some(w) => (w.as_ptr(), w.len()),
             None => (ptr::null(), 0),
@@ -410,6 +515,7 @@ impl AneKernel {
         input_sizes: &[usize],
         output_sizes: &[usize],
     ) -> Result<Self, String> {
+        let _guard = lock_ane_runtime()?;
         assert_eq!(weight_names.len(), weight_datas.len());
         let c_names: Vec<CString> = weight_names
             .iter()
@@ -453,6 +559,7 @@ impl AneKernel {
         input_sizes: &[usize],
         output_sizes: &[usize],
     ) -> Result<Self, String> {
+        let _guard = lock_ane_runtime()?;
         assert_eq!(weight_names.len(), weight_datas.len());
         let c_names: Vec<CString> = weight_names
             .iter()
@@ -492,6 +599,7 @@ impl AneKernel {
     /// The compiled model is ref-counted — it is unloaded only when all
     /// clones and the original are dropped.
     pub fn clone_kernel(&self) -> Result<Self, String> {
+        let _guard = lock_ane_runtime()?;
         let handle = unsafe { ane_bridge_clone_kernel(self.handle) };
         if handle.is_null() {
             return Err("ANE kernel clone failed".into());
@@ -510,6 +618,7 @@ impl AneKernel {
 
     /// Execute the kernel on ANE hardware.
     pub fn eval(&self) -> Result<(), String> {
+        let _guard = lock_ane_runtime()?;
         let ok = unsafe { ane_bridge_eval(self.handle) };
         if ok {
             Ok(())
@@ -590,6 +699,7 @@ impl AneKernel {
         dst: &AneKernel,
         in_idx: usize,
     ) -> Result<(), String> {
+        let _guard = lock_ane_runtime()?;
         let ok = unsafe {
             ane_bridge_share_surface(self.handle, out_idx as c_int, dst.handle, in_idx as c_int)
         };
@@ -606,6 +716,7 @@ impl AneKernel {
     /// stay on ANE IOSurfaces. Only the first kernel's input and last kernel's
     /// output need CPU I/O.
     pub fn eval_chain(kernels: &[&AneKernel]) -> Result<(), String> {
+        let _guard = lock_ane_runtime()?;
         let mut handles: Vec<*mut ANEKernelHandle> = kernels.iter().map(|k| k.handle).collect();
         let ok = unsafe { ane_bridge_eval_chain(handles.as_mut_ptr(), handles.len() as c_int) };
         if ok {
@@ -617,16 +728,19 @@ impl AneKernel {
 
     /// Enter real-time dispatch mode (lower per-dispatch latency).
     pub fn begin_realtime() -> bool {
+        let _guard = lock_ane_runtime().expect("failed to lock ANE runtime");
         unsafe { ane_bridge_begin_realtime() }
     }
 
     /// Exit real-time dispatch mode.
     pub fn end_realtime() {
+        let _guard = lock_ane_runtime().expect("failed to lock ANE runtime");
         unsafe { ane_bridge_end_realtime() }
     }
 
     /// Evaluate using real-time dispatch (requires begin_realtime).
     pub fn eval_realtime(&self) -> Result<(), String> {
+        let _guard = lock_ane_runtime()?;
         let ok = unsafe { ane_bridge_eval_realtime(self.handle) };
         if ok {
             Ok(())
@@ -637,6 +751,7 @@ impl AneKernel {
 
     /// Evaluate chain using real-time dispatch.
     pub fn eval_chain_realtime(kernels: &[&AneKernel]) -> Result<(), String> {
+        let _guard = lock_ane_runtime()?;
         let mut handles: Vec<*mut ANEKernelHandle> = kernels.iter().map(|k| k.handle).collect();
         let ok =
             unsafe { ane_bridge_eval_chain_realtime(handles.as_mut_ptr(), handles.len() as c_int) };
@@ -649,6 +764,7 @@ impl AneKernel {
 
     /// Prepare chain for pipelined ANE execution.
     pub fn prepare_chain(kernels: &[&AneKernel]) -> Result<(), String> {
+        let _guard = lock_ane_runtime()?;
         let mut handles: Vec<*mut ANEKernelHandle> = kernels.iter().map(|k| k.handle).collect();
         let ok = unsafe { ane_bridge_prepare_chain(handles.as_mut_ptr(), handles.len() as c_int) };
         if ok {
@@ -757,6 +873,7 @@ impl AneKernel {
     /// `weight_datas` must have the same number of entries as the original
     /// compile call's weight arrays.
     pub fn reload_weights(&self, weight_datas: &[&[u8]]) -> Result<(), String> {
+        let _guard = lock_ane_runtime()?;
         let data_ptrs: Vec<*const u8> = weight_datas.iter().map(|d| d.as_ptr()).collect();
         let data_lens: Vec<usize> = weight_datas.iter().map(|d| d.len()).collect();
         let ok = unsafe {
@@ -779,6 +896,7 @@ impl AneKernel {
     /// (e.g. classifier tiles). Falls back to `reload_weights` if in-memory caches
     /// (net.plist, MIL) aren't available.
     pub fn delta_reload(&self, weight_datas: &[&[u8]]) -> Result<(), String> {
+        let _guard = lock_ane_runtime()?;
         let data_ptrs: Vec<*const u8> = weight_datas.iter().map(|d| d.as_ptr()).collect();
         let data_lens: Vec<usize> = weight_datas.iter().map(|d| d.len()).collect();
         let ok = unsafe {
@@ -810,6 +928,7 @@ impl AneKernel {
         input_sizes: &[usize],
         output_sizes: &[usize],
     ) -> Result<Self, String> {
+        let _guard = lock_ane_runtime()?;
         assert_eq!(weight_names.len(), weight_datas.len());
         let c_names: Vec<CString> = weight_names
             .iter()
@@ -847,7 +966,14 @@ impl AneKernel {
 impl Drop for AneKernel {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            unsafe { ane_bridge_free(self.handle) };
+            match lock_ane_runtime() {
+                Ok(_guard) => unsafe { ane_bridge_free(self.handle) },
+                Err(_) => {
+                    // Mutex poisoned (prior panic during ANE op). Free without lock
+                    // rather than cascading panics through every kernel destructor.
+                    unsafe { ane_bridge_free(self.handle) }
+                }
+            }
             self.handle = ptr::null_mut();
         }
     }
@@ -1011,6 +1137,7 @@ mod tests {
     /// Test reload_weights: update weight blob without recompiling.
     #[test]
     fn smoke_reload_weights() {
+        let _test_guard = lock_ane_test_runtime();
         ane_init().expect("ane_init failed");
         clear_cache(); // ensure cold compile
 
@@ -1071,6 +1198,7 @@ mod tests {
     /// Verifies multiple consecutive delta reloads produce correct results.
     #[test]
     fn smoke_delta_reload() {
+        let _test_guard = lock_ane_test_runtime();
         ane_init().expect("ane_init failed");
 
         let tensor_bytes = N * 4;
@@ -1128,6 +1256,7 @@ mod tests {
     /// Test patch_from_donor: create kernel from donor's compiled microcode.
     #[test]
     fn smoke_patch_from_donor() {
+        let _test_guard = lock_ane_test_runtime();
         ane_init().expect("ane_init failed");
         let tensor_bytes = N * 4;
         let weight_name = "@model_path/weights/weight.bin";
@@ -1235,6 +1364,7 @@ mod tests {
     /// Second compile should hit the delta cache (net.plist saved to ~/.nanobot/ane_cache/).
     #[test]
     fn bench_delta_compilation_cache() {
+        let _test_guard = lock_ane_test_runtime();
         ane_init().expect("ane_init failed");
         clear_cache(); // ensure cold start
         let tensor_bytes = N * 4;

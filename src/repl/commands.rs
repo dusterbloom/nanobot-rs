@@ -160,16 +160,26 @@ impl ReplContext {
     ///
     /// Aborts any previous watchdog task, collects current server ports, and
     /// spawns a fresh watchdog with auto-repair. Called on REPL init and on `/local` toggle-on.
-    /// No-op when using a remote local server (LM Studio) — nothing to watch.
+    /// No-op when using a remote local server — nothing to watch.
+    /// Exception: Higgs is a managed sidecar that uses local_api_base but still
+    /// needs watchdog monitoring.
     pub fn restart_watchdog(&mut self) {
         if let Some(handle) = self.watchdog_handle.take() {
             handle.abort();
         }
-        // LMS-managed server: nothing to watch locally.
-        if !self.config.agents.defaults.local_api_base.is_empty() {
+        // Remote server: nothing to watch locally — unless it's Higgs (managed sidecar).
+        let is_higgs = crate::config::schema::is_higgs_backend(
+            &self.config.agents.defaults.local_backend,
+        );
+        if !is_higgs && !self.config.agents.defaults.local_api_base.is_empty() {
             return;
         }
-        let ports = vec![("main".to_string(), self.srv.local_port.clone())];
+        let port = if is_higgs {
+            self.config.agents.defaults.higgs_port.to_string()
+        } else {
+            self.srv.local_port.clone()
+        };
+        let ports = vec![("main".to_string(), port)];
         self.watchdog_handle = Some(crate::server::start_health_watchdog_with_autorepair(
             ports,
             self.display_tx.clone(),
@@ -192,9 +202,13 @@ impl ReplContext {
     ///
     /// Returns true if a restart was performed.
     pub async fn handle_restart_requests(&mut self) -> bool {
-        // When using a remote local server (e.g. LM Studio), there are no
-        // local server processes to restart — drain and ignore any stale requests.
-        if !self.config.agents.defaults.local_api_base.is_empty() {
+        // When using a remote local server, there are no local server processes
+        // to restart — drain and ignore any stale requests.
+        // Exception: Higgs is managed and CAN be restarted.
+        let is_higgs = crate::config::schema::is_higgs_backend(
+            &self.config.agents.defaults.local_backend,
+        );
+        if !is_higgs && !self.config.agents.defaults.local_api_base.is_empty() {
             while self.restart_rx.try_recv().is_ok() {}
             return false;
         }

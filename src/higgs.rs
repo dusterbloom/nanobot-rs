@@ -14,22 +14,23 @@ use std::path::{Path, PathBuf};
 /// Find the `higgs` binary on the system.
 ///
 /// Search order:
-/// 1. `~/.cargo/bin/higgs` (cargo install location)
-/// 2. `higgs` on PATH (via `which`)
+/// 1. `HIGGS_BIN` env var (explicit override, e.g. for development builds)
+/// 2. `~/.cargo/bin/higgs` (cargo install location)
+/// 3. `higgs` on PATH (via `which`)
 pub(crate) fn find_binary() -> Option<PathBuf> {
-    // 1. ~/.cargo/bin/higgs (most common for Rust tools)
-    if let Some(home) = dirs::home_dir() {
-        let cargo_bin = home.join(".cargo/bin/higgs");
-        if cargo_bin.exists() {
-            return Some(cargo_bin);
-        }
-    }
-
-    // 2. HIGGS_BIN env var (for development)
+    // 1. HIGGS_BIN env var (highest priority — dev builds and CI overrides)
     if let Ok(bin) = std::env::var("HIGGS_BIN") {
         let path = PathBuf::from(bin);
         if path.exists() {
             return Some(path);
+        }
+    }
+
+    // 2. ~/.cargo/bin/higgs (most common for Rust tools installed via cargo install)
+    if let Some(home) = dirs::home_dir() {
+        let cargo_bin = home.join(".cargo/bin/higgs");
+        if cargo_bin.exists() {
+            return Some(cargo_bin);
         }
     }
 
@@ -83,17 +84,33 @@ pub(crate) async fn server_start(
     // Already running and healthy?
     if let Some(pid) = read_pid() {
         if pid_is_alive(pid) && wait_for_ready(port, 3).await {
-            tracing::info!(pid, port, "higgs already running");
-            return Ok(());
+            // Verify it's serving the expected model — if not, restart.
+            if is_serving_expected_model(port, model_dir).await {
+                tracing::info!(pid, port, "higgs already running");
+                return Ok(());
+            }
+            tracing::info!(pid, port, "higgs running but serving wrong model, restarting");
+            server_stop()?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Fall through to spawn with the correct model.
+        } else {
+            // Stale PID — clean up
+            let _ = fs::remove_file(pid_path());
         }
-        // Stale PID — clean up
-        let _ = fs::remove_file(pid_path());
     }
 
     // Also check if something else is already serving on this port
     if wait_for_ready(port, 1).await {
-        tracing::info!(port, "higgs port already responding (externally managed)");
-        return Ok(());
+        // Verify model even for externally managed instances.
+        if is_serving_expected_model(port, model_dir).await {
+            tracing::info!(port, "higgs port already responding (externally managed)");
+            return Ok(());
+        }
+        // Wrong model on the port — can't restart an external instance.
+        return Err(format!(
+            "port {port} is serving a different model than configured.\n\
+             Stop the existing server and retry, or update mlxModelDir to match."
+        ));
     }
 
     // Safety: check if another Higgs process is already running (e.g. on a
@@ -266,6 +283,42 @@ pub(crate) fn resolve_model_dir(
          (e.g. ~/.cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit)"
             .to_string(),
     )
+}
+
+/// Restart Higgs with a (potentially different) model.
+///
+/// Stops the running instance, waits briefly for port release, then starts
+/// with the new model directory.
+pub(crate) async fn server_restart(
+    bin: &Path,
+    port: u16,
+    model_dir: &str,
+) -> Result<(), String> {
+    server_stop()?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    server_start(bin, port, model_dir).await
+}
+
+/// Check if the running Higgs is serving a model that matches `expected_dir`.
+///
+/// Compares the model name from `/v1/models` against the last path component
+/// of `expected_dir`. Returns `true` if they match or if the server can't be
+/// queried (optimistic fallback).
+async fn is_serving_expected_model(port: u16, expected_dir: &str) -> bool {
+    let Some(running_name) = get_model_name(port).await else {
+        return true; // Can't query → assume ok
+    };
+    let expected_name = Path::new(expected_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if expected_name.is_empty() {
+        return true;
+    }
+    // Model IDs may be paths or short names — check substring both ways.
+    let r = running_name.to_lowercase();
+    let e = expected_name.to_lowercase();
+    r.contains(&e) || e.contains(&r)
 }
 
 /// Query the model name from a running Higgs instance via /v1/models.
