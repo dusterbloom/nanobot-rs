@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! Weight management for ANE dynamic kernels.
 //!
 //! Provides weight packing into the IOSurface layout that dynamic kernels expect:

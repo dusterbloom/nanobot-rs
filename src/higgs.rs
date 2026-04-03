@@ -68,8 +68,7 @@ fn read_pid() -> Option<u32> {
 
 /// Check if a process is alive.
 fn pid_is_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 checks existence without sending a signal.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    platform::is_process_alive(pid)
 }
 
 /// Start Higgs serving a model on the given port.
@@ -151,13 +150,7 @@ pub(crate) async fn server_start(
     cmd.stderr(log_err);
 
     // Create new session so the server survives terminal close.
-    // SAFETY: setsid is async-signal-safe per POSIX.
-    unsafe {
-        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    platform::set_new_session(&mut cmd);
 
     let child = cmd
         .spawn()
@@ -201,19 +194,14 @@ pub(crate) fn server_stop() -> Result<(), String> {
         return Ok(());
     }
 
-    // SAFETY: sending SIGTERM to a known PID.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
+    platform::send_signal(pid, libc::SIGTERM);
 
     // Wait briefly for graceful shutdown
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while pid_is_alive(pid) {
         if std::time::Instant::now() >= deadline {
             tracing::warn!(pid, "higgs still running after SIGTERM, sending SIGKILL");
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
+            platform::send_signal(pid, libc::SIGKILL);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -332,6 +320,32 @@ pub(crate) async fn get_model_name(port: u16) -> Option<String> {
         .get("id")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+#[allow(unsafe_code)]
+mod platform {
+    /// Check if a process is alive (signal 0 checks existence without sending a signal).
+    pub(super) fn is_process_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    /// Send a signal to a process.
+    pub(super) fn send_signal(pid: u32, signal: libc::c_int) {
+        unsafe {
+            libc::kill(pid as i32, signal);
+        }
+    }
+
+    /// Configure a Command to create a new session (setsid) via pre_exec.
+    pub(super) fn set_new_session(cmd: &mut std::process::Command) {
+        // SAFETY: setsid is async-signal-safe per POSIX.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(cmd, || {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
 }
 
 #[cfg(test)]

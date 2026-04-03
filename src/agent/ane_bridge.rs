@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! FFI bridge to Apple Neural Engine via private APIs.
 //!
 //! Wraps the Objective-C `ane_bridge.{h,m}` dylib into safe Rust types.

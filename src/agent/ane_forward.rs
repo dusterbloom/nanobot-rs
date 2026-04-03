@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! Forward inference pipeline for ANE transformer training.
 //!
 //! CPU ops (RMSNorm, embedding, cross-entropy) plus compiled kernel set

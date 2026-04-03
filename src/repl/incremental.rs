@@ -55,7 +55,10 @@ pub struct IncrementalRenderer {
 // SAFETY: IncrementalRenderer is only ever created, used, and dropped within
 // a single tokio task. The non-Send parts (HighlightLines from syntect/onig
 // containing raw pointers) are never shared between threads.
-unsafe impl Send for IncrementalRenderer {}
+#[allow(unsafe_code)]
+mod send_impl {
+    unsafe impl Send for super::IncrementalRenderer {}
+}
 
 impl IncrementalRenderer {
     pub fn new() -> Self {

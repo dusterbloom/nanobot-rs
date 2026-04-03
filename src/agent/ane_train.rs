@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! Training loop & optimizer for ANE transformer fine-tuning.
 //!
 //! Adam optimizer, cosine LR schedule with warmup, gradient ops,

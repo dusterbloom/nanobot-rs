@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! ANE speculative decode: single-token forward pass with KV cache.
 //!
 //! Phase 1c of the ANE speculative decoding plan. This module provides:

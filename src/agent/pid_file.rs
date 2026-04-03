@@ -41,27 +41,19 @@ pub fn remove_pid(name: &str, port: u16) {
 
 /// Send SIGTERM, wait up to 2s, then SIGKILL if still alive.
 fn graceful_kill(pid: u32) {
-    let pid_i32 = pid as i32;
-    unsafe {
-        // Check if process is alive
-        if libc::kill(pid_i32, 0) != 0 {
-            return; // already dead
-        }
-        libc::kill(pid_i32, libc::SIGTERM);
+    if !platform::is_process_alive(pid) {
+        return; // already dead
     }
+    platform::send_signal(pid, libc::SIGTERM);
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
-        unsafe {
-            if libc::kill(pid_i32, 0) != 0 {
-                return; // died from SIGTERM
-            }
+        if !platform::is_process_alive(pid) {
+            return; // died from SIGTERM
         }
     }
     // Still alive after grace period — force kill
-    unsafe {
-        libc::kill(pid_i32, libc::SIGKILL);
-    }
+    platform::send_signal(pid, libc::SIGKILL);
     std::thread::sleep(Duration::from_millis(50));
 }
 
@@ -87,13 +79,27 @@ pub fn cleanup_stale_pids() {
             }
         };
         if let Ok(pid) = contents.trim().parse::<u32>() {
-            let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-            if alive {
+            if platform::is_process_alive(pid) {
                 tracing::info!(pid, file = %path.display(), "killing stale child process");
                 graceful_kill(pid);
             }
         }
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[allow(unsafe_code)]
+mod platform {
+    /// Check if a process is alive (signal 0 checks existence without sending a signal).
+    pub(super) fn is_process_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    /// Send a signal to a process.
+    pub(super) fn send_signal(pid: u32, signal: libc::c_int) {
+        unsafe {
+            libc::kill(pid as i32, signal);
+        }
     }
 }
 
@@ -118,8 +124,7 @@ pub fn acquire_agent_singleton() {
     let path = agent_pid_path();
     if let Ok(contents) = std::fs::read_to_string(&path) {
         if let Ok(old_pid) = contents.trim().parse::<u32>() {
-            let alive = unsafe { libc::kill(old_pid as i32, 0) == 0 };
-            if alive && old_pid != std::process::id() {
+            if platform::is_process_alive(old_pid) && old_pid != std::process::id() {
                 tracing::warn!(old_pid, "killing stale agent process (singleton guard)");
                 graceful_kill(old_pid);
             }

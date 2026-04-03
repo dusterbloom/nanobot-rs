@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! ANE↔MLX LoRA weight bridge.
 //!
 //! Transfers trained LoRA weights from ANE (CPU f32 Vec) to MLX (GPU Array).

@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 //! nanobot library — exposes internal modules for the trio_bench binary.
 
 pub mod agent;

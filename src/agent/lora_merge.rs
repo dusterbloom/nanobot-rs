@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! LoRA merge-on-disk: bake trained LoRA deltas directly into base model weights.
 //!
 //! Sidesteps the broken oMLX adapter API by merging `δW = scale * B @ A` into

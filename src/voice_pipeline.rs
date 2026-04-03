@@ -1,4 +1,5 @@
 #![cfg(feature = "voice")]
+#![allow(unsafe_code)]
 
 //! Unified voice pipeline for nanobot.
 //!

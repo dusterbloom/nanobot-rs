@@ -148,16 +148,7 @@ pub fn force_exit_raw_mode() {
 /// and may leave OPOST cleared after `readline()` returns.
 #[cfg(unix)]
 pub fn ensure_cooked_output() {
-    use libc::{OPOST, STDOUT_FILENO, TCSANOW};
-    unsafe {
-        let mut termios: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(STDOUT_FILENO, &mut termios) == 0 {
-            if termios.c_oflag & OPOST == 0 {
-                termios.c_oflag |= OPOST;
-                libc::tcsetattr(STDOUT_FILENO, TCSANOW, &termios);
-            }
-        }
-    }
+    platform::restore_opost();
 }
 
 #[cfg(not(unix))]
@@ -176,10 +167,7 @@ static CACHED_HEIGHT: AtomicU16 = AtomicU16::new(0);
 pub fn register_resize_handler() {
     #[cfg(unix)]
     {
-        // SIGWINCH handler: clear cached dimensions so next query re-reads from OS.
-        unsafe {
-            libc::signal(libc::SIGWINCH, sigwinch_handler as libc::sighandler_t);
-        }
+        platform::install_sigwinch_handler(sigwinch_handler);
     }
 }
 
@@ -796,9 +784,7 @@ pub(crate) fn drain_stdin() {
     {
         use std::os::unix::io::AsRawFd;
         let fd = std::io::stdin().as_raw_fd();
-        unsafe {
-            libc::tcflush(fd, libc::TCIFLUSH);
-        }
+        platform::flush_input(fd);
     }
 }
 
@@ -948,6 +934,42 @@ pub(crate) fn voice_read_input() -> VoiceAction {
 
     exit_raw_mode(owned);
     result
+}
+
+// ============================================================================
+// Platform-specific unsafe wrappers
+// ============================================================================
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod platform {
+    /// Restore OPOST flag on stdout termios (ensures `\n` → `\r\n` translation).
+    pub(super) fn restore_opost() {
+        use libc::{OPOST, STDOUT_FILENO, TCSANOW};
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(STDOUT_FILENO, &mut termios) == 0 {
+                if termios.c_oflag & OPOST == 0 {
+                    termios.c_oflag |= OPOST;
+                    libc::tcsetattr(STDOUT_FILENO, TCSANOW, &termios);
+                }
+            }
+        }
+    }
+
+    /// Install a SIGWINCH handler.
+    pub(super) fn install_sigwinch_handler(handler: extern "C" fn(libc::c_int)) {
+        unsafe {
+            libc::signal(libc::SIGWINCH, handler as libc::sighandler_t);
+        }
+    }
+
+    /// Flush (discard) buffered terminal input on the given file descriptor.
+    pub(super) fn flush_input(fd: std::os::unix::io::RawFd) {
+        unsafe {
+            libc::tcflush(fd, libc::TCIFLUSH);
+        }
+    }
 }
 
 // ============================================================================

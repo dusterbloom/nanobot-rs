@@ -46,6 +46,21 @@ pub struct StoreStats {
     pub total_chars: i64,
 }
 
+#[cfg(feature = "semantic")]
+#[allow(unsafe_code)]
+mod init {
+    /// Register the sqlite-vec extension globally (once) so vec0 is available.
+    pub(super) fn register_sqlite_vec() {
+        use std::sync::Once;
+        static REGISTER: Once = Once::new();
+        REGISTER.call_once(|| unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        });
+    }
+}
+
 impl KnowledgeStore {
     /// Open or create the knowledge database at the specified path.
     pub fn open(db_path: &Path) -> Result<Self> {
@@ -122,13 +137,7 @@ impl KnowledgeStore {
     /// Register the sqlite-vec extension globally so vec0 is available on new connections.
     #[cfg(feature = "semantic")]
     fn register_vec_extension() {
-        use std::sync::Once;
-        static REGISTER: Once = Once::new();
-        REGISTER.call_once(|| unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        });
+        init::register_sqlite_vec();
     }
 
     /// Create the vec0 virtual table for cosine KNN search.

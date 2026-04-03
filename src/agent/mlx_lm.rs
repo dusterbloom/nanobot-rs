@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! Managed MLX inference server subprocess.
 //!
 //! Supports two backends:

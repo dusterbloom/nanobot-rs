@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! Backward pass pipeline for ANE transformer training.
 //!
 //! CPU backward ops (rmsnorm_bwd, silu_bwd, classifier_bwd, embed_bwd),
