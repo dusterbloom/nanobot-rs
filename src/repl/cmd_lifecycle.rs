@@ -589,7 +589,23 @@ impl ReplContext {
                 if !crate::config::schema::is_higgs_backend(
                     &self.config.agents.defaults.local_backend,
                 ) {
-                    self.config.agents.defaults.local_backend = "omlx".to_string();
+                    // Only switch backend when the current value would route
+                    // through in-process MLX. Preserve a valid HTTP backend tag
+                    // (e.g. "lmstudio") so it isn't masked behind "omlx" for
+                    // non-oMLX peers like llama.cpp.
+                    if self.config.agents.defaults.local_backend == "mlx" {
+                        self.config.agents.defaults.local_backend = if is_lms {
+                            "lmstudio".to_string()
+                        } else {
+                            "omlx".to_string()
+                        };
+                    }
+                }
+                // llama.cpp (and other non-LMS remote peers) do not JIT-load
+                // models: a single-permit JitGate would needlessly serialise
+                // requests against the peer with no benefit. Skip it.
+                if !is_lms {
+                    self.config.agents.defaults.skip_jit_gate = true;
                 }
                 // No longer managed by LM Studio — prevent watchdog auto-restart.
                 self.srv.lms_managed = false;

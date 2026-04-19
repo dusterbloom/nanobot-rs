@@ -168,12 +168,16 @@ pub(super) fn make_local_providers(
             .with_retry(config.retry.clone()),
     );
 
-    // Auto-detect context size from local server; fall back to config default.
-    let max_context_tokens = if !has_custom_base {
-        crate::server::query_local_context_size(local_port)
+    // Auto-detect context size from the active server; fall back to config default.
+    // The cluster path (custom base, possibly remote) needs a URL-aware probe so
+    // peers exposing /props (llama-server) get their real n_ctx instead of the
+    // 32k schema default.
+    let max_context_tokens = if has_custom_base {
+        crate::server::query_context_size_from_url(&base_url)
             .unwrap_or(config.agents.defaults.local_max_context_tokens)
     } else {
-        config.agents.defaults.local_max_context_tokens
+        crate::server::query_local_context_size(local_port)
+            .unwrap_or(config.agents.defaults.local_max_context_tokens)
     };
 
     // Compaction provider (separate port only).

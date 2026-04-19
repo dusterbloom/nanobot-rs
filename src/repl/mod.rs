@@ -1059,7 +1059,27 @@ pub(crate) fn cmd_agent(
         // Higgs sidecar: auto-start when backend is "higgs" (single-message or interactive).
         // Start even when localApiBase is set — it may point to the managed Higgs port
         // from a previous session (Higgs survives nanobot exit but may have been stopped).
-        if use_higgs {
+        //
+        // Exception: when localApiBase points at a REMOTE host (cluster peer, not
+        // localhost), respect the user's explicit endpoint and skip Higgs entirely.
+        // The higgs backend tag is sticky across /m switches (see cmd_lifecycle.rs:589),
+        // so a stale "higgs" tag must not clobber a deliberate remote URL.
+        let api_base_is_remote_host = {
+            let base = config.agents.defaults.local_api_base.trim().to_lowercase();
+            let host_port = base
+                .strip_prefix("http://")
+                .or_else(|| base.strip_prefix("https://"))
+                .unwrap_or(&base);
+            !base.is_empty()
+                && !host_port.starts_with("localhost:")
+                && !host_port.starts_with("127.0.0.1:")
+        };
+        if use_higgs && api_base_is_remote_host {
+            info!(
+                api_base = %config.agents.defaults.local_api_base,
+                "skipping higgs auto-start: localApiBase points at a remote host"
+            );
+        } else if use_higgs {
             let higgs_port = config.agents.defaults.higgs_port;
             match crate::higgs::resolve_model_dir(&config) {
                 Ok(model_dir) => {
@@ -1085,6 +1105,7 @@ pub(crate) fn cmd_agent(
                                 eprintln!("Warning: failed to start Higgs: {e}");
                                 // Clear any stale local_api_base so we don't send
                                 // requests to a dead endpoint from a previous session.
+                                // Safe because the remote-URL case short-circuited above.
                                 config.agents.defaults.local_api_base.clear();
                             }
                         }

@@ -705,30 +705,14 @@ pub(crate) async fn check_local_health(port: &str) -> bool {
 // Context Size Query
 // ============================================================================
 
-/// Query the local server for its actual context size (`n_ctx`).
-///
-/// Returns the server's context window with 5% headroom subtracted.
-pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
-    let url = format!("http://localhost:{}/props", port);
-    let props = tokio::task::block_in_place(|| {
-        let rt = tokio::runtime::Handle::try_current();
-        match rt {
-            Ok(handle) => handle.block_on(async {
-                reqwest::Client::new()
-                    .get(&url)
-                    .send()
-                    .await
-                    .ok()?
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-            }),
-            Err(_) => reqwest::blocking::get(&url)
-                .ok()?
-                .json::<serde_json::Value>()
-                .ok(),
-        }
-    })?;
+/// Strip a trailing `/v1` (and trailing slashes) from a base URL.
+fn strip_v1_suffix(api_base: &str) -> &str {
+    let trimmed = api_base.trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).trim_end_matches('/')
+}
+
+/// Parse `/props` JSON into a per-request context size with 5% headroom.
+fn parse_props_n_ctx(props: &serde_json::Value) -> Option<usize> {
     let n_ctx = props
         .get("default_generation_settings")
         .and_then(|v| v.get("n_ctx"))
@@ -745,30 +729,59 @@ pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
     Some((per_request_ctx as f64 * 0.95) as usize)
 }
 
+/// Query a `/props` endpoint at an arbitrary base URL.
+///
+/// Returns the server's per-request context window with 5% headroom subtracted.
+/// Works for any llama.cpp-style server (localhost or cluster peer).
+pub(crate) fn query_context_size_from_url(api_base: &str) -> Option<usize> {
+    let url = format!("{}/props", strip_v1_suffix(api_base));
+    let props = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::try_current();
+        match rt {
+            Ok(handle) => handle.block_on(async {
+                reqwest::Client::new()
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(3))
+                    .send()
+                    .await
+                    .ok()?
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+            }),
+            Err(_) => reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .ok()?
+                .get(&url)
+                .send()
+                .ok()?
+                .json::<serde_json::Value>()
+                .ok(),
+        }
+    })?;
+    parse_props_n_ctx(&props)
+}
+
+/// Query the local server for its actual context size (`n_ctx`).
+///
+/// Returns the server's context window with 5% headroom subtracted.
+pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
+    query_context_size_from_url(&format!("http://localhost:{}", port))
+}
+
 pub(crate) async fn query_local_context_size_async(port: &str) -> Option<usize> {
     let url = format!("http://localhost:{}/props", port);
     let props = reqwest::Client::new()
         .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
         .ok()?
         .json::<serde_json::Value>()
         .await
         .ok()?;
-    let n_ctx = props
-        .get("default_generation_settings")
-        .and_then(|v| v.get("n_ctx"))
-        .and_then(|v| v.as_u64())
-        .or_else(|| props.get("n_ctx").and_then(|v| v.as_u64()))? as usize;
-    let n_parallel = props
-        .get("default_generation_settings")
-        .and_then(|v| v.get("n_parallel"))
-        .and_then(|v| v.as_u64())
-        .or_else(|| props.get("n_parallel").and_then(|v| v.as_u64()))
-        .unwrap_or(1)
-        .max(1) as usize;
-    let per_request_ctx = (n_ctx / n_parallel).max(1);
-    Some((per_request_ctx as f64 * 0.95) as usize)
+    parse_props_n_ctx(&props)
 }
 
 // ============================================================================
