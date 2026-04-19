@@ -2,6 +2,8 @@
 
 use std::io::{self, Write as _};
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "voice")]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::*;

@@ -1520,7 +1520,12 @@ pub(crate) fn cmd_agent(
 
         let health_registry = std::sync::Arc::new(crate::heartbeat::health::build_registry(&config));
 
-        let agent_loop = cli::create_agent_loop(
+        // Must be `mut` for the cluster-feature code path below, which passes
+        // `&mut agent_loop` to `setup_cluster_for_repl`. Under non-cluster
+        // builds the binding is still reassigned/shadowed later, so no
+        // unused_mut warning is emitted regardless.
+        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+        let mut agent_loop = cli::create_agent_loop(
             core_handle.clone(),
             &config,
             Some(cron_service.clone()),

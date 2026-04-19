@@ -23,7 +23,7 @@ pub(crate) use core_builder::{
 pub(crate) use provider::{check_api_key, create_provider};
 pub(crate) use skills::{cmd_skill_add, cmd_skill_remove};
 #[cfg(feature = "voice")]
-pub(crate) use voice::{cmd_voice_clone, cmd_voice_config, cmd_voice_list, parse_input_mode};
+pub(crate) use voice::{cmd_voice_clone, cmd_voice_config, cmd_voice_list};
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -430,18 +430,9 @@ mod tests {
         assert_eq!(strip_gguf_suffix("model-q8_0"), "model");
     }
 
-    #[cfg(feature = "voice")]
-    #[test]
-    fn test_input_mode_from_cli_flag() {
-        use crate::realtime::InputMode;
-
-        assert_eq!(parse_input_mode("continuous"), InputMode::Continuous);
-        assert_eq!(parse_input_mode("c"), InputMode::Continuous);
-        assert_eq!(parse_input_mode("ptt"), InputMode::PushToTalk);
-        assert_eq!(parse_input_mode("push-to-talk"), InputMode::PushToTalk);
-        assert_eq!(parse_input_mode("p"), InputMode::PushToTalk);
-        assert_eq!(parse_input_mode("unknown"), InputMode::Continuous);
-    }
+    // test_input_mode_from_cli_flag was removed: the `realtime` module and
+    // parse_input_mode helper were deleted in commit 1f9e1d5 alongside
+    // src/realtime/*. No replacement needed — no caller exists.
 }
 
 // ============================================================================
