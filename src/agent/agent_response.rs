@@ -264,7 +264,11 @@ impl AgentLoopShared {
         }
 
         // Anti-drift post-completion: collapse babble (before classification).
-        if ctx.core.is_local && ctx.core.anti_drift.enabled && !response.has_tool_calls() {
+        // migrated from swappable().is_local — phase 09-03
+        if ctx.core.mode().needs_anti_drift()
+            && ctx.core.anti_drift.enabled
+            && !response.has_tool_calls()
+        {
             if let Some(ref mut content) = response.content {
                 anti_drift::post_completion_pipeline(content, &ctx.messages, &ctx.core.anti_drift);
             }
@@ -272,9 +276,10 @@ impl AgentLoopShared {
 
         // --- Classify ---
         let thinking_was_on = counters.thinking_budget.load(Ordering::Relaxed) > 0;
+        // migrated from swappable().is_local — phase 09-03
         let kind = classify_response(
             &response,
-            ctx.core.is_local,
+            ctx.core.mode().is_local(),
             ctx.protocol.is_textual_replay(),
             ctx.flow.tool_guard.had_blocked_calls,
             &ctx.flow.retries,
@@ -451,7 +456,8 @@ impl AgentLoopShared {
     async fn handle_provider_error(&self, ctx: &TurnContext, err_msg: &str) -> StepResult {
         error!(model = %ctx.core.model, error = %err_msg, "llm_provider_error");
 
-        if ctx.core.is_local {
+        // migrated from swappable().is_local — phase 09-03
+        if ctx.core.mode().is_local() {
             if let Some(base) = ctx.core.provider.get_api_base() {
                 if !crate::server::check_health(base, ctx.core.health_check_timeout_secs).await {
                     error!("Local LLM server is down!");
@@ -560,7 +566,8 @@ impl AgentLoopShared {
         counters: &crate::agent::agent_core::RuntimeCounters,
     ) -> StepResult {
         // Try rescue pass first (forced finalize for local models).
-        if ctx.core.is_local
+        // migrated from swappable().is_local — phase 09-03
+        if ctx.core.mode().is_local()
             && response.finish_reason == "length"
             && !ctx.flow.retries.rescue_attempted
         {

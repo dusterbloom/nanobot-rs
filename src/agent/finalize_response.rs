@@ -117,7 +117,8 @@ impl AgentLoopShared {
                         crate::agent::provenance::redact_fabrications(&ctx.final_content, &claims);
                     ctx.final_content = redacted;
                     if redaction_count > 0 {
-                        let warning_role = provenance_warning_role(ctx.core.is_local);
+                        // migrated from swappable().is_local — phase 09-03
+                        let warning_role = provenance_warning_role(ctx.core.mode().is_local());
                         let warning_content = format!(
                             "NOTICE: {} claim(s) in the previous response could not be \
                              verified against tool outputs and were removed.",
@@ -154,7 +155,8 @@ impl AgentLoopShared {
                 }
 
                 // Inject system reminder for the next turn.
-                let warning_role = provenance_warning_role(ctx.core.is_local);
+                // migrated from swappable().is_local — phase 09-03
+                let warning_role = provenance_warning_role(ctx.core.mode().is_local());
                 ctx.messages.push(json!({
                     "role": warning_role,
                     "content": detection.system_warning

@@ -20,6 +20,7 @@ use crate::agent::context_hygiene;
 use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
 use crate::agent::policy;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
+use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
@@ -328,7 +329,7 @@ impl AgentLoopShared {
     /// drives the inner state machine through `IterationPhase` steps.
     #[instrument(name = "agent_loop", skip(self, ctx), fields(
         session = %ctx.session_key,
-        mode = if ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main { "trio" } else { "inline" },
+        mode = if ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main { "trio" } else { "inline" },
         model = %ctx.core.model,
         streaming = ctx.streaming,
     ))]
@@ -622,7 +623,7 @@ impl AgentLoopShared {
         context_hygiene::hygiene_pipeline(&mut ctx.messages, ctx.core.hygiene_keep_last_messages);
 
         // --- Anti-Drift: quality-based cleanup for local models ---
-        if ctx.core.is_local && ctx.core.anti_drift.enabled {
+        if ctx.core.mode().needs_anti_drift() && ctx.core.anti_drift.enabled {
             anti_drift::pre_completion_pipeline(&mut ctx.messages, iteration, &ctx.core.anti_drift);
         }
 
@@ -740,7 +741,7 @@ impl AgentLoopShared {
     /// emergency trim, and router preflight.
     #[instrument(name = "step_pre_call", skip(self, ctx), fields(
         iteration,
-        trio_mode = ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main,
+        trio_mode = ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main,
         boundary_active = ctx.flow.force_response,
         msg_count = ctx.messages.len(),
     ))]
@@ -817,7 +818,7 @@ impl AgentLoopShared {
                                 "proactive_grounding_injected"
                             );
                             ctx.messages.push(serde_json::json!({
-                                "role": if ctx.core.is_local { "user" } else { "system" },
+                                "role": ctx.core.mode().grounding_role(),
                                 "content": text,
                                 "_synthetic": true,
                             }));
@@ -897,27 +898,33 @@ impl AgentLoopShared {
         // Filter tool definitions to relevant tools.
         // Local models get a minimal set to conserve context tokens.
         let current_phase = self.system_state.load_full().task_phase;
-        let mut tool_defs = if ctx.core.is_local {
-            match ctx.core.local_tool_mode {
+        let mut tool_defs = match ctx.core.mode() {
+            RuntimeMode::Local { .. } => match ctx.core.local_tool_mode {
                 crate::config::schema::LocalToolMode::Proxy => ctx.tools.get_proxy_definition(),
                 crate::config::schema::LocalToolMode::Slim => ctx.tools.get_slim_definitions(),
                 crate::config::schema::LocalToolMode::Full => ctx.tools.get_local_definitions(),
+            },
+            RuntimeMode::Cloud => {
+                if self.proprioception_config.enabled
+                    && self.proprioception_config.dynamic_tool_scoping
+                {
+                    ctx.tools.get_scoped_definitions(
+                        &current_phase,
+                        &ctx.messages,
+                        &ctx.used_tools,
+                    )
+                } else {
+                    // Cloud models have 100K+ context — give them all registered
+                    // tools instead of keyword-gated subsets that hide capabilities.
+                    ctx.tools.get_definitions()
+                }
             }
-        } else if self.proprioception_config.enabled
-            && self.proprioception_config.dynamic_tool_scoping
-        {
-            ctx.tools
-                .get_scoped_definitions(&current_phase, &ctx.messages, &ctx.used_tools)
-        } else {
-            // Cloud models have 100K+ context — give them all registered
-            // tools instead of keyword-gated subsets that hide capabilities.
-            ctx.tools.get_definitions()
         };
         // Save tool_defs before potential stripping so we can restore them if
         // the router preflight returns Passthrough (router said "respond") — in
         // that case the main model must have tools as fallback.
         let saved_tool_defs = tool_defs.clone();
-        if ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main {
+        if ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main {
             // Hard separation (local trio only): main model is conversation/orchestration only.
             // Cloud providers handle tools natively and must never have them stripped.
             // BUT: if trio routing is degraded, keep tools so main model can still act.
@@ -939,7 +946,7 @@ impl AgentLoopShared {
                 .lock()
                 .is_available(&cb_key);
             if should_strip_tools_for_trio(
-                ctx.core.is_local,
+                ctx.core.mode().is_local(),
                 ctx.core.tool_delegation_config.strict_no_tools_main,
                 router_probe_healthy,
                 cb_available,
@@ -980,7 +987,7 @@ impl AgentLoopShared {
         // Local models already get condensed descriptions (~350 tokens for
         // 12 tools, <1.1% of 32K context) and real availability is gated
         // by `is_available()`, so ToolGate would only remove useful tools.
-        if !ctx.core.is_local {
+        if matches!(ctx.core.mode(), RuntimeMode::Cloud) {
             let effective_size = ctx
                 .core
                 .lane
@@ -1348,7 +1355,7 @@ impl AgentLoopShared {
             had_long,
             user_text,
             recent_tool_calls,
-            ctx.core.is_local,
+            ctx.core.mode().is_local(),
             thinking_budget,
             &ctx.core.adaptive_tokens,
         )
@@ -1408,13 +1415,17 @@ impl AgentLoopShared {
             if stored > 0 {
                 // Small local models can burn the whole completion budget in reasoning.
                 // Hard-cap explicit thinking to keep them action-oriented.
-                if ctx.core.is_local
-                    && ctx.core.model_capabilities.size_class
-                        == crate::agent::model_capabilities::ModelSizeClass::Small
-                {
-                    Some(stored.min(ctx.core.adaptive_tokens.local_thinking_small_model_cap))
-                } else {
-                    Some(stored)
+                // The cap value is config-driven (adaptive_tokens.local_thinking_small_model_cap),
+                // so we match on mode + size_class rather than using the hardcoded
+                // mode.thinking_cap_policy() constant.
+                match ctx.core.mode() {
+                    RuntimeMode::Local { caps }
+                        if caps.size_class
+                            == crate::agent::model_capabilities::ModelSizeClass::Small =>
+                    {
+                        Some(stored.min(ctx.core.adaptive_tokens.local_thinking_small_model_cap))
+                    }
+                    _ => Some(stored),
                 }
             } else {
                 None

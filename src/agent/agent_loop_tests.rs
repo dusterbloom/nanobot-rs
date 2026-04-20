@@ -3287,4 +3287,172 @@ mod runtime_mode_parity_tests {
             RuntimeMode::Cloud => panic!("expected Local variant"),
         }
     }
+
+    // ------------------------------------------------------------------
+    // Wave 3 reader-migration parity tests.
+    //
+    // Every migration in plan 09-03 replaces `ctx.core.is_local` with a
+    // typed `mode()` dispatch. These tests pin the parity between the old
+    // bool branch and the new mode-driven branch for the non-trivial
+    // migration sites, so a future reader-migration regression surfaces
+    // as a failing test rather than a behavioral drift only visible in
+    // three-way smoke.
+    // ------------------------------------------------------------------
+
+    /// agent_shared.rs :820 — proactive grounding message role.
+    /// Pre-Wave-3: `if core.is_local { "user" } else { "system" }`.
+    /// Post-Wave-3: `core.mode().grounding_role()`.
+    #[test]
+    fn wave3_grounding_role_cloud_matches_pre_migration() {
+        let core = build_test_core(false, None, None);
+        assert_eq!(core.mode().grounding_role(), "system");
+    }
+
+    #[test]
+    fn wave3_grounding_role_local_matches_pre_migration() {
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let main = MockLLM::named("local-main");
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace,
+            model: "local-model".to_string(),
+            max_iterations: 10,
+            max_continuations: 2,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16_384,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            local_tool_mode: crate::config::schema::LocalToolMode::default(),
+            lane: Lane::default(),
+            compaction_provider: None,
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+        });
+        assert_eq!(core.mode().grounding_role(), "user");
+    }
+
+    /// agent_shared.rs :625 — anti-drift pipeline gate.
+    /// Pre: `ctx.core.is_local && ctx.core.anti_drift.enabled`.
+    /// Post: `ctx.core.mode().needs_anti_drift() && ctx.core.anti_drift.enabled`.
+    /// The mode half of the AND must agree bit-for-bit with the old bool.
+    #[test]
+    fn wave3_anti_drift_gate_agrees_with_is_local() {
+        let cloud = build_test_core(false, None, None);
+        assert_eq!(cloud.mode().needs_anti_drift(), cloud.is_local);
+
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let main = MockLLM::named("local-main");
+        let local = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace,
+            model: "local-model".to_string(),
+            max_iterations: 10,
+            max_continuations: 2,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16_384,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            local_tool_mode: crate::config::schema::LocalToolMode::default(),
+            lane: Lane::default(),
+            compaction_provider: None,
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+        });
+        assert_eq!(local.mode().needs_anti_drift(), local.is_local);
+    }
+
+    /// agent_shared.rs :983 — ToolGate applies to cloud only.
+    /// Pre: `if !ctx.core.is_local { ... }`.
+    /// Post: `if matches!(ctx.core.mode(), RuntimeMode::Cloud) { ... }`.
+    /// The new predicate must agree bit-for-bit with the old.
+    #[test]
+    fn wave3_tool_gate_cloud_predicate_agrees_with_not_is_local() {
+        let cloud = build_test_core(false, None, None);
+        assert_eq!(matches!(cloud.mode(), RuntimeMode::Cloud), !cloud.is_local);
+    }
+
+    /// prepare_context.rs :518 — protocol selection respects the mlx: prefix
+    /// exception. The non-mlx local path must still pick LocalProtocol, which
+    /// is equivalent to `mode.is_local() && !model.starts_with("mlx:")`.
+    #[test]
+    fn wave3_protocol_selection_mlx_exception_preserved() {
+        // Cloud always → CloudProtocol (mode.is_local() == false).
+        let cloud = build_test_core(false, None, None);
+        assert!(!cloud.mode().is_local());
+
+        // Local with mlx: prefix model would go to CloudProtocol
+        // (behavior-preserving: is_local && !starts_with("mlx:")).
+        // This test pins the `mode.is_local()` half; the mlx: prefix check
+        // is string-based and not affected by the migration.
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let main = MockLLM::named("mlx-main");
+        let local_mlx = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace,
+            model: "mlx:llama-8b".to_string(),
+            max_iterations: 10,
+            max_continuations: 2,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16_384,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            local_tool_mode: crate::config::schema::LocalToolMode::default(),
+            lane: Lane::default(),
+            compaction_provider: None,
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+        });
+        // mlx: prefix model: mode is Local, but protocol selection still
+        // falls through to CloudProtocol via the `!starts_with("mlx:")` guard.
+        assert!(local_mlx.mode().is_local());
+        assert!(local_mlx.model.starts_with("mlx:"));
+    }
 }

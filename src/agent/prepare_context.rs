@@ -17,6 +17,7 @@ use crate::agent::memory_ladder::{MemoryLadder, MemoryLayer, MemoryQuery};
 use crate::agent::policy;
 use crate::agent::prompt_contract::{PromptSection, SectionEntry, SectionSource};
 use crate::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
+use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::taint::TaintState;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tool_guard::ToolGuard;
@@ -210,7 +211,7 @@ impl AgentLoopShared {
         }
 
         // 2. Recent daily notes (cloud mode, local-backend only).
-        if core.is_local && core.memory_enabled {
+        if core.mode().is_local() && core.memory_enabled {
             let memory_store = crate::agent::memory::MemoryStore::new(&core.workspace);
             let notes = memory_store.read_recent_daily_notes(3);
             if !notes.is_empty() {
@@ -513,13 +514,13 @@ impl AgentLoopShared {
         // Select conversation protocol based on whether we're talking to a local model.
         // Protocol correctness is enforced at render time — no repair needed.
         // MLX models are in-process and speak cloud protocol (proper tool_calls),
-        // so they use CloudProtocol even though is_local=true for context sizing.
-        let protocol: Arc<dyn ConversationProtocol> =
-            if core.is_local && !core.model.starts_with("mlx:") {
+        // so they use CloudProtocol even though mode=Local for context sizing.
+        let protocol: Arc<dyn ConversationProtocol> = match core.mode() {
+            RuntimeMode::Local { .. } if !core.model.starts_with("mlx:") => {
                 Arc::new(LocalProtocol::auto_for_model(&core.model))
-            } else {
-                Arc::new(CloudProtocol)
-            };
+            }
+            RuntimeMode::Local { .. } | RuntimeMode::Cloud => Arc::new(CloudProtocol),
+        };
 
         TurnContext {
             core,
