@@ -304,7 +304,8 @@ impl ReplContext {
     /// Reads `is_local` from the current core to pass through, unless the caller
     /// is about to change modes — in which case use `apply_and_rebuild_with`.
     pub fn apply_and_rebuild(&mut self) {
-        let is_local = self.core_handle.swappable().is_local;
+        // migrated from swappable().is_local — phase 09-03
+        let is_local = self.core_handle.swappable().mode().is_local();
         self.apply_and_rebuild_with(is_local);
     }
 

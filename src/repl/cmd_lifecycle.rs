@@ -28,7 +28,8 @@ impl ReplContext {
             None,
             None,
             None,
-            self.core_handle.swappable().is_local,
+            // migrated from swappable().is_local — phase 09-03
+            self.core_handle.swappable().mode().is_local(),
         );
         self.agent_loop = cli::create_agent_loop(
             self.core_handle.clone(),
@@ -194,7 +195,8 @@ impl ReplContext {
 
     /// /ctx [size] — show or set context size for the main model.
     pub(super) async fn cmd_ctx(&mut self, arg: &str) {
-        if !self.core_handle.swappable().is_local {
+        // migrated from swappable().is_local — phase 09-03
+        if !self.core_handle.swappable().mode().is_local() {
             println!(
                 "\n  {}Not in local mode — use /local first{}\n",
                 tui::DIM,
@@ -356,7 +358,8 @@ impl ReplContext {
             }
         };
 
-        if !self.core_handle.swappable().is_local && !has_cluster {
+        // migrated from swappable().is_local — phase 09-03
+        if !self.core_handle.swappable().mode().is_local() && !has_cluster {
             println!("\n  /model is only available in local mode. Use /local to switch.\n");
             return;
         }
@@ -868,7 +871,8 @@ impl ReplContext {
 
     /// Show VRAM budget breakdown.
     async fn cmd_trio_budget(&self) {
-        if !self.core_handle.swappable().is_local {
+        // migrated from swappable().is_local — phase 09-03
+        if !self.core_handle.swappable().mode().is_local() {
             println!(
                 "\n  {}Not in local mode — use /local first{}\n",
                 tui::DIM,
@@ -922,7 +926,8 @@ impl ReplContext {
             }
 
             // Auto-compute optimal context sizes to fit VRAM budget
-            if self.core_handle.swappable().is_local {
+            // migrated from swappable().is_local — phase 09-03
+            if self.core_handle.swappable().mode().is_local() {
                 let budget = self.compute_current_vram_budget();
                 if budget.fits {
                     // Apply computed context sizes
@@ -1070,7 +1075,8 @@ impl ReplContext {
         }
 
         // VRAM budget summary (local mode only)
-        if self.core_handle.swappable().is_local {
+        // migrated from swappable().is_local — phase 09-03
+        if self.core_handle.swappable().mode().is_local() {
             let budget = self.compute_current_vram_budget();
             let total_gb = budget.total_vram_bytes as f64 / 1e9;
             let limit_gb = budget.effective_limit_bytes as f64 / 1e9;
@@ -1211,7 +1217,8 @@ impl ReplContext {
         );
 
         // Warn if VRAM budget exceeded after model change
-        if self.config.trio.enabled && self.core_handle.swappable().is_local {
+        // migrated from swappable().is_local — phase 09-03
+        if self.config.trio.enabled && self.core_handle.swappable().mode().is_local() {
             let budget = self.compute_current_vram_budget();
             if !budget.fits {
                 println!(
@@ -1249,7 +1256,8 @@ impl ReplContext {
 
     /// /local — toggle between local and cloud mode.
     pub(super) async fn cmd_local(&mut self) {
-        let currently_local = self.core_handle.swappable().is_local;
+        // migrated from swappable().is_local — phase 09-03
+        let currently_local = self.core_handle.swappable().mode().is_local();
 
         if !currently_local {
             // Kill any stale managed inference servers from previous runs

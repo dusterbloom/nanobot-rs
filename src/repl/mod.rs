@@ -1747,7 +1747,8 @@ pub(crate) fn cmd_agent(
                 // Handle auto-restart requests from watchdog.
                 ctx.handle_restart_requests().await;
 
-                let is_local = ctx.core_handle.swappable().is_local;
+                // migrated from swappable().is_local — phase 09-03
+                let is_local = ctx.core_handle.swappable().mode().is_local();
                 let voice_on = ctx.voice_on();
                 let thinking_on = ctx
                     .core_handle

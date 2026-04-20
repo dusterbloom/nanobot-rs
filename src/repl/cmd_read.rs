@@ -11,7 +11,8 @@ impl ReplContext {
     pub(super) async fn cmd_status(&mut self) {
         let core = self.core_handle.swappable();
         let counters = &self.core_handle.counters;
-        let is_local = core.is_local;
+        // migrated from swappable().is_local — phase 09-03
+        let is_local = core.mode().is_local();
         let is_mlx = core.model.starts_with("mlx:");
         let model_name = &core.model;
         let mode_label = if is_mlx {
