@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v0.4
 milestone_name: milestone
-current_plan: 3
-status: "RuntimeMode type landed as parallel structure; Wave 2 ready to migrate derivations in agent_core.rs::build_swappable_core"
-last_updated: "2026-04-20T14:20:24.353Z"
+current_plan: 4
+status: "Wave 2 complete — 4 construction-path derivations in build_swappable_core dispatch through RuntimeMode; Wave 3 ready to migrate downstream is_local readers"
+last_updated: "2026-04-20T14:55:00.000Z"
 last_activity: 2026-04-20
 progress:
   total_phases: 3
   completed_phases: 0
   total_plans: 5
-  completed_plans: 3
-  percent: 40
+  completed_plans: 4
+  percent: 80
 ---
 
 # State: nanobot
@@ -19,11 +19,11 @@ progress:
 ## Current Position
 
 Milestone v0.4.0 Lean Runtime Refactor — IN PROGRESS (pivoted)
-Phase: 09 (Runtime Mode Spine) — Waves 0 and 1 complete (2 of 5 plans done)
-Current Plan: 3
+Phase: 09 (Runtime Mode Spine) — Waves 0, 1, and 2 complete (4 of 5 plans done)
+Current Plan: 4
 Total Plans in Phase: 5
-Status: RuntimeMode type landed as parallel structure; Wave 2 ready to migrate derivations in agent_core.rs::build_swappable_core
-Progress: [████░░░░░░] 40%
+Status: Wave 2 complete — 4 construction-path derivations in build_swappable_core dispatch through RuntimeMode; Wave 3 ready to migrate downstream is_local readers
+Progress: [████████░░] 80%
 Last activity: 2026-04-20
 
 ## Project Reference
@@ -70,7 +70,13 @@ See: .planning/PROJECT.md (updated 2026-03-21)
   - Plan text referenced `LocalProtocolMode`; real type is `LocalReplayMode`. Real name used throughout. Wave 2 can assume the existing enum.
   - Plan text pointed `ModelCapabilities` at `config::schema`; real path is `agent::model_capabilities`. Real path used. Fixture builders construct the full struct (caps contain `thinking`, `needs_native_lms_api`, `strict_alternation`, `reader_tier`, `parser` fields the plan did not enumerate).
   - Env-var tests serialise on a module-local `Mutex` — any future env-coupled test in this module should follow the same `lock_env_cleared()` pattern.
-- **Wave 2 next:** migrate memory-provider / delegation-provider construction in `agent_core.rs::build_swappable_core` to consult `RuntimeMode` instead of `is_local`.
+- **Wave 2 (commits `46b6d61`, `83b086c`):** SwappableCore.mode field + `mode()` accessor added alongside `is_local`; 4 roadmap-named derivations migrated (context constructor, budget scaling, memory provider, reserve cap). `resolve_memory_provider` free function extracted (~50 lines out of build_swappable_core). `match mode` occurrences in agent_core.rs: 4. 10 new invariant tests (2110 lib tests passing, zero new warnings). Cloud smoke green; Higgs smoke deferred (no sidecar on this machine). SUMMARY at `.planning/phases/09-runtime-mode-spine/09-02-SUMMARY.md`.
+- **Open decisions from Wave 2:**
+  - Branch 5 (delegation provider) evaluated NOT APPLICABLE — tool-runner resolution is driven by `tool_delegation.enabled` + `delegation_provider.is_some()`, not `is_local`. Already RuntimeMode-agnostic.
+  - `context.local_prompt_mode = is_local` reader NOT migrated — Wave 3 scope.
+  - `is_local: bool` remains canonical on SwappableCore; both fields reconciled at construction via `debug_assert_eq!(matches!(mode, Local {..}), is_local)`. Wave 3 reader migration relies on this invariant.
+  - Higgs smoke transcript still owed — user must configure sidecar and re-run before Wave 4's "final proof" phase.
+- **Wave 3 next:** migrate downstream `is_local` readers (~33 call sites in `agent_shared.rs`, `agent_heuristics.rs`, `context.rs`, `provenance_warning_role`, etc.) to consult `core.mode()` via `match`.
 
 ### v0.5.0 readiness
 

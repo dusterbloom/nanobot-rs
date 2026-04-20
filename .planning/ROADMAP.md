@@ -10,7 +10,7 @@
 | # | Phase | Goal | Requirements | Status | Depends On |
 |---|-------|------|--------------|--------|------------|
 | 08 | Prune & Externalize | Delete in-process training/MLX/candle; adopt Higgs as managed sidecar for local inference | PRUNE-01, BACK-01 | Shipped (retroactive) | — |
-| 09 | 2/5 | In Progress|  | Pending | Phase 08 |
+| 09 | 3/5 | In Progress|  | Pending | Phase 08 |
 | 10 | Turn Orchestration Seams | Split agent-loop and shared-turn dispatch into explicit event and helper units | LOOP-01, TURN-01 | Pending | Phase 09 |
 
 **Cancelled (see RETROSPECTIVE):** 11a Shared LoRA State, 11b Model Definition Extraction, 11c Local Backend Boundary Cleanup, 12 In-Process MoE — subject matter deleted by Phase 08.
