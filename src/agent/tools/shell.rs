@@ -320,7 +320,10 @@ impl Tool for ExecTool {
         "Execute a shell command and return its output.\n\
          Safe: ls, pwd, cat, grep, find, python, cargo, git, echo, curl.\n\
          Blocked: rm -rf, sudo, eval, shred (destructive commands are rejected).\n\
-         Prefer read_file over cat, list_dir over ls when available."
+         Prefer read_file over cat, list_dir over ls when available.\n\
+         Bulk edits (\u{2265}3 files): use `ambr 'old' 'new'` for codebase-wide replace,\n\
+         or `fd -e rs | xargs sd 'old' 'new'` for a typed subset.\n\
+         Don't loop edit_file across many files when one pipeline does it."
     }
 
     fn permission(&self) -> PermissionLevel {
@@ -634,6 +637,23 @@ mod tests {
     #[test]
     fn test_guard_allows_grep() {
         assert!(guard("grep -r 'pattern' src/").is_none());
+    }
+
+    #[test]
+    fn test_description_hints_bulk_edit_tools() {
+        // The tool description must point the model at `ambr` / `sd` for
+        // multi-file replacements so it stops looping `edit_file` one file at
+        // a time.
+        let tool = make_exec_tool(false);
+        let desc = tool.description();
+        assert!(
+            desc.contains("ambr"),
+            "exec description should mention ambr, got: {desc}"
+        );
+        assert!(
+            desc.contains("sd"),
+            "exec description should mention sd, got: {desc}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -360,6 +360,18 @@ impl SkillsLoader {
             warnings.push(format!("Unmet requirement(s): {}", missing));
         }
 
+        // Lint oversized SKILL.md files — large skills drift and are fragile
+        // to patch one edit_file call at a time.
+        if let Ok(content) = fs::read_to_string(&skill.path) {
+            let line_count = content.lines().count();
+            if line_count > 200 {
+                warnings.push(format!(
+                    "SKILL.md is oversized ({} lines > 200); consider splitting into focused skills",
+                    line_count
+                ));
+            }
+        }
+
         SkillValidationResult {
             name: skill.name.clone(),
             path: skill.path.clone(),
@@ -961,6 +973,46 @@ mod tests {
             result.errors
         );
         assert!(result.is_valid());
+    }
+
+    #[test]
+    fn test_validate_skill_warns_on_oversized_file() {
+        // A SKILL.md over 200 lines should emit a warning (lint rule: large
+        // skill files are fragile to edit and signal a skill doing too much).
+        let body = "line\n".repeat(300);
+        let frontmatter = "description: A proper description";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), &body);
+        let skills = loader.list_skills(false);
+        assert_eq!(skills.len(), 1);
+        let result = loader.validate_skill(&skills[0]);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("lines")
+                    || w.to_lowercase().contains("oversized")),
+            "expected an oversized-file warning, got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_no_size_warning_when_small() {
+        // A small SKILL.md must not emit a size warning.
+        let body = "line\n".repeat(50);
+        let frontmatter = "description: A proper description";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), &body);
+        let skills = loader.list_skills(false);
+        let result = loader.validate_skill(&skills[0]);
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("lines")
+                    || w.to_lowercase().contains("oversized")),
+            "small skill should not trigger size warning, got: {:?}",
+            result.warnings
+        );
     }
 
     #[test]
