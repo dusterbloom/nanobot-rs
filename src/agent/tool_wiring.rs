@@ -291,7 +291,8 @@ impl AgentLoopShared {
         spawn_tool.set_context(channel, chat_id).await;
         // Local models get the lite schema (~200 tokens) instead of the full
         // schema (~1,100 tokens) which would consume 55% of a 4K context.
-        if core.is_local {
+        // migrated from swappable().is_local — phase 09-03
+        if core.mode().is_local() {
             tools.register(Box::new(SpawnToolLite(spawn_tool)));
         } else {
             tools.register(Box::new(ArcToolProxy(spawn_tool)));

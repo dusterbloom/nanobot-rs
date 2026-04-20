@@ -823,12 +823,13 @@ pub(crate) async fn router_preflight(
     ctx: &mut TurnContext,
     health_registry: Option<&crate::heartbeat::health::HealthRegistry>,
 ) -> PreflightResult {
-    if !(ctx.core.is_local
+    // migrated from swappable().is_local — phase 09-03
+    if !(ctx.core.mode().is_local()
         && ctx.core.tool_delegation_config.strict_no_tools_main
         && ctx.core.tool_delegation_config.strict_router_schema
         && !ctx.flow.router_preflight_done)
     {
-        if ctx.core.is_local && !ctx.flow.router_preflight_done {
+        if ctx.core.mode().is_local() && !ctx.flow.router_preflight_done {
             debug!(
                 strict_no_tools_main = ctx.core.tool_delegation_config.strict_no_tools_main,
                 strict_router_schema = ctx.core.tool_delegation_config.strict_router_schema,
@@ -1291,7 +1292,8 @@ pub(crate) async fn route_tool_calls(
         }
     }
 
-    if ctx.core.is_local
+    // migrated from swappable().is_local — phase 09-03
+    if ctx.core.mode().is_local()
         && role_policy::should_block_main_tool_calls(
             ctx.core.tool_delegation_config.strict_no_tools_main,
             true,

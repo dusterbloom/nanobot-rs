@@ -108,7 +108,8 @@ impl AgentLoop {
             core.brave_api_key.clone(),
             core.exec_timeout,
             core.restrict_to_workspace,
-            core.is_local,
+            // migrated from swappable().is_local — phase 09-03
+            core.mode().is_local(),
             core.max_tool_result_chars,
         )
         .with_search_config(
@@ -139,7 +140,8 @@ impl AgentLoop {
         if let Some(ref dtx) = repl_display_tx {
             subagent_mgr = subagent_mgr.with_display_tx(dtx.clone());
         }
-        if core.is_local {
+        // migrated from swappable().is_local — phase 09-03
+        if core.mode().is_local() {
             subagent_mgr = subagent_mgr.with_local_context_limit(core.token_budget.max_context());
         }
 
@@ -321,7 +323,8 @@ impl AgentLoop {
     /// request for the single-model GPU, causing OOM or stalls.
     fn spawn_background_reflection(shared: &Arc<AgentLoopShared>) {
         let core = shared.core_handle.swappable();
-        if !core.memory_enabled || core.is_local {
+        // migrated from swappable().is_local — phase 09-03
+        if !core.memory_enabled || core.mode().is_local() {
             return;
         }
         let reflector = Reflector::new(
