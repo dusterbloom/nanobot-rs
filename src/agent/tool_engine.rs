@@ -329,14 +329,20 @@ pub(crate) async fn execute_tools_delegated(
         let ok = !data.starts_with("Error:");
         let per_tool_ms = delegation_elapsed_ms / n_results;
 
+        // Only render CallEnd in the TUI for results that the caller asked
+        // for. Internal scratchpad calls the runner made on its own already
+        // roll up into the runner-summary user message — emitting a CallEnd
+        // for them produces a duplicate identical-duration block per tool.
         if let Some(ref tx) = ctx.tool_event_tx {
-            let _ = tx.send(ToolEvent::CallEnd {
-                tool_name: tool_name.clone(),
-                tool_call_id: tool_call_id.clone(),
-                result_data: data.clone(),
-                ok,
-                duration_ms: per_tool_ms,
-            });
+            if is_routed_call(tool_call_id, routed_tool_calls) {
+                let _ = tx.send(ToolEvent::CallEnd {
+                    tool_name: tool_name.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    result_data: data.clone(),
+                    ok,
+                    duration_ms: per_tool_ms,
+                });
+            }
         }
 
         if let Some(ref audit) = ctx.audit {
@@ -377,6 +383,14 @@ pub(crate) async fn execute_tools_delegated(
 
     tracing::Span::current().record("outcome", "ok");
     true
+}
+
+/// Returns `true` when a delegated tool result corresponds to one of the
+/// caller's routed tool calls (rather than an internal scratchpad call the
+/// tool runner made on its own). The TUI should only render `CallEnd` for
+/// these — internal extras already roll up into the runner summary message.
+fn is_routed_call(tool_call_id: &str, routed_tool_calls: &[ToolCallRequest]) -> bool {
+    routed_tool_calls.iter().any(|tc| tc.id == tool_call_id)
 }
 
 /// Returns `true` if a tool is safe to execute in parallel with other
@@ -775,6 +789,36 @@ mod tests {
         let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
         assert!(par.is_empty());
         assert_eq!(seq.len(), 2);
+    }
+
+    #[test]
+    fn test_is_routed_call_matches_routed_id() {
+        // A result whose id matches a routed tool call must be considered
+        // routed (so the TUI gets a CallEnd for it).
+        let routed = vec![make_tc("read_file", "tc_routed_1")];
+        assert!(is_routed_call("tc_routed_1", &routed));
+    }
+
+    #[test]
+    fn test_is_routed_call_skips_runner_scratchpad_id() {
+        // Tool runner internal scratchpad calls use synthetic ids like
+        // "sp0000001" (see tool_runner.rs). They must NOT be considered
+        // routed — otherwise every delegated tool call produces a duplicate
+        // CallEnd block in the TUI.
+        let routed = vec![make_tc("read_file", "tc_routed_1")];
+        assert!(!is_routed_call("sp0000001", &routed));
+        assert!(!is_routed_call("tc_other", &routed));
+    }
+
+    #[test]
+    fn test_is_routed_call_handles_multiple_routed() {
+        let routed = vec![
+            make_tc("read_file", "id_a"),
+            make_tc("exec", "id_b"),
+        ];
+        assert!(is_routed_call("id_a", &routed));
+        assert!(is_routed_call("id_b", &routed));
+        assert!(!is_routed_call("id_c", &routed));
     }
 
     #[test]
