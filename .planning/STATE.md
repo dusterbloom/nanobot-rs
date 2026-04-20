@@ -1,16 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.4.0
-milestone_name: Lean Runtime Refactor
-status: in_progress
-stopped_at: pivoted to Higgs sidecar; retroactive Phase 08 documented; ready to plan Phase 09
-last_updated: "2026-04-20"
-last_activity: 2026-04-20 — Higgs pivot captured in RETROSPECTIVE; REQUIREMENTS/ROADMAP pruned (11a/11b/11c/12 cancelled); Phase 08 Prune & Externalize added retroactively
+milestone: v0.4
+milestone_name: milestone
+current_plan: 3
+status: "RuntimeMode type landed as parallel structure; Wave 2 ready to migrate derivations in agent_core.rs::build_swappable_core"
+last_updated: "2026-04-20T14:20:24.353Z"
+last_activity: 2026-04-20
 progress:
   total_phases: 3
-  completed_phases: 1
-  total_plans: 0
-  completed_plans: 0
+  completed_phases: 0
+  total_plans: 5
+  completed_plans: 3
+  percent: 40
 ---
 
 # State: nanobot
@@ -18,9 +19,12 @@ progress:
 ## Current Position
 
 Milestone v0.4.0 Lean Runtime Refactor — IN PROGRESS (pivoted)
-Phase: 09 (Runtime Mode Spine) — research done, ready to plan
-Status: v0.4.0 scope halved by Higgs pivot; 2 of 6 original phases remain active (09, 10); Phase 08 retroactively captures the pivot work (Higgs sidecar + ~86k-line prune)
-Last activity: 2026-04-20 — retrospective + roadmap/requirements updates to reflect the pivot; close-v0.4 plan ready
+Phase: 09 (Runtime Mode Spine) — Waves 0 and 1 complete (2 of 5 plans done)
+Current Plan: 3
+Total Plans in Phase: 5
+Status: RuntimeMode type landed as parallel structure; Wave 2 ready to migrate derivations in agent_core.rs::build_swappable_core
+Progress: [████░░░░░░] 40%
+Last activity: 2026-04-20
 
 ## Project Reference
 
@@ -57,6 +61,16 @@ See: .planning/PROJECT.md (updated 2026-03-21)
 - `agent_core.rs` 772 LOC (Phase 09 target)
 - `agent_shared.rs` 1,799 LOC (Phase 10 target)
 - `providers/mlx.rs` — **deleted** (was 1,833 LOC pre-pivot)
+
+### Phase 09 progress (active)
+
+- **Wave 0 (commits `5c4fa7d`, `4c7d652`, `dbd68f4`):** Inline unit tests pinning the 11 + 5 `is_local` branch reads in `agent_shared.rs` / `agent_heuristics.rs`, plus 2 `_cloud` fixture variants in `agent_loop_tests.rs` that rebalance the 8:2 local/cloud asymmetry to 8:4. SUMMARY at `.planning/phases/09-runtime-mode-spine/09-00-SUMMARY.md`.
+- **Wave 1 (commit `7d6d2d3`):** `RuntimeMode` enum + 9 derivation methods + 27 invariant tests in `src/agent/runtime_mode.rs`. Parallel-rollout foundation; zero production callsite migrated.
+- **Open decisions from Wave 1:**
+  - Plan text referenced `LocalProtocolMode`; real type is `LocalReplayMode`. Real name used throughout. Wave 2 can assume the existing enum.
+  - Plan text pointed `ModelCapabilities` at `config::schema`; real path is `agent::model_capabilities`. Real path used. Fixture builders construct the full struct (caps contain `thinking`, `needs_native_lms_api`, `strict_alternation`, `reader_tier`, `parser` fields the plan did not enumerate).
+  - Env-var tests serialise on a module-local `Mutex` — any future env-coupled test in this module should follow the same `lock_env_cleared()` pattern.
+- **Wave 2 next:** migrate memory-provider / delegation-provider construction in `agent_core.rs::build_swappable_core` to consult `RuntimeMode` instead of `is_local`.
 
 ### v0.5.0 readiness
 
