@@ -1519,6 +1519,20 @@ pub(crate) fn cmd_agent(
             // of get_or_resume, so session_id as-is is correct)
             info!(session_key = %session_id, "continuing latest session");
             session_id
+        } else if session_id == "cli:default" {
+            // No explicit --session / --resume / --continue: mint a fresh
+            // per-invocation key so we don't silently resume the latest
+            // cli:default session (which accretes history across runs and
+            // blows up TTFT on cold local models).
+            let fresh = format!(
+                "cli:oneshot-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            );
+            info!(session_key = %fresh, "starting fresh ephemeral session (no --continue/--resume)");
+            fresh
         } else {
             session_id
         };
