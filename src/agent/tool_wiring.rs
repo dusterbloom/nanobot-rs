@@ -16,7 +16,7 @@ use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
 use crate::agent::tools::{
     CancelCallback, CheckCallback, CheckInboxTool, CronScheduleTool, ListCallback, LoopCallback,
     MessageTool, PipelineCallback, SendCallback, SendEmailTool, SpawnCallback, SpawnTool,
-    SpawnToolLite, WaitCallback,
+    SpawnToolLite, TodoTool, WaitCallback,
 };
 use crate::bus::events::OutboundMessage;
 
@@ -303,6 +303,9 @@ impl AgentLoopShared {
             ct.set_context(channel, chat_id).await;
             tools.register(Box::new(ArcToolProxy(ct)));
         }
+
+        // Todo scratchpad — workspace-scoped working memory.
+        tools.register(Box::new(TodoTool::new(&core.workspace)));
 
         // Email tools (optional) - available when email is configured.
         if let Some(ref email_cfg) = self.email_config {

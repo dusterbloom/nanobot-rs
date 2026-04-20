@@ -15,6 +15,7 @@ pub mod remember;
 pub mod session_search;
 pub mod shell;
 pub mod spawn;
+pub mod todo;
 pub mod web;
 
 pub use base::{PermissionLevel, Tool};
@@ -34,4 +35,5 @@ pub use spawn::{
     CancelCallback, CheckCallback, ListCallback, LoopCallback, PipelineCallback, SpawnCallback,
     SpawnTool, SpawnToolLite, WaitCallback,
 };
+pub use todo::TodoTool;
 pub use web::{WebFetchTool, WebSearchTool};
