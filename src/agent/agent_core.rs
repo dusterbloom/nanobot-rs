@@ -444,19 +444,20 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         "is_local and RuntimeMode must agree during parallel rollout"
     );
     let router_provider = delegation_provider.clone();
-    let mut context = if is_local {
-        ContextBuilder::new_lite(&workspace)
-    } else {
-        ContextBuilder::new(&workspace)
+    // Branch 1 (Wave 2): context constructor selection is driven by RuntimeMode.
+    let mut context = match mode {
+        RuntimeMode::Local { .. } => ContextBuilder::new_lite(&workspace),
+        RuntimeMode::Cloud => ContextBuilder::new(&workspace),
     };
-    // Scale prompt budgets proportionally to the model's context window.
-    // Without this, a 1M-context model gets the same tiny fixed caps as a 16K model.
-    if is_local {
-        context.set_lite_mode(max_context_tokens);
-    } else {
-        context.scale_budgets(max_context_tokens);
+    // Branch 2 (Wave 2): scale prompt budgets proportionally to the context window.
+    // Local uses the lite clamps; cloud uses the full scaling curve.
+    match mode {
+        RuntimeMode::Local { .. } => context.set_lite_mode(max_context_tokens),
+        RuntimeMode::Cloud => context.scale_budgets(max_context_tokens),
     }
     context.model_name = model.clone();
+    // `local_prompt_mode` still reads `is_local` during Wave 2 parallel rollout;
+    // Wave 3 migrates this to `matches!(mode, RuntimeMode::Local { .. })`.
     context.local_prompt_mode = is_local;
     // Inject provenance verification rules when enabled.
     if provenance.enabled && provenance.system_prompt_rules {
@@ -476,74 +477,21 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         .join("sessions.db");
     let sessions = SessionDb::new(&db_path);
 
-    // Resolve memory provider + model.
-    //
-    // Priority:
-    //   1. Explicit `memory.model` / `memory.provider` from config.json
-    //   2. Cloud default: "haiku" (cheap, fast summarisation)
-    //   3. Local default: specialist provider from trio (if available),
-    //      then dedicated compaction provider, then main provider.
-    let (memory_provider, memory_model): (Arc<dyn LLMProvider>, String) = if is_local {
-        // --- Local mode ---
-        let mem_model = if !memory_config.model.is_empty() {
-            memory_config.model.clone()
-        } else if let Some(ref sp) = specialist_provider {
-            // Trio specialist is ideal for summarisation tasks.
-            sp.get_default_model().to_string()
-        } else {
-            model.clone()
-        };
-        let mem_provider: Arc<dyn LLMProvider> =
-            if let Some(ref mem_provider_cfg) = memory_config.provider {
-                crate::providers::factory::from_provider_config_for_model(
-                    mem_provider_cfg,
-                    Some(&mem_model),
-                )
-            } else if let Some(ref sp) = specialist_provider {
-                // Reuse trio specialist provider when no explicit memory provider.
-                sp.clone()
-            } else if let Some(cp) = compaction_provider {
-                cp
-            } else {
-                // In local mode, provider is already the local server — use it directly.
-                provider.clone()
-            };
-        (mem_provider, mem_model)
-    } else {
-        // --- Cloud mode ---
-        let mem_model = if !memory_config.model.is_empty() {
-            memory_config.model.clone()
-        } else if provider.get_api_base().is_none()
-            || provider
-                .get_api_base()
-                .map_or(false, |b| b.contains("openrouter"))
-        {
-            // Anthropic native or OpenRouter — use haiku for cheap memory ops.
-            "haiku".to_string()
-        } else {
-            model.clone()
-        };
-        let mem_provider: Arc<dyn LLMProvider> =
-            if let Some(ref mem_provider_cfg) = memory_config.provider {
-                crate::providers::factory::from_provider_config_for_model(
-                    mem_provider_cfg,
-                    Some(&mem_model),
-                )
-            } else {
-                provider.clone()
-            };
-        (mem_provider, mem_model)
-    };
+    // Branch 3 (Wave 2): memory-provider resolution is extracted into a named
+    // helper dispatched via `match mode`. See `resolve_memory_provider` below.
+    let (memory_provider, memory_model) = resolve_memory_provider(
+        &mode,
+        &memory_config,
+        &model,
+        &provider,
+        specialist_provider.as_ref(),
+        compaction_provider,
+    );
 
-    // For local models, cap response reserve to 25% of context to avoid
-    // starving the message budget. With 4096 context and 2048 reserve,
-    // tool defs would leave only ~500 tokens for messages, triggering
-    // LCM compaction on the first prompt.
-    let effective_reserve = if is_local {
-        (max_tokens as usize).min(max_context_tokens / 4)
-    } else {
-        max_tokens as usize
-    };
+    // Branch 4 (Wave 2): response-reserve cap is derived from the runtime mode.
+    // Cloud: passthrough of `max_tokens`. Local: clamp to 25% of the context
+    // window so conversation + tool defs still fit.
+    let effective_reserve = mode.reserve_cap(max_tokens as usize, max_context_tokens);
     let token_budget = TokenBudget::new(max_context_tokens, effective_reserve);
     let compaction_ctx_size = if memory_config.compaction_model_context_size > 0 {
         memory_config.compaction_model_context_size
@@ -670,6 +618,84 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         tool_heartbeat_secs,
         health_check_timeout_secs,
         adaptive_tokens,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory-provider resolution (Wave 2 extraction — G4 SPLIT)
+// ---------------------------------------------------------------------------
+
+/// Resolve the memory provider + model for a freshly-built `SwappableCore`.
+///
+/// Extracted from `build_swappable_core` in Wave 2 (09-02). Dispatch is
+/// driven by [`RuntimeMode`] via exhaustive `match` (G5 BRANCH → TYPE).
+///
+/// Priority (per pre-Wave-2 behaviour, preserved bit-identically):
+///  1. Explicit `memory.model` / `memory.provider` from config.json.
+///  2. Cloud default: "haiku" (cheap, fast summarisation) when the main
+///     provider is Anthropic native or OpenRouter; otherwise falls back to
+///     the main model.
+///  3. Local default: trio specialist (if available) → dedicated compaction
+///     provider → main provider.
+fn resolve_memory_provider(
+    mode: &RuntimeMode,
+    memory_config: &MemoryConfig,
+    model: &str,
+    provider: &Arc<dyn LLMProvider>,
+    specialist_provider: Option<&Arc<dyn LLMProvider>>,
+    compaction_provider: Option<Arc<dyn LLMProvider>>,
+) -> (Arc<dyn LLMProvider>, String) {
+    match mode {
+        RuntimeMode::Local { .. } => {
+            let mem_model = if !memory_config.model.is_empty() {
+                memory_config.model.clone()
+            } else if let Some(sp) = specialist_provider {
+                // Trio specialist is ideal for summarisation tasks.
+                sp.get_default_model().to_string()
+            } else {
+                model.to_string()
+            };
+            let mem_provider: Arc<dyn LLMProvider> =
+                if let Some(ref mem_provider_cfg) = memory_config.provider {
+                    crate::providers::factory::from_provider_config_for_model(
+                        mem_provider_cfg,
+                        Some(&mem_model),
+                    )
+                } else if let Some(sp) = specialist_provider {
+                    // Reuse trio specialist provider when no explicit memory provider.
+                    sp.clone()
+                } else if let Some(cp) = compaction_provider {
+                    cp
+                } else {
+                    // In local mode, provider is already the local server — use it directly.
+                    provider.clone()
+                };
+            (mem_provider, mem_model)
+        }
+        RuntimeMode::Cloud => {
+            let mem_model = if !memory_config.model.is_empty() {
+                memory_config.model.clone()
+            } else if provider.get_api_base().is_none()
+                || provider
+                    .get_api_base()
+                    .map_or(false, |b| b.contains("openrouter"))
+            {
+                // Anthropic native or OpenRouter — use haiku for cheap memory ops.
+                "haiku".to_string()
+            } else {
+                model.to_string()
+            };
+            let mem_provider: Arc<dyn LLMProvider> =
+                if let Some(ref mem_provider_cfg) = memory_config.provider {
+                    crate::providers::factory::from_provider_config_for_model(
+                        mem_provider_cfg,
+                        Some(&mem_model),
+                    )
+                } else {
+                    provider.clone()
+                };
+            (mem_provider, mem_model)
+        }
     }
 }
 

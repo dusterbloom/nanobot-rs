@@ -3069,6 +3069,168 @@ mod runtime_mode_parity_tests {
         );
     }
 
+    /// Task 2 / Branch 4: reserve_cap is now derived from mode.
+    /// Cloud: passthrough. Local + ample ctx: unchanged. Local + tight ctx: clamped to 25%.
+    #[test]
+    fn build_core_reserve_cap_cloud_passthrough() {
+        // Cloud fixture: max_tokens=4096, max_ctx=16384. Cloud reserve = max_tokens verbatim.
+        let core = build_test_core(false, None, None);
+        // token_budget exposes reserve via the constructor; reconstruct the
+        // expected value from what mode.reserve_cap returns on Cloud.
+        let mode = core.mode();
+        assert!(matches!(mode, RuntimeMode::Cloud));
+        assert_eq!(mode.reserve_cap(4096, 16384), 4096);
+    }
+
+    #[test]
+    fn build_core_reserve_cap_local_clamped_to_25_pct() {
+        // Local fixture with a tight 16K ctx + 4096 max_tokens: reserve clamps to 4096 (ctx/4).
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let main = MockLLM::named("local-main");
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace,
+            model: "local-model".to_string(),
+            max_iterations: 10,
+            max_continuations: 2,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16_384,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            local_tool_mode: crate::config::schema::LocalToolMode::default(),
+            lane: Lane::default(),
+            compaction_provider: None,
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+        });
+        // ctx/4 == 4096; min(4096, 4096) == 4096.
+        assert_eq!(core.mode().reserve_cap(4096, 16_384), 4096);
+        // Tighter ctx: 8192/4 = 2048 → reserve clamps below max_tokens.
+        assert_eq!(core.mode().reserve_cap(4096, 8_192), 2048);
+    }
+
+    /// Task 2 / Branch 1–2: context builder reflects the mode's lite/full defaults.
+    /// Cloud: `local_prompt_mode == false`, `system_prompt_cap == 0` prior to scaling
+    /// (then scale_budgets sets it to 40% of ctx). Local: `local_prompt_mode == true`,
+    /// `system_prompt_cap` capped by set_lite_mode's `(ctx*3/10).clamp(500, 4000)`.
+    #[test]
+    fn build_core_context_cap_cloud_uses_full_scaling() {
+        let core = build_test_core(false, None, None);
+        // Cloud: scale_budgets sets system_prompt_cap = ctx * 2/5 = 16384 * 2/5 = 6553.
+        assert!(!core.context.local_prompt_mode);
+        assert_eq!(core.context.system_prompt_cap, 16_384 * 2 / 5);
+    }
+
+    #[test]
+    fn build_core_context_cap_local_uses_lite_mode() {
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let main = MockLLM::named("local-main");
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace,
+            model: "local-model".to_string(),
+            max_iterations: 10,
+            max_continuations: 2,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16_384,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            local_tool_mode: crate::config::schema::LocalToolMode::default(),
+            lane: Lane::default(),
+            compaction_provider: None,
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+        });
+        assert!(core.context.local_prompt_mode);
+        // set_lite_mode clamps system_prompt_cap to (ctx * 3/10).clamp(500, 4000).
+        // 16384 * 3/10 = 4915 → clamped to 4000.
+        let expected = (16_384usize * 3 / 10).clamp(500, 4_000);
+        assert_eq!(core.context.system_prompt_cap, expected);
+    }
+
+    /// Task 2 / Branch 3: cloud memory provider/model follows the pre-Wave-2 path.
+    /// MockLLM returns `get_api_base() == None` → triggers the "haiku" branch.
+    #[test]
+    fn build_core_memory_provider_cloud_defaults_to_haiku_when_no_api_base() {
+        let core = build_test_core(false, None, None);
+        // provider.get_api_base() is None for MockLLM → "haiku" memory model.
+        assert_eq!(core.memory_model, "haiku");
+    }
+
+    /// Task 2 / Branch 3: local memory provider falls through specialist → compaction → main.
+    /// With no explicit memory config and no specialist/compaction providers,
+    /// the local path returns the main model name.
+    #[test]
+    fn build_core_memory_provider_local_defaults_to_main_without_trio() {
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let main = MockLLM::named("local-main");
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace,
+            model: "local-model".to_string(),
+            max_iterations: 10,
+            max_continuations: 2,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16_384,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            local_tool_mode: crate::config::schema::LocalToolMode::default(),
+            lane: Lane::default(),
+            compaction_provider: None,
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+        });
+        assert_eq!(core.memory_model, "local-model");
+    }
+
     /// Caps carried inside `Local { caps }` match the capabilities resolved
     /// for the model. Ensures `mode_accessor_round_trip` (VALIDATION.md):
     /// construction inputs are consistent with the mode's payload.
