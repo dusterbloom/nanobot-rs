@@ -23,6 +23,18 @@ use super::agent_loop::TurnContext;
 
 const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
 
+/// Per-tool token threshold above which a raw tool result is replaced by a
+/// summary. Enumerative tools (`exec`, `list_dir`, `web_search`, `read_file`)
+/// return specific strings — filenames, URLs, error lines — that the model
+/// needs to quote verbatim. Summaries destroy them, which the model then
+/// papers over by fabricating. Keep raw output for these up to ~4000 tokens.
+fn summary_threshold_tokens(tool_name: &str) -> usize {
+    match tool_name {
+        "exec" | "list_dir" | "web_search" | "read_file" => 4000,
+        _ => LARGE_TOOL_RESULT_TOKEN_THRESHOLD,
+    }
+}
+
 /// Execute tool calls via the delegation (tool-runner) path.
 ///
 /// Returns `true` if delegation was used (caller should `continue` the main loop).
@@ -245,9 +257,10 @@ pub(crate) async fn execute_tools_delegated(
 
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
+        let threshold = summary_threshold_tokens(&tc.name);
         let injected = if let Some(ref summary) = run_result.summary {
             // Summary exists from scratch-pad analysis.
-            if full_tokens > LARGE_TOOL_RESULT_TOKEN_THRESHOLD {
+            if full_tokens > threshold {
                 // Large data + good summary available: use the summary so compaction
                 // can never destroy the content by proportional truncation.
                 format!(
@@ -260,9 +273,7 @@ pub(crate) async fn execute_tools_delegated(
                 // Small data — raw injection is safe; compaction won't truncate it.
                 ctx.content_gate.admit_simple(full_data).into_text()
             }
-        } else if ctx.core.specialist_provider.is_some()
-            && full_tokens > LARGE_TOOL_RESULT_TOKEN_THRESHOLD
-        {
+        } else if ctx.core.specialist_provider.is_some() && full_tokens > threshold {
             ctx.content_gate
                 .admit_with_specialist(
                     full_data,
@@ -541,8 +552,9 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
     };
 
     // Gate tool result through context budget.
+    let threshold = summary_threshold_tokens(&r.tool_name);
     let data = if ctx.core.specialist_provider.is_some()
-        && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > 500
+        && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > threshold
     {
         ctx.content_gate
             .admit_with_specialist(
@@ -735,6 +747,38 @@ mod tests {
             name: name.to_string(),
             arguments: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn test_summary_threshold_enumerative_tools_high() {
+        // Enumerative tools return specific strings (filenames, URLs, error
+        // lines) that the model must quote verbatim. They should tolerate
+        // much larger raw output before a summary replaces them.
+        assert_eq!(summary_threshold_tokens("exec"), 4000);
+        assert_eq!(summary_threshold_tokens("list_dir"), 4000);
+        assert_eq!(summary_threshold_tokens("web_search"), 4000);
+        assert_eq!(summary_threshold_tokens("read_file"), 4000);
+    }
+
+    #[test]
+    fn test_summary_threshold_other_tools_default() {
+        // Non-enumerative tools keep the stricter default threshold.
+        assert_eq!(
+            summary_threshold_tokens("write_file"),
+            LARGE_TOOL_RESULT_TOKEN_THRESHOLD
+        );
+        assert_eq!(
+            summary_threshold_tokens("edit_file"),
+            LARGE_TOOL_RESULT_TOKEN_THRESHOLD
+        );
+        assert_eq!(
+            summary_threshold_tokens("spawn"),
+            LARGE_TOOL_RESULT_TOKEN_THRESHOLD
+        );
+        assert_eq!(
+            summary_threshold_tokens("unknown_tool"),
+            LARGE_TOOL_RESULT_TOKEN_THRESHOLD
+        );
     }
 
     #[test]
