@@ -73,6 +73,23 @@ fn truncate_output(data: &str, max_lines: usize, max_chars: usize) -> String {
     out
 }
 
+/// ANSI escape to rewind `n` rows and clear everything below the cursor,
+/// without emitting newlines. Used to overwrite a previously-rendered block
+/// in place — e.g. rewriting raw user input as a styled box, or replacing a
+/// stale tool-call status when the same tool emits a new `CallEnd`.
+///
+/// An earlier implementation looped `"\x1b[2K\r\n"` per row, which scrolls
+/// the terminal when the cursor sits on the last row — migrating the old
+/// block into scrollback instead of overwriting it in place.
+fn rewind_and_clear_below(n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    // CSI n A  — cursor up n rows
+    // CSI   J  — erase from cursor to end of screen
+    format!("\x1b[{}A\x1b[J", n)
+}
+
 /// Extract a short context label from tool result data for display.
 ///
 /// For `read_file`, extracts the file path from the `# /path/to/file (lines ...)`
@@ -553,11 +570,7 @@ async fn stream_and_render_inner(
         use std::io::Write as _;
         let prompt_and_input = format!("> {}", input);
         let raw_lines = tui::terminal_rows(&prompt_and_input, 0);
-        print!("\x1b[{}A", raw_lines);
-        for _ in 0..raw_lines {
-            print!("\x1b[2K\r\n");
-        }
-        print!("\x1b[{}A", raw_lines);
+        print!("{}", rewind_and_clear_below(raw_lines));
         std::io::stdout().flush().ok();
         print!("{}", syntax::render_turn(input, syntax::TurnRole::User));
     }
@@ -680,9 +693,7 @@ async fn stream_and_render_inner(
                             // Coalesce repeated CallEnd for the same tool.
                             if let Some((ref prev_name, prev_lines)) = prev_call_end {
                                 if prev_name == tool_name && prev_lines > 0 {
-                                    print!("\x1b[{}A", prev_lines);
-                                    for _ in 0..prev_lines { print!("\x1b[2K\r\n"); }
-                                    print!("\x1b[{}A", prev_lines);
+                                    print!("{}", rewind_and_clear_below(prev_lines));
                                     std::io::stdout().flush().ok();
                                     tool_lines = tool_lines.saturating_sub(prev_lines);
                                     let keep = collected.len().saturating_sub(prev_lines);
@@ -2244,6 +2255,31 @@ mod tests {
         state.shutdown();
         assert!(!state.lms_managed);
         assert_eq!(state.engine, InferenceEngine::None);
+    }
+
+    // --- rewind_and_clear_below (render scroll regression) ---
+
+    #[test]
+    fn rewind_escape_is_empty_when_no_prior_block() {
+        assert_eq!(rewind_and_clear_below(0), "");
+    }
+
+    #[test]
+    fn rewind_escape_does_not_emit_newlines() {
+        // The prior implementation used `\x1b[2K\r\n` in a loop, which scrolls
+        // the terminal on the bottom row. Guard against regressing to that.
+        for n in 1..=10 {
+            let esc = rewind_and_clear_below(n);
+            assert!(!esc.contains('\n'), "n={n}: {esc:?} contains newline");
+            assert!(!esc.contains('\r'), "n={n}: {esc:?} contains CR");
+        }
+    }
+
+    #[test]
+    fn rewind_escape_moves_up_and_clears_to_end() {
+        // CSI n A = cursor up n rows; CSI J = erase cursor-to-end-of-screen.
+        assert_eq!(rewind_and_clear_below(3), "\x1b[3A\x1b[J");
+        assert_eq!(rewind_and_clear_below(1), "\x1b[1A\x1b[J");
     }
 
     // --- truncate_output ---
