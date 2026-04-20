@@ -169,6 +169,26 @@ impl Tool for WriteFileTool {
 // EditFileTool
 // ---------------------------------------------------------------------------
 
+/// Explain why `old_text` didn't match `content` byte-for-byte by trying
+/// progressively looser comparisons. Returns an error string that names the
+/// specific whitespace issue when possible, so the model can fix its input
+/// instead of re-reading the whole file.
+fn diagnose_missing_old_text(content: &str, old_text: &str) -> String {
+    if content.replace("\r\n", "\n").contains(&old_text.replace("\r\n", "\n")) {
+        return "Error: old_text not found — line endings differ (file uses CRLF, old_text uses LF or vice versa). Normalize to LF in old_text and retry.".to_string();
+    }
+    let strip_trailing = |s: &str| {
+        s.lines()
+            .map(|l| l.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if strip_trailing(content).contains(&strip_trailing(old_text)) {
+        return "Error: old_text not found — trailing whitespace on one or more lines differs. Match trailing spaces/tabs exactly, or re-read the file first.".to_string();
+    }
+    "Error: old_text not found in file. Make sure it matches exactly. Hint: use read_file to see the current file contents, then copy the exact text to match.".to_string()
+}
+
 /// Tool to edit a file by replacing text.
 pub struct EditFileTool;
 
@@ -233,14 +253,14 @@ impl Tool for EditFileTool {
         };
 
         if !content.contains(old_text) {
-            return "Error: old_text not found in file. Make sure it matches exactly. Hint: use read_file to see the current file contents, then copy the exact text to match.".to_string();
+            return diagnose_missing_old_text(&content, old_text);
         }
 
         // Count occurrences.
         let count = content.matches(old_text).count();
         if count > 1 {
             return format!(
-                "Warning: old_text appears {} times. Please provide more context to make it unique.",
+                "Error: old_text appears {} times. Please provide more context to make it unique.",
                 count
             );
         }
@@ -831,7 +851,67 @@ mod tests {
             ("new_text", "ccc"),
         ]);
         let result = tool.execute(params).await;
+        // Must be surfaced as an Error, not a Warning — small models
+        // routinely misread "Warning:" as a non-fatal success.
+        assert!(
+            result.starts_with("Error:"),
+            "multi-match should return Error, got: {result}"
+        );
         assert!(result.contains("appears 2 times"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_line_ending_mismatch_gives_hint() {
+        // File on disk uses CRLF; model remembered LF. Bytes differ, so
+        // `contains` returns false, but a whitespace-normalized check would
+        // match. The error must tell the model exactly what's wrong instead
+        // of the generic "not found" dead-end.
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("crlf.txt");
+        std::fs::write(&file_path, "foo\r\nbar\r\n").unwrap();
+
+        let tool = EditFileTool;
+        let params = make_params(&[
+            ("path", file_path.to_str().unwrap()),
+            ("old_text", "foo\nbar"),
+            ("new_text", "baz"),
+        ]);
+        let result = tool.execute(params).await;
+        assert!(
+            result.starts_with("Error:"),
+            "expected Error prefix, got: {result}"
+        );
+        assert!(
+            result.to_lowercase().contains("line ending")
+                || result.to_lowercase().contains("whitespace")
+                || result.to_lowercase().contains("crlf"),
+            "expected a whitespace/line-ending hint, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_trailing_whitespace_mismatch_gives_hint() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("trail.txt");
+        // On-disk content has a trailing space after `hello`.
+        std::fs::write(&file_path, "hello \nworld\n").unwrap();
+
+        let tool = EditFileTool;
+        let params = make_params(&[
+            ("path", file_path.to_str().unwrap()),
+            ("old_text", "hello\nworld"), // no trailing space
+            ("new_text", "bye"),
+        ]);
+        let result = tool.execute(params).await;
+        assert!(
+            result.starts_with("Error:"),
+            "expected Error prefix, got: {result}"
+        );
+        assert!(
+            result.to_lowercase().contains("whitespace")
+                || result.to_lowercase().contains("trailing"),
+            "expected a whitespace hint, got: {result}"
+        );
     }
 
     #[tokio::test]
