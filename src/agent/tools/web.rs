@@ -410,7 +410,11 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch URL and extract readable content (HTML -> text)."
+        "Fetch URL and extract readable content (HTML -> text).\n\
+         Only pass a URL that appeared verbatim in a prior tool result or in the\n\
+         user's message. Do not guess URLs from memory — Vercel/Cloudflare/news\n\
+         site paths change and guessed URLs return 404 or login walls. If you\n\
+         don't have the URL, call web_search first to discover it."
     }
 
     fn permission(&self) -> PermissionLevel {
@@ -986,6 +990,24 @@ mod tests {
     fn test_web_fetch_tool_name() {
         let tool = WebFetchTool::new(50000);
         assert_eq!(tool.name(), "web_fetch");
+    }
+
+    #[test]
+    fn test_web_fetch_description_steers_away_from_url_guessing() {
+        // Models (notably Qwen on local) will otherwise guess plausible-looking
+        // URLs like vercel.com/blog/security-<year> and hit 404 walls. The
+        // description must point them at web_search first when the URL isn't
+        // already in context.
+        let tool = WebFetchTool::new(50000);
+        let desc = tool.description();
+        assert!(
+            desc.contains("web_search"),
+            "web_fetch description should point at web_search, got: {desc}"
+        );
+        assert!(
+            desc.to_lowercase().contains("guess"),
+            "web_fetch description should warn against guessing URLs, got: {desc}"
+        );
     }
 
     #[test]
