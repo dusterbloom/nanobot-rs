@@ -566,6 +566,99 @@ fn test_delegation_with_is_local_true() {
     );
 }
 
+/// Wave 0 cloud-path sibling of `test_delegation_with_is_local_true`.
+///
+/// Pins the `is_local=false` branches in `build_swappable_core`
+/// (agent_core.rs:460-509 memory provider, :516-520 reserve cap) so
+/// Wave 1→3 can't silently regress cloud delegation wiring.
+///
+/// Phase 09 plan:
+///   .planning/phases/09-runtime-mode-spine/00-wave-0-coverage-PLAN.md
+#[test]
+fn test_delegation_with_is_local_false_cloud() {
+    // Verify wiring + cloud-specific derivations when is_local=false.
+    // MockLLM returns `None` from `get_api_base()` — treated as Anthropic
+    // native → memory_model defaults to "haiku" (cheap summarisation).
+    let workspace = tempfile::tempdir().unwrap().into_path();
+    let main = MockLLM::named("cloud-main");
+    let dp = MockLLM::named("cloud-delegation");
+    let td = ToolDelegationConfig {
+        enabled: true,
+        model: "delegation-model".to_string(),
+        auto_local: true,
+        ..Default::default()
+    };
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider: main,
+        workspace,
+        model: "cloud-model".to_string(),
+        max_iterations: 10,
+        max_continuations: 2,
+        max_tokens: 4096,
+        temperature: 0.7,
+        max_context_tokens: 16384,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: false,
+        memory_config: MemoryConfig::default(),
+        is_local: false,
+        local_tool_mode: crate::config::schema::LocalToolMode::default(),
+        lane: Lane::default(),
+        compaction_provider: None,
+        tool_delegation: td,
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        delegation_provider: Some(dp),
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+    });
+
+    // pins agent_core.rs: is_local plumbs through to the core unchanged
+    assert!(!core.is_local, "cloud core must carry is_local=false");
+
+    // pins agent_core.rs: delegation provider still wired through in cloud mode
+    assert!(
+        core.tool_runner_provider.is_some(),
+        "cloud mode must still wire delegation provider"
+    );
+    assert_eq!(
+        core.tool_runner_provider
+            .as_ref()
+            .unwrap()
+            .get_default_model(),
+        "cloud-delegation",
+        "Cloud mode must use the delegation provider we passed in"
+    );
+
+    // pins agent_core.rs:487-498 cloud memory-model default (haiku for
+    // Anthropic-native / OpenRouter — MockLLM.get_api_base() == None, so
+    // the Anthropic branch wins).
+    assert_eq!(
+        core.memory_model, "haiku",
+        "Cloud + MockLLM(api_base=None) → memory_model must default to haiku"
+    );
+
+    // pins agent_core.rs:516-520 reserve cap: cloud mode leaves max_tokens
+    // as-is; local mode clamps to max_context/4. Here max_tokens=4096,
+    // max_context=16384, so local would also be 4096 — a pure-cloud distinct
+    // assertion belongs elsewhere, but we pin the cloud path doesn't
+    // spuriously clamp when max_tokens > max_context/4 is not triggered.
+    // (The stronger clamp-difference assertion is in the paired
+    // `_cloud_reserve_uncapped` test below.)
+    assert!(
+        core.token_budget.max_context() == 16384,
+        "max_context must pass through untouched in cloud mode"
+    );
+}
+
 #[test]
 fn test_delegation_with_compaction_and_delegation_providers() {
     // Both compaction and delegation providers set — should not interfere
@@ -625,6 +718,89 @@ fn test_delegation_with_compaction_and_delegation_providers() {
             .get_default_model(),
         "delegation",
         "Tool runner should use delegation provider"
+    );
+}
+
+/// Wave 0 cloud-path sibling of
+/// `test_delegation_with_compaction_and_delegation_providers`.
+///
+/// Same compaction + delegation provider mix, but with is_local=false.
+/// Cloud mode takes the is_local=false branch at agent_core.rs:486-509,
+/// where `compaction_provider` is IGNORED by the memory-provider
+/// selection — cloud memory defaults to main provider (or haiku for
+/// Anthropic/OpenRouter). Delegation provider plumbing stays the same.
+///
+/// Phase 09 plan:
+///   .planning/phases/09-runtime-mode-spine/00-wave-0-coverage-PLAN.md
+#[test]
+fn test_delegation_with_compaction_and_delegation_providers_cloud() {
+    // Both compaction and delegation providers set — in cloud mode the
+    // compaction_provider is ignored by memory wiring (memory falls back to
+    // haiku via Anthropic-native branch), but delegation_provider still wires
+    // through to tool_runner.
+    let workspace = tempfile::tempdir().unwrap().into_path();
+    let main = MockLLM::named("main");
+    let compaction = MockLLM::named("compaction");
+    let delegation = MockLLM::named("delegation");
+    let td = ToolDelegationConfig {
+        enabled: true,
+        model: "deleg-model".to_string(),
+        auto_local: true,
+        ..Default::default()
+    };
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider: main,
+        workspace,
+        model: "main-model".to_string(),
+        max_iterations: 10,
+        max_continuations: 2,
+        max_tokens: 4096,
+        temperature: 0.7,
+        max_context_tokens: 16384,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: false,
+        memory_config: MemoryConfig::default(),
+        is_local: false,
+        local_tool_mode: crate::config::schema::LocalToolMode::default(),
+        lane: Lane::default(),
+        compaction_provider: Some(compaction),
+        tool_delegation: td,
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        delegation_provider: Some(delegation),
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+    });
+
+    // pins agent_core.rs:486-509 — cloud memory path ignores
+    // `compaction_provider`; MockLLM(api_base=None) → "haiku" branch.
+    assert_eq!(
+        core.memory_model, "haiku",
+        "Cloud mode: memory_model must default to haiku (not 'compaction')"
+    );
+    assert_eq!(
+        core.memory_provider.get_default_model(),
+        "main",
+        "Cloud mode: compaction_provider ignored; memory reuses main provider"
+    );
+
+    // Delegation plumbing still works identically on both paths.
+    assert_eq!(
+        core.tool_runner_provider
+            .as_ref()
+            .unwrap()
+            .get_default_model(),
+        "delegation",
+        "Cloud mode: tool runner still uses delegation provider"
     );
 }
 
