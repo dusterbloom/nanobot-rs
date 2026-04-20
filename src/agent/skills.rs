@@ -229,7 +229,10 @@ impl SkillsLoader {
             return String::new();
         }
         let mut lines = vec![
-            "Available skills (use `read_skill __list__` for details, `read_skill <name>` for full content):"
+            "Available skills. Before reading any SKILL.md file by hand, \
+             call `read_skill __list__` first to get canonical file paths — \
+             editing by a guessed path will hit the wrong file. Then use \
+             `read_skill <name>` for full content."
                 .to_string(),
         ];
         for skill in &skills {
@@ -865,6 +868,33 @@ mod tests {
             index.contains("- test-skill: A helpful skill for coding tasks"),
             "index should contain skill entry: {}",
             index
+        );
+    }
+
+    #[test]
+    fn test_compact_index_preamble_is_imperative() {
+        // The header must tell the model to call `read_skill __list__`
+        // BEFORE reading any SKILL.md file by hand. A parenthetical hint
+        // is not enough — small local models routinely skip hints and
+        // re-read skill files from guessed paths, which is how Qwen3.6
+        // ended up editing the wrong file.
+        let frontmatter = "description: A skill";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let index = loader.build_compact_index();
+        let lower = index.to_lowercase();
+        assert!(
+            lower.contains("read_skill __list__"),
+            "preamble must name the read_skill __list__ tool call: {index}"
+        );
+        // The preamble must frame __list__ as a prerequisite, not an option.
+        assert!(
+            lower.contains("before") || lower.contains("first") || lower.contains("mandatory"),
+            "preamble must be imperative (before/first/mandatory), got: {index}"
+        );
+        // And it must warn against editing by guessed path.
+        assert!(
+            lower.contains("guess") || lower.contains("wrong file") || lower.contains("canonical"),
+            "preamble must warn about guessed paths / wrong file: {index}"
         );
     }
 
