@@ -56,6 +56,7 @@ pub mod reflector;
 pub mod role_policy;
 pub mod router;
 pub mod router_fallback;
+pub mod runtime_mode;
 pub mod sanitize;
 pub mod session_indexer;
 pub mod skills;
