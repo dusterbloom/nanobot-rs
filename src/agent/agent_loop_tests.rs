@@ -2982,3 +2982,147 @@ mod nudge_tests {
         // TODO: Update this test to verify actual cost recording after wiring
     }
 }
+
+// ============================================================================
+// RuntimeMode parallel-rollout parity tests (Wave 2)
+// ============================================================================
+//
+// These tests pin the invariant that `SwappableCore.is_local` and
+// `SwappableCore.mode` agree by construction. Wave 3's reader-migration
+// relies on this invariant to swap each `is_local` read for a `mode` match
+// without behavioural drift.
+mod runtime_mode_parity_tests {
+    use super::*;
+    use crate::agent::runtime_mode::RuntimeMode;
+
+    /// Cloud-fixture path: `is_local: false` → `mode == Cloud`, accessor returns Cloud.
+    #[test]
+    fn mode_accessor_cloud_matches_is_local_false() {
+        let core = build_test_core(false, None, None);
+        assert!(!core.is_local, "fixture is is_local=false");
+        assert!(
+            matches!(core.mode(), RuntimeMode::Cloud),
+            "cloud fixture must resolve to RuntimeMode::Cloud"
+        );
+    }
+
+    /// Parallel-rollout invariant: `core.is_local == matches!(core.mode(), Local { .. })`.
+    /// This is what Wave 3 reader migrations rely on.
+    #[test]
+    fn mode_and_is_local_agree_cloud() {
+        let core = build_test_core(false, None, None);
+        assert_eq!(
+            core.is_local,
+            matches!(core.mode(), RuntimeMode::Local { .. }),
+            "parallel fields must agree for cloud core"
+        );
+    }
+
+    /// Local-fixture path: build a local core via a minimal SwappableCoreConfig
+    /// (mirrors the pattern in `test_delegation_with_is_local_true`). Verifies
+    /// the accessor returns `Local { caps }` and that the parallel invariant holds.
+    #[test]
+    fn mode_accessor_local_matches_is_local_true() {
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let main = MockLLM::named("local-main");
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace,
+            model: "local-model".to_string(),
+            max_iterations: 10,
+            max_continuations: 2,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16384,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            local_tool_mode: crate::config::schema::LocalToolMode::default(),
+            lane: Lane::default(),
+            compaction_provider: None,
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+        });
+        assert!(core.is_local, "fixture is is_local=true");
+        assert!(
+            matches!(core.mode(), RuntimeMode::Local { .. }),
+            "local fixture must resolve to RuntimeMode::Local"
+        );
+        assert_eq!(
+            core.is_local,
+            matches!(core.mode(), RuntimeMode::Local { .. }),
+            "parallel fields must agree for local core"
+        );
+    }
+
+    /// Caps carried inside `Local { caps }` match the capabilities resolved
+    /// for the model. Ensures `mode_accessor_round_trip` (VALIDATION.md):
+    /// construction inputs are consistent with the mode's payload.
+    #[test]
+    fn mode_accessor_round_trip_local_caps_match_lookup() {
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let main = MockLLM::named("local-main");
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace,
+            model: "local-model".to_string(),
+            max_iterations: 10,
+            max_continuations: 2,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16384,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            local_tool_mode: crate::config::schema::LocalToolMode::default(),
+            lane: Lane::default(),
+            compaction_provider: None,
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+        });
+        match core.mode() {
+            RuntimeMode::Local { caps } => {
+                // The wrapped caps must equal the model-capabilities lookup for the
+                // same model — construction doesn't silently swap in a different
+                // capability record.
+                assert_eq!(
+                    caps.size_class, core.model_capabilities.size_class,
+                    "mode caps.size_class must match core.model_capabilities"
+                );
+                assert_eq!(
+                    caps.tool_calling, core.model_capabilities.tool_calling,
+                    "mode caps.tool_calling must match core.model_capabilities"
+                );
+            }
+            RuntimeMode::Cloud => panic!("expected Local variant"),
+        }
+    }
+}

@@ -17,6 +17,7 @@ use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
 use crate::agent::lane::Lane;
 use crate::agent::learning::LearningStore;
+use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
 use crate::config::schema::{
@@ -60,6 +61,11 @@ pub struct SwappableCore {
     pub memory_model: String,
     pub reflection_threshold: usize,
     pub is_local: bool,
+    /// Typed runtime descriptor (parallel to `is_local` during the Wave 2 rollout).
+    ///
+    /// Waves 2–4: construction-site derivations consult `mode`; Wave 3 migrates
+    /// downstream readers off `is_local`; Wave 4 removes the bool.
+    pub mode: RuntimeMode,
     pub local_tool_mode: crate::config::schema::LocalToolMode,
     pub lane: Lane,
     /// Whether the current main provider is a cluster peer (feature-gated).
@@ -111,6 +117,12 @@ impl SwappableCore {
         {
             self.is_local
         }
+    }
+
+    /// Typed runtime descriptor for this core. Wave 2 introduces this accessor
+    /// alongside the still-canonical `is_local` bool; Wave 3 migrates readers.
+    pub fn mode(&self) -> &RuntimeMode {
+        &self.mode
     }
 }
 
@@ -417,6 +429,20 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     } = cfg;
     let model_capabilities =
         crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
+    // Construct the typed runtime descriptor *once*, from the same inputs that
+    // decide `is_local`. Parallel-rollout invariant (Wave 2): `is_local` and
+    // `mode` must agree. Wave 3 migrates downstream readers; Wave 4 removes
+    // the bool. See .planning/phases/09-runtime-mode-spine/09-CONTEXT.md.
+    let mode = if is_local {
+        RuntimeMode::from_caps(Some(Arc::new(model_capabilities.clone())))
+    } else {
+        RuntimeMode::from_caps(None)
+    };
+    debug_assert_eq!(
+        matches!(mode, RuntimeMode::Local { .. }),
+        is_local,
+        "is_local and RuntimeMode must agree during parallel rollout"
+    );
     let router_provider = delegation_provider.clone();
     let mut context = if is_local {
         ContextBuilder::new_lite(&workspace)
@@ -613,6 +639,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_model,
         reflection_threshold: memory_config.reflection_threshold,
         is_local,
+        mode,
         local_tool_mode,
         lane,
         #[cfg(feature = "cluster")]
