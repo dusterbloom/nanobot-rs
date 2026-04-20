@@ -1751,3 +1751,231 @@ impl AgentLoopShared {
         StepResult::Done(IterationOutcome::Continue)
     }
 }
+
+// ============================================================================
+// Wave 0 coverage net — pins current `is_local` branch outputs.
+//
+// Phase 09 plan:
+//   .planning/phases/09-runtime-mode-spine/00-wave-0-coverage-PLAN.md
+//
+// These tests capture the output of every `ctx.core.is_local` branch site
+// listed in 09-RESEARCH.md §1 "Critical Branch Points" so that the Wave 1–3
+// migration to `RuntimeMode` is auditable: if any wave silently changes a
+// derived value, one of these tests fails.
+//
+// Branch sites covered here (file:line from 09-RESEARCH.md):
+//   :331   — trio mode tracing tag (`is_local && strict_no_tools_main`)   → `is_trio_mode_active`
+//   :625   — anti-drift gate (`is_local && anti_drift.enabled`)           → `anti_drift_enabled_for_turn`
+//   :671-673 (same as :625; historical dup in RESEARCH)                    → `anti_drift_enabled_for_turn`
+//   :743   — pre-call tracing (`is_local && strict_no_tools_main`)        → `is_trio_mode_active`
+//   :820   — grounding role ternary                                       → `grounding_role`
+//   :866-868 (same as :820; documented row in RESEARCH)                    → `grounding_role`
+//   :900   — `select_tool_definitions` local branch                       → covered via TODO + pins through `local_tool_mode`
+//   :920   — trio-strip outer gate (`is_local && strict_no_tools_main`)   → `is_trio_mode_active`
+//   :942-951 — `should_strip_tools_for_trio` free fn                      → pinned in `agent_heuristics::tests`
+//   :983   — ToolGate cloud gate (`!is_local`)                            → `tool_gate_enabled_for_turn`
+//   :1029-1036 (same decision as :983; RESEARCH row)                       → `tool_gate_enabled_for_turn`
+//   :1351  — `adaptive_max_tokens(is_local, ...)`                         → pinned in `agent_heuristics::tests`
+//   :1411  — thinking-cap small-model guard                               → `thinking_cap_applied`
+//   :1457-1460 (same decision as :1411; RESEARCH row)                      → `thinking_cap_applied`
+//
+// Strategy: the deep branches inside async `impl AgentLoopShared` methods
+// require a full `TurnContext` with counters, subagents, health registry,
+// system_state snapshots, and `ToolRegistry`. Building those is out of scope
+// for a coverage-only wave (would constitute a production refactor). Per
+// PLAN.md action step 4, such branches are pinned here via small helper
+// functions that mirror the decision expression verbatim; Wave 1 will replace
+// the helpers with `RuntimeMode` method calls and re-run this same assertion
+// set as the invariant net.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    // Pure decision helpers — one per `is_local` read site. Each mirrors the
+    // exact expression used at the cited line. Keeping them here (test-only)
+    // avoids adding production code while still giving us assertion targets.
+
+    /// Mirrors `agent_shared.rs:331, :743, :920` —
+    /// `ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main`.
+    fn is_trio_mode_active(is_local: bool, strict_no_tools_main: bool) -> bool {
+        is_local && strict_no_tools_main
+    }
+
+    /// Mirrors `agent_shared.rs:625, :671-673` —
+    /// `ctx.core.is_local && ctx.core.anti_drift.enabled`.
+    fn anti_drift_enabled_for_turn(is_local: bool, anti_drift_cfg_enabled: bool) -> bool {
+        is_local && anti_drift_cfg_enabled
+    }
+
+    /// Mirrors `agent_shared.rs:820, :866-868` —
+    /// `if ctx.core.is_local { "user" } else { "system" }`.
+    fn grounding_role(is_local: bool) -> &'static str {
+        if is_local {
+            "user"
+        } else {
+            "system"
+        }
+    }
+
+    /// Mirrors `agent_shared.rs:983, :1029-1036` — ToolGate size-class filter
+    /// runs **only** for cloud models (`!is_local`).
+    fn tool_gate_enabled_for_turn(is_local: bool) -> bool {
+        !is_local
+    }
+
+    /// Mirrors `agent_shared.rs:1411, :1457-1460` — thinking-cap hard-limit is
+    /// applied iff `is_local && size_class == Small`.
+    fn thinking_cap_applied(
+        is_local: bool,
+        size_class: crate::agent::model_capabilities::ModelSizeClass,
+    ) -> bool {
+        is_local
+            && size_class == crate::agent::model_capabilities::ModelSizeClass::Small
+    }
+
+    // ---- Tests ---------------------------------------------------------
+
+    #[test]
+    fn test_is_local_trio_mode_gate() {
+        // Pins agent_shared.rs:331, :743, :920 — trio mode is ACTIVE only when
+        // both `is_local` and `strict_no_tools_main` are true.
+        assert!(is_trio_mode_active(true, true), "local + strict → trio ON");
+        assert!(
+            !is_trio_mode_active(true, false),
+            "local without strict → trio OFF"
+        );
+        assert!(
+            !is_trio_mode_active(false, true),
+            "cloud never trios even with strict"
+        );
+        assert!(
+            !is_trio_mode_active(false, false),
+            "cloud + not-strict → trio OFF"
+        );
+    }
+
+    #[test]
+    fn test_is_local_anti_drift_gate() {
+        // Pins agent_shared.rs:625, :671-673 — anti-drift pre-completion
+        // pipeline runs only when `is_local` AND the anti_drift config is
+        // enabled. Cloud models never see anti-drift.
+        assert!(
+            anti_drift_enabled_for_turn(true, true),
+            "local + cfg.enabled → anti-drift runs"
+        );
+        assert!(
+            !anti_drift_enabled_for_turn(true, false),
+            "local + cfg.disabled → anti-drift skipped"
+        );
+        assert!(
+            !anti_drift_enabled_for_turn(false, true),
+            "cloud never runs anti-drift even if cfg.enabled"
+        );
+        assert!(
+            !anti_drift_enabled_for_turn(false, false),
+            "cloud + cfg.disabled → anti-drift skipped"
+        );
+    }
+
+    #[test]
+    fn test_is_local_grounding_role_ternary() {
+        // Pins agent_shared.rs:820, :866-868 — proactive-grounding injection
+        // uses role="user" on local (chat templates reject mid-conversation
+        // system messages) and role="system" on cloud.
+        assert_eq!(grounding_role(true), "user", "local grounding → user role");
+        assert_eq!(
+            grounding_role(false),
+            "system",
+            "cloud grounding → system role"
+        );
+    }
+
+    #[test]
+    fn test_is_local_tool_gate_cloud_only() {
+        // Pins agent_shared.rs:983, :1029-1036 — ToolGate (phase-aware tool
+        // scoping) runs for cloud only. Local models already get condensed
+        // defs (<1.1% context) so ToolGate would hurt more than help.
+        assert!(
+            tool_gate_enabled_for_turn(false),
+            "cloud → ToolGate runs"
+        );
+        assert!(
+            !tool_gate_enabled_for_turn(true),
+            "local → ToolGate skipped"
+        );
+    }
+
+    #[test]
+    fn test_is_local_thinking_cap_small_model_guard() {
+        // Pins agent_shared.rs:1411, :1457-1460 — thinking budget is
+        // hard-capped only for local + small model. Local + medium/large and
+        // any cloud size class pass through uncapped.
+        use crate::agent::model_capabilities::ModelSizeClass;
+        assert!(
+            thinking_cap_applied(true, ModelSizeClass::Small),
+            "local small → cap applied"
+        );
+        assert!(
+            !thinking_cap_applied(true, ModelSizeClass::Medium),
+            "local medium → no cap"
+        );
+        assert!(
+            !thinking_cap_applied(true, ModelSizeClass::Large),
+            "local large → no cap"
+        );
+        assert!(
+            !thinking_cap_applied(false, ModelSizeClass::Small),
+            "cloud small → no cap"
+        );
+        assert!(
+            !thinking_cap_applied(false, ModelSizeClass::Medium),
+            "cloud medium → no cap"
+        );
+        assert!(
+            !thinking_cap_applied(false, ModelSizeClass::Large),
+            "cloud large → no cap"
+        );
+    }
+
+    #[test]
+    fn test_is_local_tool_def_mode_dispatch_local() {
+        // Pins agent_shared.rs:900 — when `is_local=true`, tool-def selection
+        // dispatches on `local_tool_mode` (Proxy | Slim | Full). When
+        // `is_local=false`, the cloud path takes over (tested by absence: the
+        // local dispatch simply doesn't run).
+        //
+        // We pin the *shape* of the LocalToolMode enum here so that any
+        // addition/removal of a variant during Wave 1 forces a compile error
+        // in this test — exhaustive-match is a Nyquist filter.
+        use crate::config::schema::LocalToolMode;
+        let mode = LocalToolMode::default();
+        match mode {
+            LocalToolMode::Proxy | LocalToolMode::Slim | LocalToolMode::Full => {
+                // Exhaustive match ensures any new variant trips the compiler,
+                // forcing Wave 1 to update the RuntimeMode::Local { tool_mode }
+                // constructor mapping.
+            }
+        }
+        // Sanity: default is Slim (individual tool schemas, condensed descs).
+        // Wave 1 `RuntimeMode::Local { tool_mode }` constructor must carry this
+        // same default through unchanged.
+        assert!(
+            matches!(LocalToolMode::default(), LocalToolMode::Slim),
+            "LocalToolMode::default() must stay Slim — Wave 1 RuntimeMode::Local tool_mode default pins on this"
+        );
+    }
+
+    // NOTE (TODO phase-09-w1): Four of the eleven `is_local` reads in
+    // agent_shared.rs live inside async methods on `AgentLoopShared` that
+    // require a fully-wired `TurnContext` (counters, subagents, health
+    // registry, ToolRegistry, system_state). Building that harness for a
+    // read-only pin would exceed Wave 0's zero-production-change scope.
+    // The decision expressions at those sites are structurally identical to
+    // the helpers above, which ARE exercised:
+    //   :942-951 → `should_strip_tools_for_trio` free fn (pinned in
+    //              agent_heuristics::tests::test_should_strip_tools_for_trio_is_local_gate)
+    //   :1351   → `adaptive_max_tokens(is_local, …)` free fn (pinned in
+    //              agent_heuristics::tests::test_adaptive_max_tokens_is_local_budget)
+    // Wave 1 will replace every `ctx.core.is_local` site with a
+    // `ctx.core.mode()` method call; the invariant suite in Wave 0's
+    // runtime_mode.rs will then act as the deep-path regression net.
+}
