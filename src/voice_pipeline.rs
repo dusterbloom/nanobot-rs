@@ -12,7 +12,7 @@
 //! Uses cross-platform `AudioCapture`/`AudioPlayer` from jack-voice (cpal-based),
 //! no `parec` dependency.
 
-use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,7 @@ use jack_voice::{
 };
 use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use tracing::{debug, info};
 
 // ============================================================================
@@ -69,6 +70,52 @@ pub(crate) fn detect_language(text: &str) -> String {
         })
         .unwrap_or("en")
         .to_string()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PocketLanguageSpec {
+    language: &'static str,
+    default_voice: &'static str,
+}
+
+fn pocket_tts_language(lang: &str) -> Option<PocketLanguageSpec> {
+    let lang = lang.trim();
+    if lang.is_empty() {
+        return None;
+    }
+    let base = lang
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(lang)
+        .to_ascii_lowercase();
+
+    match base.as_str() {
+        "en" | "english" => Some(PocketLanguageSpec {
+            language: "en",
+            default_voice: "alba",
+        }),
+        "fr" | "french" => Some(PocketLanguageSpec {
+            language: "fr",
+            default_voice: "estelle",
+        }),
+        "de" | "german" => Some(PocketLanguageSpec {
+            language: "de",
+            default_voice: "juergen",
+        }),
+        "it" | "italian" => Some(PocketLanguageSpec {
+            language: "it",
+            default_voice: "giovanni",
+        }),
+        "pt" | "portuguese" => Some(PocketLanguageSpec {
+            language: "pt",
+            default_voice: "rafael",
+        }),
+        "es" | "spanish" => Some(PocketLanguageSpec {
+            language: "es",
+            default_voice: "lola",
+        }),
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -614,6 +661,7 @@ pub struct VoicePipeline {
     stt: Arc<Mutex<SpeechToText>>,
     tts_en: Option<Arc<Mutex<TextToSpeech>>>,
     tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
+    tts_pocket_by_lang: Arc<Mutex<HashMap<String, Arc<Mutex<TextToSpeech>>>>>,
     engine_config: TtsEngineConfig,
     cancel: Arc<AtomicBool>,
 }
@@ -630,12 +678,14 @@ impl VoicePipeline {
 
     /// Create a pipeline with optional language-based engine selection (mic mode).
     ///
-    /// - `None` → load both Pocket (English) and Kokoro (multilingual)
-    /// - `Some("en")` → load only Pocket
+    /// - `None` → load Pocket (English) and Kokoro fallback; other Pocket languages load lazily
+    /// - `Some("en" | "fr" | "de" | "it" | "pt" | "es")` → load Pocket for that language
     /// - `Some(_)` → load only Kokoro
     pub async fn with_lang(lang: Option<&str>) -> Result<Self, String> {
-        let load_pocket = lang.is_none() || lang == Some("en");
-        let load_kokoro = lang.is_none() || lang != Some("en");
+        let pocket_lang = lang.and_then(pocket_tts_language);
+        let load_pocket = lang.is_none() || pocket_lang.is_some();
+        let load_kokoro = lang.is_none() || pocket_lang.is_none();
+        let initial_pocket_lang = pocket_lang.map(|spec| spec.language).unwrap_or("en");
 
         if load_kokoro && std::env::var("PIPER_ESPEAKNG_DATA_DIRECTORY").is_err() {
             let home = dirs::home_dir().unwrap_or_default();
@@ -646,9 +696,9 @@ impl VoicePipeline {
         }
 
         let label = match lang {
-            Some("en") => "Pocket only",
+            Some(lang) if pocket_tts_language(lang).is_some() => "Pocket multilingual",
             Some(_) => "Kokoro only",
-            None => "Pocket + Kokoro",
+            None => "Pocket multilingual + Kokoro fallback",
         };
         info!("Initializing voice pipeline ({label})...");
 
@@ -679,13 +729,15 @@ impl VoicePipeline {
         let stt = SpeechToText::new(SttMode::Batch).map_err(|e| format!("STT init failed: {e}"))?;
 
         let tts_en = if load_pocket {
-            match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket))
-                .await
-                .map_err(|e| format!("spawn_blocking join error: {e}"))?
+            match tokio::task::spawn_blocking(move || {
+                TextToSpeech::new_pocket_with_language(initial_pocket_lang)
+            })
+            .await
+            .map_err(|e| format!("spawn_blocking join error: {e}"))?
             {
                 Ok(tts) => {
                     info!(
-                        "{} TTS ready (English) [engine: {}]",
+                        "{} TTS ready ({initial_pocket_lang}) [engine: {}]",
                         if tts.engine_type() == "pocket" {
                             "Pocket"
                         } else {
@@ -696,7 +748,9 @@ impl VoicePipeline {
                     Some(Arc::new(Mutex::new(tts)))
                 }
                 Err(e) => {
-                    tracing::warn!("Pocket TTS init failed, English will use Kokoro: {e}");
+                    tracing::warn!(
+                        "Pocket TTS init failed for {initial_pocket_lang}, fallback may be used: {e}"
+                    );
                     None
                 }
             }
@@ -722,6 +776,13 @@ impl VoicePipeline {
             None
         };
 
+        let tts_pocket_by_lang = Arc::new(Mutex::new(HashMap::new()));
+        if let Some(tts) = &tts_en {
+            tts_pocket_by_lang
+                .lock()
+                .insert(initial_pocket_lang.to_string(), tts.clone());
+        }
+
         if tts_en.is_none() && tts_multi.is_none() {
             return Err("No TTS engine could be initialized".to_string());
         }
@@ -730,6 +791,7 @@ impl VoicePipeline {
             stt: Arc::new(Mutex::new(stt)),
             tts_en,
             tts_multi,
+            tts_pocket_by_lang,
             engine_config: TtsEngineConfig::Pocket,
             cancel: Arc::new(AtomicBool::new(false)),
         })
@@ -772,13 +834,13 @@ impl VoicePipeline {
                     .map_err(|e| format!("Model download failed: {e}"))?;
 
                 let tts_en = match tokio::task::spawn_blocking(|| {
-                    TextToSpeech::with_engine(TtsEngine::Pocket)
+                    TextToSpeech::new_pocket_with_language("en")
                 })
                 .await
                 .map_err(|e| format!("spawn_blocking join error: {e}"))?
                 {
                     Ok(tts) => {
-                        info!("Pocket TTS ready (English)");
+                        info!("Pocket TTS ready (en)");
                         Some(Arc::new(Mutex::new(tts)))
                     }
                     Err(e) => {
@@ -819,6 +881,13 @@ impl VoicePipeline {
             }
         };
 
+        let tts_pocket_by_lang = Arc::new(Mutex::new(HashMap::new()));
+        if let Some(tts) = &tts_en {
+            tts_pocket_by_lang
+                .lock()
+                .insert("en".to_string(), tts.clone());
+        }
+
         if tts_en.is_none() && tts_multi.is_none() {
             return Err("No TTS engine could be initialized".to_string());
         }
@@ -829,6 +898,7 @@ impl VoicePipeline {
             stt: Arc::new(Mutex::new(stt)),
             tts_en,
             tts_multi,
+            tts_pocket_by_lang,
             engine_config: engine,
             cancel: Arc::new(AtomicBool::new(false)),
         })
@@ -923,21 +993,46 @@ impl VoicePipeline {
     // Mic mode: speak (blocking)
     // ----------------------------------------------------------------
 
+    fn get_or_init_pocket_tts(
+        &self,
+        spec: PocketLanguageSpec,
+    ) -> Result<Arc<Mutex<TextToSpeech>>, String> {
+        if let Some(tts) = self.tts_pocket_by_lang.lock().get(spec.language).cloned() {
+            return Ok(tts);
+        }
+
+        let tts = TextToSpeech::new_pocket_with_language(spec.language)
+            .map_err(|e| format!("Pocket TTS init failed for {}: {e}", spec.language))?;
+        let tts = Arc::new(Mutex::new(tts));
+        self.tts_pocket_by_lang
+            .lock()
+            .insert(spec.language.to_string(), tts.clone());
+        Ok(tts)
+    }
+
     /// Select the appropriate TTS engine based on language and config.
     fn select_tts(&self, lang: &str) -> Result<(Arc<Mutex<TextToSpeech>>, String), String> {
-        let is_english = matches!(lang, "en" | "en-us" | "en-gb");
-
-        let tts = if is_english {
-            self.tts_en.as_ref().or(self.tts_multi.as_ref())
-        } else {
-            self.tts_multi.as_ref().or(self.tts_en.as_ref())
+        if self.engine_config != TtsEngineConfig::Kokoro {
+            if let Some(spec) = pocket_tts_language(lang) {
+                match self.get_or_init_pocket_tts(spec) {
+                    Ok(tts) => return Ok((tts, spec.default_voice.to_string())),
+                    Err(e) => tracing::warn!("{e}; falling back to Kokoro if available"),
+                }
+            }
         }
-        .ok_or("No TTS engine available")?
-        .clone();
 
-        let is_pocket = tts.lock().engine_type() == "pocket";
-        let voice_id = if is_pocket {
-            "alba".to_string()
+        let tts = self
+            .tts_multi
+            .as_ref()
+            .or(self.tts_en.as_ref())
+            .ok_or("No TTS engine available")?
+            .clone();
+
+        let voice_id = if tts.lock().engine_type() == "pocket" {
+            pocket_tts_language(lang)
+                .map(|spec| spec.default_voice)
+                .unwrap_or("alba")
+                .to_string()
         } else {
             let (vid, _) = language_to_kokoro_voice(lang);
             vid.to_string()
@@ -1166,33 +1261,13 @@ impl VoicePipeline {
         let text = text.to_string();
         let lang = lang.to_string();
         let lang_for_log = lang.clone();
-        let is_english = matches!(lang.as_str(), "en" | "en-us" | "en-gb");
-        let tts = if is_english {
-            self.tts_en
-                .as_ref()
-                .or(self.tts_multi.as_ref())
-                .ok_or("No TTS engine available")?
-                .clone()
-        } else {
-            self.tts_multi
-                .as_ref()
-                .or(self.tts_en.as_ref())
-                .ok_or("No TTS engine available")?
-                .clone()
-        };
+        let (tts, voice_id) = self.select_tts(&lang)?;
 
         let (all_samples, sample_rate) = tokio::task::spawn_blocking(move || {
             let mut guard = tts.lock();
-            let engine_type = guard.engine_type().to_string();
-
-            if engine_type == "pocket" {
-                // default voice
-            } else {
-                let (voice_id, _) = language_to_kokoro_voice(&lang);
-                guard
-                    .set_speaker(voice_id)
-                    .map_err(|e| format!("Voice switch failed: {e}"))?;
-            }
+            guard
+                .set_speaker(&voice_id)
+                .map_err(|e| format!("Voice switch failed: {e}"))?;
 
             let sentences = split_tts_sentences(&text);
             if sentences.is_empty() {
@@ -1554,6 +1629,35 @@ mod tests {
     #[test]
     fn test_lingua_detects_japanese() {
         assert_eq!(detect_language("今日の天気はどうですか？"), "ja");
+    }
+
+    #[test]
+    fn test_pocket_tts_language_supports_multilingual_defaults() {
+        let cases = [
+            ("en", "en", "alba"),
+            ("en-US", "en", "alba"),
+            ("fr", "fr", "estelle"),
+            ("de", "de", "juergen"),
+            ("it", "it", "giovanni"),
+            ("pt", "pt", "rafael"),
+            ("es", "es", "lola"),
+        ];
+
+        for (input, expected_lang, expected_voice) in cases {
+            let spec = pocket_tts_language(input).expect("language should be supported by Pocket");
+            assert_eq!(spec.language, expected_lang);
+            assert_eq!(spec.default_voice, expected_voice);
+        }
+    }
+
+    #[test]
+    fn test_pocket_tts_language_rejects_kokoro_fallback_languages() {
+        for lang in ["ja", "zh", "hi", "vi", ""] {
+            assert!(
+                pocket_tts_language(lang).is_none(),
+                "{lang:?} should use Kokoro fallback, not Pocket"
+            );
+        }
     }
 
     #[test]

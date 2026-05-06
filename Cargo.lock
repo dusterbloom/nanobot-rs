@@ -3185,9 +3185,10 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 [[package]]
 name = "jack-voice"
 version = "0.1.0"
-source = "git+https://github.com/dusterbloom/jack-voice.git?rev=3a650c3bb9291dc70a735e4a1672acb30b7d2309#3a650c3bb9291dc70a735e4a1672acb30b7d2309"
+source = "git+https://github.com/dusterbloom/jack-voice.git?rev=c9aef93a7c4a7cc8f22833c08da8b0985573ac2f#c9aef93a7c4a7cc8f22833c08da8b0985573ac2f"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytemuck",
  "bzip2 0.5.2",
  "chrono",
@@ -4843,9 +4844,8 @@ dependencies = [
 
 [[package]]
 name = "pocket-tts"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8633c5e97cfe7855486cd6b6f0d9fe90443e405d0873e11fa18116687c5957af"
+version = "0.7.0"
+source = "git+https://github.com/dusterbloom/pocket-tts.git?rev=c1f0acee7cec385f2044492660751668e0f880f5#c1f0acee7cec385f2044492660751668e0f880f5"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -6284,7 +6284,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "supertonic"
 version = "0.1.0"
-source = "git+https://github.com/dusterbloom/jack-voice.git?rev=3a650c3bb9291dc70a735e4a1672acb30b7d2309#3a650c3bb9291dc70a735e4a1672acb30b7d2309"
+source = "git+https://github.com/dusterbloom/jack-voice.git?rev=c9aef93a7c4a7cc8f22833c08da8b0985573ac2f#c9aef93a7c4a7cc8f22833c08da8b0985573ac2f"
 dependencies = [
  "anyhow",
  "hound",

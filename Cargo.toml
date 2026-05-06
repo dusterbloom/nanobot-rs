@@ -166,8 +166,11 @@ candle = ["dep:candle-core", "dep:candle-nn"]  # Candle Metal GPU inference (GQA
 
 [dependencies.jack-voice]
 git = "https://github.com/dusterbloom/jack-voice.git"
-rev = "3a650c3bb9291dc70a735e4a1672acb30b7d2309"
+rev = "c9aef93a7c4a7cc8f22833c08da8b0985573ac2f"
 optional = true
+
+[patch.crates-io]
+pocket-tts = { git = "https://github.com/dusterbloom/pocket-tts.git", rev = "c1f0acee7cec385f2044492660751668e0f880f5" }
 
 [dependencies.crossterm]
 version = "0.28"
