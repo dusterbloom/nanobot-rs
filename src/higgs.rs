@@ -71,50 +71,57 @@ fn pid_is_alive(pid: u32) -> bool {
     platform::is_process_alive(pid)
 }
 
+/// Outcome of `server_start`.
+pub(crate) enum StartResult {
+    /// Server is healthy and ready.
+    Ready,
+    /// Process spawned and alive but not yet healthy (large model still loading).
+    /// Caller may still route requests — they will retry until the server responds.
+    Loading { pid: u32, port: u16 },
+}
+
 /// Start Higgs serving a model on the given port.
 ///
-/// If Higgs is already running and healthy, returns immediately.
+/// If Higgs is already running and healthy, returns `Ready` immediately.
 /// Otherwise spawns a new detached instance and waits for readiness.
+///
+/// Returns `Loading` when the process is alive but health check timed out
+/// (large model still loading). Returns `Err` for hard failures.
 pub(crate) async fn server_start(
     bin: &Path,
     port: u16,
     model_dir: &str,
-) -> Result<(), String> {
+) -> Result<StartResult, String> {
     // Already running and healthy?
     if let Some(pid) = read_pid() {
         if pid_is_alive(pid) && wait_for_ready(port, 3).await {
-            // Verify it's serving the expected model — if not, restart.
             if is_serving_expected_model(port, model_dir).await {
                 tracing::info!(pid, port, "higgs already running");
-                return Ok(());
+                return Ok(StartResult::Ready);
             }
-            tracing::info!(pid, port, "higgs running but serving wrong model, restarting");
+            tracing::info!(
+                pid,
+                port,
+                "higgs running but serving wrong model, restarting"
+            );
             server_stop()?;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            // Fall through to spawn with the correct model.
         } else {
-            // Stale PID — clean up
             let _ = fs::remove_file(pid_path());
         }
     }
 
-    // Also check if something else is already serving on this port
     if wait_for_ready(port, 1).await {
-        // Verify model even for externally managed instances.
         if is_serving_expected_model(port, model_dir).await {
             tracing::info!(port, "higgs port already responding (externally managed)");
-            return Ok(());
+            return Ok(StartResult::Ready);
         }
-        // Wrong model on the port — can't restart an external instance.
         return Err(format!(
             "port {port} is serving a different model than configured.\n\
              Stop the existing server and retry, or update mlxModelDir to match."
         ));
     }
 
-    // Safety: check if another Higgs process is already running (e.g. on a
-    // different port for benchmarks). Spawning a second instance would likely
-    // OOM on machines with limited unified memory.
     if let Some(existing_pid) = find_existing_higgs_process() {
         return Err(format!(
             "another Higgs process is already running (pid {existing_pid}).\n\
@@ -123,33 +130,40 @@ pub(crate) async fn server_start(
         ));
     }
 
-    // Ensure ~/.nanobot/ exists for PID and log files
     if let Some(parent) = pid_path().parent() {
         let _ = fs::create_dir_all(parent);
     }
 
-    let log_file = fs::File::create(log_path())
-        .map_err(|e| format!("failed to create higgs log: {e}"))?;
+    let log_file =
+        fs::File::create(log_path()).map_err(|e| format!("failed to create higgs log: {e}"))?;
     let log_err = log_file
         .try_clone()
         .map_err(|e| format!("failed to clone log handle: {e}"))?;
 
-    let devnull = fs::File::open("/dev/null")
-        .map_err(|e| format!("failed to open /dev/null: {e}"))?;
+    let devnull =
+        fs::File::open("/dev/null").map_err(|e| format!("failed to open /dev/null: {e}"))?;
 
     let mut cmd = std::process::Command::new(bin);
+    // Maximise local-MLX throughput: throughput profile, TurboQuant KV @ 4-bit.
+    // TurboQuant activates above its internal threshold (2048 tokens) so short
+    // turns are unaffected; long-context decode benefits from compressed KV.
     cmd.args([
         "serve",
         "--model",
         model_dir,
         "--port",
         &port.to_string(),
+        "--mlx-profile",
+        "throughput",
+        "--kv-cache",
+        "turboquant",
+        "--kv-bits",
+        "4",
     ]);
     cmd.stdin(devnull);
     cmd.stdout(log_file);
     cmd.stderr(log_err);
 
-    // Create new session so the server survives terminal close.
     platform::set_new_session(&mut cmd);
 
     let child = cmd
@@ -158,29 +172,67 @@ pub(crate) async fn server_start(
 
     let child_pid = child.id();
 
-    // Write PID file
     fs::write(pid_path(), child_pid.to_string())
         .map_err(|e| format!("failed to write higgs PID file: {e}"))?;
 
-    // Reap the child handle in a background thread to avoid zombies.
-    // The actual server process is detached via setsid and will outlive us.
+    // Reaper thread: wait for higgs to exit and log how it died.
+    //
+    // Higgs has been observed to die silently mid-request with no trace in
+    // its own log, no `ReportCrash` artifact, and no kernel-level kill
+    // message. Logging the exit status from the parent gives us the
+    // POSIX signal (SIGKILL, SIGSEGV, SIGBUS, etc.) which is the missing
+    // signal in the crash forensics.
     std::thread::spawn(move || {
         let mut child = child;
-        let _ = child.wait();
+        match child.wait() {
+            Ok(status) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    let code = status.code();
+                    let signal = status.signal();
+                    let core_dumped = status.core_dumped();
+                    tracing::warn!(
+                        pid = child_pid,
+                        ?code,
+                        ?signal,
+                        core_dumped,
+                        "higgs child exited",
+                    );
+                }
+                #[cfg(not(unix))]
+                {
+                    tracing::warn!(pid = child_pid, ?status, "higgs child exited");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(pid = child_pid, error = %e, "higgs child wait failed");
+            }
+        }
     });
 
     tracing::info!(pid = child_pid, port, model_dir, "higgs spawned");
 
-    // Wait for readiness (model loading can take a while for large models)
     if !wait_for_ready(port, 60).await {
+        if pid_is_alive(child_pid) {
+            tracing::warn!(
+                pid = child_pid,
+                port,
+                "higgs still loading after 60s, routing requests anyway"
+            );
+            return Ok(StartResult::Loading {
+                pid: child_pid,
+                port,
+            });
+        }
         return Err(format!(
-            "higgs started (pid {child_pid}) but /health not responding after 60s on port {port}\n\
+            "higgs (pid {child_pid}) exited before becoming healthy on port {port}\n\
              check log: {}",
             log_path().display()
         ));
     }
 
-    Ok(())
+    Ok(StartResult::Ready)
 }
 
 /// Stop a running Higgs instance.
@@ -238,8 +290,7 @@ fn find_existing_higgs_process() -> Option<u32> {
 /// Wait for the Higgs health endpoint to respond.
 async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
     let url = format!("http://127.0.0.1:{port}/health");
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     while tokio::time::Instant::now() < deadline {
         if let Ok(resp) = reqwest::get(&url).await {
@@ -256,21 +307,17 @@ async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
 /// Resolve the model directory for Higgs from config.
 ///
 /// Priority: `mlxModelDir` → error.
-pub(crate) fn resolve_model_dir(
-    config: &crate::config::schema::Config,
-) -> Result<String, String> {
+pub(crate) fn resolve_model_dir(config: &crate::config::schema::Config) -> Result<String, String> {
     if let Some(ref dir) = config.agents.defaults.mlx_model_dir {
         if !dir.is_empty() && *dir != "auto" {
             return Ok(dir.clone());
         }
     }
 
-    Err(
-        "no model directory configured for Higgs.\n\
+    Err("no model directory configured for Higgs.\n\
          Set mlxModelDir in ~/.nanobot/config.json to the path of an MLX model directory\n\
          (e.g. ~/.cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit)"
-            .to_string(),
-    )
+        .to_string())
 }
 
 /// Restart Higgs with a (potentially different) model.
@@ -281,7 +328,7 @@ pub(crate) async fn server_restart(
     bin: &Path,
     port: u16,
     model_dir: &str,
-) -> Result<(), String> {
+) -> Result<StartResult, String> {
     server_stop()?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     server_start(bin, port, model_dir).await
