@@ -1,42 +1,68 @@
-# AGENTS.md
+# Agent Notes
 
-# nanobot - Agent Instructions
-A lightweight personal AI assistant framework in Rust. Binary name: `nanobot`.
+`nanobot` is a personal AI assistant framework. It receives messages on channels
+(Telegram/WhatsApp/Feishu/Email), runs an agent loop against an OpenAI-compatible
+LLM, executes tools, and replies. The goal is a small, readable, fast Rust
+codebase with one well-tuned hot path per concern.
 
-## Build Commands
-```bash
-cargo build --release        # Release build (optimized)
-cargo build                  # Debug build
-cargo test                   # Run all tests
-cargo test test_name         # Run a single test by name (partial match)
-cargo test module::tests     # Run tests for a specific module
-RUST_LOG=debug cargo run -- agent -m "Hello"  # Run with debug logging
-```
+## Goals
 
-**Testing Notes**: 
-- All tests are inline in modules under `#[cfg(test)] mod tests { ... }`
-- Use `cargo test -- --nocapture` to see test output
+- Keep the production path as: channel → agent_loop → provider → tools → reply.
+- One way to do each thing. No protocol-mode flags, no router-fallback fallbacks,
+  no parallel "experimental" pipelines living next to the real one.
+- Local (LM Studio) and cloud (Anthropic/OpenAI/etc) are two branches of one
+  `RuntimeMode` enum, not two parallel codebases.
+- Long sessions practical via JSONL session files + on-disk `MEMORY.md`.
 
-## Project Structure
-```
-src/
-├── main.rs              # CLI entry point, command routing
-├── agent/
-│   ├── agent_loop.rs    # Core message processing loop
-│   ├── context.rs       # System prompt building
-│   ├── tools/           # Tool implementations
-│   ├── memory.rs        # Long-term memory management
-│   └── skills.rs        # Skill loading and execution
-├── providers/           # LLM provider clients (OpenAI-compatible)
-├── config/              # JSON config schema and loader
-├── channels/            # Chat adapters (Telegram, WhatsApp, Feishu, Email)
-├── bus/                 # InboundMessage/OutboundMessage event types
-└── session/             # JSONL-based session persistence
-```
+## Quality Rules
 
-## Code Style Guidelines
-### Imports
-Group imports: std → external crates → internal modules
+- Comment important agent code where the LLM-protocol contract, tool-call bytes,
+  message-array invariants, or session-replay rules are not obvious.
+- Prefer comments beside the implementation over separate design documents.
+- Keep public APIs narrow. `src/agent/mod.rs` should re-export ~20 things, not 70.
+- Do not add permanent semantic variants behind flags. Diagnostic switches are
+  fine when they validate the one release path.
+- The second occurrence of a piece of logic triggers extraction, not the third.
+- A `bool` parameter that selects between two downstream behaviors is an enum.
+- Failure modes are solved inside the hot path with comments, not extracted into
+  `_gate` / `_guard` / `_hygiene` / `anti_*` modules.
+- Do not introduce a new module to "organize" code that already fits in 500 lines.
+
+## Safety
+
+- Shell and code-execution tools must check deny-patterns before running.
+- File tools must validate paths and honor workspace restrictions when configured.
+- Web-fetched content must be marked tainted before reaching exec tools.
+
+## Layout
+
+- `src/main.rs`, `src/cli/`, `src/repl/`: command-line and REPL entrypoints.
+- `src/agent/agent_loop.rs`: the message-processing loop. Builds context, calls
+  the LLM, runs tools, emits reply. The hot path.
+- `src/agent/tools/`: one file per tool. Each implements the `Tool` trait.
+- `src/agent/context.rs`: system prompt assembly. Identity + bootstrap files +
+  memory + skills.
+- `src/agent/skills.rs`, `src/agent/memory.rs`: workspace skills and `MEMORY.md`.
+- `src/providers/`: OpenAI-compatible HTTP client (covers 9 providers) plus
+  Anthropic-native client.
+- `src/channels/`: chat adapters (one file per channel).
+- `src/bus/`, `src/session/`: message types, JSONL session persistence.
+- `src/config/`: JSON config schema and loader.
+
+## Testing
+
+Use `cargo build` for build validation. Use `cargo test` for unit/regression
+tests. Use `cargo run --release --bin nanobot-bench` for speed regressions when
+changing the agent loop, provider client, or context builder. See
+`CONTRIBUTING.md` for the correctness and speed regression tracks.
+
+## Code Style
+
+Rust 2021. `snake_case` fns, `PascalCase` types, `SCREAMING_SNAKE` consts.
+`serde` `camelCase` for JSON config. `anyhow::Result` at app layer; tools return
+`String` (prefix errors with `"Error: "`). Async via `async_trait` + `tokio`.
+Shared state via `Arc<Mutex<_>>`.
+
 ```rust
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -47,126 +73,24 @@ use serde::{Deserialize, Serialize};
 use crate::agent::tools::base::Tool;
 ```
 
-### Naming Conventions
-- **Types/Structs/Enums**: `PascalCase` (e.g., `AgentLoop`, `ToolRegistry`)
-- **Functions/Methods**: `snake_case` (e.g., `process_direct`, `build_context`)
-- **Variables**: `snake_case` (e.g., `session_id`, `max_iterations`)
-- **Constants**: `SCREAMING_SNAKE_CASE` (e.g., `MAX_TOKENS`)
+## Provider Selection
 
-### Error Handling
-```rust
-// Application-level: use anyhow
-use anyhow::{Context, Result};
+Config chooses provider in this order (first non-empty API key wins):
+OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM.
 
-fn load_config() -> Result<Config> {
-    let content = std::fs::read_to_string(&path)
-        .context("Failed to read config file")?;
-}
-
-// Tool execute() returns String, not Result
-// - Success: return output directly
-// - Error: prefix with "Error: "
-async fn execute(&self, params: HashMap<String, Value>) -> String {
-    if missing_param {
-        return "Error: 'command' parameter is required".to_string();
-    }
-}
-```
-
-### Async Patterns
-```rust
-use async_trait::async_trait;
-
-#[async_trait]
-pub trait Tool: Send + Sync {
-    async fn execute(&self, params: HashMap<String, Value>) -> String;
-}
-
-// Use Arc for shared state
-use std::sync::Arc;
-use tokio::sync::Mutex;
-let shared = Arc::new(Mutex::new(State::new()));
-```
-
-### Struct and Config Patterns
-```rust
-// Use serde with camelCase for JSON config
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Config {
-    pub max_iterations: u32,     // Rust: snake_case
-    pub api_key: String,         // JSON: "apiKey"
-}
-```
-
-### Tool Development
-All tools implement the `Tool` trait from `src/agent/tools/base.rs`:
-```rust
-#[async_trait]
-impl Tool for MyTool {
-    fn name(&self) -> &str { "my_tool" }
-    fn description(&self) -> &str { "Brief description" };
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "param_name": {"type": "string", "description": "..."}
-            },
-            "required": ["param_name"]
-        })
-    }
-
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let value = params.get("param_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default");
-        format!("Result: {}",$value)
-    }
-}
-```
-
-### Safety Guidelines
-- **Shell commands**: Use safety guards with deny patterns (see `src/agent/tools/shell.rs`)
-- **File operations**: Validate paths and restrict to workspace when configured
-- **User input**: Always validate and sanitize before use
-
-### Testing Patterns
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_feature_name() {
-        let tool = MyTool::new();
-        let result = tool.method();
-        assert_eq!(result, expected);
-    }
-
-    #[tokio::test]
-    async fn test_async_operation() {
-        let result = async_function().await;
-        assert!(result.is_ok());
-    }
-}
-```
+All providers use OpenAI-compatible chat completions API via
+`OpenAICompatProvider`, except Anthropic (native Messages API).
 
 ## Configuration
-- Config location: `~/.nanobot/config.json`
-- Session storage: `~/.nanobot/sessions/`
+
+- Config: `~/.nanobot/config.json`
+- Sessions: `~/.nanobot/sessions/`
 - Workspace (skills, memory): `~/.nanobot/workspace/`
-
-## Provider Selection
-Config chooses provider in this order (first non-empty API key wins):
-OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM
-
-All providers use OpenAI-compatible chat completions API via `OpenAICompatProvider`.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **nanobot-rs** (10857 symbols, 29439 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **nanobot-rs** (8293 symbols, 21550 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
