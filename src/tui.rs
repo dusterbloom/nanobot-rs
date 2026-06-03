@@ -691,6 +691,7 @@ pub(crate) fn strip_markdown_for_tts(text: &str) -> String {
     // First: strip any <thinking>...</thinking> blocks (safety net — these
     // should already be removed at the provider level, but defense in depth).
     let cleaned_text = strip_thinking_blocks(text);
+    let cleaned_text = crate::voice_pipeline::strip_tool_calls_for_tts(&cleaned_text);
     let mut out = String::new();
     let mut in_code_block = false;
 
@@ -973,6 +974,15 @@ mod tests {
         assert_eq!(rows, 1);
         // Verify we're not using byte length: byte len is 4, but width is 2.
         assert_ne!(text.len(), text.width());
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_strip_markdown_for_tts_removes_tool_calls() {
+        let text = "Before <tool_call>{\"name\":\"exec\",\"arguments\":{}}</tool_call> after.";
+        let stripped = strip_markdown_for_tts(text);
+
+        assert_eq!(stripped, "Before after.");
     }
 
     // --- raw mode guard ---

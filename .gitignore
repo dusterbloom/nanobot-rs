@@ -13,3 +13,5 @@ experiments/**/.venv/
 .planning/
 src/.janitor/
 .gitnexus
+node_modules/
+__pycache__/

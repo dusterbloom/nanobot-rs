@@ -35,6 +35,14 @@ fn summary_threshold_tokens(tool_name: &str) -> usize {
     }
 }
 
+fn local_model_key(model: &str) -> String {
+    model
+        .strip_prefix("local:")
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase()
+}
+
 /// Execute tool calls via the delegation (tool-runner) path.
 ///
 /// Returns `true` if delegation was used (caller should `continue` the main loop).
@@ -83,6 +91,15 @@ pub(crate) async fn execute_tools_delegated(
         .as_ref()
         .map(|c| c.contains("[VERBATIM]"))
         .unwrap_or(false);
+    let same_local_model = ctx.core.mode().is_local()
+        && local_model_key(&tr_model) == local_model_key(&ctx.core.model);
+    let verbatim = verbatim || same_local_model;
+    if same_local_model {
+        debug!(
+            "Delegation model is the main local model ({}); skipping scratch-pad LLM analysis",
+            tr_model
+        );
+    }
 
     // Delegation models (Qwen, Nemotron, Claude) typically have 8K+ context.
     // Cap tool results to ~2000 tokens (~8000 chars) to allow meaningful content
@@ -782,6 +799,18 @@ mod tests {
     }
 
     #[test]
+    fn test_local_model_key_strips_internal_prefix() {
+        assert_eq!(
+            local_model_key("local:Qwen3.6-35B-A3B-4bit"),
+            "qwen3.6-35b-a3b-4bit"
+        );
+        assert_eq!(
+            local_model_key("Qwen3.6-35B-A3B-4bit"),
+            "qwen3.6-35b-a3b-4bit"
+        );
+    }
+
+    #[test]
     fn test_is_parallel_safe_classification() {
         // Parallel-safe tools
         assert!(is_parallel_safe("read_file"));
@@ -856,10 +885,7 @@ mod tests {
 
     #[test]
     fn test_is_routed_call_handles_multiple_routed() {
-        let routed = vec![
-            make_tc("read_file", "id_a"),
-            make_tc("exec", "id_b"),
-        ];
+        let routed = vec![make_tc("read_file", "id_a"), make_tc("exec", "id_b")];
         assert!(is_routed_call("id_a", &routed));
         assert!(is_routed_call("id_b", &routed));
         assert!(!is_routed_call("id_c", &routed));

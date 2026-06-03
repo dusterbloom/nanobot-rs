@@ -487,7 +487,6 @@ impl Default for AgentDefaults {
     }
 }
 
-
 /// Agent configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1766,6 +1765,7 @@ impl Default for ProprioceptionConfig {
 pub enum TtsEngineConfig {
     #[default]
     Pocket,
+    Supertonic,
     Kokoro,
 }
 
@@ -1781,6 +1781,7 @@ pub struct VoiceConfig {
     pub tts_engine: TtsEngineConfig,
     /// Voice ID for the selected TTS engine.
     /// - Pocket: "alba", "marius", "javert", etc.
+    /// - Supertonic: "F1", "F2", "M1", "M2", etc.
     /// - Kokoro: numeric string "0"-"10"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_voice: Option<String>,
@@ -1860,8 +1861,7 @@ impl LcmSchemaConfig {
     /// Whether LCM is active. If `enabled` was not explicitly set in config,
     /// defaults to `true` when a `compaction_endpoint` is configured.
     pub fn is_enabled(&self) -> bool {
-        self.enabled
-            .unwrap_or(self.compaction_endpoint.is_some())
+        self.enabled.unwrap_or(self.compaction_endpoint.is_some())
     }
 }
 
@@ -2089,7 +2089,6 @@ pub struct MonitoringConfig {
     #[serde(default = "default_tool_heartbeat_secs")]
     pub tool_heartbeat_secs: u64,
 }
-
 
 fn default_degraded_threshold() -> u32 {
     3
@@ -2619,6 +2618,10 @@ mod tests {
             r#""pocket""#
         );
         assert_eq!(
+            serde_json::to_string(&TtsEngineConfig::Supertonic).unwrap(),
+            r#""supertonic""#
+        );
+        assert_eq!(
             serde_json::to_string(&TtsEngineConfig::Kokoro).unwrap(),
             r#""kokoro""#
         );
@@ -2627,8 +2630,10 @@ mod tests {
     #[test]
     fn test_tts_engine_config_deserialization() {
         let pocket: TtsEngineConfig = serde_json::from_str(r#""pocket""#).unwrap();
+        let supertonic: TtsEngineConfig = serde_json::from_str(r#""supertonic""#).unwrap();
         let kokoro: TtsEngineConfig = serde_json::from_str(r#""kokoro""#).unwrap();
         assert_eq!(pocket, TtsEngineConfig::Pocket);
+        assert_eq!(supertonic, TtsEngineConfig::Supertonic);
         assert_eq!(kokoro, TtsEngineConfig::Kokoro);
     }
 
@@ -2855,7 +2860,8 @@ mod tests {
 
     #[test]
     fn test_lcm_auto_enabled_with_endpoint() {
-        let json = r#"{"compactionEndpoint": {"url": "http://localhost:1234/v1", "model": "qwen3-0.6b"}}"#;
+        let json =
+            r#"{"compactionEndpoint": {"url": "http://localhost:1234/v1", "model": "qwen3-0.6b"}}"#;
         let lcm: LcmSchemaConfig = serde_json::from_str(json).unwrap();
         assert!(lcm.enabled.is_none(), "enabled was not set in JSON");
         assert!(lcm.is_enabled(), "auto-enables when endpoint is configured");
@@ -3063,5 +3069,4 @@ mod tests {
             "missing redaction markers"
         );
     }
-
 }

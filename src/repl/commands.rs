@@ -150,9 +150,8 @@ impl ReplContext {
             handle.abort();
         }
         // Remote server: nothing to watch locally — unless it's Higgs (managed sidecar).
-        let is_higgs = crate::config::schema::is_higgs_backend(
-            &self.config.agents.defaults.local_backend,
-        );
+        let is_higgs =
+            crate::config::schema::is_higgs_backend(&self.config.agents.defaults.local_backend);
         if !is_higgs && !self.config.agents.defaults.local_api_base.is_empty() {
             return;
         }
@@ -187,9 +186,8 @@ impl ReplContext {
         // When using a remote local server, there are no local server processes
         // to restart — drain and ignore any stale requests.
         // Exception: Higgs is managed and CAN be restarted.
-        let is_higgs = crate::config::schema::is_higgs_backend(
-            &self.config.agents.defaults.local_backend,
-        );
+        let is_higgs =
+            crate::config::schema::is_higgs_backend(&self.config.agents.defaults.local_backend);
         if !is_higgs && !self.config.agents.defaults.local_api_base.is_empty() {
             while self.restart_rx.try_recv().is_ok() {}
             return false;

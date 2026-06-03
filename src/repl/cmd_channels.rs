@@ -151,7 +151,15 @@ impl ReplContext {
                 .store(false, Ordering::Relaxed);
             println!("\nVoice mode OFF\n");
         } else {
-            match crate::voice_pipeline::VoiceSession::with_lang(self.lang.as_deref()).await {
+            let tts_engine = self.config.voice.tts_engine;
+            let mut voice_config = self.config.voice.clone();
+            if voice_config.language.is_none() {
+                voice_config.language = self.lang.clone();
+            }
+            let voice_session =
+                crate::voice_pipeline::VoiceSession::with_voice_config(&voice_config).await;
+
+            match voice_session {
                 Ok(vs) => {
                     self.voice_session = Some(vs);
                     // Auto-suppress thinking tokens from TTS.
@@ -160,7 +168,8 @@ impl ReplContext {
                         .suppress_thinking_in_tts
                         .store(true, Ordering::Relaxed);
                     println!(
-                        "\nVoice mode ON. Ctrl+Space or Enter to speak/interrupt, type for text.\n"
+                        "\nVoice mode ON ({:?}). Ctrl+Space or Enter to speak/interrupt, type for text.\n",
+                        tts_engine
                     );
                 }
                 Err(e) => eprintln!("\nFailed to start voice mode: {}\n", e),

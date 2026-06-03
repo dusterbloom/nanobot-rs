@@ -174,7 +174,10 @@ impl Tool for WriteFileTool {
 /// specific whitespace issue when possible, so the model can fix its input
 /// instead of re-reading the whole file.
 fn diagnose_missing_old_text(content: &str, old_text: &str) -> String {
-    if content.replace("\r\n", "\n").contains(&old_text.replace("\r\n", "\n")) {
+    if content
+        .replace("\r\n", "\n")
+        .contains(&old_text.replace("\r\n", "\n"))
+    {
         return "Error: old_text not found — line endings differ (file uses CRLF, old_text uses LF or vice versa). Normalize to LF in old_text and retry.".to_string();
     }
     let strip_trailing = |s: &str| {

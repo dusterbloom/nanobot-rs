@@ -20,8 +20,8 @@ use crate::agent::context_hygiene;
 use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
 use crate::agent::policy;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
-use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
+use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
 use crate::agent::token_budget::TokenBudget;
@@ -908,11 +908,8 @@ impl AgentLoopShared {
                 if self.proprioception_config.enabled
                     && self.proprioception_config.dynamic_tool_scoping
                 {
-                    ctx.tools.get_scoped_definitions(
-                        &current_phase,
-                        &ctx.messages,
-                        &ctx.used_tools,
-                    )
+                    ctx.tools
+                        .get_scoped_definitions(&current_phase, &ctx.messages, &ctx.used_tools)
                 } else {
                     // Cloud models have 100K+ context — give them all registered
                     // tools instead of keyword-gated subsets that hide capabilities.
@@ -1445,7 +1442,12 @@ impl AgentLoopShared {
         };
 
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
-            // Streaming path: forward text deltas as they arrive.
+            // Streaming path: forward text deltas as they arrive. For local
+            // tool-enabled turns, buffer speculative text until the response is
+            // classified so TTS/display do not speak "let me check" text that
+            // may be followed by a tool call or validation retry.
+            let buffer_local_tool_text = ctx.core.mode().is_local() && tool_defs_opt.is_some();
+            let mut buffered_tool_text_chars = 0usize;
             let mut stream = match ctx
                 .core
                 .provider
@@ -1505,17 +1507,28 @@ impl AgentLoopShared {
                                     in_thinking = false;
                                     let _ = delta_tx.send("\x1b[0m\n\n".to_string());
                                 }
-                                ctx.flow.content_was_streamed = true;
                                 // Filter out <tool_call>...</tool_call> XML
                                 // blocks so they don't render in the terminal.
                                 let filtered = xml_filter.filter(&delta);
                                 if !filtered.is_empty() {
-                                    let _ = delta_tx.send(filtered);
+                                    if buffer_local_tool_text {
+                                        buffered_tool_text_chars += filtered.len();
+                                    } else {
+                                        ctx.flow.content_was_streamed = true;
+                                        let _ = delta_tx.send(filtered);
+                                    }
                                 }
                             }
                             Some(StreamChunk::Done(resp)) => {
                                 if in_thinking {
                                     let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+                                }
+                                if buffer_local_tool_text && buffered_tool_text_chars > 0 {
+                                    debug!(
+                                        buffered_chars = buffered_tool_text_chars,
+                                        tool_calls = resp.tool_calls.len(),
+                                        "stream_buffered_local_tool_text"
+                                    );
                                 }
                                 streamed_response = Some(resp);
                                 break;
@@ -1839,8 +1852,7 @@ mod tests {
         is_local: bool,
         size_class: crate::agent::model_capabilities::ModelSizeClass,
     ) -> bool {
-        is_local
-            && size_class == crate::agent::model_capabilities::ModelSizeClass::Small
+        is_local && size_class == crate::agent::model_capabilities::ModelSizeClass::Small
     }
 
     // ---- Tests ---------------------------------------------------------
@@ -1905,10 +1917,7 @@ mod tests {
         // Pins agent_shared.rs:983, :1029-1036 — ToolGate (phase-aware tool
         // scoping) runs for cloud only. Local models already get condensed
         // defs (<1.1% context) so ToolGate would hurt more than help.
-        assert!(
-            tool_gate_enabled_for_turn(false),
-            "cloud → ToolGate runs"
-        );
+        assert!(tool_gate_enabled_for_turn(false), "cloud → ToolGate runs");
         assert!(
             !tool_gate_enabled_for_turn(true),
             "local → ToolGate skipped"

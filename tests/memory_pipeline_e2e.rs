@@ -443,4 +443,3 @@ fn full_pipeline_agent_remembers_across_sessions() {
         stdout2
     );
 }
-

@@ -304,6 +304,10 @@ impl AgentLoopShared {
             }
 
             ResponseKind::Text(content) => {
+                if !ctx.flow.content_was_streamed {
+                    send_delta(&ctx.text_delta_tx, &content);
+                    ctx.flow.content_was_streamed = true;
+                }
                 send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
                 StepResult::Done(IterationOutcome::Finished(content))
             }
@@ -432,14 +436,34 @@ impl AgentLoopShared {
             max_retries = validation::MAX_VALIDATION_RETRIES,
             "response_validation_failed"
         );
+
+        if matches!(error, validation::ValidationError::ClaimedButNotExecuted)
+            && ctx.flow.retries.validation > 0
+        {
+            warn!(
+                model = %ctx.core.model,
+                retry = retry_num,
+                "response_validation_claimed_tool_intent_repeated"
+            );
+            return StepResult::Done(IterationOutcome::Error(
+                "I could not complete the tool step because the model described a tool action without emitting a valid structured tool call."
+                    .to_string(),
+            ));
+        }
+
         let hint = validation::generate_retry_prompt(error, retry_num as u8);
-        ctx.messages.push(json!({
-            "role": "assistant",
-            "content": raw_content
-        }));
+
+        if !matches!(error, validation::ValidationError::ClaimedButNotExecuted) {
+            ctx.messages.push(json!({
+                "role": "assistant",
+                "content": raw_content
+            }));
+        }
+
         ctx.messages.push(json!({
             "role": "user",
-            "content": hint
+            "content": hint,
+            "_synthetic": true
         }));
         debug!(
             "Injected validation retry hint (retry {}/{})",

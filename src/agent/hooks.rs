@@ -87,7 +87,11 @@ pub async fn run_hook(
             });
         }
         Err(_) => {
-            warn!("Hook {} timed out after {:?}", script.display(), HOOK_TIMEOUT);
+            warn!(
+                "Hook {} timed out after {:?}",
+                script.display(),
+                HOOK_TIMEOUT
+            );
             return Some(HookResult {
                 allowed: true, // fail-open on timeout
                 output: "hook timed out".to_string(),
@@ -264,11 +268,7 @@ mod tests {
     async fn test_hook_receives_params_json() {
         let dir = tempfile::TempDir::new().unwrap();
         let script = dir.path().join("params_hook.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\necho \"params=$NANOBOT_TOOL_PARAMS\"\n",
-        )
-        .unwrap();
+        std::fs::write(&script, "#!/bin/sh\necho \"params=$NANOBOT_TOOL_PARAMS\"\n").unwrap();
         make_executable(&script);
 
         let mut params = HashMap::new();
@@ -277,15 +277,9 @@ mod tests {
             serde_json::Value::String("/tmp/test.txt".to_string()),
         );
 
-        let result = run_hook(
-            &script,
-            HookPhase::PreToolUse,
-            "read_file",
-            &params,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = run_hook(&script, HookPhase::PreToolUse, "read_file", &params, None)
+            .await
+            .unwrap();
 
         assert!(result.output.contains("/tmp/test.txt"));
     }

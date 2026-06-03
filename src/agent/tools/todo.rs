@@ -184,7 +184,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = tool_in(&tmp);
         let added = tool
-            .execute(params(&[("action", json!("add")), ("text", json!("fix bug"))]))
+            .execute(params(&[
+                ("action", json!("add")),
+                ("text", json!("fix bug")),
+            ]))
             .await;
         assert!(added.starts_with("Added todo #1"));
         let listed = tool.execute(params(&[("action", json!("list"))])).await;
@@ -225,7 +228,10 @@ mod tests {
         let a = TempDir::new().unwrap();
         let b = TempDir::new().unwrap();
         tool_in(&a)
-            .execute(params(&[("action", json!("add")), ("text", json!("only-a"))]))
+            .execute(params(&[
+                ("action", json!("add")),
+                ("text", json!("only-a")),
+            ]))
             .await;
         let listed_b = tool_in(&b)
             .execute(params(&[("action", json!("list"))]))
@@ -238,7 +244,10 @@ mod tests {
         // New tool instance against the same workspace must see the earlier state.
         let tmp = TempDir::new().unwrap();
         tool_in(&tmp)
-            .execute(params(&[("action", json!("add")), ("text", json!("persisted"))]))
+            .execute(params(&[
+                ("action", json!("add")),
+                ("text", json!("persisted")),
+            ]))
             .await;
         let listed = tool_in(&tmp)
             .execute(params(&[("action", json!("list"))]))
@@ -271,9 +280,7 @@ mod tests {
     fn test_schema_has_action_enum() {
         let tool = TodoTool::new(Path::new("/tmp"));
         let schema = tool.parameters();
-        let variants = schema["properties"]["action"]["enum"]
-            .as_array()
-            .unwrap();
+        let variants = schema["properties"]["action"]["enum"].as_array().unwrap();
         let names: Vec<&str> = variants.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(names, vec!["add", "list", "complete", "clear"]);
     }

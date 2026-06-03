@@ -708,7 +708,10 @@ pub(crate) async fn check_local_health(port: &str) -> bool {
 /// Strip a trailing `/v1` (and trailing slashes) from a base URL.
 fn strip_v1_suffix(api_base: &str) -> &str {
     let trimmed = api_base.trim_end_matches('/');
-    trimmed.strip_suffix("/v1").unwrap_or(trimmed).trim_end_matches('/')
+    trimmed
+        .strip_suffix("/v1")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
 }
 
 /// Parse `/props` JSON into a per-request context size with 5% headroom.

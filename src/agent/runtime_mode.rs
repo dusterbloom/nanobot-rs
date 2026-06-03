@@ -134,7 +134,8 @@ impl RuntimeMode {
         match self {
             Self::Cloud => {
                 let context_scaled = (max_ctx / CLOUD_MAX_ITERATIONS_SCALE_DIVISOR)
-                    .min(CLOUD_MAX_ITERATIONS_CEILING as usize) as u32;
+                    .min(CLOUD_MAX_ITERATIONS_CEILING as usize)
+                    as u32;
                 configured.max(context_scaled)
             }
             Self::Local { .. } => configured.min(LOCAL_MAX_ITERATIONS_CLAMP),

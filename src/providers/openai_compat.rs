@@ -306,6 +306,21 @@ fn apply_local_reasoning_controls(
     }
 }
 
+/// Keep local OpenAI-compatible tool calls single-call and parser-friendly.
+///
+/// Local servers/models are much more likely than cloud APIs to emit malformed
+/// or duplicate parallel tool calls. For the local path, force serial tool
+/// calls whenever tools are exposed.
+fn apply_local_tool_call_controls(
+    body: &mut serde_json::Value,
+    api_base: &str,
+    request_has_tools: bool,
+) {
+    if request_has_tools && is_local_api_base(api_base) {
+        body["parallel_tool_calls"] = serde_json::json!(false);
+    }
+}
+
 /// Check if a model uses template-level thinking that requires the native LMS
 /// API to disable (Nemotron models with `/no_think` mode).
 ///
@@ -808,17 +823,21 @@ impl LLMProvider for OpenAICompatProvider {
             supports_thinking,
         );
 
+        let mut request_has_tools = false;
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.clone());
                 body["tool_choice"] = serde_json::json!("auto");
+                request_has_tools = true;
             }
         } else if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.to_vec());
                 body["tool_choice"] = serde_json::json!("auto");
+                request_has_tools = true;
             }
         }
+        apply_local_tool_call_controls(&mut body, &self.api_base, request_has_tools);
         apply_local_thinking_prefill(
             &mut body,
             &self.api_base,
@@ -1075,17 +1094,21 @@ impl LLMProvider for OpenAICompatProvider {
             supports_thinking,
         );
 
+        let mut request_has_tools = false;
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.clone());
                 body["tool_choice"] = serde_json::json!("auto");
+                request_has_tools = true;
             }
         } else if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.to_vec());
                 body["tool_choice"] = serde_json::json!("auto");
+                request_has_tools = true;
             }
         }
+        apply_local_tool_call_controls(&mut body, &self.api_base, request_has_tools);
         apply_local_thinking_prefill(
             &mut body,
             &self.api_base,
@@ -2395,6 +2418,21 @@ mod tests {
     }
 
     #[test]
+    fn test_local_tool_call_controls_disable_parallel_calls() {
+        let mut body = serde_json::json!({"model": "qwen36-35b", "messages": []});
+        apply_local_tool_call_controls(&mut body, "http://localhost:1234", true);
+        assert_eq!(body["parallel_tool_calls"], false);
+
+        let mut remote_body = serde_json::json!({"model": "gpt-4o", "messages": []});
+        apply_local_tool_call_controls(&mut remote_body, "https://api.openai.com/v1", true);
+        assert!(remote_body.get("parallel_tool_calls").is_none());
+
+        let mut no_tools_body = serde_json::json!({"model": "qwen36-35b", "messages": []});
+        apply_local_tool_call_controls(&mut no_tools_body, "http://localhost:1234", false);
+        assert!(no_tools_body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
     fn test_prefill_not_added_for_non_thinking_model() {
         let mut body = serde_json::json!({"model": "nanbeige-16b", "messages": [{"role": "user", "content": "hi"}]});
         apply_local_thinking_prefill(&mut body, "http://localhost:1234", None, false);
@@ -2422,6 +2460,7 @@ mod tests {
     #[test]
     fn test_model_supports_thinking_helper() {
         assert!(model_supports_thinking("qwen3-1.7b-q4_k_m"));
+        assert!(model_supports_thinking("qwen36-35b"));
         assert!(!model_supports_thinking("nanbeige-2-8b"));
         assert!(!model_supports_thinking("ministral-3b-instruct"));
     }

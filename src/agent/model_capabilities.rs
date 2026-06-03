@@ -127,6 +127,14 @@ fn has_size_marker(name: &str, marker: &str) -> bool {
     false
 }
 
+fn is_qwen35_family(lower: &str) -> bool {
+    lower.contains("qwen3.5") || lower.contains("qwen3_5") || lower.contains("qwen35")
+}
+
+fn is_qwen36_family(lower: &str) -> bool {
+    lower.contains("qwen3.6") || lower.contains("qwen3_6") || lower.contains("qwen36")
+}
+
 fn builtin_capabilities(lower: &str) -> ModelCapabilities {
     // Specific model patterns (most specific first)
     if lower.contains("nanbeige") {
@@ -157,7 +165,30 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
     }
     // Qwen3.5 family: thinking enabled by default (template-level, not /think markers).
     // Must explicitly send `enable_thinking: false` to suppress reasoning.
-    if lower.contains("qwen3.5") {
+    if is_qwen35_family(lower) {
+        let size = if has_size_marker(lower, "0.8b") || has_size_marker(lower, "2b") {
+            ModelSizeClass::Small
+        } else {
+            ModelSizeClass::Medium
+        };
+        return ModelCapabilities {
+            size_class: size,
+            tool_calling: true,
+            thinking: true,
+            needs_native_lms_api: false,
+            strict_alternation: true,
+            max_reliable_output: 4096,
+            scratch_pad_rounds: 8,
+            reader_tier: if size == ModelSizeClass::Small {
+                ReaderTier::Minimal
+            } else {
+                ReaderTier::Standard
+            },
+            parser: None,
+        };
+    }
+    // Qwen3.6 family: same capabilities as Qwen3.5.
+    if is_qwen36_family(lower) {
         let size = if has_size_marker(lower, "0.8b") || has_size_marker(lower, "2b") {
             ModelSizeClass::Small
         } else {
@@ -344,6 +375,27 @@ mod tests {
         assert_eq!(caps.size_class, ModelSizeClass::Small);
         assert!(caps.thinking);
         assert_eq!(caps.scratch_pad_rounds, 4);
+    }
+
+    #[test]
+    fn test_qwen36_alias_thinking_and_strict_alternation() {
+        let caps = lookup("qwen36-35b", &empty_overrides());
+        assert_eq!(caps.size_class, ModelSizeClass::Medium);
+        assert!(caps.tool_calling);
+        assert!(caps.thinking);
+        assert!(caps.strict_alternation);
+        assert_eq!(caps.scratch_pad_rounds, 8);
+    }
+
+    #[test]
+    fn test_qwen36_path_spelling_thinking_and_strict_alternation() {
+        let caps = lookup(
+            "Brooooooklyn/Qwen3.6-35B-A3B-UD-Q3_K_XL-mlx",
+            &empty_overrides(),
+        );
+        assert_eq!(caps.size_class, ModelSizeClass::Medium);
+        assert!(caps.thinking);
+        assert!(caps.strict_alternation);
     }
 
     #[test]

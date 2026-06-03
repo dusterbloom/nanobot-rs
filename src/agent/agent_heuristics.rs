@@ -336,14 +336,12 @@ mod tests {
         // keeps us within typical local-model context limits even when base +
         // thinking would otherwise exceed it.
         let cfg = AdaptiveTokenConfig::default();
-        let got =
-            adaptive_max_tokens(40_000, false, "x", 0, true, Some(10_000), &cfg);
+        let got = adaptive_max_tokens(40_000, false, "x", 0, true, Some(10_000), &cfg);
         assert_eq!(got, 32_768, "local thinking total must clamp to 32_768");
 
         // Cloud path ignores thinking addition entirely, so no clamp needed;
         // pin that the cloud branch does not re-clamp to 32K.
-        let cloud_got =
-            adaptive_max_tokens(40_000, false, "x", 0, false, Some(10_000), &cfg);
+        let cloud_got = adaptive_max_tokens(40_000, false, "x", 0, false, Some(10_000), &cfg);
         assert_eq!(
             cloud_got, 40_000,
             "cloud path leaves base untouched — no 32K clamp"
@@ -362,14 +360,16 @@ mod tests {
         let thinking = Some(500u32);
 
         // Cloud long-form: bumped to adaptive_long_form_min_tokens (4096 default).
-        let cloud_long = adaptive_max_tokens(base, false, long_form_trigger, 0, false, thinking, &cfg);
+        let cloud_long =
+            adaptive_max_tokens(base, false, long_form_trigger, 0, false, thinking, &cfg);
         assert_eq!(
             cloud_long, cfg.adaptive_long_form_min_tokens,
             "cloud long-form bump → adaptive_long_form_min_tokens; no thinking add"
         );
 
         // Local long-form: bump first, then add thinking budget on top.
-        let local_long = adaptive_max_tokens(base, false, long_form_trigger, 0, true, thinking, &cfg);
+        let local_long =
+            adaptive_max_tokens(base, false, long_form_trigger, 0, true, thinking, &cfg);
         assert_eq!(
             local_long,
             cfg.adaptive_long_form_min_tokens + 500,

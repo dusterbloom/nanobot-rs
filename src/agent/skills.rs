@@ -4,10 +4,9 @@
 //! Skills are markdown files (`SKILL.md`) that teach the agent how to use
 //! specific tools or perform certain tasks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -24,6 +23,36 @@ pub struct SkillInfo {
     pub name: String,
     pub path: String,
     pub source: String,
+}
+
+#[derive(Debug, Clone)]
+struct SkillRecord {
+    info: SkillInfo,
+    metadata: Option<HashMap<String, String>>,
+    skill_meta: HashMap<String, serde_json::Value>,
+}
+
+impl SkillRecord {
+    fn description(&self) -> String {
+        self.metadata
+            .as_ref()
+            .and_then(|meta| meta.get("description"))
+            .filter(|desc| !desc.is_empty())
+            .cloned()
+            .unwrap_or_else(|| self.info.name.clone())
+    }
+
+    fn version(&self) -> Option<String> {
+        self.metadata
+            .as_ref()?
+            .get("version")
+            .filter(|version| !version.is_empty())
+            .cloned()
+    }
+
+    fn frontmatter_value(&self, key: &str) -> Option<&str> {
+        self.metadata.as_ref()?.get(key).map(|value| value.as_str())
+    }
 }
 
 /// Result of validating a single skill.
@@ -71,71 +100,103 @@ impl SkillsLoader {
     /// When `filter_unavailable` is `true`, skills with unmet requirements are
     /// excluded from the result.
     pub fn list_skills(&self, filter_unavailable: bool) -> Vec<SkillInfo> {
-        let mut skills: Vec<SkillInfo> = Vec::new();
-        let mut seen_names: Vec<String> = Vec::new();
+        let skills = self.discover_skill_infos();
+        if !filter_unavailable {
+            return skills;
+        }
 
-        // Workspace skills (highest priority).
-        if self.workspace_skills.exists() {
-            if let Ok(entries) = fs::read_dir(&self.workspace_skills) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let skill_file = path.join("SKILL.md");
-                        if skill_file.exists() {
-                            let name = path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            seen_names.push(name.clone());
-                            skills.push(SkillInfo {
-                                name,
-                                path: skill_file.to_string_lossy().to_string(),
-                                source: "workspace".to_string(),
-                            });
-                        }
-                    }
-                }
+        self.skill_records_from_infos(skills)
+            .into_iter()
+            .filter(|record| _check_requirements(&record.skill_meta))
+            .map(|record| record.info)
+            .collect()
+    }
+
+    fn discover_skill_infos(&self) -> Vec<SkillInfo> {
+        let mut skills = Vec::new();
+        let mut seen_names = HashSet::new();
+
+        Self::collect_skill_infos(
+            &self.workspace_skills,
+            "workspace",
+            &mut seen_names,
+            &mut skills,
+        );
+        Self::collect_skill_infos(
+            &self.builtin_skills,
+            "builtin",
+            &mut seen_names,
+            &mut skills,
+        );
+
+        skills
+    }
+
+    fn collect_skill_infos(
+        skills_dir: &Path,
+        source: &str,
+        seen_names: &mut HashSet<String>,
+        skills: &mut Vec<SkillInfo>,
+    ) {
+        if !skills_dir.exists() {
+            return;
+        }
+
+        let Ok(entries) = fs::read_dir(skills_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let skill_file = path.join("SKILL.md");
+            if !skill_file.exists() {
+                continue;
+            }
+
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if seen_names.insert(name.clone()) {
+                skills.push(SkillInfo {
+                    name,
+                    path: skill_file.to_string_lossy().to_string(),
+                    source: source.to_string(),
+                });
             }
         }
+    }
 
-        // Built-in skills.
-        if self.builtin_skills.exists() {
-            if let Ok(entries) = fs::read_dir(&self.builtin_skills) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let skill_file = path.join("SKILL.md");
-                        if skill_file.exists() {
-                            let name = path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            if !seen_names.contains(&name) {
-                                skills.push(SkillInfo {
-                                    name,
-                                    path: skill_file.to_string_lossy().to_string(),
-                                    source: "builtin".to_string(),
-                                });
-                            }
-                        }
-                    }
+    fn discover_skill_records(&self) -> Vec<SkillRecord> {
+        self.skill_records_from_infos(self.discover_skill_infos())
+    }
+
+    fn skill_records_from_infos(&self, skills: Vec<SkillInfo>) -> Vec<SkillRecord> {
+        skills
+            .into_iter()
+            .map(|info| {
+                let metadata = _read_skill_metadata_from_path(Path::new(&info.path));
+                let skill_meta = metadata
+                    .as_ref()
+                    .map(|meta| {
+                        _parse_skill_metadata(
+                            meta.get("metadata").map(|s| s.as_str()).unwrap_or(""),
+                        )
+                    })
+                    .unwrap_or_default();
+
+                SkillRecord {
+                    info,
+                    metadata,
+                    skill_meta,
                 }
-            }
-        }
-
-        if filter_unavailable {
-            skills
-                .into_iter()
-                .filter(|s| {
-                    let meta = self._get_skill_meta(&s.name);
-                    _check_requirements(&meta)
-                })
-                .collect()
-        } else {
-            skills
-        }
+            })
+            .collect()
     }
 
     /// Load a skill's content by name.
@@ -175,21 +236,20 @@ impl SkillsLoader {
 
     /// Build an XML-formatted summary of all skills.
     pub fn build_skills_summary(&self) -> String {
-        let all_skills = self.list_skills(false);
-        if all_skills.is_empty() {
+        let skill_records = self.discover_skill_records();
+        if skill_records.is_empty() {
             return String::new();
         }
 
         let mut lines: Vec<String> = vec!["<skills>".to_string()];
 
-        for s in &all_skills {
-            let name = _escape_xml(&s.name);
-            let path = &s.path;
-            let desc = _escape_xml(&self._get_skill_description(&s.name));
-            let skill_meta = self._get_skill_meta(&s.name);
-            let available = _check_requirements(&skill_meta);
-            let version_attr = self
-                ._get_skill_version(&s.name)
+        for record in &skill_records {
+            let name = _escape_xml(&record.info.name);
+            let path = &record.info.path;
+            let desc = _escape_xml(&record.description());
+            let available = _check_requirements(&record.skill_meta);
+            let version_attr = record
+                .version()
                 .map(|v| format!(" version=\"{}\"", _escape_xml(&v)))
                 .unwrap_or_default();
 
@@ -203,7 +263,7 @@ impl SkillsLoader {
             lines.push(format!("    <location>{}</location>", path));
 
             if !available {
-                let missing = _get_missing_requirements(&skill_meta);
+                let missing = _get_missing_requirements(&record.skill_meta);
                 if !missing.is_empty() {
                     lines.push(format!(
                         "    <requires>{}</requires>",
@@ -224,8 +284,8 @@ impl SkillsLoader {
     /// Format: "- skill_name (vX.Y): first 60 chars of description"
     /// Token cost: ~20 tokens per skill vs ~150 for XML summary.
     pub fn build_compact_index(&self) -> String {
-        let skills = self.list_skills(false);
-        if skills.is_empty() {
+        let skill_records = self.discover_skill_records();
+        if skill_records.is_empty() {
             return String::new();
         }
         let mut lines = vec![
@@ -235,8 +295,8 @@ impl SkillsLoader {
              `read_skill <name>` for full content."
                 .to_string(),
         ];
-        for skill in &skills {
-            let desc = self._get_skill_description(&skill.name);
+        for record in &skill_records {
+            let desc = record.description();
             let display = if desc.len() > 60 {
                 // Truncate at a char boundary to avoid breaking multibyte chars.
                 let end = crate::utils::helpers::floor_char_boundary(&desc, 60);
@@ -244,11 +304,14 @@ impl SkillsLoader {
             } else {
                 desc
             };
-            let version_suffix = self
-                ._get_skill_version(&skill.name)
+            let version_suffix = record
+                .version()
                 .map(|v| format!(" (v{})", v))
                 .unwrap_or_default();
-            lines.push(format!("- {}{}: {}", skill.name, version_suffix, display));
+            lines.push(format!(
+                "- {}{}: {}",
+                record.info.name, version_suffix, display
+            ));
         }
         lines.join("\n")
     }
@@ -290,22 +353,26 @@ impl SkillsLoader {
     pub fn get_always_skills(&self) -> Vec<String> {
         let mut result: Vec<String> = Vec::new();
 
-        for s in self.list_skills(true) {
-            if let Some(meta) = self.get_skill_metadata(&s.name) {
-                let skill_meta =
-                    _parse_skill_metadata(meta.get("metadata").map(|s| s.as_str()).unwrap_or(""));
-                if skill_meta
-                    .get("always")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    result.push(s.name.clone());
-                    continue;
-                }
-                // Also check top-level "always" in frontmatter.
-                if meta.get("always").map(|v| v == "true").unwrap_or(false) {
-                    result.push(s.name.clone());
-                }
+        for record in self.discover_skill_records() {
+            if !_check_requirements(&record.skill_meta) {
+                continue;
+            }
+            if record
+                .skill_meta
+                .get("always")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                result.push(record.info.name.clone());
+                continue;
+            }
+            // Also check top-level "always" in frontmatter.
+            if record
+                .frontmatter_value("always")
+                .map(|v| v == "true")
+                .unwrap_or(false)
+            {
+                result.push(record.info.name.clone());
             }
         }
 
@@ -315,27 +382,7 @@ impl SkillsLoader {
     /// Parse YAML-like frontmatter metadata from a skill file.
     pub fn get_skill_metadata(&self, name: &str) -> Option<HashMap<String, String>> {
         let content = self.load_skill(name)?;
-
-        if !content.starts_with("---") {
-            return None;
-        }
-
-        let caps = RE_FRONTMATTER.captures(&content)?;
-        let frontmatter = caps.get(1)?.as_str();
-
-        let mut metadata = HashMap::new();
-        for line in frontmatter.lines() {
-            if let Some((key, value)) = line.split_once(':') {
-                let k = key.trim().to_string();
-                let v = value
-                    .trim()
-                    .trim_matches(|c| c == '"' || c == '\'')
-                    .to_string();
-                metadata.insert(k, v);
-            }
-        }
-
-        Some(metadata)
+        _parse_frontmatter_metadata(&content)
     }
 
     /// Validate a skill by name and return a `SkillValidationResult`.
@@ -391,12 +438,10 @@ impl SkillsLoader {
     /// Get cleanup commands from all skills that declare one in frontmatter.
     pub fn get_cleanup_commands(&self) -> Vec<(String, String)> {
         let mut commands = Vec::new();
-        for skill in self.list_skills(false) {
-            if let Some(meta) = self.get_skill_metadata(&skill.name) {
-                if let Some(cmd) = meta.get("cleanup") {
-                    if !cmd.is_empty() {
-                        commands.push((skill.name.clone(), cmd.clone()));
-                    }
+        for record in self.discover_skill_records() {
+            if let Some(cmd) = record.frontmatter_value("cleanup") {
+                if !cmd.is_empty() {
+                    commands.push((record.info.name.clone(), cmd.to_string()));
                 }
             }
         }
@@ -450,6 +495,34 @@ fn _strip_frontmatter(content: &str) -> String {
         }
     }
     content.to_string()
+}
+
+fn _read_skill_metadata_from_path(path: &Path) -> Option<HashMap<String, String>> {
+    let content = fs::read_to_string(path).ok()?;
+    _parse_frontmatter_metadata(&content)
+}
+
+fn _parse_frontmatter_metadata(content: &str) -> Option<HashMap<String, String>> {
+    if !content.starts_with("---") {
+        return None;
+    }
+
+    let caps = RE_FRONTMATTER.captures(content)?;
+    let frontmatter = caps.get(1)?.as_str();
+
+    let mut metadata = HashMap::new();
+    for line in frontmatter.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let k = key.trim().to_string();
+            let v = value
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string();
+            metadata.insert(k, v);
+        }
+    }
+
+    Some(metadata)
 }
 
 /// Parse skill metadata JSON from frontmatter value.
@@ -860,6 +933,37 @@ mod tests {
         // load_skill should return workspace version.
         let content = loader.load_skill("overlap").unwrap();
         assert_eq!(content, "workspace version");
+    }
+
+    #[test]
+    fn test_index_uses_workspace_metadata_when_shadowing_builtin() {
+        let tmp = TempDir::new().unwrap();
+
+        let ws_skill = tmp.path().join("skills").join("overlap");
+        fs::create_dir_all(&ws_skill).unwrap();
+        fs::write(
+            ws_skill.join("SKILL.md"),
+            "---\ndescription: Workspace description\n---\nworkspace version",
+        )
+        .unwrap();
+
+        let bi_dir = tmp.path().join("builtin");
+        let bi_skill = bi_dir.join("overlap");
+        fs::create_dir_all(&bi_skill).unwrap();
+        fs::write(
+            bi_skill.join("SKILL.md"),
+            "---\ndescription: Builtin description\n---\nbuiltin version",
+        )
+        .unwrap();
+
+        let loader = SkillsLoader::new(tmp.path(), Some(&bi_dir));
+        let index = loader.build_compact_index();
+        let summary = loader.build_skills_summary();
+
+        assert!(index.contains("Workspace description"));
+        assert!(!index.contains("Builtin description"));
+        assert!(summary.contains("Workspace description"));
+        assert!(!summary.contains("Builtin description"));
     }
 
     // ----- build_compact_index -----

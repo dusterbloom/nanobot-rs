@@ -63,7 +63,8 @@ pub enum ValidationOutcome {
     /// Real tool_calls exist but response text contains hallucinated call syntax.
     /// Caller should strip the garbage text and continue.
     StripHallucination,
-    /// Validation failed — caller should retry with corrective prompt.
+    /// Validation failed — caller should retry or terminate through control
+    /// logic, without exposing the repair text to the user-facing stream.
     Error(ValidationError),
 }
 
@@ -128,15 +129,13 @@ pub fn strip_hallucinated_text(content: &str) -> String {
 pub fn generate_retry_prompt(error: &ValidationError, attempt: u8) -> String {
     match error {
         ValidationError::HallucinatedToolCall => format!(
-            "CRITICAL: Do NOT describe tool calls in text. \
-             Use the tools array in your response structure. \
-             Attempt {}/3. Actually call the tool or respond without tool intent.",
+            "[system] Your previous response described a tool call in text instead of emitting a structured tool_call. \
+             Retry {}/3: emit a structured tool_call now, or provide a final answer with no tool-action wording.",
             attempt
         ),
         ValidationError::ClaimedButNotExecuted => format!(
-            "CRITICAL: You expressed tool intent ('let me check/read/look') but called no tools. \
-             Either ACTUALLY call the tool OR respond without implying tool use. \
-             Attempt {}/3.",
+            "[system] Your previous response described future tool use but did not emit a structured tool_call. \
+             Retry {}/3: emit a structured tool_call now, or provide a final answer with no tool-action wording.",
             attempt
         ),
     }
@@ -251,14 +250,14 @@ mod tests {
     #[test]
     fn test_generate_retry_prompt_hallucinated() {
         let prompt = generate_retry_prompt(&ValidationError::HallucinatedToolCall, 1);
-        assert!(prompt.contains("Do NOT describe tool calls in text"));
+        assert!(prompt.contains("structured tool_call"));
         assert!(prompt.contains("1/3"));
     }
 
     #[test]
     fn test_generate_retry_prompt_claimed() {
         let prompt = generate_retry_prompt(&ValidationError::ClaimedButNotExecuted, 2);
-        assert!(prompt.contains("tool intent"));
+        assert!(prompt.contains("future tool use"));
         assert!(prompt.contains("2/3"));
     }
 

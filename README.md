@@ -318,6 +318,39 @@ Key agent settings in `config.json`:
 
 For local mode, install [LM Studio](https://lmstudio.ai/) and its CLI (`lms`). Models are managed through LM Studio.
 
+### Voice settings (`voice` block in `config.json`)
+
+```json
+{
+  "voice": {
+    "ttsEngine": "supertonic",
+    "ttsVoice": "F5",
+    "language": "it"
+  }
+}
+```
+
+| Key | Values | Effect |
+|-----|--------|--------|
+| `ttsEngine` | `pocket` (default), `supertonic`, `kokoro` | Which TTS backend to load. SuperTonic 3 supports 31 languages at 44.1 kHz, ~4× realtime on M-series. |
+| `ttsVoice` | engine-specific ID, or `null` | If `null` and engine is `supertonic`, the curated per-language voice is auto-selected (see below). |
+| `language` | ISO-639-1 code (`"it"`, `"en"`, `"es"`, `"de"`, …) or `null` | Used to pick the curated voice when `ttsVoice` is `null`, and to bias multilingual fallback. |
+
+**SuperTonic 3 voice IDs (ear-checked May 2026):**
+
+| Voice | Notes |
+|-------|-------|
+| `M2` | Default male, recommended for general use |
+| `F5` | Recommended female (Italian + general) |
+| `F1`, `F3` | Also good for Italian |
+| `M1`, `M3`, `M4`, `M5` | Untested per-language; usable |
+| `F2`, `F4` | ⚠️ Drift off pronunciation on Italian — not auto-selected |
+
+When `ttsVoice: null` and `ttsEngine: "supertonic"`, the curated picker resolves to:
+- `language: "it"` → `M2` (male) / `F5` (female via `ttsVoice: "F5"`)
+- `language: "en"` → `M2` (male) / `F1` (female via `ttsVoice: "F1"`)
+- Any other language → `M2` global default
+
 ## Architecture
 
 ```

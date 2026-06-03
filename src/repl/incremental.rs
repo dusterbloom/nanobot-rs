@@ -240,7 +240,10 @@ impl IncrementalRenderer {
                     let theme = &THEME_SET.themes["base16-ocean.dark"];
                     let highlighter = HighlightLines::new(syntax, theme);
 
-                    self.state = StreamState::CodeBlock { _lang: lang, highlighter };
+                    self.state = StreamState::CodeBlock {
+                        _lang: lang,
+                        highlighter,
+                    };
                     return;
                 }
             }

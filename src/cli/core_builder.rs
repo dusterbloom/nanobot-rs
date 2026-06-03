@@ -125,6 +125,14 @@ pub(super) struct LocalProviders {
     pub max_context_tokens: usize,
 }
 
+fn shared_local_role_model<'a>(configured_role_model: &'a str, main_model_id: &'a str) -> &'a str {
+    if configured_role_model.is_empty() {
+        main_model_id
+    } else {
+        configured_role_model
+    }
+}
+
 /// Build providers for all local roles from config + endpoint resolution.
 ///
 /// Endpoint priority per trio role:
@@ -214,11 +222,14 @@ pub(super) fn make_local_providers(
 
         // Priority 2: shared JIT server (localApiBase set) + trio model name
         if has_custom_base {
-            let model = if !trio_model.is_empty() {
-                trio_model
-            } else {
-                role_name
-            };
+            let model = shared_local_role_model(trio_model, &model_id);
+            if trio_model.is_empty() {
+                tracing::warn!(
+                    role = role_name,
+                    model = %model,
+                    "No local role model configured; reusing main local model"
+                );
+            }
             return Some(factory::create_openai_compat(
                 factory::ProviderSpec::local_with_key(&base_url, Some(model), api_key)
                     .with_jit_gate_opt(jit_gate.clone())
@@ -1075,6 +1086,22 @@ mod matching_tests {
             .iter()
             .map(|n| std::path::PathBuf::from(format!("/models/mlx-community/{n}")))
             .collect()
+    }
+
+    #[test]
+    fn test_shared_local_role_model_reuses_main_when_unconfigured() {
+        assert_eq!(
+            shared_local_role_model("", "Qwen3.6-35B-A3B-4bit"),
+            "Qwen3.6-35B-A3B-4bit"
+        );
+    }
+
+    #[test]
+    fn test_shared_local_role_model_uses_configured_role_model() {
+        assert_eq!(
+            shared_local_role_model("Qwen3.5-0.8B-8bit", "Qwen3.6-35B-A3B-4bit"),
+            "Qwen3.5-0.8B-8bit"
+        );
     }
 
     #[test]

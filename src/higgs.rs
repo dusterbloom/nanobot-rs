@@ -158,7 +158,7 @@ pub(crate) async fn server_start(
         "--kv-cache",
         "turboquant",
         "--kv-bits",
-        "4",
+        "8",
     ]);
     cmd.stdin(devnull);
     cmd.stdout(log_file);
@@ -336,13 +336,15 @@ pub(crate) async fn server_restart(
 
 /// Check if the running Higgs is serving a model that matches `expected_dir`.
 ///
-/// Compares the model name from `/v1/models` against the last path component
-/// of `expected_dir`. Returns `true` if they match or if the server can't be
-/// queried (optimistic fallback).
+/// Scans the FULL set of served models (an externally-managed Higgs can serve
+/// several at once) and matches each against the last path component of
+/// `expected_dir`. Returns `true` if any served model matches, or if the
+/// server can't be queried (optimistic fallback).
 async fn is_serving_expected_model(port: u16, expected_dir: &str) -> bool {
-    let Some(running_name) = get_model_name(port).await else {
+    let served = list_served_models(port).await;
+    if served.is_empty() {
         return true; // Can't query → assume ok
-    };
+    }
     let expected_name = Path::new(expected_dir)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -350,23 +352,55 @@ async fn is_serving_expected_model(port: u16, expected_dir: &str) -> bool {
     if expected_name.is_empty() {
         return true;
     }
-    // Model IDs may be paths or short names — check substring both ways.
-    let r = running_name.to_lowercase();
-    let e = expected_name.to_lowercase();
-    r.contains(&e) || e.contains(&r)
+    served.iter().any(|id| model_id_matches(id, &expected_name))
 }
 
-/// Query the model name from a running Higgs instance via /v1/models.
-pub(crate) async fn get_model_name(port: u16) -> Option<String> {
+/// Case-insensitive fuzzy match between two model identifiers.
+///
+/// Model ids reach us as full paths, directory basenames, or short names, so a
+/// match is accepted when either id contains the other after lowercasing
+/// (e.g. dir basename `MiniCPM5-1B-4bit` matches served id `minicpm5-1b`).
+fn model_id_matches(a: &str, b: &str) -> bool {
+    let a = a.to_lowercase();
+    let b = b.to_lowercase();
+    !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
+}
+
+/// List every model id a running Higgs instance is serving (via /v1/models).
+pub(crate) async fn list_served_models(port: u16) -> Vec<String> {
     let url = format!("http://127.0.0.1:{port}/v1/models");
-    let resp = reqwest::get(&url).await.ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-    json.get("data")?
-        .as_array()?
-        .first()?
-        .get("id")?
-        .as_str()
-        .map(|s| s.to_string())
+    let Ok(resp) = reqwest::get(&url).await else {
+        return Vec::new();
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    json.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the served model id that best matches `preferred`.
+///
+/// nanobot's own auto-started Higgs serves a single model named after its
+/// model directory, so `preferred` matches directly. An externally-managed
+/// Higgs may serve SEVERAL models under arbitrary ids — there we must pick the
+/// one the user actually configured rather than blindly taking the first
+/// entry, otherwise nanobot requests a model id Higgs has not loaded (→ 404).
+///
+/// Falls back to the first served model when nothing matches `preferred`.
+pub(crate) async fn resolve_served_model(port: u16, preferred: &str) -> Option<String> {
+    let served = list_served_models(port).await;
+    served
+        .iter()
+        .find(|id| model_id_matches(id, preferred))
+        .cloned()
+        .or_else(|| served.into_iter().next())
 }
 
 #[allow(unsafe_code)]
@@ -417,5 +451,20 @@ mod tests {
     async fn test_wait_for_ready_unreachable_returns_false() {
         let result = wait_for_ready(19998, 1).await;
         assert!(!result, "unreachable port should return false");
+    }
+
+    #[test]
+    fn test_model_id_matches() {
+        // The regression that motivated this: a model-dir basename must match
+        // the shorter served id (and vice versa), case-insensitively.
+        assert!(model_id_matches("MiniCPM5-1B-4bit", "minicpm5-1b"));
+        assert!(model_id_matches("minicpm5-1b", "MiniCPM5-1B-4bit"));
+        // Symmetric and case-insensitive in general.
+        assert!(model_id_matches("Qwen3-8B", "qwen3-8b"));
+        // Distinct models served side-by-side must NOT match each other.
+        assert!(!model_id_matches("bonsai-8b-mlx", "minicpm5-1b"));
+        // Empty ids never match (avoids vacuous substring hits).
+        assert!(!model_id_matches("", "minicpm5-1b"));
+        assert!(!model_id_matches("minicpm5-1b", ""));
     }
 }

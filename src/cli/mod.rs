@@ -16,9 +16,9 @@ pub(crate) use core_builder::{
 };
 #[cfg(feature = "mlx")]
 pub(crate) use core_builder::{
-    build_core_handle_mlx, find_mlx_dir_for_model, model_config_from_preset,
-    preset_from_model_dir, rebuild_core_mlx, resolve_mlx_inference_url, resolve_mlx_model_dir,
-    start_mlx_provider, MlxHandle,
+    build_core_handle_mlx, find_mlx_dir_for_model, model_config_from_preset, preset_from_model_dir,
+    rebuild_core_mlx, resolve_mlx_inference_url, resolve_mlx_model_dir, start_mlx_provider,
+    MlxHandle,
 };
 pub(crate) use provider::{check_api_key, create_provider};
 pub(crate) use skills::{cmd_skill_add, cmd_skill_remove};
@@ -319,7 +319,6 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.agents.defaults.local_backend, "lmstudio");
     }
-
 
     // -- effective_max_iterations tests --
 
@@ -648,20 +647,19 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
     }
 
     #[cfg(feature = "mlx")]
-    let mlx_handle: Option<MlxHandle> = if crate::config::schema::needs_mlx_inprocess(
-        &config.agents.defaults,
-    ) {
-        match start_mlx_provider(&config) {
-            Ok(h) => Some(h),
-            Err(e) => {
-                eprintln!("⚠ MLX provider failed to start: {e}");
-                eprintln!("  Falling back to default provider");
-                None
+    let mlx_handle: Option<MlxHandle> =
+        if crate::config::schema::needs_mlx_inprocess(&config.agents.defaults) {
+            match start_mlx_provider(&config) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    eprintln!("⚠ MLX provider failed to start: {e}");
+                    eprintln!("  Falling back to default provider");
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     #[cfg(feature = "mlx")]
     let core_handle = if let Some(ref mlx) = mlx_handle {
@@ -744,7 +742,6 @@ pub(crate) async fn run_gateway_async(
         Some(health_registry.clone()),
     );
 
-
     // Apply optional setup (e.g. MLX provider wiring).
     if let Some(f) = setup_fn {
         f(&mut agent_loop);
@@ -774,14 +771,14 @@ pub(crate) async fn run_gateway_async(
         use crate::config::schema::TtsEngineConfig;
         use tracing::warn;
 
-        // Use configured TTS engine from config
+        // Use configured TTS engine + voice + language from config.
         let tts_engine = config.voice.tts_engine;
 
-        match crate::voice_pipeline::VoicePipeline::with_engine(tts_engine).await {
+        match crate::voice_pipeline::VoicePipeline::with_voice_config(&config.voice).await {
             Ok(vp) => {
                 info!(
-                    "Voice pipeline initialized for channels (engine: {:?})",
-                    tts_engine
+                    "Voice pipeline initialized for channels (engine: {:?}, voice: {:?}, lang: {:?})",
+                    tts_engine, config.voice.tts_voice, config.voice.language,
                 );
                 Some(Arc::new(vp))
             }

@@ -596,6 +596,12 @@ async fn stream_and_render_inner(
         (None, None)
     };
 
+    #[cfg(feature = "voice")]
+    let tts_lang_override = lang
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+        .map(str::to_string);
+
     // Spawn unified print task: incremental renderer for text deltas,
     // tool events interleaved via clear_partial/restore_partial.
     let has_tool_rx = tool_rx_opt.is_some();
@@ -603,8 +609,12 @@ async fn stream_and_render_inner(
     let print_task = tokio::spawn(async move {
         use std::io::Write as _;
         #[cfg(feature = "voice")]
-        let mut tts_acc =
-            tts_tx.map(|tx| crate::voice_pipeline::SentenceAccumulator::new_streaming(tx));
+        let mut tts_acc = tts_tx.map(|tx| {
+            crate::voice_pipeline::SentenceAccumulator::new_streaming_with_language(
+                tx,
+                tts_lang_override.as_deref(),
+            )
+        });
         #[cfg(not(feature = "voice"))]
         let _ = tts_tx;
 
@@ -1096,27 +1106,33 @@ pub(crate) fn cmd_agent(
                 Ok(model_dir) => {
                     if let Some(bin) = crate::higgs::find_binary() {
                         match crate::higgs::server_start(&bin, higgs_port, &model_dir).await {
-                            Ok(()) => {
-                                // Always point at the managed Higgs port — overwrite any
-                                // stale localApiBase from a previous session that may point
-                                // at a different port or a dead endpoint.
+                            Ok(crate::higgs::StartResult::Ready) => {
                                 config.agents.defaults.local_api_base =
                                     format!("http://127.0.0.1:{higgs_port}/v1");
                                 config.agents.defaults.skip_jit_gate = true;
-                                // Always refresh model name from the running server so
-                                // display and routing use the actual loaded model, not a
-                                // stale value from a previous /m switch.
-                                if let Some(name) = crate::higgs::get_model_name(higgs_port).await
+                                // Resolve the served id that matches the configured model.
+                                // An externally-managed Higgs may serve several models; taking
+                                // the first one (or a stale name) makes nanobot request a model
+                                // Higgs hasn't loaded → 404.
+                                if let Some(name) =
+                                    crate::higgs::resolve_served_model(higgs_port, &local_model_name)
+                                        .await
                                 {
                                     config.agents.defaults.lms_main_model = name.clone();
                                     local_model_name = name;
                                 }
                             }
+                            Ok(crate::higgs::StartResult::Loading { pid, port }) => {
+                                eprintln!(
+                                    "Warning: Higgs (pid {}) still loading model on port {} — requests will retry until ready",
+                                    pid, port
+                                );
+                                config.agents.defaults.local_api_base =
+                                    format!("http://127.0.0.1:{port}/v1");
+                                config.agents.defaults.skip_jit_gate = true;
+                            }
                             Err(e) => {
                                 eprintln!("Warning: failed to start Higgs: {e}");
-                                // Clear any stale local_api_base so we don't send
-                                // requests to a dead endpoint from a previous session.
-                                // Safe because the remote-URL case short-circuited above.
                                 config.agents.defaults.local_api_base.clear();
                             }
                         }
@@ -1961,7 +1977,14 @@ pub(crate) fn cmd_agent(
                 if let Some(ref mut vs) = ctx.voice_session {
                     let tts_text = tui::strip_markdown_for_tts(&response);
                     if !tts_text.is_empty() {
-                        tui::speak_interruptible(vs, &tts_text, "en");
+                        let tts_lang = ctx
+                            .lang
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+                            .map(str::to_string)
+                            .unwrap_or_else(|| crate::voice_pipeline::detect_language(&tts_text));
+                        tui::speak_interruptible(vs, &tts_text, &tts_lang);
                     }
                 }
             }

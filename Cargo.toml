@@ -174,7 +174,9 @@ rev = "c9aef93a7c4a7cc8f22833c08da8b0985573ac2f"
 optional = true
 
 [patch.crates-io]
-pocket-tts = { git = "https://github.com/dusterbloom/pocket-tts.git", rev = "c1f0acee7cec385f2044492660751668e0f880f5" }
+
+[patch."https://github.com/dusterbloom/jack-voice.git"]
+jack-voice = { path = "../jack-voice/jack-voice" }
 
 [dependencies.crossterm]
 version = "0.28"

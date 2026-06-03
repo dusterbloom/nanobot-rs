@@ -616,7 +616,9 @@ impl ReplContext {
         let counters = &self.core_handle.counters;
         counters.last_context_used.store(0, Ordering::Relaxed);
         counters.last_message_count.store(0, Ordering::Relaxed);
-        counters.last_working_memory_tokens.store(0, Ordering::Relaxed);
+        counters
+            .last_working_memory_tokens
+            .store(0, Ordering::Relaxed);
 
         // Refresh the TUI — clear screen and reprint the logo like a fresh session.
         print!("{}", tui::CLEAR_SCREEN);
@@ -739,5 +741,4 @@ impl ReplContext {
             }
         }
     }
-
 }

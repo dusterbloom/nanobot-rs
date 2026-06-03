@@ -55,7 +55,15 @@ impl ReplContext {
     /// Returns the model name if the server responded, or None.
     async fn apply_higgs_endpoint(&mut self, port: u16) -> Option<String> {
         self.config.agents.defaults.local_api_base = format!("http://127.0.0.1:{port}/v1");
-        if let Some(name) = crate::higgs::get_model_name(port).await {
+        // Prefer the model the user configured; only fall back to whatever Higgs
+        // serves first when that model isn't among the served set. Avoids adopting
+        // a sibling model (e.g. a multi-model Higgs) that triggers a 404 later.
+        let preferred = if !self.config.agents.defaults.lms_main_model.is_empty() {
+            self.config.agents.defaults.lms_main_model.clone()
+        } else {
+            self.config.agents.defaults.local_model.clone()
+        };
+        if let Some(name) = crate::higgs::resolve_served_model(port, &preferred).await {
             self.config.agents.defaults.lms_main_model = name.clone();
             self.config.agents.defaults.local_model = name.clone();
             Some(name)
@@ -75,18 +83,30 @@ impl ReplContext {
                         print!("  Restarting Higgs server... ");
                         io::stdout().flush().ok();
                         match crate::higgs::server_restart(&bin, port, &model_dir).await {
-                            Ok(()) => {
+                            Ok(crate::higgs::StartResult::Ready) => {
                                 println!("{}OK{}", tui::GREEN, tui::RESET);
                                 if let Some(name) = self.apply_higgs_endpoint(port).await {
                                     println!("  Model: {name}");
                                 }
+                            }
+                            Ok(crate::higgs::StartResult::Loading { pid, port: _ }) => {
+                                println!(
+                                    "{}LOADING{} (pid {} still warming up)",
+                                    tui::YELLOW,
+                                    tui::RESET,
+                                    pid
+                                );
+                                self.config.agents.defaults.local_api_base =
+                                    format!("http://127.0.0.1:{port}/v1");
+                                self.config.agents.defaults.skip_jit_gate = true;
                             }
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
                     } else {
                         println!(
                             "  {}Higgs binary not found.{} Install with: cargo install higgs",
-                            tui::YELLOW, tui::RESET,
+                            tui::YELLOW,
+                            tui::RESET,
                         );
                     }
                 }
@@ -95,7 +115,9 @@ impl ReplContext {
             self.apply_and_rebuild();
             println!(
                 "  {}{}Rebuilt{} agent core.",
-                tui::BOLD, tui::GREEN, tui::RESET
+                tui::BOLD,
+                tui::GREEN,
+                tui::RESET
             );
             return;
         }
@@ -523,9 +545,8 @@ impl ReplContext {
                 let mut disk_cfg = load_config(None);
                 disk_cfg.agents.defaults.local_model = selected.id.clone();
                 disk_cfg.agents.defaults.lms_main_model = selected.id;
-                if !crate::config::schema::is_higgs_backend(
-                    &disk_cfg.agents.defaults.local_backend,
-                ) {
+                if !crate::config::schema::is_higgs_backend(&disk_cfg.agents.defaults.local_backend)
+                {
                     disk_cfg.agents.defaults.local_backend = "lmstudio".to_string();
                 }
                 save_config(&disk_cfg, None);
@@ -536,7 +557,7 @@ impl ReplContext {
                 #[cfg(feature = "cluster")]
                 ref peer_type,
                 #[cfg(not(feature = "cluster"))]
-                peer_type: _,
+                    peer_type: _,
             } => {
                 // Determine if this is an LM Studio peer that supports load/unload
                 #[cfg(feature = "cluster")]
@@ -642,11 +663,8 @@ impl ReplContext {
                         io::stdout().flush().ok();
                         match crate::higgs::server_restart(&bin, port, &dir_str).await {
                             Ok(()) => {
-                                self.config.agents.defaults.mlx_model_dir =
-                                    Some(dir_str.clone());
-                                if let Some(model_name) =
-                                    self.apply_higgs_endpoint(port).await
-                                {
+                                self.config.agents.defaults.mlx_model_dir = Some(dir_str.clone());
+                                if let Some(model_name) = self.apply_higgs_endpoint(port).await {
                                     println!("{}OK{} · {model_name}", tui::GREEN, tui::RESET);
                                 } else {
                                     self.config.agents.defaults.local_model = name.clone();
@@ -672,7 +690,8 @@ impl ReplContext {
                     } else {
                         println!(
                             "  {}Higgs binary not found.{} Install with: cargo install higgs",
-                            tui::YELLOW, tui::RESET,
+                            tui::YELLOW,
+                            tui::RESET,
                         );
                         return;
                     }
@@ -728,10 +747,7 @@ impl ReplContext {
                                             println!("{}OK{}", tui::GREEN, tui::RESET);
                                         }
                                         Err(e2) => {
-                                            println!(
-                                                "{}FAILED: {}{}",
-                                                tui::RED, e2, tui::RESET
-                                            );
+                                            println!("{}FAILED: {}{}", tui::RED, e2, tui::RESET);
                                         }
                                     }
                                 }
@@ -1268,9 +1284,8 @@ impl ReplContext {
             // Try to start a local inference engine if none is active.
             // For Higgs: always attempt start regardless of local_api_base — it may
             // be stale from a previous session and Higgs may have stopped.
-            let is_higgs = crate::config::schema::is_higgs_backend(
-                &self.config.agents.defaults.local_backend,
-            );
+            let is_higgs =
+                crate::config::schema::is_higgs_backend(&self.config.agents.defaults.local_backend);
             if (self.config.agents.defaults.local_api_base.is_empty() || is_higgs)
                 && !self.srv.lms_managed
                 && self.srv.engine == super::super::InferenceEngine::None
@@ -1283,32 +1298,46 @@ impl ReplContext {
                                 let port = self.config.agents.defaults.higgs_port;
                                 println!(
                                     "\n  {}{}Higgs{} starting on port {port}...",
-                                    tui::BOLD, tui::YELLOW, tui::RESET,
+                                    tui::BOLD,
+                                    tui::YELLOW,
+                                    tui::RESET,
                                 );
                                 match crate::higgs::server_start(&bin, port, &model_dir).await {
-                                    Ok(()) => {
+                                    Ok(crate::higgs::StartResult::Ready) => {
                                         self.srv.engine = super::super::InferenceEngine::Higgs;
                                         self.srv.local_port = port.to_string();
                                         self.config.agents.defaults.skip_jit_gate = true;
-                                        if let Some(name) =
-                                            self.apply_higgs_endpoint(port).await
-                                        {
-                                            println!(
-                                                "  {}OK{} · {name}",
-                                                tui::GREEN, tui::RESET
-                                            );
+                                        if let Some(name) = self.apply_higgs_endpoint(port).await {
+                                            println!("  {}OK{} · {name}", tui::GREEN, tui::RESET);
                                         } else {
                                             println!("  {}OK{}", tui::GREEN, tui::RESET);
                                         }
                                     }
+                                    Ok(crate::higgs::StartResult::Loading {
+                                        pid,
+                                        port: loading_port,
+                                    }) => {
+                                        self.srv.engine = super::super::InferenceEngine::Higgs;
+                                        self.srv.local_port = loading_port.to_string();
+                                        self.config.agents.defaults.skip_jit_gate = true;
+                                        self.config.agents.defaults.local_api_base =
+                                            format!("http://127.0.0.1:{loading_port}/v1");
+                                        println!(
+                                            "  {}{}Higgs (pid {}) still loading{} — requests will retry until ready",
+                                            tui::BOLD, tui::YELLOW, pid, tui::RESET,
+                                        );
+                                    }
                                     Err(e) => {
                                         println!(
                                             "  {}{}Higgs start failed:{} {e}",
-                                            tui::BOLD, tui::YELLOW, tui::RESET,
+                                            tui::BOLD,
+                                            tui::YELLOW,
+                                            tui::RESET,
                                         );
                                         println!(
                                             "  {}Remaining in cloud mode{}\n",
-                                            tui::DIM, tui::RESET
+                                            tui::DIM,
+                                            tui::RESET
                                         );
                                         return;
                                     }
@@ -1316,7 +1345,9 @@ impl ReplContext {
                             } else {
                                 println!(
                                     "\n  {}{}Higgs not found.{} Install with: cargo install higgs",
-                                    tui::BOLD, tui::YELLOW, tui::RESET,
+                                    tui::BOLD,
+                                    tui::YELLOW,
+                                    tui::RESET,
                                 );
                                 return;
                             }
@@ -1324,7 +1355,9 @@ impl ReplContext {
                         Err(e) => {
                             println!(
                                 "\n  {}{}Higgs config error:{} {e}",
-                                tui::BOLD, tui::YELLOW, tui::RESET,
+                                tui::BOLD,
+                                tui::YELLOW,
+                                tui::RESET,
                             );
                             return;
                         }
@@ -1353,9 +1386,7 @@ impl ReplContext {
                                             .current_model_path
                                             .file_name()
                                             .and_then(|n| n.to_str())
-                                            .unwrap_or(
-                                                &self.config.agents.defaults.local_model,
-                                            );
+                                            .unwrap_or(&self.config.agents.defaults.local_model);
                                         cli::strip_gguf_suffix(mn).to_string()
                                     };
                                 let main_ctx =
@@ -1378,10 +1409,7 @@ impl ReplContext {
                                 }
                                 if self.config.trio.enabled {
                                     if !self.config.trio.router_model.is_empty() {
-                                        print!(
-                                            "  Loading {}... ",
-                                            self.config.trio.router_model
-                                        );
+                                        print!("  Loading {}... ", self.config.trio.router_model);
                                         io::stdout().flush().ok();
                                         match crate::lms::load_model(
                                             "",
@@ -1395,10 +1423,9 @@ impl ReplContext {
                                             Ok(()) => {
                                                 println!("{}OK{}", tui::GREEN, tui::RESET)
                                             }
-                                            Err(e) => println!(
-                                                "{}FAILED: {}{}",
-                                                tui::RED, e, tui::RESET
-                                            ),
+                                            Err(e) => {
+                                                println!("{}FAILED: {}{}", tui::RED, e, tui::RESET)
+                                            }
                                         }
                                     }
                                     if !self.config.trio.specialist_model.is_empty() {
@@ -1419,10 +1446,9 @@ impl ReplContext {
                                             Ok(()) => {
                                                 println!("{}OK{}", tui::GREEN, tui::RESET)
                                             }
-                                            Err(e) => println!(
-                                                "{}FAILED: {}{}",
-                                                tui::RED, e, tui::RESET
-                                            ),
+                                            Err(e) => {
+                                                println!("{}FAILED: {}{}", tui::RED, e, tui::RESET)
+                                            }
                                         }
                                     }
                                 }
@@ -1442,12 +1468,12 @@ impl ReplContext {
                             Err(e) => {
                                 println!(
                                     "  {}{}lms server start failed:{} {}",
-                                    tui::BOLD, tui::YELLOW, tui::RESET, e
+                                    tui::BOLD,
+                                    tui::YELLOW,
+                                    tui::RESET,
+                                    e
                                 );
-                                println!(
-                                    "  {}Remaining in cloud mode{}\n",
-                                    tui::DIM, tui::RESET
-                                );
+                                println!("  {}Remaining in cloud mode{}\n", tui::DIM, tui::RESET);
                                 return;
                             }
                         }
@@ -1499,9 +1525,8 @@ impl ReplContext {
             // Preserve "higgs" backend (managed sidecar) so next /l re-starts it.
             // Reset oMLX → lmstudio since oMLX has no auto-start.
             self.config.agents.defaults.local_api_base.clear();
-            if !crate::config::schema::is_higgs_backend(
-                &self.config.agents.defaults.local_backend,
-            ) {
+            if !crate::config::schema::is_higgs_backend(&self.config.agents.defaults.local_backend)
+            {
                 self.config.agents.defaults.local_backend = "lmstudio".to_string();
             }
             self.config.agents.defaults.skip_jit_gate = false;
