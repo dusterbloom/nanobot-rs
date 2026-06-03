@@ -403,6 +403,16 @@ pub(crate) enum TtsCommand {
     Finish,
 }
 
+/// Find the earliest occurrence of any `needles` substring in `hay`, returning
+/// its byte index and the matched needle. Used to strip reasoning tags where a
+/// model may emit either `<think>` or `<thinking>` variants.
+fn earliest_tag<'a>(hay: &str, needles: &[&'a str]) -> Option<(usize, &'a str)> {
+    needles
+        .iter()
+        .filter_map(|n| hay.find(n).map(|i| (i, *n)))
+        .min_by_key(|(i, _)| *i)
+}
+
 /// Accumulates streaming text deltas and batches complete sentences into ~200-char
 /// chunks before sending to TTS.
 pub(crate) struct SentenceAccumulator {
@@ -479,27 +489,37 @@ impl SentenceAccumulator {
     }
 
     fn strip_thinking_from_buffer(&mut self) {
+        // Reasoning models emit either <think>…</think> or <thinking>…</thinking>.
+        // Strip whole blocks; also drop a stray closing tag whose opener arrived
+        // in an earlier segment (common on the non-streaming continuation path,
+        // where a bare "</think>" can lead the continuation text and otherwise
+        // gets spoken aloud).
+        const OPENS: [&str; 2] = ["<thinking>", "<think>"];
+        const CLOSES: [&str; 2] = ["</thinking>", "</think>"];
         loop {
             if self.in_thinking_block {
-                if let Some(end) = self.buffer.find("</thinking>") {
-                    self.buffer = self.buffer[end + "</thinking>".len()..].to_string();
+                if let Some((end, close)) = earliest_tag(&self.buffer, &CLOSES) {
+                    self.buffer = self.buffer[end + close.len()..].to_string();
                     self.in_thinking_block = false;
                 } else {
                     self.buffer.clear();
                     return;
                 }
-            } else if let Some(start) = self.buffer.find("<thinking>") {
+            } else if let Some((start, open)) = earliest_tag(&self.buffer, &OPENS) {
                 let before = self.buffer[..start].to_string();
-                let after_tag = self.buffer[start + "<thinking>".len()..].to_string();
+                let after_tag = self.buffer[start + open.len()..].to_string();
                 self.in_thinking_block = true;
-                if let Some(end) = after_tag.find("</thinking>") {
-                    let remaining = after_tag[end + "</thinking>".len()..].to_string();
+                if let Some((end, close)) = earliest_tag(&after_tag, &CLOSES) {
+                    let remaining = after_tag[end + close.len()..].to_string();
                     self.buffer = format!("{}{}", before, remaining);
                     self.in_thinking_block = false;
                 } else {
                     self.buffer = before;
                     return;
                 }
+            } else if let Some((idx, close)) = earliest_tag(&self.buffer, &CLOSES) {
+                // Orphan closing tag, no opener in view — drop just the tag.
+                self.buffer.replace_range(idx..idx + close.len(), "");
             } else {
                 return;
             }
@@ -2120,6 +2140,30 @@ mod tests {
                 "{lang:?} should use Kokoro fallback, not Pocket"
             );
         }
+    }
+
+    #[test]
+    fn test_strip_thinking_handles_think_and_thinking_tags() {
+        let (tx, _rx) = std_mpsc::channel();
+        let mut acc = SentenceAccumulator::new(tx);
+
+        // <think>…</think> (the variant local models emit) is removed.
+        acc.buffer = "<think>secret reasoning</think>Hello".to_string();
+        acc.strip_thinking_from_buffer();
+        assert_eq!(acc.buffer, "Hello");
+        assert!(!acc.in_thinking_block);
+
+        // Legacy <thinking>…</thinking> still stripped.
+        acc.buffer = "<thinking>hidden</thinking>World".to_string();
+        acc.strip_thinking_from_buffer();
+        assert_eq!(acc.buffer, "World");
+
+        // Stray closing tag (opener arrived in an earlier segment) is dropped,
+        // not spoken — this is the </think> leak seen on the continuation path.
+        acc.in_thinking_block = false;
+        acc.buffer = "tail of thought</think> the real answer".to_string();
+        acc.strip_thinking_from_buffer();
+        assert_eq!(acc.buffer, "tail of thought the real answer");
     }
 
     #[test]

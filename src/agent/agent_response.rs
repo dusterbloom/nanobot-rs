@@ -192,6 +192,28 @@ fn send_finish_reason(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, r
     }
 }
 
+/// Maximum auto-continuations when the turn's output is being spoken (voice/TTS).
+/// A rambling local model would otherwise re-synthesize dozens of chunks.
+const VOICE_MAX_CONTINUATIONS: u32 = 4;
+
+/// Normalize whitespace and case for loose repetition comparison.
+fn normalize_for_repeat(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// True when an auto-continuation adds nothing new: it is empty, identical to
+/// the previous continuation (`prev_norm`), or a sizeable span already present
+/// in `accumulated`. Small local models that hit `finish_reason="length"` tend
+/// to re-emit the same sentence; without this guard the continue loop runs to
+/// the cap, re-synthesizing every repeat to TTS.
+fn is_degenerate_continuation(new: &str, prev_norm: &str, accumulated: &str) -> bool {
+    let norm = normalize_for_repeat(new);
+    if norm.is_empty() || norm == prev_norm {
+        return true;
+    }
+    norm.chars().count() >= 24 && normalize_for_repeat(accumulated).contains(&norm)
+}
+
 fn send_delta(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, text: &str) {
     if let Some(ref tx) = tx {
         let _ = tx.send(text.to_string());
@@ -507,8 +529,18 @@ impl AgentLoopShared {
         mut accumulated: String,
     ) -> String {
         let counters = &self.core_handle.counters;
-        let max_cont = ctx.core.max_continuations;
+        // Voice/TTS turns cap continuations hard: a rambling local model would
+        // otherwise re-synthesize dozens of chunks. `is_voice_message` covers
+        // channel voice notes; `suppress_thinking_in_tts` covers REPL voice mode.
+        let voice_active = ctx.is_voice_message
+            || counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
+        let max_cont = if voice_active {
+            ctx.core.max_continuations.min(VOICE_MAX_CONTINUATIONS)
+        } else {
+            ctx.core.max_continuations
+        };
         let mut finish_reason = original_response.finish_reason.clone();
+        let mut prev_norm = String::new();
 
         while ctx.flow.retries.continuations < max_cont {
             // Check if still truncated.
@@ -562,10 +594,17 @@ impl AgentLoopShared {
 
             match cont_result {
                 Ok(cont_response) => {
-                    if let Some(ref new_text) = cont_response.content {
-                        send_delta(&ctx.text_delta_tx, new_text);
+                    let continuation = cont_response.content.clone().unwrap_or_default();
+                    // Stop if the model is repeating itself rather than adding new content.
+                    if is_degenerate_continuation(&continuation, &prev_norm, &accumulated) {
+                        info!(
+                            "auto_continue: degenerate/repeated continuation at {}/{}, stopping early",
+                            ctx.flow.retries.continuations, max_cont
+                        );
+                        break;
                     }
-                    let continuation = cont_response.content.unwrap_or_default();
+                    prev_norm = normalize_for_repeat(&continuation);
+                    send_delta(&ctx.text_delta_tx, &continuation);
                     accumulated.push_str(&continuation);
                     finish_reason = cont_response.finish_reason;
                 }
@@ -733,6 +772,37 @@ fn prepare_rescue_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_degenerate_continuation() {
+        // Empty / whitespace-only adds nothing.
+        assert!(is_degenerate_continuation("   ", "", ""));
+        // Identical to the previous continuation (case/space-insensitive).
+        assert!(is_degenerate_continuation(
+            "I was created by Peppi.",
+            &normalize_for_repeat("i was   created by peppi."),
+            "earlier text"
+        ));
+        // A sizeable span already present in accumulated output.
+        let acc = "Hello there. I am an AI assistant who helps you.";
+        assert!(is_degenerate_continuation(
+            "I am an AI assistant who helps you.",
+            "something else",
+            acc
+        ));
+        // Genuinely new content continues the loop.
+        assert!(!is_degenerate_continuation(
+            "And here is a brand new follow-up point.",
+            "previous chunk",
+            "Hello there."
+        ));
+        // Short novel fragments are not falsely flagged as repeats-in-accumulated.
+        assert!(!is_degenerate_continuation(
+            "and so",
+            "prev",
+            "a long prior body of text"
+        ));
+    }
 
     fn make_response(content: Option<&str>, finish_reason: &str) -> LLMResponse {
         LLMResponse {
