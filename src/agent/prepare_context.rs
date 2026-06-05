@@ -449,7 +449,17 @@ impl AgentLoopShared {
             detected_language.as_deref(),
         );
 
-        let local_runtime_blocks = if core.context.local_prompt_mode {
+        // Append-only local prompt (default): keep per-turn-volatile runtime
+        // blocks (Working Memory, Background Tasks, Tool Patterns, LCM hints)
+        // OUT of the system prefix so turn N stays a byte-prefix of turn N+1 and
+        // Higgs reuses the prior turn's KV cache (flat TTFT on long sessions —
+        // measured ~1.9s full prefill → ~0.07s reuse). Long-term MEMORY.md stays
+        // in the static prefix (build_developer_context); recent context comes
+        // from the append-only history; older/cross-session facts via `recall`.
+        // Opt back into always-on injection with NANOBOT_LOCAL_ALWAYS_ON_MEMORY=1.
+        let local_runtime_blocks = if core.context.local_prompt_mode
+            && std::env::var("NANOBOT_LOCAL_ALWAYS_ON_MEMORY").is_ok()
+        {
             self.build_local_runtime_blocks(&core, &session_key).await
         } else {
             Vec::new()

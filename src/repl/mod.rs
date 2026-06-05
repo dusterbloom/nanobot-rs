@@ -1105,7 +1105,7 @@ pub(crate) fn cmd_agent(
             match crate::higgs::resolve_model_dir(&config) {
                 Ok(model_dir) => {
                     if let Some(bin) = crate::higgs::find_binary() {
-                        match crate::higgs::server_start(&bin, higgs_port, &model_dir).await {
+                        match crate::higgs::server_start(&bin, higgs_port, &model_dir, &config.agents.defaults.local_model).await {
                             Ok(crate::higgs::StartResult::Ready) => {
                                 config.agents.defaults.local_api_base =
                                     format!("http://127.0.0.1:{higgs_port}/v1");

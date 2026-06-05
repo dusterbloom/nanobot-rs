@@ -91,11 +91,12 @@ pub(crate) async fn server_start(
     bin: &Path,
     port: u16,
     model_dir: &str,
+    local_model: &str,
 ) -> Result<StartResult, String> {
     // Already running and healthy?
     if let Some(pid) = read_pid() {
         if pid_is_alive(pid) && wait_for_ready(port, 3).await {
-            if is_serving_expected_model(port, model_dir).await {
+            if is_serving_expected_model(port, model_dir, local_model).await {
                 tracing::info!(pid, port, "higgs already running");
                 return Ok(StartResult::Ready);
             }
@@ -112,7 +113,7 @@ pub(crate) async fn server_start(
     }
 
     if wait_for_ready(port, 1).await {
-        if is_serving_expected_model(port, model_dir).await {
+        if is_serving_expected_model(port, model_dir, local_model).await {
             tracing::info!(port, "higgs port already responding (externally managed)");
             return Ok(StartResult::Ready);
         }
@@ -158,7 +159,7 @@ pub(crate) async fn server_start(
         "--kv-cache",
         "turboquant",
         "--kv-bits",
-        "8",
+        "4",
     ]);
     cmd.stdin(devnull);
     cmd.stdout(log_file);
@@ -328,10 +329,11 @@ pub(crate) async fn server_restart(
     bin: &Path,
     port: u16,
     model_dir: &str,
+    local_model: &str,
 ) -> Result<StartResult, String> {
     server_stop()?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    server_start(bin, port, model_dir).await
+    server_start(bin, port, model_dir, local_model).await
 }
 
 /// Check if the running Higgs is serving a model that matches `expected_dir`.
@@ -340,7 +342,7 @@ pub(crate) async fn server_restart(
 /// several at once) and matches each against the last path component of
 /// `expected_dir`. Returns `true` if any served model matches, or if the
 /// server can't be queried (optimistic fallback).
-async fn is_serving_expected_model(port: u16, expected_dir: &str) -> bool {
+async fn is_serving_expected_model(port: u16, expected_dir: &str, preferred: &str) -> bool {
     let served = list_served_models(port).await;
     if served.is_empty() {
         return true; // Can't query → assume ok
@@ -349,10 +351,17 @@ async fn is_serving_expected_model(port: u16, expected_dir: &str) -> bool {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    if expected_name.is_empty() {
+    if expected_name.is_empty() && preferred.is_empty() {
         return true;
     }
-    served.iter().any(|id| model_id_matches(id, &expected_name))
+    // Accept if any served model matches the model-dir basename OR the configured
+    // model name. Matching `preferred` (localModel) is essential when Higgs serves
+    // a custom-named model (e.g. "qwen36-35b") that doesn't correspond to the
+    // mlxModelDir basename — otherwise nanobot wrongly rejects a healthy server.
+    served.iter().any(|id| {
+        (!expected_name.is_empty() && model_id_matches(id, &expected_name))
+            || (!preferred.is_empty() && model_id_matches(id, preferred))
+    })
 }
 
 /// Case-insensitive fuzzy match between two model identifiers.

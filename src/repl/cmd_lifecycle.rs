@@ -82,7 +82,7 @@ impl ReplContext {
                     if let Some(bin) = crate::higgs::find_binary() {
                         print!("  Restarting Higgs server... ");
                         io::stdout().flush().ok();
-                        match crate::higgs::server_restart(&bin, port, &model_dir).await {
+                        match crate::higgs::server_restart(&bin, port, &model_dir, &self.config.agents.defaults.local_model).await {
                             Ok(crate::higgs::StartResult::Ready) => {
                                 println!("{}OK{}", tui::GREEN, tui::RESET);
                                 if let Some(name) = self.apply_higgs_endpoint(port).await {
@@ -661,7 +661,7 @@ impl ReplContext {
                     if let Some(bin) = crate::higgs::find_binary() {
                         print!("  Restarting Higgs with {}... ", name);
                         io::stdout().flush().ok();
-                        match crate::higgs::server_restart(&bin, port, &dir_str).await {
+                        match crate::higgs::server_restart(&bin, port, &dir_str, &self.config.agents.defaults.local_model).await {
                             Ok(()) => {
                                 self.config.agents.defaults.mlx_model_dir = Some(dir_str.clone());
                                 if let Some(model_name) = self.apply_higgs_endpoint(port).await {
@@ -1302,7 +1302,7 @@ impl ReplContext {
                                     tui::YELLOW,
                                     tui::RESET,
                                 );
-                                match crate::higgs::server_start(&bin, port, &model_dir).await {
+                                match crate::higgs::server_start(&bin, port, &model_dir, &self.config.agents.defaults.local_model).await {
                                     Ok(crate::higgs::StartResult::Ready) => {
                                         self.srv.engine = super::super::InferenceEngine::Higgs;
                                         self.srv.local_port = port.to_string();

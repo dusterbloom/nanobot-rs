@@ -637,17 +637,18 @@ impl ContextBuilder {
             });
         }
 
-        // Timestamp goes LAST so the stable prefix (identity + bootstrap +
-        // skills + tools) hashes identically across turns.  oMLX prefix cache
-        // uses 1024-token block hashing — putting the timestamp at token ~15
-        // would poison the entire hash chain and cause 0% cache hits.
-        let now = Local::now();
+        // DATE ONLY (not wall-clock time) so the system prefix stays byte-stable
+        // across turns within a day → Higgs's radix prefix cache can reuse the
+        // prefix instead of re-prefilling it. A minute-resolution timestamp here
+        // (near token 15) would change every turn and poison the whole
+        // prefix-cache chain for the entire downstream prompt.
+        let today = Local::now().format("%Y-%m-%d");
         sections.push(SectionEntry {
             section: PromptSection::MemoryBriefing, // highest section → rendered last
-            block: PromptBlock::new("Session", &format!("Current time: {now}")),
+            block: PromptBlock::new("Session", &format!("Today's date: {today}")),
             allocated_tokens: 0,
             actual_tokens: 0,
-            source: SectionSource::Runtime("timestamp".to_string()),
+            source: SectionSource::Static("session date"),
             included: true,
             shrinkable: false,
         });
@@ -1683,6 +1684,23 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cb = ContextBuilder::new(tmp.path());
         (tmp, cb)
+    }
+
+    // ----- TTFT: system prefix stable within a day (date-only timestamp) -----
+
+    #[test]
+    fn test_local_system_prefix_stable_within_day() {
+        let (_tmp, cb) = make_context();
+        // The local system prefix must be byte-identical across turns so Higgs's
+        // radix prefix cache can reuse it. The per-minute wall-clock timestamp
+        // was the worst offender; it's now date-only (stable within a day).
+        let p1 = cb.build_local_system_prompt(None, None, None, false, None, &[]);
+        let p2 = cb.build_local_system_prompt(None, None, None, false, None, &[]);
+        assert_eq!(p1, p2, "system prefix must be byte-identical across turns");
+        assert!(
+            !p1.contains("Current time:"),
+            "per-minute timestamp must not be in the cached prefix"
+        );
     }
 
     // ----- _guess_mime -----
