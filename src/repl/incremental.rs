@@ -43,6 +43,9 @@ pub struct IncrementalRenderer {
     /// provider reports no usage.
     total_chars: u64,
     start_time: Instant,
+    /// Elapsed time to the first streamed chunk of the turn — the prefill cost
+    /// the user waits through (TTFT). `None` until the first `push`.
+    ttft: Option<std::time::Duration>,
     first_line: bool,
     /// Track whether we have a visible partial line on the current terminal row.
     has_partial: bool,
@@ -72,6 +75,7 @@ impl IncrementalRenderer {
             total_tokens: 0,
             total_chars: 0,
             start_time: Instant::now(),
+            ttft: None,
             first_line: true,
             has_partial: false,
             partial_rows: 0,
@@ -82,6 +86,10 @@ impl IncrementalRenderer {
 
     /// Feed a text delta. May print zero or more completed lines to stdout.
     pub fn push(&mut self, delta: &str) {
+        // First chunk of any kind marks end of prefill → time to first token.
+        if self.ttft.is_none() {
+            self.ttft = Some(self.start_time.elapsed());
+        }
         // Detect thinking start: agent_loop sends "\x1b[90m\x1b[2m"
         if delta.starts_with("\x1b[90m") {
             if !matches!(self.state, StreamState::Thinking { .. }) {
@@ -341,9 +349,10 @@ impl IncrementalRenderer {
         } else {
             self.total_chars / 4
         };
+        let ttft = self.ttft.map(|d| d.as_secs_f32());
         println!(
             "\r\x1b[2m{}\x1b[0m",
-            format_footer(elapsed, tokens, self.finish_reason.as_deref())
+            format_footer(elapsed, ttft, tokens, self.finish_reason.as_deref())
         );
         std::io::stdout().flush().ok();
     }
@@ -480,11 +489,19 @@ impl IncrementalRenderer {
     }
 }
 
-/// Format the timing footer: elapsed seconds, token count, and tok/s rate,
-/// with an optional `[reason]` suffix for non-"stop" finish reasons.
+/// Format the timing footer: elapsed seconds, time-to-first-token (prefill),
+/// token count, and tok/s rate, with an optional `[reason]` suffix for
+/// non-"stop" finish reasons.
+///
+/// `ttft` (seconds to first streamed token) is shown when known — it exposes
+/// the prefill cost that dominates perceived latency, separate from decode.
 ///
 /// Pure helper so the formatting is unit-testable without touching stdout.
-fn format_footer(elapsed: f32, tokens: u64, finish_reason: Option<&str>) -> String {
+fn format_footer(elapsed: f32, ttft: Option<f32>, tokens: u64, finish_reason: Option<&str>) -> String {
+    let ttft_str = match ttft {
+        Some(t) => format!("  ttft {:.2}s", t),
+        None => String::new(),
+    };
     let rate = if elapsed > 0.5 {
         format!("  {:.1} tok/s", tokens as f32 / elapsed)
     } else {
@@ -494,7 +511,10 @@ fn format_footer(elapsed: f32, tokens: u64, finish_reason: Option<&str>) -> Stri
         Some(fr) if fr != "stop" => format!("  [{}]", fr),
         _ => String::new(),
     };
-    format!("⧗ {:.1}s  {} tok{}{}", elapsed, tokens, rate, reason_suffix)
+    format!(
+        "⧗ {:.1}s{}  {} tok{}{}",
+        elapsed, ttft_str, tokens, rate, reason_suffix
+    )
 }
 
 /// Render a single prose line with inline markdown formatting.
@@ -815,16 +835,26 @@ mod tests {
     #[test]
     fn test_footer_tokens_and_rate() {
         // 100 tokens in 2.0s → 50 tok/s.
-        let f = format_footer(2.0, 100, Some("stop"));
+        let f = format_footer(2.0, None, 100, Some("stop"));
         assert!(f.contains("100 tok"), "footer: {f}");
         assert!(f.contains("50.0 tok/s"), "footer: {f}");
         // "stop" is the normal case — no reason suffix.
         assert!(!f.contains('['), "footer: {f}");
+        // No ttft passed → no ttft segment.
+        assert!(!f.contains("ttft"), "footer: {f}");
+    }
+
+    #[test]
+    fn test_footer_shows_ttft() {
+        // ttft is the prefill cost; surfaced separately from total elapsed.
+        let f = format_footer(53.6, Some(46.2), 352, Some("stop"));
+        assert!(f.contains("ttft 46.20s"), "footer: {f}");
+        assert!(f.contains("352 tok"), "footer: {f}");
     }
 
     #[test]
     fn test_footer_truncated_reason() {
-        let f = format_footer(1.0, 10, Some("length"));
+        let f = format_footer(1.0, None, 10, Some("length"));
         assert!(f.contains("10 tok"), "footer: {f}");
         assert!(f.contains("[length]"), "footer: {f}");
     }
@@ -832,7 +862,7 @@ mod tests {
     #[test]
     fn test_footer_no_rate_when_too_fast() {
         // Below the 0.5s threshold the rate is omitted (avoids divide-by-tiny).
-        let f = format_footer(0.1, 5, None);
+        let f = format_footer(0.1, None, 5, None);
         assert!(f.contains("5 tok"), "footer: {f}");
         assert!(!f.contains("tok/s"), "footer: {f}");
     }

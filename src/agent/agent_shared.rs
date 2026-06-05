@@ -209,10 +209,26 @@ pub(crate) struct FlowControl {
     pub(crate) consecutive_all_blocked: u32,
     /// When the LLM call started — set in step_call_llm, read in step_process_response.
     pub(crate) llm_call_start: Option<std::time::Instant>,
+    /// Time to first token (ms) for the current LLM call: elapsed from
+    /// `llm_call_start` to the first streamed chunk. This is the prefill cost —
+    /// the metric that dominates TTFT. Reset per call; `None` until first token
+    /// (or for non-streaming calls).
+    pub(crate) ttft_ms: Option<u64>,
     /// Typed retry counters — each failure mode has a named field with its own cap.
     pub(crate) retries: RetryState,
     /// Saved thinking budget to restore after a thinking-off retry iteration.
     pub(crate) restore_thinking_budget: Option<u32>,
+}
+
+impl FlowControl {
+    /// Record time-to-first-token for the current call on the first streamed
+    /// chunk (prefill done). Idempotent within a call — only the first chunk
+    /// sets it; later chunks are no-ops.
+    pub(crate) fn mark_first_token(&mut self) {
+        if self.ttft_ms.is_none() {
+            self.ttft_ms = self.llm_call_start.map(|t| t.elapsed().as_millis() as u64);
+        }
+    }
 }
 
 /// Shared handles for background compaction coordination.
@@ -1431,6 +1447,7 @@ impl AgentLoopShared {
         // Signal watchdog: LLM inference is active — skip health checks.
         counters.mark_inference_started();
         ctx.flow.llm_call_start = Some(std::time::Instant::now());
+        ctx.flow.ttft_ms = None; // reset per call; set on this call's first token
 
         // Use the protocol-rendered wire format for the provider call.
         // `ctx.rendered_messages` was computed by `render_via_protocol()` in step_pre_call.
@@ -1491,6 +1508,8 @@ impl AgentLoopShared {
                     chunk = stream.rx.recv() => {
                         match chunk {
                             Some(StreamChunk::ThinkingDelta(delta)) => {
+                                // First token (even a hidden thinking token) marks end of prefill.
+                                ctx.flow.mark_first_token();
                                 if !thinking_enabled || suppress_thinking_tts {
                                     // /t off → hide from display; /nothink → hide from TTS
                                     continue;
@@ -1503,6 +1522,7 @@ impl AgentLoopShared {
                                 let _ = delta_tx.send(delta);
                             }
                             Some(StreamChunk::TextDelta(delta)) => {
+                                ctx.flow.mark_first_token();
                                 if in_thinking {
                                     in_thinking = false;
                                     let _ = delta_tx.send("\x1b[0m\n\n".to_string());

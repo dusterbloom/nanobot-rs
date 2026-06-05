@@ -751,6 +751,7 @@ impl AgentLoopShared {
                 .flow
                 .llm_call_start
                 .map_or(0, |t| t.elapsed().as_millis() as u64),
+            ttft_ms: ctx.flow.ttft_ms,
             prompt_tokens: actual_prompt.max(0) as u64,
             completion_tokens: actual_completion.max(0) as u64,
             status: "ok".into(),

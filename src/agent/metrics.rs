@@ -18,6 +18,10 @@ pub struct RequestMetrics {
     pub model: String,
     pub provider_base: String,
     pub elapsed_ms: u64,
+    /// Time to first token (ms) — the prefill cost. `None` for non-streaming
+    /// calls or when no token was produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub status: String,
@@ -99,6 +103,7 @@ mod tests {
             model: "qwen3-8b".into(),
             provider_base: "http://localhost:1234/v1".into(),
             elapsed_ms: 1500,
+            ttft_ms: Some(420),
             prompt_tokens: 2048,
             completion_tokens: 256,
             status: "ok".into(),
@@ -119,6 +124,7 @@ mod tests {
         assert!(parsed.get("error_detail").is_none()); // skip_serializing_if
         assert!(parsed.get("validation_result").is_none());
         assert_eq!(parsed["anti_drift_score"], 0.3);
+        assert_eq!(parsed["ttft_ms"], 420);
     }
 
     #[test]
@@ -130,6 +136,7 @@ mod tests {
             model: "nvidia_Orchestrator-8B".into(),
             provider_base: "http://192.168.1.22:1234/v1".into(),
             elapsed_ms: 200,
+            ttft_ms: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             status: "error:reasoning_config_rejected".into(),
@@ -147,6 +154,7 @@ mod tests {
         assert_eq!(parsed["status"], "error:reasoning_config_rejected");
         assert_eq!(parsed["error_detail"], "reasoning_budget not supported");
         assert_eq!(parsed["role"], "router");
+        assert!(parsed.get("ttft_ms").is_none()); // skip_serializing_if None
     }
 
     #[test]
@@ -194,6 +202,7 @@ mod tests {
             model: "test-model".into(),
             provider_base: "http://localhost/v1".into(),
             elapsed_ms: 100,
+            ttft_ms: Some(33),
             prompt_tokens: 10,
             completion_tokens: 5,
             status: "ok".into(),

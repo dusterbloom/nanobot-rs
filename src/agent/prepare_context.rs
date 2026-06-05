@@ -576,6 +576,7 @@ impl AgentLoopShared {
                 content_was_streamed: false,
                 consecutive_all_blocked: 0,
                 llm_call_start: None,
+                ttft_ms: None,
                 retries: crate::agent::agent_loop::RetryState::new(),
                 restore_thinking_budget: None,
             },

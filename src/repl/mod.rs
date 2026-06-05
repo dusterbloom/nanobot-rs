@@ -346,6 +346,96 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
     }
 }
 
+/// Default Higgs keepalive interval (seconds). Short enough to keep the 35B
+/// resident across read/think pauses, long enough to be negligible compute.
+const DEFAULT_HIGGS_KEEPALIVE_SECS: u64 = 45;
+
+/// Decide whether (and how often) to run the Higgs warm-keep ping.
+///
+/// Returns `Some(secs)` only for *our own* local Higgs sidecar
+/// (localhost/127.0.0.1) — we never keep a remote peer warm. The env var
+/// `NANOBOT_HIGGS_KEEPALIVE_SECS` overrides the interval; `0` disables it.
+/// A non-numeric value falls back to the default.
+pub(crate) fn higgs_keepalive_secs(backend: &str, api_base: &str, env: Option<&str>) -> Option<u64> {
+    if !crate::config::schema::is_higgs_backend(backend) {
+        return None;
+    }
+    let lower = api_base.trim().to_lowercase();
+    let host = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or(&lower);
+    let is_local = host.starts_with("127.0.0.1:") || host.starts_with("localhost:");
+    if !is_local {
+        return None;
+    }
+    match env {
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_HIGGS_KEEPALIVE_SECS),
+        },
+        None => Some(DEFAULT_HIGGS_KEEPALIVE_SECS),
+    }
+}
+
+/// Keep a local Higgs model resident by sending a 1-token completion whenever
+/// the REPL is idle.
+///
+/// Why: an idle gap lets the OS evict the 35B's weights, so the next real turn
+/// pays a multi-second cold reload (observed 37–67 s TTFT vs ~3 s warm). A tiny
+/// periodic inference touches the weights so they stay hot, and surfaces a
+/// crash early via a WARN. The 1-token prompt cannot evict the user's cached
+/// prefix from Higgs's radix cache (it's a separate, negligible branch).
+///
+/// Skips a tick while a real request is in flight (`inference_active`) — that
+/// request is already keeping the model warm.
+fn spawn_higgs_keepalive(
+    api_base: String,
+    api_key: String,
+    model: String,
+    interval_s: u64,
+    inference_active: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "."}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": false,
+        });
+        loop {
+            tokio::time::sleep(Duration::from_secs(interval_s)).await;
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if inference_active.load(Ordering::Relaxed) {
+                continue; // a real request is already keeping it warm
+            }
+            let started = Instant::now();
+            match client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&body)
+                .timeout(Duration::from_secs(60))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    debug!(ms = started.elapsed().as_millis() as u64, "higgs_keepalive_ok");
+                }
+                Ok(r) => warn!(status = %r.status(), "higgs_keepalive_unexpected_status"),
+                Err(e) => warn!(error = %e, "higgs_keepalive_failed (Higgs may be down)"),
+            }
+        }
+        debug!("higgs_keepalive stopped");
+    })
+}
+
 /// Parse a `/ctx` argument into a byte count.
 ///
 /// Accepts:
@@ -1856,6 +1946,32 @@ pub(crate) fn cmd_agent(
                 ctx.restart_watchdog();
             }
 
+            // Keep the local Higgs model warm so idle gaps don't trigger a cold
+            // reload on the next turn (the watchdog only checks liveness; it
+            // doesn't touch the weights). Gated to our own localhost Higgs.
+            let keepalive_stop = Arc::new(AtomicBool::new(false));
+            let keepalive_handle = higgs_keepalive_secs(
+                &ctx.config.agents.defaults.local_backend,
+                &ctx.config.agents.defaults.local_api_base,
+                std::env::var("NANOBOT_HIGGS_KEEPALIVE_SECS").ok().as_deref(),
+            )
+            .map(|secs| {
+                let model = if !ctx.config.agents.defaults.lms_main_model.is_empty() {
+                    ctx.config.agents.defaults.lms_main_model.clone()
+                } else {
+                    local_model_name.clone()
+                };
+                info!(interval_s = secs, model = %model, "higgs_keepalive_enabled");
+                spawn_higgs_keepalive(
+                    ctx.config.agents.defaults.local_api_base.clone(),
+                    ctx.config.agents.defaults.local_api_key.clone(),
+                    model,
+                    secs,
+                    Arc::clone(&ctx.core_handle.counters.inference_active),
+                    Arc::clone(&keepalive_stop),
+                )
+            });
+
             // First bar render pushes content up to make room; all subsequent
             // renders refresh in place so we never get a duplicate bar.
             let mut bar_needs_push = true;
@@ -2124,6 +2240,10 @@ pub(crate) fn cmd_agent(
 
             // Cleanup: stop heartbeat, save readline history, kill servers
             heartbeat.stop().await;
+            if let Some(h) = keepalive_handle {
+                keepalive_stop.store(true, Ordering::Relaxed);
+                h.abort();
+            }
             let _ = ctx.rl.as_mut().unwrap().save_history(&history_path);
 
             // Unload trio models so LM Studio returns to just the main model.
@@ -2496,5 +2616,50 @@ mod tests {
     #[test]
     fn test_extract_tool_context_exec_no_args() {
         assert_eq!(extract_tool_context("exec", "out", ""), "");
+    }
+
+    // --- higgs_keepalive_secs (warm-keep decision) ---
+
+    #[test]
+    fn test_keepalive_local_higgs_default() {
+        let s = higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", None);
+        assert_eq!(s, Some(DEFAULT_HIGGS_KEEPALIVE_SECS));
+        // localhost host form also counts.
+        assert_eq!(
+            higgs_keepalive_secs("higgs", "http://localhost:8000/v1", None),
+            Some(DEFAULT_HIGGS_KEEPALIVE_SECS)
+        );
+    }
+
+    #[test]
+    fn test_keepalive_env_override_and_disable() {
+        assert_eq!(
+            higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", Some("30")),
+            Some(30)
+        );
+        // "0" disables.
+        assert_eq!(
+            higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", Some("0")),
+            None
+        );
+        // Non-numeric → default.
+        assert_eq!(
+            higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", Some("nope")),
+            Some(DEFAULT_HIGGS_KEEPALIVE_SECS)
+        );
+    }
+
+    #[test]
+    fn test_keepalive_skips_remote_and_non_higgs() {
+        // Remote peer → never kept warm by us.
+        assert_eq!(
+            higgs_keepalive_secs("higgs", "http://192.168.1.22:8000/v1", None),
+            None
+        );
+        // Non-higgs backend → no keepalive (LMS/oMLX manage themselves).
+        assert_eq!(
+            higgs_keepalive_secs("lms", "http://127.0.0.1:8000/v1", None),
+            None
+        );
     }
 }
