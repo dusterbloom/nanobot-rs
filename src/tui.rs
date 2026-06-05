@@ -222,7 +222,9 @@ pub fn loading_animation(message: &str) {
 /// Each `\n`-delimited line takes `ceil(len / width)` rows (minimum 1).
 /// Adds `extra` for surrounding blank lines / println calls.
 pub(crate) fn terminal_rows(text: &str, extra: usize) -> usize {
-    let width = terminal_width();
+    // Guard against a 0-width terminal (e.g. a pty with no winsize, or a
+    // resize-to-zero): `(len + width - 1) / width` would divide by zero/panic.
+    let width = terminal_width().max(1);
     let rows: usize = text
         .split('\n')
         .map(|line| {
