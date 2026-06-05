@@ -36,7 +36,12 @@ enum StreamState {
 pub struct IncrementalRenderer {
     state: StreamState,
     line_buffer: String,
-    total_words: usize,
+    /// Provider-reported completion tokens, accumulated across the turn's LLM
+    /// calls. Drives the throughput footer. Zero until the first token marker.
+    total_tokens: u64,
+    /// Rendered prose characters, used to estimate tokens (chars/4) when the
+    /// provider reports no usage.
+    total_chars: u64,
     start_time: Instant,
     first_line: bool,
     /// Track whether we have a visible partial line on the current terminal row.
@@ -64,7 +69,8 @@ impl IncrementalRenderer {
         Self {
             state: StreamState::Prose,
             line_buffer: String::new(),
-            total_words: 0,
+            total_tokens: 0,
+            total_chars: 0,
             start_time: Instant::now(),
             first_line: true,
             has_partial: false,
@@ -187,9 +193,10 @@ impl IncrementalRenderer {
 
     /// Render a single completed line based on current state.
     fn render_line(&mut self, line: &str) {
-        // Count words for stats (exclude thinking — internal reasoning).
+        // Count characters for the throughput fallback (exclude thinking —
+        // internal reasoning isn't part of the visible answer).
         if !matches!(self.state, StreamState::Thinking { .. }) {
-            self.total_words += line.split_whitespace().count();
+            self.total_chars += line.chars().count() as u64;
         }
 
         // Table buffering: collect table lines and render via termimad
@@ -325,22 +332,26 @@ impl IncrementalRenderer {
         // Flush any buffered table rows
         self.flush_table();
 
-        // Print stats footer
+        // Print stats footer: elapsed, tokens, throughput. Prefer the
+        // provider-reported token count; fall back to a chars/4 estimate when
+        // the provider returned no usage data.
         let elapsed = self.start_time.elapsed().as_secs_f32();
-        let rate = if elapsed > 0.5 {
-            format!("  {:.1}w/s", self.total_words as f32 / elapsed)
+        let tokens = if self.total_tokens > 0 {
+            self.total_tokens
         } else {
-            String::new()
-        };
-        let reason_suffix = match self.finish_reason.as_deref() {
-            Some(fr) if fr != "stop" => format!("  [{}]", fr),
-            _ => String::new(),
+            self.total_chars / 4
         };
         println!(
-            "\r\x1b[2m⧗ {:.1}s  {}w{}{}\x1b[0m",
-            elapsed, self.total_words, rate, reason_suffix
+            "\r\x1b[2m{}\x1b[0m",
+            format_footer(elapsed, tokens, self.finish_reason.as_deref())
         );
         std::io::stdout().flush().ok();
+    }
+
+    /// Accumulate a provider-reported completion-token count for this turn.
+    /// Called once per LLM response (markers parsed from the delta stream).
+    pub fn add_tokens(&mut self, tokens: u64) {
+        self.total_tokens += tokens;
     }
 
     /// Emit the И marker now (used when tool events arrive before any text).
@@ -467,6 +478,23 @@ impl IncrementalRenderer {
             self.partial_rows = 0;
         }
     }
+}
+
+/// Format the timing footer: elapsed seconds, token count, and tok/s rate,
+/// with an optional `[reason]` suffix for non-"stop" finish reasons.
+///
+/// Pure helper so the formatting is unit-testable without touching stdout.
+fn format_footer(elapsed: f32, tokens: u64, finish_reason: Option<&str>) -> String {
+    let rate = if elapsed > 0.5 {
+        format!("  {:.1} tok/s", tokens as f32 / elapsed)
+    } else {
+        String::new()
+    };
+    let reason_suffix = match finish_reason {
+        Some(fr) if fr != "stop" => format!("  [{}]", fr),
+        _ => String::new(),
+    };
+    format!("⧗ {:.1}s  {} tok{}{}", elapsed, tokens, rate, reason_suffix)
 }
 
 /// Render a single prose line with inline markdown formatting.
@@ -782,5 +810,38 @@ mod tests {
         let plain = strip_ansi(&result);
         assert!(plain.contains("•"));
         assert!(plain.starts_with("  "));
+    }
+
+    #[test]
+    fn test_footer_tokens_and_rate() {
+        // 100 tokens in 2.0s → 50 tok/s.
+        let f = format_footer(2.0, 100, Some("stop"));
+        assert!(f.contains("100 tok"), "footer: {f}");
+        assert!(f.contains("50.0 tok/s"), "footer: {f}");
+        // "stop" is the normal case — no reason suffix.
+        assert!(!f.contains('['), "footer: {f}");
+    }
+
+    #[test]
+    fn test_footer_truncated_reason() {
+        let f = format_footer(1.0, 10, Some("length"));
+        assert!(f.contains("10 tok"), "footer: {f}");
+        assert!(f.contains("[length]"), "footer: {f}");
+    }
+
+    #[test]
+    fn test_footer_no_rate_when_too_fast() {
+        // Below the 0.5s threshold the rate is omitted (avoids divide-by-tiny).
+        let f = format_footer(0.1, 5, None);
+        assert!(f.contains("5 tok"), "footer: {f}");
+        assert!(!f.contains("tok/s"), "footer: {f}");
+    }
+
+    #[test]
+    fn test_add_tokens_accumulates() {
+        let mut r = IncrementalRenderer::new();
+        r.add_tokens(40);
+        r.add_tokens(60);
+        assert_eq!(r.total_tokens, 100);
     }
 }

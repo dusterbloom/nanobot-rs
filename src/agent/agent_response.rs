@@ -192,6 +192,14 @@ fn send_finish_reason(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, r
     }
 }
 
+/// Stream the provider-reported completion-token count to the REPL renderer.
+/// The renderer accumulates these across a turn's LLM calls to show tok/s.
+fn send_token_count(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, tokens: u64) {
+    if let Some(ref tx) = tx {
+        let _ = tx.send(format!("\x00tokens:{}", tokens));
+    }
+}
+
 /// Maximum auto-continuations when the turn's output is being spoken (voice/TTS).
 /// A rambling local model would otherwise re-synthesize dozens of chunks.
 const VOICE_MAX_CONTINUATIONS: u32 = 4;
@@ -310,6 +318,16 @@ impl AgentLoopShared {
 
         // --- Token telemetry (always, regardless of kind) ---
         self.emit_token_telemetry(ctx, &response);
+        // Forward the completion-token count to the REPL footer. Sent per LLM
+        // call so the renderer can accumulate the turn total and report tok/s.
+        let completion_tokens = response
+            .usage
+            .get("completion_tokens")
+            .copied()
+            .unwrap_or(-1);
+        if completion_tokens > 0 {
+            send_token_count(&ctx.text_delta_tx, completion_tokens as u64);
+        }
 
         // --- Dispatch ---
         match kind {

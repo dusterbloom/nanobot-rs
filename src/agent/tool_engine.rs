@@ -140,10 +140,12 @@ pub(crate) async fn execute_tools_delegated(
     // Emit tool call start events for delegated calls.
     if let Some(ref tx) = ctx.tool_event_tx {
         for tc in routed_tool_calls {
+            // Keep enough of the arguments JSON that the REPL can recover the
+            // command/path for the persistent tool line (e.g. exec's command).
             let preview: String = serde_json::to_string(&tc.arguments)
                 .unwrap_or_default()
                 .chars()
-                .take(80)
+                .take(200)
                 .collect();
             let _ = tx.send(ToolEvent::CallStart {
                 tool_name: tc.name.clone(),
@@ -472,10 +474,12 @@ async fn execute_single_tool(
 
         // Emit CallStart.
         if let Some(ref tx) = tool_event_tx {
+            // Keep enough of the arguments JSON that the REPL can recover the
+            // command/path for the persistent tool line (e.g. exec's command).
             let preview: String = serde_json::to_string(&tc.arguments)
                 .unwrap_or_default()
                 .chars()
-                .take(80)
+                .take(200)
                 .collect();
             let _ = tx.send(ToolEvent::CallStart {
                 tool_name: tc.name.clone(),

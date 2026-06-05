@@ -90,12 +90,61 @@ fn rewind_and_clear_below(n: usize) -> String {
     format!("\x1b[{}A\x1b[J", n)
 }
 
-/// Extract a short context label from tool result data for display.
+/// Clear the prefill "working…" spinner the first time real output streams in.
+/// No-op once already cleared, so callers can invoke it unconditionally.
+fn clear_prefill(active: &mut bool) {
+    if *active {
+        print!("\r\x1b[K");
+        std::io::stdout().flush().ok();
+        *active = false;
+    }
+}
+
+/// Extract a string field value from a (possibly truncated) JSON object string.
 ///
-/// For `read_file`, extracts the file path from the `# /path/to/file (lines ...)`
-/// header. For `exec`, extracts the command if short enough. Returns empty
-/// string if no useful context can be extracted.
-fn extract_tool_context(tool_name: &str, result_data: &str) -> String {
+/// `arguments_preview` is clipped to a fixed width, so the JSON may not parse.
+/// Try a real parse first; on failure, scan for `"field"` and read the quoted
+/// value that follows, honoring `\"`/`\n`/`\t` escapes.
+fn extract_json_string_field(json_ish: &str, field: &str) -> Option<String> {
+    if let Ok(serde_json::Value::Object(map)) =
+        serde_json::from_str::<serde_json::Value>(json_ish)
+    {
+        if let Some(v) = map.get(field).and_then(|v| v.as_str()) {
+            return Some(v.to_string());
+        }
+    }
+    let key = format!("\"{}\"", field);
+    let start = json_ish.find(&key)? + key.len();
+    let after_colon = json_ish[start..].trim_start().strip_prefix(':')?;
+    let body = after_colon.trim_start().strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => break,
+            },
+            '"' => break,
+            other => out.push(other),
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Extract a short context label for a tool's persistent status line.
+///
+/// `args_preview` is the JSON arguments captured at `CallStart` (the result
+/// data alone doesn't contain the command/path). For `read_file`/`edit_file`
+/// the path comes from `result_data`; for `exec` the command comes from
+/// `args_preview`. Returns "" when no useful label can be extracted.
+fn extract_tool_context(tool_name: &str, result_data: &str, args_preview: &str) -> String {
     match tool_name {
         "read_file" => {
             // Result starts with "# /path/to/file.rs (lines N-M of T)"
@@ -125,9 +174,21 @@ fn extract_tool_context(tool_name: &str, result_data: &str) -> String {
             String::new()
         }
         "exec" => {
-            // For exec, result_data is the output, not the command.
-            // We don't have the command here, so skip.
-            String::new()
+            // The command lives in the arguments, not the output. Show it
+            // (first line, clipped) so the persistent line reads `$ <command>`.
+            let Some(cmd) = extract_json_string_field(args_preview, "command") else {
+                return String::new();
+            };
+            let one_line = cmd.trim().lines().next().unwrap_or("").trim();
+            if one_line.is_empty() {
+                return String::new();
+            }
+            let short: String = one_line.chars().take(80).collect();
+            if short.chars().count() < one_line.chars().count() {
+                format!("$ {}…", short)
+            } else {
+                format!("$ {}", short)
+            }
         }
         "edit_file" => {
             if result_data.contains("Successfully edited") {
@@ -602,6 +663,11 @@ async fn stream_and_render_inner(
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
         .map(str::to_string);
 
+    // Breathing room before the streamed answer. Printed here (cooked mode,
+    // before the input watcher enters raw mode and before the print task is
+    // scheduled) so it can't race with the task's prefill spinner.
+    println!();
+
     // Spawn unified print task: incremental renderer for text deltas,
     // tool events interleaved via clear_partial/restore_partial.
     let has_tool_rx = tool_rx_opt.is_some();
@@ -626,6 +692,19 @@ async fn stream_and_render_inner(
         let mut tool_done = !has_tool_rx;
         // Track previous CallEnd to coalesce repeated status-check calls.
         let mut prev_call_end: Option<(String, usize)> = None;
+        // Arguments captured at CallStart, keyed by tool_call_id, so the
+        // persistent CallEnd line can show the command/path that ran.
+        let mut args_by_id: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        // Prefill spinner: the blind wait before the first token is otherwise
+        // silent. Show a dim cue, cleared the moment any output streams in.
+        let mut prefill_active = false;
+        if std::io::stdout().is_terminal() {
+            print!("\r\x1b[2m\u{23f3} working\u{2026}\x1b[0m");
+            std::io::stdout().flush().ok();
+            prefill_active = true;
+        }
 
         loop {
             if delta_done && tool_done {
@@ -636,10 +715,15 @@ async fn stream_and_render_inner(
                 delta = delta_rx.recv(), if !delta_done => {
                     match delta {
                         Some(d) => {
-                            // Detect finish_reason metadata message (not rendered text).
+                            // Detect control markers (not rendered text).
                             if let Some(fr) = d.strip_prefix("\x00finish_reason:") {
                                 renderer.finish_reason = Some(fr.to_string());
+                            } else if let Some(tok) = d.strip_prefix("\x00tokens:") {
+                                if let Ok(n) = tok.parse::<u64>() {
+                                    renderer.add_tokens(n);
+                                }
                             } else {
+                                clear_prefill(&mut prefill_active);
                                 full_text.push_str(&d);
                                 renderer.push(&d);
                                 #[cfg(feature = "voice")]
@@ -665,7 +749,10 @@ async fn stream_and_render_inner(
                     }
                 }, if !tool_done => {
                     match event {
-                        Some(ToolEvent::CallStart { ref tool_name, ref arguments_preview, .. }) => {
+                        Some(ToolEvent::CallStart { ref tool_name, ref tool_call_id, ref arguments_preview }) => {
+                            clear_prefill(&mut prefill_active);
+                            // Stash args so the CallEnd line can show the command/path.
+                            args_by_id.insert(tool_call_id.clone(), arguments_preview.clone());
                             renderer.flush_pending();
                             renderer.clear_partial();
                             renderer.emit_marker();
@@ -678,6 +765,7 @@ async fn stream_and_render_inner(
                             renderer.restore_partial();
                         }
                         Some(ToolEvent::Progress { ref tool_name, elapsed_ms, ref output_preview, .. }) => {
+                            clear_prefill(&mut prefill_active);
                             renderer.flush_pending();
                             renderer.clear_partial();
                             renderer.emit_marker();
@@ -696,7 +784,8 @@ async fn stream_and_render_inner(
                             std::io::stdout().flush().ok();
                             renderer.restore_partial();
                         }
-                        Some(ToolEvent::CallEnd { ref tool_name, ok, duration_ms, ref result_data, .. }) => {
+                        Some(ToolEvent::CallEnd { ref tool_name, ref tool_call_id, ok, duration_ms, ref result_data }) => {
+                            clear_prefill(&mut prefill_active);
                             renderer.flush_pending();
                             renderer.clear_partial();
                             renderer.emit_marker();
@@ -712,8 +801,13 @@ async fn stream_and_render_inner(
                             }
 
                             let marker = if ok { "\x1b[32m\u{2713}\x1b[0m" } else { "\x1b[31m\u{2717}\x1b[0m" };
-                            // Extract a short context label from result data.
-                            let context = extract_tool_context(tool_name, result_data);
+                            // Extract a short label (command/path) from the args
+                            // captured at CallStart plus the result data.
+                            let args_preview = args_by_id
+                                .get(tool_call_id.as_str())
+                                .map(String::as_str)
+                                .unwrap_or("");
+                            let context = extract_tool_context(tool_name, result_data, args_preview);
                             let status_line = if context.is_empty() {
                                 format!(
                                     "\x1b[36m  \u{25b6} {}\x1b[0m  {} \x1b[2m{}ms\x1b[0m",
@@ -776,8 +870,6 @@ async fn stream_and_render_inner(
         std::io::stdout().flush().ok();
         (tool_lines, collected)
     });
-
-    println!();
 
     // Full-duplex input watcher: handles Enter (cancel + record), ESC+ESC (cancel),
     // Ctrl+C (cancel), and backtick (priority injection) during streaming/tool execution.
@@ -2337,5 +2429,60 @@ mod tests {
     fn test_truncate_output_empty() {
         let result = truncate_output("", 40, 2000);
         assert_eq!(result, "");
+    }
+
+    // --- extract_json_string_field ---
+
+    #[test]
+    fn test_extract_json_field_wellformed() {
+        let got = extract_json_string_field(r#"{"command":"ls -la"}"#, "command");
+        assert_eq!(got.as_deref(), Some("ls -la"));
+    }
+
+    #[test]
+    fn test_extract_json_field_truncated() {
+        // Clipped preview: no closing quote/brace, but the value is still readable.
+        let got = extract_json_string_field(r#"{"command":"echo hello world"#, "command");
+        assert_eq!(got.as_deref(), Some("echo hello world"));
+    }
+
+    #[test]
+    fn test_extract_json_field_escapes() {
+        let got = extract_json_string_field(r#"{"command":"grep \"foo\" ."}"#, "command");
+        assert_eq!(got.as_deref(), Some(r#"grep "foo" ."#));
+    }
+
+    #[test]
+    fn test_extract_json_field_missing() {
+        assert!(extract_json_string_field(r#"{"path":"/tmp"}"#, "command").is_none());
+    }
+
+    // --- extract_tool_context (exec shows the command) ---
+
+    #[test]
+    fn test_extract_tool_context_exec_shows_command() {
+        let ctx = extract_tool_context("exec", "some stdout output", r#"{"command":"ls -la"}"#);
+        assert_eq!(ctx, "$ ls -la");
+    }
+
+    #[test]
+    fn test_extract_tool_context_exec_first_line_only() {
+        // Multi-line commands collapse to the first line for the status line.
+        let ctx = extract_tool_context("exec", "out", "{\"command\":\"echo a\\nrm -rf b\"}");
+        assert_eq!(ctx, "$ echo a");
+    }
+
+    #[test]
+    fn test_extract_tool_context_exec_clips_long_command() {
+        let long = "x".repeat(200);
+        let args = format!(r#"{{"command":"{}"}}"#, long);
+        let ctx = extract_tool_context("exec", "out", &args);
+        assert!(ctx.starts_with("$ "));
+        assert!(ctx.ends_with('\u{2026}'), "expected ellipsis, got: {ctx}");
+    }
+
+    #[test]
+    fn test_extract_tool_context_exec_no_args() {
+        assert_eq!(extract_tool_context("exec", "out", ""), "");
     }
 }

@@ -1442,12 +1442,12 @@ impl AgentLoopShared {
         };
 
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
-            // Streaming path: forward text deltas as they arrive. For local
-            // tool-enabled turns, buffer speculative text until the response is
-            // classified so TTS/display do not speak "let me check" text that
-            // may be followed by a tool call or validation retry.
-            let buffer_local_tool_text = ctx.core.mode().is_local() && tool_defs_opt.is_some();
-            let mut buffered_tool_text_chars = 0usize;
+            // Streaming path: forward text deltas to the REPL/voice renderer as
+            // they arrive so the answer streams live — tokens appear as they are
+            // generated and feed sentence-by-sentence into streaming TTS. Brief
+            // pre-tool prose ("let me check…") streams as visible progress; tool
+            // parameters and output never reach this channel (they are emitted as
+            // ToolEvents and rendered separately).
             let mut stream = match ctx
                 .core
                 .provider
@@ -1511,24 +1511,13 @@ impl AgentLoopShared {
                                 // blocks so they don't render in the terminal.
                                 let filtered = xml_filter.filter(&delta);
                                 if !filtered.is_empty() {
-                                    if buffer_local_tool_text {
-                                        buffered_tool_text_chars += filtered.len();
-                                    } else {
-                                        ctx.flow.content_was_streamed = true;
-                                        let _ = delta_tx.send(filtered);
-                                    }
+                                    ctx.flow.content_was_streamed = true;
+                                    let _ = delta_tx.send(filtered);
                                 }
                             }
                             Some(StreamChunk::Done(resp)) => {
                                 if in_thinking {
                                     let _ = delta_tx.send("\x1b[0m\n\n".to_string());
-                                }
-                                if buffer_local_tool_text && buffered_tool_text_chars > 0 {
-                                    debug!(
-                                        buffered_chars = buffered_tool_text_chars,
-                                        tool_calls = resp.tool_calls.len(),
-                                        "stream_buffered_local_tool_text"
-                                    );
                                 }
                                 streamed_response = Some(resp);
                                 break;
