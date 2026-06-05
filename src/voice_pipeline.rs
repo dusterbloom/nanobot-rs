@@ -832,6 +832,22 @@ pub(crate) fn strip_tool_calls_for_tts(text: &str) -> String {
     filter.filter(text)
 }
 
+/// Short spoken cue for a tool action, used to narrate tool execution in voice
+/// mode. Deliberately speaks only the *action*, never the parameters or output
+/// (those carry paths, commands, and data that shouldn't be read aloud).
+pub(crate) fn tool_speech_cue(tool_name: &str) -> String {
+    match tool_name {
+        "exec" => "running a command".to_string(),
+        "web_search" => "searching the web".to_string(),
+        "web_fetch" | "read_url" => "reading a web page".to_string(),
+        "read_file" => "reading a file".to_string(),
+        "write_file" => "writing a file".to_string(),
+        "edit_file" => "editing a file".to_string(),
+        "recall" => "checking memory".to_string(),
+        other => format!("using {}", other),
+    }
+}
+
 fn find_sentence_boundary(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     for i in 0..bytes.len().saturating_sub(1) {
@@ -2086,6 +2102,24 @@ pub(crate) fn start_tts_playback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tool_speech_cue_known_and_default() {
+        assert_eq!(tool_speech_cue("exec"), "running a command");
+        assert_eq!(tool_speech_cue("web_search"), "searching the web");
+        assert_eq!(tool_speech_cue("read_file"), "reading a file");
+        assert_eq!(tool_speech_cue("recall"), "checking memory");
+        // Unknown tools fall back to a generic cue naming the tool.
+        assert_eq!(tool_speech_cue("frobnicate"), "using frobnicate");
+    }
+
+    #[test]
+    fn test_tool_speech_cue_passes_through_speech_filter() {
+        // A cue must survive the tool-call speech filter (no markup to strip).
+        let mut filter = ToolCallSpeechFilter::new();
+        let cue = tool_speech_cue("exec");
+        assert_eq!(filter.filter(&cue), cue);
+    }
 
     #[test]
     fn test_lingua_detects_short_english() {

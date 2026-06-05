@@ -649,8 +649,12 @@ async fn stream_and_render_inner(
 
     let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-    // Create tool event channel when provenance is enabled.
-    let (tool_rx_opt, tool_event_tx) = if show_tool_calls {
+    // Create the tool-event channel when provenance display is on (text REPL)
+    // OR when streaming to TTS — voice mode needs CallStart events to narrate
+    // tool actions aloud. In non-voice builds `tts_tx` is always None, so this
+    // reduces to the provenance condition.
+    let want_tool_events = show_tool_calls || tts_tx.is_some();
+    let (tool_rx_opt, tool_event_tx) = if want_tool_events {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         (Some(rx), Some(tx))
     } else {
@@ -753,6 +757,14 @@ async fn stream_and_render_inner(
                             clear_prefill(&mut prefill_active);
                             // Stash args so the CallEnd line can show the command/path.
                             args_by_id.insert(tool_call_id.clone(), arguments_preview.clone());
+                            // Voice: narrate the action (no params/output spoken).
+                            #[cfg(feature = "voice")]
+                            if let Some(ref mut acc) = tts_acc {
+                                acc.push(&format!(
+                                    "{}. ",
+                                    crate::voice_pipeline::tool_speech_cue(tool_name)
+                                ));
+                            }
                             renderer.flush_pending();
                             renderer.clear_partial();
                             renderer.emit_marker();
