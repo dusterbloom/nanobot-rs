@@ -72,6 +72,15 @@ pub enum StreamChunk {
     TextDelta(String),
     /// Incremental thinking/reasoning content (extended thinking).
     ThinkingDelta(String),
+    /// A streamed tool call started (its function name arrived). Emitted so
+    /// consumers can mark end-of-prefill: responses that go straight into
+    /// tool calls produce no text/thinking deltas and would otherwise never
+    /// record TTFT. Full calls are delivered in `Done`.
+    ToolCallDelta,
+    /// Server-reported prefill progress (`prompt_progress` chunks from
+    /// llama.cpp/higgs when the request set `return_progress`). `processed`
+    /// counts cached + prefilled prompt tokens out of `total`.
+    PrefillProgress { processed: u64, total: u64 },
     /// Stream complete — contains the fully assembled response.
     Done(LLMResponse),
 }

@@ -264,6 +264,10 @@ pub(crate) fn terminal_width() -> usize {
         return cached as usize;
     }
     let (w, h) = termimad::crossterm::terminal::size().unwrap_or((80, 24));
+    // A pty without a winsize (e.g. `script -q`) reports 0×0. Rendering math
+    // divides by width (incremental.rs compute_partial_rows), so treat 0 as
+    // unknown and fall back to the default instead of caching it.
+    let w = if w == 0 { 80 } else { w };
     CACHED_WIDTH.store(w, Ordering::Relaxed);
     CACHED_HEIGHT.store(h, Ordering::Relaxed);
     w as usize

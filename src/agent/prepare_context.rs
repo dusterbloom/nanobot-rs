@@ -569,7 +569,7 @@ impl AgentLoopShared {
             lcm_synced_to: None,
             counters: self.core_handle.counters.clone(),
             flow: FlowControl {
-                force_response: false,
+                boundary: crate::agent::agent_loop::ResponseBoundary::Off,
                 router_preflight_done: false,
                 tool_guard,
                 iterations_since_compaction: 0,

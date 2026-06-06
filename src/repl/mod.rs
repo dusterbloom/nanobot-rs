@@ -90,13 +90,136 @@ fn rewind_and_clear_below(n: usize) -> String {
     format!("\x1b[{}A\x1b[J", n)
 }
 
-/// Clear the prefill "working…" spinner the first time real output streams in.
-/// No-op once already cleared, so callers can invoke it unconditionally.
-fn clear_prefill(active: &mut bool) {
-    if *active {
-        print!("\r\x1b[K");
-        std::io::stdout().flush().ok();
-        *active = false;
+/// Prefill spinner: the otherwise-silent wait before a model's first token.
+///
+/// `Disabled` when stdout is not a terminal. `Idle` between prefills —
+/// cleared by the first streamed output, re-armed by the next LLM call's
+/// progress markers (tool loops prefill once per call). While `Active`, a
+/// 100ms ticker redraws elapsed time, upgraded to a true percentage when the
+/// server streams `prompt_progress` (higgs/llama.cpp `return_progress`).
+enum PrefillSpinner {
+    Disabled,
+    Idle,
+    Active {
+        started: std::time::Instant,
+        progress: Option<(u64, u64)>,
+    },
+}
+
+impl PrefillSpinner {
+    /// Terminal-gated constructor: the spinner renders only on real TTYs.
+    fn new() -> Self {
+        if std::io::stdout().is_terminal() {
+            Self::Idle
+        } else {
+            Self::Disabled
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+
+    /// Show the spinner at the start of the blind wait. No-op unless Idle.
+    fn start(&mut self) {
+        if matches!(self, Self::Idle) {
+            *self = Self::Active {
+                started: std::time::Instant::now(),
+                progress: None,
+            };
+            self.redraw();
+        }
+    }
+
+    /// Record server-reported prefill progress and redraw. Re-arms an Idle
+    /// spinner so later calls' prefill waits become visible too.
+    fn on_progress(&mut self, processed: u64, total: u64) {
+        match self {
+            Self::Disabled => {}
+            Self::Idle => {
+                *self = Self::Active {
+                    started: std::time::Instant::now(),
+                    progress: Some((processed, total)),
+                };
+                self.redraw();
+            }
+            Self::Active { progress, .. } => {
+                *progress = Some((processed, total));
+                self.redraw();
+            }
+        }
+    }
+
+    /// Repaint the spinner line in place. No-op unless Active.
+    fn redraw(&self) {
+        if let Self::Active { started, progress } = self {
+            print!(
+                "\r\x1b[K\x1b[2m{}\x1b[0m",
+                prefill_line(started.elapsed().as_secs_f32(), *progress)
+            );
+            std::io::stdout().flush().ok();
+        }
+    }
+
+    /// Erase the spinner the moment real output arrives. Active → Idle;
+    /// no-op otherwise, so callers can invoke it unconditionally.
+    fn clear(&mut self) {
+        if self.is_active() {
+            print!("\r\x1b[K");
+            std::io::stdout().flush().ok();
+            *self = Self::Idle;
+        }
+    }
+}
+
+/// Control markers smuggled through the text-delta channel (`\x00`-prefixed,
+/// never rendered). One enum so the print task dispatches with a `match`
+/// and the wire syntax is parsed in exactly one place.
+enum ControlMarker {
+    FinishReason(String),
+    Tokens(u64),
+    PrefillProgress { processed: u64, total: u64 },
+}
+
+/// Parse a delta-channel control marker. `None` means renderable text.
+fn parse_control_marker(d: &str) -> Option<ControlMarker> {
+    let rest = d.strip_prefix('\x00')?;
+    if let Some(fr) = rest.strip_prefix("finish_reason:") {
+        return Some(ControlMarker::FinishReason(fr.to_string()));
+    }
+    if let Some(tok) = rest.strip_prefix("tokens:") {
+        return tok.parse().ok().map(ControlMarker::Tokens);
+    }
+    if let Some(pp) = rest.strip_prefix("prefill:") {
+        let (p, t) = pp.split_once('/')?;
+        return Some(ControlMarker::PrefillProgress {
+            processed: p.parse().ok()?,
+            total: t.parse().ok()?,
+        });
+    }
+    None
+}
+
+/// Format the spinner line. Without server progress: `⏳ working… 3.2s`.
+/// With it: `⏳ prefill 42% · 1.4k/3.4k tok · 3.2s` — a prefix-cache hit
+/// shows immediately as a high starting percentage.
+fn prefill_line(elapsed_secs: f32, progress: Option<(u64, u64)>) -> String {
+    fn fmt_k(n: u64) -> String {
+        if n < 1000 {
+            n.to_string()
+        } else {
+            format!("{:.1}k", n as f64 / 1000.0)
+        }
+    }
+    match progress {
+        Some((processed, total)) if total > 0 => format!(
+            "\u{23f3} prefill {}% \u{b7} {}/{} tok \u{b7} {:.1}s",
+            processed * 100 / total,
+            fmt_k(processed),
+            fmt_k(total),
+            elapsed_secs
+        ),
+        _ => format!("\u{23f3} working\u{2026} {:.1}s", elapsed_secs),
     }
 }
 
@@ -792,13 +915,11 @@ async fn stream_and_render_inner(
             std::collections::HashMap::new();
 
         // Prefill spinner: the blind wait before the first token is otherwise
-        // silent. Show a dim cue, cleared the moment any output streams in.
-        let mut prefill_active = false;
-        if std::io::stdout().is_terminal() {
-            print!("\r\x1b[2m\u{23f3} working\u{2026}\x1b[0m");
-            std::io::stdout().flush().ok();
-            prefill_active = true;
-        }
+        // silent. Ticks elapsed time every 100ms; shows a true percentage when
+        // the server streams prefill progress. Cleared the moment any output
+        // arrives; re-armed by later calls' progress markers.
+        let mut prefill = PrefillSpinner::new();
+        prefill.start();
 
         loop {
             if delta_done && tool_done {
@@ -809,15 +930,23 @@ async fn stream_and_render_inner(
                 delta = delta_rx.recv(), if !delta_done => {
                     match delta {
                         Some(d) => {
-                            // Detect control markers (not rendered text).
-                            if let Some(fr) = d.strip_prefix("\x00finish_reason:") {
-                                renderer.finish_reason = Some(fr.to_string());
-                            } else if let Some(tok) = d.strip_prefix("\x00tokens:") {
-                                if let Ok(n) = tok.parse::<u64>() {
-                                    renderer.add_tokens(n);
+                            // Control markers are consumed here; only real
+                            // text falls through to the renderer/TTS.
+                            if let Some(marker) = parse_control_marker(&d) {
+                                match marker {
+                                    ControlMarker::FinishReason(fr) => {
+                                        renderer.finish_reason = Some(fr);
+                                    }
+                                    ControlMarker::Tokens(n) => renderer.add_tokens(n),
+                                    ControlMarker::PrefillProgress { processed, total } => {
+                                        // Never redraw over restored partial text.
+                                        if prefill.is_active() || !renderer.has_partial_text() {
+                                            prefill.on_progress(processed, total);
+                                        }
+                                    }
                                 }
                             } else {
-                                clear_prefill(&mut prefill_active);
+                                prefill.clear();
                                 full_text.push_str(&d);
                                 renderer.push(&d);
                                 #[cfg(feature = "voice")]
@@ -844,7 +973,7 @@ async fn stream_and_render_inner(
                 }, if !tool_done => {
                     match event {
                         Some(ToolEvent::CallStart { ref tool_name, ref tool_call_id, ref arguments_preview }) => {
-                            clear_prefill(&mut prefill_active);
+                            prefill.clear();
                             // Stash args so the CallEnd line can show the command/path.
                             args_by_id.insert(tool_call_id.clone(), arguments_preview.clone());
                             // Voice: narrate the action (no params/output spoken).
@@ -867,7 +996,7 @@ async fn stream_and_render_inner(
                             renderer.restore_partial();
                         }
                         Some(ToolEvent::Progress { ref tool_name, elapsed_ms, ref output_preview, .. }) => {
-                            clear_prefill(&mut prefill_active);
+                            prefill.clear();
                             renderer.flush_pending();
                             renderer.clear_partial();
                             renderer.emit_marker();
@@ -887,7 +1016,7 @@ async fn stream_and_render_inner(
                             renderer.restore_partial();
                         }
                         Some(ToolEvent::CallEnd { ref tool_name, ref tool_call_id, ok, duration_ms, ref result_data }) => {
-                            clear_prefill(&mut prefill_active);
+                            prefill.clear();
                             renderer.flush_pending();
                             renderer.clear_partial();
                             renderer.emit_marker();
@@ -960,6 +1089,9 @@ async fn stream_and_render_inner(
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)), if !delta_done => {
                     renderer.tick();
+                    // Keep the prefill spinner's elapsed time live (no-op
+                    // unless the spinner is showing).
+                    prefill.redraw();
                     if crate::tui::take_resize_pending() {
                         crate::tui::reset_scroll_region();
                         renderer.notify_resize();
@@ -2390,6 +2522,33 @@ fn index_sessions_background() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- prefill_line ---
+
+    /// One test, all spinner-line shapes: elapsed-only fallback, true
+    /// percentage with k-formatting, cache-hit start (>0%), and the
+    /// total==0 guard.
+    #[test]
+    fn test_prefill_line_formats() {
+        // No server progress → elapsed-only ticker.
+        assert_eq!(prefill_line(3.24, None), "⏳ working… 3.2s");
+        // Server progress → true percentage with k-formatted counts.
+        assert_eq!(
+            prefill_line(3.24, Some((1400, 3391))),
+            "⏳ prefill 41% · 1.4k/3.4k tok · 3.2s"
+        );
+        // Prefix-cache hit shows immediately as a high starting %.
+        assert_eq!(
+            prefill_line(0.05, Some((14000, 14500))),
+            "⏳ prefill 96% · 14.0k/14.5k tok · 0.1s"
+        );
+        // Sub-1000 counts stay plain; total==0 falls back to elapsed-only.
+        assert_eq!(
+            prefill_line(1.0, Some((999, 999))),
+            "⏳ prefill 100% · 999/999 tok · 1.0s"
+        );
+        assert_eq!(prefill_line(1.0, Some((0, 0))), "⏳ working… 1.0s");
+    }
 
     // --- parse_ctx_arg ---
 

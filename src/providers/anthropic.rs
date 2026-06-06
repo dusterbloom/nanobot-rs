@@ -809,6 +809,9 @@ async fn parse_anthropic_sse(
                         let id = block["id"].as_str().unwrap_or("").to_string();
                         let name = block["name"].as_str().unwrap_or("").to_string();
                         tool_blocks.insert(current_block_index, (id, name, String::new()));
+                        // Signal end-of-prefill for TTFT tracking — a response
+                        // that opens with tool_use has no text/thinking deltas.
+                        let _ = tx.send(StreamChunk::ToolCallDelta);
                     }
                 }
                 "content_block_delta" => {

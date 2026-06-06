@@ -325,11 +325,16 @@ impl TokenBudget {
 
     /// Trim message history to fit within the token budget.
     ///
-    /// Strategy (4 stages):
-    /// 1. **Soft**: Truncate old tool results to summaries.
-    /// 1.5. **Age-based**: Drop messages older than `max_age_turns` (if set).
-    /// 2. **Medium**: Drop oldest history messages (keep system + recent).
-    /// 3. **Hard**: Keep only system prompt + last user message + summary.
+    /// Within budget, messages are returned untouched — byte-stable prompts
+    /// keep server-side prefix caches hot (any head/middle mutation forces a
+    /// re-prefill of everything after it: ~60s for a 14k-token local
+    /// context). Long-session hygiene is compaction's job, not trim's.
+    ///
+    /// Over budget, four stages:
+    /// 1. **Age-based**: Drop messages older than `max_age_turns` (if set).
+    /// 2. **Soft**: Truncate old tool results to summaries.
+    /// 3. **Medium**: Drop oldest history messages (keep system + recent).
+    /// 4. **Hard**: Keep only system prompt + last user message + summary.
     ///
     /// The system prompt (first message) and the most recent user message
     /// (last message) are always preserved.
@@ -352,29 +357,37 @@ impl TokenBudget {
         let budget = self.available_budget(tool_def_tokens);
         let mut msgs = messages.to_vec();
 
-        // Stage 0: Proactive age-based eviction — runs even when within budget.
-        // Prevents context rot from old messages accumulating in large windows.
+        // Byte-stable fast path: within budget, never touch the history.
+        // This used to run age eviction proactively ("context rot"
+        // prevention), which dropped one head-of-history message per turn on
+        // long sessions — diverging the prompt prefix every turn and forcing
+        // the local server into a full re-prefill (~60s at ~250 tok/s).
+        if Self::estimate_tokens(&msgs) <= budget {
+            return msgs;
+        }
+
+        // Stage 1: Age-based eviction — drop messages older than max_age_turns.
         evict_by_age(&mut msgs, current_turn, max_age_turns);
 
         if Self::estimate_tokens(&msgs) <= budget {
             return msgs;
         }
 
-        // Stage 1: Truncate old tool results to digest summaries.
+        // Stage 2: Truncate old tool results to digest summaries.
         truncate_old_tool_results(&mut msgs);
 
         if Self::estimate_tokens(&msgs) <= budget {
             return msgs;
         }
 
-        // Stage 2: Drop oldest messages, keeping system + recent tail that fits.
+        // Stage 3: Drop oldest messages, keeping system + recent tail that fits.
         keep_recent_within_budget(&mut msgs, budget);
 
         if Self::estimate_tokens(&msgs) <= budget {
             return msgs;
         }
 
-        // Stage 3 (hard): System prompt + truncation notice + last message.
+        // Stage 4 (hard): System prompt + truncation notice + last message.
         hard_reset(&mut msgs);
 
         msgs
@@ -564,8 +577,6 @@ mod tests {
 
     #[test]
     fn test_age_based_eviction_drops_old_messages() {
-        // Budget is generous — age eviction should fire before size eviction.
-        let budget = TokenBudget::new(100_000, 8192);
         let mut messages = vec![json!({"role": "system", "content": "System prompt"})];
 
         // Add messages with turn tags. Turns 1-10 are "old", turn 50 is current.
@@ -580,8 +591,12 @@ mod tests {
 
         let original_count = messages.len();
 
+        // One token over budget → trimming engages; age eviction runs first.
+        let total = TokenBudget::estimate_tokens(&messages);
+        let budget = TokenBudget::new(total - 1, 0);
+
         // max_age_turns=10, current_turn=50 → threshold = 40. All turns 1-10 < 40 → evicted.
-        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+        let trimmed = budget.trim_to_fit_with_age(&messages, 0, 50, 10);
 
         // Old messages (turns 1-10) should be evicted, system + recent kept.
         assert!(
@@ -594,24 +609,28 @@ mod tests {
     }
 
     #[test]
-    fn test_age_based_eviction_keeps_recent_messages() {
+    fn test_age_eviction_skipped_within_budget() {
+        // Prefix-stability contract: within budget the history is returned
+        // byte-identical, even when messages exceed the age threshold.
+        // Proactive eviction used to drop one head message per turn on long
+        // sessions, diverging the prompt prefix and forcing the local server
+        // into a full re-prefill (~60s) every turn.
         let budget = TokenBudget::new(100_000, 8192);
-        let mut messages = vec![json!({"role": "system", "content": "System"})];
-
-        // All messages are recent (turns 45-50, threshold=40 with max_age=10, current=50).
-        for turn in 45..=50 {
-            messages
-                .push(json!({"role": "user", "content": format!("Msg {}", turn), "_turn": turn}));
-        }
+        let messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Ancient", "_turn": 1}),
+            json!({"role": "user", "content": "Recent", "_turn": 50}),
+        ];
 
         let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
-        // No eviction — all messages are within age window.
-        assert_eq!(trimmed.len(), messages.len());
+        assert_eq!(
+            trimmed, messages,
+            "within budget the prompt must stay byte-identical (prefix-cache safety)"
+        );
     }
 
     #[test]
     fn test_age_based_eviction_preserves_untagged_messages() {
-        let budget = TokenBudget::new(100_000, 8192);
         let mut messages = vec![json!({"role": "system", "content": "System"})];
 
         // Mix of tagged and untagged messages.
@@ -619,7 +638,11 @@ mod tests {
         messages.push(json!({"role": "user", "content": "Old", "_turn": 1}));
         messages.push(json!({"role": "user", "content": "Recent", "_turn": 50}));
 
-        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+        // One token over budget → eviction engages.
+        let total = TokenBudget::estimate_tokens(&messages);
+        let budget = TokenBudget::new(total - 1, 0);
+
+        let trimmed = budget.trim_to_fit_with_age(&messages, 0, 50, 10);
         // Untagged message preserved, old tagged dropped.
         let contents: Vec<&str> = trimmed
             .iter()

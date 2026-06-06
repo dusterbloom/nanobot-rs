@@ -19,7 +19,7 @@ use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
 use crate::providers::base::{LLMResponse, ToolCallRequest};
 use std::sync::Arc;
 
-use super::agent_loop::TurnContext;
+use super::agent_loop::{ResponseBoundary, TurnContext};
 
 const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
 
@@ -41,6 +41,11 @@ fn local_model_key(model: &str) -> String {
         .unwrap_or(model)
         .trim()
         .to_ascii_lowercase()
+}
+
+/// Side-effect tools that arm (and are rejected by) the response boundary.
+pub(crate) fn is_side_effect_tool(name: &str) -> bool {
+    matches!(name, "exec" | "write_file")
 }
 
 /// Execute tool calls via the delegation (tool-runner) path.
@@ -403,12 +408,13 @@ pub(crate) async fn execute_tools_delegated(
         ctx.taint_state.mark_tainted(tool_name, None);
     }
 
-    // Set response boundary flag if any delegated tool was exec/write_file.
-    for (_, tool_name, _) in &run_result.tool_results {
-        if tool_name == "exec" || tool_name == "write_file" {
-            ctx.flow.force_response = true;
-            break;
-        }
+    // Arm the response boundary if any delegated tool was exec/write_file.
+    if run_result
+        .tool_results
+        .iter()
+        .any(|(_, tool_name, _)| is_side_effect_tool(tool_name))
+    {
+        ctx.flow.boundary = ResponseBoundary::Pending;
     }
 
     tracing::Span::current().record("outcome", "ok");
@@ -667,9 +673,41 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
         r.result.error.as_deref(),
     );
 
-    // Response boundary flag.
-    if r.tool_name == "exec" || r.tool_name == "write_file" {
-        ctx.flow.force_response = true;
+    // Arm the response boundary after side-effect tools.
+    if is_side_effect_tool(&r.tool_name) {
+        ctx.flow.boundary = ResponseBoundary::Pending;
+    }
+}
+
+/// Inject an error result for a side-effect tool call rejected by the
+/// response boundary.
+///
+/// Deliberately narrower than `inject_tool_result`: no learning record, no
+/// taint, no audit, and — critically — it does NOT re-arm the boundary (a
+/// rejected call must not extend its own boundary, or the loop would
+/// livelock: nudge → reject → nudge → …).
+fn inject_boundary_rejection(ctx: &mut TurnContext, tc: &ToolCallRequest) {
+    let msg = format!(
+        "response boundary: {} was not executed — first respond with what the \
+         previous tool results showed; it can run in a later step.",
+        tc.name
+    );
+    if ctx.core.provenance_config.enabled {
+        ContextBuilder::add_tool_result_immutable(&mut ctx.messages, &tc.id, &tc.name, &msg);
+    } else {
+        ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &msg);
+    }
+    // The model attempted a tool but was prevented — suppress
+    // ClaimedButNotExecuted validation for this turn.
+    ctx.flow.tool_guard.had_blocked_calls = true;
+    if let Some(ref tx) = ctx.tool_event_tx {
+        let _ = tx.send(ToolEvent::CallEnd {
+            tool_name: tc.name.clone(),
+            tool_call_id: tc.id.clone(),
+            result_data: msg,
+            ok: false,
+            duration_ms: 0,
+        });
     }
 }
 
@@ -695,9 +733,22 @@ pub(crate) async fn execute_tools_inline(
         Some(&tc_json),
     );
 
-    // Partition into parallel-safe and sequential tool calls.
-    let (parallel, sequential): (Vec<_>, Vec<_>) = routed_tool_calls
+    // Response boundary enforcement: when this call was nudged to respond,
+    // side-effect tools are rejected with an error result instead of having
+    // been stripped from the schema (schema churn changes the prompt head
+    // and breaks server-side prefix caching; an error result appends at the
+    // tail and is cache-safe).
+    let boundary_armed = ctx.flow.boundary == ResponseBoundary::Armed;
+    let (blocked, allowed): (Vec<&ToolCallRequest>, Vec<&ToolCallRequest>) = routed_tool_calls
         .iter()
+        .partition(|tc| boundary_armed && is_side_effect_tool(&tc.name));
+    for tc in &blocked {
+        inject_boundary_rejection(ctx, tc);
+    }
+
+    // Partition into parallel-safe and sequential tool calls.
+    let (parallel, sequential): (Vec<_>, Vec<_>) = allowed
+        .into_iter()
         .partition(|tc| is_parallel_safe(&tc.name));
 
     // Build taint warnings up-front (immutable borrow of ctx.taint_state).

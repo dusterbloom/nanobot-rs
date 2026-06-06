@@ -189,17 +189,53 @@ impl TurnContext {
     }
 }
 
+/// Response-boundary lifecycle. After a side-effect tool (exec/write_file)
+/// runs, the next LLM call is nudged to report results as text.
+///
+/// Enforcement happens at execution time (side-effect calls are rejected
+/// with an error result), NOT by stripping tools from the schema: the tool
+/// array renders at the head of the prompt, and any change there invalidates
+/// server-side prefix caches — a full re-prefill of a 14k-token local
+/// context costs ~60s at ~250 tok/s prefill speed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum ResponseBoundary {
+    /// No boundary in effect.
+    #[default]
+    Off,
+    /// A side-effect tool just ran; arm the boundary on the next call.
+    Pending,
+    /// This call was nudged to respond; side-effect tool calls are rejected.
+    Armed,
+}
+
+/// Advance the response-boundary state machine at the start of an LLM call.
+/// Returns the new state plus whether the wrap-up nudge should be injected.
+///
+/// One-shot by construction: `Armed` never carries into the next call, so a
+/// model that insists on calling exec gets exactly one rejection nudge and
+/// may proceed on the call after — no livelock.
+fn advance_response_boundary(
+    state: ResponseBoundary,
+    cfg_enabled: bool,
+) -> (ResponseBoundary, bool) {
+    match state {
+        ResponseBoundary::Pending if cfg_enabled => (ResponseBoundary::Armed, true),
+        ResponseBoundary::Pending | ResponseBoundary::Armed => (ResponseBoundary::Off, false),
+        ResponseBoundary::Off => (ResponseBoundary::Off, false),
+    }
+}
+
 /// Per-turn flow control flags.
 ///
-/// These are orthogonal booleans (not a linear state machine):
-/// - `force_response`: set by exec/write_file tools, cleared after boundary injection
+/// These are orthogonal fields (not a linear state machine):
+/// - `boundary`: response-boundary lifecycle, set by exec/write_file tools
 /// - `router_preflight_done`: one-shot, set after router runs
 /// - `content_was_streamed`: one-shot, set when TextDelta chunks are sent
 /// - `iterations_since_compaction`: counter, reset when compaction swaps in
 /// - `tool_guard`: per-turn tool call policy enforcement
 /// - `retries`: typed per-failure counters (validation, continuation, rescue, etc.)
 pub(crate) struct FlowControl {
-    pub(crate) force_response: bool,
+    pub(crate) boundary: ResponseBoundary,
     pub(crate) router_preflight_done: bool,
     pub(crate) tool_guard: ToolGuard,
     pub(crate) iterations_since_compaction: u32,
@@ -758,15 +794,21 @@ impl AgentLoopShared {
     #[instrument(name = "step_pre_call", skip(self, ctx), fields(
         iteration,
         trio_mode = ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main,
-        boundary_active = ctx.flow.force_response,
+        boundary = ?ctx.flow.boundary,
         msg_count = ctx.messages.len(),
     ))]
     async fn step_pre_call(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
-        // Response boundary: suppress exec/write_file tools to force text output.
-        let boundary_active = ctx.flow.force_response
-            && ctx.core.provenance_config.enabled
-            && ctx.core.provenance_config.response_boundary;
-        if boundary_active {
+        // Response boundary: after exec/write_file, nudge the model to report
+        // results as text. Tool definitions stay byte-stable across calls —
+        // enforcement happens at execution time (execute_tools_inline rejects
+        // side-effect calls while Armed) so the prompt head never changes and
+        // server-side prefix caches survive the boundary.
+        let boundary_cfg =
+            ctx.core.provenance_config.enabled && ctx.core.provenance_config.response_boundary;
+        let (new_boundary, inject_nudge) =
+            advance_response_boundary(ctx.flow.boundary, boundary_cfg);
+        ctx.flow.boundary = new_boundary;
+        if inject_nudge {
             // Use "user" role, not "system". The Anthropic OpenAI-compat
             // endpoint strips mid-conversation system messages, which would
             // leave the conversation ending with an assistant message and
@@ -784,11 +826,10 @@ impl AgentLoopShared {
                 "role": "user",
                 "content": format!("[system] Acknowledged.{budget_note}")
             }));
-            ctx.flow.force_response = false;
         }
 
         // Select and filter tool definitions for this turn.
-        let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx, boundary_active);
+        let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx);
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
         } else {
@@ -906,11 +947,7 @@ impl AgentLoopShared {
     ///
     /// Returns `(active_defs, saved_defs)` where `saved_defs` preserves the
     /// pre-trio-stripping state for router passthrough fallback.
-    fn select_tool_definitions(
-        &self,
-        ctx: &mut TurnContext,
-        boundary_active: bool,
-    ) -> (Vec<Value>, Vec<Value>) {
+    fn select_tool_definitions(&self, ctx: &mut TurnContext) -> (Vec<Value>, Vec<Value>) {
         // Filter tool definitions to relevant tools.
         // Local models get a minimal set to conserve context tokens.
         let current_phase = self.system_state.load_full().task_phase;
@@ -987,15 +1024,9 @@ impl AgentLoopShared {
                 debug!("trio degraded — keeping tools for main model fallback");
             }
         }
-        if boundary_active {
-            tool_defs.retain(|def| {
-                let name = def
-                    .pointer("/function/name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                name != "exec" && name != "write_file"
-            });
-        }
+        // NOTE: the response boundary deliberately does NOT filter tool_defs.
+        // Schema changes invalidate server-side prefix caches (full re-prefill);
+        // side-effect calls are rejected at execution time instead.
         // ToolGate: size-class filtering for cloud models only.
         // Local models already get condensed descriptions (~350 tokens for
         // 12 tools, <1.1% of 32K context) and real availability is gated
@@ -1458,6 +1489,38 @@ impl AgentLoopShared {
             ctx.rendered_messages.clone()
         };
 
+        // Prefix-divergence diagnostic: a prompt that is not an append-only
+        // extension of this session's previous call forces the server to
+        // re-prefill everything past the divergence point (~60s for a 14k
+        // local context). Make every such miss a one-line diagnosis.
+        {
+            use crate::agent::prompt_fingerprint::{self, PromptDelta};
+            let fp = prompt_fingerprint::fingerprint(&messages_for_llm, tool_defs_opt);
+            let mut store = counters.prompt_fingerprints.lock();
+            match prompt_fingerprint::compare(store.get(&ctx.session_key), &fp) {
+                PromptDelta::Diverged {
+                    first_divergent_msg,
+                    prev_msgs,
+                    new_msgs,
+                    tools_changed,
+                } => {
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        at_msg = first_divergent_msg,
+                        prev_msgs,
+                        new_msgs,
+                        tools_changed,
+                        "prompt_prefix_diverged — server re-prefills past this point"
+                    );
+                }
+                PromptDelta::AppendOnly { added_msgs } => {
+                    debug!(session = %ctx.session_key, added_msgs, "prompt_append_only");
+                }
+                PromptDelta::First => {}
+            }
+            store.insert(ctx.session_key.clone(), fp);
+        }
+
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas to the REPL/voice renderer as
             // they arrive so the answer streams live — tokens appear as they are
@@ -1534,6 +1597,19 @@ impl AgentLoopShared {
                                     ctx.flow.content_was_streamed = true;
                                     let _ = delta_tx.send(filtered);
                                 }
+                            }
+                            Some(StreamChunk::ToolCallDelta) => {
+                                // Pure tool-call responses have no text/thinking
+                                // deltas — the first tool-call fragment marks
+                                // end of prefill for TTFT.
+                                ctx.flow.mark_first_token();
+                            }
+                            Some(StreamChunk::PrefillProgress { processed, total }) => {
+                                // Prefill still running — not a token, so no
+                                // mark_first_token. Forward to the REPL spinner
+                                // as a control marker.
+                                let _ =
+                                    delta_tx.send(format!("\x00prefill:{}/{}", processed, total));
                             }
                             Some(StreamChunk::Done(resp)) => {
                                 if in_thinking {
@@ -1719,7 +1795,14 @@ impl AgentLoopShared {
                 );
             }
         }
-        let should_delegate = ctx.core.tool_delegation_config.enabled && delegation_alive;
+        // A boundary-armed call must not delegate batches containing
+        // side-effect tools — the inline path below rejects them in-protocol.
+        let boundary_blocks_batch = ctx.flow.boundary == ResponseBoundary::Armed
+            && routed_tool_calls
+                .iter()
+                .any(|tc| crate::agent::tool_engine::is_side_effect_tool(&tc.name));
+        let should_delegate =
+            ctx.core.tool_delegation_config.enabled && delegation_alive && !boundary_blocks_batch;
         // Resolve provider+model from explicit config.
         let delegation_provider = ctx.core.tool_runner_provider.clone();
         let delegation_model = ctx.core.tool_runner_model.clone();
@@ -1744,7 +1827,7 @@ impl AgentLoopShared {
         if ctx.core.reasoning_config.auto_checkpoint_before_exec {
             let should_checkpoint = routed_tool_calls
                 .iter()
-                .any(|tc| tc.name == "exec" || tc.name == "write_file");
+                .any(|tc| crate::agent::tool_engine::is_side_effect_tool(&tc.name));
             if should_checkpoint {
                 {
                     let mut engine = ctx.reasoning.lock();
@@ -1823,6 +1906,25 @@ impl AgentLoopShared {
 // ============================================================================
 #[cfg(test)]
 mod tests {
+    use super::{advance_response_boundary, ResponseBoundary};
+
+    /// The response boundary is one-shot: Pending → Armed (with nudge) → Off.
+    /// Schema never changes; a model that insists on exec gets exactly one
+    /// rejection and may proceed on the following call — no livelock.
+    #[test]
+    fn test_response_boundary_lifecycle() {
+        use ResponseBoundary::{Armed, Off, Pending};
+        // Pending + feature on → Armed, inject the wrap-up nudge.
+        assert_eq!(advance_response_boundary(Pending, true), (Armed, true));
+        // Armed never carries into the next call (one rejection max).
+        assert_eq!(advance_response_boundary(Armed, true), (Off, false));
+        // Feature off: Pending is dropped silently.
+        assert_eq!(advance_response_boundary(Pending, false), (Off, false));
+        // Off is stable regardless of config.
+        assert_eq!(advance_response_boundary(Off, true), (Off, false));
+        assert_eq!(advance_response_boundary(Off, false), (Off, false));
+    }
+
     // Pure decision helpers — one per `is_local` read site. Each mirrors the
     // exact expression used at the cited line. Keeping them here (test-only)
     // avoids adding production code while still giving us assertion targets.

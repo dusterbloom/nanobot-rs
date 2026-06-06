@@ -218,6 +218,11 @@ pub struct RuntimeCounters {
     pub trio_state: AtomicU8,
     /// Per-domain ring buffer memory for specialist multi-turn context.
     pub specialist_memory: parking_lot::Mutex<crate::agent::router::SpecialistMemory>,
+    /// Per-session prompt fingerprints for the prefix-divergence diagnostic
+    /// (~8 bytes per message per session). See `agent::prompt_fingerprint`.
+    pub prompt_fingerprints: parking_lot::Mutex<
+        std::collections::HashMap<String, crate::agent::prompt_fingerprint::PromptFingerprint>,
+    >,
     /// Lazy auxiliary mlx-lm server for delegation/compaction/memory.
     /// Spawned on first use, killed on drop.
     #[cfg(feature = "mlx")]
@@ -253,6 +258,7 @@ impl RuntimeCounters {
             specialist_memory: parking_lot::Mutex::new(
                 crate::agent::router::SpecialistMemory::default(),
             ),
+            prompt_fingerprints: parking_lot::Mutex::new(std::collections::HashMap::new()),
             #[cfg(feature = "mlx")]
             auxiliary_server: None,
         }

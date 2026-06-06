@@ -363,6 +363,12 @@ impl IncrementalRenderer {
         self.total_tokens += tokens;
     }
 
+    /// True when un-rendered partial text exists (visible partial row or
+    /// buffered line). The prefill spinner must not redraw over it.
+    pub fn has_partial_text(&self) -> bool {
+        self.has_partial || !self.line_buffer.is_empty()
+    }
+
     /// Emit the И marker now (used when tool events arrive before any text).
     /// After this, subsequent text will render without the marker.
     pub fn emit_marker(&mut self) {
@@ -502,8 +508,12 @@ fn format_footer(elapsed: f32, ttft: Option<f32>, tokens: u64, finish_reason: Op
         Some(t) => format!("  ttft {:.2}s", t),
         None => String::new(),
     };
-    let rate = if elapsed > 0.5 {
-        format!("  {:.1} tok/s", tokens as f32 / elapsed)
+    // Decode rate excludes prefill: tokens stream only after the first token,
+    // so dividing by total elapsed would understate throughput (e.g. 90 tok
+    // after an 89s prefill is ~32 tok/s of decode, not 1 tok/s).
+    let decode_secs = elapsed - ttft.unwrap_or(0.0);
+    let rate = if decode_secs > 0.5 {
+        format!("  {:.1} tok/s", tokens as f32 / decode_secs)
     } else {
         String::new()
     };
@@ -850,6 +860,9 @@ mod tests {
         let f = format_footer(53.6, Some(46.2), 352, Some("stop"));
         assert!(f.contains("ttft 46.20s"), "footer: {f}");
         assert!(f.contains("352 tok"), "footer: {f}");
+        // Rate is decode throughput: 352 tok / (53.6 - 46.2)s = 47.6 tok/s,
+        // not 352/53.6 = 6.6 — dividing by total elapsed buries prefill cost.
+        assert!(f.contains("47.6 tok/s"), "footer: {f}");
     }
 
     #[test]

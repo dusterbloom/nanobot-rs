@@ -1086,6 +1086,14 @@ impl LLMProvider for OpenAICompatProvider {
         if let Some(tp) = top_p {
             body["top_p"] = serde_json::json!(tp);
         }
+        if is_local_api_base(&self.api_base) {
+            // Ask llama.cpp/higgs servers to stream prefill progress
+            // (`prompt_progress` chunks) so the REPL can show a real %.
+            // Local-only: cloud APIs may reject unknown fields, and their
+            // prefill is not the bottleneck. Servers without support
+            // (LM Studio) ignore the field.
+            body["return_progress"] = serde_json::json!(true);
+        }
         let supports_thinking = model_supports_thinking(model);
         apply_local_reasoning_controls(
             &mut body,
@@ -1610,6 +1618,16 @@ async fn parse_sse_stream(
                 }
             };
 
+            // Prefill progress (llama.cpp/higgs `return_progress`): these
+            // chunks have empty choices and carry only prompt_progress.
+            if let Some(pp) = chunk.get("prompt_progress") {
+                let processed = pp.get("processed").and_then(|v| v.as_u64()).unwrap_or(0);
+                let total = pp.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                if total > 0 {
+                    let _ = tx.send(StreamChunk::PrefillProgress { processed, total });
+                }
+            }
+
             // Extract from choices[0].delta
             if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
                 if let Some(choice) = choices.first() {
@@ -1659,6 +1677,11 @@ async fn parse_sse_stream(
                                         function.get("name").and_then(|v| v.as_str())
                                     {
                                         entry.1 = name.to_string();
+                                        // Name arrives in a call's first fragment —
+                                        // signal end-of-prefill for TTFT tracking
+                                        // (pure tool-call responses have no
+                                        // text/thinking deltas).
+                                        let _ = tx.send(StreamChunk::ToolCallDelta);
                                     }
                                     if let Some(args) =
                                         function.get("arguments").and_then(|v| v.as_str())
@@ -2804,6 +2827,41 @@ mod tests {
         assert!(
             resp.tool_calls[0].arguments.contains_key("raw"),
             "malformed tool args should be wrapped in 'raw' key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_tool_call_emits_prefill_marker() {
+        // A response that goes straight into a tool call (no text/thinking
+        // deltas) must emit ToolCallDelta when the function name arrives so
+        // the agent loop can record TTFT — otherwise tool-call turns never
+        // measure prefill, hiding exactly the slow calls.
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"function\":{\"name\":\"exec\",\"arguments\":\"\"}}]},\"index\":0}]}",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]},\"index\":0}]}",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"index\":0}]}",
+            "data: [DONE]",
+        ]);
+
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        parse_sse_stream(stream, tx).await;
+
+        let mut received = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            received.push(chunk);
+        }
+        let marker_pos = received
+            .iter()
+            .position(|c| matches!(c, StreamChunk::ToolCallDelta))
+            .expect("tool-call stream must emit ToolCallDelta so TTFT is recorded");
+        let done_pos = received
+            .iter()
+            .position(|c| matches!(c, StreamChunk::Done(_)))
+            .expect("should have received Done");
+        assert!(
+            marker_pos < done_pos,
+            "ToolCallDelta must arrive before Done (it marks end of prefill)"
         );
     }
 
