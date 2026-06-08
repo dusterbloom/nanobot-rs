@@ -45,33 +45,7 @@ type TtsSentenceSender = Option<()>;
 // Helpers (testable, pure-ish)
 // ============================================================================
 
-/// Truncate tool output for verbatim display: max `max_lines` lines or `max_chars` characters.
-fn truncate_output(data: &str, max_lines: usize, max_chars: usize) -> String {
-    let mut out = String::new();
-    let mut lines = 0usize;
-    let mut chars = 0usize;
-    for line in data.lines() {
-        if lines >= max_lines || chars >= max_chars {
-            out.push_str("...[truncated]");
-            break;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-            chars += 1;
-        }
-        let remaining = max_chars.saturating_sub(chars);
-        if line.len() > remaining {
-            let partial: String = line.chars().take(remaining).collect();
-            out.push_str(&partial);
-            out.push_str("...[truncated]");
-            break;
-        }
-        out.push_str(line);
-        chars += line.len();
-        lines += 1;
-    }
-    out
-}
+use crate::utils::helpers::truncate_lines_chars as truncate_output;
 
 /// ANSI escape to rewind `n` rows and clear everything below the cursor,
 /// without emitting newlines. Used to overwrite a previously-rendered block

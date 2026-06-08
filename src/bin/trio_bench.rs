@@ -208,25 +208,10 @@ fn truncate_to(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..FloorCharBoundary::floor_char_boundary(s, max)])
-    }
-}
-
-/// Extension trait to get floor char boundary for clean UTF-8 truncation.
-trait FloorCharBoundary {
-    fn floor_char_boundary(&self, index: usize) -> usize;
-}
-
-impl FloorCharBoundary for str {
-    fn floor_char_boundary(&self, index: usize) -> usize {
-        if index >= self.len() {
-            return self.len();
-        }
-        let mut i = index;
-        while i > 0 && !self.is_char_boundary(i) {
-            i -= 1;
-        }
-        i
+        format!(
+            "{}…",
+            &s[..nanobot::utils::helpers::floor_char_boundary(s, max)]
+        )
     }
 }
 

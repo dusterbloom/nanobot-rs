@@ -34,33 +34,7 @@ struct SubagentConfig {
     max_tool_result_chars: usize,
 }
 
-/// Truncate text for display: max `max_lines` lines or `max_chars` characters.
-fn truncate_for_display(data: &str, max_lines: usize, max_chars: usize) -> String {
-    let mut out = String::new();
-    let mut lines = 0usize;
-    let mut chars = 0usize;
-    for line in data.lines() {
-        if lines >= max_lines || chars >= max_chars {
-            out.push_str("...[truncated]");
-            break;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-            chars += 1;
-        }
-        let remaining = max_chars.saturating_sub(chars);
-        if line.len() > remaining {
-            let partial: String = line.chars().take(remaining).collect();
-            out.push_str(&partial);
-            out.push_str("...[truncated]");
-            break;
-        }
-        out.push_str(line);
-        chars += line.len();
-        lines += 1;
-    }
-    out
-}
+use crate::utils::helpers::truncate_lines_chars;
 
 /// Extract localhost port from an API base URL.
 fn extract_local_port_from_api_base(api_base: &str) -> Option<u16> {
@@ -498,7 +472,7 @@ impl SubagentManager {
                         priority,
                         agent_id: tid.clone(),
                         category,
-                        message: truncate_for_display(&result_text, 5, 500),
+                        message: truncate_lines_chars(&result_text, 5, 500),
                     });
                 }
             }
@@ -531,7 +505,7 @@ impl SubagentManager {
                     .replace("__", "")
                     .trim()
                     .to_string();
-                let truncated = truncate_for_display(&clean_result, 30, 3000);
+                let truncated = truncate_lines_chars(&clean_result, 30, 3000);
 
                 // Build a compact, clean result block.
                 // Use \x1b[RAW] prefix to bypass markdown rendering in the REPL.

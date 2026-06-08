@@ -350,13 +350,9 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    }
-}
+// Panic-safe truncation (the previous local copy sliced `&s[..max-3]`, which
+// panics on a multibyte char boundary, e.g. a session key with Unicode).
+use crate::utils::helpers::truncate_string as truncate;
 
 // ---------------------------------------------------------------------------
 // Tests

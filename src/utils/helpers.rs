@@ -133,6 +133,39 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
     result
 }
 
+/// Truncate multi-line output to at most `max_lines` lines and `max_chars`
+/// characters, appending `...[truncated]` when either bound is hit.
+///
+/// Used to bound tool/command output for display (REPL) and for subagent
+/// hand-back. Char counting is byte-length-based per line (cheap); the suffix
+/// is the load-bearing marker callers and tests look for.
+pub fn truncate_lines_chars(data: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut lines = 0usize;
+    let mut chars = 0usize;
+    for line in data.lines() {
+        if lines >= max_lines || chars >= max_chars {
+            out.push_str("...[truncated]");
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+            chars += 1;
+        }
+        let remaining = max_chars.saturating_sub(chars);
+        if line.len() > remaining {
+            let partial: String = line.chars().take(remaining).collect();
+            out.push_str(&partial);
+            out.push_str("...[truncated]");
+            break;
+        }
+        out.push_str(line);
+        chars += line.len();
+        lines += 1;
+    }
+    out
+}
+
 /// Convert a string to a safe filename by replacing unsafe characters with underscores.
 pub fn safe_filename(name: &str) -> String {
     const UNSAFE_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
