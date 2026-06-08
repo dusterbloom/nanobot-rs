@@ -575,6 +575,18 @@ impl ContextBuilder {
         LocalAssembler.assemble(&ctx).report
     }
 
+    /// Date-only session stamp (NOT wall-clock).
+    ///
+    /// A minute-resolution timestamp placed in the system/developer prefix sits
+    /// BEFORE the conversation history (`build_messages` extends history after
+    /// the developer message), so it changes every call and poisons the entire
+    /// downstream prefix cache — both Higgs's local radix cache and Anthropic
+    /// prompt caching. Date-only is stable within a day. Both the local and
+    /// cloud prompt paths MUST use this so they cannot drift apart again.
+    fn session_date_stamp() -> String {
+        Local::now().format("%Y-%m-%d").to_string()
+    }
+
     /// Collect local prompt sections as `SectionEntry` values.
     ///
     /// Converts the local identity prefix and static blocks into typed entries
@@ -642,7 +654,7 @@ impl ContextBuilder {
         // prefix instead of re-prefilling it. A minute-resolution timestamp here
         // (near token 15) would change every turn and poison the whole
         // prefix-cache chain for the entire downstream prompt.
-        let today = Local::now().format("%Y-%m-%d");
+        let today = Self::session_date_stamp();
         sections.push(SectionEntry {
             section: PromptSection::MemoryBriefing, // highest section → rendered last
             block: PromptBlock::new("Session", &format!("Today's date: {today}")),
@@ -850,15 +862,17 @@ impl ContextBuilder {
             }
         }
 
-        // Timestamp goes LAST so the stable prefix (identity + bootstrap +
-        // skills) hashes identically across turns for prefix-cache reuse.
-        let now = Local::now();
+        // Date-only (NOT wall-clock): the developer message holding this sits at
+        // index 1, before the conversation history, so a per-call timestamp here
+        // invalidates the prefix cache for everything downstream. Stable within a
+        // day. Shares `session_date_stamp` with the local path so they can't drift.
+        let today = Self::session_date_stamp();
         sections.push(SectionEntry {
             section: PromptSection::MemoryBriefing,
-            block: PromptBlock::new("Session", &format!("Current time: {now}")),
+            block: PromptBlock::new("Session", &format!("Today's date: {today}")),
             allocated_tokens: 0,
             actual_tokens: 0,
-            source: SectionSource::Runtime("timestamp".to_string()),
+            source: SectionSource::Static("session date"),
             included: true,
             shrinkable: false,
         });
@@ -2377,9 +2391,11 @@ mod tests {
     #[test]
     fn test_developer_role_no_context_no_extra_message() {
         // Even when there is no memory, no skills, no profiles, there is still
-        // a timestamp injected as a runtime section.  On cloud models the
+        // a date stamp injected as a session section.  On cloud models the
         // assembler puts non-Identity sections into the developer message, so
-        // we always get at least one developer message containing the time.
+        // we always get at least one developer message containing the date.
+        // The stamp is DATE-ONLY (not wall-clock) so it stays byte-stable across
+        // turns within a day and does not poison the prefix cache.
         let (_tmp, mut cb) = make_context();
         cb.model_name = "claude-opus-4-6".to_string();
 
@@ -2387,15 +2403,21 @@ mod tests {
 
         // Must still have a system message.
         assert!(messages.iter().any(|m| m["role"] == "system"));
-        // Developer message exists and contains the timestamp.
+        // Developer message exists and contains the date stamp...
         let dev: Vec<_> = messages
             .iter()
             .filter(|m| m["role"] == "developer")
             .collect();
         assert!(
             dev.iter()
+                .any(|m| m["content"].as_str().unwrap_or("").contains("Today's date")),
+            "developer message should contain the session date stamp"
+        );
+        // ...and must NOT contain a per-call wall-clock time (cache poison).
+        assert!(
+            !dev.iter()
                 .any(|m| m["content"].as_str().unwrap_or("").contains("Current time")),
-            "developer message should contain timestamp"
+            "developer message must not contain a wall-clock timestamp"
         );
     }
 

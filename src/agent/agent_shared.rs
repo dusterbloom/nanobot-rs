@@ -1799,11 +1799,33 @@ impl AgentLoopShared {
             && routed_tool_calls
                 .iter()
                 .any(|tc| crate::agent::tool_engine::is_side_effect_tool(&tc.name));
-        let should_delegate =
-            ctx.core.tool_delegation_config.enabled && delegation_alive && !boundary_blocks_batch;
         // Resolve provider+model from explicit config.
         let delegation_provider = ctx.core.tool_runner_provider.clone();
         let delegation_model = ctx.core.tool_runner_model.clone();
+        // Same-model local delegation is pure prefix-cache poison. The delegation
+        // sub-loop runs many distinct prompts on the SAME local server+model as
+        // the main agent; those calls evict the main conversation's KV/radix
+        // prefix, forcing a full re-prefill (~60-90s at large context, measured)
+        // every tool round. It also yields ZERO token-cost benefit (same model).
+        // When delegation would reuse the main local model, run tools inline so
+        // the main prefix stays warm. A genuinely separate delegation model
+        // (different name/server) is unaffected.
+        let delegation_reuses_main_model =
+            crate::agent::tool_engine::delegation_reuses_main_local_model(
+                ctx.core.is_local,
+                &ctx.core.model,
+                delegation_model.as_deref(),
+            );
+        if delegation_reuses_main_model {
+            debug!(
+                model = %ctx.core.model,
+                "delegation skipped: same local model as main — inline keeps the prefix cache warm"
+            );
+        }
+        let should_delegate = ctx.core.tool_delegation_config.enabled
+            && delegation_alive
+            && !boundary_blocks_batch
+            && !delegation_reuses_main_model;
 
         if should_delegate {
             if crate::agent::tool_engine::execute_tools_delegated(

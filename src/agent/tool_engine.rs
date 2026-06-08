@@ -35,12 +35,29 @@ fn summary_threshold_tokens(tool_name: &str) -> usize {
     }
 }
 
-fn local_model_key(model: &str) -> String {
+pub(crate) fn local_model_key(model: &str) -> String {
     model
         .strip_prefix("local:")
         .unwrap_or(model)
         .trim()
         .to_ascii_lowercase()
+}
+
+/// True when tool delegation would reuse the SAME local model as the main agent.
+///
+/// Such delegation is pure prefix-cache poison: the delegation sub-loop runs
+/// many distinct prompts on the same local server+model, evicting the main
+/// conversation's KV/radix prefix and forcing a full re-prefill (~60-90s at
+/// large context, measured) every tool round — for zero token-cost benefit
+/// (same model). The caller runs tools inline instead, keeping one warm prefix.
+/// A genuinely separate delegation model (different name) returns false, and a
+/// cloud main model (`is_local == false`) returns false.
+pub(crate) fn delegation_reuses_main_local_model(
+    is_local: bool,
+    main_model: &str,
+    delegation_model: Option<&str>,
+) -> bool {
+    is_local && delegation_model.map(local_model_key) == Some(local_model_key(main_model))
 }
 
 /// Side-effect tools that arm (and are rejected by) the response boundary.
@@ -910,6 +927,36 @@ mod tests {
         assert!(!is_parallel_safe("spawn"));
         // Unknown defaults to serial
         assert!(!is_parallel_safe("unknown_tool"));
+    }
+
+    #[test]
+    fn test_delegation_reuses_main_local_model() {
+        // Same local model (with/without the "local:" prefix, any case) → reuse
+        // → must NOT delegate (delegation would evict the main prefix cache).
+        assert!(delegation_reuses_main_local_model(
+            true,
+            "local:qwen36-35b",
+            Some("qwen36-35b")
+        ));
+        assert!(delegation_reuses_main_local_model(
+            true,
+            "Qwen36-35B",
+            Some("local:qwen36-35b")
+        ));
+        // A genuinely separate delegation model → real offload → delegate.
+        assert!(!delegation_reuses_main_local_model(
+            true,
+            "local:qwen36-35b",
+            Some("qwen3.5-2b")
+        ));
+        // Cloud main model → no shared local KV cache → delegation is fine.
+        assert!(!delegation_reuses_main_local_model(
+            false,
+            "claude-opus-4-6",
+            Some("claude-opus-4-6")
+        ));
+        // No delegation model resolved → cannot reuse.
+        assert!(!delegation_reuses_main_local_model(true, "local:qwen36-35b", None));
     }
 
     #[test]
