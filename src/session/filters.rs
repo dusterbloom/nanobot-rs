@@ -21,6 +21,20 @@ fn estimate_msg_tokens(m: &Value) -> usize {
     (content_len + tc_len + 20) / 4 // +20 for role/JSON overhead
 }
 
+/// A real conversational user turn: a `role: "user"` message that is NOT an
+/// injected synthetic scaffolding nudge (grounding, format-anchor, response
+/// boundary, iteration notice, etc.). Only these count as turns and serve as
+/// history-drop boundaries — counting synthetic nudges as turns would head-drop
+/// real history on every reload and diverge the prompt prefix, defeating the
+/// server-side prefix cache.
+fn is_real_user_turn(msg: &Value) -> bool {
+    msg.get("role").and_then(|r| r.as_str()) == Some("user")
+        && !msg
+            .get("_synthetic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+}
+
 /// Advance an index past leading `role: "tool"` messages whose parent
 /// `assistant+tool_calls` is outside the window. Sending a lone tool result
 /// to the LLM is a protocol error.
@@ -72,14 +86,17 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     // Stage 3: advance past orphaned tool results at the window boundary.
     let mut safe_start = skip_leading_orphan_tools(messages, start.max(clear_start));
 
-    // Stage 4: turn-based limit. Scan backward from the end counting user
-    // messages as turn boundaries. If more than `max_turns` user messages are
-    // seen, advance safe_start to drop the oldest ones.
+    // Stage 4: turn-based limit. Scan backward from the end counting REAL user
+    // messages (not synthetic nudges) as turn boundaries. If more than
+    // `max_turns` real turns are seen, advance safe_start to the oldest kept
+    // real-turn start. Because the boundary is always a real user-turn start,
+    // dropping happens at whole-turn granularity: the kept prefix only changes
+    // when an entire oldest turn ages out, not on every reload.
     if max_turns > 0 {
         let mut turns_seen = 0;
         let mut turn_start = safe_start;
         for i in (safe_start..messages.len()).rev() {
-            if messages[i].get("role").and_then(|r| r.as_str()) == Some("user") {
+            if is_real_user_turn(&messages[i]) {
                 turns_seen += 1;
                 if turns_seen > max_turns {
                     break;
@@ -157,6 +174,15 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
         keep_from = i;
     }
     let keep_from = skip_leading_orphan_tools(&mapped, keep_from);
+    // Snap the cut forward to the next real user-turn boundary so we drop whole
+    // oldest turns rather than slicing mid-turn. This keeps the kept-history
+    // prefix stable across reloads (the cut only advances a full turn at a time)
+    // and avoids starting the wire history on an assistant/tool message.
+    let keep_from = mapped[keep_from..]
+        .iter()
+        .position(is_real_user_turn)
+        .map(|off| keep_from + off)
+        .unwrap_or(keep_from);
     let dropped = mapped.len() - (mapped.len() - keep_from);
     if dropped > 0 {
         warn!(
@@ -475,6 +501,103 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["content"], "q5");
         assert_eq!(result[1]["content"], "a5");
+    }
+
+    #[test]
+    fn test_synthetic_nudges_dont_count_as_turns() {
+        // 3 real turns, each padded with synthetic scaffolding nudges injected
+        // during the turn's tool loop. Even with max_turns=3, all 3 REAL turns
+        // must survive — synthetic nudges are not turns. Before the fix, the 9
+        // nudges (role=user) pushed the turn count past the limit and head-
+        // dropped real history on every reload, diverging the prompt prefix.
+        let mut messages = Vec::new();
+        for i in 0..3u32 {
+            messages.push(user(&format!("real question {i}")));
+            messages.push(assistant(&format!("answer {i}")));
+            messages.push(synthetic("[grounding] Turn x. Context: 3% used."));
+            messages.push(synthetic("[format-anchor] reminder"));
+            messages.push(synthetic("[system] report first"));
+        }
+        let result = filter_history(&messages, 100, 3);
+
+        let real_users: Vec<&str> = result
+            .iter()
+            .filter(|m| role_of(m) == "user")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(
+            real_users,
+            vec!["real question 0", "real question 1", "real question 2"],
+            "all real turns must survive; synthetic nudges must not be counted as turns"
+        );
+        // Synthetic nudge content must never reach the wire history.
+        assert!(
+            result
+                .iter()
+                .all(|m| !m["content"].as_str().unwrap_or("").starts_with('[')),
+            "no synthetic scaffolding nudge should survive to the wire"
+        );
+    }
+
+    #[test]
+    fn test_prefix_byte_stable_across_reloads() {
+        // The prefix-cache invariant: turn N+1's reloaded wire history must be an
+        // APPEND-ONLY extension of turn N's — reload N's output is a byte-
+        // identical prefix of N+1's, so the server only re-prefills the appended
+        // tail instead of cold-prefilling from the divergence point.
+        let turn_n = vec![
+            user("q0"),
+            assistant("a0"),
+            synthetic("[grounding] g"),
+            synthetic("[format-anchor] f"),
+            user("q1"),
+            assistant("a1"),
+        ];
+        let mut turn_n1 = turn_n.clone();
+        turn_n1.extend(vec![
+            synthetic("[system] report first"),
+            user("q2"),
+            assistant("a2"),
+        ]);
+
+        let out_n = filter_history(&turn_n, 100, 10);
+        let out_n1 = filter_history(&turn_n1, 100, 10);
+
+        assert!(out_n1.len() >= out_n.len());
+        for (i, m) in out_n.iter().enumerate() {
+            assert_eq!(
+                m, &out_n1[i],
+                "prefix diverged at index {i}: reload is not append-only"
+            );
+        }
+    }
+
+    #[test]
+    fn test_token_budget_drops_at_real_user_turn_boundary() {
+        // When over the Stage-6 token budget, the kept head must begin at a real
+        // user turn — we drop whole oldest turns rather than slicing mid-turn and
+        // leaving the history starting on an assistant message. Here the natural
+        // budget cut lands on `a1` (the response to a large user turn); the snap
+        // must advance it forward to the next real user turn (`q2`).
+        let big_user = "x".repeat(8000); // ~2000 tokens, dwarfs the budget
+        let messages = vec![
+            user("q0"),
+            assistant("a0"),
+            json!({"role": "user", "content": big_user}),
+            assistant("a1"),
+            user("q2"),
+            assistant("a2"),
+        ];
+        // max_messages=6 == len (no Stage-1 window drop); Stage-6 budget = 900.
+        let result = filter_history(&messages, 6, 0);
+
+        assert!(!result.is_empty());
+        assert_eq!(
+            role_of(&result[0]),
+            "user",
+            "kept history must start at a real user turn, not mid-turn"
+        );
+        assert_eq!(result[0]["content"], "q2");
     }
 
     // ------------------------------------------------------------------

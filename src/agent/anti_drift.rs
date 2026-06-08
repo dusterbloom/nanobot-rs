@@ -340,10 +340,9 @@ fn inject_format_anchor(messages: &mut Vec<Value>, iteration: u32, interval: u32
             return false;
         }
     }
-    messages.push(serde_json::json!({
-        "role": "user",
-        "content": "[format-anchor] Reminder: use tool calls for actions, not text descriptions. Be concise. No XML imitation. If unsure, ask."
-    }));
+    messages.push(crate::agent::markers::scaffold_user(
+        "[format-anchor] Reminder: use tool calls for actions, not text descriptions. Be concise. No XML imitation. If unsure, ask.",
+    ));
     true
 }
 

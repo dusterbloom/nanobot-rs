@@ -437,10 +437,8 @@ impl AgentLoopShared {
                     "[System notice] You have {} iteration(s) remaining. Produce your final answer now.",
                     remaining
                 );
-                ctx.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": nudge_msg
-                }));
+                ctx.messages
+                    .push(crate::agent::markers::scaffold_user(nudge_msg));
                 info!(
                     "iteration_nudge: injected wrap-up nudge at iteration {}/{}",
                     iteration, ctx.core.max_iterations
@@ -502,15 +500,12 @@ impl AgentLoopShared {
                             "loop_breaker: {} consecutive non-tool iterations, forcing stop",
                             consecutive_empty
                         );
-                        ctx.messages.push(json!({
-                            "role": "user",
-                            "content": format!(
-                                "[System] Loop detected: you produced {} consecutive responses without executing any tool calls. \
-                                 Your output may contain leaked thinking (<think> blocks) or text descriptions of actions instead of actual tool calls. \
-                                 Stop describing what you want to do — either use a tool call or give your final answer as plain text.",
-                                consecutive_empty
-                            )
-                        }));
+                        ctx.messages.push(crate::agent::markers::scaffold_user(format!(
+                            "[System] Loop detected: you produced {} consecutive responses without executing any tool calls. \
+                             Your output may contain leaked thinking (<think> blocks) or text descriptions of actions instead of actual tool calls. \
+                             Stop describing what you want to do — either use a tool call or give your final answer as plain text.",
+                            consecutive_empty
+                        )));
                         // Promote to a real iteration to make progress
                         ctx.flow.retries.validation = 0;
                         iteration += 1;
@@ -748,10 +743,8 @@ impl AgentLoopShared {
                 state.context_pressure,
             ) {
                 let grounding = system_state::format_grounding(&state);
-                ctx.messages.push(json!({
-                    "role": "user",
-                    "content": grounding
-                }));
+                ctx.messages
+                    .push(crate::agent::markers::scaffold_user(grounding));
             }
         }
 
@@ -822,10 +815,15 @@ impl AgentLoopShared {
             } else {
                 String::new()
             };
-            ctx.messages.push(json!({
-                "role": "user",
-                "content": format!("[system] Acknowledged.{budget_note}")
-            }));
+            // Behavioral boundary: this nudge fires only when the model ran a
+            // side-effect tool without reporting. Tell it what to do (report
+            // first) instead of a bare acknowledgement. Marked `_synthetic` so
+            // it is not persisted as a real turn and does not break the prefix
+            // cache on the next reload.
+            ctx.messages.push(crate::agent::markers::scaffold_user(format!(
+                "[system] Report what the previous tool results showed before \
+                 running more tools.{budget_note}"
+            )));
         }
 
         // Select and filter tool definitions for this turn.

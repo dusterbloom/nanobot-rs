@@ -48,6 +48,21 @@ pub(crate) fn is_side_effect_tool(name: &str) -> bool {
     matches!(name, "exec" | "write_file")
 }
 
+/// Decide whether to arm the response boundary after a tool-execution round.
+///
+/// Behavioral, not positional: arm ONLY when a side-effect tool (exec/write_file)
+/// actually ran AND the assistant produced no text report. A model that narrates
+/// each step is not fabricating results, so it must not be throttled. Arming
+/// blindly after every side-effect call (the prior behavior) rejected ~1/3 of
+/// legitimate consecutive exec/write_file calls. `executed_tools` must contain
+/// only the tools that actually executed — never boundary-rejected calls — so a
+/// rejected call cannot re-arm the boundary.
+fn should_arm_boundary(assistant_content: Option<&str>, executed_tools: &[&str]) -> bool {
+    let reported = assistant_content.is_some_and(|c| !c.trim().is_empty());
+    let ran_side_effect = executed_tools.iter().any(|n| is_side_effect_tool(n));
+    ran_side_effect && !reported
+}
+
 /// Execute tool calls via the delegation (tool-runner) path.
 ///
 /// Returns `true` if delegation was used (caller should `continue` the main loop).
@@ -408,12 +423,14 @@ pub(crate) async fn execute_tools_delegated(
         ctx.taint_state.mark_tainted(tool_name, None);
     }
 
-    // Arm the response boundary if any delegated tool was exec/write_file.
-    if run_result
+    // Behavioral response-boundary arming (mirrors execute_tools_inline).
+    // `response` is the main-model response that requested delegation.
+    let executed: Vec<&str> = run_result
         .tool_results
         .iter()
-        .any(|(_, tool_name, _)| is_side_effect_tool(tool_name))
-    {
+        .map(|(_, tool_name, _)| tool_name.as_str())
+        .collect();
+    if should_arm_boundary(response.content.as_deref(), &executed) {
         ctx.flow.boundary = ResponseBoundary::Pending;
     }
 
@@ -673,10 +690,12 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
         r.result.error.as_deref(),
     );
 
-    // Arm the response boundary after side-effect tools.
-    if is_side_effect_tool(&r.tool_name) {
-        ctx.flow.boundary = ResponseBoundary::Pending;
-    }
+    // NOTE: response-boundary arming is NOT done here. This function sees only
+    // one tool result and cannot tell whether the model reported its work in the
+    // assistant turn. Arming is decided once, behaviorally, by the caller
+    // (execute_tools_inline / execute_tools_delegated) which holds the assistant
+    // `response`. Arming here (per-tool, unconditionally) was positional, not
+    // behavioral — it throttled legitimate narrated side-effect chains.
 }
 
 /// Inject an error result for a side-effect tool call rejected by the
@@ -806,6 +825,17 @@ pub(crate) async fn execute_tools_inline(
         .await;
         inject_tool_result(ctx, &r).await;
     }
+
+    // Behavioral response-boundary arming. `parallel`/`sequential` hold only the
+    // EXECUTED (non-blocked) calls, so a boundary-rejected call cannot re-arm.
+    let executed: Vec<&str> = parallel
+        .iter()
+        .chain(sequential.iter())
+        .map(|tc| tc.name.as_str())
+        .collect();
+    if should_arm_boundary(response.content.as_deref(), &executed) {
+        ctx.flow.boundary = ResponseBoundary::Pending;
+    }
 }
 
 #[cfg(test)]
@@ -880,6 +910,30 @@ mod tests {
         assert!(!is_parallel_safe("spawn"));
         // Unknown defaults to serial
         assert!(!is_parallel_safe("unknown_tool"));
+    }
+
+    #[test]
+    fn test_should_arm_boundary_behavioral_matrix() {
+        // The response boundary is BEHAVIORAL: it arms only when a side-effect
+        // tool (exec/write_file) actually ran AND the assistant produced no text
+        // report. This is the whole point of the fix — a model that narrates its
+        // work must not be throttled.
+
+        // ran side-effect + no report -> ARM (force a report next call)
+        assert!(should_arm_boundary(None, &["exec"]));
+        assert!(should_arm_boundary(Some(""), &["write_file"]));
+        assert!(should_arm_boundary(Some("  \n\t "), &["exec", "read_file"]));
+
+        // ran side-effect + reported -> do NOT arm (the regression being fixed:
+        // narrated consecutive exec/write_file chains were being rejected ~1/3
+        // of the time)
+        assert!(!should_arm_boundary(Some("Running wc -l to size the files."), &["exec"]));
+        assert!(!should_arm_boundary(Some("Writing the summary now."), &["write_file"]));
+
+        // no side-effect tool ran -> never arm, report or not
+        assert!(!should_arm_boundary(None, &["read_file", "list_dir"]));
+        assert!(!should_arm_boundary(Some("here are the files"), &["read_file"]));
+        assert!(!should_arm_boundary(None, &[]));
     }
 
     #[test]
