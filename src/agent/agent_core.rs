@@ -106,21 +106,7 @@ pub struct SwappableCore {
 }
 
 impl SwappableCore {
-    /// Whether this core needs local-model protocol constraints.
-    /// True for both local servers and cluster peers (which are also local LAN servers).
-    pub fn needs_local_protocol(&self) -> bool {
-        #[cfg(feature = "cluster")]
-        {
-            self.is_local || self.is_cluster_peer
-        }
-        #[cfg(not(feature = "cluster"))]
-        {
-            self.is_local
-        }
-    }
-
-    /// Typed runtime descriptor for this core. Wave 2 introduces this accessor
-    /// alongside the still-canonical `is_local` bool; Wave 3 migrates readers.
+    /// Typed runtime descriptor for this core.
     pub fn mode(&self) -> &RuntimeMode {
         &self.mode
     }
