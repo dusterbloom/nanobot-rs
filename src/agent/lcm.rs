@@ -373,40 +373,6 @@ impl LcmEngine {
         engine
     }
 
-    /// Get the active context rendered through a protocol.
-    ///
-    /// This is the preferred way to get messages for the LLM - it ensures
-    /// the protocol is applied correctly.
-    pub fn active_context_with_protocol(
-        &self,
-        protocol: &dyn ConversationProtocol,
-        system_prompt: &str,
-    ) -> Vec<Value> {
-        // Convert active entries to Turns, then render via protocol
-        let mut turns: Vec<Turn> = Vec::new();
-
-        for entry in &self.active {
-            match entry {
-                ContextEntry::Raw { message, .. } => {
-                    if let Some(turn) = crate::agent::turn::turn_from_legacy(message) {
-                        turns.push(turn);
-                    }
-                }
-                ContextEntry::Summary { node_id, .. } => {
-                    if let Some(node) = self.dag.get(*node_id) {
-                        turns.push(Turn::Summary {
-                            text: node.text.clone(),
-                            source_ids: node.source_ids.clone(),
-                            level: node.level,
-                        });
-                    }
-                }
-            }
-        }
-
-        protocol.render(system_prompt, &turns)
-    }
-
     /// Ingest a new message into the immutable store and active context.
     ///
     /// Returns the assigned MessageId.
@@ -709,12 +675,6 @@ impl LcmEngine {
             .iter()
             .filter_map(|&id| self.store.get(id).map(|msg| (id, msg)))
             .collect()
-    }
-
-    /// Expand a summary node: retrieve all original messages it covers.
-    pub fn expand_summary(&self, node_id: usize) -> Vec<(MessageId, &Value)> {
-        let ids = self.dag.all_source_ids(node_id);
-        self.expand(&ids)
     }
 
     /// Format expanded messages for display (used by lcm_expand tool).

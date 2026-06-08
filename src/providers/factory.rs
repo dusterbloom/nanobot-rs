@@ -112,18 +112,6 @@ pub fn create_openai_compat(spec: ProviderSpec) -> Arc<dyn LLMProvider> {
     Arc::new(prov)
 }
 
-/// Create an Anthropic native provider (for OAuth / direct API) with retry config.
-pub fn create_anthropic_with_retry(
-    token: &str,
-    model: Option<&str>,
-    retry: &RetryConfig,
-) -> Arc<dyn LLMProvider> {
-    Arc::new(
-        AnthropicProvider::new(token, model)
-            .with_retry_config(retry.provider_min_secs, retry.provider_max_secs),
-    )
-}
-
 /// Create an Anthropic native provider (for OAuth / direct API).
 pub fn create_anthropic(token: &str, model: Option<&str>) -> Arc<dyn LLMProvider> {
     Arc::new(AnthropicProvider::new(token, model))
@@ -145,14 +133,6 @@ pub fn is_claude_model(model: &str) -> bool {
 /// 1. `api_base` contains `localhost` / `127.0.0.1` → OpenAICompat (local server).
 /// 2. `api_key` starts with `sk-ant-` AND model is Claude (or unspecified) → AnthropicProvider.
 /// 3. Otherwise → OpenAICompat (safe fallback for all other cloud providers).
-///
-/// The model hint prevents misrouting non-Claude models (e.g. ministral) to
-/// the Anthropic Messages API, which would 404.
-pub fn from_provider_config(cfg: &ProviderConfig) -> Arc<dyn LLMProvider> {
-    from_provider_config_for_model(cfg, None)
-}
-
-/// Model-aware variant of [`from_provider_config`].
 ///
 /// When the target `model` is known at the call site, pass it here so the
 /// routing logic can avoid sending non-Claude models to the Anthropic API.
@@ -265,7 +245,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             api_base: None,
         };
-        let provider = from_provider_config(&cfg);
+        let provider = from_provider_config_for_model(&cfg, None);
         // Should use the localhost:8080 fallback.
         assert!(provider.get_api_base().is_some());
         assert_eq!(
@@ -280,7 +260,7 @@ mod tests {
             api_key: "local".to_string(),
             api_base: Some("http://localhost:11434/v1".to_string()),
         };
-        let provider = from_provider_config(&cfg);
+        let provider = from_provider_config_for_model(&cfg, None);
         assert_eq!(
             provider.get_api_base().as_deref(),
             Some("http://localhost:11434/v1")
@@ -293,7 +273,7 @@ mod tests {
             api_key: "local".to_string(),
             api_base: Some("http://127.0.0.1:8080/v1".to_string()),
         };
-        let provider = from_provider_config(&cfg);
+        let provider = from_provider_config_for_model(&cfg, None);
         assert_eq!(
             provider.get_api_base().as_deref(),
             Some("http://127.0.0.1:8080/v1")
@@ -306,7 +286,7 @@ mod tests {
             api_key: "sk-ant-api03-abc123".to_string(),
             api_base: None,
         };
-        let provider = from_provider_config(&cfg);
+        let provider = from_provider_config_for_model(&cfg, None);
         // AnthropicProvider reports None for get_api_base() or the Anthropic base.
         // The key check: it should NOT be pointing to localhost.
         let base = provider.get_api_base();
@@ -324,7 +304,7 @@ mod tests {
             api_key: "sk-ant-oat01-abc123".to_string(),
             api_base: None,
         };
-        let provider = from_provider_config(&cfg);
+        let provider = from_provider_config_for_model(&cfg, None);
         let base = provider.get_api_base();
         if let Some(b) = base {
             assert!(

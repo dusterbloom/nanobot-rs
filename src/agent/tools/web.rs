@@ -24,25 +24,12 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 // Static regexes (compiled once)
 // ---------------------------------------------------------------------------
-static RE_SCRIPT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?is)<script[\s\S]*?</script>").unwrap());
-static RE_STYLE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?is)<style[\s\S]*?</style>").unwrap());
-static RE_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
 static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").unwrap());
 static RE_NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Remove HTML tags and decode entities.
-fn strip_tags(text: &str) -> String {
-    let text = RE_SCRIPT.replace_all(text, "");
-    let text = RE_STYLE.replace_all(&text, "");
-    let text = RE_TAGS.replace_all(&text, "");
-    html_escape::decode_html_entities(&text).trim().to_string()
-}
 
 /// Normalize whitespace: collapse runs of spaces/tabs, limit consecutive newlines.
 fn normalize_whitespace(text: &str) -> String {
@@ -756,47 +743,6 @@ mod tests {
         assert!(validate_url("https://1.1.1.1").is_ok());
     }
 
-    // -----------------------------------------------------------------------
-    // strip_tags tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_strip_tags_basic() {
-        let result = strip_tags("<p>Hello <b>World</b></p>");
-        assert_eq!(result, "Hello World");
-    }
-
-    #[test]
-    fn test_strip_tags_removes_script() {
-        let html = "Before<script>alert('xss')</script>After";
-        let result = strip_tags(html);
-        assert_eq!(result, "BeforeAfter");
-    }
-
-    #[test]
-    fn test_strip_tags_removes_style() {
-        let html = "Before<style>body { color: red; }</style>After";
-        let result = strip_tags(html);
-        assert_eq!(result, "BeforeAfter");
-    }
-
-    #[test]
-    fn test_strip_tags_plain_text() {
-        let result = strip_tags("no tags here");
-        assert_eq!(result, "no tags here");
-    }
-
-    #[test]
-    fn test_strip_tags_html_entities() {
-        let result = strip_tags("&amp; &lt; &gt;");
-        assert_eq!(result, "& < >");
-    }
-
-    #[test]
-    fn test_strip_tags_empty() {
-        let result = strip_tags("");
-        assert_eq!(result, "");
-    }
 
     // -----------------------------------------------------------------------
     // normalize_whitespace tests

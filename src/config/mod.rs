@@ -9,11 +9,3 @@ pub fn redact(s: &str) -> String {
         format!("[REDACTED len={}]", s.len())
     }
 }
-
-/// Redact an optional secret for Debug output.
-pub fn redact_opt(s: &Option<String>) -> String {
-    match s {
-        None => "[none]".into(),
-        Some(s) => redact(s),
-    }
-}
