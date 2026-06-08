@@ -1320,7 +1320,10 @@ Rules:
             concat!(
                 "Use tools only when they change the answer. ",
                 "After tool results, answer directly. ",
-                "One tool call at a time."
+                "One tool call at a time. ",
+                "read_file returns the first 500 lines and the file's total; ",
+                "for large files read the specific range you need with ",
+                "lines=\"START:END\" rather than the whole file."
             ),
         ));
 

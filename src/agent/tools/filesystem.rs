@@ -22,6 +22,14 @@ fn require_param<'a>(
 // ReadFileTool
 // ---------------------------------------------------------------------------
 
+/// Default number of lines a bare `read_file` returns. Modeled on ds4's
+/// `AGENT_READ_DEFAULT_LINES` (antirez/DwarfStar): reading defaults to a
+/// bounded chunk, never the whole file, so the model only pulls more lines
+/// (via the `lines` param) where it actually needs them. This keeps each read
+/// a small, individually cacheable prefill instead of dumping an entire file
+/// into context.
+const DEFAULT_READ_LINES: usize = 500;
+
 /// Tool to read file contents.
 pub struct ReadFileTool;
 
@@ -32,7 +40,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file at the given path. Optionally read a specific line range."
+        "Read a file: returns the first 500 lines (numbered) and the file's total line count, so you can page large files instead of loading them whole. Read other lines with lines=\"START:END\" (1-indexed, inclusive); use lines=\"1:\" only when you truly need the entire file."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -45,7 +53,7 @@ impl Tool for ReadFileTool {
                 },
                 "lines": {
                     "type": "string",
-                    "description": "Optional line range to read, e.g. \"10:50\" (1-indexed, inclusive). Omit to read the entire file."
+                    "description": "Line range, e.g. \"10:50\" (1-indexed, inclusive). Omit for the first 500 lines; use \"1:\" for the whole file. The output header reports the total line count and the next range to read."
                 }
             },
             "required": ["path"]
@@ -85,13 +93,18 @@ impl Tool for ReadFileTool {
         }
 
         let content = String::from_utf8_lossy(&bytes).to_string();
+        let total = content.lines().count();
+        if total == 0 {
+            return format!("# {} (0 lines)\n", path);
+        }
 
-        // If lines parameter is provided, extract the range.
+        // Explicit range → render it. Bare read → first DEFAULT_READ_LINES,
+        // ds4-style, so the model never dumps a whole file unless it asks
+        // (lines="1:"). Both paths share the deterministic renderer below.
         if let Some(lines_param) = params.get("lines").and_then(|v| v.as_str()) {
             return extract_line_range(&content, lines_param, path);
         }
-
-        content
+        render_range(&content, 1, DEFAULT_READ_LINES.min(total), path, total)
     }
 }
 
@@ -457,20 +470,44 @@ fn extract_line_range(content: &str, range: &str, path: &str) -> String {
         return format!("Error: Start line {} is after end line {}.", start, end);
     }
 
+    render_range(content, start, end, path, total)
+}
+
+/// Render a 1-indexed inclusive line range with line numbers, a header
+/// reporting the file's total length, and — when the range stops short of EOF
+/// — the exact next range to read (ds4's `continue_offset`). This nudges the
+/// model to page forward contiguously rather than re-reading overlapping
+/// ranges, keeping appended reads cache-friendly.
+///
+/// Output is a pure function of `(content, start, end, path)`: no timestamps,
+/// ids, or mtimes, so two reads of the same file+range are byte-identical and
+/// the inference server's prefix cache stays warm.
+fn render_range(content: &str, start: usize, end: usize, path: &str, total: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let end = end.min(total);
     let selected: Vec<String> = lines[start - 1..end]
         .iter()
         .enumerate()
         .map(|(i, line)| format!("{:>4}: {}", start + i, line))
         .collect();
 
-    format!(
+    let mut out = format!(
         "# {} (lines {}-{} of {})\n{}",
         path,
         start,
         end,
         total,
         selected.join("\n")
-    )
+    );
+    if end < total {
+        out.push_str(&format!(
+            "\n[{} more lines — read the next chunk with lines=\"{}:{}\"]",
+            total - end,
+            end + 1,
+            total
+        ));
+    }
+    out
 }
 
 /// Expand a path: `~` → home dir, relative paths → workspace-relative.
@@ -638,7 +675,81 @@ mod tests {
         let tool = ReadFileTool;
         let params = make_params(&[("path", file_path.to_str().unwrap())]);
         let result = tool.execute(params).await;
-        assert_eq!(result, "hello world");
+        // Bounded-default format: numbered line + header reporting the total.
+        // A small file fits in one read → no continuation hint.
+        assert!(result.contains("(lines 1-1 of 1)"), "{result}");
+        assert!(result.contains("   1: hello world"), "{result}");
+        assert!(!result.contains("more lines"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_default_is_bounded_with_paging_hint() {
+        // ds4-style: a bare read returns the first DEFAULT_READ_LINES, NOT the
+        // whole file, and tells the model the total + exact next range to read.
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("big.txt");
+        let content = (1..=1200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool
+            .execute(make_params(&[("path", file_path.to_str().unwrap())]))
+            .await;
+
+        assert!(result.contains("(lines 1-500 of 1200)"), "header: {}", &result[..80]);
+        assert!(result.contains(" 500: line 500"));
+        assert!(!result.contains(" 501: line 501"), "must not dump past the default");
+        assert!(
+            result.contains("read the next chunk with lines=\"501:1200\""),
+            "must tell the model the exact next range"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_whole_via_open_range() {
+        // The model can still read the entire file when it needs to: lines="1:".
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("whole.txt");
+        let content = (1..=700).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let tool = ReadFileTool;
+        let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
+        params.insert("lines".to_string(), serde_json::json!("1:"));
+        let result = tool.execute(params).await;
+
+        assert!(result.contains("(lines 1-700 of 700)"));
+        assert!(result.contains(" 700: L700"));
+        assert!(!result.contains("more lines"), "full read has no continuation");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_output_is_deterministic() {
+        // The prefix-cache contract: identical (path, args) must yield
+        // byte-identical output every call, so the inference server reuses the
+        // cached prefix instead of re-prefilling. No timestamps/ids may leak in.
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("det.txt");
+        let content = (1..=800).map(|i| format!("x{i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+        let tool = ReadFileTool;
+        let p = file_path.to_str().unwrap();
+
+        let bare1 = tool.execute(make_params(&[("path", p)])).await;
+        let bare2 = tool.execute(make_params(&[("path", p)])).await;
+        assert_eq!(bare1, bare2, "bare read must be byte-identical across calls");
+
+        let ranged = |s: &str| {
+            let mut m = make_params(&[("path", p)]);
+            m.insert("lines".to_string(), serde_json::json!(s));
+            m
+        };
+        let r1 = tool.execute(ranged("100:200")).await;
+        let r2 = tool.execute(ranged("100:200")).await;
+        assert_eq!(r1, r2, "ranged read must be byte-identical across calls");
     }
 
     #[tokio::test]

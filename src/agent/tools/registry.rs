@@ -773,8 +773,20 @@ impl ToolRegistry {
     /// parameter descriptions. Keeps property names, types, and required list
     /// but removes per-parameter `"description"` fields that consume most tokens.
     pub fn get_slim_definitions(&self) -> Vec<serde_json::Value> {
+        // Tools whose parameter semantics are load-bearing and must survive
+        // slimming. read_file's `lines` paging syntax is the prime case: strip
+        // it and the local model can't page large files and re-prefills the
+        // whole file each turn.
+        const KEEP_PARAM_DESCRIPTIONS: &[&str] = &["read_file"];
         let mut defs = self.get_local_definitions();
         for def in &mut defs {
+            let name = def
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if KEEP_PARAM_DESCRIPTIONS.contains(&name) {
+                continue;
+            }
             if let Some(params) = def.pointer_mut("/function/parameters/properties") {
                 if let Some(props) = params.as_object_mut() {
                     for (_key, prop) in props.iter_mut() {
@@ -1153,6 +1165,46 @@ mod tests {
     /// (measured: a warm turn re-prefilling ~10s instead of ~1s). Build two
     /// registries with the SAME tools registered in DIFFERENT orders and
     /// require identical output from every definition accessor.
+    #[test]
+    fn test_slim_keeps_read_file_param_descriptions() {
+        // The local model gets slim definitions by default. read_file's `lines`
+        // paging syntax is load-bearing — it must survive slimming, while a
+        // normal tool's param descriptions are still stripped to save tokens.
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(ReadFileTool));
+        reg.register(Box::new(ListDirTool));
+
+        let slim = reg.get_slim_definitions();
+        let find = |name: &str| {
+            slim.iter()
+                .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some(name))
+                .unwrap()
+                .clone()
+        };
+
+        // read_file keeps its `lines` description (paging guidance preserved).
+        let rf = find("read_file");
+        let lines_desc = rf.pointer("/function/parameters/properties/lines/description");
+        assert!(
+            lines_desc.and_then(|v| v.as_str()).is_some_and(|s| s.contains("1:")),
+            "read_file lines description must survive slim: {rf:?}"
+        );
+
+        // A non-allowlisted tool still has every param description stripped.
+        let other = find("list_dir");
+        if let Some(props) = other
+            .pointer("/function/parameters/properties")
+            .and_then(|v| v.as_object())
+        {
+            for (k, prop) in props {
+                assert!(
+                    prop.get("description").is_none(),
+                    "list_dir param '{k}' description should be stripped in slim"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_definitions_order_is_deterministic() {
         let names = ["zeta", "alpha", "mike", "bravo", "yankee"];
