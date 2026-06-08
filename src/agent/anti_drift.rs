@@ -262,16 +262,27 @@ fn collapse_repetitive_attempts(messages: &mut Vec<Value>, min_count: usize) -> 
             }
             let mut fp = String::new();
             if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
-                let mut names: Vec<&str> = tcs
+                // Fingerprint each call by name AND arguments. Keying on the
+                // name alone conflates distinct calls — reading five different
+                // files all fingerprint as "read_file" and get collapsed as
+                // "repetitive", which both discards real history AND rewrites
+                // the prompt prefix every iteration (busting the inference
+                // server's cache → full re-prefill). Only genuinely identical
+                // calls (same tool, same args) are drift.
+                let mut calls: Vec<String> = tcs
                     .iter()
                     .filter_map(|tc| {
-                        tc.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
+                        let func = tc.get("function")?;
+                        let name = func.get("name").and_then(|n| n.as_str())?;
+                        let args = func
+                            .get("arguments")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("");
+                        Some(format!("{name}({args})"))
                     })
                     .collect();
-                names.sort();
-                fp.push_str(&names.join(","));
+                calls.sort();
+                fp.push_str(&calls.join(","));
             }
             fp.push('|');
             let content = msg_content(m);
@@ -711,6 +722,36 @@ mod tests {
             "Expected 2 collapsed attempts in interleaved conversation, got {}",
             collapsed_count
         );
+    }
+
+    #[test]
+    fn test_collapse_distinguishes_tool_arguments() {
+        let asst = |path: &str| {
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": path,
+                    "function": {"name": "read_file", "arguments": format!("{{\"path\":\"{path}\"}}")}
+                }]
+            })
+        };
+
+        // Same tool, DIFFERENT args = legitimate multi-file work, NOT drift.
+        // Must not collapse — collapsing both discards history and rewrites
+        // the prompt prefix (busting the server's cache).
+        let mut distinct = vec![asst("src/tui.rs"), asst("src/main.rs"), asst("src/lib.rs")];
+        let original = distinct.clone();
+        let collapsed = collapse_repetitive_attempts(&mut distinct, 2);
+        assert_eq!(collapsed, 0, "distinct-arg calls must not collapse as drift");
+        assert_eq!(distinct, original, "distinct-arg history must be untouched");
+
+        // Same tool, SAME args = genuine drift loop. Still collapses (all but
+        // last), preserving the anti-drift behavior for real repetition.
+        let mut same = vec![asst("a.rs"), asst("a.rs"), asst("a.rs")];
+        let collapsed_same = collapse_repetitive_attempts(&mut same, 2);
+        assert_eq!(collapsed_same, 2, "identical repeated calls still collapse");
+        assert!(msg_content(&same[0]).contains("previous similar attempts removed"));
     }
 
     #[test]
