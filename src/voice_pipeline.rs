@@ -1422,8 +1422,23 @@ impl VoicePipeline {
         print!("\x1b[2mrecording...\x1b[0m");
         std::io::stdout().flush().ok();
 
+        // The stop-key loop below reads crossterm key events, which are ONLY
+        // delivered in raw mode. `voice_read_input()` exits raw mode before
+        // returning `Record`, so without re-entering it here the terminal is
+        // cooked: Enter echoes as `^M`, no key event ever arrives, the loop
+        // spins forever (recording never stops, nothing transcribes), and the
+        // user is wedged. Own raw mode for the duration of the key loop and
+        // restore the prior mode before transcription.
+        let raw_owned = crate::tui::enter_raw_mode();
+
         let (sample_tx, sample_rx) = std_mpsc::channel::<Vec<f32>>();
-        let capture = start_native_capture(sample_tx)?;
+        let capture = match start_native_capture(sample_tx) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::tui::exit_raw_mode(raw_owned);
+                return Err(e);
+            }
+        };
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = stop_flag.clone();
@@ -1445,24 +1460,45 @@ impl VoicePipeline {
             all_samples
         });
 
+        // Stop: Enter / Ctrl+Space / Esc → finish & transcribe.
+        // Cancel: Ctrl+C → finish & discard (a guaranteed escape; in raw mode
+        // Ctrl+C is a key event, not SIGINT, so the loop must handle it).
+        let mut cancelled = false;
         loop {
-            if let Ok(Event::Key(key)) = event::read() {
-                let is_stop = key.code == KeyCode::Enter
-                    || (key.code == KeyCode::Char(' ')
-                        && key.modifiers.contains(KeyModifiers::CONTROL))
-                    || key.code == KeyCode::Esc;
-                if is_stop {
-                    break;
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        cancelled = true;
+                        break;
+                    }
+                    let is_stop = key.code == KeyCode::Enter
+                        || (key.code == KeyCode::Char(' ')
+                            && key.modifiers.contains(KeyModifiers::CONTROL))
+                        || key.code == KeyCode::Esc;
+                    if is_stop {
+                        break;
+                    }
                 }
+                Ok(_) => {} // ignore resize/mouse/etc.
+                Err(_) => break,
             }
         }
 
         stop_flag.store(true, Ordering::Relaxed);
         drop(capture); // stop AudioCapture
 
-        let all_samples = collector.join().map_err(|_| "Audio collector panicked")?;
+        let join_result = collector.join();
+        // Restore the terminal mode the caller had (cooked) BEFORE any error
+        // propagation, rendering, or transcription — never leave the terminal
+        // in raw mode on an error path (that is the wedge this fix removes).
+        crate::tui::exit_raw_mode(raw_owned);
+        let all_samples = join_result.map_err(|_| "Audio collector panicked")?;
 
-        if all_samples.is_empty() {
+        if cancelled || all_samples.is_empty() {
+            print!("\x1b[12D\x1b[K");
+            std::io::stdout().flush().ok();
             return Ok(None);
         }
 
