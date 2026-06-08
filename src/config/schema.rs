@@ -401,15 +401,6 @@ pub fn is_higgs_backend(backend: &str) -> bool {
     backend == "higgs"
 }
 
-/// Whether the config requests an in-process MLX provider.
-/// True when inference_engine or local_backend is "mlx" and the backend
-/// is not an external server (oMLX) or Higgs sidecar.
-#[cfg_attr(not(feature = "mlx"), allow(dead_code))]
-pub fn needs_mlx_inprocess(defaults: &AgentDefaults) -> bool {
-    (defaults.inference_engine == "mlx" || defaults.local_backend == "mlx")
-        && !is_external_server_backend(&defaults.local_backend)
-        && !is_higgs_backend(&defaults.local_backend)
-}
 
 fn default_mlx_preset() -> String {
     "qwen3.5-2b".to_string()

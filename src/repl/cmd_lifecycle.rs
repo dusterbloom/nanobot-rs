@@ -260,17 +260,6 @@ impl ReplContext {
         save_config(&disk_cfg, None);
 
         // MLX mode: no LMS server to reload — just rebuild with new context cap.
-        #[cfg(feature = "mlx")]
-        if self.mlx_handle.is_some() {
-            self.apply_and_rebuild();
-            println!(
-                "\n  Context size set to {}{}K{}.\n",
-                tui::BOLD,
-                new_ctx / 1024,
-                tui::RESET,
-            );
-            return;
-        }
 
         // Reload model in LMS with new context
         if self.srv.lms_managed {
@@ -432,7 +421,6 @@ impl ReplContext {
                     }
                 }
                 ModelSource::File { .. } => "~/models/".to_string(),
-                ModelSource::Mlx { .. } => "MLX (Apple Silicon GPU)".to_string(),
                 ModelSource::Omlx { ref endpoint } => {
                     let short = crate::tui::shorten_url(endpoint)
                         .split('/')
@@ -461,14 +449,6 @@ impl ReplContext {
                     .map(|m| m.len() / 1_048_576)
                     .unwrap_or(0);
                 println!("    [{}] {} ({} MB){}", i + 1, entry.id, size_mb, marker);
-            } else if let ModelSource::Mlx { ref path } = entry.source {
-                let has_lora = path.join("adapters/adapters.safetensors").exists();
-                let lora_tag = if has_lora {
-                    format!(" {}(trained){}", tui::DIM, tui::RESET)
-                } else {
-                    String::new()
-                };
-                println!("    [{}] {}{}{}", i + 1, entry.id, lora_tag, marker);
             } else {
                 println!("    [{}] {}{}", i + 1, entry.id, marker);
             }
@@ -645,123 +625,6 @@ impl ReplContext {
                 disk_cfg.agents.defaults.local_model = name;
                 save_config(&disk_cfg, None);
                 self.apply_and_rebuild();
-            }
-            #[cfg(feature = "mlx")]
-            ModelSource::Mlx { ref path } => {
-                let dir_str = path.to_string_lossy().to_string();
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                // When Higgs is the active backend, restart it with the new
-                // model dir instead of switching to in-process MLX.
-                if self.srv.engine == super::super::InferenceEngine::Higgs {
-                    let port = self.config.agents.defaults.higgs_port;
-                    if let Some(bin) = crate::higgs::find_binary() {
-                        print!("  Restarting Higgs with {}... ", name);
-                        io::stdout().flush().ok();
-                        match crate::higgs::server_restart(&bin, port, &dir_str, &self.config.agents.defaults.local_model).await {
-                            Ok(()) => {
-                                self.config.agents.defaults.mlx_model_dir = Some(dir_str.clone());
-                                if let Some(model_name) = self.apply_higgs_endpoint(port).await {
-                                    println!("{}OK{} · {model_name}", tui::GREEN, tui::RESET);
-                                } else {
-                                    self.config.agents.defaults.local_model = name.clone();
-                                    self.config.agents.defaults.lms_main_model = name;
-                                    println!("{}OK{}", tui::GREEN, tui::RESET);
-                                }
-                                self.current_model_path = path.clone();
-                                // Persist updated model dir to disk.
-                                let mut disk_cfg = load_config(None);
-                                disk_cfg.agents.defaults.mlx_model_dir = Some(dir_str);
-                                disk_cfg.agents.defaults.lms_main_model =
-                                    self.config.agents.defaults.lms_main_model.clone();
-                                disk_cfg.agents.defaults.local_model =
-                                    self.config.agents.defaults.local_model.clone();
-                                save_config(&disk_cfg, None);
-                                self.apply_and_rebuild();
-                            }
-                            Err(e) => {
-                                println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
-                                return;
-                            }
-                        }
-                    } else {
-                        println!(
-                            "  {}Higgs binary not found.{} Install with: cargo install higgs",
-                            tui::YELLOW,
-                            tui::RESET,
-                        );
-                        return;
-                    }
-                } else {
-                    // In-process MLX path (original behavior).
-
-                    // Snapshot old config so we can restore on failure
-                    let old_model_dir = self.config.agents.defaults.mlx_model_dir.clone();
-                    let old_preset = self.config.agents.defaults.mlx_preset.clone();
-
-                    // Update config first
-                    self.config.agents.defaults.mlx_model_dir = Some(dir_str.clone());
-                    self.config.agents.defaults.inference_engine = "mlx".to_string();
-                    self.config.agents.defaults.local_backend = "mlx".to_string();
-                    let preset = cli::preset_from_model_dir(path).to_string();
-                    self.config.agents.defaults.mlx_preset = preset;
-
-                    // Kill the old managed mlx-lm server to free port 8090 before starting new one
-                    let old_handle = self.mlx_handle.take();
-                    if let Some(ref h) = old_handle {
-                        h.provider.kill_managed_server();
-                    }
-
-                    // Rebuild MLX provider from scratch with the new model
-                    print!("  Loading {}... ", name);
-                    io::stdout().flush().ok();
-                    match cli::start_mlx_provider(&self.config) {
-                        Ok(h) => {
-                            // Success — persist config to disk now
-                            let mut disk_cfg = load_config(None);
-                            disk_cfg.agents.defaults.mlx_model_dir = Some(dir_str);
-                            disk_cfg.agents.defaults.inference_engine = "mlx".to_string();
-                            disk_cfg.agents.defaults.local_backend = "mlx".to_string();
-                            disk_cfg.agents.defaults.mlx_preset =
-                                self.config.agents.defaults.mlx_preset.clone();
-                            save_config(&disk_cfg, None);
-                            self.mlx_handle = Some(h);
-                            println!("{}OK{}", tui::GREEN, tui::RESET);
-                        }
-                        Err(e) => {
-                            println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
-                            // Restore previous config
-                            self.config.agents.defaults.mlx_model_dir = old_model_dir;
-                            self.config.agents.defaults.mlx_preset = old_preset;
-                            // Try to restore the old provider
-                            match old_handle {
-                                Some(_) => {
-                                    print!("  Restoring previous model... ");
-                                    io::stdout().flush().ok();
-                                    match cli::start_mlx_provider(&self.config) {
-                                        Ok(h) => {
-                                            self.mlx_handle = Some(h);
-                                            println!("{}OK{}", tui::GREEN, tui::RESET);
-                                        }
-                                        Err(e2) => {
-                                            println!("{}FAILED: {}{}", tui::RED, e2, tui::RESET);
-                                        }
-                                    }
-                                }
-                                None => {}
-                            }
-                            return;
-                        }
-                    }
-                    self.apply_and_rebuild();
-                }
-            }
-            #[cfg(not(feature = "mlx"))]
-            ModelSource::Mlx { .. } => {
-                println!("  MLX support not compiled in (--features mlx).");
             }
             ModelSource::Omlx { ref endpoint } => {
                 // oMLX/Higgs uses LRU auto-eviction — just update config, no load/unload.

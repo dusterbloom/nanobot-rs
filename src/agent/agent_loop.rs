@@ -271,10 +271,6 @@ impl AgentLoop {
     }
 
     /// Check whether the in-process MLX provider is set.
-    #[cfg(all(test, feature = "mlx"))]
-    pub fn has_mlx_provider(&self) -> bool {
-        self.shared.mlx_provider.is_some()
-    }
 
     /// Spawn a periodic bulletin refresh task (compaction model, when idle).
     fn spawn_bulletin_refresh(shared: &Arc<AgentLoopShared>, running: &Arc<AtomicBool>) {

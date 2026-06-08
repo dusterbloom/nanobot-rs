@@ -165,7 +165,6 @@ semantic = ["dep:fastembed", "dep:sqlite-vec", "dep:zerocopy"]
 knowledge-graph = ["dep:petgraph"]
 lora = ["dep:qlora-rs", "dep:candle-core"]
 ane = ["dep:half", "dep:memmap2", "dep:rayon"]  # Apple Neural Engine fine-tuning (macOS Apple Silicon only)
-mlx = ["dep:mlx-rs", "dep:tokenizers", "dep:axum"]  # MLX GPU LoRA training (macOS Apple Silicon)
 candle = ["dep:candle-core", "dep:candle-nn"]  # Candle Metal GPU inference (GQA attention layers)
 
 [dependencies.jack-voice]
@@ -197,21 +196,3 @@ features = ["metal"]
 version = "0.9"
 optional = true
 
-# MLX: Apple Silicon GPU acceleration for LoRA training
-[dependencies.mlx-rs]
-version = "0.25"
-optional = true
-features = ["safetensors"]
-
-# Axum web framework (used for MLX inference server)
-[dependencies.axum]
-version = "0.8"
-optional = true
-features = ["json"]
-
-# HuggingFace tokenizers (BPE/Unigram/WordPiece — reads tokenizer.json)
-[dependencies.tokenizers]
-version = "0.22"
-optional = true
-default-features = false
-features = ["onig"]

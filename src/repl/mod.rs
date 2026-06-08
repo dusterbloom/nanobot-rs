@@ -1371,11 +1371,6 @@ pub(crate) fn cmd_agent(
         // True when the backend requires LM Studio management (spawn, probe, trio, JIT warmup).
         // False for MLX (in-process), oMLX (externally managed), and Higgs (managed sidecar).
         let needs_lms = is_local && !use_mlx_local && !use_omlx && !use_higgs;
-        #[cfg(feature = "mlx")]
-        if use_mlx_local {
-            // Force inference_engine to "mlx" so the MLX provider path activates below.
-            config.agents.defaults.inference_engine = "mlx".to_string();
-        }
 
         // Higgs sidecar: auto-start when backend is "higgs" (single-message or interactive).
         // Start even when localApiBase is set — it may point to the managed Higgs port
@@ -1551,16 +1546,6 @@ pub(crate) fn cmd_agent(
         let mut srv = ServerState::new(local_port.clone());
         let mut config = config; // shadow to allow mutation
         let is_interactive = message.is_none();
-        #[cfg(feature = "mlx")]
-        if is_interactive && use_mlx_local {
-            tui::register_resize_handler();
-            let mlx_dir = cli::resolve_mlx_model_dir(&config);
-            let mlx_model = mlx_dir.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| config.agents.defaults.mlx_preset.clone());
-            let mlx_lm_mode = config.agents.defaults.mlx_lm_url.as_deref();
-            tui::print_mlx_splash(&mlx_model, mlx_lm_mode);
-        }
         if is_interactive && use_omlx {
             tui::register_resize_handler();
             let base = &config.agents.defaults.local_api_base;
@@ -1793,34 +1778,6 @@ pub(crate) fn cmd_agent(
             "delegation_config_at_core_build"
         );
 
-        #[cfg(feature = "mlx")]
-        let mlx_handle: Option<cli::MlxHandle> =
-            if crate::config::schema::needs_mlx_inprocess(&config.agents.defaults) {
-                match cli::start_mlx_provider(&config) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        eprintln!("⚠ MLX provider failed to start: {e}");
-                        eprintln!("  Falling back to default provider");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-        #[cfg(feature = "mlx")]
-        let core_handle = if let Some(ref mlx) = mlx_handle {
-            cli::build_core_handle_mlx(&config, mlx)
-        } else {
-            cli::build_core_handle(
-                &config,
-                &srv.local_port,
-                Some(&local_model_name),
-                None, None, None,
-                is_local,
-            )
-        };
-        #[cfg(not(feature = "mlx"))]
         let core_handle = cli::build_core_handle(
             &config,
             &srv.local_port,
@@ -1971,8 +1928,6 @@ pub(crate) fn cmd_agent(
                 voice_session: None,
                 #[cfg(feature = "cluster")]
                 cluster_state,
-                #[cfg(feature = "mlx")]
-                mlx_handle,
             };
 
             let _ = ctx.rl.as_mut().unwrap().load_history(&history_path);
@@ -2381,10 +2336,6 @@ pub(crate) fn cmd_agent(
             ctx.srv.shutdown();
 
             // Shut down auxiliary mlx-lm server if we spawned one.
-            #[cfg(feature = "mlx")]
-            if let Some(ref aux) = ctx.core_handle.counters.auxiliary_server {
-                aux.shutdown();
-            }
 
             // Run skill cleanup commands (e.g. stop background audio).
             {

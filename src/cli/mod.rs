@@ -14,12 +14,6 @@ pub(crate) use core_builder::setup_cluster_for_repl;
 pub(crate) use core_builder::{
     build_core_handle, create_agent_loop, effective_max_iterations, rebuild_core, strip_gguf_suffix,
 };
-#[cfg(feature = "mlx")]
-pub(crate) use core_builder::{
-    build_core_handle_mlx, find_mlx_dir_for_model, model_config_from_preset, preset_from_model_dir,
-    rebuild_core_mlx, resolve_mlx_inference_url, resolve_mlx_model_dir, start_mlx_provider,
-    MlxHandle,
-};
 pub(crate) use provider::{check_api_key, create_provider};
 pub(crate) use skills::{cmd_skill_add, cmd_skill_remove};
 #[cfg(feature = "voice")]
@@ -197,120 +191,6 @@ mod tests {
         assert_eq!(
             cfg.agents.defaults.mlx_model_dir.as_deref(),
             Some("/tmp/my-model")
-        );
-    }
-
-    #[cfg(feature = "mlx")]
-    #[test]
-    fn test_resolve_mlx_model_dir_default() {
-        let cfg = Config::default();
-        let dir = core_builder::resolve_mlx_model_dir(&cfg);
-        // Default local_model is "gemma-3n-e4b-it-Q4_K_M.gguf" — no MLX dir
-        // for gemma on most machines, so falls through to auto-detect or hardcoded.
-        assert!(
-            !dir.to_string_lossy().is_empty(),
-            "should resolve to some path: {:?}",
-            dir
-        );
-    }
-
-    #[cfg(feature = "mlx")]
-    #[test]
-    fn test_resolve_mlx_model_dir_custom() {
-        let mut cfg = Config::default();
-        cfg.agents.defaults.mlx_model_dir = Some("/tmp/custom-model".to_string());
-        let dir = core_builder::resolve_mlx_model_dir(&cfg);
-        assert_eq!(dir.to_string_lossy(), "/tmp/custom-model");
-    }
-
-    #[cfg(feature = "mlx")]
-    #[test]
-    fn test_resolve_mlx_model_dir_from_local_model() {
-        // When localModel matches an MLX dir on disk, resolve should find it.
-        let mut cfg = Config::default();
-        cfg.agents.defaults.local_model = "Qwen3.5-35B-A3B-4bit".to_string();
-        cfg.agents.defaults.mlx_model_dir = None;
-        let dir = core_builder::resolve_mlx_model_dir(&cfg);
-        if dir.to_string_lossy().contains("Qwen3.5-35B-A3B-4bit") {
-            // MLX dir for 35B exists on this machine — resolved correctly.
-        } else {
-            // 35B MLX not installed — falls through to auto-detect/default.
-            assert!(
-                !dir.to_string_lossy().is_empty(),
-                "should still resolve to some path"
-            );
-        }
-    }
-
-    #[cfg(feature = "mlx")]
-    #[test]
-    fn test_resolve_mlx_inference_url_prefers_explicit_setting() {
-        let mut cfg = Config::default();
-        cfg.agents.defaults.mlx_lm_url = Some("http://127.0.0.1:9090".to_string());
-        cfg.agents.defaults.local_api_base = "http://127.0.0.1:8080/v1".to_string();
-        assert_eq!(
-            core_builder::resolve_mlx_inference_url(&cfg),
-            "http://127.0.0.1:9090"
-        );
-    }
-
-    #[cfg(feature = "mlx")]
-    #[test]
-    fn test_resolve_mlx_inference_url_uses_local_api_base_when_present() {
-        let mut cfg = Config::default();
-        cfg.agents.defaults.local_api_base = "http://127.0.0.1:8080/v1".to_string();
-        assert_eq!(
-            core_builder::resolve_mlx_inference_url(&cfg),
-            "http://127.0.0.1:8080"
-        );
-    }
-
-    #[cfg(feature = "mlx")]
-    #[test]
-    fn test_resolve_mlx_inference_url_defaults_to_auto() {
-        let cfg = Config::default();
-        assert_eq!(core_builder::resolve_mlx_inference_url(&cfg), "auto");
-    }
-
-    #[cfg(feature = "mlx")]
-    #[test]
-    fn test_build_core_handle_mlx_sets_local_and_model_prefix() {
-        let cfg = Config::default();
-        let dir = core_builder::resolve_mlx_model_dir(&cfg);
-        assert!(!dir.to_string_lossy().is_empty());
-    }
-
-    #[cfg(feature = "mlx")]
-    #[test]
-    fn test_preset_from_model_dir() {
-        use std::path::Path;
-        assert_eq!(
-            core_builder::preset_from_model_dir(Path::new(
-                "/models/mlx-community/Qwen3-1.7B-MLX-8bit"
-            )),
-            "qwen3-1.7b"
-        );
-        assert_eq!(
-            core_builder::preset_from_model_dir(Path::new(
-                "/models/mlx-community/Qwen3-4B-MLX-4bit"
-            )),
-            "qwen3-4b"
-        );
-        assert_eq!(
-            core_builder::preset_from_model_dir(Path::new(
-                "/models/mlx-community/Qwen3.5-2B-MLX-8bit"
-            )),
-            "qwen3.5-2b"
-        );
-        assert_eq!(
-            core_builder::preset_from_model_dir(Path::new(
-                "/models/mlx-community/Qwen3.5-9B-MLX-4bit"
-            )),
-            "qwen3.5-9b"
-        );
-        assert_eq!(
-            core_builder::preset_from_model_dir(Path::new("/models/some-unknown-model")),
-            "unknown"
         );
     }
 
@@ -646,29 +526,6 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
         );
     }
 
-    #[cfg(feature = "mlx")]
-    let mlx_handle: Option<MlxHandle> =
-        if crate::config::schema::needs_mlx_inprocess(&config.agents.defaults) {
-            match start_mlx_provider(&config) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    eprintln!("⚠ MLX provider failed to start: {e}");
-                    eprintln!("  Falling back to default provider");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-    #[cfg(feature = "mlx")]
-    let core_handle = if let Some(ref mlx) = mlx_handle {
-        build_core_handle_mlx(&config, mlx)
-    } else {
-        let is_local = !config.agents.defaults.local_api_base.is_empty();
-        build_core_handle(&config, "8080", None, None, None, None, is_local)
-    };
-    #[cfg(not(feature = "mlx"))]
     let core_handle = {
         let is_local = !config.agents.defaults.local_api_base.is_empty();
         build_core_handle(&config, "8080", None, None, None, None, is_local)

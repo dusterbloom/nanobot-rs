@@ -76,9 +76,6 @@ pub(crate) struct ReplContext {
     /// Cluster state for /cluster command (peer discovery, model listing).
     #[cfg(feature = "cluster")]
     pub cluster_state: Option<Arc<crate::cluster::state::ClusterState>>,
-    /// In-process MLX provider handle (kept alive so the model worker persists).
-    #[cfg(feature = "mlx")]
-    pub mlx_handle: Option<cli::MlxHandle>,
 }
 
 // ============================================================================
@@ -101,9 +98,6 @@ enum ModelSource {
     },
     /// Filesystem GGUF file.
     File { path: PathBuf },
-    /// MLX model directory (safetensors, served via managed mlx-lm server).
-    #[cfg_attr(not(feature = "mlx"), allow(dead_code))]
-    Mlx { path: PathBuf },
     /// oMLX server (external, auto-discovery via LRU eviction).
     Omlx { endpoint: String },
 }
@@ -310,20 +304,6 @@ impl ReplContext {
     /// Like `apply_and_rebuild` but with an explicit `is_local` override.
     /// Use when toggling between local and cloud mode.
     pub fn apply_and_rebuild_with(&mut self, is_local: bool) {
-        // MLX mode: rebuild core via rebuild_core_mlx, not make_local_providers.
-        // Only use the MLX path when staying in local mode AND the backend is
-        // explicitly "mlx" (in-process).  Switching to oMLX or a Remote peer
-        // must fall through to the HTTP provider path even though mlx_handle
-        // is still Some.
-        #[cfg(feature = "mlx")]
-        if is_local && self.config.agents.defaults.local_backend == "mlx" {
-            if let Some(ref mlx) = self.mlx_handle {
-                cli::rebuild_core_mlx(&self.core_handle, &self.config, mlx);
-                self.rebuild_agent_loop();
-                return;
-            }
-        }
-
         super::apply_server_change(
             &self.srv,
             &self.current_model_path,
@@ -535,27 +515,6 @@ impl ReplContext {
         }
 
         // 4. MLX models (safetensors dirs, served via managed mlx-lm server)
-        #[cfg(feature = "mlx")]
-        {
-            let mlx_models = crate::agent::mlx_lm::discover_mlx_models();
-            let mlx_active = self
-                .config
-                .agents
-                .defaults
-                .mlx_model_dir
-                .clone()
-                .unwrap_or_default();
-            for m in mlx_models {
-                let is_active =
-                    mlx_active.ends_with(&m.name) || m.path.to_string_lossy() == mlx_active;
-                entries.push(ModelEntry {
-                    id: m.name.clone(),
-                    source: ModelSource::Mlx { path: m.path },
-                    is_active,
-                    is_loaded: false,
-                });
-            }
-        }
 
         entries
     }

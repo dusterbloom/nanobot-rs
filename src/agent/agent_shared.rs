@@ -1148,17 +1148,6 @@ impl AgentLoopShared {
                         // Lazily start auxiliary server before compaction uses its endpoint.
                         // If aux fails, clear the dedicated compactor so we fall back to
                         // the main provider's compactor (bg_core.compactor).
-                        #[cfg(feature = "mlx")]
-                        if bg_lcm_compactor.is_some() {
-                            if let Some(ref aux) = self.core_handle.counters.auxiliary_server {
-                                if !aux.ensure_ready() {
-                                    tracing::warn!(
-                                        "auxiliary server unavailable — compaction will use main provider"
-                                    );
-                                    bg_lcm_compactor = None;
-                                }
-                            }
-                        }
 
                         if action == CompactionAction::Async {
                             // Mark async pending so we don't re-trigger.
@@ -1764,12 +1753,6 @@ impl AgentLoopShared {
         }
 
         // Lazily start auxiliary server if delegation targets a local endpoint.
-        #[cfg(feature = "mlx")]
-        if ctx.core.tool_delegation_config.enabled {
-            if let Some(ref aux) = counters.auxiliary_server {
-                aux.ensure_ready();
-            }
-        }
 
         // Check if we should delegate to the tool runner.
         // Skip delegation if the provider was previously marked dead.

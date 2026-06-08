@@ -579,28 +579,6 @@ pub(crate) fn print_mode_banner(local_port: &str, is_local: bool) {
     println!();
 }
 
-/// Full startup splash for MLX local backend.
-pub(crate) fn print_mlx_splash(model_name: &str, mlx_lm_mode: Option<&str>) {
-    print!("{CLEAR_SCREEN}");
-    std::io::Write::flush(&mut std::io::stdout()).ok();
-
-    print_logo();
-    let mode_hint = match mlx_lm_mode {
-        Some("auto") => "mlx-lm (managed)",
-        Some("vllm-mlx") => "vllm-mlx (managed)",
-        Some(_) => "mlx-lm (external)",
-        None => "mlx-lm (managed default)",
-    };
-    print!("  {BOLD}{YELLOW}MLX{RESET} {DIM}{model_name} · {mode_hint}{RESET}\r\n");
-    print!(
-        "  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}\r\n",
-        env!("CARGO_PKG_VERSION")
-    );
-    print!("\r\n");
-
-    loading_animation("Loading model");
-}
-
 /// oMLX startup splash: clear screen, ASCII logo, oMLX endpoint info.
 pub(crate) fn print_omlx_splash(api_base: &str) {
     print!("{CLEAR_SCREEN}");

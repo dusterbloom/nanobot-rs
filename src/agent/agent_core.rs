@@ -209,10 +209,6 @@ pub struct RuntimeCounters {
     pub prompt_fingerprints: parking_lot::Mutex<
         std::collections::HashMap<String, crate::agent::prompt_fingerprint::PromptFingerprint>,
     >,
-    /// Lazy auxiliary mlx-lm server for delegation/compaction/memory.
-    /// Spawned on first use, killed on drop.
-    #[cfg(feature = "mlx")]
-    pub auxiliary_server: Option<Arc<crate::agent::mlx_lm::LazyAuxiliaryServer>>,
 }
 
 impl RuntimeCounters {
@@ -245,8 +241,6 @@ impl RuntimeCounters {
                 crate::agent::router::SpecialistMemory::default(),
             ),
             prompt_fingerprints: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            #[cfg(feature = "mlx")]
-            auxiliary_server: None,
         }
     }
 }
