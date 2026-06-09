@@ -46,6 +46,7 @@ pub mod policy;
 pub mod prepare_context;
 pub mod proactive;
 pub mod prompt_contract;
+pub mod prefix_guard;
 pub mod prompt_fingerprint;
 pub mod protocol;
 pub mod provenance;

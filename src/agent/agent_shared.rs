@@ -18,6 +18,7 @@ use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_hygiene;
 use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
+use crate::agent::prefix_guard;
 use crate::agent::policy;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
 use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
@@ -666,12 +667,31 @@ impl AgentLoopShared {
     async fn step_prepare(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
         let counters = &self.core_handle.counters;
 
+        // Freeze the already-sent prefix (warm in the server's KV cache) so the
+        // cleanup passes below rewrite only the uncached tail. Without this,
+        // hygiene/anti-drift rewrite the middle of the array every iteration,
+        // moving the first-divergent token earlier and forcing a full
+        // re-prefill of the whole context (~65s for 19k tokens). The watermark
+        // is re-anchored on every send in step_call; 0 = cold / post-trim /
+        // post-compaction, i.e. unrestricted cleanup while a re-prefill is
+        // already sunk cost. See `agent::prefix_guard`.
+        let frozen_prefix = counters
+            .prompt_cache_watermark
+            .lock()
+            .get(&ctx.session_key)
+            .copied()
+            .unwrap_or(0);
+
         // --- Context Hygiene: clean up conversation history ---
-        context_hygiene::hygiene_pipeline(&mut ctx.messages, ctx.core.hygiene_keep_last_messages);
+        prefix_guard::with_frozen_prefix(&mut ctx.messages, frozen_prefix, |m| {
+            context_hygiene::hygiene_pipeline(m, ctx.core.hygiene_keep_last_messages);
+        });
 
         // --- Anti-Drift: quality-based cleanup for local models ---
         if ctx.core.mode().needs_anti_drift() && ctx.core.anti_drift.enabled {
-            anti_drift::pre_completion_pipeline(&mut ctx.messages, iteration, &ctx.core.anti_drift);
+            prefix_guard::with_frozen_prefix(&mut ctx.messages, frozen_prefix, |m| {
+                anti_drift::pre_completion_pipeline(m, iteration, &ctx.core.anti_drift);
+            });
         }
 
         // --- Proprioception: update SystemState ---
@@ -1507,6 +1527,16 @@ impl AgentLoopShared {
             }
             store.insert(ctx.session_key.clone(), fp);
         }
+
+        // Re-anchor the prefix-cache watermark to exactly what is being sent.
+        // Everything currently in `ctx.messages` (raw) is now warm on the
+        // server; next iteration's cleanup freezes below this length so the
+        // prompt stays an append-only extension. Raw length (not rendered) —
+        // the cleanup passes operate on `ctx.messages`. See `agent::prefix_guard`.
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(ctx.session_key.clone(), ctx.messages.len());
 
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas to the REPL/voice renderer as

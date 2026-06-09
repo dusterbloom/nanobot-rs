@@ -209,6 +209,12 @@ pub struct RuntimeCounters {
     pub prompt_fingerprints: parking_lot::Mutex<
         std::collections::HashMap<String, crate::agent::prompt_fingerprint::PromptFingerprint>,
     >,
+    /// Per-session prefix-cache watermark: the number of leading messages
+    /// already sent (hence warm on the inference server). Mid-turn cleanup is
+    /// frozen below this index so the rendered prompt stays an append-only
+    /// extension of the last send. Re-anchored on every send. See
+    /// `agent::prefix_guard`.
+    pub prompt_cache_watermark: parking_lot::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl RuntimeCounters {
@@ -241,6 +247,7 @@ impl RuntimeCounters {
                 crate::agent::router::SpecialistMemory::default(),
             ),
             prompt_fingerprints: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            prompt_cache_watermark: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
