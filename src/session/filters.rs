@@ -93,18 +93,26 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     // dropping happens at whole-turn granularity: the kept prefix only changes
     // when an entire oldest turn ages out, not on every reload.
     if max_turns > 0 {
-        let mut turns_seen = 0;
-        let mut turn_start = safe_start;
-        for i in (safe_start..messages.len()).rev() {
-            if is_real_user_turn(&messages[i]) {
-                turns_seen += 1;
-                if turns_seen > max_turns {
-                    break;
-                }
-                turn_start = i;
+        // Real-turn start indices within the current window, oldest first.
+        let turn_starts: Vec<usize> = (safe_start..messages.len())
+            .filter(|&i| is_real_user_turn(&messages[i]))
+            .collect();
+        let n = turn_starts.len();
+        if n > max_turns {
+            // Hysteresis: advance the drop boundary in whole batches of `batch`
+            // turns, not one turn per reload. Dropping the single oldest turn on
+            // every reload shifts the kept-history HEAD each turn, diverging the
+            // prompt prefix and forcing the inference server to re-prefill the
+            // entire context (~50s at 15k tokens on a local MLX backend). With
+            // batched drops the head stays byte-stable for `batch` reloads at a
+            // time, so the prefix cache stays warm between drops. `batch` of 1
+            // (i.e. max_turns < 2) preserves the original drop-one-each behavior.
+            let batch = (max_turns / 2).max(1);
+            let dropped = ((n - max_turns) / batch) * batch;
+            if dropped > 0 {
+                safe_start = safe_start.max(turn_starts[dropped]);
             }
         }
-        safe_start = safe_start.max(turn_start);
     }
 
     // Stage 5: filter and map each surviving message to wire format.
@@ -162,35 +170,46 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
         return mapped;
     }
 
-    // Over budget. Drop from the front (oldest), skip orphaned tool results.
-    let mut cumulative = 0;
-    let mut keep_from = mapped.len();
-    for i in (0..mapped.len()).rev() {
-        let msg_tokens = estimate_msg_tokens(&mapped[i]);
-        if cumulative + msg_tokens > token_budget {
+    // Over budget. Drop whole oldest turns in quantized batches (hysteresis) —
+    // the same reasoning as the Stage-4 turn limit. The original code kept "the
+    // last `token_budget` tokens", a boundary that slides one turn per reload
+    // once history saturates the budget, re-prefilling the entire context on the
+    // live server every turn. Batching the drop keeps the kept-history head
+    // byte-stable for several reloads between drops, so the prefix cache stays
+    // warm. Whole-turn granularity also avoids starting the wire history on an
+    // assistant/tool message.
+    let turn_starts: Vec<usize> = (0..mapped.len())
+        .filter(|&i| is_real_user_turn(&mapped[i]))
+        .collect();
+    // Fewest oldest turns to drop so the kept suffix fits the budget.
+    let mut min_drop = turn_starts.len();
+    for (d, &ts) in turn_starts.iter().enumerate() {
+        let kept: usize = mapped[ts..].iter().map(estimate_msg_tokens).sum();
+        if kept <= token_budget {
+            min_drop = d;
             break;
         }
-        cumulative += msg_tokens;
-        keep_from = i;
     }
+    // Quantize the drop up to a whole batch so the boundary advances only every
+    // `batch` reloads (stable plateaus = warm prefix cache between drops).
+    let batch = (max_turns / 2).max(1);
+    let dropped_turns = if min_drop == 0 {
+        0
+    } else {
+        ((min_drop + batch - 1) / batch * batch).min(turn_starts.len())
+    };
+    let keep_from = turn_starts
+        .get(dropped_turns)
+        .copied()
+        .unwrap_or(mapped.len());
     let keep_from = skip_leading_orphan_tools(&mapped, keep_from);
-    // Snap the cut forward to the next real user-turn boundary so we drop whole
-    // oldest turns rather than slicing mid-turn. This keeps the kept-history
-    // prefix stable across reloads (the cut only advances a full turn at a time)
-    // and avoids starting the wire history on an assistant/tool message.
-    let keep_from = mapped[keep_from..]
-        .iter()
-        .position(is_real_user_turn)
-        .map(|off| keep_from + off)
-        .unwrap_or(keep_from);
-    let dropped = mapped.len() - (mapped.len() - keep_from);
-    if dropped > 0 {
+    if keep_from > 0 {
         warn!(
-            dropped_messages = dropped,
+            dropped_turns,
             budget_tokens = token_budget,
             total_tokens = total_tokens,
             kept_messages = mapped.len() - keep_from,
-            "token_budget_trim: dropped oldest messages from session history"
+            "token_budget_trim: dropped oldest whole turns from session history"
         );
     }
     mapped[keep_from..].to_vec()
@@ -573,6 +592,48 @@ mod tests {
     }
 
     #[test]
+    fn test_turn_limit_hysteresis_keeps_prefix_stable_past_limit() {
+        // Past the turn limit, the kept-history HEAD must not shift on every
+        // reload. The original code dropped the single oldest turn each reload,
+        // so once a session passed `max_turns` every new turn re-based the head
+        // and the inference server re-prefilled the whole context (~50s at 15k
+        // tokens). With hysteresis (batch = max_turns/2), the drop boundary
+        // advances only every `batch` turns, so consecutive reloads stay
+        // append-only between drops and the prefix cache stays warm.
+        let max_turns = 10;
+        // 20 real turns added one at a time; capture the reload after each.
+        // max_messages = 0 isolates the Stage-4 turn limit (no Stage-1 window,
+        // no Stage-6 token budget).
+        let mut messages = Vec::new();
+        let mut reloads = Vec::new();
+        for t in 0..20 {
+            messages.push(user(&format!("q{t}")));
+            messages.push(assistant(&format!("a{t}")));
+            reloads.push(filter_history(&messages, 0, max_turns));
+        }
+
+        // A reload that is NOT an append-only extension of the previous one is a
+        // head shift = a full re-prefill on the live server.
+        let head_shifts = reloads
+            .windows(2)
+            .filter(|w| {
+                let (prev, cur) = (&w[0], &w[1]);
+                let append_only =
+                    prev.len() <= cur.len() && prev.iter().zip(cur.iter()).all(|(a, b)| a == b);
+                !append_only
+            })
+            .count();
+
+        // Turns 11..=20 exceed the limit. Without hysteresis that is ~10 head
+        // shifts (one per reload). With batch=5 it must be at most 2.
+        assert!(
+            head_shifts <= 2,
+            "expected batched drops (<=2 head shifts over 20 turns), got {head_shifts} \
+             — the kept-history head is shifting on (nearly) every reload, busting the cache"
+        );
+    }
+
+    #[test]
     fn test_token_budget_drops_at_real_user_turn_boundary() {
         // When over the Stage-6 token budget, the kept head must begin at a real
         // user turn — we drop whole oldest turns rather than slicing mid-turn and
@@ -598,6 +659,41 @@ mod tests {
             "kept history must start at a real user turn, not mid-turn"
         );
         assert_eq!(result[0]["content"], "q2");
+    }
+
+    #[test]
+    fn test_token_budget_hysteresis_keeps_prefix_stable() {
+        // The Stage-6 token budget must also drop in whole-turn batches, not
+        // slide one turn per reload once history saturates the budget. Heavy
+        // turns (large assistant content) make the token budget bind before the
+        // Stage-4 turn limit; with batch=5 the kept head must hold for several
+        // reloads between drops (warm prefix cache), not shift every turn.
+        let max_turns = 10;
+        let max_messages = 100; // token_budget = 15000; Stage-1 window won't bind
+        let big = "y".repeat(10_000); // ~2505 tokens per assistant message
+        let mut messages = Vec::new();
+        let mut reloads = Vec::new();
+        for t in 0..14 {
+            messages.push(user(&format!("q{t}")));
+            messages.push(json!({"role": "assistant", "content": format!("{t}:{big}")}));
+            reloads.push(filter_history(&messages, max_messages, max_turns));
+        }
+        let head_shifts = reloads
+            .windows(2)
+            .filter(|w| {
+                let (prev, cur) = (&w[0], &w[1]);
+                let append_only =
+                    prev.len() <= cur.len() && prev.iter().zip(cur.iter()).all(|(a, b)| a == b);
+                !append_only
+            })
+            .count();
+        // The budget binds ~turn 6; sliding would give ~8 head shifts. Batched
+        // drops must keep it to at most 3.
+        assert!(
+            head_shifts <= 3,
+            "Stage-6 token budget is sliding every reload ({head_shifts} head shifts) \
+             instead of dropping in batches — the prefix cache busts every turn"
+        );
     }
 
     // ------------------------------------------------------------------
