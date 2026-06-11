@@ -59,6 +59,13 @@ pub(super) fn model_context_size(model: &str, config_default: usize) -> usize {
         config_default.max(1_000_000)
     } else if m.contains("gemini") {
         config_default.max(1_000_000)
+    } else if m.contains("qwen3.6") || m.contains("qwen36") || m.contains("qwen3.5") {
+        // Qwen3.5/3.6 (incl. A3B MoE) ship 256K native context. Cap at 128K to
+        // bound local decode-slowdown at high fill while leaving ample history
+        // room — its hybrid arch only grows KV on full-attention layers, so long
+        // context is cheap here. Smaller local models (e.g. Bonsai 32K/64K) keep
+        // the conservative config default and are not overshot.
+        config_default.max(131_072)
     } else {
         config_default
     }
@@ -364,10 +371,15 @@ pub(crate) fn build_core_handle(
             specialist_port,
         );
         let model = format!("local:{}", lp.model_id);
+        // Size context per-model on the local path too (not just cloud): a
+        // capable long-context model (e.g. Qwen3.6, 256K native) gets its real
+        // budget, while smaller local models (Bonsai 32K/64K) keep the
+        // conservative server-probed/default value and are never overshot.
+        let ctx = model_context_size(&lp.model_id, lp.max_context_tokens);
         (
             lp.main,
             model,
-            lp.max_context_tokens,
+            ctx,
             lp.compaction,
             lp.delegation,
             lp.specialist,
@@ -438,10 +450,15 @@ pub(crate) fn rebuild_core(
             specialist_port,
         );
         let model = format!("local:{}", lp.model_id);
+        // Size context per-model on the local path too (not just cloud): a
+        // capable long-context model (e.g. Qwen3.6, 256K native) gets its real
+        // budget, while smaller local models (Bonsai 32K/64K) keep the
+        // conservative server-probed/default value and are never overshot.
+        let ctx = model_context_size(&lp.model_id, lp.max_context_tokens);
         (
             lp.main,
             model,
-            lp.max_context_tokens,
+            ctx,
             lp.compaction,
             lp.delegation,
             lp.specialist,

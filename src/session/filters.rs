@@ -129,9 +129,21 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
         })
         .map(|m| {
             let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            // Tool results are the bulkiest, lowest-value-once-stale part of
+            // history (web_fetch / skill dumps). Cap their body to a generous,
+            // FIXED size so one large dump can't crowd conversation out of the
+            // token budget. The cap is applied identically on every reload (not
+            // age-based), so it never shifts the prompt prefix — no extra
+            // re-prefill, unlike dropping or sliding truncation.
+            let raw = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let content = if role == "tool" {
+                cap_tool_body(raw)
+            } else {
+                raw.to_string()
+            };
             let mut msg = serde_json::json!({
                 "role": role,
-                "content": m.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                "content": content,
             });
             // Preserve tool_calls on assistant messages.
             if let Some(tc) = m.get("tool_calls") {
@@ -213,6 +225,26 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
         );
     }
     mapped[keep_from..].to_vec()
+}
+
+/// Max bytes retained for a tool-result body in wire history (~2k tokens).
+/// Generous enough that typical tool outputs (web_fetch defaults to ~2k chars)
+/// pass through untouched; only large dumps (multi-source news, big fetches)
+/// are trimmed, with a marker so the model knows content was elided.
+const TOOL_BODY_MAX_BYTES: usize = 8000;
+
+/// Cap an oversized tool-result body to [`TOOL_BODY_MAX_BYTES`], truncating on a
+/// UTF-8 char boundary. Deterministic in its input, so the same stored tool
+/// result always renders identically — keeping the prompt prefix byte-stable.
+fn cap_tool_body(content: &str) -> String {
+    if content.len() <= TOOL_BODY_MAX_BYTES {
+        return content.to_string();
+    }
+    let mut end = TOOL_BODY_MAX_BYTES;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…[tool output truncated]", &content[..end])
 }
 
 #[cfg(test)]
@@ -925,5 +957,50 @@ mod tests {
         assert_eq!(result.len(), 2, "only user + assistant should remain");
         assert_eq!(result[0]["content"], "question");
         assert_eq!(result[1]["content"], "answer");
+    }
+
+    #[test]
+    fn test_oversized_tool_body_capped_deterministically() {
+        // A large tool result is capped to a fixed size with a marker, and the
+        // render is deterministic — the same stored result yields identical wire
+        // bytes on every reload, so it never shifts the prompt prefix (no extra
+        // re-prefill). Small tool bodies and non-tool content pass through.
+        let big = "x".repeat(TOOL_BODY_MAX_BYTES + 5000);
+        let messages = vec![
+            user("fetch something"),
+            tool_call_assistant("t1"),
+            json!({"role": "tool", "tool_call_id": "t1", "name": "exec", "content": big}),
+            assistant("done"),
+            user("and a small one"),
+            tool_call_assistant("t2"),
+            json!({"role": "tool", "tool_call_id": "t2", "name": "exec", "content": "short result"}),
+            assistant("ok"),
+        ];
+        // Stages 1/4/6 disabled (0,0) to isolate the Stage-5 tool-body cap.
+        let a = filter_history(&messages, 0, 0);
+        let b = filter_history(&messages, 0, 0);
+        assert_eq!(a, b, "render must be deterministic for prefix stability");
+
+        let big_tool = a
+            .iter()
+            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "t1")
+            .unwrap();
+        let body = big_tool["content"].as_str().unwrap();
+        assert!(
+            body.len() <= TOOL_BODY_MAX_BYTES + 40,
+            "oversized tool body must be capped"
+        );
+        assert!(
+            body.ends_with("[tool output truncated]"),
+            "truncation marker appended"
+        );
+
+        // Small tool body and non-tool content are untouched.
+        let small_tool = a
+            .iter()
+            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "t2")
+            .unwrap();
+        assert_eq!(small_tool["content"], "short result", "small tool unchanged");
+        assert_eq!(a[0]["content"], "fetch something", "user content not capped");
     }
 }

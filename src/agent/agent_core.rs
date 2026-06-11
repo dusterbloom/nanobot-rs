@@ -699,14 +699,16 @@ fn resolve_memory_provider(
 /// Scale history message count with context window size.
 ///
 /// Small models (16K) can't afford 100 messages of history — that alone
-/// can eat 40%+ of the context. Scale linearly: ~20 msgs at 16K, ~100 at
-/// 128K, clamped to [6, 100].
+/// can eat 40%+ of the context. Scale linearly: ~87 msgs at 32K, ~349 at
+/// 128K, clamped to [6, 600].
 pub(crate) fn history_limit(max_context_tokens: usize) -> usize {
     // Real-world average is ~150 tokens per message (user queries + assistant
-    // responses). Reserve at most 30% of context for history.
-    let max_history_tokens = max_context_tokens * 3 / 10;
+    // responses). Reserve up to 40% of context for history — long multi-turn
+    // and tool-heavy sessions keep more history append-only, which also keeps
+    // the inference server's prefix cache warm (fewer turn-boundary drops).
+    let max_history_tokens = max_context_tokens * 4 / 10;
     let limit = max_history_tokens / 150;
-    limit.clamp(6, 100)
+    limit.clamp(6, 600)
 }
 
 // ---------------------------------------------------------------------------

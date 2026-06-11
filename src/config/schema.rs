@@ -1246,11 +1246,17 @@ fn default_compaction_threshold_tokens() -> usize {
 }
 
 fn default_max_message_age_turns() -> usize {
-    50
+    // Keep in step with `default_max_history_turns` (60) so anti-drift's
+    // age-based eviction doesn't rewrite old turns — busting the prefix cache —
+    // before the history turn-limit would drop them.
+    60
 }
 
 fn default_max_history_turns() -> usize {
-    10
+    // Keep many turns append-only so the inference server's prefix cache stays
+    // warm across a long session (drops past this limit force a re-prefill).
+    // Capable long-context models (e.g. Qwen3.6, 256K) comfortably hold this.
+    60
 }
 
 fn default_reflection_threshold() -> usize {
