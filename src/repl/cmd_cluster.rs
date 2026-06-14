@@ -11,6 +11,7 @@ impl ReplContext {
             [] | ["status"] => self.cmd_cluster_status().await,
             ["models"] => self.cmd_cluster_models().await,
             ["peers"] => self.cmd_cluster_peers().await,
+            ["probe", rest @ ..] => self.cmd_cluster_probe(&rest.join(" ")).await,
             ["use", rest @ ..] => self.cmd_cluster_use(&rest.join(" ")).await,
             _ => {
                 println!(
@@ -20,6 +21,7 @@ impl ReplContext {
                 println!("    /cluster              Show cluster status");
                 println!("    /cluster peers        List discovered peers");
                 println!("    /cluster models       List all models across peers");
+                println!("    /cluster probe <url>  Probe and adopt a known OpenAI-compatible peer");
                 println!(
                     "    /cluster use <model>  Switch to a model on a cluster peer
 "
@@ -174,6 +176,59 @@ impl ReplContext {
         println!();
     }
 
+    /// `/cluster probe <url>` — immediately probe a known peer and add it to cluster state.
+    #[cfg(feature = "cluster")]
+    async fn cmd_cluster_probe(&mut self, endpoint: &str) {
+        let Some(endpoint) = normalize_cluster_probe_endpoint(endpoint) else {
+            println!("\n  Usage: /cluster probe <url>\n  Example: /cluster probe 192.168.1.22:18100\n");
+            return;
+        };
+
+        let state = match &self.cluster_state {
+            Some(s) => s.clone(),
+            None => {
+                println!("\n  Cluster not enabled. Add \"cluster\": {{ \"enabled\": true }} to config.\n");
+                return;
+            }
+        };
+
+        println!("\n  Probing {}...", endpoint);
+        match crate::cluster::discovery::probe_endpoint(&endpoint).await {
+            Some(peer) => {
+                let endpoint = peer.endpoint.clone();
+                let peer_type = peer.peer_type.clone();
+                let models = peer.models.clone();
+                state.update_peer(peer).await;
+
+                println!(
+                    "  {}Found{} {} ({}) — {} model{}",
+                    tui::GREEN,
+                    tui::RESET,
+                    endpoint,
+                    peer_type,
+                    models.len(),
+                    if models.len() == 1 { "" } else { "s" }
+                );
+                for model in models.iter().take(8) {
+                    println!("    - {}", model.id);
+                }
+                if models.len() > 8 {
+                    println!("    ... {} more", models.len() - 8);
+                }
+                println!("  Use /cluster use <model> to switch.\n");
+            }
+            None => {
+                println!(
+                    "  {}No OpenAI-compatible /v1/models response from {}{}",
+                    tui::YELLOW,
+                    endpoint,
+                    tui::RESET
+                );
+                println!("  Check host, port, firewall, and whether the server needs a different API base.\n");
+            }
+        }
+    }
+
     /// `/cluster use <model>` — switch the active model to one on a cluster peer.
     #[cfg(feature = "cluster")]
     async fn cmd_cluster_use(&mut self, query: &str) {
@@ -285,5 +340,48 @@ impl ReplContext {
                 );
             }
         }
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn normalize_cluster_probe_endpoint(raw: &str) -> Option<String> {
+    let endpoint = raw.trim().trim_end_matches('/');
+    if endpoint.is_empty() {
+        return None;
+    }
+    let endpoint = endpoint.strip_suffix("/models").unwrap_or(endpoint);
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        Some(endpoint.to_string())
+    } else {
+        Some(format!("http://{}", endpoint))
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_cluster_probe_endpoint_adds_scheme() {
+        assert_eq!(
+            normalize_cluster_probe_endpoint("192.168.1.22:18100").as_deref(),
+            Some("http://192.168.1.22:18100")
+        );
+    }
+
+    #[test]
+    fn test_normalize_cluster_probe_endpoint_keeps_v1() {
+        assert_eq!(
+            normalize_cluster_probe_endpoint("http://192.168.1.22:18100/v1").as_deref(),
+            Some("http://192.168.1.22:18100/v1")
+        );
+    }
+
+    #[test]
+    fn test_normalize_cluster_probe_endpoint_trims_models_url() {
+        assert_eq!(
+            normalize_cluster_probe_endpoint("http://192.168.1.22:18100/v1/models").as_deref(),
+            Some("http://192.168.1.22:18100/v1")
+        );
     }
 }

@@ -357,7 +357,7 @@ async fn probe_endpoint_with_client(
     endpoint: &str,
     local_api_key: &str,
 ) -> Option<ClusterPeer> {
-    let url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
+    let url = models_url_for_endpoint(endpoint);
 
     // JAN (port 1337) validates the Host header and rejects requests from
     // remote IPs. Sending `Host: localhost` works around this.
@@ -400,7 +400,7 @@ async fn probe_endpoint_with_client(
             );
 
             Some(ClusterPeer {
-                endpoint: format!("{}/v1", endpoint.trim_end_matches('/')),
+                endpoint: canonical_peer_endpoint(endpoint),
                 peer_type,
                 models,
                 total_vram_mb: None,
@@ -438,6 +438,29 @@ pub fn parse_models_response(body: &serde_json::Value) -> Vec<ClusterModel> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn models_url_for_endpoint(endpoint: &str) -> String {
+    let base = endpoint.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{}/models", base)
+    } else if base.ends_with("/v1/models") {
+        base.to_string()
+    } else {
+        format!("{}/v1/models", base)
+    }
+}
+
+fn canonical_peer_endpoint(endpoint: &str) -> String {
+    let base = endpoint.trim_end_matches('/');
+    if let Some(rest) = base.strip_suffix("/models") {
+        return rest.to_string();
+    }
+    if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{}/v1", base)
+    }
 }
 
 /// Heuristic to identify the type of inference server.
@@ -785,6 +808,38 @@ mod tests {
         let models = parse_models_response(&json);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "valid-model");
+    }
+
+    #[test]
+    fn test_models_url_for_endpoint_plain_base() {
+        assert_eq!(
+            models_url_for_endpoint("http://192.168.1.22:18100"),
+            "http://192.168.1.22:18100/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_models_url_for_endpoint_v1_base() {
+        assert_eq!(
+            models_url_for_endpoint("http://192.168.1.22:18100/v1"),
+            "http://192.168.1.22:18100/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_models_url_for_endpoint_models_url() {
+        assert_eq!(
+            models_url_for_endpoint("http://192.168.1.22:18100/v1/models"),
+            "http://192.168.1.22:18100/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_canonical_peer_endpoint_accepts_v1_models_url() {
+        assert_eq!(
+            canonical_peer_endpoint("http://192.168.1.22:18100/v1/models"),
+            "http://192.168.1.22:18100/v1"
+        );
     }
 
     // --- detect_peer_type ---

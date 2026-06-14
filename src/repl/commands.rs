@@ -115,6 +115,60 @@ struct ModelEntry {
     is_loaded: bool,
 }
 
+fn model_short_id(id: &str) -> &str {
+    id.rsplit('/').next().unwrap_or(id)
+}
+
+fn model_direct_match_rank(entry: &ModelEntry, query: &str) -> Option<usize> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+
+    let id = entry.id.to_ascii_lowercase();
+    let short = model_short_id(&entry.id).to_ascii_lowercase();
+
+    if id == query {
+        Some(0)
+    } else if short == query {
+        Some(1)
+    } else if id.starts_with(&query) {
+        Some(2)
+    } else if short.starts_with(&query) {
+        Some(3)
+    } else if id.contains(&query) {
+        Some(4)
+    } else if short.contains(&query) {
+        Some(5)
+    } else {
+        None
+    }
+}
+
+fn unique_direct_model_match<'a>(
+    entries: &[&'a ModelEntry],
+    query: &str,
+) -> Option<&'a ModelEntry> {
+    let mut best_rank = usize::MAX;
+    let mut best = None;
+    let mut ties = 0usize;
+
+    for entry in entries {
+        let Some(rank) = model_direct_match_rank(entry, query) else {
+            continue;
+        };
+        if rank < best_rank {
+            best_rank = rank;
+            best = Some(*entry);
+            ties = 1;
+        } else if rank == best_rank {
+            ties += 1;
+        }
+    }
+
+    if ties == 1 { best } else { None }
+}
+
 // ============================================================================
 // DRY helpers — replace 3–10x copy-paste patterns
 // ============================================================================
@@ -771,6 +825,46 @@ mod tests {
         assert_eq!(normalize_alias("/local"), "/local");
         assert_eq!(normalize_alias("/unknown"), "/unknown");
         assert_eq!(normalize_alias("hello"), "hello");
+    }
+
+    fn test_model_entry(id: &str) -> ModelEntry {
+        ModelEntry {
+            id: id.to_string(),
+            source: ModelSource::LocalLms { port: 1234 },
+            is_active: false,
+            is_loaded: false,
+        }
+    }
+
+    #[test]
+    fn test_unique_direct_model_match_short_name() {
+        let qwen = test_model_entry("mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit");
+        let nemotron = test_model_entry("nvidia/Nemotron-Nano-12B");
+        let entries = vec![&qwen, &nemotron];
+
+        let selected = unique_direct_model_match(&entries, "qwen3-coder").unwrap();
+
+        assert_eq!(selected.id, qwen.id);
+    }
+
+    #[test]
+    fn test_unique_direct_model_match_refuses_ambiguous_prefix() {
+        let coder = test_model_entry("mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit");
+        let chat = test_model_entry("mlx-community/Qwen3-14B-Instruct-4bit");
+        let entries = vec![&coder, &chat];
+
+        assert!(unique_direct_model_match(&entries, "qwen3").is_none());
+    }
+
+    #[test]
+    fn test_unique_direct_model_match_prefers_exact_over_contains() {
+        let exact = test_model_entry("Qwen3");
+        let longer = test_model_entry("mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit");
+        let entries = vec![&longer, &exact];
+
+        let selected = unique_direct_model_match(&entries, "qwen3").unwrap();
+
+        assert_eq!(selected.id, exact.id);
     }
 
     #[test]

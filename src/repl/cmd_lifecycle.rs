@@ -394,85 +394,95 @@ impl ReplContext {
             return;
         }
 
-        // Group entries by source label for display
-        println!();
-        let mut current_group = String::new();
-        for (i, entry) in entries.iter().enumerate() {
-            let group = match &entry.source {
-                ModelSource::LocalLms { port } => {
-                    format!("Local (LM Studio :{})", port)
-                }
-                ModelSource::Remote {
-                    endpoint,
-                    peer_type,
-                } => {
-                    let short = crate::tui::shorten_url(endpoint)
-                        .split('/')
-                        .next()
-                        .unwrap_or(endpoint);
-                    #[cfg(feature = "cluster")]
-                    {
-                        format!("{} ({})", short, peer_type)
-                    }
-                    #[cfg(not(feature = "cluster"))]
-                    {
-                        let _ = peer_type;
-                        format!("{}", short)
-                    }
-                }
-                ModelSource::File { .. } => "~/models/".to_string(),
-                ModelSource::Omlx { ref endpoint } => {
-                    let short = crate::tui::shorten_url(endpoint)
-                        .split('/')
-                        .next()
-                        .unwrap_or(endpoint);
-                    format!("oMLX ({})", short)
-                }
-            };
-            if group != current_group {
-                if !current_group.is_empty() {
-                    println!();
-                }
-                println!("  {}{}{}:", tui::DIM, group, tui::RESET);
-                current_group = group;
-            }
-            let marker = if entry.is_active {
-                format!(" {}(active){}", tui::GREEN, tui::RESET)
-            } else if entry.is_loaded {
-                format!(" {}(loaded){}", tui::DIM, tui::RESET)
-            } else {
-                String::new()
-            };
-            // For file entries, show size
-            if let ModelSource::File { ref path } = entry.source {
-                let size_mb = std::fs::metadata(path)
-                    .map(|m| m.len() / 1_048_576)
-                    .unwrap_or(0);
-                println!("    [{}] {} ({} MB){}", i + 1, entry.id, size_mb, marker);
-            } else {
-                println!("    [{}] {}{}", i + 1, entry.id, marker);
-            }
-        }
-
-        // Prompt for selection
-        let prompt = format!("\nSelect model [1-{}] or Enter to cancel: ", entries.len());
-        let choice = match self.rl.as_mut().unwrap().readline(&prompt) {
-            Ok(line) => line,
-            Err(_) => return,
+        let selected = if !filter_lower.is_empty() {
+            unique_direct_model_match(&entries, &filter_lower).cloned()
+        } else {
+            None
         };
-        let choice = choice.trim();
-        if choice.is_empty() {
-            return;
-        }
-        let idx: usize = match choice.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= entries.len() => n - 1,
-            _ => {
-                println!("  Invalid selection.\n");
+
+        let selected = if let Some(selected) = selected {
+            selected
+        } else {
+            // Group entries by source label for display
+            println!();
+            let mut current_group = String::new();
+            for (i, entry) in entries.iter().enumerate() {
+                let group = match &entry.source {
+                    ModelSource::LocalLms { port } => {
+                        format!("Local (LM Studio :{})", port)
+                    }
+                    ModelSource::Remote {
+                        endpoint,
+                        peer_type,
+                    } => {
+                        let short = crate::tui::shorten_url(endpoint)
+                            .split('/')
+                            .next()
+                            .unwrap_or(endpoint);
+                        #[cfg(feature = "cluster")]
+                        {
+                            format!("{} ({})", short, peer_type)
+                        }
+                        #[cfg(not(feature = "cluster"))]
+                        {
+                            let _ = peer_type;
+                            format!("{}", short)
+                        }
+                    }
+                    ModelSource::File { .. } => "~/models/".to_string(),
+                    ModelSource::Omlx { ref endpoint } => {
+                        let short = crate::tui::shorten_url(endpoint)
+                            .split('/')
+                            .next()
+                            .unwrap_or(endpoint);
+                        format!("oMLX ({})", short)
+                    }
+                };
+                if group != current_group {
+                    if !current_group.is_empty() {
+                        println!();
+                    }
+                    println!("  {}{}{}:", tui::DIM, group, tui::RESET);
+                    current_group = group;
+                }
+                let marker = if entry.is_active {
+                    format!(" {}(active){}", tui::GREEN, tui::RESET)
+                } else if entry.is_loaded {
+                    format!(" {}(loaded){}", tui::DIM, tui::RESET)
+                } else {
+                    String::new()
+                };
+                // For file entries, show size
+                if let ModelSource::File { ref path } = entry.source {
+                    let size_mb = std::fs::metadata(path)
+                        .map(|m| m.len() / 1_048_576)
+                        .unwrap_or(0);
+                    println!("    [{}] {} ({} MB){}", i + 1, entry.id, size_mb, marker);
+                } else {
+                    println!("    [{}] {}{}", i + 1, entry.id, marker);
+                }
+            }
+
+            // Prompt for selection
+            let prompt = format!("\nSelect model [1-{}] or Enter to cancel: ", entries.len());
+            let choice = match self.rl.as_mut().unwrap().readline(&prompt) {
+                Ok(line) => line,
+                Err(_) => return,
+            };
+            let choice = choice.trim();
+            if choice.is_empty() {
                 return;
-            }
+            };
+            let idx: usize = match choice.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= entries.len() => n - 1,
+                _ => {
+                    println!("  Invalid selection.\n");
+                    return;
+                }
+            };
+            entries[idx].clone()
         };
 
-        let selected = entries[idx].clone();
         println!("\n  Selected: {}", selected.id);
 
         // Dispatch based on source
@@ -509,7 +519,15 @@ impl ReplContext {
                 .await
                 {
                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                    Err(e) => {
+                        println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
+                        println!(
+                            "  {}Model switch aborted; config was not changed.{}\n",
+                            tui::DIM,
+                            tui::RESET
+                        );
+                        return;
+                    }
                 }
                 // Persist — switch backend away from "mlx" to LM Studio HTTP.
                 // Do NOT overwrite "higgs" backend: Higgs is a managed sidecar
@@ -547,38 +565,59 @@ impl ReplContext {
 
                 if is_lms {
                     // LM Studio remote peer: do unload/load like local LMS
-                    if let Some(port) = Self::extract_endpoint_port(endpoint) {
-                        let remote_host = super::super::extract_url_host(endpoint);
-                        let prev_model = self.config.agents.defaults.lms_main_model.clone();
-                        if !prev_model.is_empty() && prev_model != selected.id {
-                            print!("  Unloading {}... ", prev_model);
-                            io::stdout().flush().ok();
-                            match crate::lms::unload_model(
-                                &remote_host,
-                                port,
-                                &prev_model,
-                                self.config.timeouts.lms_unload_secs,
-                            )
-                            .await
-                            {
-                                Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                                Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
-                            }
-                        }
-                        let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
-                        print!("  Loading {}... ", selected.id);
+                    let Some(port) = Self::extract_endpoint_port(endpoint) else {
+                        println!(
+                            "  {}FAILED: could not parse LM Studio endpoint port from {}{}",
+                            tui::RED,
+                            endpoint,
+                            tui::RESET
+                        );
+                        println!(
+                            "  {}Model switch aborted; config was not changed.{}\n",
+                            tui::DIM,
+                            tui::RESET
+                        );
+                        return;
+                    };
+
+                    let remote_host = super::super::extract_url_host(endpoint);
+                    let prev_model = self.config.agents.defaults.lms_main_model.clone();
+                    if !prev_model.is_empty() && prev_model != selected.id {
+                        print!("  Unloading {}... ", prev_model);
                         io::stdout().flush().ok();
-                        match crate::lms::load_model(
+                        match crate::lms::unload_model(
                             &remote_host,
                             port,
-                            &selected.id,
-                            ctx,
-                            self.config.timeouts.lms_load_secs,
+                            &prev_model,
+                            self.config.timeouts.lms_unload_secs,
                         )
                         .await
                         {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                            Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
+                        }
+                    }
+                    let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
+                    print!("  Loading {}... ", selected.id);
+                    io::stdout().flush().ok();
+                    match crate::lms::load_model(
+                        &remote_host,
+                        port,
+                        &selected.id,
+                        ctx,
+                        self.config.timeouts.lms_load_secs,
+                    )
+                    .await
+                    {
+                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                        Err(e) => {
+                            println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
+                            println!(
+                                "  {}Model switch aborted; config was not changed.{}\n",
+                                tui::DIM,
+                                tui::RESET
+                            );
+                            return;
                         }
                     }
                 }

@@ -3,8 +3,76 @@
 use std::sync::atomic::Ordering;
 
 use crate::agent::context::PromptBlockKind;
+use crate::config::schema::{Config, PROVIDER_PREFIXES};
 
 use super::*;
+
+fn provider_key_enabled(key: &str) -> bool {
+    !key.is_empty() && !key.eq_ignore_ascii_case("none")
+}
+
+fn cloud_provider_status(config: &Config, model: &str) -> String {
+    for (prefix, accessor, default_base) in PROVIDER_PREFIXES {
+        if let Some(stripped_model) = model.strip_prefix(prefix) {
+            let provider = prefix.trim_end_matches('/');
+            let cfg = accessor(&config.providers);
+            let base = cfg.api_base.as_deref().unwrap_or(default_base);
+            if provider_key_enabled(&cfg.api_key) {
+                return format!(
+                    "{} @ {} · model {}",
+                    provider,
+                    tui::shorten_url(base),
+                    stripped_model
+                );
+            }
+            return format!(
+                "{}{} missing key{} · model {}",
+                tui::YELLOW,
+                provider,
+                tui::RESET,
+                stripped_model
+            );
+        }
+    }
+
+    if let Some(base) = config.get_api_base() {
+        return format!(
+            "{} @ {} · model {}",
+            provider_label_from_base(&base),
+            tui::shorten_url(&base),
+            model
+        );
+    }
+
+    format!(
+        "{}missing cloud key{} · configure ~/.nanobot/config.json",
+        tui::YELLOW,
+        tui::RESET
+    )
+}
+
+fn provider_label_from_base(base: &str) -> &'static str {
+    let lower = base.to_ascii_lowercase();
+    if lower.contains("openrouter") {
+        "openrouter"
+    } else if lower.contains("deepseek") {
+        "deepseek"
+    } else if lower.contains("anthropic") {
+        "anthropic"
+    } else if lower.contains("openai") {
+        "openai"
+    } else if lower.contains("generativelanguage") || lower.contains("gemini") {
+        "gemini"
+    } else if lower.contains("zhipu") {
+        "zhipu"
+    } else if lower.contains("groq") {
+        "groq"
+    } else if lower.contains("localhost") || lower.contains("127.0.0.1") {
+        "vllm"
+    } else {
+        "custom"
+    }
+}
 
 impl ReplContext {
     /// /status — show current mode, model, and channel info.
@@ -44,6 +112,35 @@ impl ReplContext {
             core.lane,
             model_name
         );
+        if is_mlx {
+            println!(
+                "  {}PROVIDER{}  local mlx in-process",
+                tui::BOLD,
+                tui::RESET
+            );
+        } else if is_local {
+            let backend = self.config.agents.defaults.local_backend.trim();
+            let backend = if backend.is_empty() { "lmstudio" } else { backend };
+            let local_base = self.config.agents.defaults.local_api_base.trim();
+            let provider = if local_base.is_empty() {
+                format!("local {} managed", backend)
+            } else {
+                format!("local {} @ {}", backend, tui::shorten_url(local_base))
+            };
+            println!(
+                "  {}PROVIDER{}  {}",
+                tui::BOLD,
+                tui::RESET,
+                provider
+            );
+        } else {
+            println!(
+                "  {}PROVIDER{}  {}",
+                tui::BOLD,
+                tui::RESET,
+                cloud_provider_status(&self.config, model_name)
+            );
+        }
 
         let thinking = counters.thinking_budget.load(Ordering::Relaxed);
         if thinking > 0 {

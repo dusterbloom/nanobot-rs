@@ -1123,8 +1123,11 @@ async fn stream_and_render_inner(
     // Only clean up trailing blank line and optionally append provenance footer.
     if !response.is_empty() && std::io::stdout().is_terminal() {
         use std::io::Write as _;
-        // Erase the trailing \r\n from the print task (1 line).
-        print!("\r\x1b[1A\x1b[2K");
+        // The print task leaves the cursor on a fresh blank row after the
+        // streamed answer/footer. Clear only that current row; moving upward
+        // here can erase visible assistant output on terminals that handle
+        // raw-mode newlines differently.
+        print!("\r\x1b[2K");
         std::io::stdout().flush().ok();
 
         // Show redaction warning if strict mode removed fabricated claims.

@@ -374,7 +374,7 @@ pub(crate) fn render_input_bar(
     let bar_lines = 5usize;
     let bar_row = height.saturating_sub(bar_lines) + 1;
 
-    // Reset scroll region to full screen so we can position cursor freely
+    // Reset scroll region to full screen so we can position cursor freely.
     print!("\x1b[r");
 
     if push_content {
@@ -425,11 +425,12 @@ pub(crate) fn clear_input_bar() {
     let height = terminal_height();
     let bar_lines = 5usize;
     let bar_row = height.saturating_sub(bar_lines) + 1;
-    for row in bar_row..=height {
+    let first_row = bar_row.saturating_sub(1).max(1);
+    for row in first_row..=height {
         print!("\x1b[{};1H\x1b[2K", row);
     }
     // Move cursor to top-left of where the bar was so subsequent output flows naturally.
-    print!("\x1b[{};1H", bar_row);
+    print!("\x1b[{};1H", first_row);
     std::io::stdout().flush().ok();
 }
 

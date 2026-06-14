@@ -1881,7 +1881,7 @@ impl Default for LcmSchemaConfig {
 // ---------------------------------------------------------------------------
 
 fn default_cluster_scan_ports() -> Vec<u16> {
-    vec![52415, 1234, 8080, 1337]
+    vec![52415, 1234, 8080, 1337, 18100]
 }
 
 fn default_cluster_scan_interval() -> u64 {
@@ -1898,7 +1898,8 @@ pub struct ClusterConfig {
     pub auto_discover: bool,
     /// Manual peer endpoint URLs (e.g. ["http://192.168.1.50:52415"]).
     pub endpoints: Vec<String>,
-    /// Ports to scan during HTTP probe discovery (default: [52415, 1234, 8080]).
+    /// Ports to scan during HTTP probe discovery.
+    /// Defaults cover Exo, LM Studio, llama.cpp, Jan, and common dstack/dFlash servers.
     #[serde(default = "default_cluster_scan_ports")]
     pub scan_ports: Vec<u16>,
     /// Seconds between discovery scans (default: 60).
