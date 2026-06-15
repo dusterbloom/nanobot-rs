@@ -83,6 +83,10 @@ enum Cell {
         elapsed_s: f32,
         ttft_s: Option<f32>,
         tokens: u64,
+        /// Generation throughput (tokens / decode time), when computable.
+        tps: Option<f32>,
+        /// True when `tokens` was estimated (provider didn't report a count).
+        estimated: bool,
     },
     /// A local system note (e.g. an unsupported command).
     Note(String),
@@ -117,6 +121,11 @@ pub(crate) struct App {
     show_help: bool,
     /// Whether voice mode is active (Enter on an empty line records).
     voice: bool,
+    /// Whether a voice recording is in progress (frozen UI, shown in header).
+    recording: bool,
+    /// Assistant text accumulated this turn, for token estimation when the
+    /// provider doesn't report a completion-token count.
+    turn_text: String,
 }
 
 impl App {
@@ -136,7 +145,14 @@ impl App {
             max_scroll: 0,
             show_help: false,
             voice: false,
+            recording: false,
+            turn_text: String::new(),
         }
+    }
+
+    /// Toggle the "recording" indicator (drawn in the header during a voice turn).
+    pub(crate) fn set_recording(&mut self, on: bool) {
+        self.recording = on;
     }
 
     /// Open or close the help overlay.
@@ -166,6 +182,7 @@ impl App {
         self.turn_start = Some(Instant::now());
         self.ttft = None;
         self.turn_tokens = 0;
+        self.turn_text.clear();
         self.prefill = None;
         self.scroll_from_bottom = 0; // jump to bottom for the new turn
     }
@@ -188,6 +205,7 @@ impl App {
     fn push_text(&mut self, d: &str) {
         self.mark_first_output();
         self.got_text = true;
+        self.turn_text.push_str(d);
         if let Some(Cell::Reply(t)) = self.transcript.last_mut() {
             t.push_str(d);
         } else {
@@ -278,6 +296,7 @@ impl App {
             if self.ttft.is_none() {
                 self.ttft = Some(self.elapsed_s());
             }
+            self.turn_text = resp.clone();
             self.transcript.push(Cell::Reply(resp));
             self.turn_produced = true;
         }
@@ -287,10 +306,26 @@ impl App {
             }
         }
         if self.turn_produced {
+            // Prefer the provider-reported count; otherwise estimate from the
+            // reply text so throughput shows for models that omit usage.
+            let reported = self.turn_tokens;
+            let tokens = if reported > 0 {
+                reported
+            } else {
+                estimate_tokens(&self.turn_text)
+            };
+            let elapsed = self.elapsed_s();
+            let gen_time = match self.ttft {
+                Some(t) => (elapsed - t).max(0.05),
+                None => elapsed.max(0.05),
+            };
+            let tps = (tokens > 0).then(|| tokens as f32 / gen_time);
             self.transcript.push(Cell::Meta {
-                elapsed_s: self.elapsed_s(),
+                elapsed_s: elapsed,
                 ttft_s: self.ttft,
-                tokens: self.turn_tokens,
+                tokens,
+                tps,
+                estimated: reported == 0,
             });
         }
     }
@@ -466,7 +501,10 @@ impl App {
         status.push(Span::styled(" TRENTADUE", style(Color::White, true)));
         status.push(Span::styled(" \u{b7} 32", dim_color(Color::Cyan)));
         status.push(Span::styled("  \u{b7}  ", dim()));
-        if self.streaming {
+        if self.recording {
+            status.push(Span::styled(format!("{DOT} recording"), style(Color::Red, true)));
+            status.push(Span::styled("  \u{b7}  Enter/Esc to stop", dim()));
+        } else if self.streaming {
             let tail = match self.prefill {
                 Some((p, t)) if t > 0 => {
                     format!("{}% \u{b7} {:.1}s", p * 100 / t, self.elapsed_s())
@@ -729,13 +767,19 @@ fn cell_lines(cell: &Cell) -> Vec<Vec<(String, Style)>> {
             elapsed_s,
             ttft_s,
             tokens,
+            tps,
+            estimated,
         } => {
             let mut s = format!("  {META} {:.1}s", elapsed_s);
             if let Some(t) = ttft_s {
                 s.push_str(&format!("  ttft {:.2}s", t));
             }
             if *tokens > 0 {
-                s.push_str(&format!("  {tokens} tok"));
+                let mark = if *estimated { "~" } else { "" };
+                s.push_str(&format!("  {mark}{tokens} tok"));
+                if let Some(tps) = tps {
+                    s.push_str(&format!("  {mark}{tps:.0} tok/s"));
+                }
             }
             vec![vec![(s, dim())]]
         }
@@ -789,6 +833,12 @@ fn row_to_line(row: &[(char, Style)]) -> Line<'static> {
         spans.push(Span::styled(buf, s));
     }
     Line::from(spans)
+}
+
+/// Rough token estimate (~4 chars/token), used only when the provider omits a
+/// usage count so throughput can still be shown (marked `~` in the UI).
+fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as f32 / 4.0).ceil() as u64
 }
 
 /// One-line summary of a tool result, collapsed like the classic renderer.
@@ -1071,5 +1121,44 @@ mod tests {
         assert!(!app.transcript.is_empty());
         app.clear_transcript();
         assert!(app.transcript.is_empty());
+    }
+
+    #[test]
+    fn meta_estimates_tokens_and_throughput_when_unreported() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("hello world this is a reply"); // no token marker sent
+        app.finish_turn(String::new());
+        match app.transcript.last() {
+            Some(Cell::Meta {
+                tokens,
+                tps,
+                estimated,
+                ..
+            }) => {
+                assert!(*estimated, "must be flagged estimated");
+                assert!(*tokens > 0, "estimated token count > 0");
+                assert!(tps.is_some(), "throughput computed from estimate");
+            }
+            other => panic!("expected meta, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn meta_uses_reported_tokens_when_present() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("hi");
+        app.on_delta("\u{0}tokens:123");
+        app.finish_turn(String::new());
+        match app.transcript.last() {
+            Some(Cell::Meta {
+                tokens, estimated, ..
+            }) => {
+                assert_eq!(*tokens, 123);
+                assert!(!*estimated, "reported tokens are exact, not estimated");
+            }
+            _ => panic!("expected meta"),
+        }
     }
 }

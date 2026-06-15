@@ -296,12 +296,26 @@ async fn voice_cycle(
     ev_rx: &mut UnboundedReceiver<Event>,
     paused: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    suspend_ui(paused)?;
+    // Inline recording — stay in the alt-screen (no jarring screen switch).
+    // Only pause the reader so `record_and_transcribe` owns stdin for its stop
+    // key; it self-erases its own transient "recording…" text on return.
+    app.set_recording(true);
+    let footer = footer_snapshot(&ctx.core_handle);
+    terminal.draw(|f| app.draw(f, &footer))?;
+
+    paused.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(120));
     let captured = ctx
         .voice_session
         .as_mut()
         .map(|vs| vs.record_and_transcribe());
-    resume_ui(terminal, ev_rx, paused)?;
+    // The recorder toggles its own raw mode; force raw back on for ratatui and
+    // repaint to wipe anything it printed over the alt-screen.
+    let _ = enable_raw_mode();
+    paused.store(false, Ordering::Relaxed);
+    while ev_rx.try_recv().is_ok() {}
+    app.set_recording(false);
+    terminal.clear()?;
 
     match captured {
         Some(Ok(Some((text, lang)))) => {
@@ -322,6 +336,8 @@ async fn voice_cycle(
         Some(Err(e)) => app.push_note(format!("voice error: {e}")),
         None => {}
     }
+    // Drop keys queued while recording/speaking so they don't trigger a turn.
+    while ev_rx.try_recv().is_ok() {}
     Ok(())
 }
 
