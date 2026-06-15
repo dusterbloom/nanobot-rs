@@ -52,6 +52,8 @@ pub(crate) enum Action {
     Quit,
     /// User submitted a message to send to the agent.
     Submit(String),
+    /// Voice mode: start a record → transcribe → reply → speak cycle.
+    Record,
 }
 
 /// Status of a single tool invocation.
@@ -113,6 +115,8 @@ pub(crate) struct App {
     max_scroll: usize,
     /// Whether the help overlay is showing.
     show_help: bool,
+    /// Whether voice mode is active (Enter on an empty line records).
+    voice: bool,
 }
 
 impl App {
@@ -131,12 +135,18 @@ impl App {
             scroll_from_bottom: 0,
             max_scroll: 0,
             show_help: false,
+            voice: false,
         }
     }
 
     /// Open or close the help overlay.
     pub(crate) fn set_help(&mut self, on: bool) {
         self.show_help = on;
+    }
+
+    /// Reflect whether voice mode is active (set after a `/voice` toggle).
+    pub(crate) fn set_voice(&mut self, on: bool) {
+        self.voice = on;
     }
 
     /// Drop all transcript history (`/clear`).
@@ -333,7 +343,13 @@ impl App {
                 self.show_help = true;
                 Action::Continue
             }
-            KeyCode::Enter if k.modifiers.is_empty() => self.submit(),
+            KeyCode::Enter if k.modifiers.is_empty() => {
+                if self.voice && self.input_is_empty() {
+                    Action::Record
+                } else {
+                    self.submit()
+                }
+            }
             KeyCode::PageUp => {
                 self.scroll_up(10);
                 Action::Continue
@@ -458,6 +474,9 @@ impl App {
                 _ => format!("{:.1}s", self.elapsed_s()),
             };
             status.push(Span::styled(tail, dim()));
+        } else if self.voice {
+            status.push(Span::styled("voice", style(Color::Green, false)));
+            status.push(Span::styled("  ·  Enter to speak", dim()));
         } else {
             status.push(Span::styled("ready", style(Color::Green, false)));
         }

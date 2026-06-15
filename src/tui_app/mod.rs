@@ -186,6 +186,10 @@ async fn event_loop(
                 };
                 run_turn(terminal, app, &session, &text, ev_rx).await?;
             }
+            Action::Record => {
+                #[cfg(feature = "voice")]
+                voice_cycle(terminal, app, ctx, ev_rx, paused).await?;
+            }
         }
     }
     Ok(())
@@ -207,12 +211,49 @@ async fn slash_command(
         "quit" | "exit" | "q" => return Ok(true),
         "help" | "?" => app.set_help(true),
         "clear" => app.clear_transcript(),
-        "voice" | "v" => app.push_note(
-            "voice isn't wired into the TUI yet (capture needs TUI integration) — use the classic REPL for voice".into(),
-        ),
+        "voice" | "v" => {
+            // Toggle voice via the classic dispatcher, then reflect the new
+            // state so the UI knows Enter-on-empty should record.
+            run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?;
+            app.set_voice(ctx.voice_on());
+        }
         _ => run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?,
     }
     Ok(false)
+}
+
+/// Leave the alt-screen and pause the reader so stdin is free for a classic
+/// command's picker or for voice recording (both read stdin themselves).
+fn suspend_ui(paused: &Arc<AtomicBool>) -> std::io::Result<()> {
+    paused.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(120)); // let an in-flight poll finish
+    disable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        Show
+    )?;
+    Ok(())
+}
+
+/// Re-enter the alt-screen, resume the reader, drop stray input, repaint.
+fn resume_ui(
+    terminal: &mut DefaultTerminal,
+    ev_rx: &mut UnboundedReceiver<Event>,
+    paused: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        Hide
+    )?;
+    terminal.clear()?;
+    paused.store(false, Ordering::Relaxed);
+    while ev_rx.try_recv().is_ok() {}
+    Ok(())
 }
 
 /// Suspend the alt-screen, run the classic `dispatch` (which may print ANSI or
@@ -227,43 +268,59 @@ async fn run_classic_command(
 ) -> std::io::Result<()> {
     use std::io::Write as _;
 
-    // Suspend: pause the reader (free stdin), leave the alt-screen, show cursor.
-    paused.store(true, Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(120)); // let an in-flight poll finish
-    disable_raw_mode()?;
-    execute!(
-        std::io::stdout(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-        Show
-    )?;
+    suspend_ui(paused)?;
     println!();
-
     let handled = ctx.dispatch(input).await;
-
     if handled {
         print!("\n\x1b[2m— press Enter to return to TRENTADUE —\x1b[0m ");
         let _ = std::io::stdout().flush();
         let mut buf = String::new();
         let _ = std::io::stdin().read_line(&mut buf);
     }
-
-    // Resume: back into the alt-screen, raw mode, hide cursor, repaint.
-    enable_raw_mode()?;
-    execute!(
-        std::io::stdout(),
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        Hide
-    )?;
-    terminal.clear()?;
-    paused.store(false, Ordering::Relaxed);
-
-    // Discard any keystrokes that slipped in around the suspend window.
-    while ev_rx.try_recv().is_ok() {}
+    resume_ui(terminal, ev_rx, paused)?;
 
     if !handled {
         app.push_note(format!("unknown command: {input}"));
+    }
+    Ok(())
+}
+
+/// Voice turn: suspend (so the recorder owns stdin), record + transcribe, resume,
+/// run the agent turn, then speak the reply. Recording is blocking, hence the
+/// suspend — `record_and_transcribe` reads keys for its own stop control.
+#[cfg(feature = "voice")]
+async fn voice_cycle(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    ctx: &mut ReplContext,
+    ev_rx: &mut UnboundedReceiver<Event>,
+    paused: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    suspend_ui(paused)?;
+    let captured = ctx
+        .voice_session
+        .as_mut()
+        .map(|vs| vs.record_and_transcribe());
+    resume_ui(terminal, ev_rx, paused)?;
+
+    match captured {
+        Some(Ok(Some((text, lang)))) => {
+            let session = Session {
+                agent: &ctx.agent_loop,
+                core: &ctx.core_handle,
+                session_id: &ctx.session_id,
+                lang: ctx.lang.as_deref(),
+            };
+            let reply = run_turn(terminal, app, &session, &text, ev_rx).await?;
+            if !reply.trim().is_empty() {
+                if let Some(vs) = ctx.voice_session.as_mut() {
+                    let _ = vs.speak(&reply, &lang);
+                }
+            }
+        }
+        Some(Ok(None)) => app.push_note("(no speech detected)".into()),
+        Some(Err(e)) => app.push_note(format!("voice error: {e}")),
+        None => {}
     }
     Ok(())
 }
@@ -276,7 +333,7 @@ async fn run_turn(
     session: &Session<'_>,
     input: &str,
     ev_rx: &mut UnboundedReceiver<Event>,
-) -> std::io::Result<()> {
+) -> std::io::Result<String> {
     app.begin_turn(input);
 
     let (delta_tx, mut delta_rx) = unbounded_channel::<String>();
@@ -324,8 +381,9 @@ async fn run_turn(
     while let Ok(e) = tool_rx.try_recv() {
         app.on_tool_event(e);
     }
+    let reply = response.clone();
     app.finish_turn(response);
     let footer = footer_snapshot(session.core);
     terminal.draw(|f| app.draw(f, &footer))?;
-    Ok(())
+    Ok(reply)
 }
