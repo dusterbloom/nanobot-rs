@@ -1310,6 +1310,20 @@ pub(crate) struct ActiveChannel {
     pub handle: tokio::task::JoinHandle<()>,
 }
 
+/// Quick reachability probe for an OpenAI-compatible base URL (≤2s). Used to
+/// avoid a long warmup hang when the oMLX server isn't up.
+async fn omlx_reachable(base: &str) -> bool {
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reqwest::Client::new().get(&url).send(),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 pub(crate) fn cmd_agent(
     message: Option<String>,
     session_id: String,
@@ -1572,8 +1586,24 @@ pub(crate) fn cmd_agent(
         let is_interactive = message.is_none();
         if is_interactive && use_omlx {
             tui::register_resize_handler();
-            let base = &config.agents.defaults.local_api_base;
-            tui::print_omlx_splash(base);
+            let base = config.agents.defaults.local_api_base.clone();
+            tui::print_omlx_splash(&base);
+            // Warm the oMLX model now so the first message isn't a cold load.
+            // (The JIT warmup further below is LMS-only; oMLX otherwise loads
+            // the model lazily on the first real request → slow first TTFT.)
+            let warm_model = if !config.agents.defaults.lms_main_model.is_empty() {
+                config.agents.defaults.lms_main_model.clone()
+            } else {
+                config.agents.defaults.local_model.clone()
+            };
+            if !warm_model.is_empty() && omlx_reachable(&base).await {
+                use std::io::Write as _;
+                print!("  {}Warming up {}...{} ", tui::DIM, warm_model, tui::RESET);
+                io::stdout().flush().ok();
+                let key = config.agents.defaults.local_api_key.clone();
+                crate::providers::jit_gate::warmup_jit_models(&base, &key, &[&warm_model]).await;
+                println!("{}done{}", tui::DIM, tui::RESET);
+            }
         }
         if is_interactive && use_higgs {
             tui::register_resize_handler();
