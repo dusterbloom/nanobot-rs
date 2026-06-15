@@ -199,6 +199,8 @@ pub(crate) struct App {
     voice: bool,
     /// Whether a voice recording is in progress (frozen UI, shown in header).
     recording: bool,
+    /// Whether the assistant reply is being spoken (Enter barges in).
+    speaking: bool,
     /// Assistant text accumulated this turn, for token estimation when the
     /// provider doesn't report a completion-token count.
     turn_text: String,
@@ -234,6 +236,7 @@ impl App {
             show_help: false,
             voice: false,
             recording: false,
+            speaking: false,
             turn_text: String::new(),
             history: Vec::new(),
             hist_pos: None,
@@ -314,6 +317,11 @@ impl App {
     /// Toggle the "recording" indicator (drawn in the header during a voice turn).
     pub(crate) fn set_recording(&mut self, on: bool) {
         self.recording = on;
+    }
+
+    /// Toggle the "speaking" indicator (TTS playing; Enter barges in).
+    pub(crate) fn set_speaking(&mut self, on: bool) {
+        self.speaking = on;
     }
 
     /// Open or close the help overlay.
@@ -839,6 +847,9 @@ impl App {
         if self.recording {
             status.push(Span::styled(format!("{DOT} recording"), style(Color::Red, true)));
             status.push(Span::styled("  \u{b7}  Enter/Esc to stop", dim()));
+        } else if self.speaking {
+            status.push(Span::styled(format!("{DOT} speaking"), style(Color::Cyan, true)));
+            status.push(Span::styled("  \u{b7}  Enter to interrupt", dim()));
         } else if self.streaming {
             let tail = match self.prefill {
                 Some((p, t)) if t > 0 => {

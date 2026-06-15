@@ -343,49 +343,79 @@ async fn voice_cycle(
     ev_rx: &mut UnboundedReceiver<Event>,
     paused: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    // Inline recording — stay in the alt-screen (no jarring screen switch).
-    // Only pause the reader so `record_and_transcribe` owns stdin for its stop
-    // key; it self-erases its own transient "recording…" text on return.
-    app.set_recording(true);
-    let footer = footer_snapshot(&ctx.core_handle);
-    terminal.draw(|f| app.draw(f, &footer))?;
+    loop {
+        // --- record (inline, no screen switch) ---
+        app.set_recording(true);
+        let footer = footer_snapshot(&ctx.core_handle);
+        terminal.draw(|f| app.draw(f, &footer))?;
+        paused.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(120));
+        let captured = ctx
+            .voice_session
+            .as_mut()
+            .map(|vs| vs.record_and_transcribe());
+        let _ = enable_raw_mode(); // recorder toggles its own raw mode
+        paused.store(false, Ordering::Relaxed);
+        while ev_rx.try_recv().is_ok() {}
+        app.set_recording(false);
+        terminal.clear()?;
 
-    paused.store(true, Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(120));
-    let captured = ctx
-        .voice_session
-        .as_mut()
-        .map(|vs| vs.record_and_transcribe());
-    // The recorder toggles its own raw mode; force raw back on for ratatui and
-    // repaint to wipe anything it printed over the alt-screen.
-    let _ = enable_raw_mode();
-    paused.store(false, Ordering::Relaxed);
-    while ev_rx.try_recv().is_ok() {}
-    app.set_recording(false);
-    terminal.clear()?;
+        let (text, lang) = match captured {
+            Some(Ok(Some(t))) => t,
+            Some(Ok(None)) => {
+                app.push_note("(no speech detected)".into());
+                return Ok(());
+            }
+            Some(Err(e)) => {
+                app.push_note(format!("voice error: {e}"));
+                return Ok(());
+            }
+            None => return Ok(()),
+        };
 
-    match captured {
-        Some(Ok(Some((text, lang)))) => {
+        // --- reply ---
+        let reply = {
             let session = Session {
                 agent: &ctx.agent_loop,
                 core: &ctx.core_handle,
                 session_id: &ctx.session_id,
                 lang: ctx.lang.as_deref(),
             };
-            let reply = run_turn(terminal, app, &session, &text, ev_rx).await?;
-            if !reply.trim().is_empty() {
-                if let Some(vs) = ctx.voice_session.as_mut() {
-                    let _ = vs.speak(&reply, &lang);
-                }
-            }
+            run_turn(terminal, app, &session, &text, ev_rx).await?
+        };
+        if reply.trim().is_empty() {
+            return Ok(());
         }
-        Some(Ok(None)) => app.push_note("(no speech detected)".into()),
-        Some(Err(e)) => app.push_note(format!("voice error: {e}")),
-        None => {}
+
+        // --- speak, interruptible: Enter / Ctrl+Space drops TTS instantly ---
+        app.set_speaking(true);
+        let footer = footer_snapshot(&ctx.core_handle);
+        terminal.draw(|f| app.draw(f, &footer))?;
+        let interrupted = {
+            let Some(vs) = ctx.voice_session.as_mut() else {
+                return Ok(());
+            };
+            vs.clear_cancel();
+            let cancel = vs.cancel_flag();
+            paused.store(true, Ordering::Relaxed); // free stdin for the watcher
+            std::thread::sleep(Duration::from_millis(60));
+            let done = Arc::new(AtomicBool::new(false));
+            let watcher = crate::tui::spawn_interrupt_watcher(cancel, done.clone());
+            let _ = vs.speak(&reply, &lang); // blocks; cancel flag stops it early
+            done.store(true, Ordering::Relaxed);
+            let i = watcher.join().unwrap_or(false);
+            let _ = enable_raw_mode();
+            paused.store(false, Ordering::Relaxed);
+            i
+        };
+        while ev_rx.try_recv().is_ok() {}
+        app.set_speaking(false);
+
+        // Barge-in: if the user interrupted, record again immediately.
+        if !interrupted {
+            return Ok(());
+        }
     }
-    // Drop keys queued while recording/speaking so they don't trigger a turn.
-    while ev_rx.try_recv().is_ok() {}
-    Ok(())
 }
 
 /// Drive a single agent turn, streaming text and tool events into the
