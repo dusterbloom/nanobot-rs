@@ -165,12 +165,14 @@ async fn event_loop(
             Action::Continue => {}
             Action::Submit(text) => {
                 if let Some(cmd) = text.strip_prefix('/') {
-                    if matches!(cmd, "quit" | "exit" | "q") {
-                        break;
+                    match cmd {
+                        "quit" | "exit" | "q" => break,
+                        "help" | "?" => app.set_help(true),
+                        "clear" => app.clear_transcript(),
+                        _ => app.push_note(format!(
+                            "/{cmd} isn't in the TUI yet — type /help. For /model, /voice, /local, /think, /status use the classic REPL (run without NANOBOT_TUI)."
+                        )),
                     }
-                    app.push_note(format!(
-                        "/{cmd} is not available in the ratatui UI yet — run without NANOBOT_TUI for slash commands"
-                    ));
                     continue;
                 }
                 run_turn(terminal, app, session, &text, ev_rx).await?;

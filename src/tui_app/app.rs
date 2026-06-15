@@ -15,10 +15,10 @@
 use std::time::Instant;
 
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::UnicodeWidthChar;
@@ -111,6 +111,8 @@ pub(crate) struct App {
     /// Max scrollable rows from the last draw, used to clamp `scroll_from_bottom`
     /// so paging back down always reaches the bottom.
     max_scroll: usize,
+    /// Whether the help overlay is showing.
+    show_help: bool,
 }
 
 impl App {
@@ -128,7 +130,19 @@ impl App {
             prefill: None,
             scroll_from_bottom: 0,
             max_scroll: 0,
+            show_help: false,
         }
+    }
+
+    /// Open or close the help overlay.
+    pub(crate) fn set_help(&mut self, on: bool) {
+        self.show_help = on;
+    }
+
+    /// Drop all transcript history (`/clear`).
+    pub(crate) fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.scroll_from_bottom = 0;
     }
 
     // --- turn lifecycle -----------------------------------------------------
@@ -290,7 +304,18 @@ impl App {
     /// Handle an event while idle (no turn in flight).
     pub(crate) fn on_idle_event(&mut self, ev: Event) -> Action {
         match ev {
-            Event::Key(k) if is_press(&k) => self.on_idle_key(k),
+            Event::Key(k) if is_press(&k) => {
+                // Help overlay is modal: any key dismisses it (Ctrl+C/D still quit).
+                if self.show_help {
+                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                    if ctrl && matches!(k.code, KeyCode::Char('c' | 'd')) {
+                        return Action::Quit;
+                    }
+                    self.show_help = false;
+                    return Action::Continue;
+                }
+                self.on_idle_key(k)
+            }
             Event::Paste(s) => {
                 self.input.insert_str(&s);
                 Action::Continue
@@ -303,6 +328,11 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('c' | 'd') if ctrl => Action::Quit,
+            // `?` opens help only when the input is empty, so it can still be typed.
+            KeyCode::Char('?') if !ctrl && self.input_is_empty() => {
+                self.show_help = true;
+                Action::Continue
+            }
             KeyCode::Enter if k.modifiers.is_empty() => self.submit(),
             KeyCode::PageUp => {
                 self.scroll_up(10);
@@ -328,6 +358,10 @@ impl App {
         let owned = trimmed.to_string();
         self.input = configure_input();
         Action::Submit(owned)
+    }
+
+    fn input_is_empty(&self) -> bool {
+        self.input.lines().iter().all(|l| l.is_empty())
     }
 
     /// Handle an event while a turn is streaming. Returns `true` to cancel.
@@ -394,6 +428,10 @@ impl App {
 
         f.render_widget(&self.input, chunks[2]);
         f.render_widget(Paragraph::new(footer_line(footer)), chunks[3]);
+
+        if self.show_help {
+            render_help(f, area);
+        }
     }
 
     fn input_height(&self) -> u16 {
@@ -536,6 +574,69 @@ fn footer_line(footer: &Footer) -> Line<'static> {
         spans.push(Span::styled("\u{2014}", dim())); // —
     }
     Line::from(spans)
+}
+
+/// Draw the centered help overlay over the current frame.
+fn render_help(f: &mut Frame, area: Rect) {
+    let lines = help_lines();
+    let w = 56.min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = centered_rect(w, h, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(style(Color::Cyan, false))
+        .title(Span::styled(" help ", style(Color::Cyan, true)))
+        .padding(Padding::horizontal(1));
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
+}
+
+fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w.min(area.width),
+        height: h.min(area.height),
+    }
+}
+
+/// Content of the help overlay: keys, TUI commands, and where model/voice live.
+fn help_lines() -> Vec<Line<'static>> {
+    let key = |k: &'static str, d: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("  {k:<12}"), style(Color::Green, false)),
+            Span::styled(d, Style::default()),
+        ])
+    };
+    let head = |t: &'static str| Line::from(Span::styled(t, style(Color::Cyan, true)));
+    vec![
+        head("keys"),
+        key("Enter", "send message"),
+        key("Alt+Enter", "newline"),
+        key("PgUp/PgDn", "scroll transcript"),
+        key("Esc", "cancel turn / close this"),
+        key("Ctrl+C", "quit"),
+        Line::default(),
+        head("commands"),
+        key("/help  ?", "this overlay"),
+        key("/clear", "clear the transcript"),
+        key("/quit", "exit"),
+        Line::default(),
+        head("model & voice"),
+        Line::from(Span::styled(
+            "  Not in the TUI yet. For /model, /voice, /local,",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  /think, /status — run the classic REPL:",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "    cargo run -- agent      (without NANOBOT_TUI)",
+            style(Color::Green, false),
+        )),
+    ]
 }
 
 /// The TRENTADUE brand mark `▞▞▞`. With `active` set, that cell is lit and the
@@ -926,5 +1027,34 @@ mod tests {
         // Paging back down reaches the bottom (the reported bug).
         app.scroll_down(app.max_scroll);
         assert_eq!(app.scroll_from_bottom, 0, "returns to bottom");
+    }
+
+    #[test]
+    fn help_overlay_lists_keys_commands_and_model_path() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new();
+        app.set_help(true);
+        let mut term = Terminal::new(TestBackend::new(70, 24)).unwrap();
+        term.draw(|f| app.draw(f, &test_footer())).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("keys"), "help keys missing:\n{text}");
+        assert!(text.contains("/clear"), "help commands missing:\n{text}");
+        assert!(
+            text.contains("NANOBOT_TUI"),
+            "model/voice guidance missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn clear_transcript_empties_history() {
+        let mut app = App::new();
+        app.begin_turn("hi");
+        app.on_delta("yo");
+        app.finish_turn(String::new());
+        assert!(!app.transcript.is_empty());
+        app.clear_transcript();
+        assert!(app.transcript.is_empty());
     }
 }
