@@ -11,18 +11,27 @@
 //! an mpsc channel, so the event loop can `select!` across input, the agent's
 //! text-delta and tool-event channels, and an animation tick — without ever
 //! holding a blocking read across an `.await`.
+//!
+//! Classic slash commands (`/model`, `/local`, `/think`, `/status`, …) that
+//! print ANSI or open interactive pickers can't run inside the alt-screen, so
+//! they use a suspend/resume bridge: the UI leaves the alt-screen, pauses the
+//! input reader (freeing stdin), runs the real `ReplContext::dispatch`, then
+//! re-enters and redraws.
 
 mod app;
 mod render;
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
 use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::time::MissedTickBehavior;
@@ -30,9 +39,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::audit::ToolEvent;
+use crate::repl::commands::ReplContext;
 use app::{Action, App, Footer};
 
-/// Immutable per-session handles the UI loop needs to drive the agent.
+/// Immutable per-session handles a single turn needs to drive the agent.
 struct Session<'a> {
     agent: &'a AgentLoop,
     core: &'a SharedCoreHandle,
@@ -42,8 +52,7 @@ struct Session<'a> {
 
 /// Restores terminal modes on drop, including on panic. `ratatui::init`'s panic
 /// hook restores the alt-screen/raw-mode, but not bracketed paste or the reader
-/// thread — this guard closes those gaps. Idempotent with the normal-path
-/// cleanup (disabling paste / restoring twice is harmless).
+/// thread — this guard closes those gaps. Idempotent with the normal cleanup.
 struct TerminalGuard {
     stop: Arc<AtomicBool>,
 }
@@ -65,27 +74,17 @@ pub(crate) fn enabled() -> bool {
 
 /// Run the full-screen UI for one interactive session. Restores the terminal
 /// before returning, even on panic (via [`TerminalGuard`]).
-pub(crate) async fn run(
-    agent: &AgentLoop,
-    core_handle: &SharedCoreHandle,
-    session_id: &str,
-    lang: Option<&str>,
-) -> std::io::Result<()> {
+pub(crate) async fn run(ctx: &mut ReplContext) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
     let stop = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
     let (ev_tx, mut ev_rx) = unbounded_channel::<Event>();
-    let reader = spawn_event_reader(ev_tx, stop.clone());
+    let reader = spawn_event_reader(ev_tx, stop.clone(), paused.clone());
     let _guard = TerminalGuard { stop: stop.clone() };
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
 
-    let session = Session {
-        agent,
-        core: core_handle,
-        session_id,
-        lang,
-    };
     let mut app = App::new();
-    let result = event_loop(&mut terminal, &mut app, &session, &mut ev_rx).await;
+    let result = event_loop(&mut terminal, &mut app, ctx, &mut ev_rx, &paused).await;
 
     stop.store(true, Ordering::Relaxed);
     let _ = reader.join();
@@ -112,7 +111,7 @@ fn footer_snapshot(core: &SharedCoreHandle) -> Footer {
 
 /// Abbreviate a path under `$HOME` to `~/…`. Matches on a path-segment boundary
 /// so a sibling like `/home/userfoo` is not mistaken for being under `/home/user`.
-fn home_relative(p: &Path) -> String {
+fn home_relative(p: &std::path::Path) -> String {
     let s = p.display().to_string();
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
@@ -127,11 +126,19 @@ fn home_relative(p: &Path) -> String {
     s
 }
 
-/// Blocking crossterm event reader. Polls so it can observe `stop` between
-/// events and exit promptly when the UI shuts down.
-fn spawn_event_reader(tx: UnboundedSender<Event>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+/// Blocking crossterm event reader. Polls so it can observe `stop`/`paused`
+/// between events; while paused it leaves stdin alone for the classic bridge.
+fn spawn_event_reader(
+    tx: UnboundedSender<Event>,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
+            if paused.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
             match event::poll(Duration::from_millis(100)) {
                 Ok(true) => match event::read() {
                     Ok(ev) => {
@@ -148,36 +155,115 @@ fn spawn_event_reader(tx: UnboundedSender<Event>, stop: Arc<AtomicBool>) -> Join
     })
 }
 
-/// Idle loop: redraw, wait for the next event, dispatch. A submitted message
-/// hands off to `run_turn` for the duration of the agent's response.
+/// Idle loop: redraw, wait for the next event, dispatch. Plain messages stream
+/// via `run_turn`; classic slash commands go through the suspend/resume bridge.
 async fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
-    session: &Session<'_>,
+    ctx: &mut ReplContext,
     ev_rx: &mut UnboundedReceiver<Event>,
+    paused: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     loop {
-        let footer = footer_snapshot(session.core);
+        let footer = footer_snapshot(&ctx.core_handle);
         terminal.draw(|f| app.draw(f, &footer))?;
         let Some(ev) = ev_rx.recv().await else { break };
         match app.on_idle_event(ev) {
             Action::Quit => break,
             Action::Continue => {}
             Action::Submit(text) => {
-                if let Some(cmd) = text.strip_prefix('/') {
-                    match cmd {
-                        "quit" | "exit" | "q" => break,
-                        "help" | "?" => app.set_help(true),
-                        "clear" => app.clear_transcript(),
-                        _ => app.push_note(format!(
-                            "/{cmd} isn't in the TUI yet — type /help. For /model, /voice, /local, /think, /status use the classic REPL (run without NANOBOT_TUI)."
-                        )),
+                if let Some(rest) = text.strip_prefix('/') {
+                    if slash_command(terminal, app, ctx, &text, rest, ev_rx, paused).await? {
+                        break; // /quit
                     }
                     continue;
                 }
-                run_turn(terminal, app, session, &text, ev_rx).await?;
+                let session = Session {
+                    agent: &ctx.agent_loop,
+                    core: &ctx.core_handle,
+                    session_id: &ctx.session_id,
+                    lang: ctx.lang.as_deref(),
+                };
+                run_turn(terminal, app, &session, &text, ev_rx).await?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Route a slash command. Returns `Ok(true)` when the UI should exit (`/quit`).
+/// UI-local commands are handled inline; everything else goes to the classic
+/// dispatcher via the suspend/resume bridge.
+async fn slash_command(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    ctx: &mut ReplContext,
+    full: &str,
+    rest: &str,
+    ev_rx: &mut UnboundedReceiver<Event>,
+    paused: &Arc<AtomicBool>,
+) -> std::io::Result<bool> {
+    match rest.split_whitespace().next().unwrap_or("") {
+        "quit" | "exit" | "q" => return Ok(true),
+        "help" | "?" => app.set_help(true),
+        "clear" => app.clear_transcript(),
+        "voice" | "v" => app.push_note(
+            "voice isn't wired into the TUI yet (capture needs TUI integration) — use the classic REPL for voice".into(),
+        ),
+        _ => run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?,
+    }
+    Ok(false)
+}
+
+/// Suspend the alt-screen, run the classic `dispatch` (which may print ANSI or
+/// open an interactive picker), then resume and redraw.
+async fn run_classic_command(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    ctx: &mut ReplContext,
+    input: &str,
+    ev_rx: &mut UnboundedReceiver<Event>,
+    paused: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    // Suspend: pause the reader (free stdin), leave the alt-screen, show cursor.
+    paused.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(120)); // let an in-flight poll finish
+    disable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        Show
+    )?;
+    println!();
+
+    let handled = ctx.dispatch(input).await;
+
+    if handled {
+        print!("\n\x1b[2m— press Enter to return to TRENTADUE —\x1b[0m ");
+        let _ = std::io::stdout().flush();
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_line(&mut buf);
+    }
+
+    // Resume: back into the alt-screen, raw mode, hide cursor, repaint.
+    enable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        Hide
+    )?;
+    terminal.clear()?;
+    paused.store(false, Ordering::Relaxed);
+
+    // Discard any keystrokes that slipped in around the suspend window.
+    while ev_rx.try_recv().is_ok() {}
+
+    if !handled {
+        app.push_note(format!("unknown command: {input}"));
     }
     Ok(())
 }

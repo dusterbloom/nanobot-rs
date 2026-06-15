@@ -621,20 +621,19 @@ fn help_lines() -> Vec<Line<'static>> {
         head("commands"),
         key("/help  ?", "this overlay"),
         key("/clear", "clear the transcript"),
+        key("/model", "switch model (opens picker)"),
+        key("/local", "toggle local / cloud"),
+        key("/think", "toggle thinking"),
+        key("/status", "show status"),
         key("/quit", "exit"),
         Line::default(),
-        head("model & voice"),
         Line::from(Span::styled(
-            "  Not in the TUI yet. For /model, /voice, /local,",
+            "  /model, /local, /think, /status briefly drop to a",
             dim(),
         )),
         Line::from(Span::styled(
-            "  /think, /status — run the classic REPL:",
+            "  classic view, then return. /voice not in the TUI yet.",
             dim(),
-        )),
-        Line::from(Span::styled(
-            "    cargo run -- agent      (without NANOBOT_TUI)",
-            style(Color::Green, false),
         )),
     ]
 }
@@ -1041,10 +1040,7 @@ mod tests {
         let text = buffer_text(term.backend().buffer());
         assert!(text.contains("keys"), "help keys missing:\n{text}");
         assert!(text.contains("/clear"), "help commands missing:\n{text}");
-        assert!(
-            text.contains("NANOBOT_TUI"),
-            "model/voice guidance missing:\n{text}"
-        );
+        assert!(text.contains("/model"), "model command missing:\n{text}");
     }
 
     #[test]

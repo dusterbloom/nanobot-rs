@@ -3,7 +3,7 @@
 //! Contains the main agent REPL, slash-command handlers, voice recording
 //! pipeline, and background channel management.
 
-mod commands;
+pub(crate) mod commands;
 mod incremental;
 
 pub(crate) use commands::{should_auto_activate_trio, trio_enable};
@@ -2065,14 +2065,7 @@ pub(crate) fn cmd_agent(
                 // Full-screen ratatui UI (opt-in via NANOBOT_TUI). Runs one
                 // interactive session, then breaks to the shared cleanup below.
                 if crate::tui_app::enabled() {
-                    if let Err(e) = crate::tui_app::run(
-                        &ctx.agent_loop,
-                        &ctx.core_handle,
-                        &ctx.session_id,
-                        ctx.lang.as_deref(),
-                    )
-                    .await
-                    {
+                    if let Err(e) = crate::tui_app::run(&mut ctx).await {
                         eprintln!("nanobot: TUI error: {e}");
                     }
                     break;
