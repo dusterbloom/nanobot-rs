@@ -430,6 +430,39 @@ impl ReplContext {
         self.core_handle.swappable().mode().is_local() || has_cluster
     }
 
+    /// Toggle voice mode without printing or switching screens (for the TUI).
+    /// Returns the new state (`true` = on). Mirrors `cmd_voice` sans output.
+    #[cfg(feature = "voice")]
+    pub(crate) async fn toggle_voice(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.voice_session.is_some() {
+            if let Some(ref mut vs) = self.voice_session {
+                vs.stop_playback();
+            }
+            self.voice_session = None;
+            self.core_handle
+                .counters
+                .suppress_thinking_in_tts
+                .store(false, Ordering::Relaxed);
+            return false;
+        }
+        let mut voice_config = self.config.voice.clone();
+        if voice_config.language.is_none() {
+            voice_config.language = self.lang.clone();
+        }
+        match crate::voice_pipeline::VoiceSession::with_voice_config(&voice_config).await {
+            Ok(vs) => {
+                self.voice_session = Some(vs);
+                self.core_handle
+                    .counters
+                    .suppress_thinking_in_tts
+                    .store(true, Ordering::Relaxed);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     pub(crate) async fn collect_all_models(&self) -> Vec<ModelEntry> {
         let mut entries = Vec::new();
         let current_model = if !self.config.agents.defaults.lms_main_model.is_empty() {

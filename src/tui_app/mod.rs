@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::audit::ToolEvent;
 use crate::repl::commands::ReplContext;
-use app::{Action, App, Footer};
+use app::{draw_outro, Action, App, Footer};
 
 /// Immutable per-session handles a single turn needs to drive the agent.
 struct Session<'a> {
@@ -86,6 +86,11 @@ pub(crate) async fn run(ctx: &mut ReplContext) -> std::io::Result<()> {
     let mut app = App::new();
     let result = event_loop(&mut terminal, &mut app, ctx, &mut ev_rx, &paused).await;
 
+    // Native farewell frame before the terminal is restored.
+    if result.is_ok() {
+        let _ = terminal.draw(draw_outro);
+        std::thread::sleep(Duration::from_millis(600));
+    }
     stop.store(true, Ordering::Relaxed);
     let _ = reader.join();
     result
@@ -238,16 +243,24 @@ async fn slash_command(
             }
         }
         "voice" | "v" => {
-            if cfg!(feature = "voice") {
-                // Toggle voice via the classic dispatcher, then reflect the new
-                // state so the UI knows Enter-on-empty should record.
-                run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?;
-                app.set_voice(ctx.voice_on());
-            } else {
+            #[cfg(feature = "voice")]
+            {
+                // Toggle natively — no alt-screen switch (the bridge leaked the
+                // classic startup screen). Header reflects the new state.
+                let on = ctx.toggle_voice().await;
+                app.set_voice(on);
                 app.push_note(
-                    "voice needs a build with the feature — rebuild with: cargo run --release --features voice,cluster -- agent".into(),
+                    if on {
+                        "voice on — press Enter on an empty line to speak".to_string()
+                    } else {
+                        "voice off".to_string()
+                    },
                 );
             }
+            #[cfg(not(feature = "voice"))]
+            app.push_note(
+                "voice needs a build with the feature — rebuild with: cargo run --release --features voice,cluster -- agent".into(),
+            );
         }
         _ => run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?,
     }

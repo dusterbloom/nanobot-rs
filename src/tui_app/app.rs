@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
@@ -790,15 +790,19 @@ impl App {
         );
 
         let transcript = chunks[1];
-        let width = transcript.width.max(1) as usize;
-        let height = transcript.height as usize;
-        let rows = self.transcript_rows(width);
-        let max_off = rows.len().saturating_sub(height);
-        self.max_scroll = max_off;
-        self.scroll_from_bottom = self.scroll_from_bottom.min(max_off);
-        let off = max_off - self.scroll_from_bottom;
-        let visible: Vec<Line> = rows.into_iter().skip(off).take(height).collect();
-        f.render_widget(Paragraph::new(Text::from(visible)), transcript);
+        if self.transcript.is_empty() {
+            render_intro(f, transcript);
+        } else {
+            let width = transcript.width.max(1) as usize;
+            let height = transcript.height as usize;
+            let rows = self.transcript_rows(width);
+            let max_off = rows.len().saturating_sub(height);
+            self.max_scroll = max_off;
+            self.scroll_from_bottom = self.scroll_from_bottom.min(max_off);
+            let off = max_off - self.scroll_from_bottom;
+            let visible: Vec<Line> = rows.into_iter().skip(off).take(height).collect();
+            f.render_widget(Paragraph::new(Text::from(visible)), transcript);
+        }
 
         let title = self
             .search
@@ -972,6 +976,59 @@ fn footer_line(footer: &Footer, mode: Mode) -> Line<'static> {
         spans.push(Span::styled("\u{2014}", dim())); // —
     }
     Line::from(spans)
+}
+
+/// Centered branded welcome shown while the transcript is empty.
+fn render_intro(f: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("{BRAND}{BRAND}{BRAND}  TRENTADUE"),
+            style(Color::Cyan, true),
+        )),
+        Line::from(Span::styled("a calm, local agent  \u{b7}  32", dim())),
+        Line::default(),
+        Line::from(Span::styled(
+            "Enter send   \u{b7}   /help keys   \u{b7}   /model switch   \u{b7}   Ctrl+D quit",
+            dim(),
+        )),
+    ];
+    let h = lines.len() as u16;
+    let top = area.height.saturating_sub(h) / 2;
+    let rect = Rect {
+        x: area.x,
+        y: area.y + top,
+        width: area.width,
+        height: h.min(area.height),
+    };
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
+        rect,
+    );
+}
+
+/// Full-frame farewell drawn just before the terminal is restored on quit.
+pub(crate) fn draw_outro(f: &mut Frame) {
+    let area = f.area();
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("{BRAND}{BRAND}{BRAND}  TRENTADUE"),
+            style(Color::Cyan, true),
+        )),
+        Line::from(Span::styled("session ended  \u{b7}  see you soon", dim())),
+    ];
+    let h = lines.len() as u16;
+    let top = area.height.saturating_sub(h) / 2;
+    let rect = Rect {
+        x: area.x,
+        y: area.y + top,
+        width: area.width,
+        height: h.min(area.height),
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
+        rect,
+    );
 }
 
 /// Draw the centered help overlay over the current frame.
@@ -1478,7 +1535,8 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
         term.draw(|f| app.draw(f, &test_footer())).unwrap();
         let text = buffer_text(term.backend().buffer());
-        assert!(text.contains("Ask nanobot-rs anything"), "welcome hint missing");
+        assert!(text.contains("TRENTADUE"), "intro brand missing");
+        assert!(text.contains("/help"), "intro hints missing");
     }
 
     #[test]
