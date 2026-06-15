@@ -185,7 +185,7 @@ impl IncrementalRenderer {
             return;
         }
         if self.first_line {
-            print!("\r\x1b[1m\x1b[97mИ\x1b[0m\n");
+            print!("\r\x1b[1m\x1b[36m▞▞▞\x1b[0m\n");
             std::io::stdout().flush().ok();
         }
         let mut table_text = self.table_buffer.join("\n");
@@ -267,14 +267,14 @@ impl IncrementalRenderer {
         // Render based on current state
         match &mut self.state {
             StreamState::Prose => {
-                // Skip empty lines before the И marker
+                // Skip empty lines before the ▞▞▞ marker
                 if self.first_line && line.trim().is_empty() {
                     return;
                 }
                 let rendered = render_inline_markdown(line);
                 if self.first_line {
-                    // И marker on first prose line
-                    println!("\r\x1b[1m\x1b[97mИ\x1b[0m {}", rendered);
+                    // ▞▞▞ marker on first prose line
+                    println!("\r\x1b[1m\x1b[36m▞▞▞\x1b[0m {}", rendered);
                     self.first_line = false;
                 } else {
                     println!("\r  {}", rendered);
@@ -350,6 +350,8 @@ impl IncrementalRenderer {
             self.total_chars / 4
         };
         let ttft = self.ttft.map(|d| d.as_secs_f32());
+        // Blank line above the stats footer for breathing room.
+        println!("\r");
         println!(
             "\r\x1b[2m{}\x1b[0m",
             format_footer(elapsed, ttft, tokens, self.finish_reason.as_deref())
@@ -369,11 +371,11 @@ impl IncrementalRenderer {
         self.has_partial || !self.line_buffer.is_empty()
     }
 
-    /// Emit the И marker now (used when tool events arrive before any text).
+    /// Emit the ▞▞▞ marker now (used when tool events arrive before any text).
     /// After this, subsequent text will render without the marker.
     pub fn emit_marker(&mut self) {
         if self.first_line {
-            println!("\r\x1b[1m\x1b[97mИ\x1b[0m");
+            println!("\r\x1b[1m\x1b[36m▞▞▞\x1b[0m");
             std::io::stdout().flush().ok();
             self.first_line = false;
         }

@@ -45,6 +45,8 @@ type TtsSentenceSender = Option<()>;
 // Helpers (testable, pure-ish)
 // ============================================================================
 
+// Only used by the truncation unit tests below now that tool output is collapsed.
+#[cfg(test)]
 use crate::utils::helpers::truncate_lines_chars as truncate_output;
 
 /// ANSI escape to rewind `n` rows and clear everything below the cursor,
@@ -125,10 +127,11 @@ impl PrefillSpinner {
     }
 
     /// Repaint the spinner line in place. No-op unless Active.
+    /// `prefill_line` styles itself (animated mark + dim time), so no dim wrap.
     fn redraw(&self) {
         if let Self::Active { started, progress } = self {
             print!(
-                "\r\x1b[K\x1b[2m{}\x1b[0m",
+                "\r\x1b[K{}",
                 prefill_line(started.elapsed().as_secs_f32(), *progress)
             );
             std::io::stdout().flush().ok();
@@ -174,26 +177,28 @@ fn parse_control_marker(d: &str) -> Option<ControlMarker> {
     None
 }
 
-/// Format the spinner line. Without server progress: `⏳ working… 3.2s`.
-/// With it: `⏳ prefill 42% · 1.4k/3.4k tok · 3.2s` — a prefix-cache hit
-/// shows immediately as a high starting percentage.
+/// Animate the brand mark `▞▞▞` as the loading indicator: the lit block sweeps
+/// across the three cells. The same mark prefixes the reply, so the animation
+/// "settles" into the answer. Tied to the prefill progress we track: shows `%`
+/// when the server reports it, otherwise just elapsed.
 fn prefill_line(elapsed_secs: f32, progress: Option<(u64, u64)>) -> String {
-    fn fmt_k(n: u64) -> String {
-        if n < 1000 {
-            n.to_string()
+    const GLYPH: &str = "\u{259e}"; // ▞
+    let active = ((elapsed_secs * 6.0) as usize) % 3;
+    let mut mark = String::new();
+    for i in 0..3 {
+        if i == active {
+            mark.push_str(&format!("\x1b[1m\x1b[36m{GLYPH}\x1b[0m")); // bright
         } else {
-            format!("{:.1}k", n as f64 / 1000.0)
+            mark.push_str(&format!("\x1b[2m\x1b[36m{GLYPH}\x1b[0m")); // dim
         }
     }
     match progress {
         Some((processed, total)) if total > 0 => format!(
-            "\u{23f3} prefill {}% \u{b7} {}/{} tok \u{b7} {:.1}s",
+            "{mark} \x1b[2m{}% \u{b7} {:.1}s\x1b[0m",
             processed * 100 / total,
-            fmt_k(processed),
-            fmt_k(total),
             elapsed_secs
         ),
-        _ => format!("\u{23f3} working\u{2026} {:.1}s", elapsed_secs),
+        _ => format!("{mark} \x1b[2m{:.1}s\x1b[0m", elapsed_secs),
     }
 }
 
@@ -304,7 +309,34 @@ fn extract_tool_context(tool_name: &str, result_data: &str, args_preview: &str) 
             }
             String::new()
         }
-        _ => String::new(),
+        "web_search" | "session_search" | "recall" => {
+            clip_param(extract_json_string_field(args_preview, "query"))
+        }
+        "web_fetch" => clip_param(extract_json_string_field(args_preview, "url")),
+        "read_skill" | "spawn" => clip_param(extract_json_string_field(args_preview, "name")),
+        "list_dir" | "write_file" => clip_param(extract_json_string_field(args_preview, "path")),
+        _ => {
+            // Generic: surface the first recognisable string argument so the tool
+            // input is always visible on the line.
+            for key in ["query", "path", "url", "name", "command", "input", "text"] {
+                if let Some(v) = extract_json_string_field(args_preview, key) {
+                    return clip_param(Some(v));
+                }
+            }
+            String::new()
+        }
+    }
+}
+
+/// Clip a parameter value to one short line for the tool status display.
+fn clip_param(value: Option<String>) -> String {
+    let Some(v) = value else { return String::new() };
+    let one_line = v.trim().lines().next().unwrap_or("").trim();
+    let short: String = one_line.chars().take(64).collect();
+    if short.chars().count() < one_line.chars().count() {
+        format!("{short}…")
+    } else {
+        short
     }
 }
 
@@ -572,33 +604,14 @@ pub(crate) fn short_channel_name(name: &str) -> &str {
 }
 
 /// Build the REPL prompt string based on current mode.
-pub(crate) fn build_prompt(is_local: bool, voice_on: bool, thinking_on: bool) -> String {
-    let think_prefix = if thinking_on { "\x1b[2mT\x1b[0m" } else { "" };
-    if voice_on {
-        format!(
-            "{}{}{}~>{} ",
-            think_prefix,
-            crate::tui::BOLD,
-            crate::tui::MAGENTA,
-            crate::tui::RESET
-        )
-    } else if is_local {
-        format!(
-            "{}{}{}L>{} ",
-            think_prefix,
-            crate::tui::BOLD,
-            crate::tui::YELLOW,
-            crate::tui::RESET
-        )
-    } else {
-        format!(
-            "{}{}{}>{} ",
-            think_prefix,
-            crate::tui::BOLD,
-            crate::tui::GREEN,
-            crate::tui::RESET
-        )
-    }
+pub(crate) fn build_prompt(_is_local: bool, _voice_on: bool, _thinking_on: bool) -> String {
+    use crate::tui::{BOLD, GREEN, RESET};
+    // One consistent prompt across all modes — mode/model already shows in the
+    // footer, so the prompt stays minimal (a single green caret). `\x1b[48;5;238m`
+    // is the input-box background, kept on after the caret so typed text sits
+    // inside the box.
+    const BG: &str = "\x1b[48;5;238m";
+    format!("{BG} {BOLD}{GREEN}\u{276f}{RESET}{BG} ")
 }
 
 /// Print the /help text.
@@ -813,12 +826,13 @@ async fn stream_and_render_inner(
     user_already_rendered: bool,
     tts_tx: TtsSentenceSender,
 ) -> (String, bool) {
-    // Erase raw readline output and reprint user text in grey box (skip if caller already rendered).
+    // Render the user turn into the conversation area, ABOVE the pinned input
+    // box. The readline echo on the (pinned) prompt row was already cleared by
+    // the caller; we drop to the bottom of the scroll region so the user box and
+    // the reply scroll up into history while the input box stays put.
     if !user_already_rendered && std::io::stdout().is_terminal() {
         use std::io::Write as _;
-        let prompt_and_input = format!("> {}", input);
-        let raw_lines = tui::terminal_rows(&prompt_and_input, 0);
-        print!("{}", rewind_and_clear_below(raw_lines));
+        print!("\x1b[{};1H", tui::conversation_bottom_row());
         std::io::stdout().flush().ok();
         print!("{}", syntax::render_turn(input, syntax::TurnRole::User));
     }
@@ -1029,23 +1043,30 @@ async fn stream_and_render_inner(
                             collected.push(status_line);
 
                             if ok && !result_data.is_empty() {
-                                let truncated = truncate_output(result_data, 40, 8000);
-                                if !truncated.is_empty() {
-                                    let header = "    \x1b[2m\u{250c}\u{2500} output \u{2500}\x1b[0m";
-                                    println!("\r\x1b[K{}", header);
-                                    collected.push(header.to_string());
-                                    this_box_lines += 1;
-                                    for line in truncated.lines() {
-                                        let formatted = format!("    \x1b[2m\u{2502}\x1b[0m {}", line);
-                                        println!("\r\x1b[K{}", formatted);
-                                        collected.push(formatted);
-                                        this_box_lines += 1;
-                                    }
-                                    let footer = "    \x1b[2m\u{2514}\u{2500}\x1b[0m";
-                                    println!("\r\x1b[K{}", footer);
-                                    collected.push(footer.to_string());
-                                    this_box_lines += 1;
-                                }
+                                // Collapsed by default: a one-line summary instead
+                                // of the full output box (full output is in /audit).
+                                let n = result_data.lines().filter(|l| !l.trim().is_empty()).count();
+                                let first = result_data
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("")
+                                    .trim();
+                                let preview: String = first.chars().take(72).collect();
+                                let more = if preview.chars().count() < first.chars().count() {
+                                    "…"
+                                } else {
+                                    ""
+                                };
+                                let summary = format!(
+                                    "    \x1b[2m\u{21b3} {}{}  \u{b7} {} line{}\x1b[0m",
+                                    preview,
+                                    more,
+                                    n,
+                                    if n == 1 { "" } else { "s" }
+                                );
+                                println!("\r\x1b[K{}", summary);
+                                collected.push(summary);
+                                this_box_lines += 1;
                             } else if !ok && !result_data.is_empty() {
                                 let preview: String = result_data.chars().take(80).collect();
                                 let err_line = format!("    \x1b[31m{}\x1b[0m", preview);
@@ -2074,7 +2095,8 @@ pub(crate) fn cmd_agent(
 
                 // === GET INPUT ===
                 let input_text: String;
-                #[allow(unused_mut)]
+                // `do_record` is only read in voice builds (recording trigger).
+                #[allow(unused_mut, unused_variables)]
                 let mut do_record = false;
 
                 #[cfg(feature = "voice")]
@@ -2114,16 +2136,10 @@ pub(crate) fn cmd_agent(
                     }
                 }
 
-                // Clear the input line and the prompt line above it (not the bar).
-                // The scroll region stays intact so the bar remains pinned at bottom.
-                // In voice mode, voice_read_input() prints \r\n leaving the ~> prompt
-                // on the line above — move up and clear both lines.
-                if do_record {
-                    print!("\x1b[A\x1b[2K\x1b[2K\r"); // up, clear prompt line, clear current line
-                } else {
-                    print!("\x1b[2K\r"); // clear current line
-                }
-                io::stdout().flush().ok();
+                // Clear the submitted text from the pinned input box (keeping its
+                // grey background) so the box stays visible and empty while the
+                // reply streams above it.
+                tui::clear_input_row();
 
                 // === VOICE RECORDING ===
                 // Uses the same stream_and_render pipeline as text mode for
@@ -2247,15 +2263,10 @@ pub(crate) fn cmd_agent(
                 .await;
                 ctx.drain_display();
                 println!();
-
-                // Refresh the input bar in place (no scroll push — just update content).
-                let ch_names: Vec<&str> = ctx
-                    .active_channels
-                    .iter()
-                    .map(|c| c.name.as_str())
-                    .collect();
-                let sa_count = ctx.agent_loop.subagent_manager().get_running_count().await;
-                tui::render_input_bar(&ctx.core_handle, &ch_names, sa_count, false);
+                // The input bar is re-rendered at the top of the loop; rendering
+                // it again here drew a second, stale bar each turn (two stacked
+                // bars + cursor/scroll-region artifacts at the bottom). The
+                // loop-top render is the single source of truth.
 
                 #[cfg(feature = "voice")]
                 if let Some(ref mut vs) = ctx.voice_session {
@@ -2453,29 +2464,33 @@ mod tests {
 
     // --- prefill_line ---
 
-    /// One test, all spinner-line shapes: elapsed-only fallback, true
-    /// percentage with k-formatting, cache-hit start (>0%), and the
-    /// total==0 guard.
+    /// The loading indicator is the animated brand mark `▞▞▞` plus elapsed time,
+    /// showing the prefill `%` when the server reports it. The lit block sweeps,
+    /// so the active cell index changes with elapsed time.
     #[test]
     fn test_prefill_line_formats() {
-        // No server progress → elapsed-only ticker.
-        assert_eq!(prefill_line(3.24, None), "⏳ working… 3.2s");
-        // Server progress → true percentage with k-formatted counts.
-        assert_eq!(
-            prefill_line(3.24, Some((1400, 3391))),
-            "⏳ prefill 41% · 1.4k/3.4k tok · 3.2s"
-        );
-        // Prefix-cache hit shows immediately as a high starting %.
-        assert_eq!(
-            prefill_line(0.05, Some((14000, 14500))),
-            "⏳ prefill 96% · 14.0k/14.5k tok · 0.1s"
-        );
-        // Sub-1000 counts stay plain; total==0 falls back to elapsed-only.
-        assert_eq!(
-            prefill_line(1.0, Some((999, 999))),
-            "⏳ prefill 100% · 999/999 tok · 1.0s"
-        );
-        assert_eq!(prefill_line(1.0, Some((0, 0))), "⏳ working… 1.0s");
+        let glyphs = |s: &str| s.chars().filter(|&c| c == '\u{259e}').count();
+
+        // No server progress → animated mark (three ▞) + elapsed, no %.
+        let p = prefill_line(3.24, None);
+        assert_eq!(glyphs(&p), 3, "three-cell mark: {p}");
+        assert!(p.contains("3.2s"), "{p}");
+        assert!(!p.contains('%'), "{p}");
+
+        // Server progress → mark + percentage + elapsed (linked to prefill).
+        let p = prefill_line(3.24, Some((1400, 3391)));
+        assert_eq!(glyphs(&p), 3, "{p}");
+        assert!(p.contains("41%") && p.contains("3.2s"), "{p}");
+
+        // The lit block sweeps: the bright (bold) span differs between phases.
+        let a = prefill_line(0.0, None);
+        let b = prefill_line(0.2, None); // ~1 step later at 6 cells/s
+        assert_ne!(a, b, "animation must advance over time: {a:?} vs {b:?}");
+
+        // total==0 → no percentage, just the animated mark + elapsed.
+        let p = prefill_line(1.0, Some((0, 0)));
+        assert_eq!(glyphs(&p), 3, "{p}");
+        assert!(!p.contains('%'), "{p}");
     }
 
     // --- parse_ctx_arg ---
@@ -2535,33 +2550,21 @@ mod tests {
 
     // --- build_prompt ---
 
+    /// The prompt is now a single consistent green caret regardless of mode
+    /// (local / cloud / voice / thinking) — mode is shown in the footer instead.
     #[test]
-    fn test_build_prompt_cloud() {
-        let p = build_prompt(false, false, false);
-        assert!(p.contains(">"));
-        // Cloud prompt uses GREEN
-        assert!(p.contains(crate::tui::GREEN));
-    }
-
-    #[test]
-    fn test_build_prompt_local() {
-        let p = build_prompt(true, false, false);
-        assert!(p.contains("L>"));
-        assert!(p.contains(crate::tui::YELLOW));
-    }
-
-    #[test]
-    fn test_build_prompt_voice() {
-        let p = build_prompt(false, true, false);
-        assert!(p.contains("~>"));
-        assert!(p.contains(crate::tui::MAGENTA));
-    }
-
-    #[test]
-    fn test_build_prompt_thinking() {
-        let p = build_prompt(false, false, true);
-        assert!(p.contains("T"));
-        assert!(p.contains(">"));
+    fn test_build_prompt_is_consistent_green_caret() {
+        let caret = "\u{276f}";
+        let cloud = build_prompt(false, false, false);
+        assert!(cloud.contains(caret), "{cloud:?}");
+        assert!(cloud.contains(crate::tui::GREEN), "{cloud:?}");
+        // No legacy mode-specific markers or colours.
+        assert!(!cloud.contains("L>") && !cloud.contains("~>"), "{cloud:?}");
+        assert!(!cloud.contains(crate::tui::YELLOW), "{cloud:?}");
+        // Local / voice / thinking all render the identical prompt.
+        assert_eq!(cloud, build_prompt(true, false, false));
+        assert_eq!(cloud, build_prompt(false, true, false));
+        assert_eq!(cloud, build_prompt(false, false, true));
     }
 
     // --- ServerState ---
@@ -2703,6 +2706,28 @@ mod tests {
     #[test]
     fn test_extract_tool_context_exec_no_args() {
         assert_eq!(extract_tool_context("exec", "out", ""), "");
+    }
+
+    #[test]
+    fn test_extract_tool_context_surfaces_input_params() {
+        // The tool input (not output) is what's shown on the status line.
+        assert_eq!(
+            extract_tool_context("web_search", "lots of results", r#"{"query":"space news 2024"}"#),
+            "space news 2024"
+        );
+        assert_eq!(
+            extract_tool_context("web_fetch", "html", r#"{"url":"https://example.com"}"#),
+            "https://example.com"
+        );
+        // Unknown tools fall back to the first recognisable string argument.
+        assert_eq!(
+            extract_tool_context("some_new_tool", "out", r#"{"input":"hello there"}"#),
+            "hello there"
+        );
+        // Long params are clipped with an ellipsis.
+        let long = "q".repeat(200);
+        let ctx = extract_tool_context("web_search", "out", &format!(r#"{{"query":"{long}"}}"#));
+        assert!(ctx.ends_with('\u{2026}'), "expected ellipsis: {ctx}");
     }
 
     // --- higgs_keepalive_secs (warm-keep decision) ---

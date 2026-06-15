@@ -189,14 +189,11 @@ pub(crate) fn take_resize_pending() -> bool {
     RESIZE_PENDING.swap(false, Ordering::AcqRel)
 }
 
-/// Print the nanobot demoscene-style ASCII logo.
-/// Uses explicit `\r\n` so the logo renders correctly even if the terminal
+/// Print the TRENTADUE wordmark.
+/// Uses explicit `\r\n` so it renders correctly even if the terminal
 /// is in raw mode (where `\n` is LF-only without carriage return).
 pub fn print_logo() {
-    print!("  {BOLD}{CYAN} _____             _       _   {RESET}\r\n");
-    print!("  {BOLD}{WHITE}|   | |___ ___ ___| |_ ___| |_ {RESET}\r\n");
-    print!("  {BOLD}{WHITE}| | | | .'|   | . | . | . |  _|{RESET}\r\n");
-    print!("  {BOLD}{CYAN}|_|___|__,|_|_|___|___|___|_|  {RESET}\r\n");
+    print!("  {BOLD}{CYAN}▞▞▞{RESET} {BOLD}{WHITE}TRENTADUE{RESET} {DIM}{CYAN}· 32{RESET}\r\n");
 }
 
 /// Animated loading sequence.
@@ -286,6 +283,28 @@ pub(crate) fn terminal_height() -> usize {
     h as usize
 }
 
+/// Total rows reserved by the pinned input bar: a 3-row input box (grey pad row,
+/// prompt, grey pad row), a blank gap, then the 2-row meta footer.
+pub(crate) const BAR_LINES: usize = 6;
+
+/// Last row of the scrolling conversation area — the row directly above the
+/// pinned input bar. Conversation output (user box, spinner, reply) is written
+/// here so it scrolls up into history while the input box itself never moves.
+pub(crate) fn conversation_bottom_row() -> usize {
+    terminal_height().saturating_sub(BAR_LINES).max(1)
+}
+
+/// Reset the input box to its empty ready state (grey background + green caret)
+/// after a line is submitted, so the box stays visible — and consistent with the
+/// live prompt — while the reply streams above it.
+pub(crate) fn clear_input_row() {
+    use std::io::Write as _;
+    // input_row = bar_row + 1 = (height - BAR_LINES + 1) + 1
+    let row = terminal_height().saturating_sub(BAR_LINES) + 2;
+    print!("\x1b[{row};1H\x1b[48;5;238m\x1b[2K {BOLD}{GREEN}\u{276f}{RESET}");
+    std::io::stdout().flush().ok();
+}
+
 /// Render a Claude Code-style input context bar pinned to the bottom of the terminal.
 ///
 /// Layout (at terminal bottom):
@@ -310,9 +329,7 @@ pub(crate) fn render_input_bar(
     use std::sync::atomic::Ordering;
 
     let counters = &core_handle.counters;
-    let width = terminal_width();
     let height = terminal_height();
-    let separator = "─".repeat(width);
 
     // Gather info
     let thinking_on = counters.thinking_budget.load(Ordering::Relaxed) > 0;
@@ -371,11 +388,20 @@ pub(crate) fn render_input_bar(
         ));
     }
 
-    let bar_lines = 5usize;
+    // Pinned input bar. The whole bar stays put; the conversation scrolls ABOVE
+    // it (scroll region below), so the input box never disappears during a turn
+    // and no bar row ever scrolls into history (which also removes the stray
+    // `[  ]` ghost). The box is three rows — grey pad / prompt / grey pad — for
+    // breathing room. Grey rows fill with `\x1b[K` (real width) so they reflow on
+    // resize instead of "staircasing".
+    const BOX_BG: &str = "\x1b[48;5;238m";
+
+    let bar_lines = BAR_LINES;
     let bar_row = height.saturating_sub(bar_lines) + 1;
 
-    // Reset scroll region to full screen so we can position cursor freely.
-    print!("\x1b[r");
+    // Reset SGR so the box background can't bleed into the clears/scroll below,
+    // then reset the scroll region so we can position the cursor freely.
+    print!("\x1b[0m\x1b[r");
 
     if push_content {
         print!("\x1b[{};1H", height);
@@ -384,31 +410,32 @@ pub(crate) fn render_input_bar(
         }
     }
 
-    // Row 1: Top separator
-    print!("\x1b[{};1H\x1b[2K", bar_row);
-    println!("{DIM}{separator}{RESET}");
+    let input_row = bar_row + 1;
 
-    // Row 2: Prompt row (left empty for readline)
-    let prompt_row = bar_row + 1;
-    print!("\x1b[{};1H\x1b[2K", prompt_row);
+    // Input box (3 rows): grey pad / prompt / grey pad. The pad rows fill to the
+    // real terminal width via `\x1b[K`; the prompt row's bg is armed at the end
+    // of the function so rustyline's own line-clear paints it.
+    print!("\x1b[{};1H\x1b[2K{BOX_BG}\x1b[K\x1b[0m", bar_row);
+    print!("\x1b[{};1H\x1b[2K", input_row);
+    print!("\x1b[{};1H\x1b[2K{BOX_BG}\x1b[K\x1b[0m", bar_row + 2);
 
-    // Row 3: Bottom separator
-    print!("\x1b[{};1H\x1b[2K", prompt_row + 1);
-    println!("{DIM}{separator}{RESET}");
+    // Blank gap between the input box and the meta footer.
+    print!("\x1b[{};1H\x1b[2K", bar_row + 3);
 
-    // Row 4: Info line (cwd + model)
-    print!("\x1b[{};1H\x1b[2K", prompt_row + 2);
+    // Info line (cwd + model) — footer, default background.
+    print!("\x1b[{};1H\x1b[2K", bar_row + 4);
     println!("  {DIM}{cwd} · {RESET}{GREEN}{model_name}{RESET}{think_str}");
 
-    // Row 5: Hints line
-    print!("\x1b[{};1H\x1b[2K", prompt_row + 3);
+    // Hints line — footer, default background.
+    print!("\x1b[{};1H\x1b[2K", bar_row + 5);
     print!("  {}", hints.join(" · "));
 
-    // Set scroll region: text scrolls in rows 1..(prompt_row-1), above the top separator
-    print!("\x1b[1;{}r", prompt_row);
+    // Scroll region ends one row ABOVE the bar, so the whole bar is pinned and
+    // the conversation scrolls only in the rows above it.
+    print!("\x1b[1;{}r", bar_row.saturating_sub(1).max(1));
 
-    // Position cursor at prompt row for readline input
-    print!("\x1b[{};1H", prompt_row);
+    // Park the cursor in the prompt row and arm the box background.
+    print!("\x1b[{};1H{BOX_BG}", input_row);
 
     std::io::stdout().flush().ok();
 
@@ -423,9 +450,11 @@ pub(crate) fn render_input_bar(
 pub(crate) fn clear_input_bar() {
     use std::io::Write as _;
     let height = terminal_height();
-    let bar_lines = 5usize;
+    let bar_lines = BAR_LINES;
     let bar_row = height.saturating_sub(bar_lines) + 1;
     let first_row = bar_row.saturating_sub(1).max(1);
+    // Reset SGR first so the panel background can't paint the cleared rows.
+    print!("\x1b[0m");
     for row in first_row..=height {
         print!("\x1b[{};1H\x1b[2K", row);
     }

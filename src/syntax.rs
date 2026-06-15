@@ -39,7 +39,7 @@ pub enum TurnRole {
 
 /// Render a complete conversation turn with role marker and markdown formatting.
 ///
-/// - **Assistant** turns get a bold white `И` marker line before the content.
+/// - **Assistant** turns get a bold white `▞▞▞` marker line before the content.
 /// - **User** turns are rendered through the same markdown pipeline (no marker).
 /// - Empty input returns an empty string.
 pub fn render_turn(text: &str, role: TurnRole) -> String {
@@ -49,35 +49,30 @@ pub fn render_turn(text: &str, role: TurnRole) -> String {
     let mut output = String::new();
     match role {
         TurnRole::User | TurnRole::VoiceUser => {
-            // Padding before user box.
-            output.push('\n');
-            // Dark grey background per line (raw text, no markdown pipeline —
-            // render_response resets would kill the bg color).
-            // First line gets a ● marker: green for text, purple for voice.
+            // Minimal user turn: a single coloured dot marker, no background box
+            // (the grey box on past text reads as clutter). Raw text, not
+            // markdown — the prompt may contain literal markup.
             let marker_color = if role == TurnRole::VoiceUser {
-                "\x1b[35m"
+                "\x1b[35m" // purple for voice
             } else {
-                "\x1b[32m"
+                "\x1b[32m" // green for text
             };
             for (i, line) in text.lines().enumerate() {
                 if i == 0 {
-                    output.push_str(&format!(
-                        "\x1b[48;5;236m {}●\x1b[0m\x1b[48;5;236m {} \x1b[0m\n",
-                        marker_color, line
-                    ));
+                    output.push_str(&format!("{marker_color}●\x1b[0m {line}\n"));
                 } else {
-                    output.push_str(&format!("\x1b[48;5;236m   {} \x1b[0m\n", line));
+                    output.push_str(&format!("  {line}\n"));
                 }
             }
-            // Extra blank line after user text before assistant reply.
+            // Blank line before the assistant reply.
             output.push('\n');
         }
         TurnRole::Assistant => {
-            // И marker on the same line as the start of the reply.
+            // ▞▞▞ marker on the same line as the start of the reply.
             // trim_start() strips the leading newline termimad injects.
             let rendered = render_response(text);
             let trimmed = rendered.trim_start();
-            output.push_str(&format!("\x1b[1m\x1b[97mИ\x1b[0m {}", trimmed));
+            output.push_str(&format!("\x1b[1m\x1b[36m▞▞▞\x1b[0m {}", trimmed));
         }
     }
     output
@@ -420,8 +415,8 @@ mod tests {
         let output = render_turn("Hello world", TurnRole::Assistant);
         let plain = strip_ansi(&output);
         assert!(
-            plain.contains('И'),
-            "assistant turn must start with И marker"
+            plain.contains('▞'),
+            "assistant turn must start with ▞▞▞ marker"
         );
         assert!(plain.contains("Hello world"));
     }
@@ -430,18 +425,18 @@ mod tests {
     fn test_render_turn_assistant_marker_before_content() {
         let output = render_turn("Some response", TurnRole::Assistant);
         let plain = strip_ansi(&output);
-        let marker_pos = plain.find('И').expect("И must be present");
+        let marker_pos = plain.find('▞').expect("▞▞▞ must be present");
         let content_pos = plain
             .find("Some response")
             .expect("content must be present");
-        assert!(marker_pos < content_pos, "И must appear before content");
+        assert!(marker_pos < content_pos, "▞▞▞ must appear before content");
     }
 
     #[test]
     fn test_render_turn_user_no_marker() {
         let output = render_turn("my question", TurnRole::User);
         let plain = strip_ansi(&output);
-        assert!(!plain.contains('И'), "user turn must NOT have И marker");
+        assert!(!plain.contains('▞'), "user turn must NOT have ▞▞▞ marker");
     }
 
     #[test]
@@ -470,7 +465,7 @@ mod tests {
     fn test_render_turn_assistant_renders_code_block() {
         let output = render_turn("Here:\n\n```python\nprint(1)\n```", TurnRole::Assistant);
         let plain = strip_ansi(&output);
-        assert!(plain.contains('И'));
+        assert!(plain.contains('▞'));
         assert!(plain.contains("print"));
         assert!(plain.contains("─"));
     }
