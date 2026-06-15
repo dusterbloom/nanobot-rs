@@ -23,6 +23,7 @@ mod session;
 mod sessions_cmd;
 mod syntax;
 mod tui;
+mod tui_app;
 mod utils;
 #[cfg(feature = "voice")]
 mod voice_pipeline;

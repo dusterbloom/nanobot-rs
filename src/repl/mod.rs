@@ -152,14 +152,14 @@ impl PrefillSpinner {
 /// Control markers smuggled through the text-delta channel (`\x00`-prefixed,
 /// never rendered). One enum so the print task dispatches with a `match`
 /// and the wire syntax is parsed in exactly one place.
-enum ControlMarker {
+pub(crate) enum ControlMarker {
     FinishReason(String),
     Tokens(u64),
     PrefillProgress { processed: u64, total: u64 },
 }
 
 /// Parse a delta-channel control marker. `None` means renderable text.
-fn parse_control_marker(d: &str) -> Option<ControlMarker> {
+pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
     let rest = d.strip_prefix('\x00')?;
     if let Some(fr) = rest.strip_prefix("finish_reason:") {
         return Some(ControlMarker::FinishReason(fr.to_string()));
@@ -2062,6 +2062,22 @@ pub(crate) fn cmd_agent(
             let mut bar_needs_push = true;
 
             loop {
+                // Full-screen ratatui UI (opt-in via NANOBOT_TUI). Runs one
+                // interactive session, then breaks to the shared cleanup below.
+                if crate::tui_app::enabled() {
+                    if let Err(e) = crate::tui_app::run(
+                        &ctx.agent_loop,
+                        &ctx.core_handle,
+                        &ctx.session_id,
+                        ctx.lang.as_deref(),
+                    )
+                    .await
+                    {
+                        eprintln!("nanobot: TUI error: {e}");
+                    }
+                    break;
+                }
+
                 // Drain any pending display messages from background channels.
                 ctx.drain_display();
 

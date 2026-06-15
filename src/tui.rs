@@ -471,7 +471,7 @@ pub(crate) fn reset_scroll_region() {
 }
 
 /// Format token count as compact string (e.g. 12430 -> "12.4K", 1200000 -> "1.2M").
-fn format_tokens(n: usize) -> String {
+pub(crate) fn format_tokens(n: usize) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
