@@ -442,7 +442,11 @@ pub async fn request_strict_router_decision(
                 "properties": {
                     "action": {"type": "string", "enum": ["respond","tool","specialist","ask_user"]},
                     "target": {"type": "string"},
-                    "args": {"type": "object"},
+                    // Apple FM guided-generation rejects free-form object
+                    // schemas ({"type":"object"} with no properties) with a 400
+                    // "Invalid tool definition". Declare args as a string so the
+                    // tool definition validates; the value is re-hydrated below.
+                    "args": {"type": "string", "description": "Tool arguments as a JSON object, serialized to a string. Use {} when there are none."},
                     "confidence": {"type": "number"}
                 },
                 "required": ["action","target","args","confidence"]
@@ -495,11 +499,19 @@ pub async fn request_strict_router_decision(
     {
         if let Some(tc) = tool_resp.tool_calls.first() {
             if tc.name == "route_decision" {
-                let args_obj = tc
+                let mut args_obj = tc
                     .arguments
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect::<serde_json::Map<String, Value>>();
+                // `args` is declared as a string in the tool schema (see above)
+                // for Apple FM compatibility. Providers may honor that and emit
+                // a JSON-encoded string, or emit an object directly. Re-hydrate
+                // the string form into an object; leave an object form as-is.
+                if let Some(Value::String(s)) = args_obj.get("args") {
+                    let rehydrated = serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}));
+                    args_obj.insert("args".to_string(), rehydrated);
+                }
                 let val = Value::Object(args_obj);
                 if let Ok(decision) = serde_json::from_value::<role_policy::RouterDecision>(val) {
                     if role_policy::parse_router_decision_strict(

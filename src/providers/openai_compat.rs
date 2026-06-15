@@ -550,6 +550,11 @@ impl LLMProvider for OpenAICompatProvider {
             "messages": cached_msgs,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            // Explicit non-streaming: the OpenAI spec defaults `stream` to
+            // false, but Apple FM's `fm serve` defaults to SSE when the field
+            // is absent, which this (non-streaming) path can't parse. Declaring
+            // it is a no-op for compliant servers and required for Apple FM.
+            "stream": false,
         });
         if let Some(tp) = top_p {
             body["top_p"] = serde_json::json!(tp);
