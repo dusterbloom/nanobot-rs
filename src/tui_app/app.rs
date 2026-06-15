@@ -901,4 +901,30 @@ mod tests {
         let text = buffer_text(term.backend().buffer());
         assert!(text.contains("Ask nanobot-rs anything"), "welcome hint missing");
     }
+
+    #[test]
+    fn scroll_up_clamps_and_returns_to_bottom() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new();
+        for i in 0..40 {
+            app.begin_turn(&format!("q{i}"));
+            app.on_delta(&format!("reply {i}"));
+            app.finish_turn(String::new());
+        }
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| app.draw(f, &test_footer())).unwrap();
+        assert!(app.max_scroll > 0, "tall transcript should be scrollable");
+
+        // Scroll far past the top: must clamp, never overshoot.
+        for _ in 0..100 {
+            app.scroll_up(10);
+        }
+        assert_eq!(app.scroll_from_bottom, app.max_scroll, "clamped at the top");
+
+        // Paging back down reaches the bottom (the reported bug).
+        app.scroll_down(app.max_scroll);
+        assert_eq!(app.scroll_from_bottom, 0, "returns to bottom");
+    }
 }
