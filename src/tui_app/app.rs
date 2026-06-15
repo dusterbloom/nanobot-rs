@@ -72,6 +72,57 @@ struct ModelPicker {
     selected: usize,
 }
 
+/// Disclosure level — how much tool output and metadata the transcript shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Minimal: collapsed tool summaries, compact metadata.
+    Calm,
+    /// Tool output previews + full metadata.
+    Inspect,
+    /// Full (capped) tool output + full metadata.
+    Deep,
+}
+
+impl Mode {
+    fn next(self) -> Self {
+        match self {
+            Mode::Calm => Mode::Inspect,
+            Mode::Inspect => Mode::Deep,
+            Mode::Deep => Mode::Calm,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Calm => "calm",
+            Mode::Inspect => "inspect",
+            Mode::Deep => "deep",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "calm" => Some(Mode::Calm),
+            "inspect" => Some(Mode::Inspect),
+            "deep" => Some(Mode::Deep),
+            _ => None,
+        }
+    }
+
+    /// Tool-output lines to show: `None` = summary only (calm), else a cap.
+    fn tool_output_lines(self) -> Option<usize> {
+        match self {
+            Mode::Calm => None,
+            Mode::Inspect => Some(6),
+            Mode::Deep => Some(usize::MAX),
+        }
+    }
+
+    fn verbose_meta(self) -> bool {
+        !matches!(self, Mode::Calm)
+    }
+}
+
 /// Reverse-search (Ctrl+R) state.
 struct Search {
     query: String,
@@ -99,6 +150,8 @@ enum Cell {
         args: String,
         state: ToolState,
         summary: Option<String>,
+        /// Full (capped) tool output, shown in inspect/deep mode.
+        output: String,
         ms: u64,
     },
     /// Per-turn metadata pinned beneath the turn's output.
@@ -159,6 +212,8 @@ pub(crate) struct App {
     search: Option<Search>,
     /// Native model picker overlay, if open.
     picker: Option<ModelPicker>,
+    /// Disclosure level (calm / inspect / deep).
+    mode: Mode,
 }
 
 impl App {
@@ -185,7 +240,28 @@ impl App {
             draft: String::new(),
             search: None,
             picker: None,
+            mode: Mode::Calm,
         }
+    }
+
+    /// Cycle calm → inspect → deep → calm (`/mode` with no argument).
+    pub(crate) fn cycle_mode(&mut self) {
+        self.mode = self.mode.next();
+    }
+
+    /// Set the mode by name; returns false if the name is unknown.
+    pub(crate) fn set_mode(&mut self, name: &str) -> bool {
+        match Mode::parse(name) {
+            Some(m) => {
+                self.mode = m;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn mode_label(&self) -> &'static str {
+        self.mode.label()
     }
 
     /// Open the native model picker, selecting the active model if present.
@@ -322,6 +398,7 @@ impl App {
                     args: arguments_preview,
                     state: ToolState::Running,
                     summary: None,
+                    output: String::new(),
                     ms: 0,
                 });
             }
@@ -338,6 +415,7 @@ impl App {
 
     fn complete_tool(&mut self, id: &str, name: &str, data: &str, ok: bool, ms: u64) {
         let summary = summarize_output(data, ok);
+        let output: String = data.chars().take(4000).collect(); // cap: never dump huge
         let state = if ok { ToolState::Ok } else { ToolState::Err };
         let idx = self
             .transcript
@@ -348,12 +426,14 @@ impl App {
                 if let Cell::Tool {
                     state: s,
                     summary: sum,
+                    output: out,
                     ms: m,
                     ..
                 } = &mut self.transcript[i]
                 {
                     *s = state;
                     *sum = summary;
+                    *out = output;
                     *m = ms;
                 }
             }
@@ -363,6 +443,7 @@ impl App {
                 args: String::new(),
                 state,
                 summary,
+                output,
                 ms,
             }),
         }
@@ -725,7 +806,7 @@ impl App {
             .map(|s| format!(" reverse-search \u{2039}{}\u{203a} ", s.query));
         self.input.set_block(input_block(title));
         f.render_widget(&self.input, chunks[2]);
-        f.render_widget(Paragraph::new(footer_line(footer)), chunks[3]);
+        f.render_widget(Paragraph::new(footer_line(footer, self.mode)), chunks[3]);
 
         if self.show_help {
             render_help(f, area);
@@ -788,7 +869,7 @@ impl App {
             if matches!(cell, Cell::User(_)) && !rows.is_empty() {
                 rows.push(Line::default());
             }
-            for segs in cell_lines(cell) {
+            for segs in cell_lines(cell, self.mode) {
                 wrap_segments(&segs, width, &mut rows);
             }
             // Breathing room between the user turn and the assistant reply.
@@ -857,19 +938,23 @@ fn dim_color(color: Color) -> Style {
 }
 
 /// Quiet footer: cwd · model · mode · ctx usage.
-fn footer_line(footer: &Footer) -> Line<'static> {
+fn footer_line(footer: &Footer, mode: Mode) -> Line<'static> {
     let mut spans = vec![
         Span::styled("  cwd ", dim()),
         Span::styled(footer.cwd.clone(), style(Color::Green, false)),
         Span::styled("   model ", dim()),
         Span::styled(footer.model.clone(), style(Color::Green, false)),
         Span::styled("   mode ", dim()),
-        Span::styled(
-            " calm ",
-            Style::default().fg(Color::Green).bg(Color::DarkGray),
-        ),
-        Span::styled("   ctx ", dim()),
     ];
+    for m in [Mode::Calm, Mode::Inspect, Mode::Deep] {
+        let st = if m == mode {
+            Style::default().fg(Color::Black).bg(Color::Green)
+        } else {
+            dim()
+        };
+        spans.push(Span::styled(format!(" {} ", m.label()), st));
+    }
+    spans.push(Span::styled("   ctx ", dim()));
     if footer.ctx_max > 0 {
         let pct = footer.ctx_used * 100 / footer.ctx_max;
         let ctx_color = match pct {
@@ -976,6 +1061,7 @@ fn help_lines() -> Vec<Line<'static>> {
         head("commands"),
         key("/help  ?", "this overlay"),
         key("/clear", "clear the transcript"),
+        key("/mode", "calm / inspect / deep (cycle or name)"),
         key("/model", "switch model (opens picker)"),
         key("/local", "toggle local / cloud"),
         key("/think", "toggle thinking"),
@@ -1010,7 +1096,7 @@ fn brand_mark(active: Option<usize>) -> Vec<Span<'static>> {
 }
 
 /// Render one cell into logical lines, each a list of `(text, style)` segments.
-fn cell_lines(cell: &Cell) -> Vec<Vec<(String, Style)>> {
+fn cell_lines(cell: &Cell, mode: Mode) -> Vec<Vec<(String, Style)>> {
     match cell {
         Cell::User(text) => text
             .split('\n')
@@ -1043,6 +1129,7 @@ fn cell_lines(cell: &Cell) -> Vec<Vec<(String, Style)>> {
             args,
             state,
             summary,
+            output,
             ms,
             ..
         } => {
@@ -1056,8 +1143,31 @@ fn cell_lines(cell: &Cell) -> Vec<Vec<(String, Style)>> {
                 ToolState::Err => head.push((format!("  {ERR} {ms}ms"), style(Color::Red, false))),
             }
             let mut out = vec![head];
-            if let Some(s) = summary {
-                out.push(vec![(format!("    {TURN} "), dim()), (s.clone(), dim())]);
+            let summary_line = |out: &mut Vec<Vec<(String, Style)>>| {
+                if let Some(s) = summary {
+                    out.push(vec![(format!("    {TURN} "), dim()), (s.clone(), dim())]);
+                }
+            };
+            match mode.tool_output_lines() {
+                None => summary_line(&mut out), // calm: one-line summary
+                Some(max) => {
+                    let lines: Vec<&str> =
+                        output.lines().filter(|l| !l.trim().is_empty()).collect();
+                    if lines.is_empty() {
+                        summary_line(&mut out);
+                    } else {
+                        let shown = lines.len().min(max);
+                        for l in lines.iter().take(shown) {
+                            out.push(vec![(format!("    {l}"), dim())]);
+                        }
+                        if lines.len() > shown {
+                            out.push(vec![(
+                                format!("    … {} more lines", lines.len() - shown),
+                                dim(),
+                            )]);
+                        }
+                    }
+                }
             }
             out
         }
@@ -1069,8 +1179,10 @@ fn cell_lines(cell: &Cell) -> Vec<Vec<(String, Style)>> {
             estimated,
         } => {
             let mut s = format!("  {META} {:.1}s", elapsed_s);
-            if let Some(t) = ttft_s {
-                s.push_str(&format!("  ttft {:.2}s", t));
+            if mode.verbose_meta() {
+                if let Some(t) = ttft_s {
+                    s.push_str(&format!("  ttft {:.2}s", t));
+                }
             }
             if *tokens > 0 {
                 let mark = if *estimated { "~" } else { "" };
@@ -1567,5 +1679,59 @@ mod tests {
         assert!(text.contains("alpha"), "models listed:\n{text}");
         assert!(text.contains("gamma"));
         assert!(text.contains("select model"));
+    }
+
+    #[test]
+    fn mode_cycles_and_sets_by_name() {
+        let mut app = App::new();
+        assert_eq!(app.mode_label(), "calm");
+        app.cycle_mode();
+        assert_eq!(app.mode_label(), "inspect");
+        app.cycle_mode();
+        assert_eq!(app.mode_label(), "deep");
+        app.cycle_mode();
+        assert_eq!(app.mode_label(), "calm");
+        assert!(app.set_mode("Deep"));
+        assert_eq!(app.mode_label(), "deep");
+        assert!(!app.set_mode("bogus"));
+        assert_eq!(app.mode_label(), "deep");
+    }
+
+    #[test]
+    fn mode_controls_tool_output_visibility() {
+        let mut app = App::new();
+        app.begin_turn("go");
+        app.on_tool_event(ToolEvent::CallStart {
+            tool_name: "exec".into(),
+            tool_call_id: "c1".into(),
+            arguments_preview: "ls".into(),
+        });
+        app.on_tool_event(ToolEvent::CallEnd {
+            tool_name: "exec".into(),
+            tool_call_id: "c1".into(),
+            result_data: "line one\nline two\nline three".into(),
+            ok: true,
+            duration_ms: 5,
+        });
+        let tool = app
+            .transcript
+            .iter()
+            .find(|c| matches!(c, Cell::Tool { .. }))
+            .unwrap();
+        let flat = |mode: Mode| -> String {
+            cell_lines(tool, mode)
+                .iter()
+                .flatten()
+                .map(|(t, _)| t.clone())
+                .collect()
+        };
+        assert!(
+            !flat(Mode::Calm).contains("line two"),
+            "calm hides raw output"
+        );
+        assert!(
+            flat(Mode::Deep).contains("line two"),
+            "deep shows raw output"
+        );
     }
 }

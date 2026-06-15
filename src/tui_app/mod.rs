@@ -217,6 +217,14 @@ async fn slash_command(
         "quit" | "exit" | "q" => return Ok(true),
         "help" | "?" => app.set_help(true),
         "clear" => app.clear_transcript(),
+        "mode" => {
+            let arg = rest.strip_prefix("mode").map(str::trim).unwrap_or("");
+            if arg.is_empty() {
+                app.cycle_mode();
+            } else if !app.set_mode(arg) {
+                app.push_note(format!("unknown mode '{arg}' — use calm | inspect | deep"));
+            }
+        }
         "model" | "m" => {
             if ctx.model_picker_available() {
                 let entries = ctx.collect_all_models().await;
