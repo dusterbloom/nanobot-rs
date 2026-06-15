@@ -190,6 +190,12 @@ async fn event_loop(
                 #[cfg(feature = "voice")]
                 voice_cycle(terminal, app, ctx, ev_rx, paused).await?;
             }
+            Action::PickModel(id) => {
+                // Apply via the proven path: an exact id auto-selects (no
+                // interactive prompt) and loads, showing progress briefly.
+                let cmd = format!("/model {id}");
+                run_classic_command(terminal, app, ctx, &cmd, ev_rx, paused).await?;
+            }
         }
     }
     Ok(())
@@ -211,6 +217,18 @@ async fn slash_command(
         "quit" | "exit" | "q" => return Ok(true),
         "help" | "?" => app.set_help(true),
         "clear" => app.clear_transcript(),
+        "model" | "m" => {
+            if ctx.model_picker_available() {
+                let entries = ctx.collect_all_models().await;
+                if entries.is_empty() {
+                    app.push_note("no models found".into());
+                } else {
+                    app.open_model_picker(entries);
+                }
+            } else {
+                app.push_note("/model is only available in local mode — use /local".into());
+            }
+        }
         "voice" | "v" => {
             if cfg!(feature = "voice") {
                 // Toggle voice via the classic dispatcher, then reflect the new

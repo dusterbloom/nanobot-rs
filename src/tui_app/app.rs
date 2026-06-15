@@ -25,6 +25,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::render;
 use crate::agent::audit::ToolEvent;
+use crate::repl::commands::ModelEntry;
 use crate::repl::{parse_control_marker, ControlMarker};
 
 const BRAND: &str = "\u{259e}"; // ▞  the nanobot wordmark glyph
@@ -54,6 +55,21 @@ pub(crate) enum Action {
     Submit(String),
     /// Voice mode: start a record → transcribe → reply → speak cycle.
     Record,
+    /// User picked a model in the native picker; apply it by id.
+    PickModel(String),
+}
+
+/// One selectable row in the model picker.
+struct PickRow {
+    id: String,
+    label: String,
+    active: bool,
+}
+
+/// Native in-TUI model picker (replaces the classic screen-switching list).
+struct ModelPicker {
+    rows: Vec<PickRow>,
+    selected: usize,
 }
 
 /// Reverse-search (Ctrl+R) state.
@@ -141,6 +157,8 @@ pub(crate) struct App {
     draft: String,
     /// Active reverse-search (Ctrl+R), if any.
     search: Option<Search>,
+    /// Native model picker overlay, if open.
+    picker: Option<ModelPicker>,
 }
 
 impl App {
@@ -166,6 +184,54 @@ impl App {
             hist_pos: None,
             draft: String::new(),
             search: None,
+            picker: None,
+        }
+    }
+
+    /// Open the native model picker, selecting the active model if present.
+    pub(crate) fn open_model_picker(&mut self, entries: Vec<ModelEntry>) {
+        let rows: Vec<PickRow> = entries
+            .iter()
+            .map(|e| PickRow {
+                id: e.id.clone(),
+                label: format!("{}   {}{}", e.id, e.source_tag(), if e.is_loaded { " · loaded" } else { "" }),
+                active: e.is_active,
+            })
+            .collect();
+        let selected = rows.iter().position(|r| r.active).unwrap_or(0);
+        self.picker = Some(ModelPicker { rows, selected });
+    }
+
+    fn on_picker_key(&mut self, k: KeyEvent) -> Action {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(p) = self.picker.as_mut() else {
+            return Action::Continue;
+        };
+        match k.code {
+            KeyCode::Char('d') if ctrl => Action::Quit,
+            KeyCode::Up => {
+                p.selected = p.selected.saturating_sub(1);
+                Action::Continue
+            }
+            KeyCode::Down => {
+                if p.selected + 1 < p.rows.len() {
+                    p.selected += 1;
+                }
+                Action::Continue
+            }
+            KeyCode::Enter => {
+                let id = p.rows.get(p.selected).map(|r| r.id.clone());
+                self.picker = None;
+                match id {
+                    Some(id) => Action::PickModel(id),
+                    None => Action::Continue,
+                }
+            }
+            KeyCode::Esc => {
+                self.picker = None;
+                Action::Continue
+            }
+            _ => Action::Continue,
         }
     }
 
@@ -377,6 +443,9 @@ impl App {
                     }
                     self.show_help = false;
                     return Action::Continue;
+                }
+                if self.picker.is_some() {
+                    return self.on_picker_key(k);
                 }
                 self.on_idle_key(k)
             }
@@ -661,6 +730,9 @@ impl App {
         if self.show_help {
             render_help(f, area);
         }
+        if let Some(p) = &self.picker {
+            render_picker(f, area, p);
+        }
     }
 
     fn input_height(&self) -> u16 {
@@ -828,6 +900,45 @@ fn render_help(f: &mut Frame, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(style(Color::Cyan, false))
         .title(Span::styled(" help ", style(Color::Cyan, true)))
+        .padding(Padding::horizontal(1));
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
+}
+
+/// Draw the native model picker as a centered, scrollable, selectable list.
+fn render_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
+    let w = 72.min(area.width.saturating_sub(4));
+    let inner_max = (area.height.saturating_sub(6) as usize).max(1);
+    let visible = p.rows.len().clamp(1, inner_max);
+    let popup = centered_rect(w, visible as u16 + 2, area);
+
+    // Window so the selected row stays in view.
+    let start = p.selected.saturating_sub(visible.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in p.rows.iter().enumerate().skip(start).take(visible) {
+        let selected = i == p.selected;
+        let prefix = if selected { "\u{203a} " } else { "  " };
+        let dot = if row.active { "\u{25cf} " } else { "  " };
+        let row_style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Green)
+        } else if row.active {
+            style(Color::Green, false)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{dot}{}", row.label),
+            row_style,
+        )));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(style(Color::Cyan, false))
+        .title(Span::styled(
+            " select model  ·  \u{2191}\u{2193} Enter Esc ",
+            style(Color::Cyan, true),
+        ))
         .padding(Padding::horizontal(1));
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
@@ -1390,5 +1501,71 @@ mod tests {
         app.cancel_search();
         assert!(app.search.is_none());
         assert_eq!(input_text(&app), "", "draft restored on cancel");
+    }
+
+    fn pick_rows() -> Vec<PickRow> {
+        vec![
+            PickRow {
+                id: "alpha".into(),
+                label: "alpha   oMLX".into(),
+                active: true,
+            },
+            PickRow {
+                id: "beta".into(),
+                label: "beta   LM Studio".into(),
+                active: false,
+            },
+            PickRow {
+                id: "gamma".into(),
+                label: "gamma   file".into(),
+                active: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn model_picker_navigates_and_selects() {
+        let mut app = App::new();
+        app.picker = Some(ModelPicker {
+            rows: pick_rows(),
+            selected: 0,
+        });
+        app.on_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        match app.on_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            Action::PickModel(id) => assert_eq!(id, "gamma"),
+            _ => panic!("expected PickModel"),
+        }
+        assert!(app.picker.is_none(), "picker closes after selection");
+    }
+
+    #[test]
+    fn model_picker_esc_cancels() {
+        let mut app = App::new();
+        app.picker = Some(ModelPicker {
+            rows: pick_rows(),
+            selected: 1,
+        });
+        let act = app.on_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(act, Action::Continue));
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn model_picker_renders_models() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new();
+        app.picker = Some(ModelPicker {
+            rows: pick_rows(),
+            selected: 1,
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        term.draw(|f| app.draw(f, &test_footer())).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("alpha"), "models listed:\n{text}");
+        assert!(text.contains("gamma"));
+        assert!(text.contains("select model"));
     }
 }

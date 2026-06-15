@@ -104,15 +104,35 @@ enum ModelSource {
 
 /// A model entry from any source, used by the unified model picker.
 #[derive(Debug, Clone)]
-struct ModelEntry {
+pub(crate) struct ModelEntry {
     /// Model identifier (name or path stem).
-    id: String,
+    pub(crate) id: String,
     /// Where it comes from.
     source: ModelSource,
     /// Currently selected model.
-    is_active: bool,
+    pub(crate) is_active: bool,
     /// Currently loaded in memory (LMS only).
-    is_loaded: bool,
+    pub(crate) is_loaded: bool,
+}
+
+impl ModelEntry {
+    /// Short, human label for the model's source (for the TUI picker).
+    pub(crate) fn source_tag(&self) -> String {
+        match &self.source {
+            ModelSource::LocalLms { port } => format!("LM Studio :{port}"),
+            ModelSource::Remote { endpoint, .. } => crate::tui::shorten_url(endpoint)
+                .split('/')
+                .next()
+                .unwrap_or(endpoint)
+                .to_string(),
+            ModelSource::File { .. } => "file".to_string(),
+            ModelSource::Omlx { endpoint } => {
+                let short = crate::tui::shorten_url(endpoint);
+                let host = short.split('/').next().unwrap_or(&short);
+                format!("oMLX {host}")
+            }
+        }
+    }
 }
 
 fn model_short_id(id: &str) -> &str {
@@ -401,7 +421,16 @@ impl ReplContext {
     }
 
     /// Aggregate models from all available sources into a unified list.
-    async fn collect_all_models(&self) -> Vec<ModelEntry> {
+    /// Whether the model picker applies (local mode, or a cluster is present).
+    pub(crate) fn model_picker_available(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        let has_cluster = self.cluster_state.is_some();
+        #[cfg(not(feature = "cluster"))]
+        let has_cluster = false;
+        self.core_handle.swappable().mode().is_local() || has_cluster
+    }
+
+    pub(crate) async fn collect_all_models(&self) -> Vec<ModelEntry> {
         let mut entries = Vec::new();
         let current_model = if !self.config.agents.defaults.lms_main_model.is_empty() {
             self.config.agents.defaults.lms_main_model.clone()
