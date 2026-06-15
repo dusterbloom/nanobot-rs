@@ -1683,10 +1683,22 @@ async fn parse_sse_stream(
                                         // text/thinking deltas).
                                         let _ = tx.send(StreamChunk::ToolCallDelta);
                                     }
-                                    if let Some(args) =
-                                        function.get("arguments").and_then(|v| v.as_str())
-                                    {
-                                        entry.2.push_str(args);
+                                    // Accumulate argument fragments. The OpenAI
+                                    // standard streams `arguments` as string
+                                    // fragments, but some local servers (oMLX/MLX
+                                    // for qwen3.6 / diffusiongemma / GLM) send the
+                                    // whole thing in one chunk as a JSON *object*.
+                                    // `parse_response` (non-streaming) handles both;
+                                    // mirror that here so the args aren't silently
+                                    // dropped → empty params. See LM Studio #1868.
+                                    if let Some(args_val) = function.get("arguments") {
+                                        if let Some(s) = args_val.as_str() {
+                                            entry.2.push_str(s);
+                                        } else if args_val.is_object() || args_val.is_array() {
+                                            entry
+                                                .2
+                                                .push_str(&serde_json::to_string(args_val).unwrap_or_default());
+                                        }
                                     }
                                 }
                             }
@@ -2898,6 +2910,39 @@ mod tests {
                 .get("path")
                 .and_then(|v| v.as_str()),
             Some("/tmp/test")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_tool_call_object_arguments() {
+        // Some local servers (oMLX/MLX for qwen3.6 / diffusiongemma / GLM) stream
+        // `arguments` as a whole JSON *object* in one chunk instead of string
+        // fragments. The streaming parser must accept that, mirroring the
+        // non-streaming path, or the params are dropped → empty query (LM Studio #1868).
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"function\":{\"name\":\"web_search\",\"arguments\":{\"query\":\"latest space news\"}}}]},\"index\":0}]}",
+            "data: [DONE]",
+        ]);
+
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx).await;
+
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Done(resp) = chunk {
+                done_response = Some(resp);
+            }
+        }
+
+        let resp = done_response.expect("should have received Done");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "web_search");
+        assert_eq!(
+            resp.tool_calls[0].arguments.get("query").and_then(|v| v.as_str()),
+            Some("latest space news"),
+            "object-form streamed arguments must survive, not drop to empty"
         );
     }
 
