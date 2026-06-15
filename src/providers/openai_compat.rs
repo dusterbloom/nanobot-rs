@@ -5,9 +5,8 @@
 //! Groq, vLLM, and any other provider that implements the OpenAI chat completions
 //! API format.
 
-use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -23,20 +22,6 @@ use super::constants::{
 };
 use super::jit_gate::JitGate;
 use super::retry;
-
-/// Per-base-URL cache for the native LMS `/api/v1/chat` probe result.
-///
-/// `true`  = endpoint is available and responding.
-/// `false` = endpoint timed out or returned a non-2xx response; skip future probes.
-/// absent  = not yet probed.
-///
-/// This avoids the 10s timeout on every call when LM Studio does not serve
-/// the native endpoint (e.g. 100 calls in trio_bench → 16+ minutes wasted).
-static NATIVE_LMS_AVAILABLE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-
-fn native_lms_cache() -> &'static Mutex<HashMap<String, bool>> {
-    NATIVE_LMS_AVAILABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 /// An LLM provider that talks to any OpenAI-compatible chat completions endpoint.
 pub struct OpenAICompatProvider {
@@ -321,15 +306,6 @@ fn apply_local_tool_call_controls(
     }
 }
 
-/// Check if a model uses template-level thinking that requires the native LMS
-/// API to disable (Nemotron models with `/no_think` mode).
-///
-/// Only these models benefit from `try_native_lms_chat`; for everything else
-/// the extra HTTP roundtrip is pure overhead.
-fn needs_native_lms_api(model: &str) -> bool {
-    crate::agent::model_capabilities::lookup_default(model).needs_native_lms_api
-}
-
 /// Extract the unsupported feature name from an LMS error message.
 ///
 /// Handles messages of the form:
@@ -353,202 +329,6 @@ pub(crate) fn extract_unsupported_feature(error_text: &str) -> Option<String> {
         return None;
     }
     Some(feature)
-}
-
-/// Call the LM Studio native REST API (`/api/v1/chat`) with `reasoning: "off"`.
-///
-/// This is the proper way to disable reasoning for models like Nemotron that
-/// use template-level thinking (not API-level reasoning control). The OpenAI-
-/// compat `/v1/chat/completions` endpoint cannot actually disable reasoning
-/// for these models.
-///
-/// Returns `Some(LLMResponse)` on success, `None` if the native API isn't
-/// available (falls back to the regular path).
-async fn try_native_lms_chat(
-    client: &Client,
-    api_base: &str,
-    api_key: &str,
-    model: &str,
-    messages: &[serde_json::Value],
-    max_tokens: u32,
-    temperature: f64,
-) -> Option<LLMResponse> {
-    // Build native API URL: strip /v1 suffix from api_base.
-    let base = api_base.trim_end_matches('/');
-    let native_base = base.strip_suffix("/v1").unwrap_or(base);
-    let url = format!("{}/api/v1/chat", native_base);
-
-    // Check the per-base-URL availability cache.  If a previous probe already
-    // determined the endpoint is unavailable, skip the 10s timeout entirely.
-    {
-        let cache = native_lms_cache().lock();
-        if cache.get(native_base) == Some(&false) {
-            tracing::debug!(
-                "native LMS chat skipped (cached unavailable) for {}",
-                native_base
-            );
-            return None;
-        }
-    }
-
-    // Extract system prompt (first system message) and user input.
-    let mut system_prompt = String::new();
-    let mut input_parts: Vec<String> = Vec::new();
-    for msg in messages {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        match role {
-            "system" => {
-                if system_prompt.is_empty() {
-                    system_prompt = content.to_string();
-                } else {
-                    system_prompt.push('\n');
-                    system_prompt.push_str(content);
-                }
-            }
-            "user" => input_parts.push(content.to_string()),
-            "assistant" => {
-                if !content.trim().is_empty() {
-                    input_parts.push(format!("Assistant: {}", content));
-                }
-            }
-            _ => {} // skip tool messages for native API
-        }
-    }
-
-    // Ensure /no_think is in system prompt for Nemotron.
-    if !system_prompt.contains("/no_think") {
-        if system_prompt.is_empty() {
-            system_prompt = "/no_think".to_string();
-        } else {
-            system_prompt = format!("/no_think\n{}", system_prompt);
-        }
-    }
-
-    let input = input_parts.join("\n");
-    if input.is_empty() {
-        return None;
-    }
-
-    // Build request body, omitting "reasoning" if the model is known to reject it.
-    let reasoning_unsupported =
-        crate::agent::model_feature_cache::is_feature_unsupported(model, "reasoning");
-    let mut body = serde_json::json!({
-        "model": model,
-        "system_prompt": system_prompt,
-        "input": input,
-        "max_output_tokens": max_tokens,
-        "temperature": temperature,
-    });
-    if !reasoning_unsupported {
-        body["reasoning"] = serde_json::Value::String("off".to_string());
-    }
-
-    tracing::debug!(
-        "native LMS chat: model={} input_len={} reasoning_field={}",
-        model,
-        input.len(),
-        !reasoning_unsupported
-    );
-
-    // Use a short probe timeout so a missing or unresponsive /api/v1/chat
-    // endpoint fails fast (within 10s) and lets the caller fall back to the
-    // standard /v1/chat/completions path.  The parent client may have a much
-    // longer timeout (120s) which would cause multi-minute hangs when LM
-    // Studio only serves the OpenAI-compat endpoint.
-    let send_future = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send();
-
-    let resp = match tokio::time::timeout(std::time::Duration::from_secs(2), send_future).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            tracing::debug!("native LMS chat send error (will fall back): {}", e);
-            native_lms_cache()
-                .lock()
-                .insert(native_base.to_string(), false);
-            return None;
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                "native LMS chat timed out after 2s for {} — marking unavailable, falling back to OpenAI-compat",
-                url
-            );
-            native_lms_cache()
-                .lock()
-                .insert(native_base.to_string(), false);
-            return None;
-        }
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        tracing::warn!("native LMS chat failed (HTTP {}): {}", status, text);
-        // Cache any feature the model explicitly says it doesn't support.
-        if let Some(feature) = extract_unsupported_feature(&text) {
-            tracing::info!(
-                "model_feature_cache: caching '{}' as unsupported for model '{}'",
-                feature,
-                model
-            );
-            crate::agent::model_feature_cache::mark_feature_unsupported(model, &feature);
-        }
-        // Mark the endpoint as unavailable so future calls skip the probe.
-        native_lms_cache()
-            .lock()
-            .insert(native_base.to_string(), false);
-        return None; // Fall back to regular path
-    }
-
-    // Endpoint responded successfully — mark it available for future calls.
-    native_lms_cache()
-        .lock()
-        .insert(native_base.to_string(), true);
-
-    let json: serde_json::Value = resp.json().await.ok()?;
-
-    // Parse native response: output is [{type: "message", content: "..."}, ...]
-    let content = json
-        .get("output")
-        .and_then(|o| o.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("message"))
-                .and_then(|item| item.get("content").and_then(|c| c.as_str()))
-        })
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let mut usage = std::collections::HashMap::new();
-    if let Some(stats) = json.get("stats") {
-        if let Some(input_tokens) = stats.get("input_tokens").and_then(|v| v.as_i64()) {
-            usage.insert("prompt_tokens".to_string(), input_tokens);
-        }
-        if let Some(output_tokens) = stats.get("total_output_tokens").and_then(|v| v.as_i64()) {
-            usage.insert("completion_tokens".to_string(), output_tokens);
-        }
-    }
-
-    // Extract finish_reason from the native LMS response. The field may live
-    // at the top level as "finish_reason" or "stop_reason", or inside the
-    // matching output item. Fall back to "stop" only when absent.
-    let finish_reason = json
-        .get("finish_reason")
-        .and_then(|v| v.as_str())
-        .or_else(|| json.get("stop_reason").and_then(|v| v.as_str()))
-        .unwrap_or("stop")
-        .to_string();
-
-    Some(LLMResponse {
-        content,
-        tool_calls: Vec::new(),
-        finish_reason,
-        usage,
-    })
 }
 
 /// For local thinking-capable models with thinking disabled: prefill the
@@ -741,47 +521,6 @@ impl LLMProvider for OpenAICompatProvider {
             "chat: api_base={} raw_model={} stripped={} model={}",
             self.api_base, raw_model, stripped, model
         );
-        // For Nemotron-family models with reasoning off and no tools: try the native
-        // LMS API which can disable reasoning at the template level. Skip for all
-        // other models to avoid a wasted HTTP roundtrip.
-        let has_tools = tools.map_or(false, |t| !t.is_empty());
-        if is_local_api_base(&self.api_base)
-            && thinking_budget.is_none()
-            && !has_tools
-            && needs_native_lms_api(model)
-        {
-            let call_start = std::time::Instant::now();
-            if let Some(response) = try_native_lms_chat(
-                &self.client,
-                &self.api_base,
-                &self.api_key,
-                model,
-                messages,
-                max_tokens,
-                temperature,
-            )
-            .await
-            {
-                let elapsed_ms = call_start.elapsed().as_millis() as u64;
-                let prompt_tokens = response.usage.get("prompt_tokens").copied().unwrap_or(0);
-                let completion_tokens = response
-                    .usage
-                    .get("completion_tokens")
-                    .copied()
-                    .unwrap_or(0);
-                info!(
-                    elapsed_ms = elapsed_ms,
-                    model = %model,
-                    tokens_prompt = prompt_tokens,
-                    tokens_completion = completion_tokens,
-                    api_base = %self.api_base,
-                    path = "native_lms",
-                    "llm_call_complete"
-                );
-                return Ok(response);
-            }
-            // Native API failed — fall through to regular path.
-        }
 
         let url = format!("{}/chat/completions", self.api_base);
 
@@ -1025,33 +764,6 @@ impl LLMProvider for OpenAICompatProvider {
             "chat_stream: api_base={} raw_model={} stripped={} model={}",
             self.api_base, raw_model, stripped, model
         );
-        // For Nemotron-family models with reasoning off and no tools: try native LMS API.
-        let has_tools = tools.map_or(false, |t| !t.is_empty());
-        if is_local_api_base(&self.api_base)
-            && thinking_budget.is_none()
-            && !has_tools
-            && needs_native_lms_api(model)
-        {
-            if let Some(response) = try_native_lms_chat(
-                &self.client,
-                &self.api_base,
-                &self.api_key,
-                model,
-                messages,
-                max_tokens,
-                temperature,
-            )
-            .await
-            {
-                // Wrap the non-streaming response as a fake stream.
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                if let Some(ref content) = response.content {
-                    let _ = tx.send(StreamChunk::TextDelta(content.clone()));
-                }
-                let _ = tx.send(StreamChunk::Done(response));
-                return Ok(StreamHandle { rx });
-            }
-        }
 
         let url = format!("{}/chat/completions", self.api_base);
 
@@ -2563,25 +2275,6 @@ mod tests {
         assert_eq!(cached[0]["content"], "Hello");
     }
 
-    // -- needs_native_lms_api tests --
-
-    #[test]
-    fn test_needs_native_lms_api_nemotron() {
-        assert!(needs_native_lms_api("nvidia/nemotron-3-nano"));
-        assert!(needs_native_lms_api(
-            "huihui-nvidia-nemotron-nano-9b-v2-abliterated-i1"
-        ));
-        assert!(needs_native_lms_api("nvidia_orchestrator-8b"));
-    }
-
-    #[test]
-    fn test_needs_native_lms_api_non_nemotron() {
-        assert!(!needs_native_lms_api("Qwen3-8B"));
-        assert!(!needs_native_lms_api("ministral-3-8b-instruct-2512"));
-        assert!(!needs_native_lms_api("local-model"));
-        assert!(!needs_native_lms_api("nanbeige4.1-3b"));
-    }
-
     // ── B6: SLM Observability tests ──────────────────────────────────
     //
     // These tests exercise the failure paths that were previously silent.
@@ -3022,129 +2715,4 @@ mod tests {
         );
     }
 
-    // ── try_native_lms_chat fast-fallback tests ──────────────────────────────
-
-    /// When the /api/v1/chat endpoint is unavailable (connection refused),
-    /// try_native_lms_chat must return None within the 10s probe timeout
-    /// rather than hanging for the parent client's 120s timeout.
-    #[tokio::test]
-    async fn test_native_lms_chat_returns_none_on_connection_refused() {
-        // Port 19999 is almost certainly not listening; connect will be refused.
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .unwrap();
-        let messages = vec![serde_json::json!({"role": "user", "content": "ping"})];
-
-        let start = std::time::Instant::now();
-        let result = try_native_lms_chat(
-            &client,
-            "http://127.0.0.1:19999/v1",
-            "",
-            "nvidia/nemotron-mini-4b",
-            &messages,
-            64,
-            0.7,
-        )
-        .await;
-
-        let elapsed = start.elapsed();
-        assert!(
-            result.is_none(),
-            "should return None when server is unreachable"
-        );
-        // Must fail fast — well under the 120s parent timeout.
-        // We allow up to 11s to account for the 10s probe timeout plus OS latency.
-        assert!(
-            elapsed.as_secs() < 11,
-            "native LMS chat took too long: {:?} (should fail fast on connection refused)",
-            elapsed
-        );
-    }
-
-    // ── native_lms_cache tests ────────────────────────────────────────────────
-
-    /// After marking a base URL as unavailable, the cache returns false immediately.
-    #[test]
-    fn test_native_lms_cache_marks_unavailable() {
-        let base = "http://127.0.0.1:29991";
-        // Mark unavailable.
-        native_lms_cache().lock().insert(base.to_string(), false);
-        // Verify the cache entry.
-        let val = native_lms_cache().lock().get(base).copied();
-        assert_eq!(
-            val,
-            Some(false),
-            "cache should hold false after marking unavailable"
-        );
-    }
-
-    /// After marking a base URL as available, the cache returns true.
-    #[test]
-    fn test_native_lms_cache_marks_available() {
-        let base = "http://127.0.0.1:29992";
-        native_lms_cache().lock().insert(base.to_string(), true);
-        let val = native_lms_cache().lock().get(base).copied();
-        assert_eq!(
-            val,
-            Some(true),
-            "cache should hold true after marking available"
-        );
-    }
-
-    /// An unprobed base URL is absent from the cache (None).
-    #[test]
-    fn test_native_lms_cache_absent_for_unknown_base() {
-        let base = "http://127.0.0.1:29993";
-        // Do NOT insert — just read.
-        let val = native_lms_cache().lock().get(base).copied();
-        assert_eq!(
-            val, None,
-            "cache should return None for an un-probed endpoint"
-        );
-    }
-
-    /// Second call with a cached-unavailable endpoint returns None instantly,
-    /// spending well under 1ms (no 10s timeout).
-    #[tokio::test]
-    async fn test_native_lms_chat_skips_probe_when_cached_unavailable() {
-        // Use a unique port that would time out, not connection-refuse, to ensure
-        // we're testing the cache bypass and not just fast TCP rejection.
-        let api_base = "http://10.255.255.1:29994/v1"; // non-routable IP
-        let native_base = "http://10.255.255.1:29994";
-        // Pre-populate cache as unavailable.
-        native_lms_cache()
-            .lock()
-            .insert(native_base.to_string(), false);
-
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .unwrap();
-        let messages = vec![serde_json::json!({"role": "user", "content": "ping"})];
-
-        let start = std::time::Instant::now();
-        let result = try_native_lms_chat(
-            &client,
-            api_base,
-            "",
-            "nvidia/nemotron-mini-4b",
-            &messages,
-            64,
-            0.7,
-        )
-        .await;
-        let elapsed = start.elapsed();
-
-        assert!(
-            result.is_none(),
-            "should return None immediately for cached-unavailable endpoint"
-        );
-        // Should complete in well under 100ms — the cache bypass is synchronous.
-        assert!(
-            elapsed.as_millis() < 100,
-            "cache bypass should be instant, got {:?}",
-            elapsed
-        );
-    }
 }
