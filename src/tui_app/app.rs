@@ -56,6 +56,13 @@ pub(crate) enum Action {
     Record,
 }
 
+/// Reverse-search (Ctrl+R) state.
+struct Search {
+    query: String,
+    /// History index of the current match, if any.
+    idx: Option<usize>,
+}
+
 /// Status of a single tool invocation.
 enum ToolState {
     Running,
@@ -126,6 +133,14 @@ pub(crate) struct App {
     /// Assistant text accumulated this turn, for token estimation when the
     /// provider doesn't report a completion-token count.
     turn_text: String,
+    /// Submitted-prompt history (most recent last).
+    history: Vec<String>,
+    /// Browse position in `history` (None = editing a fresh draft).
+    hist_pos: Option<usize>,
+    /// Draft saved while browsing history or reverse-searching.
+    draft: String,
+    /// Active reverse-search (Ctrl+R), if any.
+    search: Option<Search>,
 }
 
 impl App {
@@ -147,6 +162,10 @@ impl App {
             voice: false,
             recording: false,
             turn_text: String::new(),
+            history: Vec::new(),
+            hist_pos: None,
+            draft: String::new(),
+            search: None,
         }
     }
 
@@ -350,10 +369,10 @@ impl App {
     pub(crate) fn on_idle_event(&mut self, ev: Event) -> Action {
         match ev {
             Event::Key(k) if is_press(&k) => {
-                // Help overlay is modal: any key dismisses it (Ctrl+C/D still quit).
+                // Help overlay is modal: any key dismisses it (Ctrl+D still quits).
                 if self.show_help {
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                    if ctrl && matches!(k.code, KeyCode::Char('c' | 'd')) {
+                    if ctrl && k.code == KeyCode::Char('d') {
                         return Action::Quit;
                     }
                     self.show_help = false;
@@ -371,11 +390,49 @@ impl App {
 
     fn on_idle_key(&mut self, k: KeyEvent) -> Action {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if self.search.is_some() {
+            return self.on_search_key(k, ctrl);
+        }
         match k.code {
-            KeyCode::Char('c' | 'd') if ctrl => Action::Quit,
+            // Ctrl+D is the explicit quit (EOF). Ctrl+C is NOT a kill switch:
+            // it clears a typed line, otherwise does nothing.
+            KeyCode::Char('d') if ctrl => Action::Quit,
+            KeyCode::Char('c') if ctrl => {
+                self.clear_input();
+                Action::Continue
+            }
+            KeyCode::Char('r') if ctrl => {
+                self.start_search();
+                Action::Continue
+            }
+            // Esc goes back: clears the input line (and closes help/cancels a
+            // turn in their handlers).
+            KeyCode::Esc => {
+                self.clear_input();
+                Action::Continue
+            }
             // `?` opens help only when the input is empty, so it can still be typed.
             KeyCode::Char('?') if !ctrl && self.input_is_empty() => {
                 self.show_help = true;
+                Action::Continue
+            }
+            // Up/Down recall prompt history at the input's edges; otherwise they
+            // move the cursor within multi-line input.
+            KeyCode::Up => {
+                if self.input.cursor().0 == 0 {
+                    self.history_prev();
+                } else {
+                    self.input.input(k);
+                }
+                Action::Continue
+            }
+            KeyCode::Down => {
+                let last = self.input.lines().len().saturating_sub(1);
+                if self.input.cursor().0 >= last {
+                    self.history_next();
+                } else {
+                    self.input.input(k);
+                }
                 Action::Continue
             }
             KeyCode::Enter if k.modifiers.is_empty() => {
@@ -407,12 +464,128 @@ impl App {
             return Action::Continue;
         }
         let owned = trimmed.to_string();
+        if self.history.last() != Some(&owned) {
+            self.history.push(owned.clone());
+        }
+        self.hist_pos = None;
         self.input = configure_input();
         Action::Submit(owned)
     }
 
     fn input_is_empty(&self) -> bool {
         self.input.lines().iter().all(|l| l.is_empty())
+    }
+
+    fn clear_input(&mut self) {
+        self.input = configure_input();
+        self.hist_pos = None;
+    }
+
+    fn load_input(&mut self, text: &str) {
+        self.input = configure_input();
+        self.input.insert_str(text);
+    }
+
+    // --- prompt history (Up/Down) ------------------------------------------
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let idx = match self.hist_pos {
+            None => {
+                self.draft = self.input.lines().join("\n");
+                self.history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.hist_pos = Some(idx);
+        self.load_input(&self.history[idx].clone());
+    }
+
+    fn history_next(&mut self) {
+        match self.hist_pos {
+            Some(i) if i + 1 < self.history.len() => {
+                self.hist_pos = Some(i + 1);
+                self.load_input(&self.history[i + 1].clone());
+            }
+            Some(_) => {
+                self.hist_pos = None;
+                self.load_input(&self.draft.clone());
+            }
+            None => {}
+        }
+    }
+
+    // --- reverse search (Ctrl+R) -------------------------------------------
+
+    fn start_search(&mut self) {
+        self.draft = self.input.lines().join("\n");
+        self.search = Some(Search {
+            query: String::new(),
+            idx: None,
+        });
+    }
+
+    fn on_search_key(&mut self, k: KeyEvent, ctrl: bool) -> Action {
+        match k.code {
+            KeyCode::Esc => self.cancel_search(),
+            KeyCode::Enter => self.search = None, // accept: keep the matched line
+            KeyCode::Char('c') if ctrl => self.cancel_search(),
+            KeyCode::Char('r') if ctrl => self.search_older(),
+            KeyCode::Backspace => {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.pop();
+                }
+                self.refresh_search();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.push(c);
+                }
+                self.refresh_search();
+            }
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    fn refresh_search(&mut self) {
+        let query = self.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+        let idx = self.find_match(&query, None);
+        if let Some(s) = self.search.as_mut() {
+            s.idx = idx;
+        }
+        match idx {
+            Some(i) => self.load_input(&self.history[i].clone()),
+            None => self.load_input(""),
+        }
+    }
+
+    fn search_older(&mut self) {
+        let Some(s) = self.search.as_ref() else { return };
+        let (query, before) = (s.query.clone(), s.idx.unwrap_or(self.history.len()));
+        if let Some(i) = self.find_match(&query, Some(before)) {
+            if let Some(s) = self.search.as_mut() {
+                s.idx = Some(i);
+            }
+            self.load_input(&self.history[i].clone());
+        }
+    }
+
+    /// Most recent history index `< before` whose entry contains `query`.
+    fn find_match(&self, query: &str, before: Option<usize>) -> Option<usize> {
+        if query.is_empty() {
+            return None;
+        }
+        let end = before.unwrap_or(self.history.len()).min(self.history.len());
+        self.history[..end].iter().rposition(|h| h.contains(query))
+    }
+
+    fn cancel_search(&mut self) {
+        self.search = None;
+        self.load_input(&self.draft.clone());
     }
 
     /// Handle an event while a turn is streaming. Returns `true` to cancel.
@@ -477,6 +650,11 @@ impl App {
         let visible: Vec<Line> = rows.into_iter().skip(off).take(height).collect();
         f.render_widget(Paragraph::new(Text::from(visible)), transcript);
 
+        let title = self
+            .search
+            .as_ref()
+            .map(|s| format!(" reverse-search \u{2039}{}\u{203a} ", s.query));
+        self.input.set_block(input_block(title));
         f.render_widget(&self.input, chunks[2]);
         f.render_widget(Paragraph::new(footer_line(footer)), chunks[3]);
 
@@ -554,16 +732,22 @@ impl App {
 // Free functions (rendering + wrapping)
 // ---------------------------------------------------------------------------
 
+fn input_block(title: Option<String>) -> Block<'static> {
+    let mut b = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .padding(Padding::horizontal(1));
+    if let Some(t) = title {
+        b = b.title(Span::styled(t, style(Color::Cyan, false)));
+    }
+    b
+}
+
 fn configure_input() -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.set_wrap_mode(WrapMode::WordOrGlyph);
-    ta.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(dim())
-            .padding(Padding::horizontal(1)),
-    );
+    ta.set_block(input_block(None));
     ta.set_placeholder_text("Ask nanobot-rs anything...");
     ta.set_cursor_line_style(Style::default());
     ta
@@ -671,9 +855,12 @@ fn help_lines() -> Vec<Line<'static>> {
         head("keys"),
         key("Enter", "send message"),
         key("Alt+Enter", "newline"),
+        key("Up / Down", "prompt history"),
+        key("Ctrl+R", "reverse-search history"),
         key("PgUp/PgDn", "scroll transcript"),
-        key("Esc", "cancel turn / close this"),
-        key("Ctrl+C", "quit"),
+        key("Esc", "clear input / cancel turn / close"),
+        key("Ctrl+C", "cancel reply / clear input"),
+        key("Ctrl+D", "quit"),
         Line::default(),
         head("commands"),
         key("/help  ?", "this overlay"),
@@ -1160,5 +1347,48 @@ mod tests {
             }
             _ => panic!("expected meta"),
         }
+    }
+
+    fn input_text(app: &App) -> String {
+        app.input.lines().join("\n")
+    }
+
+    #[test]
+    fn up_down_recall_prompt_history() {
+        let mut app = App::new();
+        app.history.push("first".into());
+        app.history.push("second".into());
+
+        app.history_prev();
+        assert_eq!(input_text(&app), "second");
+        app.history_prev();
+        assert_eq!(input_text(&app), "first");
+        app.history_prev(); // clamps at oldest
+        assert_eq!(input_text(&app), "first");
+        app.history_next();
+        assert_eq!(input_text(&app), "second");
+        app.history_next(); // past newest → back to (empty) draft
+        assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn reverse_search_finds_and_steps_back_through_matches() {
+        let mut app = App::new();
+        app.history.push("cargo build".into());
+        app.history.push("git commit".into());
+        app.history.push("cargo test".into());
+
+        app.start_search();
+        if let Some(s) = app.search.as_mut() {
+            s.query.push_str("car");
+        }
+        app.refresh_search();
+        assert_eq!(input_text(&app), "cargo test", "newest match");
+        app.search_older();
+        assert_eq!(input_text(&app), "cargo build", "older match");
+
+        app.cancel_search();
+        assert!(app.search.is_none());
+        assert_eq!(input_text(&app), "", "draft restored on cancel");
     }
 }

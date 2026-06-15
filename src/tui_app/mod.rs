@@ -212,10 +212,16 @@ async fn slash_command(
         "help" | "?" => app.set_help(true),
         "clear" => app.clear_transcript(),
         "voice" | "v" => {
-            // Toggle voice via the classic dispatcher, then reflect the new
-            // state so the UI knows Enter-on-empty should record.
-            run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?;
-            app.set_voice(ctx.voice_on());
+            if cfg!(feature = "voice") {
+                // Toggle voice via the classic dispatcher, then reflect the new
+                // state so the UI knows Enter-on-empty should record.
+                run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?;
+                app.set_voice(ctx.voice_on());
+            } else {
+                app.push_note(
+                    "voice needs a build with the feature — rebuild with: cargo run --release --features voice,cluster -- agent".into(),
+                );
+            }
         }
         _ => run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?,
     }
@@ -272,10 +278,12 @@ async fn run_classic_command(
     println!();
     let handled = ctx.dispatch(input).await;
     if handled {
-        print!("\n\x1b[2m— press Enter to return to TRENTADUE —\x1b[0m ");
+        // Wait for ANY key (Esc included). A line-read here only returned on
+        // Enter, so pressing Esc left the user wedged (→ Ctrl+C to escape).
+        let _ = enable_raw_mode();
+        print!("\r\n  \x1b[2mpress any key to return to TRENTADUE\x1b[0m ");
         let _ = std::io::stdout().flush();
-        let mut buf = String::new();
-        let _ = std::io::stdin().read_line(&mut buf);
+        let _ = event::read();
     }
     resume_ui(terminal, ev_rx, paused)?;
 
