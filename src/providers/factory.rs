@@ -29,6 +29,9 @@ pub struct ProviderSpec {
     pub timeout_secs: u64,
     /// Timeout for LMS native probe requests in seconds (default: 2).
     pub lms_native_probe_secs: u64,
+    /// Whether grammar-constrained tool calls are enabled for local backends
+    /// (default: true). The config escape hatch sets this false.
+    pub constrained_tool_calls: bool,
 }
 
 impl ProviderSpec {
@@ -47,6 +50,7 @@ impl ProviderSpec {
             retry: RetryConfig::default(),
             timeout_secs: 120,
             lms_native_probe_secs: 2,
+            constrained_tool_calls: true,
         }
     }
 
@@ -64,6 +68,7 @@ impl ProviderSpec {
             retry: RetryConfig::default(),
             timeout_secs: 120,
             lms_native_probe_secs: 2,
+            constrained_tool_calls: true,
         }
     }
 
@@ -83,6 +88,12 @@ impl ProviderSpec {
     /// Override retry backoff settings from `RetryConfig`.
     pub fn with_retry(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Enable/disable grammar-constrained tool calls for local backends.
+    pub fn with_constrained_tool_calls(mut self, enabled: bool) -> Self {
+        self.constrained_tool_calls = enabled;
         self
     }
 }
@@ -109,6 +120,7 @@ pub fn create_openai_compat(spec: ProviderSpec) -> Arc<dyn LLMProvider> {
         spec.retry.jit_min_secs,
         spec.retry.jit_max_secs,
     );
+    prov = prov.with_constrained_tool_calls(spec.constrained_tool_calls);
     Arc::new(prov)
 }
 
@@ -228,6 +240,7 @@ mod tests {
             retry: RetryConfig::default(),
             timeout_secs: 120,
             lms_native_probe_secs: 2,
+            constrained_tool_calls: true,
         };
         let provider = create_openai_compat(spec);
         assert_eq!(provider.get_default_model(), "gpt-4");

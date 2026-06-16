@@ -22,7 +22,7 @@ use crate::agent::router_fallback;
 use crate::agent::tool_guard::ToolGuard;
 use crate::agent::toolplan::{self, ToolPlanAction};
 use crate::agent::tools::registry::ToolRegistry;
-use crate::providers::base::{LLMProvider, ToolCallRequest};
+use crate::providers::base::{LLMProvider, ToolCallRequest, ToolChoice};
 
 const ROUTER_SUSPICIOUS_TARGET_MAX_LEN: usize = 96;
 const ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS: usize = 220;
@@ -440,7 +440,10 @@ pub async fn request_strict_router_decision(
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["respond","tool","specialist","ask_user"]},
+                    // Must list every action parse_router_decision_strict accepts
+                    // (role_policy.rs): grammar-constrained local decoding enforces
+                    // this enum, so an omitted action becomes unreachable.
+                    "action": {"type": "string", "enum": ["respond","tool","subagent","specialist","ask_user","pipeline"]},
                     "target": {"type": "string"},
                     // Apple FM guided-generation rejects free-form object
                     // schemas ({"type":"object"} with no properties) with a 400
@@ -486,7 +489,7 @@ pub async fn request_strict_router_decision(
         }),
     ];
     if let Ok(tool_resp) = provider
-        .chat(
+        .chat_with_tool_choice(
             &tool_messages,
             Some(&tool_defs),
             Some(model),
@@ -494,6 +497,10 @@ pub async fn request_strict_router_decision(
             temperature,
             None,
             Some(top_p),
+            // Force exactly one route_decision call. On a local Higgs backend
+            // this triggers grammar-constrained decoding so the decision is
+            // always a well-formed tool call (no fragile JSON-text fallback).
+            ToolChoice::Required,
         )
         .await
     {

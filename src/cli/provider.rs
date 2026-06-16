@@ -93,6 +93,7 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
             retry: config.retry.clone(),
             timeout_secs: config.timeouts.provider_http_secs,
             lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
+            constrained_tool_calls: config.agents.defaults.constrained_tool_calls,
         });
     }
 
@@ -139,6 +140,7 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
         retry: config.retry.clone(),
         timeout_secs: config.timeouts.provider_http_secs,
         lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
+        constrained_tool_calls: config.agents.defaults.constrained_tool_calls,
     })
 }
 

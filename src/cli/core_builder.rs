@@ -169,6 +169,7 @@ pub(super) fn make_local_providers(
     };
 
     let api_key = &config.agents.defaults.local_api_key;
+    let constrained = config.agents.defaults.constrained_tool_calls;
 
     let main: Arc<dyn LLMProvider> = factory::create_openai_compat(
         factory::ProviderSpec::local_with_key(&base_url, Some(&model_id), api_key)
@@ -218,6 +219,7 @@ pub(super) fn make_local_providers(
                 retry: config.retry.clone(),
                 timeout_secs: config.timeouts.provider_http_secs,
                 lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
+                constrained_tool_calls: constrained,
             }));
         }
 
@@ -235,7 +237,8 @@ pub(super) fn make_local_providers(
                 factory::ProviderSpec::local_with_key(&base_url, Some(model), api_key)
                     .with_jit_gate_opt(jit_gate.clone())
                     .with_timeout_config(&config.timeouts)
-                    .with_retry(config.retry.clone()),
+                    .with_retry(config.retry.clone())
+                    .with_constrained_tool_calls(constrained),
             ));
         }
 
@@ -248,7 +251,8 @@ pub(super) fn make_local_providers(
                     api_key,
                 )
                 .with_timeout_config(&config.timeouts)
-                .with_retry(config.retry.clone()),
+                .with_retry(config.retry.clone())
+                .with_constrained_tool_calls(constrained),
             )
         })
     };

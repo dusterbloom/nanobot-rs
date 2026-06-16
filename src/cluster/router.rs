@@ -129,6 +129,7 @@ impl ClusterRouter {
                     retry: crate::config::schema::RetryConfig::default(),
                     timeout_secs: 120,
                     lms_native_probe_secs: 2,
+                    constrained_tool_calls: true,
                 };
                 let provider = factory::create_openai_compat(spec);
                 tracing::info!(

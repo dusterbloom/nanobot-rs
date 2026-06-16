@@ -185,6 +185,7 @@ impl AgentLoop {
                         retry: crate::config::schema::RetryConfig::default(),
                         timeout_secs: 120,
                         lms_native_probe_secs: 2,
+                        constrained_tool_calls: true,
                     },
                 );
             Arc::new(ContextCompactor::new(

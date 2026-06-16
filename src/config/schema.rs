@@ -226,6 +226,12 @@ pub struct AgentDefaults {
     /// Separate from maxContextTokens so cloud (512K) and local (32K) coexist.
     #[serde(default = "default_local_max_context_tokens")]
     pub local_max_context_tokens: usize,
+    /// Grammar-constrained tool calls for local backends (default: true).
+    /// When the router (or other forced-tool path) asks for a tool call, the
+    /// local server constrains decoding so the call is always well-formed.
+    /// Escape hatch: set false to fall back to unconstrained "auto" behavior.
+    #[serde(default = "default_constrained_tool_calls")]
+    pub constrained_tool_calls: bool,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     #[serde(default = "default_temperature")]
@@ -333,6 +339,10 @@ fn default_model() -> String {
 
 fn default_local_max_context_tokens() -> usize {
     32768
+}
+
+fn default_constrained_tool_calls() -> bool {
+    true
 }
 
 fn default_max_tokens() -> u32 {
@@ -447,6 +457,7 @@ impl Default for AgentDefaults {
             local_api_base: String::new(),
             local_api_key: default_local_api_key(),
             local_max_context_tokens: default_local_max_context_tokens(),
+            constrained_tool_calls: default_constrained_tool_calls(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             max_tool_iterations: default_max_tool_iterations(),

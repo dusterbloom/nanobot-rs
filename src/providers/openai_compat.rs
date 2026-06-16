@@ -16,7 +16,7 @@ use tracing::{debug, info, instrument, warn};
 
 use backon::Retryable;
 
-use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
+use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest, ToolChoice};
 use super::constants::{
     ANTHROPIC_API_BASE, DEEPSEEK_API_BASE, GROQ_API_BASE, OPENAI_API_BASE, OPENROUTER_API_BASE,
 };
@@ -41,6 +41,10 @@ pub struct OpenAICompatProvider {
     retry_jit_max_secs: u64,
     /// Timeout for native LMS probe requests in seconds (default: 2).
     lms_native_probe_secs: u64,
+    /// Whether to emit `tool_choice: "required"` to local backends when a caller
+    /// requests [`ToolChoice::Required`]. Default `true`; the config escape hatch
+    /// (`agents.defaults.constrained_tool_calls = false`) sets it `false`.
+    constrained_tool_calls: bool,
 }
 
 /// Normalize Claude model short-names so the API always gets the canonical ID.
@@ -134,7 +138,17 @@ impl OpenAICompatProvider {
             retry_jit_min_secs: 2,
             retry_jit_max_secs: 8,
             lms_native_probe_secs: 2,
+            constrained_tool_calls: true,
         }
+    }
+
+    /// Enable or disable grammar-constrained tool calls for local backends.
+    ///
+    /// When `false`, [`ToolChoice::Required`] degrades to `"auto"` (the config
+    /// escape hatch). No effect on cloud providers.
+    pub fn with_constrained_tool_calls(mut self, enabled: bool) -> Self {
+        self.constrained_tool_calls = enabled;
+        self
     }
 
     /// Override the HTTP client timeout.
@@ -205,6 +219,21 @@ fn parse_retry_after_ms(response_text: &str) -> u64 {
     }
     // Default: 1 second
     1000
+}
+
+/// Map a [`ToolChoice`] to the OpenAI `tool_choice` body value.
+///
+/// `Required` becomes `"required"` only for local backends when constrained tool
+/// calls are enabled; otherwise it degrades to `"auto"`, leaving cloud behavior
+/// unchanged and honoring the config escape hatch.
+fn tool_choice_value(tc: ToolChoice, api_base: &str, constrained: bool) -> serde_json::Value {
+    match tc {
+        ToolChoice::Required if is_local_api_base(api_base) && constrained => {
+            serde_json::json!("required")
+        }
+        ToolChoice::None => serde_json::json!("none"),
+        _ => serde_json::json!("auto"),
+    }
 }
 
 pub(crate) fn is_local_api_base(api_base: &str) -> bool {
@@ -526,10 +555,10 @@ fn extract_reasoning_delta(delta: &serde_json::Value) -> Option<&str> {
         })
 }
 
-#[async_trait]
-impl LLMProvider for OpenAICompatProvider {
+impl OpenAICompatProvider {
     #[instrument(skip(self, messages, tools), fields(api_base = %self.api_base))]
-    async fn chat(
+    #[allow(clippy::too_many_arguments)]
+    async fn chat_impl(
         &self,
         messages: &[serde_json::Value],
         tools: Option<&[serde_json::Value]>,
@@ -538,6 +567,7 @@ impl LLMProvider for OpenAICompatProvider {
         temperature: f64,
         thinking_budget: Option<u32>,
         top_p: Option<f64>,
+        tool_choice: ToolChoice,
     ) -> Result<LLMResponse> {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -606,17 +636,20 @@ impl LLMProvider for OpenAICompatProvider {
             supports_thinking,
         );
 
+        // Forced tool calls ("required") only engage for local backends with
+        // constrained tool calls enabled; elsewhere this is "auto" (unchanged).
+        let tc_value = tool_choice_value(tool_choice, &self.api_base, self.constrained_tool_calls);
         let mut request_has_tools = false;
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.clone());
-                body["tool_choice"] = serde_json::json!("auto");
+                body["tool_choice"] = tc_value.clone();
                 request_has_tools = true;
             }
         } else if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.to_vec());
-                body["tool_choice"] = serde_json::json!("auto");
+                body["tool_choice"] = tc_value.clone();
                 request_has_tools = true;
             }
         }
@@ -780,6 +813,57 @@ impl LLMProvider for OpenAICompatProvider {
             }
         }
         result.map_err(|e| e.into())
+    }
+}
+
+#[async_trait]
+impl LLMProvider for OpenAICompatProvider {
+    async fn chat(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+        thinking_budget: Option<u32>,
+        top_p: Option<f64>,
+    ) -> Result<LLMResponse> {
+        self.chat_impl(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            thinking_budget,
+            top_p,
+            ToolChoice::Auto,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn chat_with_tool_choice(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+        thinking_budget: Option<u32>,
+        top_p: Option<f64>,
+        tool_choice: ToolChoice,
+    ) -> Result<LLMResponse> {
+        self.chat_impl(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            thinking_budget,
+            top_p,
+            tool_choice,
+        )
+        .await
     }
 
     #[instrument(skip(self, messages, tools), fields(api_base = %self.api_base))]
@@ -2838,4 +2922,46 @@ mod tests {
         );
     }
 
+    // --- tool_choice_value mapping / gating ---
+
+    const LOCAL: &str = "http://localhost:8000/v1";
+    const CLOUD: &str = "https://api.openai.com/v1";
+
+    #[test]
+    fn tool_choice_required_local_constrained_is_required() {
+        assert_eq!(
+            tool_choice_value(ToolChoice::Required, LOCAL, true),
+            serde_json::json!("required")
+        );
+    }
+
+    #[test]
+    fn tool_choice_required_local_escape_hatch_degrades_to_auto() {
+        // constrained=false (config escape hatch) → no forcing.
+        assert_eq!(
+            tool_choice_value(ToolChoice::Required, LOCAL, false),
+            serde_json::json!("auto")
+        );
+    }
+
+    #[test]
+    fn tool_choice_required_cloud_stays_auto() {
+        // Tier 1 is local-only; cloud behavior is unchanged.
+        assert_eq!(
+            tool_choice_value(ToolChoice::Required, CLOUD, true),
+            serde_json::json!("auto")
+        );
+    }
+
+    #[test]
+    fn tool_choice_auto_and_none_map_directly() {
+        assert_eq!(
+            tool_choice_value(ToolChoice::Auto, LOCAL, true),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            tool_choice_value(ToolChoice::None, LOCAL, true),
+            serde_json::json!("none")
+        );
+    }
 }

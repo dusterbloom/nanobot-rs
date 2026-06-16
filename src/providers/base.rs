@@ -90,6 +90,21 @@ pub struct StreamHandle {
     pub rx: tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
 }
 
+/// How the model should choose tools for a request. Maps to OpenAI `tool_choice`.
+///
+/// `Required` asks the server to force exactly one tool call; for a local Higgs
+/// backend this triggers grammar-constrained decoding so the call is always
+/// well-formed. The default `chat()` path and cloud providers use `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// Model decides whether to call a tool (OpenAI `"auto"`).
+    Auto,
+    /// Force exactly one tool call (OpenAI `"required"`).
+    Required,
+    /// Forbid tool calls (OpenAI `"none"`).
+    None,
+}
+
 /// Abstract base trait for LLM providers.
 ///
 /// Implementations should handle the specifics of each provider's API
@@ -116,6 +131,36 @@ pub trait LLMProvider: Send + Sync {
         thinking_budget: Option<u32>,
         top_p: Option<f64>,
     ) -> Result<LLMResponse>;
+
+    /// Like [`chat`](Self::chat) but with an explicit [`ToolChoice`].
+    ///
+    /// The default implementation ignores `tool_choice` and delegates to
+    /// `chat`, so providers that don't support forcing keep their existing
+    /// behavior. `OpenAICompatProvider` overrides this to emit `tool_choice`
+    /// for local backends.
+    #[allow(clippy::too_many_arguments)]
+    async fn chat_with_tool_choice(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+        thinking_budget: Option<u32>,
+        top_p: Option<f64>,
+        _tool_choice: ToolChoice,
+    ) -> Result<LLMResponse> {
+        self.chat(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            thinking_budget,
+            top_p,
+        )
+        .await
+    }
 
     /// Send a streaming chat completion request.
     ///
