@@ -35,7 +35,7 @@ use crate::bus::events::OutboundMessage;
 use crate::config::schema::{EmailConfig, LcmSchemaConfig, ProprioceptionConfig};
 use crate::cron::service::CronService;
 use crate::errors::is_retryable_provider_error;
-use crate::providers::base::{LLMResponse, StreamChunk, ToolCallRequest};
+use crate::providers::base::{LLMResponse, StreamChunk, ToolCallRequest, ToolChoice};
 
 use crate::agent::agent_core::{
     append_to_system_prompt, apply_compaction_result, PendingCompaction, RuntimeCounters,
@@ -320,6 +320,38 @@ enum StepResult {
     Next(IterationPhase),
     /// Iteration is done — report outcome to the outer loop.
     Done(IterationOutcome),
+}
+
+/// Decide whether a response warrants a Tier-2 forced-tool recovery: re-issuing
+/// the turn with `tool_choice=required` so a local Higgs backend grammar-forces
+/// a valid tool call instead of looping on a corrective hint.
+///
+/// Fires only when the model produced no real tool call, on the first
+/// validation slot, in local mode, with tools available, and when the content
+/// reads as a botched/claimed tool call (same detector the main loop uses). In
+/// TextualReplay mode `validate_response` returns `Ok`, so this never fires.
+fn should_attempt_forced_recovery(
+    has_tool_calls: bool,
+    is_local: bool,
+    validation_retries: u32,
+    tools_present: bool,
+    content: Option<&str>,
+    is_textual_replay: bool,
+    had_blocked_calls: bool,
+) -> bool {
+    if has_tool_calls || !is_local || validation_retries != 0 || !tools_present {
+        return false;
+    }
+    let Some(content) = content else {
+        return false;
+    };
+    matches!(
+        validation::validate_response(content, &[], is_textual_replay, had_blocked_calls),
+        validation::ValidationOutcome::Error(
+            validation::ValidationError::ClaimedButNotExecuted
+                | validation::ValidationError::HallucinatedToolCall
+        )
+    )
 }
 
 impl AgentLoopShared {
@@ -1682,7 +1714,77 @@ impl AgentLoopShared {
         // Inference complete — allow watchdog health checks again.
         counters.mark_inference_finished();
 
+        // Tier-2 forced-tool recovery: if a local model botched a tool call
+        // (intent prose / hallucinated syntax / empty block) instead of emitting
+        // one, re-issue once with tool_choice=required so the Higgs backend
+        // grammar-constrains a valid call — replacing the old hint-and-loop.
+        let response = self
+            .maybe_recover_botched_tool_call(
+                ctx,
+                response,
+                &messages_for_llm,
+                tool_defs_opt,
+                max_tokens,
+            )
+            .await;
+
         StepResult::Next(IterationPhase::Processing { response })
+    }
+
+    /// One-shot forced-tool recovery for local backends. See call site above.
+    ///
+    /// Fires only on the first validation slot (`retries.validation == 0`), in
+    /// local mode, with tools present, when the response has no real tool calls
+    /// but its content reads as a botched/claimed tool call. Returns the
+    /// recovered (constrained) response on success, else the original unchanged
+    /// so the normal validation-retry path still applies.
+    async fn maybe_recover_botched_tool_call(
+        &self,
+        ctx: &TurnContext,
+        response: LLMResponse,
+        messages_for_llm: &[Value],
+        tool_defs_opt: Option<&[Value]>,
+        max_tokens: u32,
+    ) -> LLMResponse {
+        if !should_attempt_forced_recovery(
+            response.has_tool_calls(),
+            ctx.core.mode().is_local(),
+            ctx.flow.retries.validation,
+            tool_defs_opt.is_some_and(|t| !t.is_empty()),
+            response.content.as_deref(),
+            ctx.protocol.is_textual_replay(),
+            ctx.flow.tool_guard.had_blocked_calls,
+        ) {
+            return response;
+        }
+
+        info!(
+            model = %ctx.core.model,
+            "forced_tool_recovery: botched tool intent — re-issuing with tool_choice=required"
+        );
+        match ctx
+            .core
+            .provider
+            .chat_with_tool_choice(
+                messages_for_llm,
+                tool_defs_opt,
+                Some(&ctx.core.model),
+                max_tokens,
+                ctx.core.temperature,
+                None, // forced from-token-0 constraint runs thinking-off
+                None,
+                ToolChoice::Required,
+            )
+            .await
+        {
+            Ok(recovered) if recovered.has_tool_calls() => {
+                info!("forced_tool_recovery: recovered a constrained tool call");
+                recovered
+            }
+            // No tool call (e.g. constraint disabled server-side) or error:
+            // fall back to the original response and the hint-retry path.
+            Ok(_) | Err(_) => response,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2142,4 +2244,74 @@ mod tests {
     // Wave 1 will replace every `ctx.core.is_local` site with a
     // `ctx.core.mode()` method call; the invariant suite in Wave 0's
     // runtime_mode.rs will then act as the deep-path regression net.
+}
+
+#[cfg(test)]
+mod forced_recovery_tests {
+    use super::should_attempt_forced_recovery;
+
+    // Real trigger strings (mirror src/agent/validation.rs tests).
+    const CLAIMED: &str = "Let me check that file for you."; // ClaimedButNotExecuted
+    const HALLUCINATED: &str = "I'll read it.\n[Called read_file({\"path\":\"/x\"})]"; // HallucinatedToolCall
+    const CLEAN: &str = "The answer is 42."; // Ok — a genuine final answer
+
+    #[test]
+    fn fires_on_claimed_tool_intent() {
+        assert!(should_attempt_forced_recovery(
+            false, true, 0, true, Some(CLAIMED), false, false
+        ));
+    }
+
+    #[test]
+    fn fires_on_hallucinated_call() {
+        assert!(should_attempt_forced_recovery(
+            false, true, 0, true, Some(HALLUCINATED), false, false
+        ));
+    }
+
+    #[test]
+    fn skips_when_real_tool_calls_present() {
+        assert!(!should_attempt_forced_recovery(
+            true, true, 0, true, Some(CLAIMED), false, false
+        ));
+    }
+
+    #[test]
+    fn skips_on_cloud_backend() {
+        assert!(!should_attempt_forced_recovery(
+            false, false, 0, true, Some(CLAIMED), false, false
+        ));
+    }
+
+    #[test]
+    fn skips_after_first_validation_slot() {
+        // One-shot: only the first slot (retries == 0) recovers.
+        assert!(!should_attempt_forced_recovery(
+            false, true, 1, true, Some(CLAIMED), false, false
+        ));
+    }
+
+    #[test]
+    fn skips_when_no_tools_available() {
+        assert!(!should_attempt_forced_recovery(
+            false, true, 0, false, Some(CLAIMED), false, false
+        ));
+    }
+
+    #[test]
+    fn skips_on_genuine_final_answer() {
+        // Critical false-positive guard: a real answer must never be hijacked.
+        assert!(!should_attempt_forced_recovery(
+            false, true, 0, true, Some(CLEAN), false, false
+        ));
+    }
+
+    #[test]
+    fn skips_in_textual_replay_mode() {
+        // TextualReplay legitimately writes call-like prose; validate_response
+        // returns Ok, so recovery must not fire.
+        assert!(!should_attempt_forced_recovery(
+            false, true, 0, true, Some(CLAIMED), true, false
+        ));
+    }
 }
