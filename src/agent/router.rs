@@ -652,10 +652,6 @@ pub(crate) async fn dispatch_specialist(
         tracing::Span::current().record("outcome", "error");
         return Err(format!("circuit breaker open for {}", cb_key));
     }
-    let specialist_state = format!(
-        "Target: {}\nRouter args: {}\nUser intent: {}",
-        target, router_args, context_summary
-    );
     let conv_tail = build_conversation_tail(
         messages,
         ROUTER_TAIL_MAX_PAIRS,
@@ -663,16 +659,12 @@ pub(crate) async fn dispatch_specialist(
         core.tool_delegation_config.router_tuning.tail_max_chars,
     );
     let specialist_pack = if core.tool_delegation_config.role_scoped_context_packs {
-        role_policy::build_context_pack(
-            role_policy::Role::Specialist,
-            user_content,
-            &conv_tail,
-            &specialist_state,
-            tool_list,
-            3000,
-        )
+        role_policy::build_specialist_pack(target, router_args, user_content, &conv_tail, tool_list, 3000)
     } else {
-        specialist_state
+        format!(
+            "Target: {}\nRouter args: {}\nUser intent: {}",
+            target, router_args, context_summary
+        )
     };
     // Load specialist domain memory and prepend to pack if available.
     let domain_memory = counters.specialist_memory.lock().format_context(target);

@@ -129,23 +129,24 @@ pub fn build_context_pack(
     available_tools: &[String],
     max_chars: usize,
 ) -> String {
+    // Tool names + the action menu reach the router via its *system* message
+    // (request_strict_router_decision), so the packs never duplicate them.
+    let _ = available_tools;
     let body = match role {
         Role::Main => format!(
             "Role: main\nUser intent:\n{}\n\nConversation summary:\n{}\n\nTask state:\n{}\n",
             user_intent, conversation_summary, task_state
         ),
-        Role::Router => format!(
-            "Role: router\nTask state:\n{}\n\nAllowed actions:\n- respond (simple conversation, greetings, direct answers)\n- tool (use a specific tool)\n- specialist (delegate complex reasoning)\n- ask_user (request clarification)\n\nAvailable tools:\n{}\n",
-            task_state,
-            if available_tools.is_empty() {
-                "(none)".to_string()
-            } else {
-                available_tools.join(", ")
-            }
-        ),
+        Role::Router => format!("Role: router\nTask state:\n{}\n", task_state),
         Role::Specialist => format!(
-            "Role: specialist\nTask state:\n{}\n\nFocused objective:\n{}\n",
-            task_state, user_intent
+            "Role: specialist\nTask state:\n{}\n\nConversation:\n{}\n\nFocused objective:\n{}\n",
+            task_state,
+            if conversation_summary.is_empty() {
+                "(none)"
+            } else {
+                conversation_summary
+            },
+            user_intent
         ),
     };
     if body.len() <= max_chars {
@@ -154,6 +155,33 @@ pub fn build_context_pack(
         let end = crate::utils::helpers::floor_char_boundary(&body, max_chars);
         body[..end].to_string()
     }
+}
+
+/// Assemble the specialist lane's user-message pack.
+///
+/// Pure (the dispatcher prepends domain memory separately) so the
+/// conversation/objective composition is unit-testable. The specialist runs on
+/// Apple FM, NOT the Higgs-cached main prefix, so per-turn volatility here does
+/// not affect main TTFT/prefix-cache.
+pub(crate) fn build_specialist_pack(
+    target: &str,
+    router_args: &Value,
+    user_intent: &str,
+    conv_tail: &str,
+    tools: &[String],
+    max_chars: usize,
+) -> String {
+    // User intent is supplied once by build_context_pack as "Focused objective";
+    // the task state carries only routing metadata (no duplicate intent).
+    let task_state = format!("Target: {}\nRouter args: {}", target, router_args);
+    build_context_pack(
+        Role::Specialist,
+        user_intent,
+        conv_tail,
+        &task_state,
+        tools,
+        max_chars,
+    )
 }
 
 #[cfg(test)]
@@ -304,6 +332,65 @@ mod tests {
         assert!(err.contains("invalid router JSON"));
     }
 
+    // I1 — the specialist must receive the recent conversation tail.
+    // Regression: build_context_pack(Role::Specialist) ignored conversation_summary,
+    // leaving the specialist blind to context for "complex reasoning" delegations.
+    #[test]
+    fn test_specialist_pack_includes_conversation_tail() {
+        let pack = build_specialist_pack(
+            "analysis",
+            &serde_json::json!({}),
+            "OBJECTIVE_MARKER",
+            "PRIOR_CONVERSATION_MARKER",
+            &[],
+            10_000,
+        );
+        assert!(
+            pack.contains("PRIOR_CONVERSATION_MARKER"),
+            "specialist pack must carry the conversation tail; got:\n{pack}"
+        );
+    }
+
+    // I2 — the user objective must appear exactly once, not duplicated as both
+    // "User intent" (task state) and "Focused objective".
+    #[test]
+    fn test_specialist_pack_objective_not_duplicated() {
+        let pack = build_specialist_pack(
+            "analysis",
+            &serde_json::json!({}),
+            "UNIQUE_OBJECTIVE_XYZ",
+            "some conversation",
+            &[],
+            10_000,
+        );
+        let count = pack.matches("UNIQUE_OBJECTIVE_XYZ").count();
+        assert_eq!(count, 1, "objective must appear exactly once, got {count} in:\n{pack}");
+    }
+
+    // I3 — actions/tools live in the router *system* message; the Role::Router
+    // *pack* must not duplicate them (wasted prefill on a latency-critical call).
+    #[test]
+    fn test_router_pack_does_not_duplicate_instructions() {
+        let tools = vec!["exec".to_string(), "read_file".to_string()];
+        let router = build_context_pack(
+            Role::Router,
+            "user request",
+            "convo",
+            "task-state",
+            &tools,
+            10_000,
+        );
+        assert!(router.contains("task-state"), "router pack must carry task state");
+        assert!(
+            !router.contains("Available tools:"),
+            "router pack must not duplicate the tool list (it's in the system msg); got:\n{router}"
+        );
+        assert!(
+            !router.contains("Allowed actions:"),
+            "router pack must not duplicate the actions list; got:\n{router}"
+        );
+    }
+
     #[test]
     fn test_build_context_pack_is_role_scoped() {
         let tools = vec!["exec".to_string(), "read_file".to_string()];
@@ -327,6 +414,7 @@ mod tests {
             10_000,
         );
         assert!(router.contains("Role: router"));
-        assert!(router.contains("Available tools:"));
+        // Tools/actions are instructions (router system msg), not pack context.
+        assert!(!router.contains("Available tools:"));
     }
 }
