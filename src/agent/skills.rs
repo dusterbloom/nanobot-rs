@@ -341,40 +341,27 @@ impl SkillsLoader {
         lines.join("\n")
     }
 
-    /// Return the skill names most relevant to `query`, capped at `k` ranked
-    /// matches plus all always-on skills.
+    /// Return up to `k` skill names most relevant to `query`.
     ///
-    /// Always-on skills (`get_always_skills`) come first and are never counted
-    /// against `k`. The remaining (non-always, requirement-met) skills are
+    /// Always-on skills (`get_always_skills`) are **excluded** — they are
+    /// surfaced separately (the static prompt prefix), so the per-turn tail
+    /// should not re-list them. Only requirement-met, non-always skills are
     /// ranked:
     /// - with the `semantic` feature: by cosine similarity between the embedded
     ///   query and each skill's embedded `"name: description"`, top-`k`.
     /// - without it (or on any embed error): the first `k` in discovery order.
-    ///
-    /// Result is de-duplicated, always-on names first.
     pub fn relevant(&self, query: &str, k: usize) -> Vec<String> {
-        let always = self.get_always_skills();
-        let always_set: HashSet<&str> = always.iter().map(|s| s.as_str()).collect();
+        let always_set: HashSet<String> = self.get_always_skills().into_iter().collect();
 
-        // Candidates: requirement-met skills that are not already always-on.
+        // Candidates: requirement-met skills that are not always-on.
         let candidates: Vec<SkillRecord> = self
             .discover_skill_records()
             .into_iter()
             .filter(|r| _check_requirements(&r.skill_meta))
-            .filter(|r| !always_set.contains(r.info.name.as_str()))
+            .filter(|r| !always_set.contains(&r.info.name))
             .collect();
 
-        let ranked = Self::rank_by_relevance(query, &candidates, k);
-
-        // Union: always-on first, then ranked, de-duplicated.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut out: Vec<String> = Vec::new();
-        for name in always.into_iter().chain(ranked.into_iter()) {
-            if seen.insert(name.clone()) {
-                out.push(name);
-            }
-        }
-        out
+        Self::rank_by_relevance(query, &candidates, k)
     }
 
     /// Rank candidate skills against `query`, returning up to `k` names.
@@ -1368,9 +1355,9 @@ mod tests {
     }
 
     #[test]
-    fn test_relevant_always_skills_always_present() {
-        // always-on skills must appear regardless of query, and never count
-        // against k. Returned names must all be real discovered skills.
+    fn test_relevant_excludes_always_skills() {
+        // always-on skills are surfaced via the static prefix, so relevant()
+        // must NOT return them — the per-turn tail shows only ranked picks.
         let (_tmp, loader) = make_workspace_with_skills(&[
             ("always-one", "description: Always loaded\nalways: true"),
             ("normal-a", "description: Normal skill A"),
@@ -1378,29 +1365,23 @@ mod tests {
             ("normal-c", "description: Normal skill C"),
         ]);
 
-        let result = loader.relevant("anything at all", 1);
+        let result = loader.relevant("anything at all", 2);
 
-        // The always-on skill is present.
+        // The always-on skill must be absent.
         assert!(
-            result.contains(&"always-one".to_string()),
-            "always-on skill must be present, got: {:?}",
+            !result.contains(&"always-one".to_string()),
+            "always-on skill must be excluded, got: {:?}",
             result
         );
-        // Total = always (1) + ranked (<= k=1).
-        assert!(
-            result.len() <= 2,
-            "result should be at most always(1)+k(1), got: {:?}",
-            result
-        );
-        // Every returned name is a real, discovered skill.
+        // Capped at k=2 ranked (non-always) skills.
+        assert_eq!(result.len(), 2, "should return k=2 ranked skills, got: {:?}", result);
+        // Every returned name is a real, non-always discovered skill.
         let known: HashSet<String> =
             loader.list_skills(false).into_iter().map(|s| s.name).collect();
         for name in &result {
             assert!(known.contains(name), "unknown skill name returned: {}", name);
+            assert_ne!(name, "always-one");
         }
-        // No duplicates.
-        let unique: HashSet<&String> = result.iter().collect();
-        assert_eq!(unique.len(), result.len(), "result must be de-duplicated");
     }
 
     #[test]
