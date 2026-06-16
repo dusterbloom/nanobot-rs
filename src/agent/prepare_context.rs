@@ -13,7 +13,7 @@ use crate::agent::agent_loop::{AgentLoopShared, CompactionHandle, FlowControl, T
 use crate::agent::audit::AuditLog;
 use crate::agent::context::PromptBlock;
 use crate::agent::context_gate::ContentGate;
-use crate::agent::memory_ladder::{MemoryLadder, MemoryLayer, MemoryQuery};
+use crate::agent::memory_ladder::{LayerResult, MemoryLadder, MemoryLayer, MemoryQuery};
 use crate::agent::policy;
 use crate::agent::prompt_contract::{PromptSection, SectionEntry, SectionSource};
 use crate::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
@@ -22,6 +22,32 @@ use crate::agent::taint::TaintState;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tool_guard::ToolGuard;
 use crate::bus::events::InboundMessage;
+
+/// Query the memory ladder for the local prompt path, capped to the local
+/// working-memory budget (the same `(working_memory_budget * multiplier).min(200)`
+/// formula the always-on prefix path has always used).
+///
+/// Shared by the legacy always-on prefix injection (`build_local_runtime_blocks`,
+/// `query = ""`) and the per-turn tail block (`query` = the user's turn) so the
+/// two cannot drift. Returns an empty vec when memory is disabled.
+fn local_memory_results(
+    core: &Arc<SwappableCore>,
+    session_key: &str,
+    query: &str,
+) -> Vec<LayerResult> {
+    if !core.memory_enabled {
+        return Vec::new();
+    }
+    let ladder = MemoryLadder::new(&core.workspace, &core.working_memory, None, &core.sessions);
+    let memory_multiplier = core.lane.policy().memory.budget_multiplier;
+    let adjusted_budget =
+        ((core.working_memory_budget as f64 * memory_multiplier) as usize).min(200);
+    ladder.query(&MemoryQuery {
+        session_key,
+        query,
+        total_budget: adjusted_budget,
+    })
+}
 
 impl AgentLoopShared {
     pub(crate) async fn build_local_runtime_blocks(
@@ -49,28 +75,18 @@ impl AgentLoopShared {
             }
         }
 
-        if core.memory_enabled {
-            let ladder =
-                MemoryLadder::new(&core.workspace, &core.working_memory, None, &core.sessions);
-            let memory_multiplier = core.lane.policy().memory.budget_multiplier;
-            let adjusted_budget =
-                ((core.working_memory_budget as f64 * memory_multiplier) as usize).min(200);
-            let results = ladder.query(&MemoryQuery {
-                session_key,
-                query: "",
-                total_budget: adjusted_budget,
-            });
-            for result in results {
-                if !result.content.is_empty() {
-                    let title = match result.layer {
-                        MemoryLayer::WorkingSession => "Working Memory",
-                        _ => "Memory Briefing",
-                    };
-                    blocks.push(crate::agent::context::PromptBlock::new(
-                        title,
-                        &result.content,
-                    ));
-                }
+        // Legacy always-on prefix path keeps query="" (non-query-aware); the
+        // query-aware path is the per-turn tail block (build_local_tail).
+        for result in local_memory_results(core, session_key, "") {
+            if !result.content.is_empty() {
+                let title = match result.layer {
+                    MemoryLayer::WorkingSession => "Working Memory",
+                    _ => "Memory Briefing",
+                };
+                blocks.push(crate::agent::context::PromptBlock::new(
+                    title,
+                    &result.content,
+                ));
             }
         }
 

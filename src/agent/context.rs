@@ -1080,6 +1080,33 @@ impl ContextBuilder {
         }
     }
 
+    /// Insert a per-turn context block as a `role:user` message immediately
+    /// before the final user message.
+    ///
+    /// This is the local "tail block" placement: query-relevant skills/memory
+    /// go AFTER history (so the bulk KV prefix stays cached across turns) but
+    /// BEFORE the user's question. Under `LocalProtocol` this `user` message
+    /// merges with the real user message, keeping the "ends with user"
+    /// invariant.
+    ///
+    /// No-op when `tail` is blank or the array does not end with a user message.
+    /// The caller MUST bump its `new_start` persistence watermark by 1 so the
+    /// ephemeral tail is never written into session history.
+    pub fn insert_tail_before_user(&self, messages: &mut Vec<Value>, tail: &str) {
+        if tail.trim().is_empty() {
+            return;
+        }
+        let ends_with_user = messages
+            .last()
+            .map(|m| m["role"] == "user")
+            .unwrap_or(false);
+        if !ends_with_user {
+            return;
+        }
+        let pos = messages.len() - 1;
+        messages.insert(pos, json!({"role": "user", "content": tail}));
+    }
+
     /// Add a tool result to the message list and return the updated list.
     pub fn add_tool_result(
         messages: &mut Vec<Value>,
@@ -1725,6 +1752,63 @@ mod tests {
             !p1.contains("Current time:"),
             "per-minute timestamp must not be in the cached prefix"
         );
+    }
+
+    // ----- insert_tail_before_user -----
+
+    #[test]
+    fn test_insert_tail_before_user_with_history() {
+        let (_tmp, cb) = make_context();
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "old q"}),
+            json!({"role": "assistant", "content": "old a"}),
+            json!({"role": "user", "content": "current question"}),
+        ];
+        cb.insert_tail_before_user(&mut messages, "RELEVANT TAIL");
+
+        // Tail lands at len-2; the real user message stays last.
+        let n = messages.len();
+        assert_eq!(messages[n - 2]["content"], "RELEVANT TAIL");
+        assert_eq!(messages[n - 2]["role"], "user");
+        assert_eq!(messages[n - 1]["content"], "current question");
+        assert_eq!(messages.last().unwrap()["role"], "user");
+    }
+
+    #[test]
+    fn test_insert_tail_before_user_no_history() {
+        let (_tmp, cb) = make_context();
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q"}),
+        ];
+        cb.insert_tail_before_user(&mut messages, "TAIL");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["content"], "TAIL");
+        assert_eq!(messages[2]["content"], "q");
+    }
+
+    #[test]
+    fn test_insert_tail_before_user_blank_is_noop() {
+        let (_tmp, cb) = make_context();
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q"}),
+        ];
+        cb.insert_tail_before_user(&mut messages, "   ");
+        assert_eq!(messages.len(), 2, "blank tail must not insert anything");
+    }
+
+    #[test]
+    fn test_insert_tail_before_user_requires_trailing_user() {
+        let (_tmp, cb) = make_context();
+        // Does not end with a user message → no-op (protocol invariant guard).
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "assistant", "content": "a"}),
+        ];
+        cb.insert_tail_before_user(&mut messages, "TAIL");
+        assert_eq!(messages.len(), 2, "must not insert when array lacks trailing user");
     }
 
     // ----- _guess_mime -----
