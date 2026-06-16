@@ -56,7 +56,14 @@ pub fn sanitize_tool_result(result: &str, max_chars: usize) -> String {
 }
 
 /// Well-known files that are loaded from the workspace root when present.
-const BOOTSTRAP_FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"];
+///
+/// `TOOLS.md` was removed: its content (tool tables, safety levels, exec
+/// timeout details) duplicated the function-calling schemas the model already
+/// receives, costing ~800 tokens of static prompt every turn for no signal.
+/// `IDENTITY.md` was removed: its persona content (name, origin, "not just a
+/// tool") duplicates `SOUL.md`; the file remains on disk but is no longer
+/// loaded into every prompt.
+const BOOTSTRAP_FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md"];
 
 #[derive(Debug, Clone)]
 pub struct PromptBlock {
