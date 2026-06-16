@@ -202,6 +202,20 @@ impl<'a> MemoryLadder<'a> {
                 if query.is_empty() {
                     return String::new();
                 }
+                // session_db.search_messages is async; bridge it synchronously
+                // via block_in_place. That requires a *multi-threaded* runtime —
+                // production always is (Runtime::new() / #[tokio::main] default),
+                // but a current-thread runtime (e.g. #[tokio::test]) or no
+                // runtime at all would panic. Skip the session-search layer in
+                // those cases rather than crash the turn.
+                let multi_thread = tokio::runtime::Handle::try_current()
+                    .map(|h| {
+                        h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                    })
+                    .unwrap_or(false);
+                if !multi_thread {
+                    return String::new();
+                }
                 // session_db.search_messages is async; use block_in_place to
                 // call it from synchronous context without Send issues.
                 let results = tokio::task::block_in_place(|| {
@@ -374,6 +388,33 @@ mod tests {
                 result.tokens_used
             );
         }
+    }
+
+    #[test]
+    fn test_scratch_query_no_panic_off_multithread_runtime() {
+        // A non-empty query exercises the Scratch layer, which bridges async
+        // search via block_in_place. Outside a multi-threaded runtime that would
+        // panic; the guard must skip it gracefully so the rest of the ladder
+        // still answers. (Runs with no tokio runtime at all.)
+        let tmp = TempDir::new().unwrap();
+        let mem_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(mem_dir.join("MEMORY.md"), "A durable fact.").unwrap();
+
+        let wm = WorkingMemoryStore::new(tmp.path());
+        let db_path = tmp.path().join("sessions.db");
+        let session_db = SessionDb::new(&db_path);
+
+        let ladder = MemoryLadder::new(tmp.path(), &wm, None, &session_db);
+        let results = ladder.query(&MemoryQuery {
+            session_key: "test:session",
+            query: "find anything",
+            total_budget: 200,
+        });
+
+        // GroundTruth still answered; Scratch was skipped (no panic).
+        assert!(results.iter().any(|r| r.layer == MemoryLayer::GroundTruth));
+        assert!(!results.iter().any(|r| r.layer == MemoryLayer::Scratch));
     }
 
     #[test]

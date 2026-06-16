@@ -49,6 +49,68 @@ fn local_memory_results(
     })
 }
 
+/// Reduce a user turn to a compact retrieval query: trimmed and truncated to a
+/// char boundary. Relevance comes from the opening of the turn, not a multi-KB
+/// paste, and a bounded query keeps embedding/search cheap.
+fn turn_query(content: &str) -> String {
+    const MAX: usize = 256;
+    let trimmed = content.trim();
+    if trimmed.len() <= MAX {
+        return trimmed.to_string();
+    }
+    let end = crate::utils::helpers::floor_char_boundary(trimmed, MAX);
+    trimmed[..end].to_string()
+}
+
+/// Build the per-turn local tail block: query-relevant skills (compact
+/// one-liners) + query-aware memory, rendered as a single `<relevant_context>`
+/// string. Returns an empty string when nothing relevant is found.
+fn build_local_tail(core: &Arc<SwappableCore>, session_key: &str, query: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Relevant skills — names + descriptions; the model reads full SKILL.md on
+    // demand via read_skill. The static name index still lists every skill.
+    let skill_names = core.context.skills.relevant(query, 3);
+    tracing::debug!(
+        ?skill_names,
+        query_len = query.len(),
+        "local_tail: query-relevant skills selected"
+    );
+    let skill_lines = core.context.skills.compact_lines(&skill_names);
+    if !skill_lines.is_empty() {
+        parts.push(format!("## Possibly-relevant skills\n{}", skill_lines));
+    }
+
+    // Query-aware memory (Scratch session-search is query-aware even without the
+    // `semantic` feature; SearchIndex/KG layers add embedding/graph recall when
+    // their features are on).
+    let mut mem_lines: Vec<String> = Vec::new();
+    for result in local_memory_results(core, session_key, query) {
+        if result.content.is_empty() {
+            continue;
+        }
+        let title = match result.layer {
+            MemoryLayer::WorkingSession => "Working Memory",
+            _ => "Memory",
+        };
+        mem_lines.push(format!("### {}\n{}", title, result.content));
+    }
+    if !mem_lines.is_empty() {
+        parts.push(format!(
+            "## Possibly-relevant memory\n{}",
+            mem_lines.join("\n\n")
+        ));
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<relevant_context>\n{}\n</relevant_context>",
+        parts.join("\n\n")
+    )
+}
+
 impl AgentLoopShared {
     pub(crate) async fn build_local_runtime_blocks(
         &self,
@@ -420,8 +482,10 @@ impl AgentLoopShared {
             )
             .await;
         // Track where new (unsaved) messages start. Updated after compaction
-        // swaps to avoid re-persisting already-saved messages.
-        let new_start = 1 + history.len();
+        // swaps to avoid re-persisting already-saved messages. Mutable because
+        // the per-turn local tail block (inserted before the user message) bumps
+        // it so the ephemeral tail is never written to session history.
+        let mut new_start = 1 + history.len();
 
         // Extract media paths.
         let media_paths: Vec<String> = msg
@@ -505,6 +569,31 @@ impl AgentLoopShared {
             );
             if let Some(first) = messages.first_mut() {
                 first["content"] = json!(rebuilt);
+            }
+        }
+
+        // Per-turn query-aware TAIL block (local only): relevant skills + memory
+        // placed AFTER history, immediately before the user message, so the bulk
+        // KV prefix [system + history] stays cached across turns (divergence
+        // lands at the tail, not at messages[0]). Skipped when the legacy
+        // always-on env injects memory into the static prefix (avoids double
+        // memory) and killable via NANOBOT_LOCAL_TAIL=0. `new_start` is bumped
+        // so the tail is excluded from session persistence.
+        if core.context.local_prompt_mode
+            && std::env::var("NANOBOT_LOCAL_ALWAYS_ON_MEMORY").is_err()
+            && std::env::var("NANOBOT_LOCAL_TAIL").as_deref() != Ok("0")
+        {
+            let query = turn_query(&msg.content);
+            let tail = build_local_tail(&core, &session_key, &query);
+            if !tail.is_empty() {
+                tracing::debug!(
+                    session = %session_key,
+                    tail_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(&tail),
+                    at_msg = messages.len().saturating_sub(1),
+                    "local_tail_injected — relevant skills+memory before user msg"
+                );
+                core.context.insert_tail_before_user(&mut messages, &tail);
+                new_start += 1;
             }
         }
 
@@ -600,5 +689,111 @@ impl AgentLoopShared {
             taint_state: TaintState::new(),
             reasoning: reasoning_engine,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn_query;
+    use crate::agent::prompt_fingerprint::{compare, fingerprint, PromptDelta};
+    use serde_json::json;
+
+    /// The whole point of tail placement: a per-turn block before the user
+    /// message must NOT invalidate the bulk [system + history] KV prefix. This
+    /// models the local rendered wire (post-merge) for two consecutive turns and
+    /// asserts divergence lands AFTER the history — not at message 0/1.
+    #[test]
+    fn test_tail_placement_preserves_bulk_history_prefix() {
+        let system = json!({"role": "system", "content": "STATIC PREFIX (identity+skills)"});
+        let h_user1 = json!({"role": "user", "content": "first question"});
+        let h_asst1 = json!({"role": "assistant", "content": "first answer"});
+
+        // Turn N rendered wire: tail merged into the user message (LocalProtocol).
+        let turn_n = vec![
+            system.clone(),
+            h_user1.clone(),
+            h_asst1.clone(),
+            json!({"role": "user", "content": "<relevant_context>N</relevant_context>\n\nsecond question"}),
+        ];
+        // Turn N+1: turn-N's user/assistant are now RAW history; a fresh tail
+        // precedes the new user message.
+        let turn_n1 = vec![
+            system.clone(),
+            h_user1.clone(),
+            h_asst1.clone(),
+            json!({"role": "user", "content": "second question"}),
+            json!({"role": "assistant", "content": "second answer"}),
+            json!({"role": "user", "content": "<relevant_context>N+1</relevant_context>\n\nthird question"}),
+        ];
+
+        let fp_n = fingerprint(&turn_n, None);
+        let fp_n1 = fingerprint(&turn_n1, None);
+        match compare(Some(&fp_n), &fp_n1) {
+            PromptDelta::Diverged {
+                first_divergent_msg,
+                ..
+            } => {
+                // Indices 0,1,2 (system + the bulk history) are byte-identical and
+                // stay cached; divergence is at index 3, where turn N carried the
+                // merged tail+user and turn N+1 has the raw user from history.
+                assert_eq!(
+                    first_divergent_msg, 3,
+                    "bulk [system+history] prefix must survive; only the tail re-prefills"
+                );
+            }
+            other => panic!("expected Diverged at the tail, got {:?}", other),
+        }
+    }
+
+    /// Contrast: folding the per-turn block into the STATIC prefix (messages[0])
+    /// — the thing tail placement avoids — diverges at message 0, forcing a full
+    /// re-prefill every turn.
+    #[test]
+    fn test_static_prefix_injection_diverges_at_head() {
+        let prefix_n = vec![
+            json!({"role": "system", "content": "STATIC + <relevant_context>N</relevant_context>"}),
+            json!({"role": "user", "content": "second question"}),
+        ];
+        let prefix_n1 = vec![
+            json!({"role": "system", "content": "STATIC + <relevant_context>N+1</relevant_context>"}),
+            json!({"role": "user", "content": "second question"}),
+        ];
+        let fp_n = fingerprint(&prefix_n, None);
+        let fp_n1 = fingerprint(&prefix_n1, None);
+        match compare(Some(&fp_n), &fp_n1) {
+            PromptDelta::Diverged {
+                first_divergent_msg,
+                ..
+            } => assert_eq!(first_divergent_msg, 0, "static-prefix injection busts the whole cache"),
+            other => panic!("expected head divergence, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_turn_query_passes_short_input_trimmed() {
+        assert_eq!(turn_query("  how do I parse JSON?  "), "how do I parse JSON?");
+    }
+
+    #[test]
+    fn test_turn_query_truncates_long_input() {
+        let long = "a".repeat(1000);
+        let q = turn_query(&long);
+        assert!(q.len() <= 256, "query should be capped at 256, got {}", q.len());
+        assert!(q.len() >= 250, "should keep most of the cap, got {}", q.len());
+    }
+
+    #[test]
+    fn test_turn_query_truncates_on_char_boundary() {
+        // Multibyte chars must not be split mid-byte (would panic on slice).
+        let s = "é".repeat(500); // 2 bytes each → 1000 bytes
+        let q = turn_query(&s);
+        assert!(q.len() <= 256);
+        // Re-encoding round-trips cleanly (valid UTF-8, no partial char).
+        assert!(q.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn test_turn_query_empty() {
+        assert_eq!(turn_query("   "), "");
     }
 }
