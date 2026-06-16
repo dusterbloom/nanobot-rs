@@ -296,24 +296,140 @@ impl SkillsLoader {
                 .to_string(),
         ];
         for record in &skill_records {
-            let desc = record.description();
-            let display = if desc.len() > 60 {
-                // Truncate at a char boundary to avoid breaking multibyte chars.
-                let end = crate::utils::helpers::floor_char_boundary(&desc, 60);
-                desc[..end].to_string()
-            } else {
-                desc
-            };
-            let version_suffix = record
-                .version()
-                .map(|v| format!(" (v{})", v))
-                .unwrap_or_default();
-            lines.push(format!(
-                "- {}{}: {}",
-                record.info.name, version_suffix, display
-            ));
+            lines.push(Self::compact_line(record));
         }
         lines.join("\n")
+    }
+
+    /// Render a single skill as a compact one-line entry:
+    /// `"- name (vX.Y): first 60 chars of description"`.
+    ///
+    /// Shared by `build_compact_index` (all skills) and `compact_lines` (a
+    /// query-relevant subset) so the two cannot drift.
+    fn compact_line(record: &SkillRecord) -> String {
+        let desc = record.description();
+        let display = if desc.len() > 60 {
+            // Truncate at a char boundary to avoid breaking multibyte chars.
+            let end = crate::utils::helpers::floor_char_boundary(&desc, 60);
+            desc[..end].to_string()
+        } else {
+            desc
+        };
+        let version_suffix = record
+            .version()
+            .map(|v| format!(" (v{})", v))
+            .unwrap_or_default();
+        format!("- {}{}: {}", record.info.name, version_suffix, display)
+    }
+
+    /// Render compact one-line entries for a specific set of skill names.
+    ///
+    /// Names that don't resolve to a discovered skill are silently skipped.
+    /// Output order follows `names`. Used to render the query-relevant skills
+    /// selected by [`relevant`](Self::relevant) into the per-turn tail block.
+    pub fn compact_lines(&self, names: &[String]) -> String {
+        if names.is_empty() {
+            return String::new();
+        }
+        let records = self.discover_skill_records();
+        let mut lines: Vec<String> = Vec::new();
+        for name in names {
+            if let Some(record) = records.iter().find(|r| &r.info.name == name) {
+                lines.push(Self::compact_line(record));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Return the skill names most relevant to `query`, capped at `k` ranked
+    /// matches plus all always-on skills.
+    ///
+    /// Always-on skills (`get_always_skills`) come first and are never counted
+    /// against `k`. The remaining (non-always, requirement-met) skills are
+    /// ranked:
+    /// - with the `semantic` feature: by cosine similarity between the embedded
+    ///   query and each skill's embedded `"name: description"`, top-`k`.
+    /// - without it (or on any embed error): the first `k` in discovery order.
+    ///
+    /// Result is de-duplicated, always-on names first.
+    pub fn relevant(&self, query: &str, k: usize) -> Vec<String> {
+        let always = self.get_always_skills();
+        let always_set: HashSet<&str> = always.iter().map(|s| s.as_str()).collect();
+
+        // Candidates: requirement-met skills that are not already always-on.
+        let candidates: Vec<SkillRecord> = self
+            .discover_skill_records()
+            .into_iter()
+            .filter(|r| _check_requirements(&r.skill_meta))
+            .filter(|r| !always_set.contains(r.info.name.as_str()))
+            .collect();
+
+        let ranked = Self::rank_by_relevance(query, &candidates, k);
+
+        // Union: always-on first, then ranked, de-duplicated.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        for name in always.into_iter().chain(ranked.into_iter()) {
+            if seen.insert(name.clone()) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// Rank candidate skills against `query`, returning up to `k` names.
+    ///
+    /// Falls back to discovery-order first-`k` when the `semantic` feature is
+    /// off, the query is blank, or embedding fails — so the default build always
+    /// returns something usable.
+    fn rank_by_relevance(query: &str, candidates: &[SkillRecord], k: usize) -> Vec<String> {
+        #[cfg(feature = "semantic")]
+        {
+            if !query.trim().is_empty() {
+                if let Some(ranked) = Self::semantic_rank(query, candidates, k) {
+                    return ranked;
+                }
+            }
+        }
+        #[cfg(not(feature = "semantic"))]
+        let _ = query;
+
+        candidates
+            .iter()
+            .take(k)
+            .map(|r| r.info.name.clone())
+            .collect()
+    }
+
+    /// Cosine-rank candidates by embedding similarity. Returns `None` (caller
+    /// falls back) if any embedding call fails.
+    #[cfg(feature = "semantic")]
+    fn semantic_rank(query: &str, candidates: &[SkillRecord], k: usize) -> Option<Vec<String>> {
+        use crate::agent::embedder;
+
+        if candidates.is_empty() {
+            return Some(Vec::new());
+        }
+        let query_vec = embedder::embed_one(query).ok()?;
+        let texts: Vec<String> = candidates
+            .iter()
+            .map(|r| format!("{}: {}", r.info.name, r.description()))
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let embeddings = embedder::embed_batch(&refs).ok()?;
+
+        let mut scored: Vec<(f32, String)> = candidates
+            .iter()
+            .zip(embeddings.iter())
+            .map(|(record, emb)| {
+                (
+                    embedder::cosine_similarity(&query_vec, emb),
+                    record.info.name.clone(),
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        Some(scored.into_iter().take(k).map(|(_, name)| name).collect())
     }
 
     /// Build a minimal skill name index for small local prompts.
@@ -1231,5 +1347,125 @@ mod tests {
         assert!(index.contains("test-skill"));
         assert!(index.contains("read_skill __list__"));
         assert!(!index.contains("A versioned skill"));
+    }
+
+    // ----- relevant() / compact_lines() -----
+
+    /// Create a workspace with several named skills, each `(name, frontmatter)`.
+    fn make_workspace_with_skills(skills: &[(&str, &str)]) -> (TempDir, SkillsLoader) {
+        let tmp = TempDir::new().unwrap();
+        for (name, frontmatter) in skills {
+            let skill_dir = tmp.path().join("skills").join(name);
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\n{}\n---\nbody", frontmatter),
+            )
+            .unwrap();
+        }
+        let loader = SkillsLoader::new(tmp.path(), Some(&tmp.path().join("no_builtin")));
+        (tmp, loader)
+    }
+
+    #[test]
+    fn test_relevant_always_skills_always_present() {
+        // always-on skills must appear regardless of query, and never count
+        // against k. Returned names must all be real discovered skills.
+        let (_tmp, loader) = make_workspace_with_skills(&[
+            ("always-one", "description: Always loaded\nalways: true"),
+            ("normal-a", "description: Normal skill A"),
+            ("normal-b", "description: Normal skill B"),
+            ("normal-c", "description: Normal skill C"),
+        ]);
+
+        let result = loader.relevant("anything at all", 1);
+
+        // The always-on skill is present.
+        assert!(
+            result.contains(&"always-one".to_string()),
+            "always-on skill must be present, got: {:?}",
+            result
+        );
+        // Total = always (1) + ranked (<= k=1).
+        assert!(
+            result.len() <= 2,
+            "result should be at most always(1)+k(1), got: {:?}",
+            result
+        );
+        // Every returned name is a real, discovered skill.
+        let known: HashSet<String> =
+            loader.list_skills(false).into_iter().map(|s| s.name).collect();
+        for name in &result {
+            assert!(known.contains(name), "unknown skill name returned: {}", name);
+        }
+        // No duplicates.
+        let unique: HashSet<&String> = result.iter().collect();
+        assert_eq!(unique.len(), result.len(), "result must be de-duplicated");
+    }
+
+    #[test]
+    fn test_relevant_caps_ranked_at_k() {
+        // With no always-on skills, relevant() returns at most k names.
+        let (_tmp, loader) = make_workspace_with_skills(&[
+            ("normal-a", "description: A"),
+            ("normal-b", "description: B"),
+            ("normal-c", "description: C"),
+            ("normal-d", "description: D"),
+        ]);
+        let result = loader.relevant("query", 2);
+        assert_eq!(result.len(), 2, "should cap at k=2, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_compact_lines_renders_named_subset() {
+        let (_tmp, loader) = make_workspace_with_skills(&[
+            ("skill-a", "description: Description for A"),
+            ("skill-b", "description: Description for B"),
+            ("skill-c", "description: Description for C"),
+        ]);
+        let names = vec!["skill-a".to_string(), "skill-c".to_string()];
+        let rendered = loader.compact_lines(&names);
+        assert!(rendered.contains("- skill-a: Description for A"));
+        assert!(rendered.contains("- skill-c: Description for C"));
+        // Unrequested skill must not appear.
+        assert!(!rendered.contains("skill-b"));
+        // One line per requested name.
+        assert_eq!(rendered.lines().count(), 2);
+    }
+
+    #[test]
+    fn test_compact_lines_skips_unknown_names() {
+        let (_tmp, loader) = make_workspace_with_skills(&[("skill-a", "description: A")]);
+        let names = vec!["skill-a".to_string(), "no-such-skill".to_string()];
+        let rendered = loader.compact_lines(&names);
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(rendered.contains("skill-a"));
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn test_relevant_semantic_ranks_topical_skill_first() {
+        // A SQL query should rank the database skill above unrelated skills.
+        let (_tmp, loader) = make_workspace_with_skills(&[
+            (
+                "database-skill",
+                "description: Query and manage SQL databases, tables, and indexes",
+            ),
+            (
+                "cooking-skill",
+                "description: Recipes for cooking pasta and Italian food",
+            ),
+            (
+                "music-skill",
+                "description: Compose and play piano and guitar music",
+            ),
+        ]);
+        let result = loader.relevant("how do I write a SQL SELECT statement", 3);
+        assert_eq!(
+            result.first().map(|s| s.as_str()),
+            Some("database-skill"),
+            "semantic ranking should place the SQL skill first, got: {:?}",
+            result
+        );
     }
 }
