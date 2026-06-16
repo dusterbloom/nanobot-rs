@@ -306,6 +306,45 @@ fn apply_local_tool_call_controls(
     }
 }
 
+/// Ensure every object schema carries a `required` key (recursively).
+///
+/// Apple FM's guided generation returns HTTP 400 ("Invalid tool definition")
+/// for any object schema that omits `required` — even no-arg tools (verified
+/// live: `{"type":"object","properties":{}}` 400s; adding `"required":[]` 200s).
+/// An empty `required: []` is a no-op for spec-compliant servers (where
+/// `required` is optional and empty == absent), so this is applied
+/// unconditionally. Deterministic → emitted tool schemas stay byte-stable
+/// across turns (prefix-cache friendly).
+fn ensure_required_keys(schema: &mut serde_json::Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    let is_object_schema = obj.get("type").and_then(|t| t.as_str()) == Some("object")
+        || obj.contains_key("properties");
+    if is_object_schema && !obj.contains_key("required") {
+        obj.insert("required".to_string(), serde_json::Value::Array(vec![]));
+    }
+    if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        for (_, v) in props.iter_mut() {
+            ensure_required_keys(v);
+        }
+    }
+    if let Some(items) = obj.get_mut("items") {
+        ensure_required_keys(items);
+    }
+}
+
+/// Apply `ensure_required_keys` to every tool's `function.parameters` in `body`.
+fn normalize_tool_schemas(body: &mut serde_json::Value) {
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in tools.iter_mut() {
+            if let Some(params) = tool.get_mut("function").and_then(|f| f.get_mut("parameters")) {
+                ensure_required_keys(params);
+            }
+        }
+    }
+}
+
 /// Extract the unsupported feature name from an LMS error message.
 ///
 /// Handles messages of the form:
@@ -582,6 +621,9 @@ impl LLMProvider for OpenAICompatProvider {
             }
         }
         apply_local_tool_call_controls(&mut body, &self.api_base, request_has_tools);
+        // Strict-validation servers (Apple FM) reject object schemas that omit a
+        // `required` key; normalize every outgoing tool schema (no-op elsewhere).
+        normalize_tool_schemas(&mut body);
         apply_local_thinking_prefill(
             &mut body,
             &self.api_base,
@@ -834,6 +876,9 @@ impl LLMProvider for OpenAICompatProvider {
             }
         }
         apply_local_tool_call_controls(&mut body, &self.api_base, request_has_tools);
+        // Strict-validation servers (Apple FM) reject object schemas that omit a
+        // `required` key; normalize every outgoing tool schema (no-op elsewhere).
+        normalize_tool_schemas(&mut body);
         apply_local_thinking_prefill(
             &mut body,
             &self.api_base,
@@ -1521,6 +1566,79 @@ async fn parse_sse_stream(
 mod tests {
     use super::super::base::LLMProvider;
     use super::*;
+
+    // R1 — Apple FM rejects object schemas missing `required` (HTTP 400, verified
+    // live). ensure_required_keys must add `required:[]` recursively while
+    // preserving existing required arrays.
+    #[test]
+    fn test_ensure_required_keys_adds_missing_required() {
+        // no-arg tool (the check_inbox case)
+        let mut s = serde_json::json!({"type":"object","properties":{}});
+        ensure_required_keys(&mut s);
+        assert_eq!(s["required"], serde_json::json!([]), "no-arg object must gain required:[]");
+
+        // nested object property must also be normalized; existing required kept
+        let mut s2 = serde_json::json!({
+            "type":"object",
+            "properties":{"inner":{"type":"object","properties":{"x":{"type":"string"}}}},
+            "required":["inner"]
+        });
+        ensure_required_keys(&mut s2);
+        assert_eq!(s2["required"], serde_json::json!(["inner"]), "existing required preserved");
+        assert_eq!(
+            s2["properties"]["inner"]["required"],
+            serde_json::json!([]),
+            "nested object must gain required:[]"
+        );
+    }
+
+    // normalize_tool_schemas walks body.tools[].function.parameters.
+    #[test]
+    fn test_normalize_tool_schemas_walks_body() {
+        let mut body = serde_json::json!({
+            "tools":[{"type":"function","function":{"name":"check_inbox","parameters":{"type":"object","properties":{}}}}]
+        });
+        normalize_tool_schemas(&mut body);
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["required"],
+            serde_json::json!([]),
+            "tool parameters must be normalized in place"
+        );
+    }
+
+    // e2e (live, gated) — proves R1 end-to-end through the real provider→Apple FM
+    // send path: a no-arg tool whose schema omits `required` (free-form object)
+    // previously 400'd ("Invalid tool definition"); after normalize_tool_schemas
+    // adds `required:[]`, Apple FM accepts it.
+    //   Run: cargo test --lib \
+    //     providers::openai_compat::tests::test_e2e_applefm_noarg_tool_accepted \
+    //     -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_e2e_applefm_noarg_tool_accepted() {
+        let base = std::env::var("NANOBOT_APPLEFM_BASE")
+            .unwrap_or_else(|_| "http://127.0.0.1:1976/v1".to_string());
+        let model = std::env::var("NANOBOT_APPLEFM_MODEL").unwrap_or_else(|_| "system".to_string());
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some(&model));
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        // Hostile free-form object schema (no `properties` content, no `required`).
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "check_inbox",
+                "description": "Check the inbox.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let res = provider
+            .chat(&messages, Some(&tools), Some(&model), 16, 0.0, None, None)
+            .await;
+        assert!(
+            res.is_ok(),
+            "no-arg tool must be accepted by Apple FM after schema normalization; got: {:?}",
+            res.err()
+        );
+    }
 
     // ── parse_response tests ──────────────────────────────────────
 
