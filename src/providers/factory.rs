@@ -7,9 +7,11 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::config::schema::{ProviderConfig, RetryConfig};
 use crate::providers::anthropic::AnthropicProvider;
-use crate::providers::base::LLMProvider;
+use crate::providers::base::{LLMProvider, LLMResponse};
 use crate::providers::jit_gate::JitGate;
 use crate::providers::openai_compat::OpenAICompatProvider;
 
@@ -129,6 +131,31 @@ pub fn create_anthropic(token: &str, model: Option<&str>) -> Arc<dyn LLMProvider
     Arc::new(AnthropicProvider::new(token, model))
 }
 
+struct MisconfiguredProvider {
+    model: String,
+    message: String,
+}
+
+#[async_trait]
+impl LLMProvider for MisconfiguredProvider {
+    async fn chat(
+        &self,
+        _messages: &[serde_json::Value],
+        _tools: Option<&[serde_json::Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<LLMResponse> {
+        Err(anyhow::anyhow!(self.message.clone()))
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.model
+    }
+}
+
 /// Determine whether an api_base URL points to a local server.
 fn is_local_base(base: &str) -> bool {
     base.contains("localhost") || base.contains("127.0.0.1")
@@ -139,23 +166,47 @@ pub fn is_claude_model(model: &str) -> bool {
     model.starts_with("claude")
 }
 
-/// Create a provider from a `ProviderConfig` with `localhost:8080` fallback.
+fn openai_compat_from_config(
+    cfg: &ProviderConfig,
+    model: Option<&str>,
+    default_base: Option<&str>,
+) -> Arc<dyn LLMProvider> {
+    let mut spec = ProviderSpec::from_config(cfg, default_base);
+    spec.model = model.map(String::from);
+    create_openai_compat(spec)
+}
+
+/// Create a provider from a `ProviderConfig`.
 ///
-/// Routing rules (applied in order):
-/// 1. `api_base` contains `localhost` / `127.0.0.1` → OpenAICompat (local server).
-/// 2. `api_key` starts with `sk-ant-` AND model is Claude (or unspecified) → AnthropicProvider.
-/// 3. Otherwise → OpenAICompat (safe fallback for all other cloud providers).
-///
-/// When the target `model` is known at the call site, pass it here so the
-/// routing logic can avoid sending non-Claude models to the Anthropic API.
+/// This form has no implicit local fallback. Local callers that want an
+/// auxiliary provider to inherit the current server must use
+/// [`from_provider_config_for_model_with_default_base`].
 pub fn from_provider_config_for_model(
     cfg: &ProviderConfig,
     model: Option<&str>,
 ) -> Arc<dyn LLMProvider> {
+    from_provider_config_for_model_with_default_base(cfg, model, None)
+}
+
+/// Create a provider from a `ProviderConfig`, optionally inheriting a caller
+/// supplied base URL.
+///
+/// Routing rules (applied in order):
+/// 1. `api_base` contains `localhost` / `127.0.0.1` → OpenAICompat (local server).
+/// 2. `api_key` starts with `sk-ant-` AND model is Claude (or unspecified) → AnthropicProvider.
+/// 3. Otherwise → OpenAICompat, using only explicit config or `default_base`.
+///
+/// When the target `model` is known at the call site, pass it here so the
+/// routing logic can avoid sending non-Claude models to the Anthropic API.
+pub fn from_provider_config_for_model_with_default_base(
+    cfg: &ProviderConfig,
+    model: Option<&str>,
+    default_base: Option<&str>,
+) -> Arc<dyn LLMProvider> {
     // Rule 1: explicit local base URL → always OpenAICompat.
     if let Some(ref base) = cfg.api_base {
         if is_local_base(base) {
-            return create_openai_compat(ProviderSpec::from_config(cfg, None));
+            return openai_compat_from_config(cfg, model, None);
         }
     }
 
@@ -168,16 +219,19 @@ pub fn from_provider_config_for_model(
         if use_anthropic {
             return create_anthropic(&cfg.api_key, model);
         }
-        // Non-Claude model with Anthropic key → fall through to OpenAICompat.
-        // The key won't authenticate against localhost, but the caller should
-        // have configured an api_base for non-Claude models.
+        if cfg.api_base.is_none() && default_base.is_none() {
+            let model = model.unwrap_or("non-Claude model").to_string();
+            return Arc::new(MisconfiguredProvider {
+                model: model.clone(),
+                message: format!(
+                    "Provider config has an Anthropic API key for {model}, but no apiBase/default_base. \
+                     Set apiBase for that model or use a Claude model."
+                ),
+            });
+        }
     }
 
-    // Rule 3: default – OpenAICompat with localhost:8080 fallback.
-    create_openai_compat(ProviderSpec::from_config(
-        cfg,
-        Some("http://localhost:8080/v1"),
-    ))
+    openai_compat_from_config(cfg, model, default_base)
 }
 
 #[cfg(test)]
@@ -259,12 +313,32 @@ mod tests {
             api_base: None,
         };
         let provider = from_provider_config_for_model(&cfg, None);
-        // Should use the localhost:8080 fallback.
         assert!(provider.get_api_base().is_some());
+        assert!(
+            provider
+                .get_api_base()
+                .is_some_and(|base| base.contains("openrouter")),
+            "unconfigured provider should not invent localhost: {:?}",
+            provider.get_api_base()
+        );
+    }
+
+    #[test]
+    fn test_provider_config_default_base_inherits_local_endpoint() {
+        let cfg = ProviderConfig {
+            api_key: "local".to_string(),
+            api_base: None,
+        };
+        let provider = from_provider_config_for_model_with_default_base(
+            &cfg,
+            Some("local:qwen36-35b"),
+            Some("http://127.0.0.1:8000/v1"),
+        );
         assert_eq!(
             provider.get_api_base().as_deref(),
-            Some("http://localhost:8080/v1")
+            Some("http://127.0.0.1:8000/v1")
         );
+        assert_eq!(provider.get_default_model(), "local:qwen36-35b");
     }
 
     #[test]
@@ -375,18 +449,12 @@ mod tests {
             api_base: None,
         };
         let provider = from_provider_config_for_model(&cfg, Some("ministral-3-8b-instruct-2512"));
-        // Should NOT be Anthropic — should be OpenAICompat.
         let base = provider.get_api_base();
         assert!(
-            base.is_some(),
-            "Non-Claude model should use OpenAICompat (which has an api_base)"
+            base.is_none(),
+            "Non-Claude Anthropic config without apiBase should fail before HTTP, not invent a base: {base:?}"
         );
-        let b = base.unwrap();
-        assert!(
-            !b.contains("anthropic"),
-            "ministral should NOT be routed to Anthropic, got: {}",
-            b
-        );
+        assert_eq!(provider.get_default_model(), "ministral-3-8b-instruct-2512");
     }
 
     #[test]
@@ -397,7 +465,10 @@ mod tests {
         };
         let provider = from_provider_config_for_model(&cfg, Some("gemma-2-9b-it"));
         let base = provider.get_api_base();
-        assert!(base.is_some(), "gemma should use OpenAICompat");
+        assert!(
+            base.is_none(),
+            "gemma with Anthropic key and no apiBase should fail before HTTP"
+        );
     }
 
     #[test]
@@ -443,9 +514,10 @@ mod tests {
         let base = provider.get_api_base();
         assert_eq!(
             base.as_deref(),
-            Some("http://localhost:8080/v1"),
-            "Non-Anthropic key should always use OpenAICompat"
+            Some("https://openrouter.ai/api/v1"),
+            "OpenRouter key should use OpenRouter, not a local fallback"
         );
+        assert_eq!(provider.get_default_model(), "ministral-3-8b-instruct-2512");
     }
 
     #[test]

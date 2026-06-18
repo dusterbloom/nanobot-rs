@@ -12,7 +12,9 @@ use crate::agent::agent_loop::{
 };
 use crate::agent::lane::Lane;
 use crate::bus::events::{InboundMessage, OutboundMessage};
-use crate::config::schema::{AdaptiveTokenConfig, Config};
+use crate::config::schema::{
+    is_external_server_backend, is_higgs_backend, AdaptiveTokenConfig, Config,
+};
 use crate::cron::service::CronService;
 use crate::providers::base::LLMProvider;
 use crate::providers::factory;
@@ -157,16 +159,20 @@ pub(super) fn make_local_providers(
     // using LM Studio, which expects clean identifiers.
     let model_id = strip_gguf_suffix(local_model_name.unwrap_or("local-model")).to_string();
 
-    // Create JIT gate for JIT-loading servers (e.g. LM Studio).
-    // All providers sharing the same JIT endpoint get the same gate so requests
-    // are serialised -- prevents concurrent model switches that crash the server.
+    // Create JIT gate only for JIT-loading servers (LM Studio). Resident
+    // servers (oMLX, Higgs) keep models loaded in memory; serialising their
+    // requests behind a single-permit gate only stalls main/compaction/memory
+    // ops without preventing any eviction — and serialised cold reloads are
+    // exactly the 89–122s prefill outliers we saw.
     // Skip when lms CLI pre-loads models (skip_jit_gate = true).
-    let jit_gate: Option<Arc<JitGate>> = if has_custom_base && !config.agents.defaults.skip_jit_gate
-    {
-        Some(Arc::new(JitGate::new()))
-    } else {
-        None
-    };
+    let is_jit_server = !is_external_server_backend(&config.agents.defaults.local_backend)
+        && !is_higgs_backend(&config.agents.defaults.local_backend);
+    let jit_gate: Option<Arc<JitGate>> =
+        if has_custom_base && is_jit_server && !config.agents.defaults.skip_jit_gate {
+            Some(Arc::new(JitGate::new()))
+        } else {
+            None
+        };
 
     let api_key = &config.agents.defaults.local_api_key;
     let constrained = config.agents.defaults.constrained_tool_calls;
@@ -407,11 +413,11 @@ pub(crate) fn build_core_handle(
     ));
     let mut counters =
         RuntimeCounters::new_with_config(max_context_tokens, &config.trio.circuit_breaker);
-    // When main_no_think is enabled, also suppress thinking display from the start
+    // When main_no_think is enabled, suppress thinking display from the start
     // so the user doesn't need to run /nothink manually each session.
     if config.trio.main_no_think {
         counters
-            .suppress_thinking_in_tts
+            .suppress_thinking_display
             .store(true, Ordering::Relaxed);
     }
     // Attach lazy auxiliary server (spawns on first delegation/compaction/memory use).

@@ -8,6 +8,7 @@
 //! happens once. Subsequent `nanobot agent -l` invocations detect the
 //! running instance and skip startup.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -148,6 +149,9 @@ pub(crate) async fn server_start(
     // Maximise local-MLX throughput: throughput profile, TurboQuant KV @ 4-bit.
     // TurboQuant activates above its internal threshold (2048 tokens) so short
     // turns are unaffected; long-context decode benefits from compressed KV.
+    // HIGGS_CHUNKED_PREFILL_CHUNK_SIZE overrides the hardcoded 1024 floor
+    // for throughput profile (384 *max(1024) = 1024 for huge+MoE).
+    cmd.env("HIGGS_CHUNKED_PREFILL_CHUNK_SIZE", "4096");
     cmd.args([
         "serve",
         "--model",
@@ -321,6 +325,522 @@ pub(crate) fn resolve_model_dir(config: &crate::config::schema::Config) -> Resul
         .to_string())
 }
 
+/// A Higgs model that nanobot can offer in `/model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeModelCandidate {
+    /// User-facing picker id.
+    pub id: String,
+    /// Path/HF id sent to Higgs' runtime model endpoints.
+    pub path: String,
+    /// Runtime model name exposed by Higgs after load.
+    pub name: String,
+}
+
+/// Discover local MLX model directories that Higgs can switch to at runtime.
+///
+/// Higgs' runtime endpoint accepts either an existing model directory or a
+/// cached Hugging Face id. `mlxModelDir` remains the startup/default model;
+/// for the picker it may also point at a parent folder to scan.
+pub(crate) fn discover_runtime_model_candidates(
+    config: &crate::config::schema::Config,
+) -> Vec<RuntimeModelCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut roots = Vec::new();
+
+    if let Some(ref dir) = config.agents.defaults.mlx_model_dir {
+        let dir = dir.trim();
+        if !dir.is_empty() && dir != "auto" {
+            let expanded = crate::utils::helpers::expand_tilde(dir);
+            if looks_like_mlx_model_dir(&expanded) {
+                let id = model_id_from_spec(dir);
+                let preferred_name =
+                    preferred_runtime_name(config).unwrap_or_else(|| model_name(&id));
+                push_candidate(
+                    &mut candidates,
+                    &mut seen,
+                    id,
+                    dir.to_string(),
+                    preferred_name,
+                );
+
+                if let Some(parent) = expanded.parent() {
+                    roots.push(parent.to_path_buf());
+                    if let Some(grandparent) = parent.parent() {
+                        roots.push(grandparent.to_path_buf());
+                    }
+                }
+            } else {
+                roots.push(expanded);
+            }
+        }
+    }
+
+    for config_path in higgs_config_paths() {
+        collect_higgs_config_models(&config_path, &mut candidates, &mut seen, &mut roots);
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".cache/lm-studio/models"));
+    }
+
+    let mut seen_roots = HashSet::new();
+    for root in roots {
+        if seen_roots.insert(root.clone()) {
+            collect_mlx_dirs(&root, 3, &mut candidates, &mut seen);
+        }
+    }
+
+    if let Some(cache) = hf_cache_root() {
+        collect_hf_cache_models(&cache, &mut candidates, &mut seen);
+    }
+
+    candidates.sort_by(|a, b| a.id.cmp(&b.id));
+    candidates
+}
+
+fn higgs_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(path) = std::env::var("HIGGS_CONFIG") {
+        paths.push(crate::utils::helpers::expand_tilde(&path));
+    }
+    if let Ok(path) = std::env::var("HIGGS_CONFIG_PATH") {
+        paths.push(crate::utils::helpers::expand_tilde(&path));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".config/higgs/config.toml"));
+    }
+    paths
+}
+
+fn collect_higgs_config_models(
+    config_path: &Path,
+    candidates: &mut Vec<RuntimeModelCandidate>,
+    seen: &mut HashSet<String>,
+    roots: &mut Vec<PathBuf>,
+) {
+    let Ok(text) = fs::read_to_string(config_path) else {
+        return;
+    };
+
+    for model in parse_higgs_config_models(&text) {
+        let id = model_id_from_spec(&model.path);
+        let expanded = crate::utils::helpers::expand_tilde(&model.path);
+        let model_path = if model_spec_is_local_path(&model.path) {
+            if looks_like_mlx_model_dir(&expanded) {
+                if let Some(parent) = expanded.parent() {
+                    roots.push(parent.to_path_buf());
+                }
+                Some(model.path.clone())
+            } else if expanded.is_dir() {
+                roots.push(expanded);
+                None
+            } else {
+                None
+            }
+        } else {
+            hf_cached_model_path_for_id(&model.path).map(|path| path.display().to_string())
+        };
+
+        let Some(model_path) = model_path else {
+            continue;
+        };
+        let name = if model.name.is_empty() {
+            model_name(&id)
+        } else {
+            model.name
+        };
+        push_candidate(candidates, seen, id, model_path, name);
+    }
+}
+
+fn model_spec_is_local_path(spec: &str) -> bool {
+    spec.starts_with("~/") || spec.starts_with('/')
+}
+
+fn hf_cached_model_path_for_id(model_id: &str) -> Option<PathBuf> {
+    let (org, name) = model_id.split_once('/')?;
+    if org.is_empty() || name.is_empty() {
+        return None;
+    }
+    let cache = hf_cache_root()?;
+    let repo = cache.join(format!("models--{org}--{name}"));
+    usable_hf_cached_model_dir(&repo)
+}
+
+fn usable_hf_cached_model_dir(repo: &Path) -> Option<PathBuf> {
+    if looks_like_mlx_model_dir(repo) {
+        return Some(repo.to_path_buf());
+    }
+
+    let main_ref = fs::read_to_string(repo.join("refs/main")).ok()?;
+    let revision = main_ref.trim();
+    if revision.is_empty() || revision.contains('/') {
+        return None;
+    }
+    let snapshot = repo.join("snapshots").join(revision);
+    if looks_like_mlx_model_dir(&snapshot) {
+        Some(snapshot)
+    } else {
+        None
+    }
+}
+
+fn hf_id_from_cache_repo(path: &Path) -> Option<(String, String)> {
+    let file_name = path.file_name().and_then(|n| n.to_str())?;
+    let rest = file_name.strip_prefix("models--")?;
+    let mut parts = rest.splitn(2, "--");
+    let (Some(org), Some(name)) = (parts.next(), parts.next()) else {
+        return None;
+    };
+    if org.is_empty() || name.is_empty() {
+        None
+    } else {
+        Some((org.to_string(), name.to_string()))
+    }
+}
+
+fn path_has_safetensors_payload(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".safetensors")
+    })
+}
+
+fn looks_like_mlx_model_dir(path: &Path) -> bool {
+    if !path.is_dir() || !path.join("config.json").is_file() {
+        return false;
+    }
+    if !(path.join("tokenizer.json").is_file() || path.join("tokenizer.model").is_file()) {
+        return false;
+    }
+    path_has_safetensors_payload(path)
+}
+
+fn collect_hf_cache_models(
+    cache: &Path,
+    candidates: &mut Vec<RuntimeModelCandidate>,
+    seen: &mut HashSet<String>,
+) {
+    let Ok(entries) = fs::read_dir(cache) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some((org, name)) = hf_id_from_cache_repo(&path) else {
+            continue;
+        };
+        let Some(model_dir) = usable_hf_cached_model_dir(&path) else {
+            continue;
+        };
+        let id = format!("{org}/{name}");
+        push_candidate(
+            candidates,
+            seen,
+            id.clone(),
+            model_dir.display().to_string(),
+            name,
+        );
+    }
+}
+
+fn hf_cache_root() -> Option<PathBuf> {
+    if let Ok(cache) = std::env::var("HF_HUB_CACHE") {
+        return Some(crate::utils::helpers::expand_tilde(&cache));
+    }
+    if let Ok(cache) = std::env::var("HUGGINGFACE_HUB_CACHE") {
+        return Some(crate::utils::helpers::expand_tilde(&cache));
+    }
+    if let Ok(home) = std::env::var("HF_HOME") {
+        return Some(crate::utils::helpers::expand_tilde(&home).join("hub"));
+    }
+    dirs::home_dir().map(|home| home.join(".cache/huggingface/hub"))
+}
+
+fn model_id_from_spec(spec: &str) -> String {
+    if model_spec_is_local_path(spec) {
+        model_id_from_path(&crate::utils::helpers::expand_tilde(spec))
+    } else {
+        spec.to_string()
+    }
+}
+
+fn model_id_from_path(path: &Path) -> String {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("model");
+    let Some(parent) = path.parent() else {
+        return name.to_string();
+    };
+    let Some(org) = parent.file_name().and_then(|n| n.to_str()) else {
+        return name.to_string();
+    };
+    let is_lmstudio_models_root = parent
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some("models");
+    if is_lmstudio_models_root {
+        format!("{org}/{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+fn model_name(id: &str) -> String {
+    id.rsplit('/').next().unwrap_or(id).to_string()
+}
+
+fn models_url_from_base(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/models")
+    } else {
+        format!("{base}/v1/models")
+    }
+}
+
+fn switch_url_from_base(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/models/switch")
+    } else {
+        format!("{base}/v1/models/switch")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HiggsConfigModel {
+    path: String,
+    name: String,
+}
+
+fn parse_higgs_config_models(text: &str) -> Vec<HiggsConfigModel> {
+    let mut models = Vec::new();
+    let mut in_model = false;
+    let mut path: Option<String> = None;
+    let mut name: Option<String> = None;
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let header = line.split('#').next().unwrap_or(line).trim();
+        if header.starts_with("[[") {
+            push_parsed_higgs_model(&mut models, &mut path, &mut name);
+            in_model = header == "[[models]]";
+            continue;
+        }
+
+        if !in_model {
+            continue;
+        }
+
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(value) = parse_toml_string_value(raw_value) else {
+            continue;
+        };
+
+        match key.trim() {
+            "path" => path = Some(value),
+            "name" => name = Some(value),
+            _ => {}
+        }
+    }
+
+    push_parsed_higgs_model(&mut models, &mut path, &mut name);
+    models
+}
+
+fn push_parsed_higgs_model(
+    models: &mut Vec<HiggsConfigModel>,
+    path: &mut Option<String>,
+    name: &mut Option<String>,
+) {
+    let Some(path_value) = path.take() else {
+        *name = None;
+        return;
+    };
+    let path_value = path_value.trim();
+    if !path_value.is_empty() {
+        models.push(HiggsConfigModel {
+            path: path_value.to_string(),
+            name: name.take().unwrap_or_default(),
+        });
+    } else {
+        *name = None;
+    }
+}
+
+fn parse_toml_string_value(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if let Some(rest) = value.strip_prefix('"') {
+        return parse_basic_quoted_string(rest);
+    }
+    if let Some(rest) = value.strip_prefix('\'') {
+        return rest.split_once('\'').map(|(parsed, _)| parsed.to_string());
+    }
+
+    let value = value.split('#').next().unwrap_or(value).trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_basic_quoted_string(rest: &str) -> Option<String> {
+    let mut parsed = String::new();
+    let mut escaped = false;
+    for ch in rest.chars() {
+        if escaped {
+            let value = match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                other => other,
+            };
+            parsed.push(value);
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(parsed),
+            other => parsed.push(other),
+        }
+    }
+    None
+}
+
+fn preferred_runtime_name(config: &crate::config::schema::Config) -> Option<String> {
+    let lms = config.agents.defaults.lms_main_model.trim();
+    if !lms.is_empty() && lms != "active" {
+        return Some(model_name(lms));
+    }
+    let local = config.agents.defaults.local_model.trim();
+    if !local.is_empty() && local != "active" && !local.ends_with(".gguf") {
+        return Some(model_name(local));
+    }
+    None
+}
+
+fn push_candidate(
+    candidates: &mut Vec<RuntimeModelCandidate>,
+    seen: &mut HashSet<String>,
+    id: String,
+    path: String,
+    name: String,
+) {
+    let key = path.to_ascii_lowercase();
+    if seen.insert(key) {
+        candidates.push(RuntimeModelCandidate { id, path, name });
+    }
+}
+
+fn collect_mlx_dirs(
+    root: &Path,
+    depth: usize,
+    candidates: &mut Vec<RuntimeModelCandidate>,
+    seen: &mut HashSet<String>,
+) {
+    if looks_like_mlx_model_dir(root) {
+        let id = model_id_from_path(root);
+        push_candidate(
+            candidates,
+            seen,
+            id.clone(),
+            root.display().to_string(),
+            model_name(&id),
+        );
+        return;
+    }
+    if depth == 0 || !root.is_dir() {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_mlx_dirs(&path, depth - 1, candidates, seen);
+        }
+    }
+}
+
+/// List models from a Higgs OpenAI-compatible base URL, with optional auth.
+pub(crate) async fn list_served_models_at(api_base: &str, api_key: &str) -> Vec<String> {
+    let url = models_url_from_base(api_base);
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let Ok(resp) = req.timeout(std::time::Duration::from_secs(3)).send().await else {
+        return Vec::new();
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    model_ids_from_models_json(&json)
+}
+
+/// Switch Higgs to one runtime model using the free-then-load endpoint.
+pub(crate) async fn switch_runtime_model(
+    api_base: &str,
+    api_key: &str,
+    path: &str,
+    name: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let url = switch_url_from_base(api_base);
+    let mut body = serde_json::json!({ "path": path });
+    if !name.is_empty() {
+        body["name"] = serde_json::json!(name);
+    }
+
+    let client = reqwest::Client::new();
+    let mut req = client.post(&url).json(&body);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let resp = req
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .map_err(|e| format!("Higgs switch request failed: {e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Higgs switch failed (HTTP {status}): {}",
+            text.trim()
+        ));
+    }
+
+    let loaded = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|json| json.get("id").and_then(|id| id.as_str()).map(String::from))
+        .unwrap_or_else(|| name.to_string());
+    Ok(loaded)
+}
+
 /// Restart Higgs with a (potentially different) model.
 ///
 /// Stops the running instance, waits briefly for port release, then starts
@@ -384,6 +904,10 @@ pub(crate) async fn list_served_models(port: u16) -> Vec<String> {
     let Ok(json) = resp.json::<serde_json::Value>().await else {
         return Vec::new();
     };
+    model_ids_from_models_json(&json)
+}
+
+fn model_ids_from_models_json(json: &serde_json::Value) -> Vec<String> {
     json.get("data")
         .and_then(|d| d.as_array())
         .map(|arr| {
@@ -475,5 +999,210 @@ mod tests {
         // Empty ids never match (avoids vacuous substring hits).
         assert!(!model_id_matches("", "minicpm5-1b"));
         assert!(!model_id_matches("minicpm5-1b", ""));
+    }
+
+    #[test]
+    fn test_runtime_model_id_from_lmstudio_path() {
+        let path = Path::new("/tmp/cache/lm-studio/models/mlx-community/Qwen3-4bit");
+        assert_eq!(model_id_from_path(path), "mlx-community/Qwen3-4bit");
+    }
+
+    #[test]
+    fn test_parse_higgs_config_models_ignores_commented_entries() {
+        let models = parse_higgs_config_models(
+            r#"
+            #[[models]]
+            #path = "/tmp/commented"
+            #name = "commented"
+
+            [[models]]
+            path = "/tmp/active"
+            name = "active-model"
+
+            [[routes]]
+            pattern = "gpt-.*"
+            provider = "openai"
+            "#,
+        );
+
+        assert_eq!(
+            models,
+            vec![HiggsConfigModel {
+                path: "/tmp/active".to_string(),
+                name: "active-model".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_collect_higgs_config_models_keeps_alias_and_scan_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp
+            .path()
+            .join("lm-studio/models/mlx-community/Qwen3-Test-4bit");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), "{}").unwrap();
+        fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        fs::write(model_dir.join("model.safetensors"), "").unwrap();
+
+        let config_path = tmp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+                [[models]]
+                path = "{}"
+                name = "qwen-test"
+                "#,
+                model_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        let mut roots = Vec::new();
+        collect_higgs_config_models(&config_path, &mut candidates, &mut seen, &mut roots);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "qwen-test");
+        assert_eq!(candidates[0].path, model_dir.display().to_string());
+        assert!(roots.iter().any(|root| root.ends_with("mlx-community")));
+    }
+
+    #[test]
+    fn test_collect_higgs_config_models_skips_missing_local_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+                [[models]]
+                path = "{}"
+                name = "old-missing"
+                "#,
+                tmp.path().join("old-model").display()
+            ),
+        )
+        .unwrap();
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        let mut roots = Vec::new();
+        collect_higgs_config_models(&config_path, &mut candidates, &mut seen, &mut roots);
+
+        assert!(
+            candidates.is_empty(),
+            "missing local config paths are stale"
+        );
+        assert!(
+            roots.is_empty(),
+            "missing local config paths should not seed scans"
+        );
+    }
+
+    #[test]
+    fn test_collect_mlx_dirs_scans_lmstudio_parent_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lm-studio/models");
+        let model_dir = root.join("mlx-community/Qwen3-Test-4bit");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), "{}").unwrap();
+        fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        fs::write(model_dir.join("model.safetensors"), "").unwrap();
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        collect_mlx_dirs(&root, 3, &mut candidates, &mut seen);
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.id == "mlx-community/Qwen3-Test-4bit"));
+    }
+
+    #[test]
+    fn test_collect_mlx_dirs_requires_safetensors_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lm-studio/models");
+        let model_dir = root.join("old-org/IndexOnly-4bit");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), "{}").unwrap();
+        fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        fs::write(model_dir.join("model.safetensors.index.json"), "{}").unwrap();
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        collect_mlx_dirs(&root, 3, &mut candidates, &mut seen);
+
+        assert!(
+            candidates.is_empty(),
+            "index-only dirs should not appear as loadable models"
+        );
+    }
+
+    #[test]
+    fn test_collect_hf_cache_models_uses_only_real_main_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("hub");
+
+        let stale = cache.join("models--old-org--OldModel");
+        fs::create_dir_all(stale.join("refs")).unwrap();
+        fs::write(stale.join("refs/main"), "deadbeef\n").unwrap();
+
+        let index_only = cache.join("models--old-org--IndexOnly");
+        let index_snapshot = index_only.join("snapshots/feedface");
+        fs::create_dir_all(index_only.join("refs")).unwrap();
+        fs::create_dir_all(&index_snapshot).unwrap();
+        fs::write(index_only.join("refs/main"), "feedface\n").unwrap();
+        fs::write(index_snapshot.join("config.json"), "{}").unwrap();
+        fs::write(index_snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(index_snapshot.join("model.safetensors.index.json"), "{}").unwrap();
+
+        let real = cache.join("models--good-org--RealModel-4bit");
+        let real_snapshot = real.join("snapshots/cafebabe");
+        fs::create_dir_all(real.join("refs")).unwrap();
+        fs::create_dir_all(&real_snapshot).unwrap();
+        fs::write(real.join("refs/main"), "cafebabe\n").unwrap();
+        fs::write(real_snapshot.join("config.json"), "{}").unwrap();
+        fs::write(real_snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(real_snapshot.join("model.safetensors"), "").unwrap();
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        collect_hf_cache_models(&cache, &mut candidates, &mut seen);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "good-org/RealModel-4bit");
+        assert_eq!(candidates[0].name, "RealModel-4bit");
+        assert_eq!(candidates[0].path, real_snapshot.display().to_string());
+    }
+
+    #[test]
+    fn test_runtime_model_urls_from_base() {
+        assert_eq!(
+            models_url_from_base("http://127.0.0.1:8091/v1"),
+            "http://127.0.0.1:8091/v1/models"
+        );
+        assert_eq!(
+            switch_url_from_base("http://127.0.0.1:8091"),
+            "http://127.0.0.1:8091/v1/models/switch"
+        );
+    }
+
+    #[test]
+    fn test_model_ids_from_models_json() {
+        let json = serde_json::json!({
+            "object": "list",
+            "data": [
+                { "id": "qwen", "object": "model" },
+                { "id": "llama", "object": "model" },
+                { "object": "model" }
+            ]
+        });
+        assert_eq!(
+            model_ids_from_models_json(&json),
+            vec!["qwen".to_string(), "llama".to_string()]
+        );
     }
 }

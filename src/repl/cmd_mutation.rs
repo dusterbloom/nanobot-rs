@@ -20,6 +20,9 @@ impl ReplContext {
                     counters
                         .thinking_budget
                         .store(default_budget, Ordering::Relaxed);
+                    counters
+                        .suppress_thinking_display
+                        .store(false, Ordering::Relaxed);
                     println!(
                         "\n  Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n",
                         default_budget
@@ -43,6 +46,9 @@ impl ReplContext {
                 Ok(budget) => {
                     let clamped = budget.clamp(1024, 128000);
                     counters.thinking_budget.store(clamped, Ordering::Relaxed);
+                    counters
+                        .suppress_thinking_display
+                        .store(false, Ordering::Relaxed);
                     println!(
                         "\n  Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n",
                         clamped
@@ -64,6 +70,9 @@ impl ReplContext {
                 counters
                     .thinking_budget
                     .store(default_budget, Ordering::Relaxed);
+                counters
+                    .suppress_thinking_display
+                    .store(false, Ordering::Relaxed);
                 println!(
                     "\n  Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n",
                     default_budget
@@ -73,12 +82,15 @@ impl ReplContext {
     }
 
     /// /nothink, /nt — suppress thinking tokens from output (and TTS).
-    /// Sets thinking budget to 0 and enables suppress_thinking_in_tts.
+    /// Sets thinking budget to 0 and enables the display/TTS suppressors.
     pub(super) fn cmd_nothink(&self) {
         let counters = &self.core_handle.counters;
-        let was_suppressed = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
+        let was_suppressed = counters.suppress_thinking_display.load(Ordering::Relaxed);
         if was_suppressed {
             // Toggle off — re-enable thinking display (but thinking budget stays 0)
+            counters
+                .suppress_thinking_display
+                .store(false, Ordering::Relaxed);
             counters
                 .suppress_thinking_in_tts
                 .store(false, Ordering::Relaxed);
@@ -87,6 +99,9 @@ impl ReplContext {
             );
         } else {
             counters.thinking_budget.store(0, Ordering::Relaxed);
+            counters
+                .suppress_thinking_display
+                .store(true, Ordering::Relaxed);
             counters
                 .suppress_thinking_in_tts
                 .store(true, Ordering::Relaxed);

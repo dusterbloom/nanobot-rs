@@ -82,7 +82,14 @@ impl ReplContext {
                     if let Some(bin) = crate::higgs::find_binary() {
                         print!("  Restarting Higgs server... ");
                         io::stdout().flush().ok();
-                        match crate::higgs::server_restart(&bin, port, &model_dir, &self.config.agents.defaults.local_model).await {
+                        match crate::higgs::server_restart(
+                            &bin,
+                            port,
+                            &model_dir,
+                            &self.config.agents.defaults.local_model,
+                        )
+                        .await
+                        {
                             Ok(crate::higgs::StartResult::Ready) => {
                                 println!("{}OK{}", tui::GREEN, tui::RESET);
                                 if let Some(name) = self.apply_higgs_endpoint(port).await {
@@ -437,6 +444,13 @@ impl ReplContext {
                             .unwrap_or(endpoint);
                         format!("oMLX ({})", short)
                     }
+                    ModelSource::Higgs { ref endpoint, .. } => {
+                        let short = crate::tui::shorten_url(endpoint)
+                            .split('/')
+                            .next()
+                            .unwrap_or(endpoint);
+                        format!("Higgs ({})", short)
+                    }
                 };
                 if group != current_group {
                     if !current_group.is_empty() {
@@ -666,33 +680,75 @@ impl ReplContext {
                 self.apply_and_rebuild();
             }
             ModelSource::Omlx { ref endpoint } => {
-                // oMLX/Higgs uses LRU auto-eviction — just update config, no load/unload.
+                // oMLX uses LRU auto-eviction — just update config, no load/unload.
                 // Switch backend away from "mlx" (in-process) so rebuild uses HTTP.
-                // Preserve "higgs" backend if already set (managed sidecar), else use "omlx".
                 self.config.agents.defaults.local_api_base = endpoint.clone();
                 self.config.agents.defaults.local_model = selected.id.clone();
                 self.config.agents.defaults.lms_main_model = selected.id.clone();
-                if !crate::config::schema::is_higgs_backend(
-                    &self.config.agents.defaults.local_backend,
-                ) {
-                    self.config.agents.defaults.local_backend = "omlx".to_string();
-                }
+                self.config.agents.defaults.local_backend = "omlx".to_string();
                 // No longer managed by LM Studio — prevent watchdog auto-restart.
                 self.srv.lms_managed = false;
                 self.current_model_path = PathBuf::from(&selected.id);
                 self.persist_local_config();
                 self.apply_and_rebuild_with(true);
-                let backend_label = if crate::config::schema::is_higgs_backend(
-                    &self.config.agents.defaults.local_backend,
-                ) {
-                    "Higgs"
-                } else {
-                    "oMLX"
-                };
                 println!(
-                    "  Switched to {} ({backend_label} will load on first request).",
+                    "  Switched to {} (oMLX will load on first request).",
                     selected.id
                 );
+            }
+            ModelSource::Higgs {
+                ref endpoint,
+                ref path,
+                ref name,
+            } => {
+                self.config.agents.defaults.local_api_base = endpoint.clone();
+                self.config.agents.defaults.local_backend = "higgs".to_string();
+                self.config.agents.defaults.skip_jit_gate = true;
+                self.srv.lms_managed = false;
+                self.srv.engine = super::super::InferenceEngine::Higgs;
+
+                if let Some(model_path) = path {
+                    print!("  Switching Higgs to {}... ", selected.id);
+                    io::stdout().flush().ok();
+                    match crate::higgs::switch_runtime_model(
+                        endpoint,
+                        &self.config.agents.defaults.local_api_key,
+                        model_path,
+                        name,
+                        self.config.timeouts.lms_load_secs,
+                    )
+                    .await
+                    {
+                        Ok(loaded_name) => {
+                            println!("{}OK{} ({loaded_name})", tui::GREEN, tui::RESET);
+                        }
+                        Err(e) => {
+                            println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
+                            println!(
+                                "  {}Model switch aborted; config was not changed.{}\n",
+                                tui::DIM,
+                                tui::RESET
+                            );
+                            return;
+                        }
+                    }
+
+                    self.config.agents.defaults.local_model = selected.id.clone();
+                    // Higgs' switch endpoint installs a stable alias for the
+                    // sole resident model; use it so future switches do not
+                    // depend on the loaded model's exposed name.
+                    self.config.agents.defaults.lms_main_model = "active".to_string();
+                    self.config.agents.defaults.mlx_model_dir = Some(model_path.clone());
+                    self.current_model_path = PathBuf::from(model_path.as_str());
+                } else {
+                    self.config.agents.defaults.local_model = selected.id.clone();
+                    self.config.agents.defaults.lms_main_model = selected.id.clone();
+                    self.current_model_path = PathBuf::from(&selected.id);
+                    println!("  Routing to resident Higgs model {}.", selected.id);
+                }
+
+                self.persist_local_config();
+                self.apply_and_rebuild_with(true);
             }
         }
 
@@ -1169,6 +1225,7 @@ impl ReplContext {
         disk_cfg.agents.defaults.lms_main_model =
             self.config.agents.defaults.lms_main_model.clone();
         disk_cfg.agents.defaults.local_model = self.config.agents.defaults.local_model.clone();
+        disk_cfg.agents.defaults.mlx_model_dir = self.config.agents.defaults.mlx_model_dir.clone();
         save_config(&disk_cfg, None);
     }
 
@@ -1204,7 +1261,14 @@ impl ReplContext {
                                     tui::YELLOW,
                                     tui::RESET,
                                 );
-                                match crate::higgs::server_start(&bin, port, &model_dir, &self.config.agents.defaults.local_model).await {
+                                match crate::higgs::server_start(
+                                    &bin,
+                                    port,
+                                    &model_dir,
+                                    &self.config.agents.defaults.local_model,
+                                )
+                                .await
+                                {
                                     Ok(crate::higgs::StartResult::Ready) => {
                                         self.srv.engine = super::super::InferenceEngine::Higgs;
                                         self.srv.local_port = port.to_string();

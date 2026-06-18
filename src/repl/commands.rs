@@ -3,6 +3,7 @@
 //! Contains `ReplContext`, `normalize_alias()`, `dispatch()`, and all
 //! `cmd_xxx()` command handlers (split across submodules).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,6 +101,12 @@ enum ModelSource {
     File { path: PathBuf },
     /// oMLX server (external, auto-discovery via LRU eviction).
     Omlx { endpoint: String },
+    /// Higgs server. `path` is present for runtime switchable models.
+    Higgs {
+        endpoint: String,
+        path: Option<String>,
+        name: String,
+    },
 }
 
 /// A model entry from any source, used by the unified model picker.
@@ -130,6 +137,11 @@ impl ModelEntry {
                 let short = crate::tui::shorten_url(endpoint);
                 let host = short.split('/').next().unwrap_or(&short);
                 format!("oMLX {host}")
+            }
+            ModelSource::Higgs { endpoint, .. } => {
+                let short = crate::tui::shorten_url(endpoint);
+                let host = short.split('/').next().unwrap_or(&short);
+                format!("Higgs {host}")
             }
         }
     }
@@ -186,7 +198,11 @@ fn unique_direct_model_match<'a>(
         }
     }
 
-    if ties == 1 { best } else { None }
+    if ties == 1 {
+        best
+    } else {
+        None
+    }
 }
 
 // ============================================================================
@@ -471,6 +487,24 @@ impl ReplContext {
             self.config.agents.defaults.local_model.clone()
         };
         let current_base = &self.config.agents.defaults.local_api_base;
+        let backend_is_higgs =
+            crate::config::schema::is_higgs_backend(&self.config.agents.defaults.local_backend);
+        let configured_higgs_base = format!(
+            "http://127.0.0.1:{}/v1",
+            self.config.agents.defaults.higgs_port
+        );
+        let current_base_norm = current_base.trim().trim_end_matches('/');
+        let configured_higgs_base_norm = configured_higgs_base.trim_end_matches('/');
+        // Older configs may still say "omlx" after pointing localApiBase at the
+        // managed Higgs port. Treat that exact localhost endpoint as Higgs so
+        // the picker can show runtime-switchable model directories.
+        let use_higgs_model_discovery = backend_is_higgs
+            || (!current_base_norm.is_empty() && current_base_norm == configured_higgs_base_norm);
+        let higgs_base = if current_base_norm.is_empty() && backend_is_higgs {
+            configured_higgs_base.clone()
+        } else {
+            current_base.trim().to_string()
+        };
 
         // 1. Local LMS (if lms_managed)
         let mut covered_endpoint: Option<String> = None;
@@ -508,6 +542,16 @@ impl ReplContext {
                         continue;
                     }
                 }
+                // The local Higgs sidecar may also appear as a healthy cluster
+                // peer. Let the Higgs-specific branch own it so it can include
+                // filesystem candidates that are switchable via /v1/models/switch.
+                if use_higgs_model_discovery
+                    && !higgs_base.is_empty()
+                    && peer.endpoint.trim().trim_end_matches('/')
+                        == higgs_base.trim_end_matches('/')
+                {
+                    continue;
+                }
                 // Skip if endpoint matches current local_api_base AND we already
                 // added models from it via the remote-server branch in step 1
                 for model in &peer.models {
@@ -531,7 +575,12 @@ impl ReplContext {
         // When the user points `local_api_base` at a remote server (e.g. LM Studio
         // on another machine), the cluster peer list may not include it.
         {
-            let base = current_base.trim().to_string();
+            let is_higgs = use_higgs_model_discovery;
+            let base = if current_base_norm.is_empty() && is_higgs {
+                higgs_base.clone()
+            } else {
+                current_base.trim().to_string()
+            };
             let already_covered = covered_endpoint
                 .as_deref()
                 .map(|c| c == base)
@@ -553,61 +602,117 @@ impl ReplContext {
 
             let is_omlx = crate::config::schema::is_external_server_backend(
                 &self.config.agents.defaults.local_backend,
-            ) || crate::config::schema::is_higgs_backend(
-                &self.config.agents.defaults.local_backend,
             );
 
-            if !base.is_empty() && !already_covered && !covered_by_cluster {
-                let models_url = {
-                    let b = base.trim_end_matches('/');
-                    if b.ends_with("/v1") {
-                        format!("{}/models", b)
-                    } else {
-                        format!("{}/v1/models", b)
-                    }
-                };
-
-                let client = reqwest::Client::new();
+            if !base.is_empty() && !already_covered && (!covered_by_cluster || is_higgs) {
                 let api_key = &self.config.agents.defaults.local_api_key;
-                if let Ok(resp) = client
-                    .get(&models_url)
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                            for item in data {
-                                let id = item
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if id.is_empty() || id.to_lowercase().contains("embedding") {
-                                    continue;
+                if is_higgs {
+                    let loaded = crate::higgs::list_served_models_at(&base, api_key).await;
+                    let active_hint = if current_model == "active" {
+                        self.config.agents.defaults.local_model.as_str()
+                    } else {
+                        current_model.as_str()
+                    };
+                    let mut covered_loaded = HashSet::new();
+
+                    for candidate in crate::higgs::discover_runtime_model_candidates(&self.config) {
+                        let is_loaded = loaded.iter().any(|id| {
+                            crate::lms::model_matches(id, &candidate.id)
+                                || crate::lms::model_matches(id, &candidate.name)
+                        });
+                        if is_loaded {
+                            covered_loaded.insert(candidate.id.clone());
+                            covered_loaded.insert(candidate.name.clone());
+                        }
+                        let is_active = crate::lms::is_model_available(
+                            &[candidate.id.clone(), candidate.name.clone()],
+                            active_hint,
+                        );
+                        entries.push(ModelEntry {
+                            id: candidate.id,
+                            source: ModelSource::Higgs {
+                                endpoint: base.clone(),
+                                path: Some(candidate.path),
+                                name: candidate.name,
+                            },
+                            is_active,
+                            is_loaded,
+                        });
+                    }
+
+                    for id in loaded {
+                        if id.to_lowercase().contains("embedding")
+                            || covered_loaded
+                                .iter()
+                                .any(|known| crate::lms::model_matches(known, &id))
+                        {
+                            continue;
+                        }
+                        let is_active = crate::lms::is_model_available(&[id.clone()], active_hint);
+                        entries.push(ModelEntry {
+                            id: id.clone(),
+                            source: ModelSource::Higgs {
+                                endpoint: base.clone(),
+                                path: None,
+                                name: id,
+                            },
+                            is_active,
+                            is_loaded: true,
+                        });
+                    }
+                } else {
+                    let models_url = {
+                        let b = base.trim_end_matches('/');
+                        if b.ends_with("/v1") {
+                            format!("{}/models", b)
+                        } else {
+                            format!("{}/v1/models", b)
+                        }
+                    };
+
+                    let client = reqwest::Client::new();
+                    if let Ok(resp) = client
+                        .get(&models_url)
+                        .header("Authorization", format!("Bearer {}", api_key))
+                        .timeout(Duration::from_secs(3))
+                        .send()
+                        .await
+                    {
+                        if let Ok(json) = resp.json::<serde_json::Value>().await {
+                            if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                                for item in data {
+                                    let id = item
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if id.is_empty() || id.to_lowercase().contains("embedding") {
+                                        continue;
+                                    }
+                                    let is_active = crate::lms::is_model_available(
+                                        &[id.clone()],
+                                        &current_model,
+                                    );
+                                    let source = if is_omlx {
+                                        ModelSource::Omlx {
+                                            endpoint: base.clone(),
+                                        }
+                                    } else {
+                                        ModelSource::Remote {
+                                            endpoint: base.clone(),
+                                            #[cfg(feature = "cluster")]
+                                            peer_type: crate::cluster::state::PeerType::Unknown,
+                                            #[cfg(not(feature = "cluster"))]
+                                            peer_type: (),
+                                        }
+                                    };
+                                    entries.push(ModelEntry {
+                                        id,
+                                        source,
+                                        is_active,
+                                        is_loaded: false,
+                                    });
                                 }
-                                let is_active =
-                                    crate::lms::is_model_available(&[id.clone()], &current_model);
-                                let source = if is_omlx {
-                                    ModelSource::Omlx {
-                                        endpoint: base.clone(),
-                                    }
-                                } else {
-                                    ModelSource::Remote {
-                                        endpoint: base.clone(),
-                                        #[cfg(feature = "cluster")]
-                                        peer_type: crate::cluster::state::PeerType::Unknown,
-                                        #[cfg(not(feature = "cluster"))]
-                                        peer_type: (),
-                                    }
-                                };
-                                entries.push(ModelEntry {
-                                    id,
-                                    source,
-                                    is_active,
-                                    is_loaded: false,
-                                });
                             }
                         }
                     }

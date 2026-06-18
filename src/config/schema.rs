@@ -411,7 +411,6 @@ pub fn is_higgs_backend(backend: &str) -> bool {
     backend == "higgs"
 }
 
-
 fn default_mlx_preset() -> String {
     "qwen3.5-2b".to_string()
 }
@@ -888,6 +887,10 @@ fn default_trio_specialist_temperature() -> f64 {
     0.7
 }
 
+fn default_trio_specialist_top_p() -> f64 {
+    0.95
+}
+
 fn default_vram_cap_gb() -> f64 {
     16.0
 }
@@ -965,6 +968,11 @@ pub struct TrioConfig {
     /// Temperature for the specialist LLM (default: 0.7).
     #[serde(default = "default_trio_specialist_temperature")]
     pub specialist_temperature: f64,
+    /// top_p for the specialist LLM (default: 0.95). Wired into the specialist
+    /// call so reasoning models (e.g. VibeThinker: temp 1.0 / top_p 0.95) sample
+    /// per their model card instead of hardcoded values.
+    #[serde(default = "default_trio_specialist_top_p")]
+    pub specialist_top_p: f64,
     /// Explicit endpoint for the router role (takes priority over router_port + router_model).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_endpoint: Option<ModelEndpoint>,
@@ -1057,6 +1065,7 @@ impl Default for TrioConfig {
             specialist_port: default_trio_specialist_port(),
             specialist_ctx_tokens: default_trio_specialist_ctx_tokens(),
             specialist_temperature: default_trio_specialist_temperature(),
+            specialist_top_p: default_trio_specialist_top_p(),
             router_endpoint: None,
             specialist_endpoint: None,
             vram_cap_gb: default_vram_cap_gb(),
@@ -1771,6 +1780,11 @@ impl Default for ProprioceptionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum TtsEngineConfig {
+    // DEPRECATED(pocket): Pocket is no longer used in practice — Supertonic is the
+    // active engine. Kept as #[default] for now only to avoid a behavioral change.
+    // TODO(pocket-removal): switch #[default] to Supertonic and delete the Pocket
+    // code paths in voice_pipeline.rs (route_tts, pocket_tts_language, init/fallback)
+    // plus the CLI/main refs. Tracked in .planning/HANDOFF-tui-ratatui-rewrite.md.
     #[default]
     Pocket,
     Supertonic,
