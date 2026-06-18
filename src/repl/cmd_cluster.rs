@@ -21,7 +21,9 @@ impl ReplContext {
                 println!("    /cluster              Show cluster status");
                 println!("    /cluster peers        List discovered peers");
                 println!("    /cluster models       List all models across peers");
-                println!("    /cluster probe <url>  Probe and adopt a known OpenAI-compatible peer");
+                println!(
+                    "    /cluster probe <url>  Probe and adopt a known OpenAI-compatible peer"
+                );
                 println!(
                     "    /cluster use <model>  Switch to a model on a cluster peer
 "
@@ -180,7 +182,9 @@ impl ReplContext {
     #[cfg(feature = "cluster")]
     async fn cmd_cluster_probe(&mut self, endpoint: &str) {
         let Some(endpoint) = normalize_cluster_probe_endpoint(endpoint) else {
-            println!("\n  Usage: /cluster probe <url>\n  Example: /cluster probe 192.168.1.22:18100\n");
+            println!(
+                "\n  Usage: /cluster probe <url>\n  Example: /cluster probe 192.168.1.22:18100\n"
+            );
             return;
         };
 

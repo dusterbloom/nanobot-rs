@@ -18,8 +18,8 @@ use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_hygiene;
 use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
-use crate::agent::prefix_guard;
 use crate::agent::policy;
+use crate::agent::prefix_guard;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
 use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
 use crate::agent::runtime_mode::RuntimeMode;
@@ -50,6 +50,22 @@ use super::{
 #[path = "agent_response.rs"]
 pub(crate) mod agent_response;
 pub(crate) use agent_response::RetryState;
+
+fn send_cache_reset_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, reason: &str) {
+    if let Some(tx) = tx {
+        let _ = tx.send(format!("\x00cache:reset:{reason}"));
+    }
+}
+
+fn send_retract_reply_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>) {
+    if let Some(tx) = tx {
+        let _ = tx.send("\x00retract_reply".to_string());
+    }
+}
+
+fn proactive_grounding_preserves_prefix_cache(is_local: bool, local_tail_opt_in: bool) -> bool {
+    !is_local || local_tail_opt_in
+}
 
 // ---------------------------------------------------------------------------
 // Per-instance state (different per agent)
@@ -328,8 +344,9 @@ enum StepResult {
 ///
 /// Fires only when the model produced no real tool call, on the first
 /// validation slot, in local mode, with tools available, and when the content
-/// reads as a botched/claimed tool call (same detector the main loop uses). In
-/// TextualReplay mode `validate_response` returns `Ok`, so this never fires.
+/// reads as a botched/claimed tool call. TextualReplay suppresses normal
+/// validation, so it gets a narrower explicit check for plain named-tool
+/// narration or invented tool-call markup.
 fn should_attempt_forced_recovery(
     has_tool_calls: bool,
     is_local: bool,
@@ -345,13 +362,24 @@ fn should_attempt_forced_recovery(
     let Some(content) = content else {
         return false;
     };
-    matches!(
-        validation::validate_response(content, &[], is_textual_replay, had_blocked_calls),
+    let outcome = validation::validate_response(content, &[], is_textual_replay, had_blocked_calls);
+    if matches!(
+        outcome,
         validation::ValidationOutcome::Error(
             validation::ValidationError::ClaimedButNotExecuted
                 | validation::ValidationError::HallucinatedToolCall
         )
-    )
+    ) {
+        return true;
+    }
+
+    // Textual replay suppresses normal validation because bracketed tool
+    // history is legitimate there, but plain named-tool narration and invented
+    // tool-call envelopes are still botched calls.
+    is_textual_replay
+        && (validation::has_claimed_tool_intent(content)
+            || validation::has_xml_hallucinated_tool_call(content)
+            || validation::has_raw_json_hallucinated_tool_call(content))
 }
 
 impl AgentLoopShared {
@@ -872,10 +900,11 @@ impl AgentLoopShared {
             // first) instead of a bare acknowledgement. Marked `_synthetic` so
             // it is not persisted as a real turn and does not break the prefix
             // cache on the next reload.
-            ctx.messages.push(crate::agent::markers::scaffold_user(format!(
-                "[system] Report what the previous tool results showed before \
+            ctx.messages
+                .push(crate::agent::markers::scaffold_user(format!(
+                    "[system] Report what the previous tool results showed before \
                  running more tools.{budget_note}"
-            )));
+                )));
         }
 
         // Select and filter tool definitions for this turn.
@@ -888,18 +917,58 @@ impl AgentLoopShared {
 
         // Trim messages to fit context budget.
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
-        ctx.messages = ctx.core.token_budget.trim_to_fit_with_age(
-            &ctx.messages,
-            tool_def_tokens,
-            ctx.turn_count,
-            ctx.core.max_message_age_turns,
-        );
+        let frozen_prefix = ctx
+            .counters
+            .prompt_cache_watermark
+            .lock()
+            .get(&ctx.session_key)
+            .copied()
+            .unwrap_or(0);
+        let (trimmed_messages, prefix_preserved) = ctx
+            .core
+            .token_budget
+            .trim_to_fit_with_age_preserving_prefix(
+                &ctx.messages,
+                tool_def_tokens,
+                ctx.turn_count,
+                ctx.core.max_message_age_turns,
+                frozen_prefix,
+            );
+        if !prefix_preserved && frozen_prefix > 0 {
+            ctx.counters
+                .prompt_cache_watermark
+                .lock()
+                .remove(&ctx.session_key);
+            send_cache_reset_marker(&ctx.text_delta_tx, "trim");
+            warn!(
+                session = %ctx.session_key,
+                frozen_prefix,
+                before_messages = ctx.messages.len(),
+                after_messages = trimmed_messages.len(),
+                "prompt_cache_watermark_invalidated_by_token_trim"
+            );
+        }
+        ctx.messages = trimmed_messages;
 
         // Spawn background compaction when threshold exceeded.
         self.manage_compaction(ctx, tool_def_tokens).await;
 
         // Proactive grounding: inject relevant knowledge before LLM call.
-        if self.proprioception_config.proactive_retrieval && iteration == 0 {
+        //
+        // Local models receive grounding as a synthetic `user` turn. That is
+        // useful, but cache-hostile: LocalProtocol merges consecutive user
+        // turns, while synthetic turns are stripped from the next replay, so
+        // turn N+1 diverges at turn N's user message. Keep the local fast path
+        // append-only unless the existing local-tail opt-in explicitly chooses
+        // per-turn retrieval over prefix-cache reuse.
+        let local_retrieval_opt_in = proactive_grounding_preserves_prefix_cache(
+            ctx.core.mode().is_local(),
+            std::env::var("NANOBOT_LOCAL_TAIL").is_ok(),
+        );
+        if self.proprioception_config.proactive_retrieval
+            && local_retrieval_opt_in
+            && iteration == 0
+        {
             if let Some(user_text) = last_user_message(&ctx.messages) {
                 if !user_text.is_empty() {
                     let intent = crate::agent::proactive::extract_intent(&user_text);
@@ -952,8 +1021,33 @@ impl AgentLoopShared {
                 model = %ctx.core.model,
                 "context_overflow_emergency_trim"
             );
+            let frozen_prefix = ctx
+                .counters
+                .prompt_cache_watermark
+                .lock()
+                .get(&ctx.session_key)
+                .copied()
+                .unwrap_or(0);
             // tool_def_tokens=0 is conservative (trims more aggressively).
-            ctx.messages = ctx.core.token_budget.trim_to_fit(&ctx.messages, 0);
+            let (trimmed_messages, prefix_preserved) = ctx
+                .core
+                .token_budget
+                .trim_to_fit_with_age_preserving_prefix(&ctx.messages, 0, 0, 0, frozen_prefix);
+            if !prefix_preserved && frozen_prefix > 0 {
+                ctx.counters
+                    .prompt_cache_watermark
+                    .lock()
+                    .remove(&ctx.session_key);
+                send_cache_reset_marker(&ctx.text_delta_tx, "emergency_trim");
+                warn!(
+                    session = %ctx.session_key,
+                    frozen_prefix,
+                    before_messages = ctx.messages.len(),
+                    after_messages = trimmed_messages.len(),
+                    "prompt_cache_watermark_invalidated_by_emergency_trim"
+                );
+            }
+            ctx.messages = trimmed_messages;
             // Re-render after trim to rebuild protocol-correct wire format.
             ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
         }
@@ -1532,43 +1626,66 @@ impl AgentLoopShared {
         // extension of this session's previous call forces the server to
         // re-prefill everything past the divergence point (~60s for a 14k
         // local context). Make every such miss a one-line diagnosis.
+        use crate::agent::prompt_fingerprint::{self, PromptDelta};
+        let prompt_fp = prompt_fingerprint::fingerprint(&messages_for_llm);
+        let prompt_msg_count = messages_for_llm.len();
+        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
+        let prompt_total_estimate =
+            TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens);
         {
-            use crate::agent::prompt_fingerprint::{self, PromptDelta};
-            let fp = prompt_fingerprint::fingerprint(&messages_for_llm, tool_defs_opt);
-            let mut store = counters.prompt_fingerprints.lock();
-            match prompt_fingerprint::compare(store.get(&ctx.session_key), &fp) {
+            let store = counters.prompt_fingerprints.lock();
+            let prompt_delta = prompt_fingerprint::compare(store.get(&ctx.session_key), &prompt_fp);
+            let prefill_estimate = match prompt_delta {
+                PromptDelta::First => prompt_total_estimate,
+                PromptDelta::AppendOnly { added_msgs } => {
+                    let tail_start = prompt_msg_count.saturating_sub(added_msgs);
+                    TokenBudget::estimate_tokens(&messages_for_llm[tail_start..])
+                }
+                PromptDelta::Diverged {
+                    first_divergent_msg,
+                    ..
+                } => {
+                    let tail_start = first_divergent_msg.min(prompt_msg_count);
+                    TokenBudget::estimate_tokens(&messages_for_llm[tail_start..])
+                }
+            };
+            let cache_marker = match prompt_delta {
                 PromptDelta::Diverged {
                     first_divergent_msg,
                     prev_msgs,
                     new_msgs,
-                    tools_changed,
                 } => {
                     tracing::info!(
                         session = %ctx.session_key,
                         at_msg = first_divergent_msg,
                         prev_msgs,
                         new_msgs,
-                        tools_changed,
+                        prefill_estimate,
                         "prompt_prefix_diverged — server re-prefills past this point"
                     );
+                    format!(
+                        "\x00cache:diverged:{}:{}:{}",
+                        first_divergent_msg, prev_msgs, new_msgs,
+                    )
                 }
                 PromptDelta::AppendOnly { added_msgs } => {
-                    debug!(session = %ctx.session_key, added_msgs, "prompt_append_only");
+                    debug!(
+                        session = %ctx.session_key,
+                        added_msgs,
+                        prefill_estimate,
+                        "prompt_append_only"
+                    );
+                    format!("\x00cache:append:{}:{}", added_msgs, prompt_msg_count)
                 }
-                PromptDelta::First => {}
+                PromptDelta::First => format!("\x00cache:first:{}", prompt_msg_count),
+            };
+            if let Some(ref delta_tx) = ctx.text_delta_tx {
+                let _ = delta_tx.send(cache_marker);
+                if prefill_estimate > 0 {
+                    let _ = delta_tx.send(format!("\x00prefill_estimate:{prefill_estimate}"));
+                }
             }
-            store.insert(ctx.session_key.clone(), fp);
         }
-
-        // Re-anchor the prefix-cache watermark to exactly what is being sent.
-        // Everything currently in `ctx.messages` (raw) is now warm on the
-        // server; next iteration's cleanup freezes below this length so the
-        // prompt stays an append-only extension. Raw length (not rendered) —
-        // the cleanup passes operate on `ctx.messages`. See `agent::prefix_guard`.
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .insert(ctx.session_key.clone(), ctx.messages.len());
 
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas to the REPL/voice renderer as
@@ -1599,8 +1716,13 @@ impl AgentLoopShared {
 
             let mut streamed_response = None;
             let mut in_thinking = false;
-            let suppress_thinking_tts = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
+            let suppress_thinking_display =
+                counters.suppress_thinking_display.load(Ordering::Relaxed);
             let thinking_enabled = counters.thinking_budget.load(Ordering::Relaxed) > 0;
+            let hidden_reasoning_enabled =
+                crate::agent::model_capabilities::prefers_hidden_reasoning(&ctx.core.model);
+            let display_thinking =
+                !suppress_thinking_display && (thinking_enabled || hidden_reasoning_enabled);
             let mut xml_filter = XmlToolCallFilter::new();
             loop {
                 tokio::select! {
@@ -1622,8 +1744,7 @@ impl AgentLoopShared {
                             Some(StreamChunk::ThinkingDelta(delta)) => {
                                 // First token (even a hidden thinking token) marks end of prefill.
                                 ctx.flow.mark_first_token();
-                                if !thinking_enabled || suppress_thinking_tts {
-                                    // /t off → hide from display; /nothink → hide from TTS
+                                if !display_thinking {
                                     continue;
                                 }
                                 // Render thinking tokens as dimmed text
@@ -1714,6 +1835,18 @@ impl AgentLoopShared {
         // Inference complete — allow watchdog health checks again.
         counters.mark_inference_finished();
 
+        // Only successful provider calls prove that the server accepted this
+        // prompt. Failed/cancelled calls must not seed the local cache model, or
+        // the next long-context turn may preserve a prefix that never warmed.
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(ctx.session_key.clone(), prompt_fp);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(ctx.session_key.clone(), ctx.messages.len());
+
         // Tier-2 forced-tool recovery: if a local model botched a tool call
         // (intent prose / hallucinated syntax / empty block) instead of emitting
         // one, re-issue once with tool_choice=required so the Higgs backend
@@ -1779,6 +1912,9 @@ impl AgentLoopShared {
         {
             Ok(recovered) if recovered.has_tool_calls() => {
                 info!("forced_tool_recovery: recovered a constrained tool call");
+                if ctx.flow.content_was_streamed {
+                    send_retract_reply_marker(&ctx.text_delta_tx);
+                }
                 recovered
             }
             // No tool call (e.g. constraint disabled server-side) or error:
@@ -2041,7 +2177,9 @@ impl AgentLoopShared {
 // ============================================================================
 #[cfg(test)]
 mod tests {
-    use super::{advance_response_boundary, ResponseBoundary};
+    use super::{
+        advance_response_boundary, proactive_grounding_preserves_prefix_cache, ResponseBoundary,
+    };
 
     /// The response boundary is one-shot: Pending → Armed (with nudge) → Off.
     /// Schema never changes; a model that insists on exec gets exactly one
@@ -2102,6 +2240,22 @@ mod tests {
     }
 
     // ---- Tests ---------------------------------------------------------
+
+    #[test]
+    fn test_local_proactive_grounding_keeps_cache_fast_path() {
+        assert!(
+            proactive_grounding_preserves_prefix_cache(false, false),
+            "cloud grounding is not governed by the local prefix-cache tradeoff"
+        );
+        assert!(
+            !proactive_grounding_preserves_prefix_cache(true, false),
+            "local default skips synthetic per-turn grounding to avoid msg-N cache resets"
+        );
+        assert!(
+            proactive_grounding_preserves_prefix_cache(true, true),
+            "NANOBOT_LOCAL_TAIL remains the explicit local relevance-over-cache opt-in"
+        );
+    }
 
     #[test]
     fn test_is_local_trio_mode_gate() {
@@ -2258,28 +2412,52 @@ mod forced_recovery_tests {
     #[test]
     fn fires_on_claimed_tool_intent() {
         assert!(should_attempt_forced_recovery(
-            false, true, 0, true, Some(CLAIMED), false, false
+            false,
+            true,
+            0,
+            true,
+            Some(CLAIMED),
+            false,
+            false
         ));
     }
 
     #[test]
     fn fires_on_hallucinated_call() {
         assert!(should_attempt_forced_recovery(
-            false, true, 0, true, Some(HALLUCINATED), false, false
+            false,
+            true,
+            0,
+            true,
+            Some(HALLUCINATED),
+            false,
+            false
         ));
     }
 
     #[test]
     fn skips_when_real_tool_calls_present() {
         assert!(!should_attempt_forced_recovery(
-            true, true, 0, true, Some(CLAIMED), false, false
+            true,
+            true,
+            0,
+            true,
+            Some(CLAIMED),
+            false,
+            false
         ));
     }
 
     #[test]
     fn skips_on_cloud_backend() {
         assert!(!should_attempt_forced_recovery(
-            false, false, 0, true, Some(CLAIMED), false, false
+            false,
+            false,
+            0,
+            true,
+            Some(CLAIMED),
+            false,
+            false
         ));
     }
 
@@ -2287,14 +2465,26 @@ mod forced_recovery_tests {
     fn skips_after_first_validation_slot() {
         // One-shot: only the first slot (retries == 0) recovers.
         assert!(!should_attempt_forced_recovery(
-            false, true, 1, true, Some(CLAIMED), false, false
+            false,
+            true,
+            1,
+            true,
+            Some(CLAIMED),
+            false,
+            false
         ));
     }
 
     #[test]
     fn skips_when_no_tools_available() {
         assert!(!should_attempt_forced_recovery(
-            false, true, 0, false, Some(CLAIMED), false, false
+            false,
+            true,
+            0,
+            false,
+            Some(CLAIMED),
+            false,
+            false
         ));
     }
 
@@ -2302,16 +2492,83 @@ mod forced_recovery_tests {
     fn skips_on_genuine_final_answer() {
         // Critical false-positive guard: a real answer must never be hijacked.
         assert!(!should_attempt_forced_recovery(
-            false, true, 0, true, Some(CLEAN), false, false
+            false,
+            true,
+            0,
+            true,
+            Some(CLEAN),
+            false,
+            false
         ));
     }
 
     #[test]
-    fn skips_in_textual_replay_mode() {
-        // TextualReplay legitimately writes call-like prose; validate_response
-        // returns Ok, so recovery must not fire.
+    fn fires_on_named_tool_intent_in_textual_replay_mode() {
+        // TextualReplay legitimately replays bracket tool history, but plain
+        // future-action prose is still a botched tool call.
+        assert!(should_attempt_forced_recovery(
+            false,
+            true,
+            0,
+            true,
+            Some("I can use the `web_fetch` tool to get the content of that URL."),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn fires_on_xml_tool_call_hallucination_in_textual_replay_mode() {
+        // TextualReplay allows our bracket replay format, not arbitrary fake
+        // XML/function-call envelopes emitted as visible answer text.
+        assert!(should_attempt_forced_recovery(
+            false,
+            true,
+            0,
+            true,
+            Some(
+                r#"<xml>
+  <bigtag name="web_search">
+    <arguments>
+      <jsonobject>
+        <parameters>
+          <string>latest news</string>
+        </parameters>
+      </jsonobject>
+    </arguments>
+  </bigtag>
+</xml>"#
+            ),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn fires_on_raw_json_tool_call_hallucination_in_textual_replay_mode() {
+        assert!(should_attempt_forced_recovery(
+            false,
+            true,
+            0,
+            true,
+            Some(
+                r#"{ "name": "exec", "parameters": { "command": "git clone https://github.com/dusterbloom/skybloom", "timeout": 60, "working_dir": "/home/your_user/Dev/nanobot-rs" } }"#,
+            ),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn skips_bracket_history_in_textual_replay_mode() {
         assert!(!should_attempt_forced_recovery(
-            false, true, 0, true, Some(CLAIMED), true, false
+            false,
+            true,
+            0,
+            true,
+            Some("[I called: recall({\"query\":\"peppi\"})]"),
+            true,
+            false
         ));
     }
 }

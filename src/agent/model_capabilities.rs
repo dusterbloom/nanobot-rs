@@ -90,6 +90,12 @@ pub fn lookup_default(model: &str) -> ModelCapabilities {
     lookup(model, &HashMap::new())
 }
 
+/// Models whose local servers can split template reasoning into
+/// `reasoning_content` even when nanobot does not send an explicit budget.
+pub fn prefers_hidden_reasoning(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("vibethinker")
+}
+
 /// Returns true if `name` contains `marker` as a standalone size token.
 ///
 /// A standalone match requires the character immediately before the match to be

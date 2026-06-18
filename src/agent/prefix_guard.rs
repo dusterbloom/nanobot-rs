@@ -113,7 +113,11 @@ mod tests {
             tail.clear();
             tail.push(assistant("replaced"));
         });
-        assert_eq!(&m[..3], &original[..3], "frozen prefix must be byte-identical");
+        assert_eq!(
+            &m[..3],
+            &original[..3],
+            "frozen prefix must be byte-identical"
+        );
         assert_eq!(m.len(), 4, "tail was replaced with one message");
         assert_eq!(m[3], assistant("replaced"));
 
@@ -131,7 +135,11 @@ mod tests {
             assert!(tail.is_empty(), "w>len yields an empty tail");
             tail.push(user("should-not-survive-as-prefix-break"));
         });
-        assert_eq!(&mover[..original.len()], &original[..], "prefix intact when w clamps");
+        assert_eq!(
+            &mover[..original.len()],
+            &original[..],
+            "prefix intact when w clamps"
+        );
     }
 
     // --- Test 2: the append-only invariant (control diverges, treatment holds) ---
@@ -166,13 +174,17 @@ mod tests {
                 crate::agent::anti_drift::pre_completion_pipeline(m, iter, &cfg);
             });
 
-            let fp = fingerprint(&messages, None);
+            let fp = fingerprint(&messages);
             deltas.push(compare(prev.as_ref(), &fp));
             prev = Some(fp);
             watermark = messages.len(); // the "send"
 
             // "response": identical search call each round → drift loop.
-            messages.push(assistant_call("call_search", "web_search", "{\"q\":\"ANE\"}"));
+            messages.push(assistant_call(
+                "call_search",
+                "web_search",
+                "{\"q\":\"ANE\"}",
+            ));
             messages.push(tool_result("call_search", "stale generic results again"));
             // every other round, a filler (polluted) assistant turn.
             if iter % 2 == 0 {
@@ -235,7 +247,10 @@ mod tests {
                     .is_some_and(|s| s.contains("previous similar attempts removed"))
             })
             .count();
-        assert!(collapsed >= 1, "w==0 must still collapse drift; got {collapsed}");
+        assert!(
+            collapsed >= 1,
+            "w==0 must still collapse drift; got {collapsed}"
+        );
     }
 
     // --- Test 4: a tool_call/result pair living in the tail survives ---
@@ -268,7 +283,10 @@ mod tests {
             m.get("role").and_then(|r| r.as_str()) == Some("tool")
                 && m.get("content").and_then(|c| c.as_str()) == Some("fetched body")
         });
-        assert!(kept, "tail-resident tool result with an in-tail call must not be dropped");
+        assert!(
+            kept,
+            "tail-resident tool result with an in-tail call must not be dropped"
+        );
         assert_eq!(messages.len(), 6, "nothing should be removed");
     }
 }

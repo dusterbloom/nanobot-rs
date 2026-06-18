@@ -186,7 +186,9 @@ fn local_last_message_is_user_after_tool_results() {
         tool_result("tc_1", "ls", "Cargo.toml\nsrc/"),
     ];
     let messages = LocalProtocol::native().render("sys", &turns);
-    let last = messages.last().expect("rendered messages must be non-empty");
+    let last = messages
+        .last()
+        .expect("rendered messages must be non-empty");
     assert_eq!(
         role(last),
         "user",
@@ -199,7 +201,9 @@ fn local_last_message_is_user_after_tool_results() {
 fn local_last_message_is_user_simple_qna() {
     let turns = vec![user("what is 2+2?")];
     let messages = LocalProtocol::native().render("sys", &turns);
-    let last = messages.last().expect("rendered messages must be non-empty");
+    let last = messages
+        .last()
+        .expect("rendered messages must be non-empty");
     assert_eq!(role(last), "user");
 }
 

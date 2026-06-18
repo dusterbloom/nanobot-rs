@@ -1186,7 +1186,9 @@ mod tests {
         let rf = find("read_file");
         let lines_desc = rf.pointer("/function/parameters/properties/lines/description");
         assert!(
-            lines_desc.and_then(|v| v.as_str()).is_some_and(|s| s.contains("1:")),
+            lines_desc
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("1:")),
             "read_file lines description must survive slim: {rf:?}"
         );
 

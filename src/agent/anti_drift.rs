@@ -274,10 +274,7 @@ fn collapse_repetitive_attempts(messages: &mut Vec<Value>, min_count: usize) -> 
                     .filter_map(|tc| {
                         let func = tc.get("function")?;
                         let name = func.get("name").and_then(|n| n.as_str())?;
-                        let args = func
-                            .get("arguments")
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("");
+                        let args = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
                         Some(format!("{name}({args})"))
                     })
                     .collect();
@@ -742,7 +739,10 @@ mod tests {
         let mut distinct = vec![asst("src/tui.rs"), asst("src/main.rs"), asst("src/lib.rs")];
         let original = distinct.clone();
         let collapsed = collapse_repetitive_attempts(&mut distinct, 2);
-        assert_eq!(collapsed, 0, "distinct-arg calls must not collapse as drift");
+        assert_eq!(
+            collapsed, 0,
+            "distinct-arg calls must not collapse as drift"
+        );
         assert_eq!(distinct, original, "distinct-arg history must be untouched");
 
         // Same tool, SAME args = genuine drift loop. Still collapses (all but

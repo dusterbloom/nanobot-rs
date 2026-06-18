@@ -1808,7 +1808,11 @@ mod tests {
             json!({"role": "assistant", "content": "a"}),
         ];
         cb.insert_tail_before_user(&mut messages, "TAIL");
-        assert_eq!(messages.len(), 2, "must not insert when array lacks trailing user");
+        assert_eq!(
+            messages.len(),
+            2,
+            "must not insert when array lacks trailing user"
+        );
     }
 
     // ----- _guess_mime -----

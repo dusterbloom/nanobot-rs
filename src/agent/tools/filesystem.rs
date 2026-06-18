@@ -699,9 +699,16 @@ mod tests {
             .execute(make_params(&[("path", file_path.to_str().unwrap())]))
             .await;
 
-        assert!(result.contains("(lines 1-500 of 1200)"), "header: {}", &result[..80]);
+        assert!(
+            result.contains("(lines 1-500 of 1200)"),
+            "header: {}",
+            &result[..80]
+        );
         assert!(result.contains(" 500: line 500"));
-        assert!(!result.contains(" 501: line 501"), "must not dump past the default");
+        assert!(
+            !result.contains(" 501: line 501"),
+            "must not dump past the default"
+        );
         assert!(
             result.contains("read the next chunk with lines=\"501:1200\""),
             "must tell the model the exact next range"
@@ -713,7 +720,10 @@ mod tests {
         // The model can still read the entire file when it needs to: lines="1:".
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("whole.txt");
-        let content = (1..=700).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=700)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(&file_path, &content).unwrap();
 
         let tool = ReadFileTool;
@@ -723,7 +733,10 @@ mod tests {
 
         assert!(result.contains("(lines 1-700 of 700)"));
         assert!(result.contains(" 700: L700"));
-        assert!(!result.contains("more lines"), "full read has no continuation");
+        assert!(
+            !result.contains("more lines"),
+            "full read has no continuation"
+        );
     }
 
     #[tokio::test]
@@ -733,14 +746,20 @@ mod tests {
         // cached prefix instead of re-prefilling. No timestamps/ids may leak in.
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("det.txt");
-        let content = (1..=800).map(|i| format!("x{i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=800)
+            .map(|i| format!("x{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(&file_path, &content).unwrap();
         let tool = ReadFileTool;
         let p = file_path.to_str().unwrap();
 
         let bare1 = tool.execute(make_params(&[("path", p)])).await;
         let bare2 = tool.execute(make_params(&[("path", p)])).await;
-        assert_eq!(bare1, bare2, "bare read must be byte-identical across calls");
+        assert_eq!(
+            bare1, bare2,
+            "bare read must be byte-identical across calls"
+        );
 
         let ranged = |s: &str| {
             let mut m = make_params(&[("path", p)]);

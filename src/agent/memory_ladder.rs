@@ -209,9 +209,7 @@ impl<'a> MemoryLadder<'a> {
                 // runtime at all would panic. Skip the session-search layer in
                 // those cases rather than crash the turn.
                 let multi_thread = tokio::runtime::Handle::try_current()
-                    .map(|h| {
-                        h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-                    })
+                    .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
                     .unwrap_or(false);
                 if !multi_thread {
                     return String::new();

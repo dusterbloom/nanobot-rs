@@ -82,6 +82,8 @@ pub struct SwappableCore {
     pub router_top_p: f64,
     pub specialist_provider: Option<Arc<dyn LLMProvider>>,
     pub specialist_model: Option<String>,
+    pub specialist_temperature: f64,
+    pub specialist_top_p: f64,
     pub tool_delegation_config: ToolDelegationConfig,
     pub provenance_config: ProvenanceConfig,
     pub max_tool_result_chars: usize,
@@ -185,8 +187,11 @@ pub struct RuntimeCounters {
     pub last_actual_completion_tokens: AtomicU64,
     /// Last estimated prompt tokens (our estimate, for comparison).
     pub last_estimated_prompt_tokens: AtomicU64,
-    /// When true, ThinkingDelta tokens are NOT sent to delta_tx (suppressed
-    /// from TTS). Auto-set when voice mode is active; toggled by `/nothink`.
+    /// When true, ThinkingDelta tokens are not sent to delta_tx for visual
+    /// rendering. Toggled by `/nothink` and config-level no-think mode.
+    pub suppress_thinking_display: AtomicBool,
+    /// When true, voice/TTS paths should not speak ThinkingDelta tokens.
+    /// Auto-set while voice mode is active.
     pub suppress_thinking_in_tts: AtomicBool,
     /// Set to true while an LLM call is in flight. The health watchdog reads
     /// this to skip health checks during inference (avoiding false "unhealthy"
@@ -237,6 +242,7 @@ impl RuntimeCounters {
             last_actual_prompt_tokens: AtomicU64::new(0),
             last_actual_completion_tokens: AtomicU64::new(0),
             last_estimated_prompt_tokens: AtomicU64::new(0),
+            suppress_thinking_display: AtomicBool::new(false),
             suppress_thinking_in_tts: AtomicBool::new(false),
             inference_active: Arc::new(AtomicBool::new(false)),
             last_inference_finished_ms: AtomicU64::new(0),
@@ -520,7 +526,15 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
             } else {
                 None
             };
-            crate::providers::factory::from_provider_config_for_model(tr_cfg, model_hint)
+            let default_base = match mode {
+                RuntimeMode::Local { .. } => provider.get_api_base(),
+                RuntimeMode::Cloud => None,
+            };
+            crate::providers::factory::from_provider_config_for_model_with_default_base(
+                tr_cfg,
+                model_hint,
+                default_base,
+            )
         } else {
             provider.clone() // Fallback to main
         };
@@ -596,6 +610,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         router_top_p: trio_config.router_top_p,
         specialist_provider,
         specialist_model,
+        specialist_temperature: trio_config.specialist_temperature,
+        specialist_top_p: trio_config.specialist_top_p,
         tool_delegation_config: tool_delegation,
         provenance_config: provenance,
         max_tool_result_chars,
@@ -650,9 +666,10 @@ fn resolve_memory_provider(
             };
             let mem_provider: Arc<dyn LLMProvider> =
                 if let Some(ref mem_provider_cfg) = memory_config.provider {
-                    crate::providers::factory::from_provider_config_for_model(
+                    crate::providers::factory::from_provider_config_for_model_with_default_base(
                         mem_provider_cfg,
                         Some(&mem_model),
+                        provider.get_api_base(),
                     )
                 } else if let Some(sp) = specialist_provider {
                     // Reuse trio specialist provider when no explicit memory provider.

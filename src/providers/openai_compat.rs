@@ -16,7 +16,9 @@ use tracing::{debug, info, instrument, warn};
 
 use backon::Retryable;
 
-use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest, ToolChoice};
+use super::base::{
+    LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest, ToolChoice,
+};
 use super::constants::{
     ANTHROPIC_API_BASE, DEEPSEEK_API_BASE, GROQ_API_BASE, OPENAI_API_BASE, OPENROUTER_API_BASE,
 };
@@ -280,6 +282,13 @@ fn model_supports_thinking(model: &str) -> bool {
     crate::agent::model_capabilities::lookup_default(model).thinking
 }
 
+/// Models that should keep template thinking enabled by default on local
+/// OpenAI-compatible servers because the server can split it into
+/// `reasoning_content` for the UI.
+fn model_prefers_hidden_reasoning(model: &str) -> bool {
+    crate::agent::model_capabilities::prefers_hidden_reasoning(model)
+}
+
 /// Apply local reasoning controls when talking to localhost.
 ///
 /// - `chat_template_kwargs.enable_thinking` toggles model reasoning mode for
@@ -287,14 +296,14 @@ fn model_supports_thinking(model: &str) -> bool {
 /// - `reasoning_budget` enforces a token budget for reasoning traces.
 /// - `reasoning_format` tells the local server how to split visible vs reasoning text.
 ///
-/// Reasoning params are USER-CONTROLLED via `/think`, not model-gated.
-/// When `thinking_budget` is None, ALL reasoning params are omitted entirely —
-/// non-reasoning models reject unknown fields like `reasoning_budget`.
-/// When `thinking_budget` is Some, params are sent regardless of model capability,
-/// because the user explicitly opted in via `/think`.
+/// `/think` remains the explicit budgeted mode. A small allowlist of local
+/// reasoning-first models keeps hidden reasoning enabled without imposing a
+/// nanobot budget, so servers like Higgs can continue splitting it into
+/// `reasoning_content` on every turn.
 fn apply_local_reasoning_controls(
     body: &mut serde_json::Value,
     api_base: &str,
+    model: &str,
     thinking_budget: Option<u32>,
     supports_thinking: bool,
 ) {
@@ -307,6 +316,11 @@ fn apply_local_reasoning_controls(
             "enable_thinking": true
         });
         body["reasoning_budget"] = serde_json::json!(budget);
+        body["reasoning_format"] = serde_json::json!("deepseek");
+    } else if model_prefers_hidden_reasoning(model) {
+        body["chat_template_kwargs"] = serde_json::json!({
+            "enable_thinking": true
+        });
         body["reasoning_format"] = serde_json::json!("deepseek");
     } else if supports_thinking {
         // Models like Qwen3.5 think by default (template-level). Without
@@ -367,7 +381,10 @@ fn ensure_required_keys(schema: &mut serde_json::Value) {
 fn normalize_tool_schemas(body: &mut serde_json::Value) {
     if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
         for tool in tools.iter_mut() {
-            if let Some(params) = tool.get_mut("function").and_then(|f| f.get_mut("parameters")) {
+            if let Some(params) = tool
+                .get_mut("function")
+                .and_then(|f| f.get_mut("parameters"))
+            {
                 ensure_required_keys(params);
             }
         }
@@ -432,14 +449,14 @@ fn apply_local_thinking_prefill(
     if !supports_thinking {
         return;
     }
-    // Skip prefill when chat_template_kwargs already disables thinking.
+    // Skip prefill when chat_template_kwargs already makes an explicit choice.
     // The prefill hack (`<think>\n</think>`) is an LM Studio workaround;
     // servers like oMLX reject assistant message prefill entirely.
     if body
         .get("chat_template_kwargs")
         .and_then(|v| v.get("enable_thinking"))
         .and_then(|v| v.as_bool())
-        == Some(false)
+        .is_some()
     {
         return;
     }
@@ -632,6 +649,7 @@ impl OpenAICompatProvider {
         apply_local_reasoning_controls(
             &mut body,
             &self.api_base,
+            model,
             thinking_budget,
             supports_thinking,
         );
@@ -941,6 +959,7 @@ impl LLMProvider for OpenAICompatProvider {
         apply_local_reasoning_controls(
             &mut body,
             &self.api_base,
+            model,
             thinking_budget,
             supports_thinking,
         );
@@ -1541,9 +1560,10 @@ async fn parse_sse_stream(
                                         if let Some(s) = args_val.as_str() {
                                             entry.2.push_str(s);
                                         } else if args_val.is_object() || args_val.is_array() {
-                                            entry
-                                                .2
-                                                .push_str(&serde_json::to_string(args_val).unwrap_or_default());
+                                            entry.2.push_str(
+                                                &serde_json::to_string(args_val)
+                                                    .unwrap_or_default(),
+                                            );
                                         }
                                     }
                                 }
@@ -1659,7 +1679,11 @@ mod tests {
         // no-arg tool (the check_inbox case)
         let mut s = serde_json::json!({"type":"object","properties":{}});
         ensure_required_keys(&mut s);
-        assert_eq!(s["required"], serde_json::json!([]), "no-arg object must gain required:[]");
+        assert_eq!(
+            s["required"],
+            serde_json::json!([]),
+            "no-arg object must gain required:[]"
+        );
 
         // nested object property must also be normalized; existing required kept
         let mut s2 = serde_json::json!({
@@ -1668,7 +1692,11 @@ mod tests {
             "required":["inner"]
         });
         ensure_required_keys(&mut s2);
-        assert_eq!(s2["required"], serde_json::json!(["inner"]), "existing required preserved");
+        assert_eq!(
+            s2["required"],
+            serde_json::json!(["inner"]),
+            "existing required preserved"
+        );
         assert_eq!(
             s2["properties"]["inner"]["required"],
             serde_json::json!([]),
@@ -2254,6 +2282,7 @@ mod tests {
         apply_local_reasoning_controls(
             &mut local_body,
             "http://localhost:18080/v1",
+            "qwen3-1.7b",
             Some(4096),
             true,
         );
@@ -2265,6 +2294,7 @@ mod tests {
         apply_local_reasoning_controls(
             &mut remote_body,
             "https://api.openai.com/v1",
+            "gpt-4o",
             Some(4096),
             true,
         );
@@ -2342,7 +2372,13 @@ mod tests {
     #[test]
     fn test_reasoning_params_not_sent_for_non_thinking_model() {
         let mut body = serde_json::json!({"model": "nanbeige-16b", "messages": []});
-        apply_local_reasoning_controls(&mut body, "http://localhost:1234", None, false);
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://localhost:1234",
+            "nanbeige-16b",
+            None,
+            false,
+        );
         assert!(body.get("reasoning_budget").is_none());
         assert!(body.get("reasoning_format").is_none());
         assert!(body.get("chat_template_kwargs").is_none());
@@ -2351,7 +2387,13 @@ mod tests {
     #[test]
     fn test_reasoning_params_sent_for_thinking_model() {
         let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": []});
-        apply_local_reasoning_controls(&mut body, "http://localhost:1234", Some(1024), true);
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://localhost:1234",
+            "qwen3-1.7b",
+            Some(1024),
+            true,
+        );
         assert_eq!(body["reasoning_budget"], 1024);
         assert_eq!(body["reasoning_format"], "deepseek");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
@@ -2360,7 +2402,13 @@ mod tests {
     #[test]
     fn test_reasoning_disabled_for_thinking_model() {
         let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": []});
-        apply_local_reasoning_controls(&mut body, "http://localhost:1234", None, true);
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://localhost:1234",
+            "qwen3-1.7b",
+            None,
+            true,
+        );
         assert!(
             body.get("reasoning_budget").is_none(),
             "reasoning_budget should not be sent"
@@ -2368,6 +2416,43 @@ mod tests {
         assert!(
             body.get("reasoning_format").is_none(),
             "reasoning_format should not be sent"
+        );
+    }
+
+    #[test]
+    fn test_vibethinker_keeps_hidden_reasoning_enabled_by_default() {
+        let mut body = serde_json::json!({
+            "model": "VibeThinker-3B-mlx-8Bit",
+            "messages": []
+        });
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://127.0.0.1:8000/v1",
+            "VibeThinker-3B-mlx-8Bit",
+            None,
+            false,
+        );
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["reasoning_format"], "deepseek");
+        assert!(
+            body.get("reasoning_budget").is_none(),
+            "default-on hidden reasoning must not impose a nanobot budget"
+        );
+    }
+
+    #[test]
+    fn test_thinking_prefill_skips_explicit_enable_true() {
+        let mut body = serde_json::json!({
+            "model": "VibeThinker-3B-mlx-8Bit",
+            "chat_template_kwargs": {"enable_thinking": true},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        apply_local_thinking_prefill(&mut body, "http://localhost:1234", None, true);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "prefill must not close a think block when thinking is explicitly enabled"
         );
     }
 
@@ -2840,7 +2925,10 @@ mod tests {
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].name, "web_search");
         assert_eq!(
-            resp.tool_calls[0].arguments.get("query").and_then(|v| v.as_str()),
+            resp.tool_calls[0]
+                .arguments
+                .get("query")
+                .and_then(|v| v.as_str()),
             Some("latest space news"),
             "object-form streamed arguments must survive, not drop to empty"
         );

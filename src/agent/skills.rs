@@ -1374,12 +1374,24 @@ mod tests {
             result
         );
         // Capped at k=2 ranked (non-always) skills.
-        assert_eq!(result.len(), 2, "should return k=2 ranked skills, got: {:?}", result);
+        assert_eq!(
+            result.len(),
+            2,
+            "should return k=2 ranked skills, got: {:?}",
+            result
+        );
         // Every returned name is a real, non-always discovered skill.
-        let known: HashSet<String> =
-            loader.list_skills(false).into_iter().map(|s| s.name).collect();
+        let known: HashSet<String> = loader
+            .list_skills(false)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         for name in &result {
-            assert!(known.contains(name), "unknown skill name returned: {}", name);
+            assert!(
+                known.contains(name),
+                "unknown skill name returned: {}",
+                name
+            );
             assert_ne!(name, "always-one");
         }
     }

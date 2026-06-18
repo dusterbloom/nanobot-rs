@@ -2064,6 +2064,172 @@ impl LLMProvider for SequenceProvider {
     }
 }
 
+struct ResponseSequenceProvider {
+    name: String,
+    responses: parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
+    call_count: std::sync::atomic::AtomicU32,
+}
+
+impl ResponseSequenceProvider {
+    fn new(name: &str, responses: Vec<crate::providers::base::LLMResponse>) -> Self {
+        Self {
+            name: name.to_string(),
+            responses: parking_lot::Mutex::new(responses.into()),
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn call_count(&self) -> u32 {
+        self.call_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl LLMProvider for ResponseSequenceProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let response = {
+            let mut deque = self.responses.lock();
+            deque.pop_front()
+        };
+        Ok(
+            response.unwrap_or_else(|| crate::providers::base::LLMResponse {
+                content: Some("ERROR: no responses left in ResponseSequenceProvider".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            }),
+        )
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+}
+
+struct FailOnceThenResponseProvider {
+    name: String,
+    response: crate::providers::base::LLMResponse,
+    call_count: std::sync::atomic::AtomicU32,
+}
+
+impl FailOnceThenResponseProvider {
+    fn new(name: &str, response: crate::providers::base::LLMResponse) -> Self {
+        Self {
+            name: name.to_string(),
+            response,
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for FailOnceThenResponseProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        let call = self
+            .call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call == 0 {
+            anyhow::bail!("synthetic provider failure");
+        }
+        Ok(self.response.clone())
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+}
+
+struct StreamingThinkingProvider {
+    name: String,
+    last_thinking_budget: std::sync::atomic::AtomicU32,
+}
+
+impl StreamingThinkingProvider {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            last_thinking_budget: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn last_thinking_budget(&self) -> u32 {
+        self.last_thinking_budget
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl LLMProvider for StreamingThinkingProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        anyhow::bail!("StreamingThinkingProvider only supports chat_stream")
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::StreamHandle> {
+        self.last_thinking_budget.store(
+            thinking_budget.unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(crate::providers::base::StreamChunk::ThinkingDelta(
+            "private thought".to_string(),
+        ));
+        let _ = tx.send(crate::providers::base::StreamChunk::TextDelta(
+            "visible answer".to_string(),
+        ));
+        let _ = tx.send(crate::providers::base::StreamChunk::Done(
+            crate::providers::base::LLMResponse {
+                content: Some("visible answer".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+        ));
+        Ok(crate::providers::base::StreamHandle { rx })
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+}
+
 struct RecordingProvider {
     name: String,
     response: String,
@@ -2196,6 +2362,634 @@ fn build_trio_offline_harness(
     );
 
     (agent_loop, workspace)
+}
+
+fn build_local_inline_harness(main: Arc<dyn LLMProvider>) -> (AgentLoop, std::path::PathBuf) {
+    build_local_inline_harness_with_model(main, "local-qwen-test")
+}
+
+fn build_local_inline_harness_with_model(
+    main: Arc<dyn LLMProvider>,
+    model: &str,
+) -> (AgentLoop, std::path::PathBuf) {
+    use crate::config::schema::LcmSchemaConfig;
+
+    let workspace = tempfile::tempdir().unwrap().into_path();
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider: main,
+        workspace: workspace.clone(),
+        model: model.to_string(),
+        max_iterations: 5,
+        max_continuations: 2,
+        max_tokens: 512,
+        temperature: 0.3,
+        max_context_tokens: 4096,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: true,
+        memory_config: MemoryConfig::default(),
+        is_local: true,
+        local_tool_mode: crate::config::schema::LocalToolMode::default(),
+        lane: Lane::default(),
+        compaction_provider: None,
+        tool_delegation: ToolDelegationConfig::default(),
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        delegation_provider: None,
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+    });
+
+    let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+    let core_handle = AgentHandle::new(core, counters);
+
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+
+    let agent_loop = AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx,
+        None,
+        1,
+        None,
+        None,
+        None,
+        ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    );
+
+    (agent_loop, workspace)
+}
+
+static NANOBOT_LOCAL_TAIL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    saved: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn remove(key: &'static str) -> Self {
+        let saved = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, saved }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(value) = self.saved.take() {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_tool_call_carrier_persists_before_tool_result() {
+    let mut args = std::collections::HashMap::new();
+    args.insert("path".to_string(), json!("."));
+    let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_list".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments: args,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+            crate::providers::base::LLMResponse {
+                content: Some("I listed the workspace.".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+        ],
+    ));
+    let (agent_loop, workspace) = build_local_inline_harness(main);
+    let session_key = format!("test-tool-order-{}", uuid::Uuid::new_v4().to_string());
+
+    let response = agent_loop
+        .process_direct("please list files", &session_key, "test", "offline")
+        .await;
+    assert_eq!(response, "I listed the workspace.");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("session should exist");
+    let raw = core.sessions.get_all_messages(&meta.id).await;
+    let roles: Vec<&str> = raw
+        .iter()
+        .map(|m| m.get("role").and_then(|r| r.as_str()).unwrap_or(""))
+        .collect();
+
+    assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
+    assert!(
+        raw[1].get("tool_calls").is_some(),
+        "assistant carrier must retain tool_calls"
+    );
+    assert_eq!(
+        raw[2].get("tool_call_id").and_then(|v| v.as_str()),
+        raw[1]
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .and_then(|calls| calls.first())
+            .and_then(|call| call.get("id"))
+            .and_then(|v| v.as_str()),
+        "tool result must point at the immediately preceding assistant call"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_multiple_tool_round_carriers_persist_in_order() {
+    let mut list_args = std::collections::HashMap::new();
+    list_args.insert("path".to_string(), json!("."));
+    let mut exec_args = std::collections::HashMap::new();
+    exec_args.insert("command".to_string(), json!("printf ok"));
+    exec_args.insert("working_dir".to_string(), json!("."));
+
+    let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_list".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments: list_args,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+            crate::providers::base::LLMResponse {
+                content: Some("I found the script; running it now.".to_string()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_exec".to_string(),
+                    name: "exec".to_string(),
+                    arguments: exec_args,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+            crate::providers::base::LLMResponse {
+                content: Some("Done.".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+        ],
+    ));
+    let (agent_loop, workspace) = build_local_inline_harness(main);
+    let session_key = format!("test-tool-order-multi-{}", uuid::Uuid::new_v4().to_string());
+
+    let response = agent_loop
+        .process_direct("please inspect and run", &session_key, "test", "offline")
+        .await;
+    assert_eq!(response, "Done.");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("session should exist");
+    let raw = core.sessions.get_all_messages(&meta.id).await;
+    let roles: Vec<&str> = raw
+        .iter()
+        .map(|m| m.get("role").and_then(|r| r.as_str()).unwrap_or(""))
+        .collect();
+
+    assert_eq!(
+        roles,
+        vec![
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant"
+        ]
+    );
+    assert!(raw[1].get("tool_calls").is_some());
+    assert!(raw[3].get("tool_calls").is_some());
+    assert_eq!(
+        raw[2].get("tool_call_id").and_then(|v| v.as_str()),
+        Some("tc_list")
+    );
+    assert_eq!(
+        raw[4].get("tool_call_id").and_then(|v| v.as_str()),
+        Some("tc_exec")
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_local_truncated_response_does_not_hidden_auto_continue() {
+    let main = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![crate::providers::base::LLMResponse {
+            content: Some("Partial local answer".to_string()),
+            tool_calls: vec![],
+            finish_reason: "length".to_string(),
+            usage: std::collections::HashMap::new(),
+        }],
+    ));
+    let main_dyn: Arc<dyn LLMProvider> = main.clone();
+    let (agent_loop, workspace) = build_local_inline_harness(main_dyn);
+    let session_key = format!(
+        "test-local-no-auto-continue-{}",
+        uuid::Uuid::new_v4().to_string()
+    );
+
+    let response = agent_loop
+        .process_direct("answer briefly", &session_key, "test", "offline")
+        .await;
+
+    assert_eq!(response, "Partial local answer");
+    assert_eq!(
+        main.call_count(),
+        1,
+        "local truncation must not issue a hidden Continue prompt that poisons the prefix cache"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_local_streaming_cache_markers_append_only_across_turns() {
+    let _local_tail_lock = NANOBOT_LOCAL_TAIL_TEST_LOCK.lock().await;
+    let _tail_guard = EnvVarGuard::remove("NANOBOT_LOCAL_TAIL");
+
+    let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some("one".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+            crate::providers::base::LLMResponse {
+                content: Some("two".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+            crate::providers::base::LLMResponse {
+                content: Some("three".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+        ],
+    ));
+    let (agent_loop, workspace) = build_local_inline_harness(main);
+    let session_key = format!(
+        "test-local-cache-markers-{}",
+        uuid::Uuid::new_v4().to_string()
+    );
+
+    let mut cache_markers = Vec::new();
+    let mut prefill_estimates = Vec::new();
+    for (input, expected) in [
+        ("first short turn", "one"),
+        ("second short turn", "two"),
+        ("third short turn", "three"),
+    ] {
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let response = agent_loop
+            .process_direct_streaming(
+                input,
+                &session_key,
+                "test",
+                "offline",
+                None,
+                delta_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response, expected);
+
+        let mut turn_cache_markers = Vec::new();
+        let mut turn_prefill_estimates = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            if delta.starts_with("\u{0}cache:") {
+                turn_cache_markers.push(delta);
+            } else if delta.starts_with("\u{0}prefill_estimate:") {
+                turn_prefill_estimates.push(delta);
+            }
+        }
+        assert_eq!(
+            turn_cache_markers.len(),
+            1,
+            "each streamed turn should emit one cache marker"
+        );
+        assert_eq!(
+            turn_prefill_estimates.len(),
+            1,
+            "each streamed turn should emit one prefill estimate"
+        );
+        cache_markers.push(turn_cache_markers.remove(0));
+        prefill_estimates.push(turn_prefill_estimates.remove(0));
+    }
+
+    assert!(
+        cache_markers[0].starts_with("\u{0}cache:first:"),
+        "first turn should establish the cache: {cache_markers:?}"
+    );
+    assert!(
+        cache_markers[1].starts_with("\u{0}cache:append:2:"),
+        "second turn should append user+assistant history, not reset: {cache_markers:?}"
+    );
+    assert!(
+        cache_markers[2].starts_with("\u{0}cache:append:2:"),
+        "third turn should remain append-only: {cache_markers:?}"
+    );
+    assert!(
+        cache_markers
+            .iter()
+            .all(|marker| !marker.starts_with("\u{0}cache:diverged:")),
+        "local cache path must not diverge across ordinary turns: {cache_markers:?}"
+    );
+    for marker in &prefill_estimates {
+        let tokens: usize = marker
+            .trim_start_matches("\u{0}prefill_estimate:")
+            .parse()
+            .expect("prefill estimate token count");
+        assert!(tokens > 0, "prefill estimate must be positive: {marker:?}");
+    }
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_failed_local_call_does_not_seed_prompt_cache_marker() {
+    let _local_tail_lock = NANOBOT_LOCAL_TAIL_TEST_LOCK.lock().await;
+    let _tail_guard = EnvVarGuard::remove("NANOBOT_LOCAL_TAIL");
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(FailOnceThenResponseProvider::new(
+        "local-main",
+        crate::providers::base::LLMResponse {
+            content: Some("recovered".to_string()),
+            tool_calls: vec![],
+            finish_reason: "stop".to_string(),
+            usage: std::collections::HashMap::new(),
+        },
+    ));
+    let (agent_loop, workspace) = build_local_inline_harness(provider);
+    let session_key = format!(
+        "test-local-cache-failure-{}",
+        uuid::Uuid::new_v4().to_string()
+    );
+
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let first = agent_loop
+        .process_direct_streaming(
+            "first turn fails before the server can warm cache",
+            &session_key,
+            "test",
+            "offline",
+            None,
+            first_tx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        first.contains("synthetic provider failure"),
+        "expected provider error, got {first:?}"
+    );
+    let mut first_markers = Vec::new();
+    while let Ok(delta) = first_rx.try_recv() {
+        if delta.starts_with("\u{0}cache:") {
+            first_markers.push(delta);
+        }
+    }
+    assert!(
+        first_markers
+            .first()
+            .is_some_and(|m| m.starts_with("\u{0}cache:first:")),
+        "failed call may diagnose cold cache, but must not commit it: {first_markers:?}"
+    );
+
+    let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let second = agent_loop
+        .process_direct_streaming(
+            "second turn should still be cold from nanobot's cache model",
+            &session_key,
+            "test",
+            "offline",
+            None,
+            second_tx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(second, "recovered");
+
+    let mut second_markers = Vec::new();
+    while let Ok(delta) = second_rx.try_recv() {
+        if delta.starts_with("\u{0}cache:") {
+            second_markers.push(delta);
+        }
+    }
+    assert!(
+        second_markers
+            .first()
+            .is_some_and(|m| m.starts_with("\u{0}cache:first:")),
+        "a failed provider call must not make the next turn look append-only: {second_markers:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_direct_streaming_forwards_thinking_delta_with_ansi_marker() {
+    let main = Arc::new(StreamingThinkingProvider::new("local-main"));
+    let main_dyn: Arc<dyn LLMProvider> = main.clone();
+    let (agent_loop, workspace) = build_local_inline_harness(main_dyn);
+    agent_loop
+        .shared
+        .core_handle
+        .counters
+        .thinking_budget
+        .store(128, std::sync::atomic::Ordering::Relaxed);
+    let session_key = format!(
+        "test-direct-thinking-stream-{}",
+        uuid::Uuid::new_v4().to_string()
+    );
+
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let response = agent_loop
+        .process_direct_streaming(
+            "show thinking",
+            &session_key,
+            "test",
+            "offline",
+            None,
+            delta_tx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert_eq!(response, "visible answer");
+    assert_eq!(
+        main.last_thinking_budget(),
+        128,
+        "direct streaming call should pass the enabled thinking budget to the provider"
+    );
+
+    let mut deltas = Vec::new();
+    while let Ok(delta) = delta_rx.try_recv() {
+        deltas.push(delta);
+    }
+    let marker_idx = deltas
+        .iter()
+        .position(|delta| delta == "\x1b[90m\x1b[2m")
+        .unwrap_or_else(|| panic!("missing thinking marker in deltas: {deltas:?}"));
+    assert_eq!(
+        deltas.get(marker_idx + 1).map(String::as_str),
+        Some("private thought"),
+        "thinking text should immediately follow the ANSI marker: {deltas:?}"
+    );
+    assert!(
+        deltas.iter().any(|delta| delta == "\x1b[0m\n\n"),
+        "thinking stream should be reset before visible text: {deltas:?}"
+    );
+    assert!(
+        deltas.iter().any(|delta| delta == "visible answer"),
+        "visible answer text should still stream after thinking: {deltas:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_vibethinker_hidden_reasoning_streams_without_think_budget() {
+    let main = Arc::new(StreamingThinkingProvider::new("VibeThinker-3B-mlx-8Bit"));
+    let main_dyn: Arc<dyn LLMProvider> = main.clone();
+    let (agent_loop, workspace) =
+        build_local_inline_harness_with_model(main_dyn, "local:VibeThinker-3B-mlx-8Bit");
+    let session_key = format!(
+        "test-vibethinker-hidden-thinking-{}",
+        uuid::Uuid::new_v4().to_string()
+    );
+
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let response = agent_loop
+        .process_direct_streaming(
+            "show native thinking",
+            &session_key,
+            "test",
+            "offline",
+            None,
+            delta_tx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert_eq!(response, "visible answer");
+    assert_eq!(
+        main.last_thinking_budget(),
+        0,
+        "hidden reasoning should not impose a nanobot thinking budget"
+    );
+
+    let mut deltas = Vec::new();
+    while let Ok(delta) = delta_rx.try_recv() {
+        deltas.push(delta);
+    }
+    assert!(
+        deltas.iter().any(|delta| delta == "\x1b[90m\x1b[2m"),
+        "VibeThinker reasoning_content should stream to display without /think: {deltas:?}"
+    );
+    assert!(
+        deltas.iter().any(|delta| delta == "private thought"),
+        "hidden reasoning text should not be dropped: {deltas:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_tts_suppression_does_not_hide_vibethinker_display() {
+    let main = Arc::new(StreamingThinkingProvider::new("VibeThinker-3B-mlx-8Bit"));
+    let main_dyn: Arc<dyn LLMProvider> = main.clone();
+    let (agent_loop, workspace) =
+        build_local_inline_harness_with_model(main_dyn, "local:VibeThinker-3B-mlx-8Bit");
+    agent_loop
+        .shared
+        .core_handle
+        .counters
+        .suppress_thinking_in_tts
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let session_key = format!(
+        "test-vibethinker-tts-suppression-display-{}",
+        uuid::Uuid::new_v4().to_string()
+    );
+
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let response = agent_loop
+        .process_direct_streaming(
+            "show native thinking while voice is on",
+            &session_key,
+            "test",
+            "offline",
+            None,
+            delta_tx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert_eq!(response, "visible answer");
+    let mut deltas = Vec::new();
+    while let Ok(delta) = delta_rx.try_recv() {
+        deltas.push(delta);
+    }
+    assert!(
+        deltas.iter().any(|delta| delta == "private thought"),
+        "TTS suppression should not suppress the visual thinking stream: {deltas:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 // -----------------------------------------------------------------------

@@ -364,7 +364,10 @@ mod tests {
             10_000,
         );
         let count = pack.matches("UNIQUE_OBJECTIVE_XYZ").count();
-        assert_eq!(count, 1, "objective must appear exactly once, got {count} in:\n{pack}");
+        assert_eq!(
+            count, 1,
+            "objective must appear exactly once, got {count} in:\n{pack}"
+        );
     }
 
     // I3 — actions/tools live in the router *system* message; the Role::Router
@@ -380,7 +383,10 @@ mod tests {
             &tools,
             10_000,
         );
-        assert!(router.contains("task-state"), "router pack must carry task state");
+        assert!(
+            router.contains("task-state"),
+            "router pack must carry task state"
+        );
         assert!(
             !router.contains("Available tools:"),
             "router pack must not duplicate the tool list (it's in the system msg); got:\n{router}"

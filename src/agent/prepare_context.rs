@@ -111,6 +111,18 @@ fn build_local_tail(core: &Arc<SwappableCore>, session_key: &str, query: &str) -
     )
 }
 
+fn local_tail_enabled() -> bool {
+    std::env::var("NANOBOT_LOCAL_TAIL")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 impl AgentLoopShared {
     pub(crate) async fn build_local_runtime_blocks(
         &self,
@@ -572,16 +584,19 @@ impl AgentLoopShared {
             }
         }
 
-        // Per-turn query-aware TAIL block (local only): relevant skills + memory
-        // placed AFTER history, immediately before the user message, so the bulk
-        // KV prefix [system + history] stays cached across turns (divergence
-        // lands at the tail, not at messages[0]). Skipped when the legacy
-        // always-on env injects memory into the static prefix (avoids double
-        // memory) and killable via NANOBOT_LOCAL_TAIL=0. `new_start` is bumped
-        // so the tail is excluded from session persistence.
+        // Optional per-turn query-aware TAIL block (local only): relevant skills
+        // + memory placed AFTER history, immediately before the user message.
+        //
+        // This is opt-in because local protocol merges consecutive user messages;
+        // if the tail is excluded from session persistence, turn N sends
+        // "tail + user" while turn N+1 replays only "user", forcing a prefix-cache
+        // divergence at the prior user message every turn. Exact Higgs/LM Studio
+        // cache reuse is the default; set NANOBOT_LOCAL_TAIL=1 to trade that for
+        // per-turn retrieved context. `new_start` is bumped so the tail remains
+        // ephemeral when enabled.
         if core.context.local_prompt_mode
             && std::env::var("NANOBOT_LOCAL_ALWAYS_ON_MEMORY").is_err()
-            && std::env::var("NANOBOT_LOCAL_TAIL").as_deref() != Ok("0")
+            && local_tail_enabled()
         {
             let query = turn_query(&msg.content);
             let tail = build_local_tail(&core, &session_key, &query);
@@ -698,12 +713,43 @@ mod tests {
     use crate::agent::prompt_fingerprint::{compare, fingerprint, PromptDelta};
     use serde_json::json;
 
-    /// The whole point of tail placement: a per-turn block before the user
-    /// message must NOT invalidate the bulk [system + history] KV prefix. This
-    /// models the local rendered wire (post-merge) for two consecutive turns and
-    /// asserts divergence lands AFTER the history — not at message 0/1.
+    /// With no ephemeral local tail, turn N is an exact prefix of turn N+1:
+    /// [system + history + current_user] becomes
+    /// [system + history + current_user + assistant + next_user].
     #[test]
-    fn test_tail_placement_preserves_bulk_history_prefix() {
+    fn test_no_local_tail_is_append_only_across_turns() {
+        let system = json!({"role": "system", "content": "STATIC PREFIX (identity+skills)"});
+        let h_user1 = json!({"role": "user", "content": "first question"});
+        let h_asst1 = json!({"role": "assistant", "content": "first answer"});
+
+        let turn_n = vec![
+            system.clone(),
+            h_user1.clone(),
+            h_asst1.clone(),
+            json!({"role": "user", "content": "second question"}),
+        ];
+        let turn_n1 = vec![
+            system,
+            h_user1,
+            h_asst1,
+            json!({"role": "user", "content": "second question"}),
+            json!({"role": "assistant", "content": "second answer"}),
+            json!({"role": "user", "content": "third question"}),
+        ];
+
+        let fp_n = fingerprint(&turn_n);
+        let fp_n1 = fingerprint(&turn_n1);
+        assert_eq!(
+            compare(Some(&fp_n), &fp_n1),
+            PromptDelta::AppendOnly { added_msgs: 2 }
+        );
+    }
+
+    /// Tail placement is still useful as an opt-in relevance tradeoff, but the
+    /// local protocol merge means the prior user message changes on replay.
+    /// This documents why the local tail is not the default cache path.
+    #[test]
+    fn test_local_tail_diverges_at_prior_user_message() {
         let system = json!({"role": "system", "content": "STATIC PREFIX (identity+skills)"});
         let h_user1 = json!({"role": "user", "content": "first question"});
         let h_asst1 = json!({"role": "assistant", "content": "first answer"});
@@ -726,19 +772,18 @@ mod tests {
             json!({"role": "user", "content": "<relevant_context>N+1</relevant_context>\n\nthird question"}),
         ];
 
-        let fp_n = fingerprint(&turn_n, None);
-        let fp_n1 = fingerprint(&turn_n1, None);
+        let fp_n = fingerprint(&turn_n);
+        let fp_n1 = fingerprint(&turn_n1);
         match compare(Some(&fp_n), &fp_n1) {
             PromptDelta::Diverged {
                 first_divergent_msg,
                 ..
             } => {
-                // Indices 0,1,2 (system + the bulk history) are byte-identical and
-                // stay cached; divergence is at index 3, where turn N carried the
-                // merged tail+user and turn N+1 has the raw user from history.
+                // Indices 0,1,2 (system + older history) are byte-identical and
+                // stay cached, but the previous user message itself re-prefills.
                 assert_eq!(
                     first_divergent_msg, 3,
-                    "bulk [system+history] prefix must survive; only the tail re-prefills"
+                    "ephemeral local tail makes the prior user message diverge"
                 );
             }
             other => panic!("expected Diverged at the tail, got {:?}", other),
@@ -758,28 +803,42 @@ mod tests {
             json!({"role": "system", "content": "STATIC + <relevant_context>N+1</relevant_context>"}),
             json!({"role": "user", "content": "second question"}),
         ];
-        let fp_n = fingerprint(&prefix_n, None);
-        let fp_n1 = fingerprint(&prefix_n1, None);
+        let fp_n = fingerprint(&prefix_n);
+        let fp_n1 = fingerprint(&prefix_n1);
         match compare(Some(&fp_n), &fp_n1) {
             PromptDelta::Diverged {
                 first_divergent_msg,
                 ..
-            } => assert_eq!(first_divergent_msg, 0, "static-prefix injection busts the whole cache"),
+            } => assert_eq!(
+                first_divergent_msg, 0,
+                "static-prefix injection busts the whole cache"
+            ),
             other => panic!("expected head divergence, got {:?}", other),
         }
     }
 
     #[test]
     fn test_turn_query_passes_short_input_trimmed() {
-        assert_eq!(turn_query("  how do I parse JSON?  "), "how do I parse JSON?");
+        assert_eq!(
+            turn_query("  how do I parse JSON?  "),
+            "how do I parse JSON?"
+        );
     }
 
     #[test]
     fn test_turn_query_truncates_long_input() {
         let long = "a".repeat(1000);
         let q = turn_query(&long);
-        assert!(q.len() <= 256, "query should be capped at 256, got {}", q.len());
-        assert!(q.len() >= 250, "should keep most of the cap, got {}", q.len());
+        assert!(
+            q.len() <= 256,
+            "query should be capped at 256, got {}",
+            q.len()
+        );
+        assert!(
+            q.len() >= 250,
+            "should keep most of the cap, got {}",
+            q.len()
+        );
     }
 
     #[test]

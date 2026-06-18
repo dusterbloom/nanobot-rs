@@ -956,7 +956,11 @@ mod tests {
             Some("claude-opus-4-6")
         ));
         // No delegation model resolved → cannot reuse.
-        assert!(!delegation_reuses_main_local_model(true, "local:qwen36-35b", None));
+        assert!(!delegation_reuses_main_local_model(
+            true,
+            "local:qwen36-35b",
+            None
+        ));
     }
 
     #[test]
@@ -974,12 +978,21 @@ mod tests {
         // ran side-effect + reported -> do NOT arm (the regression being fixed:
         // narrated consecutive exec/write_file chains were being rejected ~1/3
         // of the time)
-        assert!(!should_arm_boundary(Some("Running wc -l to size the files."), &["exec"]));
-        assert!(!should_arm_boundary(Some("Writing the summary now."), &["write_file"]));
+        assert!(!should_arm_boundary(
+            Some("Running wc -l to size the files."),
+            &["exec"]
+        ));
+        assert!(!should_arm_boundary(
+            Some("Writing the summary now."),
+            &["write_file"]
+        ));
 
         // no side-effect tool ran -> never arm, report or not
         assert!(!should_arm_boundary(None, &["read_file", "list_dir"]));
-        assert!(!should_arm_boundary(Some("here are the files"), &["read_file"]));
+        assert!(!should_arm_boundary(
+            Some("here are the files"),
+            &["read_file"]
+        ));
         assert!(!should_arm_boundary(None, &[]));
     }
 

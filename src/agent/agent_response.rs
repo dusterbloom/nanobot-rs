@@ -200,13 +200,25 @@ fn send_token_count(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, tok
     }
 }
 
+/// Stream the provider-reported prompt-token count to the TUI. This lets the
+/// UI compute effective prefill throughput even when the local server does not
+/// stream prompt_progress chunks.
+fn send_prompt_token_count(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, tokens: u64) {
+    if let Some(ref tx) = tx {
+        let _ = tx.send(format!("\x00prompt_tokens:{}", tokens));
+    }
+}
+
 /// Maximum auto-continuations when the turn's output is being spoken (voice/TTS).
 /// A rambling local model would otherwise re-synthesize dozens of chunks.
 const VOICE_MAX_CONTINUATIONS: u32 = 4;
 
 /// Normalize whitespace and case for loose repetition comparison.
 fn normalize_for_repeat(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// True when an auto-continuation adds nothing new: it is empty, identical to
@@ -547,11 +559,19 @@ impl AgentLoopShared {
         mut accumulated: String,
     ) -> String {
         let counters = &self.core_handle.counters;
+        if ctx.core.mode().is_local() {
+            info!(
+                finish_reason = %original_response.finish_reason,
+                "auto_continue_skipped_local: preserving prefix cache instead of issuing hidden Continue prompt"
+            );
+            return accumulated;
+        }
+
         // Voice/TTS turns cap continuations hard: a rambling local model would
         // otherwise re-synthesize dozens of chunks. `is_voice_message` covers
         // channel voice notes; `suppress_thinking_in_tts` covers REPL voice mode.
-        let voice_active = ctx.is_voice_message
-            || counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
+        let voice_active =
+            ctx.is_voice_message || counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
         let max_cont = if voice_active {
             ctx.core.max_continuations.min(VOICE_MAX_CONTINUATIONS)
         } else {
@@ -731,6 +751,7 @@ impl AgentLoopShared {
             counters
                 .last_actual_prompt_tokens
                 .store(actual_prompt as u64, Ordering::Relaxed);
+            send_prompt_token_count(&ctx.text_delta_tx, actual_prompt as u64);
         }
         if actual_completion > 0 {
             counters

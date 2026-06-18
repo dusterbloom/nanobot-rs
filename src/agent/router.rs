@@ -536,7 +536,7 @@ pub async fn request_strict_router_decision(
 
     let json_system = format!(
         "Output EXACTLY one JSON object. No markdown, no explanation, no extra text.\n\
-         Schema: {{\"action\":\"respond|tool|specialist|ask_user\",\"target\":\"string\",\"args\":{{}},\"confidence\":0.0-1.0}}\n\
+         Schema: {{\"action\":\"respond|tool|subagent|specialist|ask_user|pipeline\",\"target\":\"string\",\"args\":{{}},\"confidence\":0.0-1.0}}\n\
          {}\n\
          Examples:\n\
          User says hello → {{\"action\":\"respond\",\"target\":\"main\",\"args\":{{}},\"confidence\":0.95}}\n\
@@ -666,7 +666,14 @@ pub(crate) async fn dispatch_specialist(
         core.tool_delegation_config.router_tuning.tail_max_chars,
     );
     let specialist_pack = if core.tool_delegation_config.role_scoped_context_packs {
-        role_policy::build_specialist_pack(target, router_args, user_content, &conv_tail, tool_list, 3000)
+        role_policy::build_specialist_pack(
+            target,
+            router_args,
+            user_content,
+            &conv_tail,
+            tool_list,
+            3000,
+        )
     } else {
         format!(
             "Target: {}\nRouter args: {}\nUser intent: {}",
@@ -691,9 +698,9 @@ pub(crate) async fn dispatch_specialist(
             None,
             Some(&specialist_model),
             core.tool_delegation_config.max_tokens,
-            0.3,
+            core.specialist_temperature,
             None,
-            None,
+            Some(core.specialist_top_p),
         )
         .await
     {

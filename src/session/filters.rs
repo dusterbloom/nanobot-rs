@@ -35,6 +35,37 @@ fn is_real_user_turn(msg: &Value) -> bool {
             .unwrap_or(false)
 }
 
+fn is_non_replayable_synthetic(msg: &Value) -> bool {
+    msg.get("_synthetic")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && !is_cache_replay_synthetic(msg)
+}
+
+fn is_cache_replay_synthetic(msg: &Value) -> bool {
+    if msg
+        .get("_cache_replay")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // Legacy scaffold rows created before `_cache_replay` existed only have
+    // `synthetic=1` in SQLite. Preserve the known turn-scaffolding prefixes
+    // because they were sent to the model and are therefore part of the warm
+    // prompt prefix.
+    if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    content.starts_with("[format-anchor]")
+        || content.starts_with("[grounding]")
+        || content.starts_with("[System notice]")
+        || content.starts_with("[System] Loop detected:")
+        || content.starts_with("[system] Report what the previous tool results showed before")
+}
+
 /// Advance an index past leading `role: "tool"` messages whose parent
 /// `assistant+tool_calls` is outside the window. Sending a lone tool result
 /// to the LLM is a protocol error.
@@ -51,7 +82,7 @@ fn skip_leading_orphan_tools(messages: &[Value], start: usize) -> usize {
 }
 
 /// Filter messages: respect clear markers, skip orphaned tool results,
-/// filter synthetics, apply turn limit, token budget, and map to wire format.
+/// filter non-replayable synthetics, apply turn limit, token budget, and map to wire format.
 ///
 /// This is the primary entry point — it applies all filtering stages
 /// in sequence:
@@ -61,7 +92,7 @@ fn skip_leading_orphan_tools(messages: &[Value], start: usize) -> usize {
 /// 3. Orphaned tool results — skip leading `role: "tool"` messages at the
 ///    window boundary when their parent assistant+tool_calls is outside the window
 /// 4. Turn limit — keep only the last `max_turns` user-assistant pairs
-/// 5. Per-message filter/map — strip synthetics, clear markers, summaries;
+/// 5. Per-message filter/map — strip non-replayable synthetics, clear markers, summaries;
 ///    copy role, content, tool_calls, tool_call_id, name, _turn to wire format
 /// 6. Token budget — drop oldest messages until total tokens ≤ budget
 ///    (prevents context bombs when sessions accumulate large tool results)
@@ -119,9 +150,10 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     let mapped: Vec<Value> = messages[safe_start..]
         .iter()
         .filter(|m| {
-            // Skip synthetic router/specialist injections — ephemeral to the
-            // turn they were created in.
-            !m.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false)
+            // Skip synthetic router/specialist injections. Cache-replay
+            // scaffolds were already sent to the model, so dropping them on
+            // reload would mutate the warm prompt prefix.
+            !is_non_replayable_synthetic(m)
                 // Skip clear markers; they must not appear in the wire history.
                 && m.get("role").and_then(|v| v.as_str()) != Some("clear")
                 // Skip internal LCM summary entries — not valid wire format.
@@ -282,6 +314,15 @@ mod tests {
 
     fn synthetic(content: &str) -> Value {
         json!({"role": "user", "content": content, "_synthetic": true})
+    }
+
+    fn cache_replay_synthetic(content: &str) -> Value {
+        json!({
+            "role": "user",
+            "content": content,
+            "_synthetic": true,
+            "_cache_replay": true
+        })
     }
 
     fn summary(content: &str) -> Value {
@@ -491,6 +532,68 @@ mod tests {
         assert_eq!(result[3]["content"], "follow up answer");
     }
 
+    #[test]
+    fn test_cache_replay_synthetic_preserved_but_not_counted_as_turn() {
+        let turn_n = vec![
+            user("q0"),
+            assistant("a0"),
+            cache_replay_synthetic("[system] Report what the previous tool results showed."),
+        ];
+        let mut turn_n1 = turn_n.clone();
+        turn_n1.extend([user("continue please"), assistant("continuing")]);
+
+        let out_n = filter_history(&turn_n, 100, 2);
+        let out_n1 = filter_history(&turn_n1, 100, 2);
+
+        assert_eq!(
+            out_n.iter().filter(|m| role_of(m) == "user").count(),
+            2,
+            "cache-replay scaffold must survive reload"
+        );
+        assert_eq!(
+            out_n1[0..out_n.len()],
+            out_n[..],
+            "next reload must preserve the scaffold-containing sent prefix"
+        );
+        assert!(
+            out_n1
+                .iter()
+                .all(|m| m.get("_synthetic").is_none() && m.get("_cache_replay").is_none()),
+            "synthetic metadata must not leak into wire history"
+        );
+    }
+
+    #[test]
+    fn test_legacy_scaffold_synthetic_preserved_without_cache_replay_marker() {
+        let turn_n = vec![
+            user("q0"),
+            assistant("a0"),
+            synthetic(
+                "[format-anchor] Reminder: use tool calls for actions, not text descriptions.",
+            ),
+        ];
+        let mut turn_n1 = turn_n.clone();
+        turn_n1.extend([user("continue please"), assistant("continuing")]);
+
+        let out_n = filter_history(&turn_n, 100, 2);
+        let out_n1 = filter_history(&turn_n1, 100, 2);
+
+        assert!(
+            out_n.iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("[format-anchor]")
+            }),
+            "legacy sent scaffold rows must survive reload"
+        );
+        assert_eq!(
+            out_n1[0..out_n.len()],
+            out_n[..],
+            "legacy scaffold replay must keep reloads append-only"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Summary filtering
     // ------------------------------------------------------------------
@@ -567,13 +670,16 @@ mod tests {
             messages.push(assistant(&format!("answer {i}")));
             messages.push(synthetic("[grounding] Turn x. Context: 3% used."));
             messages.push(synthetic("[format-anchor] reminder"));
-            messages.push(synthetic("[system] report first"));
+            messages.push(synthetic(
+                "[system] Report what the previous tool results showed before running more tools.",
+            ));
         }
         let result = filter_history(&messages, 100, 3);
 
         let real_users: Vec<&str> = result
             .iter()
             .filter(|m| role_of(m) == "user")
+            .filter(|m| !m["content"].as_str().unwrap_or("").starts_with('['))
             .filter_map(|m| m["content"].as_str())
             .collect();
         assert_eq!(
@@ -581,12 +687,13 @@ mod tests {
             vec!["real question 0", "real question 1", "real question 2"],
             "all real turns must survive; synthetic nudges must not be counted as turns"
         );
-        // Synthetic nudge content must never reach the wire history.
-        assert!(
-            result
-                .iter()
-                .all(|m| !m["content"].as_str().unwrap_or("").starts_with('[')),
-            "no synthetic scaffolding nudge should survive to the wire"
+        let scaffold_count = result
+            .iter()
+            .filter(|m| m["content"].as_str().unwrap_or("").starts_with('['))
+            .count();
+        assert_eq!(
+            scaffold_count, 9,
+            "sent scaffolding nudges must be replayed for cache stability"
         );
     }
 
@@ -1000,7 +1107,13 @@ mod tests {
             .iter()
             .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "t2")
             .unwrap();
-        assert_eq!(small_tool["content"], "short result", "small tool unchanged");
-        assert_eq!(a[0]["content"], "fetch something", "user content not capped");
+        assert_eq!(
+            small_tool["content"], "short result",
+            "small tool unchanged"
+        );
+        assert_eq!(
+            a[0]["content"], "fetch something",
+            "user content not capped"
+        );
     }
 }

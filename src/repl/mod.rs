@@ -153,19 +153,59 @@ impl PrefillSpinner {
 /// never rendered). One enum so the print task dispatches with a `match`
 /// and the wire syntax is parsed in exactly one place.
 pub(crate) enum ControlMarker {
+    RetractReply,
     FinishReason(String),
     Tokens(u64),
+    PromptTokens(u64),
+    PrefillEstimate(u64),
     PrefillProgress { processed: u64, total: u64 },
+    CacheStatus(CacheStatus),
+}
+
+/// Prompt-cache relationship between this LLM call and the previous one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheStatus {
+    First {
+        messages: usize,
+    },
+    AppendOnly {
+        added: usize,
+        messages: usize,
+    },
+    Diverged {
+        at: usize,
+        prev: usize,
+        messages: usize,
+    },
+    Reset {
+        reason: CacheResetReason,
+    },
+}
+
+/// Why the agent knowingly invalidated the prompt-cache prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheResetReason {
+    Trim,
+    EmergencyTrim,
 }
 
 /// Parse a delta-channel control marker. `None` means renderable text.
 pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
     let rest = d.strip_prefix('\x00')?;
+    if rest == "retract_reply" {
+        return Some(ControlMarker::RetractReply);
+    }
     if let Some(fr) = rest.strip_prefix("finish_reason:") {
         return Some(ControlMarker::FinishReason(fr.to_string()));
     }
     if let Some(tok) = rest.strip_prefix("tokens:") {
         return tok.parse().ok().map(ControlMarker::Tokens);
+    }
+    if let Some(tok) = rest.strip_prefix("prompt_tokens:") {
+        return tok.parse().ok().map(ControlMarker::PromptTokens);
+    }
+    if let Some(tok) = rest.strip_prefix("prefill_estimate:") {
+        return tok.parse().ok().map(ControlMarker::PrefillEstimate);
     }
     if let Some(pp) = rest.strip_prefix("prefill:") {
         let (p, t) = pp.split_once('/')?;
@@ -174,7 +214,77 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
             total: t.parse().ok()?,
         });
     }
+    if let Some(cache) = rest.strip_prefix("cache:") {
+        let mut parts = cache.split(':');
+        return match parts.next()? {
+            "first" => Some(ControlMarker::CacheStatus(CacheStatus::First {
+                messages: parts.next()?.parse().ok()?,
+            })),
+            "append" => Some(ControlMarker::CacheStatus(CacheStatus::AppendOnly {
+                added: parts.next()?.parse().ok()?,
+                messages: parts.next()?.parse().ok()?,
+            })),
+            "diverged" => Some(ControlMarker::CacheStatus(CacheStatus::Diverged {
+                at: parts.next()?.parse().ok()?,
+                prev: parts.next()?.parse().ok()?,
+                messages: parts.next()?.parse().ok()?,
+            })),
+            "reset" => {
+                let reason = match parts.next()? {
+                    "trim" => CacheResetReason::Trim,
+                    "emergency_trim" => CacheResetReason::EmergencyTrim,
+                    _ => return None,
+                };
+                Some(ControlMarker::CacheStatus(CacheStatus::Reset { reason }))
+            }
+            _ => None,
+        };
+    }
     None
+}
+
+#[cfg(any(test, feature = "voice"))]
+fn thinking_delta_should_skip_tts(delta: &str, in_thinking: &mut bool) -> bool {
+    if delta.starts_with("\x1b[90m\x1b[2m") {
+        *in_thinking = true;
+        return true;
+    }
+    if *in_thinking {
+        if delta.starts_with("\x1b[0m") {
+            *in_thinking = false;
+        }
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod thinking_tts_tests {
+    use super::*;
+
+    #[test]
+    fn tts_filter_skips_ansi_delimited_thinking_only() {
+        let mut in_thinking = false;
+
+        assert!(thinking_delta_should_skip_tts(
+            "\x1b[90m\x1b[2m",
+            &mut in_thinking
+        ));
+        assert!(in_thinking);
+        assert!(thinking_delta_should_skip_tts(
+            "private thought",
+            &mut in_thinking
+        ));
+        assert!(thinking_delta_should_skip_tts(
+            "\x1b[0m\n\n",
+            &mut in_thinking
+        ));
+        assert!(!in_thinking);
+        assert!(!thinking_delta_should_skip_tts(
+            "visible answer",
+            &mut in_thinking
+        ));
+    }
 }
 
 /// Animate the brand mark `▞▞▞` as the loading indicator: the lit block sweeps
@@ -208,8 +318,7 @@ fn prefill_line(elapsed_secs: f32, progress: Option<(u64, u64)>) -> String {
 /// Try a real parse first; on failure, scan for `"field"` and read the quoted
 /// value that follows, honoring `\"`/`\n`/`\t` escapes.
 fn extract_json_string_field(json_ish: &str, field: &str) -> Option<String> {
-    if let Ok(serde_json::Value::Object(map)) =
-        serde_json::from_str::<serde_json::Value>(json_ish)
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(json_ish)
     {
         if let Some(v) = map.get(field).and_then(|v| v.as_str()) {
             return Some(v.to_string());
@@ -485,7 +594,11 @@ const DEFAULT_HIGGS_KEEPALIVE_SECS: u64 = 45;
 /// (localhost/127.0.0.1) — we never keep a remote peer warm. The env var
 /// `NANOBOT_HIGGS_KEEPALIVE_SECS` overrides the interval; `0` disables it.
 /// A non-numeric value falls back to the default.
-pub(crate) fn higgs_keepalive_secs(backend: &str, api_base: &str, env: Option<&str>) -> Option<u64> {
+pub(crate) fn higgs_keepalive_secs(
+    backend: &str,
+    api_base: &str,
+    env: Option<&str>,
+) -> Option<u64> {
     if !crate::config::schema::is_higgs_backend(backend) {
         return None;
     }
@@ -555,7 +668,10 @@ fn spawn_higgs_keepalive(
                 .await
             {
                 Ok(r) if r.status().is_success() => {
-                    debug!(ms = started.elapsed().as_millis() as u64, "higgs_keepalive_ok");
+                    debug!(
+                        ms = started.elapsed().as_millis() as u64,
+                        "higgs_keepalive_ok"
+                    );
                 }
                 Ok(r) => warn!(status = %r.status(), "higgs_keepalive_unexpected_status"),
                 Err(e) => warn!(error = %e, "higgs_keepalive_failed (Higgs may be down)"),
@@ -886,6 +1002,8 @@ async fn stream_and_render_inner(
                 tts_lang_override.as_deref(),
             )
         });
+        #[cfg(feature = "voice")]
+        let mut tts_in_thinking = false;
         #[cfg(not(feature = "voice"))]
         let _ = tts_tx;
 
@@ -922,24 +1040,39 @@ async fn stream_and_render_inner(
                             // text falls through to the renderer/TTS.
                             if let Some(marker) = parse_control_marker(&d) {
                                 match marker {
+                                    ControlMarker::RetractReply => {
+                                        prefill.clear();
+                                        renderer.clear_partial();
+                                        full_text.clear();
+                                        renderer = incremental::IncrementalRenderer::new();
+                                    }
                                     ControlMarker::FinishReason(fr) => {
                                         renderer.finish_reason = Some(fr);
                                     }
                                     ControlMarker::Tokens(n) => renderer.add_tokens(n),
+                                    ControlMarker::PromptTokens(_) => {}
+                                    ControlMarker::PrefillEstimate(_) => {}
                                     ControlMarker::PrefillProgress { processed, total } => {
                                         // Never redraw over restored partial text.
                                         if prefill.is_active() || !renderer.has_partial_text() {
                                             prefill.on_progress(processed, total);
                                         }
                                     }
+                                    ControlMarker::CacheStatus(_) => {}
                                 }
                             } else {
                                 prefill.clear();
                                 full_text.push_str(&d);
                                 renderer.push(&d);
                                 #[cfg(feature = "voice")]
-                                if let Some(ref mut acc) = tts_acc {
-                                    acc.push(&d);
+                                {
+                                    let skip_tts =
+                                        thinking_delta_should_skip_tts(&d, &mut tts_in_thinking);
+                                    if !skip_tts {
+                                        if let Some(ref mut acc) = tts_acc {
+                                            acc.push(&d);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1125,6 +1258,7 @@ async fn stream_and_render_inner(
             tool_event_tx,
             Some(cancel_token.clone()),
             Some(inject_rx),
+            None,
         )
         .await;
 
@@ -2751,7 +2885,11 @@ mod tests {
     fn test_extract_tool_context_surfaces_input_params() {
         // The tool input (not output) is what's shown on the status line.
         assert_eq!(
-            extract_tool_context("web_search", "lots of results", r#"{"query":"space news 2024"}"#),
+            extract_tool_context(
+                "web_search",
+                "lots of results",
+                r#"{"query":"space news 2024"}"#
+            ),
             "space news 2024"
         );
         assert_eq!(

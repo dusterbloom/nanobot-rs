@@ -26,11 +26,14 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ratatui::crossterm::cursor::{Hide, Show};
-use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
+use ratatui::crossterm::cursor::{Hide, MoveTo, Show};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -40,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::audit::ToolEvent;
 use crate::repl::commands::ReplContext;
-use app::{draw_outro, Action, App, Footer};
+use app::{draw_outro, Action, App, Footer, StreamingAction, SubmittedTurn};
 
 /// Immutable per-session handles a single turn needs to drive the agent.
 struct Session<'a> {
@@ -50,18 +53,40 @@ struct Session<'a> {
     lang: Option<&'a str>,
 }
 
+/// Result of one streaming assistant turn.
+struct TurnOutcome {
+    #[cfg(feature = "voice")]
+    reply: String,
+    queued_turn: Option<SubmittedTurn>,
+}
+
 /// Restores terminal modes on drop, including on panic. `ratatui::init`'s panic
 /// hook restores the alt-screen/raw-mode, but not bracketed paste or the reader
 /// thread — this guard closes those gaps. Idempotent with the normal cleanup.
 struct TerminalGuard {
     stop: Arc<AtomicBool>,
+    restored: bool,
+}
+
+impl TerminalGuard {
+    fn restore(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
+        ratatui::restore();
+        self.restored = true;
+    }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
-        ratatui::restore();
+        self.restore();
     }
 }
 
@@ -80,8 +105,11 @@ pub(crate) async fn run(ctx: &mut ReplContext) -> std::io::Result<()> {
     let paused = Arc::new(AtomicBool::new(false));
     let (ev_tx, mut ev_rx) = unbounded_channel::<Event>();
     let reader = spawn_event_reader(ev_tx, stop.clone(), paused.clone());
-    let _guard = TerminalGuard { stop: stop.clone() };
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    let mut guard = TerminalGuard {
+        stop: stop.clone(),
+        restored: false,
+    };
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
 
     let mut app = App::new();
     let result = event_loop(&mut terminal, &mut app, ctx, &mut ev_rx, &paused).await;
@@ -93,8 +121,36 @@ pub(crate) async fn run(ctx: &mut ReplContext) -> std::io::Result<()> {
     }
     stop.store(true, Ordering::Relaxed);
     let _ = reader.join();
+    guard.restore();
+    if result.is_ok() {
+        clear_normal_screen();
+    }
     result
-    // `_guard` drops here (and on panic): DisableBracketedPaste + ratatui::restore().
+    // `guard` drops here (and on panic): DisableBracketedPaste + ratatui::restore().
+}
+
+fn clear_normal_screen() {
+    let _ = execute!(std::io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show);
+}
+
+fn model_accepts_images(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    [
+        "vision",
+        "vl",
+        "llava",
+        "pixtral",
+        "gpt-4o",
+        "o3",
+        "o4",
+        "gemini",
+        "claude-3",
+        "qwen-vl",
+        "qwen2.5-vl",
+        "qwen3-vl",
+    ]
+    .iter()
+    .any(|marker| model.contains(marker))
 }
 
 /// Snapshot the quiet footer state (cwd / model / context usage) from the core.
@@ -169,27 +225,48 @@ async fn event_loop(
     ev_rx: &mut UnboundedReceiver<Event>,
     paused: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    loop {
+    'ui: loop {
         let footer = footer_snapshot(&ctx.core_handle);
         terminal.draw(|f| app.draw(f, &footer))?;
         let Some(ev) = ev_rx.recv().await else { break };
         match app.on_idle_event(ev) {
             Action::Quit => break,
             Action::Continue => {}
-            Action::Submit(text) => {
-                if let Some(rest) = text.strip_prefix('/') {
-                    if slash_command(terminal, app, ctx, &text, rest, ev_rx, paused).await? {
-                        break; // /quit
+            Action::Submit(turn) => {
+                let mut queued = Some(turn);
+                while let Some(mut turn) = queued.take() {
+                    if turn.media.is_empty() {
+                        if let Some(rest) = turn.text.strip_prefix('/') {
+                            let text = turn.text.clone();
+                            if slash_command(terminal, app, ctx, &text, rest, ev_rx, paused).await?
+                            {
+                                break 'ui; // /quit
+                            }
+                            continue;
+                        }
                     }
-                    continue;
+                    let session = Session {
+                        agent: &ctx.agent_loop,
+                        core: &ctx.core_handle,
+                        session_id: &ctx.session_id,
+                        lang: ctx.lang.as_deref(),
+                    };
+                    if !turn.media.is_empty() {
+                        let model = session.core.swappable().model.clone();
+                        if !model_accepts_images(&model) {
+                            let suffix = if turn.media.len() == 1 { "" } else { "s" };
+                            app.push_note(format!(
+                                "{} image{} not sent — {model} does not advertise image input",
+                                turn.media.len(),
+                                suffix
+                            ));
+                            turn.media.clear();
+                        }
+                    }
+                    queued = run_turn(terminal, app, &session, &turn, ev_rx)
+                        .await?
+                        .queued_turn;
                 }
-                let session = Session {
-                    agent: &ctx.agent_loop,
-                    core: &ctx.core_handle,
-                    session_id: &ctx.session_id,
-                    lang: ctx.lang.as_deref(),
-                };
-                run_turn(terminal, app, &session, &text, ev_rx).await?;
             }
             Action::Record => {
                 #[cfg(feature = "voice")]
@@ -231,7 +308,9 @@ async fn slash_command(
             }
         }
         "model" | "m" => {
-            if ctx.model_picker_available() {
+            if model_command_direct_arg(rest).is_some() {
+                run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?;
+            } else if ctx.model_picker_available() {
                 let entries = ctx.collect_all_models().await;
                 if entries.is_empty() {
                     app.push_note("no models found".into());
@@ -249,13 +328,11 @@ async fn slash_command(
                 // classic startup screen). Header reflects the new state.
                 let on = ctx.toggle_voice().await;
                 app.set_voice(on);
-                app.push_note(
-                    if on {
-                        "voice on — press Enter on an empty line to speak".to_string()
-                    } else {
-                        "voice off".to_string()
-                    },
-                );
+                app.push_note(if on {
+                    "voice on — press Enter on an empty line to speak".to_string()
+                } else {
+                    "voice off".to_string()
+                });
             }
             #[cfg(not(feature = "voice"))]
             app.push_note(
@@ -265,6 +342,16 @@ async fn slash_command(
         _ => run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?,
     }
     Ok(false)
+}
+
+fn model_command_direct_arg(rest: &str) -> Option<&str> {
+    let trimmed = rest.trim();
+    let command = trimmed.split_whitespace().next()?;
+    if !matches!(command, "model" | "m") {
+        return None;
+    }
+    let arg = trimmed[command.len()..].trim();
+    (!arg.is_empty()).then_some(arg)
 }
 
 /// Leave the alt-screen and pause the reader so stdin is free for a classic
@@ -277,8 +364,10 @@ fn suspend_ui(paused: &Arc<AtomicBool>) -> std::io::Result<()> {
         std::io::stdout(),
         LeaveAlternateScreen,
         DisableBracketedPaste,
+        DisableMouseCapture,
         Show
     )?;
+    clear_normal_screen();
     Ok(())
 }
 
@@ -293,6 +382,7 @@ fn resume_ui(
         std::io::stdout(),
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableMouseCapture,
         Hide
     )?;
     terminal.clear()?;
@@ -323,6 +413,7 @@ async fn run_classic_command(
         print!("\r\n  \x1b[2mpress any key to return to TRENTADUE\x1b[0m ");
         let _ = std::io::stdout().flush();
         let _ = event::read();
+        clear_normal_screen();
     }
     resume_ui(terminal, ev_rx, paused)?;
 
@@ -381,7 +472,18 @@ async fn voice_cycle(
                 session_id: &ctx.session_id,
                 lang: ctx.lang.as_deref(),
             };
-            run_turn(terminal, app, &session, &text, ev_rx).await?
+            let outcome = run_turn(
+                terminal,
+                app,
+                &session,
+                &SubmittedTurn {
+                    text: text.clone(),
+                    media: Vec::new(),
+                },
+                ev_rx,
+            )
+            .await?;
+            outcome.reply
         };
         if reply.trim().is_empty() {
             return Ok(());
@@ -424,17 +526,17 @@ async fn run_turn(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     session: &Session<'_>,
-    input: &str,
+    turn: &SubmittedTurn,
     ev_rx: &mut UnboundedReceiver<Event>,
-) -> std::io::Result<String> {
-    app.begin_turn(input);
+) -> std::io::Result<TurnOutcome> {
+    app.begin_turn(&turn.display_text());
 
     let (delta_tx, mut delta_rx) = unbounded_channel::<String>();
     let (tool_tx, mut tool_rx) = unbounded_channel::<ToolEvent>();
     let cancel = CancellationToken::new();
 
     let fut = session.agent.process_direct_streaming(
-        input,
+        &turn.text,
         session.session_id,
         "cli",
         "direct",
@@ -443,24 +545,39 @@ async fn run_turn(
         Some(tool_tx),
         Some(cancel.clone()),
         None,
+        (!turn.media.is_empty()).then_some(turn.media.as_slice()),
     );
     tokio::pin!(fut);
 
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let mut queued_turn = None;
+    let mut cancel_requested = false;
     let response = loop {
         let footer = footer_snapshot(session.core);
         terminal.draw(|f| app.draw(f, &footer))?;
         tokio::select! {
             biased;
-            resp = &mut fut => break resp,
-            Some(d) = delta_rx.recv() => app.on_delta(&d),
-            Some(e) = tool_rx.recv() => app.on_tool_event(e),
             Some(ev) = ev_rx.recv() => {
-                if app.on_streaming_event(ev) {
-                    cancel.cancel();
+                match app.on_streaming_event(ev) {
+                    StreamingAction::Continue => {}
+                    StreamingAction::Cancel => {
+                        cancel_requested = true;
+                        cancel.cancel();
+                    }
+                    StreamingAction::CancelAndSubmit(turn) => {
+                        queued_turn = Some(turn);
+                        cancel_requested = true;
+                        cancel.cancel();
+                    }
                 }
+            }
+            resp = &mut fut => break resp,
+            Some(d) = delta_rx.recv(), if !cancel_requested => app.on_delta(&d),
+            Some(e) = tool_rx.recv(), if !cancel_requested => {
+                drain_pending_deltas(app, &mut delta_rx);
+                app.on_tool_event(e);
             }
             _ = tick.tick() => app.tick(0.08),
         }
@@ -468,15 +585,109 @@ async fn run_turn(
 
     // Drain anything buffered after the agent returned (deltas can land just
     // before the future resolves under `biased`).
-    while let Ok(d) = delta_rx.try_recv() {
-        app.on_delta(&d);
+    if cancel_requested {
+        while delta_rx.try_recv().is_ok() {}
+        while tool_rx.try_recv().is_ok() {}
+    } else {
+        drain_pending_deltas(app, &mut delta_rx);
+        while let Ok(e) = tool_rx.try_recv() {
+            drain_pending_deltas(app, &mut delta_rx);
+            app.on_tool_event(e);
+        }
+        drain_pending_deltas(app, &mut delta_rx);
     }
-    while let Ok(e) = tool_rx.try_recv() {
-        app.on_tool_event(e);
-    }
-    let reply = response.clone();
+    #[cfg(feature = "voice")]
+    let reply = if cancel_requested {
+        String::new()
+    } else {
+        response.clone()
+    };
+    let response = if cancel_requested {
+        String::new()
+    } else {
+        response
+    };
     app.finish_turn(response);
     let footer = footer_snapshot(session.core);
     terminal.draw(|f| app.draw(f, &footer))?;
-    Ok(reply)
+    Ok(TurnOutcome {
+        #[cfg(feature = "voice")]
+        reply,
+        queued_turn,
+    })
+}
+
+fn drain_pending_deltas(app: &mut App, delta_rx: &mut UnboundedReceiver<String>) {
+    while let Ok(d) = delta_rx.try_recv() {
+        app.on_delta(&d);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = *buf.area();
+        let mut s = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(c) = buf.cell((x, y)) {
+                    s.push_str(c.symbol());
+                }
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn draining_deltas_before_tool_events_preserves_setup_text_order() {
+        let mut app = App::new();
+        app.begin_turn("news");
+
+        let (tx, mut delta_rx) = unbounded_channel::<String>();
+        tx.send("Let me check first.".into()).unwrap();
+        drain_pending_deltas(&mut app, &mut delta_rx);
+        app.on_tool_event(ToolEvent::CallStart {
+            tool_name: "exec".into(),
+            tool_call_id: "c1".into(),
+            arguments_preview: "news.py".into(),
+        });
+
+        let footer = Footer {
+            cwd: "~/Dev/nanobot-rs".into(),
+            model: "local:test".into(),
+            ctx_used: 1,
+            ctx_max: 10,
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| app.draw(f, &footer)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        let reply = text.find("Let me check first.").expect("reply rendered");
+        let tool = text.find("exec").expect("tool rendered");
+        assert!(
+            reply < tool,
+            "setup text should render before tool:\n{text}"
+        );
+    }
+
+    #[test]
+    fn model_image_gate_recognizes_vision_models_only() {
+        assert!(model_accepts_images("gpt-4o-mini"));
+        assert!(model_accepts_images("qwen2.5-vl-7b"));
+        assert!(!model_accepts_images("local:qwen36-35b"));
+    }
+
+    #[test]
+    fn model_command_with_argument_goes_to_classic_dispatch() {
+        assert_eq!(
+            model_command_direct_arg("model VibeThinker-3B-mlx-8Bit"),
+            Some("VibeThinker-3B-mlx-8Bit")
+        );
+        assert_eq!(model_command_direct_arg("model"), None);
+        assert_eq!(model_command_direct_arg("m"), None);
+    }
 }

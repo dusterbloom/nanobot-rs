@@ -159,6 +159,67 @@ fn keep_recent_within_budget(msgs: &mut Vec<Value>, budget: usize) {
     *msgs = std::iter::once(system_msg).chain(kept_tail).collect();
 }
 
+/// Tail-only variant of Stage 2 for a prompt whose head is already warm in the
+/// server prefix cache.
+///
+/// The tail starts after the previous send boundary, so it has no guaranteed
+/// system message. Keep contiguous assistant-tool chunks together to avoid
+/// manufacturing invalid provider history while dropping unsent overflow.
+fn keep_recent_tail_chunks_within_budget(msgs: &mut Vec<Value>, budget: usize) {
+    if msgs.is_empty() {
+        return;
+    }
+
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < msgs.len() {
+        let mut end = i + 1;
+        if msgs[i].get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            let mut pending_call_ids: HashSet<String> = msgs[i]
+                .get("tool_calls")
+                .and_then(|tc| tc.as_array())
+                .into_iter()
+                .flat_map(|tcs| tcs.iter())
+                .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()))
+                .map(String::from)
+                .collect();
+
+            while !pending_call_ids.is_empty() && end < msgs.len() {
+                if msgs[end].get("role").and_then(|r| r.as_str()) != Some("tool") {
+                    break;
+                }
+                let Some(tool_call_id) = msgs[end].get("tool_call_id").and_then(|id| id.as_str())
+                else {
+                    break;
+                };
+                if !pending_call_ids.remove(tool_call_id) {
+                    break;
+                }
+                end += 1;
+            }
+        }
+        chunks.push((i, end));
+        i = end;
+    }
+
+    let mut kept_rev: Vec<Value> = Vec::new();
+    let mut used = 0;
+    for &(start, end) in chunks.iter().rev() {
+        let chunk_tokens: usize = msgs[start..end]
+            .iter()
+            .map(TokenBudget::estimate_message_tokens)
+            .sum();
+        if used + chunk_tokens <= budget {
+            for msg in msgs[start..end].iter().rev() {
+                kept_rev.push(msg.clone());
+            }
+            used += chunk_tokens;
+        }
+    }
+    kept_rev.reverse();
+    *msgs = kept_rev;
+}
+
 /// Stage 3 (hard reset): Keep only system prompt + truncation notice + last user message.
 ///
 /// Last resort when all softer strategies still exceed the budget.
@@ -392,12 +453,92 @@ impl TokenBudget {
 
         msgs
     }
+
+    /// Trim while preserving a previously-sent prompt prefix when possible.
+    ///
+    /// Returns `(messages, prefix_preserved)`. `prefix_preserved == false`
+    /// means fitting required the normal whole-history trimmer, so callers
+    /// should treat any prompt-cache watermark as invalid until the next send.
+    pub fn trim_to_fit_with_age_preserving_prefix(
+        &self,
+        messages: &[Value],
+        tool_def_tokens: usize,
+        current_turn: u64,
+        max_age_turns: usize,
+        frozen_prefix: usize,
+    ) -> (Vec<Value>, bool) {
+        let budget = self.available_budget(tool_def_tokens);
+        let msgs = messages.to_vec();
+
+        if Self::estimate_tokens(&msgs) <= budget {
+            return (msgs, true);
+        }
+
+        let w = frozen_prefix.min(messages.len());
+        if w == 0 {
+            return (
+                self.trim_to_fit_with_age(messages, tool_def_tokens, current_turn, max_age_turns),
+                false,
+            );
+        }
+
+        let prefix = &messages[..w];
+        let prefix_tokens = Self::estimate_tokens(prefix);
+        if prefix_tokens > budget {
+            return (
+                self.trim_to_fit_with_age(messages, tool_def_tokens, current_turn, max_age_turns),
+                false,
+            );
+        }
+
+        let tail_budget = budget.saturating_sub(prefix_tokens);
+        let mut tail = messages[w..].to_vec();
+
+        if Self::estimate_tokens(&tail) > tail_budget {
+            truncate_old_tool_results(&mut tail);
+        }
+        if Self::estimate_tokens(&tail) > tail_budget {
+            keep_recent_tail_chunks_within_budget(&mut tail, tail_budget);
+        }
+
+        let mut preserved = prefix.to_vec();
+        preserved.extend(tail);
+        if Self::estimate_tokens(&preserved) <= budget {
+            return (preserved, true);
+        }
+
+        (
+            self.trim_to_fit_with_age(messages, tool_def_tokens, current_turn, max_age_turns),
+            false,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn assistant_call(id: &str) -> Value {
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": id,
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }]
+        })
+    }
+
+    fn tool_result(id: &str, content: String) -> Value {
+        json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "name": "read_file",
+            "content": content
+        })
+    }
 
     #[test]
     fn test_estimate_str_tokens() {
@@ -455,6 +596,83 @@ mod tests {
         ];
         let trimmed = budget.trim_to_fit(&messages, 500);
         assert_eq!(trimmed.len(), 2);
+    }
+
+    #[test]
+    fn test_trim_preserving_prefix_trims_only_uncached_tail() {
+        let prefix = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Warm question"}),
+            assistant_call("warm_tool"),
+            tool_result("warm_tool", "warm-result-".repeat(200)),
+            json!({"role": "assistant", "content": "Warm answer"}),
+        ];
+        let frozen_prefix = prefix.len();
+        let mut messages = prefix.clone();
+        for i in 0..6 {
+            let id = format!("tail_tool_{i}");
+            messages.push(assistant_call(&id));
+            messages.push(tool_result(&id, "tail-result-".repeat(240)));
+        }
+
+        let mut expected_tail = messages[frozen_prefix..].to_vec();
+        truncate_old_tool_results(&mut expected_tail);
+        let target_budget =
+            TokenBudget::estimate_tokens(&prefix) + TokenBudget::estimate_tokens(&expected_tail);
+        assert!(
+            TokenBudget::estimate_tokens(&messages) > target_budget,
+            "test setup must require trimming"
+        );
+
+        let budget = TokenBudget::new(target_budget, 0);
+        let (trimmed, prefix_preserved) =
+            budget.trim_to_fit_with_age_preserving_prefix(&messages, 0, 0, 0, frozen_prefix);
+
+        assert!(prefix_preserved, "warm prefix should remain cache-safe");
+        assert_eq!(
+            &trimmed[..frozen_prefix],
+            &prefix[..],
+            "frozen prefix must be byte-identical"
+        );
+        assert!(
+            TokenBudget::estimate_tokens(&trimmed) <= budget.available_budget(0),
+            "trimmed prompt should fit the requested budget"
+        );
+    }
+
+    #[test]
+    fn test_trim_preserving_prefix_reports_unavoidable_prefix_trim() {
+        let messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "old ".repeat(2000)}),
+            json!({"role": "user", "content": "Latest question"}),
+        ];
+        let frozen_prefix = 2;
+        let target_budget = TokenBudget::estimate_tokens(&messages[0..1])
+            + TokenBudget::estimate_tokens(&messages[2..3])
+            + 10;
+        assert!(
+            TokenBudget::estimate_tokens(&messages[..frozen_prefix]) > target_budget,
+            "test setup must make the frozen prefix too large to preserve"
+        );
+
+        let budget = TokenBudget::new(target_budget, 0);
+        let (trimmed, prefix_preserved) =
+            budget.trim_to_fit_with_age_preserving_prefix(&messages, 0, 0, 0, frozen_prefix);
+
+        assert!(
+            !prefix_preserved,
+            "caller must know the prompt cache watermark is no longer valid"
+        );
+        assert!(
+            trimmed.iter().all(|m| {
+                m.get("content")
+                    .and_then(|content| content.as_str())
+                    .map(|content| !content.starts_with("old old"))
+                    .unwrap_or(true)
+            }),
+            "unavoidable full trim should drop the oversized old prefix message"
+        );
     }
 
     #[test]

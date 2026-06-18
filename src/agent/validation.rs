@@ -19,6 +19,60 @@ static HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\[(?:\w+\s+)*call(?:ed|ing)(?:\s+tool)?[\s:]").expect("hallucination regex")
 });
 
+static XML_HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?isx)
+        <xml\b[^>]*>\s*
+        <bigtag\b[^>]*\bname\s*=\s*["'][a-z][a-z0-9_]*["'][^>]*>
+        .*?<arguments\b
+        .*?</bigtag>\s*
+        </xml>
+        "#,
+    )
+    .expect("xml hallucinated tool-call regex")
+});
+
+static NAMED_TOOL_INTENT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?ix)
+        \b(?:i\s+(?:can|could|will|would|should|need\s+to)|i'll|let\s+me)\s+
+        (?:use|run|call|invoke|execute)\s+
+        (?:the\s+)?
+        (?:
+            `?[a-z][a-z0-9]*_[a-z0-9_]*`?
+            |
+            `?[a-z][a-z0-9_]*`?\s+tool
+        )
+        (?:\b|`)",
+    )
+    .expect("named tool intent regex")
+});
+
+const RAW_JSON_TOOL_NAMES: &[&str] = &[
+    "backtrack",
+    "browser",
+    "check_inbox",
+    "checkpoint",
+    "cron",
+    "edit_file",
+    "exec",
+    "execute_code",
+    "list_dir",
+    "message",
+    "plan",
+    "read_file",
+    "read_skill",
+    "recall",
+    "remember",
+    "send_email",
+    "session_search",
+    "spawn",
+    "todo",
+    "web_fetch",
+    "web_search",
+    "write_file",
+];
+
 // ---------------------------------------------------------------------------
 // ValidationError
 // ---------------------------------------------------------------------------
@@ -50,6 +104,96 @@ const TOOL_INTENT_PATTERNS: &[&str] = &[
     "i found that",
     "i can see that",
 ];
+
+pub(crate) fn has_claimed_tool_intent(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    TOOL_INTENT_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+        || NAMED_TOOL_INTENT_RE.is_match(content)
+}
+
+pub(crate) fn has_hallucinated_tool_call(content: &str) -> bool {
+    HALLUCINATED_CALL_RE.is_match(content)
+        || XML_HALLUCINATED_CALL_RE.is_match(content)
+        || raw_json_tool_call_span(content).is_some()
+}
+
+pub(crate) fn has_xml_hallucinated_tool_call(content: &str) -> bool {
+    XML_HALLUCINATED_CALL_RE.is_match(content)
+}
+
+pub(crate) fn has_raw_json_hallucinated_tool_call(content: &str) -> bool {
+    raw_json_tool_call_span(content).is_some()
+}
+
+fn raw_json_tool_call_span(content: &str) -> Option<(usize, usize)> {
+    if !content.contains("\"name\"")
+        || !(content.contains("\"parameters\"") || content.contains("\"arguments\""))
+    {
+        return None;
+    }
+
+    for (start, _) in content.char_indices().filter(|(_, ch)| *ch == '{') {
+        let Some(end) = json_object_end(content, start) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content[start..end]) else {
+            continue;
+        };
+        if value_is_raw_json_tool_call(&value) {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+fn json_object_end(content: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in content[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(start + offset + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn value_is_raw_json_tool_call(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let Some(name) = obj.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    if !RAW_JSON_TOOL_NAMES.iter().any(|known| *known == name) {
+        return false;
+    }
+    obj.get("parameters")
+        .or_else(|| obj.get("arguments"))
+        .is_some_and(Value::is_object)
+}
 
 // ---------------------------------------------------------------------------
 // ValidationOutcome
@@ -91,15 +235,13 @@ pub fn validate_response(
     // prevented. Punishing it with ClaimedButNotExecuted retries creates a
     // death spiral. Only check for hallucinated `[Called ...]` syntax.
     if had_blocked_calls && actual_tool_calls.is_empty() {
-        if HALLUCINATED_CALL_RE.is_match(content) {
+        if has_hallucinated_tool_call(content) {
             return ValidationOutcome::Error(ValidationError::HallucinatedToolCall);
         }
         return ValidationOutcome::Ok;
     }
 
-    let lower = content.to_lowercase();
-
-    if HALLUCINATED_CALL_RE.is_match(content) {
+    if has_hallucinated_tool_call(content) {
         if actual_tool_calls.is_empty() {
             return ValidationOutcome::Error(ValidationError::HallucinatedToolCall);
         } else {
@@ -108,10 +250,8 @@ pub fn validate_response(
     }
 
     if actual_tool_calls.is_empty() {
-        for pattern in TOOL_INTENT_PATTERNS {
-            if lower.contains(pattern) {
-                return ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted);
-            }
+        if has_claimed_tool_intent(content) {
+            return ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted);
         }
     }
 
@@ -120,8 +260,13 @@ pub fn validate_response(
 
 /// Strip hallucinated tool-call text from response content.
 pub fn strip_hallucinated_text(content: &str) -> String {
+    let content = XML_HALLUCINATED_CALL_RE.replace_all(content, "");
+    let mut content = content.to_string();
+    while let Some((start, end)) = raw_json_tool_call_span(&content) {
+        content.replace_range(start..end, "");
+    }
     HALLUCINATED_CALL_RE
-        .replace_all(content, "")
+        .replace_all(&content, "")
         .trim()
         .to_string()
 }
@@ -238,6 +383,83 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_named_tool_future_action() {
+        let content = "I can use the `web_fetch` tool to get the content of that URL. Which part?";
+        let result = validate_response(content, &[], false, false);
+        assert!(
+            matches!(
+                result,
+                ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)
+            ),
+            "Named tool narration should be treated as claimed tool intent"
+        );
+    }
+
+    #[test]
+    fn test_detect_xml_tool_call_hallucination() {
+        let content = r#"<xml>
+  <bigtag name="web_search">
+    <arguments>
+      <jsonobject>
+        <parameters>
+          <string>latest news</string>
+        </parameters>
+      </jsonobject>
+    </arguments>
+  </bigtag>
+</xml>"#;
+        let result = validate_response(content, &[], false, false);
+        assert!(
+            matches!(
+                result,
+                ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
+            ),
+            "XML-ish tool-call envelopes should be treated as hallucinated tool calls"
+        );
+    }
+
+    #[test]
+    fn test_detect_raw_json_tool_call_hallucination() {
+        let content = r#"{ "name": "exec", "parameters": { "command": "git clone https://github.com/dusterbloom/skybloom", "timeout": 60, "working_dir": "/home/your_user/Dev/nanobot-rs" } }"#;
+        let result = validate_response(content, &[], false, false);
+        assert!(
+            matches!(
+                result,
+                ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
+            ),
+            "Raw tool-call JSON should not be treated as a final answer"
+        );
+    }
+
+    #[test]
+    fn test_detect_raw_json_tool_call_after_reasoning() {
+        let content = r#"We need to use the exec tool.
+{ "name": "exec", "parameters": { "command": "git clone https://github.com/dusterbloom/skybloom", "timeout": 60, "working_dir": "/home/your_user/Dev/nanobot-rs" } }"#;
+        let result = validate_response(content, &[], false, false);
+        assert!(
+            matches!(
+                result,
+                ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
+            ),
+            "Raw tool-call JSON after leaked reasoning should still trigger recovery"
+        );
+    }
+
+    #[test]
+    fn test_raw_json_non_tool_name_passes() {
+        let content = r#"{ "name": "skybloom", "parameters": { "stars": 42 } }"#;
+        let result = validate_response(content, &[], false, false);
+        assert_eq!(result, ValidationOutcome::Ok);
+    }
+
+    #[test]
+    fn test_named_tool_intent_does_not_catch_plain_capability_talk() {
+        let content = "I can use Rust, Python, and JavaScript for serious coding.";
+        let result = validate_response(content, &[], false, false);
+        assert_eq!(result, ValidationOutcome::Ok);
+    }
+
+    #[test]
     fn test_lower_case_called_pattern() {
         let content = "i will do it\n[called spawn({})]";
         let result = validate_response(content, &[], false, false);
@@ -349,6 +571,17 @@ mod tests {
         let tool_calls = vec![make_tool_call("recall")];
         let result = validate_response(content, &tool_calls, false, false);
         assert_eq!(result, ValidationOutcome::StripHallucination);
+    }
+
+    #[test]
+    fn test_strip_raw_json_when_real_tools_present() {
+        let content = r#"Starting clone.
+{ "name": "exec", "parameters": { "command": "git clone https://github.com/dusterbloom/skybloom" } }
+Done."#;
+        let tool_calls = vec![make_tool_call("exec")];
+        let result = validate_response(content, &tool_calls, false, false);
+        assert_eq!(result, ValidationOutcome::StripHallucination);
+        assert_eq!(strip_hallucinated_text(content), "Starting clone.\n\nDone.");
     }
 
     #[test]

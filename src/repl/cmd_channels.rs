@@ -144,7 +144,7 @@ impl ReplContext {
                 vs.stop_playback();
             }
             self.voice_session = None;
-            // Restore thinking display when voice mode turns off.
+            // Restore thinking speech when voice mode turns off.
             self.core_handle
                 .counters
                 .suppress_thinking_in_tts

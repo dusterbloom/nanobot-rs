@@ -739,6 +739,7 @@ impl AgentLoop {
         tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent::audit::ToolEvent>>,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
         priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+        media_paths: Option<&[String]>,
     ) -> String {
         if !self.reflection_spawned.swap(true, Ordering::SeqCst) {
             Self::spawn_background_reflection(&self.shared);
@@ -750,6 +751,9 @@ impl AgentLoop {
         if let Some(lang) = detected_language {
             msg.metadata
                 .insert("detected_language".to_string(), json!(lang));
+        }
+        if let Some(media) = media_paths.filter(|paths| !paths.is_empty()) {
+            msg.metadata.insert("media".to_string(), json!(media));
         }
 
         match self

@@ -505,7 +505,12 @@ impl IncrementalRenderer {
 /// the prefill cost that dominates perceived latency, separate from decode.
 ///
 /// Pure helper so the formatting is unit-testable without touching stdout.
-fn format_footer(elapsed: f32, ttft: Option<f32>, tokens: u64, finish_reason: Option<&str>) -> String {
+fn format_footer(
+    elapsed: f32,
+    ttft: Option<f32>,
+    tokens: u64,
+    finish_reason: Option<&str>,
+) -> String {
     let ttft_str = match ttft {
         Some(t) => format!("  ttft {:.2}s", t),
         None => String::new(),

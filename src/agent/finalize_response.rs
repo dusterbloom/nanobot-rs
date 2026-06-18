@@ -170,20 +170,31 @@ impl AgentLoopShared {
         // assistant message into a plain text assistant message, merging here
         // prevents two consecutive assistant messages from being persisted.
         if !ctx.final_content.is_empty() {
-            let last_is_assistant = ctx
+            let last_can_absorb_final_text = ctx
                 .messages
                 .last()
-                .and_then(|m| m.get("role").and_then(|r| r.as_str()))
-                .map(|r| r == "assistant")
+                .map(|m| {
+                    let is_assistant = m.get("role").and_then(|r| r.as_str()) == Some("assistant");
+                    let has_tool_calls = m
+                        .get("tool_calls")
+                        .and_then(|v| v.as_array())
+                        .map(|calls| !calls.is_empty())
+                        .unwrap_or(false);
+                    is_assistant && !has_tool_calls
+                })
                 .unwrap_or(false);
-            if last_is_assistant {
+            if last_can_absorb_final_text {
                 if let Some(last) = ctx.messages.last_mut() {
                     let existing = last
                         .get("content")
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
-                    last["content"] = json!(format!("{}\n\n{}", existing, ctx.final_content));
+                    last["content"] = if existing.trim().is_empty() {
+                        json!(ctx.final_content.clone())
+                    } else {
+                        json!(format!("{}\n\n{}", existing, ctx.final_content))
+                    };
                 }
             } else {
                 ctx.messages
@@ -193,6 +204,32 @@ impl AgentLoopShared {
 
         // Update session history -- persist full message array including tool calls.
         // Skip system prompt (index 0) and pre-existing history.
+        //
+        // Cancellation rescue: when the user cancelled mid-stream, the messages
+        // array may contain a partial (truncated) assistant response. If we
+        // persist it, the next turn's fingerprint will diverge at that truncated
+        // message, forcing a full re-prefill. Strip it so the next call starts
+        // from the last complete user message instead.
+        if ctx.final_content.is_empty() && ctx.is_cancelled() {
+            // Find and remove the partial assistant response (if any).
+            // The user message was already eagerly persisted (Bug 3 fix), so
+            // we only need to discard the incomplete assistant turn.
+            let mut end = ctx.messages.len();
+            while end > ctx.new_start {
+                if let Some(role) = ctx.messages[end - 1].get("role").and_then(|r| r.as_str()) {
+                    if role == "assistant" {
+                        end -= 1; // remove the partial assistant
+                    } else {
+                        break; // hit a user/tool message — stop
+                    }
+                } else {
+                    break;
+                }
+            }
+            // Truncate the messages array to remove the partial response.
+            ctx.messages.truncate(end);
+        }
+
         let new_messages: Vec<serde_json::Value> = if ctx.new_start < ctx.messages.len() {
             ctx.messages[ctx.new_start..].to_vec()
         } else if !ctx.final_content.is_empty() {

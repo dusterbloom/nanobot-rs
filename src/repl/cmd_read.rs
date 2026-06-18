@@ -120,19 +120,18 @@ impl ReplContext {
             );
         } else if is_local {
             let backend = self.config.agents.defaults.local_backend.trim();
-            let backend = if backend.is_empty() { "lmstudio" } else { backend };
+            let backend = if backend.is_empty() {
+                "lmstudio"
+            } else {
+                backend
+            };
             let local_base = self.config.agents.defaults.local_api_base.trim();
             let provider = if local_base.is_empty() {
                 format!("local {} managed", backend)
             } else {
                 format!("local {} @ {}", backend, tui::shorten_url(local_base))
             };
-            println!(
-                "  {}PROVIDER{}  {}",
-                tui::BOLD,
-                tui::RESET,
-                provider
-            );
+            println!("  {}PROVIDER{}  {}", tui::BOLD, tui::RESET, provider);
         } else {
             println!(
                 "  {}PROVIDER{}  {}",
