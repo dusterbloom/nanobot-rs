@@ -309,6 +309,9 @@ pub(crate) struct App {
     picker: Option<ModelPicker>,
     /// Disclosure level (calm / inspect / deep).
     mode: Mode,
+    /// View-only toggle for model reasoning blocks. Thinking remains enabled
+    /// and stored; this only decides whether `Cell::Thinking` rows render.
+    show_thinking: bool,
     /// Local image paths attached to the next submitted turn.
     attachments: Vec<String>,
 }
@@ -349,6 +352,7 @@ impl App {
             search: None,
             picker: None,
             mode: Mode::Calm,
+            show_thinking: true,
             attachments: Vec::new(),
         }
     }
@@ -371,6 +375,10 @@ impl App {
 
     pub(crate) fn mode_label(&self) -> &'static str {
         self.mode.label()
+    }
+
+    fn toggle_thinking_display(&mut self) {
+        self.show_thinking = !self.show_thinking;
     }
 
     /// Open the native model picker, selecting the active model if present.
@@ -980,6 +988,10 @@ impl App {
                 self.start_search();
                 Action::Continue
             }
+            KeyCode::Char('t') if ctrl => {
+                self.toggle_thinking_display();
+                Action::Continue
+            }
             // Esc goes back: clears the input line (and closes help/cancels a
             // turn in their handlers).
             KeyCode::Esc => {
@@ -1204,6 +1216,10 @@ impl App {
                         self.clear_input();
                         StreamingAction::Cancel
                     }
+                    KeyCode::Char('t') if ctrl => {
+                        self.toggle_thinking_display();
+                        StreamingAction::Continue
+                    }
                     KeyCode::Enter if k.modifiers.is_empty() => match self.submit() {
                         Action::Submit(turn) => StreamingAction::CancelAndSubmit(turn),
                         _ => StreamingAction::Cancel,
@@ -1320,7 +1336,10 @@ impl App {
         let title = self.input_title();
         self.input.set_block(input_block(title));
         f.render_widget(&self.input, chunks[2]);
-        f.render_widget(Paragraph::new(footer_line(footer, self.mode)), chunks[3]);
+        f.render_widget(
+            Paragraph::new(footer_line(footer, self.mode, self.show_thinking)),
+            chunks[3],
+        );
 
         if self.show_help {
             render_help(f, area);
@@ -1397,6 +1416,9 @@ impl App {
         let mut prev_was_tool = false;
         let mut assistant_mark_used = false;
         for cell in &self.transcript {
+            if matches!(cell, Cell::Thinking(_)) && !self.show_thinking {
+                continue;
+            }
             // Blank line before each user turn separates conversation turns.
             if matches!(cell, Cell::User(_)) && !rows.is_empty() {
                 rows.push(Line::default());
@@ -1755,7 +1777,7 @@ fn strip_ascii_case_insensitive(text: &str, needle: &str) -> String {
 }
 
 /// Quiet footer: cwd · model · mode · ctx usage.
-fn footer_line(footer: &Footer, mode: Mode) -> Line<'static> {
+fn footer_line(footer: &Footer, mode: Mode, show_thinking: bool) -> Line<'static> {
     let mut spans = vec![
         Span::styled("  cwd ", dim()),
         Span::styled(footer.cwd.clone(), style(OK_COLOR, false)),
@@ -1770,6 +1792,10 @@ fn footer_line(footer: &Footer, mode: Mode) -> Line<'static> {
             dim()
         };
         spans.push(Span::styled(format!(" {} ", m.label()), st));
+    }
+    if !show_thinking {
+        spans.push(Span::styled("   think ", dim()));
+        spans.push(Span::styled("hidden", style(WARN_COLOR, false)));
     }
     spans.push(Span::styled("   ctx ", dim()));
     if footer.ctx_max > 0 {
@@ -1926,6 +1952,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("Alt+Enter", "newline"),
         key("Up / Down", "prompt history"),
         key("Ctrl+R", "reverse-search history"),
+        key("Ctrl+T", "show / hide thinking"),
         key("PgUp/PgDn", "scroll transcript"),
         key("Esc", "clear input / cancel turn / close"),
         key("Ctrl+C", "cancel reply / clear input"),
@@ -2629,6 +2656,59 @@ mod tests {
             .find(|s| s.content.contains("the answer"))
             .expect("answer rendered");
         assert_ne!(answer.style.fg, Some(Color::Gray), "answer is not grey");
+    }
+
+    #[test]
+    fn ctrl_t_hides_and_shows_thinking_without_dropping_it() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("\x1b[90m\x1b[2m");
+        app.on_delta("private thought");
+        app.on_delta("\x1b[0m\n\n");
+        app.on_delta("visible answer");
+
+        assert!(flatten_text(Text::from(app.transcript_rows(100))).contains("private thought"));
+
+        let action = app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(matches!(action, Action::Continue));
+        assert_eq!(kinds(&app), vec!["user", "thinking", "reply"]);
+
+        let hidden = flatten_text(Text::from(app.transcript_rows(100)));
+        assert!(!hidden.contains("private thought"));
+        assert!(hidden.contains("visible answer"));
+
+        let action = app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(matches!(action, Action::Continue));
+        let shown = flatten_text(Text::from(app.transcript_rows(100)));
+        assert!(shown.contains("private thought"));
+    }
+
+    #[test]
+    fn ctrl_t_toggles_thinking_while_streaming() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("\x1b[90m\x1b[2m");
+        app.on_delta("live thought");
+
+        let action = app.on_streaming_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(matches!(action, StreamingAction::Continue));
+        assert!(!flatten_text(Text::from(app.transcript_rows(100))).contains("live thought"));
+
+        let action = app.on_streaming_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(matches!(action, StreamingAction::Continue));
+        assert!(flatten_text(Text::from(app.transcript_rows(100))).contains("live thought"));
     }
 
     #[test]
