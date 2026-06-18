@@ -22,6 +22,8 @@ use std::sync::Arc;
 use super::agent_loop::{ResponseBoundary, TurnContext};
 
 const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
+const INLINE_TOOL_RESULT_HOT_PROMPT_MAX_CHARS: usize = 2_400;
+const INLINE_TOOL_RESULT_HOT_PROMPT_MIN_CHARS: usize = 800;
 
 /// Per-tool token threshold above which a raw tool result is replaced by a
 /// summary. Enumerative tools (`exec`, `list_dir`, `web_search`, `read_file`)
@@ -30,9 +32,86 @@ const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
 /// papers over by fabricating. Keep raw output for these up to ~4000 tokens.
 fn summary_threshold_tokens(tool_name: &str) -> usize {
     match tool_name {
-        "exec" | "list_dir" | "web_search" | "read_file" => 4000,
+        "exec" | "list_dir" | "find_files" | "search_files" | "file_info" | "workspace_diff"
+        | "system_info" | "web_search" | "read_file" => 4000,
         _ => LARGE_TOOL_RESULT_TOKEN_THRESHOLD,
     }
+}
+
+fn inline_hot_prompt_result_cap(ctx: &TurnContext) -> usize {
+    ctx.core
+        .max_tool_result_chars
+        .min(INLINE_TOOL_RESULT_HOT_PROMPT_MAX_CHARS)
+        .max(INLINE_TOOL_RESULT_HOT_PROMPT_MIN_CHARS)
+}
+
+fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "path",
+        "lines",
+        "query",
+        "pattern",
+        "url",
+        "command",
+        "glob",
+        "max_lines",
+    ] {
+        if let Some(value) = args.get(key) {
+            let rendered = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            parts.push(format!("{}={}", key, rendered));
+        }
+    }
+
+    let summary = if parts.is_empty() {
+        "(arguments omitted)".to_string()
+    } else {
+        parts.join(", ")
+    };
+
+    summary.chars().take(260).collect()
+}
+
+fn compact_inline_tool_result(
+    tool_name: &str,
+    args: &std::collections::HashMap<String, Value>,
+    data: &str,
+    max_chars: usize,
+) -> String {
+    let total_chars = data.chars().count();
+    if total_chars <= max_chars {
+        return data.to_string();
+    }
+
+    let source = tool_arg_summary(args);
+    let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
+    let header = format!(
+        "[tool result compacted for hot prompt]\n\
+         tool: {tool_name}\n\
+         args: {source}\n\
+         full_output: {total_chars} chars, ~{estimated_tokens} tokens\n\
+         guidance: do not repeat the same broad call; request a narrow line range, search term, or URL section only if the omitted bytes are required.\n\n\
+         --- head preview ---\n"
+    );
+
+    let footer = "\n\n--- tail preview ---\n";
+    let fixed_chars = header.chars().count() + footer.chars().count();
+    let preview_budget = max_chars.saturating_sub(fixed_chars).max(200);
+    let head_chars = preview_budget * 2 / 3;
+    let tail_chars = preview_budget.saturating_sub(head_chars);
+
+    let head: String = data.chars().take(head_chars).collect();
+    let tail_rev: Vec<char> = data.chars().rev().take(tail_chars).collect();
+    let tail: String = tail_rev.into_iter().rev().collect();
+
+    let mut out = format!("{header}{head}{footer}{tail}");
+    if out.chars().count() > max_chars {
+        out = out.chars().take(max_chars).collect();
+    }
+    out
 }
 
 pub(crate) fn local_model_key(model: &str) -> String {
@@ -314,7 +393,8 @@ pub(crate) async fn execute_tools_delegated(
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
         let threshold = summary_threshold_tokens(&tc.name);
-        let injected = if let Some(ref summary) = run_result.summary {
+        let cap = inline_hot_prompt_result_cap(ctx);
+        let injected_raw = if let Some(ref summary) = run_result.summary {
             // Summary exists from scratch-pad analysis.
             if full_tokens > threshold {
                 // Large data + good summary available: use the summary so compaction
@@ -341,6 +421,7 @@ pub(crate) async fn execute_tools_delegated(
         } else {
             ctx.content_gate.admit_simple(full_data).into_text()
         };
+        let injected = compact_inline_tool_result(&tc.name, &tc.arguments, &injected_raw, cap);
 
         if ctx.core.provenance_config.enabled {
             ContextBuilder::add_tool_result_immutable(
@@ -469,7 +550,16 @@ fn is_routed_call(tool_call_id: &str, routed_tool_calls: &[ToolCallRequest]) -> 
 fn is_parallel_safe(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "read_file" | "list_dir" | "web_fetch" | "web_search" | "read_skill"
+        "read_file"
+            | "list_dir"
+            | "find_files"
+            | "search_files"
+            | "file_info"
+            | "workspace_diff"
+            | "system_info"
+            | "web_fetch"
+            | "web_search"
+            | "read_skill"
     )
 }
 
@@ -614,19 +704,23 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
 
     // Gate tool result through context budget.
     let threshold = summary_threshold_tokens(&r.tool_name);
+    let cap = inline_hot_prompt_result_cap(ctx);
     let data = if ctx.core.specialist_provider.is_some()
         && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > threshold
     {
-        ctx.content_gate
+        let summarized = ctx
+            .content_gate
             .admit_with_specialist(
                 &result_data,
                 ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
                 ctx.core.specialist_model.as_deref().unwrap_or(""),
             )
             .await
-            .into_text()
+            .into_text();
+        compact_inline_tool_result(&r.tool_name, &r.arguments, &summarized, cap)
     } else {
-        ctx.content_gate.admit_simple(&result_data).into_text()
+        let prompt_data = compact_inline_tool_result(&r.tool_name, &r.arguments, &result_data, cap);
+        ctx.content_gate.admit_simple(&prompt_data).into_text()
     };
 
     if ctx.core.provenance_config.enabled {
@@ -877,6 +971,7 @@ mod tests {
         assert_eq!(summary_threshold_tokens("list_dir"), 4000);
         assert_eq!(summary_threshold_tokens("web_search"), 4000);
         assert_eq!(summary_threshold_tokens("read_file"), 4000);
+        assert_eq!(summary_threshold_tokens("search_files"), 4000);
     }
 
     #[test]
@@ -901,6 +996,40 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_inline_tool_result_keeps_short_data_raw() {
+        let args = HashMap::new();
+        let data = "short result";
+        assert_eq!(
+            compact_inline_tool_result("read_file", &args, data, 100),
+            data
+        );
+    }
+
+    #[test]
+    fn test_compact_inline_tool_result_caps_large_data() {
+        let mut args = HashMap::new();
+        args.insert("path".to_string(), serde_json::json!("src/lib.rs"));
+        args.insert("lines".to_string(), serde_json::json!("1:1000"));
+        let data = format!(
+            "{}MIDDLE_SHOULD_BE_OMITTED{}",
+            "head line\n".repeat(200),
+            "tail line\n".repeat(200)
+        );
+
+        let compacted = compact_inline_tool_result("read_file", &args, &data, 900);
+
+        assert!(compacted.chars().count() <= 900);
+        assert!(compacted.contains("[tool result compacted for hot prompt]"));
+        assert!(compacted.contains("tool: read_file"));
+        assert!(compacted.contains("path=src/lib.rs"));
+        assert!(compacted.contains("lines=1:1000"));
+        assert!(compacted.contains("do not repeat the same broad call"));
+        assert!(compacted.contains("--- head preview ---"));
+        assert!(compacted.contains("--- tail preview ---"));
+        assert!(!compacted.contains("MIDDLE_SHOULD_BE_OMITTED"));
+    }
+
+    #[test]
     fn test_local_model_key_strips_internal_prefix() {
         assert_eq!(
             local_model_key("local:Qwen3.6-35B-A3B-4bit"),
@@ -917,6 +1046,11 @@ mod tests {
         // Parallel-safe tools
         assert!(is_parallel_safe("read_file"));
         assert!(is_parallel_safe("list_dir"));
+        assert!(is_parallel_safe("find_files"));
+        assert!(is_parallel_safe("search_files"));
+        assert!(is_parallel_safe("file_info"));
+        assert!(is_parallel_safe("workspace_diff"));
+        assert!(is_parallel_safe("system_info"));
         assert!(is_parallel_safe("web_fetch"));
         assert!(is_parallel_safe("web_search"));
         assert!(is_parallel_safe("read_skill"));
@@ -1003,12 +1137,14 @@ mod tests {
             make_tc("exec", "2"),
             make_tc("list_dir", "3"),
             make_tc("write_file", "4"),
+            make_tc("find_files", "5"),
         ];
         let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
-        assert_eq!(par.len(), 2);
+        assert_eq!(par.len(), 3);
         assert_eq!(seq.len(), 2);
         assert_eq!(par[0].name, "read_file");
         assert_eq!(par[1].name, "list_dir");
+        assert_eq!(par[2].name, "find_files");
         assert_eq!(seq[0].name, "exec");
         assert_eq!(seq[1].name, "write_file");
     }
@@ -1019,9 +1155,10 @@ mod tests {
             make_tc("read_file", "1"),
             make_tc("list_dir", "2"),
             make_tc("web_search", "3"),
+            make_tc("file_info", "4"),
         ];
         let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
-        assert_eq!(par.len(), 3);
+        assert_eq!(par.len(), 4);
         assert!(seq.is_empty());
     }
 

@@ -1460,7 +1460,7 @@ pub(crate) async fn route_tool_calls(
     // Tool guard filtering: split calls into allowed, blocked-with-cache, blocked-without-cache.
     let original_count = routed_tool_calls.len();
     let mut allowed_calls: Vec<ToolCallRequest> = Vec::new();
-    let mut blocked_with_result: Vec<(ToolCallRequest, String)> = Vec::new();
+    let mut blocked_with_result: Vec<(ToolCallRequest, usize)> = Vec::new();
     let mut blocked_no_result = 0usize;
 
     for tc in routed_tool_calls {
@@ -1470,7 +1470,7 @@ pub(crate) async fn route_tool_calls(
                 warn!("{}", e);
                 let key = ToolGuard::key(&tc.name, &tc.arguments);
                 if let Some(cached) = ctx.flow.tool_guard.get_cached_result(&key) {
-                    blocked_with_result.push((tc, cached.to_string()));
+                    blocked_with_result.push((tc, cached.chars().count()));
                 } else {
                     blocked_no_result += 1;
                 }
@@ -1480,15 +1480,23 @@ pub(crate) async fn route_tool_calls(
 
     let total_blocked = blocked_with_result.len() + blocked_no_result;
 
-    // Replay cached results for blocked calls that have them.
+    // A blocked duplicate still needs a protocol-valid tool result for the
+    // assistant call, but replaying the cached bytes grows the hot prompt for
+    // no new evidence. Keep the result as a fixed-size receipt.
     if !blocked_with_result.is_empty() {
         let tc_json: Vec<Value> = blocked_with_result
             .iter()
             .map(|(tc, _)| tc.to_openai_json())
             .collect();
         ContextBuilder::add_assistant_message(&mut ctx.messages, response_content, Some(&tc_json));
-        for (tc, cached_result) in &blocked_with_result {
-            ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, cached_result);
+        for (tc, cached_chars) in &blocked_with_result {
+            let receipt = format!(
+                "duplicate {} call blocked; cached result from the earlier identical call \
+                 was {} chars and is already represented in the conversation. Do not replay \
+                 this broad call; answer from the prior result or request a narrower range/check.",
+                tc.name, cached_chars
+            );
+            ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &receipt);
         }
     }
 
@@ -2081,14 +2089,14 @@ mod tests {
     // ── Tool result truncation ─────────────────────────────────────────────────
 
     // RED: truncate_tool_result must cap long results to the provided max_chars limit.
-    // Use the default value (12000) which matches MAX_TOOL_RESULT_CHARS.
+    // Use the router default value so preflight cannot stuff large tool output into the prompt.
     #[test]
     fn test_tool_result_truncation() {
         let long_input: String = "x".repeat(20_000);
-        let result = truncate_tool_result(&long_input, 12000);
+        let result = truncate_tool_result(&long_input, 2400);
         assert!(
-            result.len() <= 12100,
-            "truncated result must be at most ~12100 chars (12000 + annotation), got {}",
+            result.len() <= 2500,
+            "truncated result must be at most ~2500 chars (2400 + annotation), got {}",
             result.len()
         );
         assert!(
@@ -2105,7 +2113,7 @@ mod tests {
     #[test]
     fn test_tool_result_no_truncation_when_short() {
         let short_input = "short result";
-        let result = truncate_tool_result(short_input, 12000);
+        let result = truncate_tool_result(short_input, 2400);
         assert_eq!(
             result, short_input,
             "short input must be returned unchanged"

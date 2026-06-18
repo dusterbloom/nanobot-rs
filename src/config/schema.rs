@@ -1415,7 +1415,7 @@ pub struct RouterTuningConfig {
     /// Max tokens for a single router LLM call (default: 256).
     pub max_tokens: u32,
     /// Max characters kept from a tool result before injection into the router
-    /// context (default: 12000).
+    /// context (default: 2400).
     pub max_tool_result_chars: usize,
     /// Max characters per message in the conversation tail passed to the
     /// router (default: 200).
@@ -1428,7 +1428,7 @@ fn default_router_max_tokens() -> u32 {
     256
 }
 fn default_router_max_tool_result_chars() -> usize {
-    12000
+    2400
 }
 fn default_router_tail_max_msg_chars() -> usize {
     200

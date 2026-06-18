@@ -1095,18 +1095,18 @@ pub async fn run_tool_loop(
 pub fn format_results_for_context(
     result: &ToolRunResult,
     max_result_chars: usize,
-    gate: Option<&mut crate::agent::context_gate::ContentGate>,
+    mut gate: Option<&mut crate::agent::context_gate::ContentGate>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     for (_, tool_name, data) in &result.tool_results {
-        // Tool results are always passed through raw — never summarized or
-        // truncated.  If they overflow context, that is a context management
-        // concern, not a tool-result concern.  Summarising file reads causes
-        // models to retry the same read in a loop, burning iterations.
-        let _ = gate; // gate unused — keep parameter for API compat
-        let _ = max_result_chars;
-        parts.push(format!("[{}]: {}", tool_name, data));
+        let compacted = compact_result_for_context(tool_name, data, max_result_chars);
+        let visible = if let Some(g) = gate.as_deref_mut() {
+            g.admit_simple(&compacted).into_text()
+        } else {
+            compacted
+        };
+        parts.push(format!("[{}]: {}", tool_name, visible));
     }
 
     if let Some(ref summary) = result.summary {
@@ -1114,6 +1114,31 @@ pub fn format_results_for_context(
     }
 
     parts.join("\n")
+}
+
+fn compact_result_for_context(tool_name: &str, data: &str, max_result_chars: usize) -> String {
+    let cap = max_result_chars.max(120);
+    let total_chars = data.chars().count();
+    if total_chars <= cap {
+        return data.to_string();
+    }
+
+    let header = format!(
+        "[tool result compacted for main context]\n\
+         tool: {tool_name}\n\
+         full_output: {total_chars} chars\n\
+         guidance: do not replay the same broad tool call; inspect a narrower range only if needed.\n\n\
+         --- preview ---\n"
+    );
+    let footer = "\n\n[truncated; full output kept outside the hot prompt]";
+    let fixed_chars = header.chars().count() + footer.chars().count();
+    let preview_chars = cap.saturating_sub(fixed_chars).max(40);
+    let preview: String = data.chars().take(preview_chars).collect();
+    let mut out = format!("{header}{preview}{footer}");
+    if out.chars().count() > cap {
+        out = out.chars().take(cap).collect();
+    }
+    out
 }
 
 /// Generate a Mistral-compatible tool call ID (exactly 9 alphanumeric chars).

@@ -312,7 +312,7 @@ fn test_aggregate_results_formatting() {
 }
 
 #[test]
-fn test_aggregate_results_passthrough() {
+fn test_aggregate_results_compacts_long_output() {
     let long_data = "x".repeat(3000);
     let result = ToolRunResult {
         tool_results: vec![("id1".into(), "big_tool".into(), long_data.clone())],
@@ -321,13 +321,15 @@ fn test_aggregate_results_passthrough() {
         error: None,
     };
 
-    // Tool results are always passed through raw — never truncated.
     let formatted = format_results_for_context(&result, 2000, None);
-    assert!(formatted.contains(&long_data));
+    assert!(formatted.len() < long_data.len());
+    assert!(formatted.contains("[big_tool]: [tool result compacted for main context]"));
+    assert!(formatted.contains("full_output: 3000 chars"));
+    assert!(formatted.contains("full output kept outside the hot prompt"));
 }
 
 #[test]
-fn test_results_passthrough_with_summary() {
+fn test_results_preview_with_summary() {
     let data = "x".repeat(500);
     let result = ToolRunResult {
         tool_results: vec![("id1".into(), "read_file".into(), data.clone())],
@@ -336,9 +338,9 @@ fn test_results_passthrough_with_summary() {
         error: None,
     };
 
-    // Tool results passed through raw regardless of limit parameter.
     let formatted = format_results_for_context(&result, 200, None);
-    assert!(formatted.contains(&data));
+    assert!(!formatted.contains(&data));
+    assert!(formatted.contains("[tool result compacted for main context]"));
     assert!(formatted.contains("Found a large file."));
 }
 
