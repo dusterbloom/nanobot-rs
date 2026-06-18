@@ -228,6 +228,31 @@ fn send_audio_chunk(
         .is_ok()
 }
 
+/// Synthesize each sentence in order. A per-sentence synthesis failure is logged
+/// and **skipped** — it must never abort the rest of the speech. Long replies are
+/// split into many chunks; if one chunk fails (e.g. a dense chunk overflowing the
+/// TTS model's fixed token window), every sentence after it would otherwise be
+/// silently dropped. Returns early only when `cancel` is set.
+fn synthesize_each<S>(sentences: &[String], cancel: &AtomicBool, mut synth: S)
+where
+    S: FnMut(usize, &str) -> Result<(), String>,
+{
+    let total = sentences.len();
+    for (i, sentence) in sentences.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(e) = synth(i, sentence) {
+            tracing::error!(
+                "TTS synthesis failed for chunk {}/{} (skipping, continuing): {}",
+                i + 1,
+                total,
+                e
+            );
+        }
+    }
+}
+
 fn f32le_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
@@ -1579,25 +1604,20 @@ impl VoicePipeline {
                 tracing::warn!("Voice switch to {} failed: {}", voice_id, e);
             }
 
-            for (i, sentence) in sentences.iter().enumerate() {
-                if cancel_synth.load(Ordering::Relaxed) {
-                    break;
-                }
-                tracing::debug!("Synthesizing sentence {}/{}...", i + 1, sentences.len());
+            let total = sentences.len();
+            synthesize_each(&sentences, &cancel_synth, |i, sentence| {
+                tracing::debug!("Synthesizing sentence {}/{}...", i + 1, total);
                 let cancel_ref = &cancel_synth;
-                match guard.synthesize_streaming(sentence, |samples, sample_rate| {
-                    if cancel_ref.load(Ordering::Relaxed) {
-                        return false;
-                    }
-                    send_audio_chunk(&audio_tx, samples, sample_rate)
-                }) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!("TTS synthesis failed: {}", e);
-                        break;
-                    }
-                }
-            }
+                guard
+                    .synthesize_streaming(sentence, |samples, sample_rate| {
+                        if cancel_ref.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        send_audio_chunk(&audio_tx, samples, sample_rate)
+                    })
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            });
         });
 
         let playback_handle = std::thread::spawn(move || -> Result<(), String> {
@@ -1684,8 +1704,12 @@ impl VoicePipeline {
                         }) {
                             Ok(_) => {}
                             Err(e) => {
-                                tracing::error!("Streaming TTS synthesis failed: {}", e);
-                                break;
+                                // Skip this chunk but keep speaking the rest — a
+                                // single bad sentence must not silence the reply.
+                                tracing::error!(
+                                    "Streaming TTS synthesis failed (skipping chunk): {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -2140,6 +2164,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn synthesize_each_skips_failures_and_speaks_the_rest() {
+        // Regression: a per-chunk synthesis failure used to `break`, silently
+        // dropping every sentence after it. It must now skip the bad chunk and
+        // keep synthesizing the remainder.
+        let cancel = AtomicBool::new(false);
+        let sentences: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let mut spoken = Vec::new();
+        synthesize_each(&sentences, &cancel, |i, s| {
+            spoken.push(s.to_string());
+            if i == 1 {
+                Err("boom".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(spoken, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn synthesize_each_stops_when_cancelled() {
+        // Cancellation must still short-circuit: nothing after the cancel point
+        // is synthesized.
+        let cancel = AtomicBool::new(false);
+        let sentences: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let mut spoken = Vec::new();
+        synthesize_each(&sentences, &cancel, |_, s| {
+            spoken.push(s.to_string());
+            if s == "b" {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        assert_eq!(spoken, vec!["a", "b"]);
+    }
+
+    #[test]
     fn test_tool_speech_cue_known_and_default() {
         assert_eq!(tool_speech_cue("exec"), "running a command");
         assert_eq!(tool_speech_cue("web_search"), "searching the web");
@@ -2412,50 +2472,9 @@ mod tests {
         assert!(!stripped.contains("query"));
     }
 
-    #[test]
-    fn test_pocket_tts_synthesizes() {
-        use jack_voice::{TextToSpeech, TtsEngine};
-        let tts = TextToSpeech::with_engine(TtsEngine::Pocket);
-        match tts {
-            Ok(mut tts) => {
-                assert_eq!(tts.engine_type(), "pocket");
-                let result = tts.synthesize("Hello, this is a test.");
-                match result {
-                    Ok(output) => {
-                        assert!(output.samples.len() > 100);
-                        assert!(output.sample_rate > 0);
-                    }
-                    Err(e) => panic!("Pocket TTS synthesis failed: {}", e),
-                }
-            }
-            Err(e) => panic!("Pocket TTS init failed: {}", e),
-        }
-    }
-
-    #[test]
-    fn test_pocket_tts_streaming() {
-        use jack_voice::{TextToSpeech, TtsEngine};
-        let mut tts = TextToSpeech::with_engine(TtsEngine::Pocket).expect("Pocket TTS init failed");
-
-        let mut chunk_count = 0u32;
-        let mut total_samples = 0usize;
-        let mut rate = 0u32;
-
-        let sr = tts
-            .synthesize_streaming(
-                "Hello, this is a streaming test. The audio should arrive in multiple chunks.",
-                |samples, sample_rate| {
-                    chunk_count += 1;
-                    total_samples += samples.len();
-                    rate = sample_rate;
-                    true
-                },
-            )
-            .expect("Streaming synthesis failed");
-
-        assert!(sr > 0);
-        assert_eq!(sr, rate);
-        assert!(total_samples > 100);
-        assert!(chunk_count > 1);
-    }
+    // DEPRECATED(pocket): the Pocket engine synth/streaming tests were removed —
+    // Pocket is no longer used (Supertonic is the active engine) and these tests
+    // require Pocket model assets that aren't shipped, so they only ever failed in
+    // CI/dev. Full Pocket removal is tracked in the TtsEngineConfig note and the
+    // TUI handoff doc.
 }
