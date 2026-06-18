@@ -312,12 +312,17 @@ fn apply_local_reasoning_controls(
     }
 
     if let Some(budget) = thinking_budget {
+        // Reasoning templates are tuned for high-entropy sampling; several
+        // local reasoning models (including VibeThinker) degrade or loop when
+        // driven with nanobot's calmer default temperature.
+        body["temperature"] = serde_json::json!(1.0);
         body["chat_template_kwargs"] = serde_json::json!({
             "enable_thinking": true
         });
         body["reasoning_budget"] = serde_json::json!(budget);
         body["reasoning_format"] = serde_json::json!("deepseek");
     } else if model_prefers_hidden_reasoning(model) {
+        body["temperature"] = serde_json::json!(1.0);
         body["chat_template_kwargs"] = serde_json::json!({
             "enable_thinking": true
         });
@@ -2386,7 +2391,8 @@ mod tests {
 
     #[test]
     fn test_reasoning_params_sent_for_thinking_model() {
-        let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": []});
+        let mut body =
+            serde_json::json!({"model": "qwen3-1.7b", "messages": [], "temperature": 0.2});
         apply_local_reasoning_controls(
             &mut body,
             "http://localhost:1234",
@@ -2397,6 +2403,7 @@ mod tests {
         assert_eq!(body["reasoning_budget"], 1024);
         assert_eq!(body["reasoning_format"], "deepseek");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["temperature"], 1.0);
     }
 
     #[test]
@@ -2423,7 +2430,8 @@ mod tests {
     fn test_vibethinker_keeps_hidden_reasoning_enabled_by_default() {
         let mut body = serde_json::json!({
             "model": "VibeThinker-3B-mlx-8Bit",
-            "messages": []
+            "messages": [],
+            "temperature": 0.2
         });
         apply_local_reasoning_controls(
             &mut body,
@@ -2438,6 +2446,21 @@ mod tests {
             body.get("reasoning_budget").is_none(),
             "default-on hidden reasoning must not impose a nanobot budget"
         );
+        assert_eq!(body["temperature"], 1.0);
+    }
+
+    #[test]
+    fn test_non_reasoning_local_model_keeps_configured_temperature() {
+        let mut body =
+            serde_json::json!({"model": "nanbeige-16b", "messages": [], "temperature": 0.2});
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://localhost:1234",
+            "nanbeige-16b",
+            None,
+            false,
+        );
+        assert_eq!(body["temperature"], 0.2);
     }
 
     #[test]
