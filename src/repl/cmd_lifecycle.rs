@@ -571,6 +571,10 @@ impl ReplContext {
             }
         }
 
+        self.core_handle
+            .counters
+            .reset_session_prompt_state(&self.session_id);
+
         if self.config.trio.enabled {
             let budget = self.compute_current_vram_budget();
             if !budget.fits {

@@ -123,6 +123,19 @@ fn local_tail_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn apply_session_prompt_epoch(messages: &mut [serde_json::Value], epoch: u64) {
+    if epoch == 0 {
+        return;
+    }
+    let Some(first) = messages.first_mut() else {
+        return;
+    };
+    let Some(content) = first.get("content").and_then(|v| v.as_str()) else {
+        return;
+    };
+    first["content"] = json!(format!("{content}\n\n[session-reset-epoch:{epoch}]"));
+}
+
 impl AgentLoopShared {
     pub(crate) async fn build_local_runtime_blocks(
         &self,
@@ -634,6 +647,12 @@ impl AgentLoopShared {
             }
         }
 
+        // `/clear` and model switches must invalidate resident-server prompt
+        // caches even when the user starts with identical text (`hi` after
+        // `hi`). Keep the marker stable within an epoch so later turns remain
+        // append-only, but make each new epoch a cold prompt prefix.
+        apply_session_prompt_epoch(&mut messages, counters.session_prompt_epoch(&session_key));
+
         // Optional per-turn query-aware TAIL block (local only): relevant skills
         // + memory placed AFTER history, immediately before the user message.
         //
@@ -760,7 +779,7 @@ impl AgentLoopShared {
 
 #[cfg(test)]
 mod tests {
-    use super::turn_query;
+    use super::{apply_session_prompt_epoch, turn_query};
     use crate::agent::prompt_fingerprint::{compare, fingerprint, PromptDelta};
     use serde_json::json;
 
@@ -865,6 +884,37 @@ mod tests {
                 "static-prefix injection busts the whole cache"
             ),
             other => panic!("expected head divergence, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_session_prompt_epoch_busts_prompt_prefix_after_clear() {
+        let mut before = vec![
+            json!({"role": "system", "content": "STATIC"}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let mut after = before.clone();
+
+        apply_session_prompt_epoch(&mut before, 0);
+        apply_session_prompt_epoch(&mut after, 1);
+
+        assert_eq!(before[0]["content"], "STATIC");
+        assert!(after[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[session-reset-epoch:1]"));
+
+        let fp_before = fingerprint(&before);
+        let fp_after = fingerprint(&after);
+        match compare(Some(&fp_before), &fp_after) {
+            PromptDelta::Diverged {
+                first_divergent_msg,
+                ..
+            } => assert_eq!(
+                first_divergent_msg, 0,
+                "clear/model switch epoch must invalidate the stale prompt head"
+            ),
+            other => panic!("expected epoch marker to diverge at the prompt head, got {other:?}"),
         }
     }
 

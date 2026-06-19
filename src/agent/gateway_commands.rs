@@ -102,6 +102,10 @@ async fn cmd_clear(shared: &AgentLoopShared, session_key: &str) -> String {
     engines.remove(session_key);
     drop(engines);
     shared
+        .core_handle
+        .counters
+        .reset_session_prompt_state(session_key);
+    shared
         .bulletin_cache
         .store(std::sync::Arc::new(String::new()));
     "Working memory and history cleared.".to_string()

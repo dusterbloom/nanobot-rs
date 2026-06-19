@@ -224,6 +224,10 @@ pub struct RuntimeCounters {
     /// Adding that block after a cache is warm mutates the prompt head, so it is
     /// introduced only at a cold/checkpoint boundary and then kept stable.
     pub lcm_prompt_advertised: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Per-session prompt epoch. Bumped by `/clear` and model switches so a
+    /// resident local server cannot keep continuing from a stale KV cache when
+    /// the next user prompt happens to be a prefix of the old conversation.
+    pub prompt_session_epoch: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl RuntimeCounters {
@@ -259,7 +263,36 @@ impl RuntimeCounters {
             prompt_fingerprints: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_cache_watermark: parking_lot::Mutex::new(std::collections::HashMap::new()),
             lcm_prompt_advertised: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            prompt_session_epoch: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Reset all prompt-cache bookkeeping for a session and advance its prompt epoch.
+    ///
+    /// The epoch is rendered into the next prompt as a tiny stable marker. This
+    /// forces local resident servers to treat post-clear/post-switch prompts as
+    /// a fresh prefix even when the user starts with identical text like `hi`.
+    pub fn reset_session_prompt_state(&self, session_key: &str) -> u64 {
+        self.prompt_fingerprints.lock().remove(session_key);
+        self.prompt_cache_watermark.lock().remove(session_key);
+        self.lcm_prompt_advertised.lock().remove(session_key);
+
+        let mut epochs = self.prompt_session_epoch.lock();
+        let next = epochs
+            .get(session_key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        epochs.insert(session_key.to_string(), next);
+        next
+    }
+
+    pub fn session_prompt_epoch(&self, session_key: &str) -> u64 {
+        self.prompt_session_epoch
+            .lock()
+            .get(session_key)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -809,5 +842,37 @@ mod tests {
         // Second call with same state — no log, no panic.
         counters.set_trio_state(TrioState::Active);
         assert_eq!(counters.get_trio_state(), TrioState::Active);
+    }
+
+    #[test]
+    fn test_reset_session_prompt_state_clears_cache_and_bumps_epoch() {
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let session = "cli:test";
+        let fp = crate::agent::prompt_fingerprint::fingerprint(&[serde_json::json!({
+            "role": "user",
+            "content": "hi",
+        })]);
+
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session.to_string(), fp);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session.to_string(), 7);
+        counters
+            .lcm_prompt_advertised
+            .lock()
+            .insert(session.to_string());
+
+        assert_eq!(counters.reset_session_prompt_state(session), 1);
+        assert!(!counters.prompt_fingerprints.lock().contains_key(session));
+        assert!(!counters.prompt_cache_watermark.lock().contains_key(session));
+        assert!(!counters.lcm_prompt_advertised.lock().contains(session));
+        assert_eq!(counters.session_prompt_epoch(session), 1);
+
+        assert_eq!(counters.reset_session_prompt_state(session), 2);
+        assert_eq!(counters.session_prompt_epoch(session), 2);
     }
 }

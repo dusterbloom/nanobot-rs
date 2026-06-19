@@ -713,6 +713,7 @@ impl ReplContext {
         self.agent_loop.clear_bulletin_cache();
 
         let counters = &self.core_handle.counters;
+        counters.reset_session_prompt_state(&self.session_id);
         counters.last_context_used.store(0, Ordering::Relaxed);
         counters.last_message_count.store(0, Ordering::Relaxed);
         counters
