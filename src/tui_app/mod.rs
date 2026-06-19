@@ -43,7 +43,10 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::audit::ToolEvent;
 use crate::repl::commands::{unique_direct_model_match, ModelEntry, ReplContext};
-use app::{draw_outro, Action, App, Footer, StreamingAction, SubmittedTurn};
+use app::{
+    draw_outro, Action, App, BackgroundJob, Footer, SessionPick, SessionRow, StreamingAction,
+    SubmittedTurn,
+};
 
 /// Immutable per-session handles a single turn needs to drive the agent.
 struct Session<'a> {
@@ -112,7 +115,9 @@ pub(crate) async fn run(ctx: &mut ReplContext) -> std::io::Result<()> {
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
 
     let mut app = App::new();
+    load_current_session_state(&mut app, ctx).await;
     let result = event_loop(&mut terminal, &mut app, ctx, &mut ev_rx, &paused).await;
+    save_current_snapshot(&app, ctx).await;
 
     // Native farewell frame before the terminal is restored.
     if result.is_ok() {
@@ -131,26 +136,6 @@ pub(crate) async fn run(ctx: &mut ReplContext) -> std::io::Result<()> {
 
 fn clear_normal_screen() {
     let _ = execute!(std::io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show);
-}
-
-fn model_accepts_images(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    [
-        "vision",
-        "vl",
-        "llava",
-        "pixtral",
-        "gpt-4o",
-        "o3",
-        "o4",
-        "gemini",
-        "claude-3",
-        "qwen-vl",
-        "qwen2.5-vl",
-        "qwen3-vl",
-    ]
-    .iter()
-    .any(|marker| model.contains(marker))
 }
 
 /// Snapshot the quiet footer state (cwd / model / context usage) from the core.
@@ -226,6 +211,7 @@ async fn event_loop(
     paused: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     'ui: loop {
+        refresh_background_jobs(app, &ctx.agent_loop).await;
         let footer = footer_snapshot(&ctx.core_handle);
         terminal.draw(|f| app.draw(f, &footer))?;
         let Some(ev) = ev_rx.recv().await else { break };
@@ -236,12 +222,13 @@ async fn event_loop(
                 let mut queued = Some(turn);
                 while let Some(mut turn) = queued.take() {
                     if turn.media.is_empty() {
-                        if let Some(rest) = turn.text.strip_prefix('/') {
+                        if let Some(rest) = as_slash_command(&turn.text) {
                             let text = turn.text.clone();
                             if slash_command(terminal, app, ctx, &text, rest, ev_rx, paused).await?
                             {
                                 break 'ui; // /quit
                             }
+                            save_current_snapshot(app, ctx).await;
                             continue;
                         }
                     }
@@ -252,13 +239,15 @@ async fn event_loop(
                         lang: ctx.lang.as_deref(),
                     };
                     if !turn.media.is_empty() {
-                        let model = session.core.swappable().model.clone();
-                        if !model_accepts_images(&model) {
+                        let core = session.core.swappable();
+                        if !core.model_capabilities.vision {
                             let suffix = if turn.media.len() == 1 { "" } else { "s" };
                             app.push_note(format!(
-                                "{} image{} not sent — {model} does not advertise image input",
+                                "{} image{} not sent — {} does not advertise image input \
+                                 (set modelCapabilities.<name>.vision = true to override)",
                                 turn.media.len(),
-                                suffix
+                                suffix,
+                                core.model
                             ));
                             turn.media.clear();
                         }
@@ -266,13 +255,32 @@ async fn event_loop(
                     queued = run_turn(terminal, app, &session, &turn, ev_rx)
                         .await?
                         .queued_turn;
+                    save_current_snapshot(app, ctx).await;
                 }
             }
             Action::Record => {
                 #[cfg(feature = "voice")]
-                voice_cycle(terminal, app, ctx, ev_rx, paused).await?;
+                {
+                    voice_cycle(terminal, app, ctx, ev_rx, paused).await?;
+                    save_current_snapshot(app, ctx).await;
+                }
             }
-            Action::PickModel(entry) => apply_model_selection(terminal, app, ctx, entry).await?,
+            Action::PickModel(entry) => {
+                apply_model_selection(terminal, app, ctx, entry).await?;
+                save_current_snapshot(app, ctx).await;
+            }
+            Action::SessionSearch(query) => {
+                let rows = load_session_rows(ctx, &query).await;
+                app.set_session_rows(rows);
+            }
+            Action::PreviewSession(pick) => {
+                let preview = preview_session(ctx, &pick).await;
+                app.set_session_preview(&pick.session_id, preview);
+            }
+            Action::ResumeSession(pick) => {
+                resume_session(app, ctx, pick).await;
+                save_current_snapshot(app, ctx).await;
+            }
         }
     }
     Ok(())
@@ -300,6 +308,22 @@ async fn apply_model_selection(
     Ok(())
 }
 
+/// Classify input that starts with `/`: a genuine slash command (`/model`,
+/// `/help`) versus an absolute file path (`/var/folders/…png`) that drag-and-drop
+/// pasted. Returns the command body (text after the `/`) only for real commands,
+/// so a path is never misrouted to the dispatcher as "unknown command".
+fn as_slash_command(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('/')?;
+    let first = rest.split_whitespace().next().unwrap_or("");
+    // A command name is a short word with no path separators; a file path has
+    // more slashes and a dotted extension.
+    let looks_like_command = !first.is_empty()
+        && first
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '?'));
+    looks_like_command.then_some(rest)
+}
+
 /// Route a slash command. Returns `Ok(true)` when the UI should exit (`/quit`).
 /// UI-local commands are handled inline; everything else goes to the classic
 /// dispatcher via the suspend/resume bridge.
@@ -312,12 +336,26 @@ async fn slash_command(
     ev_rx: &mut UnboundedReceiver<Event>,
     paused: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
+    app.record_command(full);
     match rest.split_whitespace().next().unwrap_or("") {
         "quit" | "exit" | "q" => return Ok(true),
         "help" | "?" => app.set_help(true),
         "clear" => {
             ctx.clear_session_state().await;
             app.clear_transcript();
+        }
+        "jobs" => app.toggle_jobs(),
+        "sessions" | "ss" => {
+            let arg = sessions_native_arg(rest);
+            match arg {
+                SessionsRoute::Native(query) => {
+                    let rows = load_session_rows(ctx, query).await;
+                    app.open_session_picker(rows, query.to_string());
+                }
+                SessionsRoute::Classic => {
+                    run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?;
+                }
+            }
         }
         "mode" => {
             let arg = rest.strip_prefix("mode").map(str::trim).unwrap_or("");
@@ -388,6 +426,26 @@ fn model_command_direct_arg(rest: &str) -> Option<&str> {
     (!arg.is_empty()).then_some(arg)
 }
 
+enum SessionsRoute<'a> {
+    Native(&'a str),
+    Classic,
+}
+
+fn sessions_native_arg(rest: &str) -> SessionsRoute<'_> {
+    let trimmed = rest.trim();
+    let command = trimmed.split_whitespace().next().unwrap_or("");
+    if !matches!(command, "sessions" | "ss") {
+        return SessionsRoute::Native("");
+    }
+    let arg = trimmed[command.len()..].trim();
+    let first = arg.split_whitespace().next().unwrap_or("");
+    match first {
+        "export" | "purge" | "archive" | "index" => SessionsRoute::Classic,
+        "list" => SessionsRoute::Native(""),
+        _ => SessionsRoute::Native(arg),
+    }
+}
+
 /// Leave the alt-screen and pause the reader so stdin is free for a classic
 /// command's picker or for voice recording (both read stdin themselves).
 fn suspend_ui(paused: &Arc<AtomicBool>) -> std::io::Result<()> {
@@ -455,6 +513,214 @@ async fn run_classic_command(
         app.push_note(format!("unknown command: {input}"));
     }
     Ok(())
+}
+
+async fn load_current_session_state(app: &mut App, ctx: &mut ReplContext) {
+    let core = ctx.core_handle.swappable();
+    let meta = core.sessions.get_or_resume(&ctx.session_id).await;
+    let history = core.sessions.get_history(&meta.id, 80, 20).await;
+    app.load_transcript_from_history(&history);
+    if let Some(snapshot) = core.sessions.load_snapshot(&ctx.session_id).await {
+        let snapshot_model = snapshot.model.clone();
+        app.apply_snapshot(&snapshot);
+        restore_snapshot_model(app, ctx, &snapshot_model).await;
+    }
+}
+
+async fn save_current_snapshot(app: &App, ctx: &ReplContext) {
+    let core = ctx.core_handle.swappable();
+    let meta = core.sessions.get_or_resume(&ctx.session_id).await;
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let snapshot = app.snapshot(&ctx.session_id, &meta.id, cwd, core.model.clone());
+    core.sessions.save_snapshot(&snapshot).await;
+}
+
+async fn restore_snapshot_model(app: &mut App, ctx: &mut ReplContext, model: &str) {
+    let model = model.trim();
+    if model.is_empty() || ctx.core_handle.swappable().model == model {
+        return;
+    }
+    if !ctx.model_picker_available() {
+        app.push_note(format!(
+            "snapshot model {model} not restored: picker unavailable"
+        ));
+        return;
+    }
+
+    let entries = ctx.collect_all_models().await;
+    let Some(entry) = snapshot_model_entry(&entries, model) else {
+        app.push_note(format!("snapshot model {model} not found"));
+        return;
+    };
+    let id = entry.id.clone();
+    match ctx.apply_model_entry(entry).await {
+        Ok(report) => {
+            for note in report.notes {
+                app.push_note(note);
+            }
+            app.push_note(format!("snapshot model restored to {id}"));
+        }
+        Err(e) => app.push_note(format!("snapshot model restore failed for {id}: {e}")),
+    }
+}
+
+fn snapshot_model_entry(entries: &[ModelEntry], model: &str) -> Option<ModelEntry> {
+    let query = model.trim();
+    if query.is_empty() {
+        return None;
+    }
+    if let Some(entry) = entries.iter().find(|entry| entry.id == query) {
+        return Some(entry.clone());
+    }
+    let refs: Vec<&ModelEntry> = entries.iter().collect();
+    unique_direct_model_match(&refs, query).cloned()
+}
+
+async fn load_session_rows(ctx: &ReplContext, query: &str) -> Vec<SessionRow> {
+    let core = ctx.core_handle.swappable();
+    let query = query.trim();
+    if query.is_empty() {
+        return core
+            .sessions
+            .list_sessions(None, 50)
+            .await
+            .into_iter()
+            .map(|meta| SessionRow {
+                session_id: meta.id,
+                session_key: meta.session_key,
+                updated_at: format_session_time(meta.updated_at),
+                message_count: meta.message_count,
+                snippet: String::new(),
+                preview: None,
+            })
+            .collect();
+    }
+
+    let mut rows = Vec::new();
+    for result in core.sessions.search_messages(query, 80, None).await {
+        if rows
+            .iter()
+            .any(|row: &SessionRow| row.session_id == result.session_id)
+        {
+            continue;
+        }
+        rows.push(SessionRow {
+            session_id: result.session_id,
+            session_key: result.session_key,
+            updated_at: result.timestamp,
+            message_count: 0,
+            snippet: clean_search_snippet(&result.snippet, &result.content),
+            preview: None,
+        });
+        if rows.len() >= 50 {
+            break;
+        }
+    }
+    rows
+}
+
+async fn preview_session(ctx: &ReplContext, pick: &SessionPick) -> String {
+    let core = ctx.core_handle.swappable();
+    let history = core.sessions.get_history(&pick.session_id, 24, 8).await;
+    if history.is_empty() {
+        return "No recent transcript rows.".to_string();
+    }
+    history
+        .iter()
+        .filter_map(format_history_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn resume_session(app: &mut App, ctx: &mut ReplContext, pick: SessionPick) {
+    save_current_snapshot(app, ctx).await;
+    ctx.session_id = pick.session_key.clone();
+    ctx.core_handle
+        .counters
+        .reset_session_prompt_state(&ctx.session_id);
+    load_current_session_state(app, ctx).await;
+    app.push_note(format!("resumed {}", pick.session_key));
+}
+
+async fn refresh_background_jobs(app: &mut App, agent: &AgentLoop) {
+    let jobs = agent
+        .subagent_manager()
+        .list_running()
+        .await
+        .into_iter()
+        .map(|info| BackgroundJob {
+            id: info.task_id,
+            label: info.label,
+            kind: "agent".to_string(),
+            elapsed_ms: info.started_at.elapsed().as_millis() as u64,
+        })
+        .collect();
+    app.set_background_jobs(jobs);
+}
+
+fn format_session_time(time: chrono::DateTime<chrono::Utc>) -> String {
+    time.format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn clean_search_snippet(snippet: &str, fallback: &str) -> String {
+    let text = if snippet.trim().is_empty() {
+        fallback
+    } else {
+        snippet
+    };
+    text.replace(">>>", "")
+        .replace("<<<", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_history_line(msg: &serde_json::Value) -> Option<String> {
+    let role = msg.get("role").and_then(serde_json::Value::as_str)?;
+    let content = msg_content(msg)?;
+    let content = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if content.is_empty() {
+        return None;
+    }
+    Some(format!("{role}: {}", shorten(&content, 140)))
+}
+
+fn msg_content(msg: &serde_json::Value) -> Option<String> {
+    let content = msg.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(parts) = content.as_array() {
+        let text = parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str().map(ToOwned::to_owned).or_else(|| {
+                    part.get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return (!text.is_empty()).then_some(text);
+    }
+    None
+}
+
+fn shorten(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        format!(
+            "{}...",
+            text.chars()
+                .take(max_chars.saturating_sub(3))
+                .collect::<String>()
+        )
+    }
 }
 
 /// Voice turn: suspend (so the recorder owns stdin), record + transcribe, resume,
@@ -589,6 +855,7 @@ async fn run_turn(
     let mut queued_turn = None;
     let mut cancel_requested = false;
     let response = loop {
+        refresh_background_jobs(app, session.agent).await;
         let footer = footer_snapshot(session.core);
         terminal.draw(|f| app.draw(f, &footer))?;
         tokio::select! {
@@ -709,13 +976,6 @@ mod tests {
     }
 
     #[test]
-    fn model_image_gate_recognizes_vision_models_only() {
-        assert!(model_accepts_images("gpt-4o-mini"));
-        assert!(model_accepts_images("qwen2.5-vl-7b"));
-        assert!(!model_accepts_images("local:qwen36-35b"));
-    }
-
-    #[test]
     fn model_command_with_argument_extracts_filter() {
         assert_eq!(
             model_command_direct_arg("model VibeThinker-3B-mlx-8Bit"),
@@ -723,5 +983,34 @@ mod tests {
         );
         assert_eq!(model_command_direct_arg("model"), None);
         assert_eq!(model_command_direct_arg("m"), None);
+    }
+
+    #[test]
+    fn snapshot_model_entry_prefers_exact_model_id() {
+        let entries = vec![
+            ModelEntry::test_local("alpha-plus"),
+            ModelEntry::test_local("alpha"),
+        ];
+
+        let selected = snapshot_model_entry(&entries, "alpha").unwrap();
+        assert_eq!(selected.id, "alpha");
+        assert!(snapshot_model_entry(&entries, "missing").is_none());
+    }
+
+    #[test]
+    fn slash_command_classifier_rejects_paths() {
+        // Genuine commands resolve to their body.
+        assert_eq!(as_slash_command("/model gpt-4"), Some("model gpt-4"));
+        assert_eq!(as_slash_command("/help"), Some("help"));
+        assert_eq!(as_slash_command("/quit"), Some("quit"));
+        assert_eq!(as_slash_command("/?"), Some("?"));
+        // Absolute paths (drag-and-drop) are NOT commands.
+        assert_eq!(
+            as_slash_command("/var/folders/x/Screenshot.png see this"),
+            None
+        );
+        assert_eq!(as_slash_command("/Users/me/pic.png"), None);
+        // Plain text isn't a command either.
+        assert_eq!(as_slash_command("hello there"), None);
     }
 }

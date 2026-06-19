@@ -873,7 +873,7 @@ impl ReplContext {
                 self.cmd_lane(arg);
             }
             "/sessions" => {
-                self.cmd_sessions(arg);
+                self.cmd_sessions(arg).await;
             }
             "/clear" => {
                 self.cmd_clear().await;

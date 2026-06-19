@@ -109,6 +109,7 @@ mod tests {
                 scratch_pad_rounds: 10,
                 reader_tier: ReaderTier::Advanced,
                 parser: None,
+                vision: false,
             })
         }
 
@@ -124,6 +125,7 @@ mod tests {
                 scratch_pad_rounds: 3,
                 reader_tier: ReaderTier::Minimal,
                 parser: None,
+                vision: false,
             })
         }
 

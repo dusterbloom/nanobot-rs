@@ -37,6 +37,11 @@ pub struct ModelCapabilities {
     /// Optional parser override name (e.g. "hermes", "qwen", "llama", "deepseek").
     /// When set, the parser registry will use this parser regardless of model name matching.
     pub parser: Option<String>,
+    /// Whether the model accepts image input (multimodal). Set in [`lookup`] from
+    /// [`is_vision_model`]; the literal value in `builtin_capabilities` is just a
+    /// placeholder. A config override (`modelCapabilities.<name>.vision`) wins —
+    /// the escape hatch for local vision models whose name doesn't reveal it.
+    pub vision: bool,
 }
 
 /// Partial override from config.json `modelCapabilities` section.
@@ -55,6 +60,9 @@ pub struct ModelCapabilitiesOverride {
     /// Parser override: selects a specific textual tool call parser by name.
     /// Valid values: "hermes", "qwen", "llama", "deepseek".
     pub parser: Option<String>,
+    /// Declare image (multimodal) input support for models whose name doesn't
+    /// reveal it — e.g. `"qwen3.6-35b-a3b": { "vision": true }`.
+    pub vision: Option<bool>,
 }
 
 /// Build `ModelCapabilities` from a model name string.
@@ -73,6 +81,9 @@ pub fn lookup(
 
     // Start with built-in pattern matching
     let mut caps = builtin_capabilities(&lower);
+    // Vision cross-cuts the family arms, so detect it centrally (overwrites the
+    // placeholder in the builtin literals). A config override can still flip it.
+    caps.vision = is_vision_model(&lower);
 
     // Apply overrides: check each override key as a substring match
     for (pattern, ovr) in overrides {
@@ -133,6 +144,31 @@ fn has_size_marker(name: &str, marker: &str) -> bool {
     false
 }
 
+/// Whether the model accepts image input. Explicit multimodal markers, plus the
+/// Qwen3.5/3.6 35B-A3B MoE which ships a vision tower (`ForConditionalGeneration`)
+/// even though its name doesn't say "vl". Anything else can be declared via the
+/// `modelCapabilities.<name>.vision` config override.
+fn is_vision_model(lower: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "vision",
+        "vl",
+        "llava",
+        "pixtral",
+        "gpt-4o",
+        "o3",
+        "o4",
+        "gemini",
+        "claude-3",
+        "qwen-vl",
+        "qwen2.5-vl",
+        "qwen3-vl",
+    ];
+    if MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    (is_qwen35_family(lower) || is_qwen36_family(lower)) && lower.contains("a3b")
+}
+
 fn is_qwen35_family(lower: &str) -> bool {
     lower.contains("qwen3.5") || lower.contains("qwen3_5") || lower.contains("qwen35")
 }
@@ -154,6 +190,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             scratch_pad_rounds: 3,
             reader_tier: ReaderTier::Minimal,
             parser: None,
+            vision: false,
         };
     }
     if lower.contains("functiongemma") {
@@ -167,6 +204,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             scratch_pad_rounds: 2,
             reader_tier: ReaderTier::Minimal,
             parser: None,
+            vision: false,
         };
     }
     // Qwen3.5 family: thinking enabled by default (template-level, not /think markers).
@@ -191,6 +229,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
                 ReaderTier::Standard
             },
             parser: None,
+            vision: false,
         };
     }
     // Qwen3.6 family: same capabilities as Qwen3.5.
@@ -214,6 +253,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
                 ReaderTier::Standard
             },
             parser: None,
+            vision: false,
         };
     }
     if lower.contains("ministral-3") {
@@ -227,6 +267,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
             parser: None,
+            vision: false,
         };
     }
     if lower.contains("qwen3-1.7b") {
@@ -240,6 +281,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
             parser: None,
+            vision: false,
         };
     }
     // Nemotron / orchestrator models (Medium, thinking enabled, native LMS API)
@@ -254,6 +296,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             scratch_pad_rounds: 10,
             reader_tier: ReaderTier::Standard,
             parser: None,
+            vision: false,
         };
     }
     // Cloud / large models
@@ -275,6 +318,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             scratch_pad_rounds: 10,
             reader_tier: ReaderTier::Advanced,
             parser: None,
+            vision: false,
         };
     }
     // Generic small model patterns (catch-all for size indicators)
@@ -296,6 +340,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
             parser: None,
+            vision: false,
         };
     }
     // Unknown default: Medium, conservative
@@ -309,6 +354,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
         scratch_pad_rounds: 10,
         reader_tier: ReaderTier::Standard,
         parser: None,
+        vision: false,
     }
 }
 
@@ -339,6 +385,9 @@ fn apply_override(caps: &mut ModelCapabilities, ovr: &ModelCapabilitiesOverride)
     }
     if ovr.parser.is_some() {
         caps.parser = ovr.parser.clone();
+    }
+    if let Some(v) = ovr.vision {
+        caps.vision = v;
     }
 }
 
@@ -455,6 +504,57 @@ mod tests {
         assert_eq!(caps.reader_tier, ReaderTier::Standard);
         assert_eq!(caps.scratch_pad_rounds, 10);
         assert!(!caps.needs_native_lms_api);
+    }
+
+    #[test]
+    fn test_vision_explicit_markers() {
+        for m in [
+            "gpt-4o-mini",
+            "qwen2.5-vl-7b",
+            "pixtral-12b",
+            "gemini-2-flash",
+        ] {
+            assert!(lookup(m, &empty_overrides()).vision, "{m} should be vision");
+        }
+    }
+
+    #[test]
+    fn test_vision_qwen36_35b_a3b_moe() {
+        // The 35B-A3B MoE ships a vision tower even though the name lacks "vl".
+        assert!(lookup("mlx-community/Qwen3.6-35B-A3B-4bit", &empty_overrides()).vision);
+        assert!(lookup("Qwen3.5-35B-A3B-8bit", &empty_overrides()).vision);
+        // Non-MoE / no-a3b qwen builds are not assumed vision.
+        assert!(!lookup("qwen36-35b", &empty_overrides()).vision);
+        assert!(!lookup("Qwen3.5-9B-MLX-4bit", &empty_overrides()).vision);
+    }
+
+    #[test]
+    fn test_vision_plain_text_model_is_not_vision() {
+        assert!(!lookup("mlx-community/MiniCPM5-1B-4bit", &empty_overrides()).vision);
+        assert!(!lookup("llama-3b", &empty_overrides()).vision);
+    }
+
+    #[test]
+    fn test_vision_config_override_wins() {
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "my-custom-vlm".to_string(),
+            ModelCapabilitiesOverride {
+                vision: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(lookup("my-custom-vlm-7b", &overrides).vision);
+        // Override can also disable a model the heuristic would flag.
+        let mut off = HashMap::new();
+        off.insert(
+            "qwen3.6-35b-a3b".to_string(),
+            ModelCapabilitiesOverride {
+                vision: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(!lookup("Qwen3.6-35B-A3B-4bit", &off).vision);
     }
 
     #[test]

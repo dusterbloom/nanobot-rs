@@ -191,7 +191,7 @@ impl ReplContext {
     }
 
     /// /sessions — session management (list, export, purge, archive, index).
-    pub(super) fn cmd_sessions(&self, arg: &str) {
+    pub(super) async fn cmd_sessions(&self, arg: &str) {
         let (sub, rest) = arg
             .split_once(' ')
             .map(|(s, r)| (s.trim(), r.trim()))
@@ -199,7 +199,7 @@ impl ReplContext {
 
         match sub {
             "list" => {
-                crate::sessions_cmd::cmd_sessions_list();
+                self.cmd_sessions_list().await;
             }
             "export" => {
                 if rest.is_empty() {
@@ -210,7 +210,7 @@ impl ReplContext {
                     .split_once(' ')
                     .map(|(k, f)| (k.trim(), f.trim()))
                     .unwrap_or((rest, "md"));
-                crate::sessions_cmd::cmd_sessions_export(key, fmt);
+                self.cmd_sessions_export(key, fmt).await;
             }
             "purge" => {
                 if rest.is_empty() {
@@ -240,6 +240,99 @@ impl ReplContext {
                     "Unknown subcommand '{}'. Available: list, export, purge, archive, index",
                     sub
                 );
+            }
+        }
+    }
+
+    async fn cmd_sessions_list(&self) {
+        let core = self.core_handle.swappable();
+        let sessions = core.sessions.list_sessions(None, 100).await;
+
+        if sessions.is_empty() {
+            println!("No sessions found.");
+            return;
+        }
+
+        println!("{:<40} {:<30} {:>6}", "SESSION KEY", "UPDATED", "MSGS");
+        println!("{}", "-".repeat(80));
+
+        for s in &sessions {
+            let updated = s.updated_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+            println!(
+                "{:<40} {:<30} {:>6}",
+                crate::utils::helpers::truncate_string(&s.session_key, 38),
+                crate::utils::helpers::truncate_string(&updated, 28),
+                s.message_count,
+            );
+        }
+        println!("\n{} session(s) total.", sessions.len());
+    }
+
+    async fn cmd_sessions_export(&self, key: &str, format: &str) {
+        let core = self.core_handle.swappable();
+        let session_id = if let Some(meta) = core.sessions.get_latest_session(key).await {
+            meta.id
+        } else if let Some(meta) = core.sessions.get_session(key).await {
+            meta.id
+        } else {
+            eprintln!("Session '{}' not found.", key);
+            eprintln!("Use `nanobot sessions list` to see available sessions.");
+            return;
+        };
+
+        let messages = core.sessions.get_all_messages(&session_id).await;
+        if format == "jsonl" {
+            for msg in &messages {
+                println!("{}", serde_json::to_string(msg).unwrap_or_default());
+            }
+            return;
+        }
+
+        println!("# Session: {}\n", key);
+        for parsed in &messages {
+            let role = parsed
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let timestamp = parsed
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let time_display = if timestamp.len() >= 19 {
+                &timestamp[11..19]
+            } else {
+                timestamp
+            };
+
+            match role {
+                "user" => {
+                    let text = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("## User ({})\n\n{}\n", time_display, text);
+                }
+                "assistant" => {
+                    let text = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    if !text.is_empty() {
+                        println!("## Assistant ({})\n\n{}\n", time_display, text);
+                    }
+                }
+                "tool" => {
+                    let tool_name = parsed
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool");
+                    let result = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    let abbreviated = crate::utils::helpers::truncate_string(result, 200);
+                    println!(
+                        "## Tool: {} ({})\n\n{}\n",
+                        tool_name, time_display, abbreviated
+                    );
+                }
+                _ => {
+                    let text = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    if !text.is_empty() {
+                        println!("## {} ({})\n\n{}\n", role, time_display, text);
+                    }
+                }
             }
         }
     }

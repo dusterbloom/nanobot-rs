@@ -17,6 +17,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -82,6 +83,21 @@ CREATE TABLE IF NOT EXISTS summary_nodes (
     created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_summary_nodes_session ON summary_nodes(session_id);
+
+CREATE TABLE IF NOT EXISTS session_snapshots (
+    session_key     TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    cwd             TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    tui_mode        TEXT NOT NULL,
+    show_thinking   INTEGER NOT NULL,
+    input_draft     TEXT NOT NULL,
+    prompt_history  TEXT NOT NULL,
+    recent_paths    TEXT NOT NULL,
+    recent_commands TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
 "#;
 
 // ---------------------------------------------------------------------------
@@ -108,6 +124,23 @@ pub struct SearchResult {
     pub timestamp: String,
     pub snippet: String,
     pub rank: f64,
+}
+
+/// UI/workspace state restored when the TUI resumes a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub version: u32,
+    pub session_key: String,
+    pub session_id: String,
+    pub cwd: String,
+    pub model: String,
+    pub tui_mode: String,
+    pub show_thinking: bool,
+    pub input_draft: String,
+    pub prompt_history: Vec<String>,
+    pub recent_paths: Vec<String>,
+    pub recent_commands: Vec<String>,
+    pub updated_at: DateTime<Utc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +396,77 @@ impl SessionDb {
             "timestamp": Utc::now().to_rfc3339(),
         });
         self.add_message(session_id, &clear_marker).await;
+    }
+
+    /// Save or replace the latest TUI/workspace snapshot for a session key.
+    pub async fn save_snapshot(&self, snapshot: &SessionSnapshot) {
+        let conn = self.conn.lock().await;
+        let prompt_history =
+            serde_json::to_string(&snapshot.prompt_history).unwrap_or_else(|_| "[]".to_string());
+        let recent_paths =
+            serde_json::to_string(&snapshot.recent_paths).unwrap_or_else(|_| "[]".to_string());
+        let recent_commands =
+            serde_json::to_string(&snapshot.recent_commands).unwrap_or_else(|_| "[]".to_string());
+        if let Err(e) = conn.execute(
+            "INSERT INTO session_snapshots \
+             (session_key, session_id, version, cwd, model, tui_mode, show_thinking, \
+              input_draft, prompt_history, recent_paths, recent_commands, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             ON CONFLICT(session_key) DO UPDATE SET \
+              session_id=excluded.session_id, version=excluded.version, cwd=excluded.cwd, \
+              model=excluded.model, tui_mode=excluded.tui_mode, \
+              show_thinking=excluded.show_thinking, input_draft=excluded.input_draft, \
+              prompt_history=excluded.prompt_history, recent_paths=excluded.recent_paths, \
+              recent_commands=excluded.recent_commands, updated_at=excluded.updated_at",
+            params![
+                &snapshot.session_key,
+                &snapshot.session_id,
+                snapshot.version as i64,
+                &snapshot.cwd,
+                &snapshot.model,
+                &snapshot.tui_mode,
+                if snapshot.show_thinking { 1 } else { 0 },
+                &snapshot.input_draft,
+                prompt_history,
+                recent_paths,
+                recent_commands,
+                snapshot.updated_at.to_rfc3339(),
+            ],
+        ) {
+            warn!(
+                "Failed to save session snapshot for {}: {}",
+                snapshot.session_key, e
+            );
+        }
+    }
+
+    /// Load the latest TUI/workspace snapshot for a session key.
+    pub async fn load_snapshot(&self, session_key: &str) -> Option<SessionSnapshot> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT session_key, session_id, version, cwd, model, tui_mode, show_thinking, \
+                    input_draft, prompt_history, recent_paths, recent_commands, updated_at \
+             FROM session_snapshots WHERE session_key = ?1",
+            params![session_key],
+            |row| {
+                let updated_at: String = row.get(11)?;
+                Ok(SessionSnapshot {
+                    session_key: row.get(0)?,
+                    session_id: row.get(1)?,
+                    version: row.get::<_, i64>(2)? as u32,
+                    cwd: row.get(3)?,
+                    model: row.get(4)?,
+                    tui_mode: row.get(5)?,
+                    show_thinking: row.get::<_, i64>(6)? != 0,
+                    input_draft: row.get(7)?,
+                    prompt_history: parse_json_vec(row.get::<_, String>(8)?),
+                    recent_paths: parse_json_vec(row.get::<_, String>(9)?),
+                    recent_commands: parse_json_vec(row.get::<_, String>(10)?),
+                    updated_at: updated_at.parse().unwrap_or_else(|_| Utc::now()),
+                })
+            },
+        )
+        .ok()
     }
 
     /// Return all messages for `session_id` without any filtering, ordered by
@@ -656,6 +760,10 @@ fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
         updated_at,
         message_count: message_count as usize,
     })
+}
+
+fn parse_json_vec(json: String) -> Vec<String> {
+    serde_json::from_str(&json).unwrap_or_default()
 }
 
 /// Insert a single message into the DB using an already-locked connection.
@@ -1330,6 +1438,40 @@ mod tests {
 
         assert_eq!(filtered.len(), 2, "clear marker must truncate history");
         assert_eq!(filtered[0]["content"], "q2");
+    }
+
+    #[tokio::test]
+    async fn test_session_snapshot_roundtrip_and_replace() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:snapshot").await;
+        let mut snapshot = SessionSnapshot {
+            version: 1,
+            session_key: meta.session_key.clone(),
+            session_id: meta.id.clone(),
+            cwd: "/tmp/project".to_string(),
+            model: "model-a".to_string(),
+            tui_mode: "inspect".to_string(),
+            show_thinking: false,
+            input_draft: "draft".to_string(),
+            prompt_history: vec!["one".to_string(), "two".to_string()],
+            recent_paths: vec!["src/main.rs".to_string()],
+            recent_commands: vec!["/jobs".to_string()],
+            updated_at: Utc::now(),
+        };
+
+        db.save_snapshot(&snapshot).await;
+        let loaded = db.load_snapshot("cli:snapshot").await.unwrap();
+        assert_eq!(loaded.session_key, snapshot.session_key);
+        assert_eq!(loaded.prompt_history, snapshot.prompt_history);
+        assert_eq!(loaded.recent_paths, snapshot.recent_paths);
+        assert!(!loaded.show_thinking);
+
+        snapshot.model = "model-b".to_string();
+        snapshot.input_draft = "new draft".to_string();
+        db.save_snapshot(&snapshot).await;
+        let replaced = db.load_snapshot("cli:snapshot").await.unwrap();
+        assert_eq!(replaced.model, "model-b");
+        assert_eq!(replaced.input_draft, "new draft");
     }
 
     // -----------------------------------------------------------------------

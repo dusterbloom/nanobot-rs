@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use chrono::Utc;
 use once_cell::sync::Lazy;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -33,6 +34,7 @@ use super::render;
 use crate::agent::audit::ToolEvent;
 use crate::repl::commands::ModelEntry;
 use crate::repl::{parse_control_marker, CacheResetReason, CacheStatus, ControlMarker};
+use crate::session::db::SessionSnapshot;
 
 const BRAND: &str = "\u{259e}"; // ▞  the nanobot wordmark glyph
 const DOT: &str = "\u{2022}"; //   •  status / user marker
@@ -68,6 +70,12 @@ pub(crate) enum Action {
     Record,
     /// User picked a model in the native picker; apply that exact row.
     PickModel(ModelEntry),
+    /// Native session picker query changed and needs fresh rows from the DB.
+    SessionSearch(String),
+    /// User requested a preview for the selected session.
+    PreviewSession(SessionPick),
+    /// User confirmed switching the TUI to the selected session key.
+    ResumeSession(SessionPick),
 }
 
 /// What a key/mouse/paste event means while the assistant is streaming.
@@ -118,6 +126,49 @@ struct PickRow {
 struct ModelPicker {
     rows: Vec<PickRow>,
     selected: usize,
+}
+
+/// Stable identity for a session-picker row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionPick {
+    pub session_id: String,
+    pub session_key: String,
+}
+
+/// One native session picker/search row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionRow {
+    pub session_id: String,
+    pub session_key: String,
+    pub updated_at: String,
+    pub message_count: usize,
+    pub snippet: String,
+    pub preview: Option<String>,
+}
+
+impl SessionRow {
+    fn pick(&self) -> SessionPick {
+        SessionPick {
+            session_id: self.session_id.clone(),
+            session_key: self.session_key.clone(),
+        }
+    }
+}
+
+/// Native in-TUI session picker/search state.
+struct SessionPicker {
+    rows: Vec<SessionRow>,
+    selected: usize,
+    query: String,
+}
+
+/// A currently running background item shown in the `/jobs` overlay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BackgroundJob {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub elapsed_ms: u64,
 }
 
 /// Disclosure level — how much tool output and metadata the transcript shows.
@@ -323,6 +374,12 @@ pub(crate) struct App {
     search: Option<Search>,
     /// Native model picker overlay, if open.
     picker: Option<ModelPicker>,
+    /// Native session resume/search overlay, if open.
+    session_picker: Option<SessionPicker>,
+    /// Native jobs overlay (`/jobs` / Ctrl+J), if open.
+    show_jobs: bool,
+    /// Running spawned subagents, refreshed by the outer async loop.
+    background_jobs: Vec<BackgroundJob>,
     /// Disclosure level (calm / inspect / deep).
     mode: Mode,
     /// View-only toggle for model reasoning blocks. Thinking remains enabled
@@ -330,6 +387,10 @@ pub(crate) struct App {
     show_thinking: bool,
     /// Local image paths attached to the next submitted turn.
     attachments: Vec<String>,
+    /// Recently referenced file paths, restored by snapshots for workspace feel.
+    recent_paths: Vec<String>,
+    /// Recently used native slash commands, restored by snapshots.
+    recent_commands: Vec<String>,
 }
 
 impl App {
@@ -368,9 +429,14 @@ impl App {
             draft: String::new(),
             search: None,
             picker: None,
+            session_picker: None,
+            show_jobs: false,
+            background_jobs: Vec::new(),
             mode: Mode::Calm,
             show_thinking: true,
             attachments: Vec::new(),
+            recent_paths: Vec::new(),
+            recent_commands: Vec::new(),
         }
     }
 
@@ -417,6 +483,58 @@ impl App {
         self.picker = Some(ModelPicker { rows, selected });
     }
 
+    /// Open the native session picker/search overlay.
+    pub(crate) fn open_session_picker(&mut self, rows: Vec<SessionRow>, query: String) {
+        self.session_picker = Some(SessionPicker {
+            rows,
+            selected: 0,
+            query,
+        });
+    }
+
+    /// Replace rows after a native session search while preserving selection.
+    pub(crate) fn set_session_rows(&mut self, rows: Vec<SessionRow>) {
+        if let Some(p) = self.session_picker.as_mut() {
+            p.rows = rows;
+            p.selected = p.selected.min(p.rows.len().saturating_sub(1));
+        }
+    }
+
+    /// Attach a preview to the matching session row.
+    pub(crate) fn set_session_preview(&mut self, session_id: &str, preview: String) {
+        if let Some(p) = self.session_picker.as_mut() {
+            for row in &mut p.rows {
+                if row.session_id == session_id {
+                    row.preview = Some(preview.clone());
+                }
+            }
+        }
+    }
+
+    /// Open/close the native jobs overlay.
+    pub(crate) fn toggle_jobs(&mut self) {
+        self.show_jobs = !self.show_jobs;
+        if self.show_jobs {
+            self.show_help = false;
+            self.picker = None;
+            self.session_picker = None;
+        }
+    }
+
+    /// Refresh running spawned subagents for the `/jobs` overlay.
+    pub(crate) fn set_background_jobs(&mut self, jobs: Vec<BackgroundJob>) {
+        self.background_jobs = jobs;
+    }
+
+    /// Remember a native slash command for the session snapshot.
+    pub(crate) fn record_command(&mut self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() {
+            return;
+        }
+        push_recent(&mut self.recent_commands, command.to_string(), 32);
+    }
+
     fn on_picker_key(&mut self, k: KeyEvent) -> Action {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let Some(p) = self.picker.as_mut() else {
@@ -450,6 +568,66 @@ impl App {
         }
     }
 
+    fn on_session_key(&mut self, k: KeyEvent) -> Action {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(p) = self.session_picker.as_mut() else {
+            return Action::Continue;
+        };
+        match k.code {
+            KeyCode::Char('d') if ctrl => Action::Quit,
+            KeyCode::Esc => {
+                self.session_picker = None;
+                Action::Continue
+            }
+            KeyCode::Up => {
+                p.selected = p.selected.saturating_sub(1);
+                Action::Continue
+            }
+            KeyCode::Down => {
+                if p.selected + 1 < p.rows.len() {
+                    p.selected += 1;
+                }
+                Action::Continue
+            }
+            KeyCode::Backspace => {
+                p.query.pop();
+                Action::SessionSearch(p.query.clone())
+            }
+            KeyCode::Char(c) if !ctrl => {
+                p.query.push(c);
+                Action::SessionSearch(p.query.clone())
+            }
+            KeyCode::Enter => {
+                let pick = p.rows.get(p.selected).map(SessionRow::pick);
+                match (ctrl, pick) {
+                    (_, None) => Action::Continue,
+                    (true, Some(pick)) => {
+                        self.session_picker = None;
+                        Action::ResumeSession(pick)
+                    }
+                    (false, Some(pick)) => Action::PreviewSession(pick),
+                }
+            }
+            _ => Action::Continue,
+        }
+    }
+
+    fn on_jobs_key(&mut self, k: KeyEvent) -> Action {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Char('d') if ctrl => Action::Quit,
+            KeyCode::Char('j') if ctrl => {
+                self.show_jobs = false;
+                Action::Continue
+            }
+            KeyCode::Esc => {
+                self.show_jobs = false;
+                Action::Continue
+            }
+            _ => Action::Continue,
+        }
+    }
+
     /// Toggle the "recording" indicator (shown in the footer during a voice turn).
     pub(crate) fn set_recording(&mut self, on: bool) {
         self.recording = on;
@@ -473,6 +651,99 @@ impl App {
     /// Drop all transcript history (`/clear`).
     pub(crate) fn clear_transcript(&mut self) {
         self.transcript.clear();
+        self.scroll_from_bottom = 0;
+    }
+
+    /// Build the latest UI/workspace snapshot for `sessions.db`.
+    pub(crate) fn snapshot(
+        &self,
+        session_key: &str,
+        session_id: &str,
+        cwd: String,
+        model: String,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            version: 1,
+            session_key: session_key.to_string(),
+            session_id: session_id.to_string(),
+            cwd,
+            model,
+            tui_mode: self.mode.label().to_string(),
+            show_thinking: self.show_thinking,
+            input_draft: self.input.lines().join("\n"),
+            prompt_history: self.history.clone(),
+            recent_paths: self.recent_paths.clone(),
+            recent_commands: self.recent_commands.clone(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Restore UI/workspace state from a snapshot. Message history is loaded
+    /// separately and remains authoritative.
+    pub(crate) fn apply_snapshot(&mut self, snapshot: &SessionSnapshot) {
+        if let Some(mode) = Mode::parse(&snapshot.tui_mode) {
+            self.mode = mode;
+        }
+        self.show_thinking = snapshot.show_thinking;
+        self.history = snapshot.prompt_history.clone();
+        self.hist_pos = None;
+        self.draft.clear();
+        self.search = None;
+        self.attachments.clear();
+        self.recent_paths = snapshot.recent_paths.clone();
+        self.recent_commands = snapshot.recent_commands.clone();
+        self.load_input(&snapshot.input_draft);
+    }
+
+    /// Replace the transcript with a capped recent history window.
+    pub(crate) fn load_transcript_from_history(&mut self, history: &[Value]) {
+        self.transcript.clear();
+        for msg in history {
+            let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+            match role {
+                "user" => {
+                    if let Some(text) = message_content_text(msg) {
+                        self.transcript.push(Cell::User(text));
+                    }
+                }
+                "assistant" => {
+                    if let Some(text) = message_content_text(msg) {
+                        if !text.trim().is_empty() {
+                            self.transcript.push(Cell::Reply(text));
+                        }
+                    }
+                }
+                "tool" => {
+                    let output = message_content_text(msg).unwrap_or_default();
+                    let name = msg
+                        .get("name")
+                        .or_else(|| msg.get("tool_name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string();
+                    let id = msg
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    self.transcript.push(Cell::Tool {
+                        id,
+                        name,
+                        args: String::new(),
+                        state: ToolState::Ok,
+                        summary: summarize_output(&output, true),
+                        output: output.chars().take(4000).collect(),
+                        preview: None,
+                        ms: 0,
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.streaming = false;
+        self.awaiting_first = false;
+        self.got_text = false;
+        self.turn_produced = false;
         self.scroll_from_bottom = 0;
     }
 
@@ -773,6 +1044,9 @@ impl App {
                 tool_call_id,
                 arguments_preview,
             } => {
+                if let Some(path) = path_arg_hint(&arguments_preview) {
+                    push_recent(&mut self.recent_paths, path, 32);
+                }
                 let had_activity = matches!(self.transcript.last(), Some(Cell::Activity { .. }));
                 let keep_tool_bridge = had_activity && !self.turn_has_reply_or_tool();
                 self.mark_first_output();
@@ -983,6 +1257,12 @@ impl App {
                     self.show_help = false;
                     return Action::Continue;
                 }
+                if self.show_jobs {
+                    return self.on_jobs_key(k);
+                }
+                if self.session_picker.is_some() {
+                    return self.on_session_key(k);
+                }
                 if self.picker.is_some() {
                     return self.on_picker_key(k);
                 }
@@ -1019,6 +1299,10 @@ impl App {
             }
             KeyCode::Char('t') if ctrl => {
                 self.toggle_thinking_display();
+                Action::Continue
+            }
+            KeyCode::Char('j') if ctrl => {
+                self.toggle_jobs();
                 Action::Continue
             }
             // Shift+Tab cycles the disclosure level (calm → inspect → deep).
@@ -1254,6 +1538,10 @@ impl App {
                         self.toggle_thinking_display();
                         StreamingAction::Continue
                     }
+                    KeyCode::Char('j') if ctrl => {
+                        self.toggle_jobs();
+                        StreamingAction::Continue
+                    }
                     KeyCode::BackTab => {
                         self.cycle_mode();
                         StreamingAction::Continue
@@ -1387,6 +1675,12 @@ impl App {
         if self.show_help {
             render_help(f, area);
         }
+        if self.show_jobs {
+            render_jobs(f, area, &self.active_tool_jobs(), &self.background_jobs);
+        }
+        if let Some(p) = &self.session_picker {
+            render_session_picker(f, area, p);
+        }
         if let Some(p) = &self.picker {
             render_picker(f, area, p);
         }
@@ -1447,6 +1741,33 @@ impl App {
         } else {
             Status::Ready
         }
+    }
+
+    fn active_tool_jobs(&self) -> Vec<BackgroundJob> {
+        self.transcript
+            .iter()
+            .filter_map(|cell| match cell {
+                Cell::Tool {
+                    id,
+                    name,
+                    args,
+                    state: ToolState::Running,
+                    preview,
+                    ms,
+                    ..
+                } => Some(BackgroundJob {
+                    id: id.clone(),
+                    label: preview
+                        .as_ref()
+                        .filter(|p| !p.trim().is_empty())
+                        .map(|p| format!("{name}: {}", compact_output_line(p)))
+                        .unwrap_or_else(|| compact_tool_label(name, args)),
+                    kind: "tool".to_string(),
+                    elapsed_ms: *ms,
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Brand title bar: wordmark + rule. All live state lives in the footer.
@@ -1528,6 +1849,33 @@ impl App {
 static MD_IMAGE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"!\[[^\]]*\]\(([^)\n]+)\)").expect("valid image regex"));
 
+/// An image path wrapped in a quote/backtick, ending in an image extension.
+/// Captures the inner path, which may contain real OR backslash-escaped spaces.
+/// Terminals wrap dragged paths differently (backticks, single/double quotes,
+/// with or without `\ ` escaping); this matches them all.
+static QUOTED_IMG_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)[`'"]\s*([^`'"\n]*?\.(?:png|jpe?g|gif|webp|bmp|tiff?|svg))\s*[`'"]"#)
+        .expect("valid quoted image regex")
+});
+
+/// Un-escape shell `\<char>` sequences (drag-and-drop escapes spaces and
+/// `()&` etc.). `\ ` -> ` `, leaving normal text alone.
+fn unescape_shell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn extract_image_attachments(text: &str) -> (String, Vec<String>) {
     let mut media = Vec::new();
     let without_markdown = MD_IMAGE_RE
@@ -1544,14 +1892,61 @@ fn extract_image_attachments(text: &str) -> (String, Vec<String>) {
         })
         .to_string();
 
-    let mut cleaned_lines = Vec::new();
-    for line in without_markdown.lines() {
-        let mut kept = Vec::new();
-        for word in line.split_whitespace() {
-            match normalize_image_path(word) {
-                Some(path) => media.push(path),
-                None => kept.push(word),
+    // Quote/backtick-wrapped paths (the common drag-and-drop format). Handled
+    // before word-splitting so a path with real spaces inside quotes stays whole.
+    let without_quoted = QUOTED_IMG_RE
+        .replace_all(&without_markdown, |caps: &regex::Captures<'_>| {
+            let original = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            match normalize_image_path(&unescape_shell(inner)) {
+                Some(path) => {
+                    media.push(path);
+                    String::new()
+                }
+                None => original.to_string(),
             }
+        })
+        .to_string();
+
+    let mut cleaned_lines = Vec::new();
+    for line in without_quoted.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let mut kept: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < words.len() {
+            // Terminal drag-and-drop shell-escapes spaces (`Screenshot\ 2026.png`),
+            // so a single path arrives split across words joined by a trailing
+            // backslash. Coalesce that run and un-escape it before checking.
+            if words[i].ends_with('\\') {
+                let start = i;
+                let mut path = String::new();
+                while i < words.len() {
+                    match words[i].strip_suffix('\\') {
+                        Some(seg) => {
+                            path.push_str(seg);
+                            path.push(' ');
+                            i += 1;
+                        }
+                        None => {
+                            path.push_str(words[i]);
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                if let Some(p) = normalize_image_path(&path) {
+                    media.push(p);
+                } else {
+                    // Not a real image path — keep the original words verbatim.
+                    kept.extend(words[start..i].iter().map(|s| s.to_string()));
+                }
+                continue;
+            }
+            match normalize_image_path(words[i]) {
+                Some(path) => media.push(path),
+                None => kept.push(words[i].to_string()),
+            }
+            i += 1;
         }
         cleaned_lines.push(kept.join(" "));
     }
@@ -1560,9 +1955,11 @@ fn extract_image_attachments(text: &str) -> (String, Vec<String>) {
 }
 
 fn normalize_image_path(raw: &str) -> Option<String> {
+    // Strip wrappers terminals add around a dragged path: angle brackets,
+    // quotes, and BACKTICKS (some terminals wrap dropped paths in `...`).
     let trimmed = raw
         .trim()
-        .trim_matches(|c| matches!(c, '<' | '>' | '"' | '\''))
+        .trim_matches(|c| matches!(c, '<' | '>' | '"' | '\'' | '`'))
         .trim_end_matches(|c| matches!(c, ',' | ';' | '.'));
     let pathish = trimmed.strip_prefix("file://").unwrap_or(trimmed);
     if !has_image_extension(pathish) {
@@ -1783,6 +2180,47 @@ fn tool_arg_hint(args: &str) -> Option<String> {
             "path" => clip(raw.rsplit('/').next().unwrap_or(raw), 30),
             _ => clip(raw, 34),
         });
+    }
+    None
+}
+
+fn path_arg_hint(args: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(args).ok()?;
+    value
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn push_recent(items: &mut Vec<String>, item: String, max: usize) {
+    items.retain(|existing| existing != &item);
+    items.push(item);
+    let excess = items.len().saturating_sub(max);
+    if excess > 0 {
+        items.drain(0..excess);
+    }
+}
+
+fn message_content_text(msg: &Value) -> Option<String> {
+    let content = msg.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(parts) = content.as_array() {
+        let text = parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str().map(ToOwned::to_owned).or_else(|| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return (!text.is_empty()).then_some(text);
     }
     None
 }
@@ -2061,12 +2499,133 @@ fn render_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
 }
 
+/// Draw current-turn tool calls and running spawned subagents.
+fn render_jobs(f: &mut Frame, area: Rect, tools: &[BackgroundJob], agents: &[BackgroundJob]) {
+    let w = 76.min(area.width.saturating_sub(4));
+    let mut lines: Vec<Line> = Vec::new();
+    if tools.is_empty() && agents.is_empty() {
+        lines.push(Line::from(Span::styled("  no running jobs", dim())));
+    } else {
+        for job in tools.iter().chain(agents.iter()) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<8}", job.kind), style(ACCENT, false)),
+                Span::styled(format!("{:<12}", clip(&job.id, 12)), style(OK_COLOR, false)),
+                Span::raw(" "),
+                Span::styled(clip(&job.label, 80), Style::default()),
+                Span::styled(format!("  {}", elapsed_label(job.elapsed_ms)), dim()),
+            ]));
+        }
+    }
+    let h = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let popup = centered_rect(w, h, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(style(ACCENT, false))
+        .title(Span::styled(
+            " jobs  ·  /kill <id> cancels ",
+            style(ACCENT, true),
+        ))
+        .padding(Padding::horizontal(1));
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
+}
+
+/// Draw the native session resume/search picker.
+fn render_session_picker(f: &mut Frame, area: Rect, p: &SessionPicker) {
+    let w = 88.min(area.width.saturating_sub(4));
+    let h = area.height.saturating_sub(4).clamp(8, 28);
+    let popup = centered_rect(w, h, area);
+    let inner_h = h.saturating_sub(2) as usize;
+    let preview = p
+        .rows
+        .get(p.selected)
+        .and_then(|row| row.preview.as_ref())
+        .filter(|text| !text.trim().is_empty());
+    let preview_rows = preview
+        .map(|text| text.lines().count().min(8) + 1)
+        .unwrap_or(0);
+    let list_h = inner_h.saturating_sub(preview_rows).max(1);
+    let start = p.selected.saturating_sub(list_h.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  search ", dim()),
+        Span::styled(
+            if p.query.is_empty() {
+                "recent".to_string()
+            } else {
+                p.query.clone()
+            },
+            style(OK_COLOR, false),
+        ),
+    ]));
+    if p.rows.is_empty() {
+        lines.push(Line::from(Span::styled("  no matching sessions", dim())));
+    } else {
+        for (i, row) in p.rows.iter().enumerate().skip(start).take(list_h) {
+            let selected = i == p.selected;
+            let row_style = if selected {
+                Style::default().fg(Color::Black).bg(OK_COLOR)
+            } else {
+                Style::default()
+            };
+            let prefix = if selected { "\u{203a} " } else { "  " };
+            let snippet = if row.snippet.trim().is_empty() {
+                format!("{} messages", row.message_count)
+            } else {
+                row.snippet.trim().replace('\n', " ")
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{prefix}{:<24} {:<16} {}",
+                    clip(&row.session_key, 24),
+                    clip(&row.updated_at, 16),
+                    clip(&snippet, 80)
+                ),
+                row_style,
+            )));
+        }
+    }
+    if let Some(preview) = preview {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("  preview", style(ACCENT, true))));
+        for line in preview.lines().take(8) {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", clip(line, 120)),
+                dim(),
+            )));
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(style(ACCENT, false))
+        .title(Span::styled(
+            " sessions  ·  Enter preview  ·  Ctrl+Enter resume ",
+            style(ACCENT, true),
+        ))
+        .padding(Padding::horizontal(1));
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
+}
+
 fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
     Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
         width: w.min(area.width),
         height: h.min(area.height),
+    }
+}
+
+fn elapsed_label(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -2086,6 +2645,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("Up / Down", "prompt history"),
         key("Ctrl+R", "reverse-search history"),
         key("Ctrl+T", "show / hide thinking"),
+        key("Ctrl+J", "jobs"),
         key("Shift+Tab", "cycle calm / inspect / deep"),
         key("PgUp/PgDn", "scroll transcript"),
         key("Esc", "clear input / cancel turn / close"),
@@ -2097,6 +2657,8 @@ fn help_lines() -> Vec<Line<'static>> {
         key("/clear", "clear session state"),
         key("/mode", "calm / inspect / deep (cycle or name)"),
         key("/model", "switch model (opens picker)"),
+        key("/sessions", "resume / search sessions"),
+        key("/jobs", "current tools and agents"),
         key("/local", "toggle local / cloud"),
         key("/think", "toggle thinking"),
         key("/status", "show status"),
@@ -4011,6 +4573,59 @@ mod tests {
     }
 
     #[test]
+    fn submit_extracts_drag_dropped_escaped_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("Screenshot 2026-06-19 at 12.31.59.png");
+        std::fs::write(&image, b"png").unwrap();
+        // Terminal drag-and-drop shell-escapes spaces AND wraps the path in
+        // backticks (observed: `…/Screenshot\ 2026-06-19\ at\ ….png`).
+        let escaped = image.display().to_string().replace(' ', "\\ ");
+
+        let mut app = App::new();
+        app.input
+            .insert_str(&format!("`{escaped}` can you see the image"));
+        match app.submit() {
+            Action::Submit(turn) => {
+                assert_eq!(turn.text, "can you see the image");
+                let expected = std::fs::canonicalize(&image).unwrap();
+                assert_eq!(turn.media, vec![expected.to_string_lossy().to_string()]);
+            }
+            _ => panic!("escaped path must extract as media, not misroute"),
+        }
+    }
+
+    #[test]
+    fn submit_extracts_path_across_terminal_wrapper_styles() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("My Screenshot.png");
+        std::fs::write(&image, b"png").unwrap();
+        let plain = image.display().to_string(); // real spaces
+        let escaped = plain.replace(' ', "\\ ");
+        let expected = std::fs::canonicalize(&image)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        // Each is a different terminal's drag-and-drop format for the same file.
+        for input in [
+            format!("`{escaped}` look"),    // backtick + escaped (observed)
+            format!("'{plain}' look"),       // single-quote, real spaces
+            format!("\"{plain}\" look"),     // double-quote, real spaces
+            format!("{escaped} look"),       // bare, escaped (Terminal.app/iTerm)
+        ] {
+            let mut app = App::new();
+            app.input.insert_str(&input);
+            match app.submit() {
+                Action::Submit(turn) => {
+                    assert_eq!(turn.media, vec![expected.clone()], "input: {input}");
+                    assert_eq!(turn.text, "look", "input: {input}");
+                }
+                _ => panic!("must extract media for: {input}"),
+            }
+        }
+    }
+
+    #[test]
     fn empty_transcript_shows_welcome_hint() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -4105,6 +4720,105 @@ mod tests {
         assert!(text.contains("keys"), "help keys missing:\n{text}");
         assert!(text.contains("/clear"), "help commands missing:\n{text}");
         assert!(text.contains("/model"), "model command missing:\n{text}");
+    }
+
+    #[test]
+    fn jobs_overlay_renders_active_tool_and_background_job() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new();
+        app.begin_turn("inspect");
+        app.on_tool_event(ToolEvent::CallStart {
+            tool_name: "read_file".into(),
+            tool_call_id: "tool-1".into(),
+            arguments_preview: r#"{"path":"src/main.rs"}"#.into(),
+        });
+        app.set_background_jobs(vec![BackgroundJob {
+            id: "agent-1".into(),
+            label: "audit session resume".into(),
+            kind: "agent".into(),
+            elapsed_ms: 2_000,
+        }]);
+        app.toggle_jobs();
+
+        let mut term = Terminal::new(TestBackend::new(100, 18)).unwrap();
+        term.draw(|f| app.draw(f, &test_footer())).unwrap();
+        let text = buffer_text(term.backend().buffer());
+
+        assert!(text.contains("jobs"), "jobs overlay missing:\n{text}");
+        assert!(text.contains("read_file"), "running tool missing:\n{text}");
+        assert!(text.contains("agent-1"), "subagent row missing:\n{text}");
+    }
+
+    #[test]
+    fn session_picker_search_preview_and_resume_actions() {
+        let mut app = App::new();
+        app.open_session_picker(
+            vec![SessionRow {
+                session_id: "s1".into(),
+                session_key: "cli:alpha".into(),
+                updated_at: "2026-06-19 12:00".into(),
+                message_count: 3,
+                snippet: "native sessions".into(),
+                preview: None,
+            }],
+            String::new(),
+        );
+
+        match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        ))) {
+            Action::SessionSearch(q) => assert_eq!(q, "r"),
+            _ => panic!("typing in session picker should search"),
+        }
+
+        match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            Action::PreviewSession(pick) => assert_eq!(pick.session_id, "s1"),
+            _ => panic!("Enter should preview the selected session"),
+        }
+        app.set_session_preview("s1", "user: hello\nassistant: hi".into());
+
+        match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        ))) {
+            Action::ResumeSession(pick) => assert_eq!(pick.session_key, "cli:alpha"),
+            _ => panic!("Ctrl+Enter should resume the selected session"),
+        }
+    }
+
+    #[test]
+    fn snapshot_restores_tui_workspace_state() {
+        let mut app = App::new();
+        app.set_mode("inspect");
+        app.toggle_thinking_display();
+        app.input.insert_str("draft prompt");
+        app.record_command("/sessions native");
+        app.on_tool_event(ToolEvent::CallStart {
+            tool_name: "read_file".into(),
+            tool_call_id: "tool-1".into(),
+            arguments_preview: r#"{"path":"src/lib.rs"}"#.into(),
+        });
+
+        let snapshot = app.snapshot(
+            "cli:snapshot",
+            "20260619-120000",
+            "/tmp/project".into(),
+            "qwen".into(),
+        );
+        let mut restored = App::new();
+        restored.apply_snapshot(&snapshot);
+
+        assert_eq!(restored.mode_label(), "inspect");
+        assert!(!restored.show_thinking);
+        assert_eq!(input_text(&restored), "draft prompt");
+        assert_eq!(restored.recent_commands, vec!["/sessions native"]);
+        assert_eq!(restored.recent_paths, vec!["src/lib.rs"]);
     }
 
     #[test]
