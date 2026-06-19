@@ -396,31 +396,6 @@ fn normalize_tool_schemas(body: &mut serde_json::Value) {
     }
 }
 
-/// Extract the unsupported feature name from an LMS error message.
-///
-/// Handles messages of the form:
-/// - `"Model does not support reasoning configuration"`
-/// - `"does not support reasoning"`
-/// - `"does not support <feature> configuration"`
-///
-/// Returns the feature name in lowercase if recognised, `None` otherwise.
-pub(crate) fn extract_unsupported_feature(error_text: &str) -> Option<String> {
-    let lower = error_text.to_ascii_lowercase();
-    // Pattern: "does not support <word>" or "does not support <word> configuration"
-    let marker = "does not support ";
-    let start = lower.find(marker)? + marker.len();
-    let rest = &lower[start..];
-    // Take the first word (stop at space, newline, or end)
-    let feature: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-    if feature.is_empty() {
-        return None;
-    }
-    Some(feature)
-}
-
 /// For local thinking-capable models with thinking disabled: prefill the
 /// assistant response with a pre-closed `<think>` block so the model
 /// skips reasoning and responds (or tool-calls) directly.
@@ -2981,55 +2956,6 @@ mod tests {
         assert!(
             resp.tool_calls.is_empty(),
             "empty stream should have no tool calls"
-        );
-    }
-
-    // ── extract_unsupported_feature tests ────────────────────────────────────
-
-    #[test]
-    fn test_extract_reasoning_unsupported() {
-        let msg = "Model does not support reasoning configuration";
-        assert_eq!(
-            extract_unsupported_feature(msg),
-            Some("reasoning".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_reasoning_lowercase() {
-        let msg = "does not support reasoning";
-        assert_eq!(
-            extract_unsupported_feature(msg),
-            Some("reasoning".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_other_feature() {
-        let msg = "error: does not support stream_options configuration";
-        assert_eq!(
-            extract_unsupported_feature(msg),
-            Some("stream_options".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_no_match_returns_none() {
-        let msg = "Internal server error";
-        assert_eq!(extract_unsupported_feature(msg), None);
-    }
-
-    #[test]
-    fn test_extract_empty_string_returns_none() {
-        assert_eq!(extract_unsupported_feature(""), None);
-    }
-
-    #[test]
-    fn test_extract_prefix_junk_still_works() {
-        let msg = r#"{"error":"Model does not support reasoning configuration","code":400}"#;
-        assert_eq!(
-            extract_unsupported_feature(msg),
-            Some("reasoning".to_string())
         );
     }
 
