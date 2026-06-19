@@ -1,8 +1,8 @@
 //! Tests for the tool runner.
 //!
-//! Extracted from tool_runner.rs for maintainability.
-//! Loaded via `#[path = "tool_runner_tests.rs"]` in tool_runner.rs so that
-//! `use super::*` continues to resolve against the tool_runner module.
+//! Declared as `#[cfg(test)] mod tests;` in `tool_runner/mod.rs`. The directory
+//! layout (mod.rs + tests.rs as siblings) keeps the test surface in its own
+//! file without needing the old `#[path]` hack.
 
 use super::*;
 use crate::agent::tools::base::Tool;

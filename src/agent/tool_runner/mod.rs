@@ -1220,5 +1220,4 @@ async fn execute_with_retry(
 const TOOL_MAX_RETRIES: u32 = 3;
 
 #[cfg(test)]
-#[path = "tool_runner_tests.rs"]
 mod tests;

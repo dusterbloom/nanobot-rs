@@ -1,8 +1,8 @@
 //! Tests for the agent loop.
 //!
-//! Extracted from agent_loop.rs for maintainability.
-//! Loaded via `#[path = "agent_loop_tests.rs"]` in agent_loop.rs so that
-//! `use super::*` continues to resolve against the agent_loop module.
+//! Declared as `#[cfg(test)] mod tests;` in `agent_loop/mod.rs`. The directory
+//! layout (mod.rs + tests.rs as siblings) keeps the test surface in its own
+//! file without needing the old `#[path]` hack.
 
 use super::*;
 use crate::agent::lane::Lane;

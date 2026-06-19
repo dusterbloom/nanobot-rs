@@ -26,17 +26,11 @@ use crate::tui;
 // Submodule declarations
 // ============================================================================
 
-#[path = "cmd_channels.rs"]
-mod cmd_channels;
-#[path = "cmd_cluster.rs"]
-mod cmd_cluster;
-#[path = "cmd_lifecycle.rs"]
-mod cmd_lifecycle;
-#[path = "cmd_mutation.rs"]
-mod cmd_mutation;
-#[path = "cmd_read.rs"]
-mod cmd_read;
-#[path = "trio_helpers.rs"]
+mod channels;
+mod cluster;
+mod lifecycle;
+mod mutation;
+mod read;
 mod trio_helpers;
 
 pub(crate) use trio_helpers::*;
