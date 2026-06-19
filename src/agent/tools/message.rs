@@ -61,7 +61,7 @@ impl Tool for MessageTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to the user. Use this when you want to communicate something."
+        "Send an explicit out-of-band notification to a chat channel. Do not use this for the normal assistant response; answer with assistant text instead."
     }
 
     fn parameters(&self) -> serde_json::Value {

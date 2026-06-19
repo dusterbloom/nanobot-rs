@@ -289,6 +289,30 @@ fn model_prefers_hidden_reasoning(model: &str) -> bool {
     crate::agent::model_capabilities::prefers_hidden_reasoning(model)
 }
 
+fn resolve_request_and_policy_model<'a>(
+    api_base: &str,
+    default_model: &'a str,
+    stripped_model: &'a str,
+) -> (&'a str, &'a str) {
+    let provider_model = if api_base.contains("openrouter") || api_base.starts_with("http://") {
+        // OpenRouter: keep org/model for routing.
+        // Local HTTP servers (LMS, vLLM): keep full identifier (e.g. "nvidia/nemotron-3-nano").
+        stripped_model
+    } else {
+        // Cloud HTTPS APIs (Anthropic, OpenAI, etc.): strip org prefix
+        // (e.g. "anthropic/claude-opus-4-5" -> "claude-opus-4-5").
+        stripped_model.split('/').last().unwrap_or(stripped_model)
+    };
+
+    if is_local_api_base(api_base) && default_model == "active" && stripped_model != "active" {
+        // Higgs uses "active" as the served transport model while nanobot keeps
+        // the loaded model's real identity for capabilities and reasoning policy.
+        ("active", stripped_model)
+    } else {
+        (provider_model, provider_model)
+    }
+}
+
 /// Apply local reasoning controls when talking to localhost.
 ///
 /// - `chat_template_kwargs.enable_thinking` toggles model reasoning mode for
@@ -572,20 +596,12 @@ impl OpenAICompatProvider {
         // and "provider/" prefix for non-OpenRouter APIs (e.g. "anthropic/claude-opus-4-5"
         // becomes "claude-opus-4-5" when hitting api.anthropic.com directly).
         let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
-        let model = if self.api_base.contains("openrouter") || self.api_base.starts_with("http://")
-        {
-            // OpenRouter: keep org/model for routing.
-            // Local HTTP servers (LMS, vLLM): keep full identifier (e.g. "nvidia/nemotron-3-nano").
-            stripped
-        } else {
-            // Cloud HTTPS APIs (Anthropic, OpenAI, etc.): strip org prefix
-            // (e.g. "anthropic/claude-opus-4-5" → "claude-opus-4-5").
-            stripped.split('/').last().unwrap_or(stripped)
-        };
+        let (model, policy_model) =
+            resolve_request_and_policy_model(&self.api_base, &self.default_model, stripped);
 
         debug!(
-            "chat: api_base={} raw_model={} stripped={} model={}",
-            self.api_base, raw_model, stripped, model
+            "chat: api_base={} raw_model={} stripped={} model={} policy_model={}",
+            self.api_base, raw_model, stripped, model, policy_model
         );
 
         let url = format!("{}/chat/completions", self.api_base);
@@ -625,11 +641,11 @@ impl OpenAICompatProvider {
         if let Some(tp) = top_p {
             body["top_p"] = serde_json::json!(tp);
         }
-        let supports_thinking = model_supports_thinking(model);
+        let supports_thinking = model_supports_thinking(policy_model);
         apply_local_reasoning_controls(
             &mut body,
             &self.api_base,
-            model,
+            policy_model,
             thinking_budget,
             supports_thinking,
         );
@@ -878,20 +894,12 @@ impl LLMProvider for OpenAICompatProvider {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
         let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
-        let model = if self.api_base.contains("openrouter") || self.api_base.starts_with("http://")
-        {
-            // OpenRouter: keep org/model for routing.
-            // Local HTTP servers (LMS, vLLM): keep full identifier (e.g. "nvidia/nemotron-3-nano").
-            stripped
-        } else {
-            // Cloud HTTPS APIs (Anthropic, OpenAI, etc.): strip org prefix
-            // (e.g. "anthropic/claude-opus-4-5" → "claude-opus-4-5").
-            stripped.split('/').last().unwrap_or(stripped)
-        };
+        let (model, policy_model) =
+            resolve_request_and_policy_model(&self.api_base, &self.default_model, stripped);
 
         debug!(
-            "chat_stream: api_base={} raw_model={} stripped={} model={}",
-            self.api_base, raw_model, stripped, model
+            "chat_stream: api_base={} raw_model={} stripped={} model={} policy_model={}",
+            self.api_base, raw_model, stripped, model, policy_model
         );
 
         let url = format!("{}/chat/completions", self.api_base);
@@ -935,11 +943,11 @@ impl LLMProvider for OpenAICompatProvider {
             // (LM Studio) ignore the field.
             body["return_progress"] = serde_json::json!(true);
         }
-        let supports_thinking = model_supports_thinking(model);
+        let supports_thinking = model_supports_thinking(policy_model);
         apply_local_reasoning_controls(
             &mut body,
             &self.api_base,
-            model,
+            policy_model,
             thinking_budget,
             supports_thinking,
         );
@@ -2963,6 +2971,23 @@ mod tests {
 
     const LOCAL: &str = "http://localhost:8000/v1";
     const CLOUD: &str = "https://api.openai.com/v1";
+
+    #[test]
+    fn active_local_transport_keeps_semantic_policy_model() {
+        let (request, policy) =
+            resolve_request_and_policy_model(LOCAL, "active", "usermma/VibeThinker-3B-mlx-8Bit");
+
+        assert_eq!(request, "active");
+        assert_eq!(policy, "usermma/VibeThinker-3B-mlx-8Bit");
+    }
+
+    #[test]
+    fn non_active_local_transport_uses_same_request_and_policy_model() {
+        let (request, policy) = resolve_request_and_policy_model(LOCAL, "qwen3-8b", "qwen3-8b");
+
+        assert_eq!(request, "qwen3-8b");
+        assert_eq!(policy, "qwen3-8b");
+    }
 
     #[test]
     fn tool_choice_required_local_constrained_is_required() {

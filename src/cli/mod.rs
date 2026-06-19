@@ -297,6 +297,52 @@ mod tests {
     }
 
     #[test]
+    fn test_higgs_active_uses_real_model_identity_for_core() {
+        let mut cfg = Config::default();
+        cfg.agents.defaults.local_backend = "higgs".to_string();
+        cfg.agents.defaults.local_model = "usermma/VibeThinker-3B-mlx-8Bit".to_string();
+        cfg.agents.defaults.lms_main_model = "active".to_string();
+
+        let handle = build_core_handle(&cfg, "18080", Some("active"), None, None, None, true);
+        let core = handle.swappable();
+
+        assert_eq!(
+            core.provider.get_default_model(),
+            "active",
+            "Higgs transport should keep using the resident active alias"
+        );
+        assert_eq!(
+            core.model, "local:usermma/VibeThinker-3B-mlx-8Bit",
+            "core identity should preserve loaded model for capabilities and UI"
+        );
+        assert!(
+            crate::agent::model_capabilities::prefers_hidden_reasoning(&core.model),
+            "VibeThinker hidden-reasoning policy should see semantic model id"
+        );
+    }
+
+    #[test]
+    fn test_local_core_uses_configured_model_when_name_omitted() {
+        let mut cfg = Config::default();
+        cfg.agents.defaults.local_backend = "higgs".to_string();
+        cfg.agents.defaults.local_model = "usermma/VibeThinker-3B-mlx-8Bit".to_string();
+        cfg.agents.defaults.lms_main_model = "active".to_string();
+
+        let handle = build_core_handle(&cfg, "18080", None, None, None, None, true);
+        let core = handle.swappable();
+
+        assert_eq!(
+            core.provider.get_default_model(),
+            "active",
+            "omitted local model arg should fall back to configured transport alias"
+        );
+        assert_eq!(
+            core.model, "local:usermma/VibeThinker-3B-mlx-8Bit",
+            "omitted local model arg should still keep semantic model identity"
+        );
+    }
+
+    #[test]
     fn test_strip_gguf_suffix() {
         assert_eq!(
             strip_gguf_suffix("nanbeige4.1-3b-q8_0.gguf"),

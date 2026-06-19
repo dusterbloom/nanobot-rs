@@ -346,6 +346,9 @@ pub(crate) struct App {
     /// re-prefill), so `tokens / turn_decode_secs` is a true decode rate rather
     /// than `tokens / (wall − first_ttft)`.
     turn_decode_secs: f32,
+    /// Monotonic animation frame, advanced once per `tick`; drives the footer
+    /// shimmer. Render-only — never affects agent state.
+    frame: u64,
     /// True while legacy ANSI-delimited thinking deltas are being received.
     in_thinking_stream: bool,
     /// Rows scrolled up from the bottom; `0` sticks to the latest output.
@@ -416,6 +419,7 @@ impl App {
             prefill_started: None,
             prefill_last: None,
             turn_decode_secs: 0.0,
+            frame: 0,
             in_thinking_stream: false,
             scroll_from_bottom: 0,
             max_scroll: 0,
@@ -1232,9 +1236,11 @@ impl App {
         self.transcript.push(Cell::Note(note));
     }
 
-    /// Tick exists to drive redraws for live activity rows; elapsed time is read
-    /// from the wall clock, so this is intentionally a no-op.
-    pub(crate) fn tick(&mut self, _dt: f32) {}
+    /// Advance the footer shimmer one frame. Elapsed time is read from the wall
+    /// clock, so the header stays timerless; only the footer word animates.
+    pub(crate) fn tick(&mut self, _dt: f32) {
+        self.frame = self.frame.wrapping_add(1);
+    }
 
     fn elapsed_s(&self) -> f32 {
         self.turn_start
@@ -1668,6 +1674,7 @@ impl App {
                 self.mode,
                 self.show_thinking,
                 self.status(),
+                self.frame,
             )),
             chunks[3],
         );
@@ -2339,7 +2346,13 @@ fn strip_ascii_case_insensitive(text: &str, needle: &str) -> String {
 
 /// Quiet footer: status · cwd · model · mode · ctx usage. The single surface
 /// for live state — header carries no status.
-fn footer_line(footer: &Footer, mode: Mode, show_thinking: bool, status: Status) -> Line<'static> {
+fn footer_line(
+    footer: &Footer,
+    mode: Mode,
+    show_thinking: bool,
+    status: Status,
+    frame: u64,
+) -> Line<'static> {
     let (glyph, word, color, bold) = match status {
         Status::Ready => (DOT, "ready", OK_COLOR, false),
         Status::Working => (BRAND, "working", ACCENT, true),
@@ -2347,15 +2360,19 @@ fn footer_line(footer: &Footer, mode: Mode, show_thinking: bool, status: Status)
         Status::Speaking => (DOT, "speaking", ACCENT, true),
         Status::Voice => (DOT, "voice", OK_COLOR, false),
     };
-    let mut spans = vec![
-        Span::styled(format!("  {glyph} "), style(color, bold)),
-        Span::styled(word, style(color, bold)),
-        Span::styled("   cwd ", dim()),
-        Span::styled(footer.cwd.clone(), style(OK_COLOR, false)),
-        Span::styled("   model ", dim()),
-        Span::styled(footer.model.clone(), style(OK_COLOR, false)),
-        Span::styled("   mode ", dim()),
-    ];
+    let mut spans = vec![Span::styled(format!("  {glyph} "), style(color, bold))];
+    // Only the working word moves: a single light sweeps across it. Every other
+    // state shows the word flat, so the footer never has two things in motion.
+    if matches!(status, Status::Working) {
+        spans.extend(shimmer(word, frame));
+    } else {
+        spans.push(Span::styled(word, style(color, bold)));
+    }
+    spans.push(Span::styled("   cwd ", dim()));
+    spans.push(Span::styled(footer.cwd.clone(), style(OK_COLOR, false)));
+    spans.push(Span::styled("   model ", dim()));
+    spans.push(Span::styled(footer.model.clone(), style(OK_COLOR, false)));
+    spans.push(Span::styled("   mode ", dim()));
     for m in [Mode::Calm, Mode::Inspect, Mode::Deep] {
         let st = if m == mode {
             Style::default().fg(Color::Black).bg(OK_COLOR)
@@ -2389,6 +2406,32 @@ fn footer_line(footer: &Footer, mode: Mode, show_thinking: bool, status: Status)
         spans.push(Span::styled("\u{2014}", dim())); // —
     }
     Line::from(spans)
+}
+
+/// The one footer animation: a single light sweeps across the status word —
+/// brightest at its head, glowing on the trailing cell, fading to the base
+/// accent elsewhere — then rests briefly before the next pass. One moving
+/// element, calm and alive. (Inspired by skeleton-shimmer loaders.)
+fn shimmer(word: &str, frame: u64) -> Vec<Span<'static>> {
+    const SHINE: Color = Color::Rgb(0xE6, 0xFB, 0xFF); // the crest
+    const GLOW: Color = Color::Rgb(0x8A, 0xDD, 0xE7); // the falloff
+    let len = word.chars().count() as i64;
+    let span = (len + 5).max(1); // +rest gap so passes pulse rather than chase
+    let head = (frame / 2 % span as u64) as i64;
+    word.chars()
+        .enumerate()
+        .map(|(i, c)| {
+            let color = match (i as i64 - head).abs() {
+                0 => SHINE,
+                1 => GLOW,
+                _ => ACCENT,
+            };
+            Span::styled(
+                c.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect()
 }
 
 /// Centered branded welcome shown while the transcript is empty.
@@ -4170,11 +4213,36 @@ mod tests {
             app.mode,
             app.show_thinking,
             app.status(),
+            app.frame,
         )));
         assert!(
             footer.contains("working"),
             "streaming status missing from footer: {footer}"
         );
+    }
+
+    #[test]
+    fn footer_working_word_shimmers_across_frames() {
+        let colors = |s: &[Span]| s.iter().map(|sp| sp.style.fg).collect::<Vec<_>>();
+
+        // The light sweeps: the colored spans differ between two frames a few
+        // ticks apart (one highlight moving across the word).
+        let a = shimmer("working", 0);
+        let b = shimmer("working", 6);
+        assert_eq!(a.len(), "working".chars().count());
+        assert_ne!(colors(&a), colors(&b), "the light must move across frames");
+
+        // Exactly one crest per frame, and the word stays intact and ordered.
+        let crests = a.iter().filter(|sp| sp.style.fg.is_some()).count();
+        assert!(crests >= 1, "a frame should light at least one cell");
+        let text: String = a.iter().map(|sp| sp.content.as_ref()).collect();
+        assert_eq!(text, "working", "every glyph preserved, in order");
+
+        // tick only advances the render frame — no agent state touched.
+        let mut app = App::new();
+        let before = app.frame;
+        app.tick(0.08);
+        assert_eq!(app.frame, before + 1);
     }
 
     #[test]
@@ -4608,10 +4676,10 @@ mod tests {
 
         // Each is a different terminal's drag-and-drop format for the same file.
         for input in [
-            format!("`{escaped}` look"),    // backtick + escaped (observed)
-            format!("'{plain}' look"),       // single-quote, real spaces
-            format!("\"{plain}\" look"),     // double-quote, real spaces
-            format!("{escaped} look"),       // bare, escaped (Terminal.app/iTerm)
+            format!("`{escaped}` look"), // backtick + escaped (observed)
+            format!("'{plain}' look"),   // single-quote, real spaces
+            format!("\"{plain}\" look"), // double-quote, real spaces
+            format!("{escaped} look"),   // bare, escaped (Terminal.app/iTerm)
         ] {
             let mut app = App::new();
             app.input.insert_str(&input);

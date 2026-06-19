@@ -125,7 +125,8 @@ pub(super) fn local_base_url(config: &Config, fallback_port: &str) -> String {
 /// Resolved local providers for all roles (main, compaction, delegation, specialist).
 pub(super) struct LocalProviders {
     pub main: Arc<dyn LLMProvider>,
-    pub model_id: String,
+    /// Real model identity used for capabilities, prompt policy, UI, and snapshots.
+    pub semantic_model_id: String,
     pub compaction: Option<Arc<dyn LLMProvider>>,
     pub delegation: Option<Arc<dyn LLMProvider>>,
     pub specialist: Option<Arc<dyn LLMProvider>>,
@@ -138,6 +139,42 @@ fn shared_local_role_model<'a>(configured_role_model: &'a str, main_model_id: &'
     } else {
         configured_role_model
     }
+}
+
+fn local_transport_model_id(config: &Config, local_model_name: Option<&str>) -> String {
+    let configured = local_model_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            let configured = config.agents.defaults.lms_main_model.trim();
+            (!configured.is_empty()).then_some(configured)
+        })
+        .or_else(|| {
+            let configured = config.agents.defaults.local_model.trim();
+            (!configured.is_empty()).then_some(configured)
+        })
+        .unwrap_or("local-model");
+
+    strip_gguf_suffix(configured).to_string()
+}
+
+fn local_semantic_model_id(config: &Config, transport_model_id: &str) -> String {
+    if is_higgs_backend(&config.agents.defaults.local_backend) && transport_model_id == "active" {
+        let configured = config.agents.defaults.local_model.trim();
+        if !configured.is_empty() {
+            return strip_gguf_suffix(configured).to_string();
+        }
+        if let Some(model_dir) = config.agents.defaults.mlx_model_dir.as_deref() {
+            if let Some(name) = std::path::Path::new(model_dir)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+            {
+                return name.to_string();
+            }
+        }
+    }
+    transport_model_id.to_string()
 }
 
 /// Build providers for all local roles from config + endpoint resolution.
@@ -161,7 +198,8 @@ pub(super) fn make_local_providers(
     // Resolve main model name.
     // Always strip GGUF suffix -- config may hold a .gguf filename even when
     // using LM Studio, which expects clean identifiers.
-    let model_id = strip_gguf_suffix(local_model_name.unwrap_or("local-model")).to_string();
+    let model_id = local_transport_model_id(config, local_model_name);
+    let semantic_model_id = local_semantic_model_id(config, &model_id);
 
     // Create JIT gate only for JIT-loading servers (LM Studio). Resident
     // servers (oMLX, Higgs) keep models loaded in memory; serialising their
@@ -291,7 +329,7 @@ pub(super) fn make_local_providers(
 
     LocalProviders {
         main,
-        model_id,
+        semantic_model_id,
         compaction,
         delegation,
         specialist,
@@ -384,12 +422,12 @@ pub(crate) fn build_core_handle(
             delegation_port,
             specialist_port,
         );
-        let model = format!("local:{}", lp.model_id);
+        let model = format!("local:{}", lp.semantic_model_id);
         // Size context per-model on the local path too (not just cloud): a
         // capable long-context model (e.g. Qwen3.6, 256K native) gets its real
         // budget, while smaller local models (Bonsai 32K/64K) keep the
         // conservative server-probed/default value and are never overshot.
-        let ctx = model_context_size(&lp.model_id, lp.max_context_tokens);
+        let ctx = model_context_size(&lp.semantic_model_id, lp.max_context_tokens);
         (
             lp.main,
             model,
@@ -463,12 +501,12 @@ pub(crate) fn rebuild_core(
             delegation_port,
             specialist_port,
         );
-        let model = format!("local:{}", lp.model_id);
+        let model = format!("local:{}", lp.semantic_model_id);
         // Size context per-model on the local path too (not just cloud): a
         // capable long-context model (e.g. Qwen3.6, 256K native) gets its real
         // budget, while smaller local models (Bonsai 32K/64K) keep the
         // conservative server-probed/default value and are never overshot.
-        let ctx = model_context_size(&lp.model_id, lp.max_context_tokens);
+        let ctx = model_context_size(&lp.semantic_model_id, lp.max_context_tokens);
         (
             lp.main,
             model,

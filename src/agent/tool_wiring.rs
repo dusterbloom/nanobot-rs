@@ -39,6 +39,10 @@ impl<T: crate::agent::tools::Tool> crate::agent::tools::Tool for ArcToolProxy<T>
     }
 }
 
+fn should_register_message_tool(channel: &str) -> bool {
+    !matches!(channel, "cli" | "voice" | "tui" | "repl")
+}
+
 impl AgentLoopShared {
     /// Build a fresh [`ToolRegistry`] with context-sensitive tools (message,
     /// spawn, cron) pre-configured for a specific channel/chat_id.
@@ -79,17 +83,20 @@ impl AgentLoopShared {
         };
         let mut tools = ToolRegistry::with_standard_tools(&tool_config);
 
-        // Message tool - context baked in.
-        let outbound_tx_clone = self.bus_outbound_tx.clone();
-        let send_cb: SendCallback = Arc::new(move |msg: OutboundMessage| {
-            let tx = outbound_tx_clone.clone();
-            Box::pin(async move {
-                tx.send(msg)
-                    .map_err(|e| anyhow::anyhow!("Failed to send outbound message: {}", e))
-            })
-        });
-        let message_tool = Arc::new(MessageTool::new(Some(send_cb), channel, chat_id));
-        tools.register(Box::new(ArcToolProxy(message_tool)));
+        // Direct UI channels already reply through `finalize_response`; exposing
+        // `message` there gives models a second, failure-prone way to answer.
+        if should_register_message_tool(channel) {
+            let outbound_tx_clone = self.bus_outbound_tx.clone();
+            let send_cb: SendCallback = Arc::new(move |msg: OutboundMessage| {
+                let tx = outbound_tx_clone.clone();
+                Box::pin(async move {
+                    tx.send(msg)
+                        .map_err(|e| anyhow::anyhow!("Failed to send outbound message: {}", e))
+                })
+            });
+            let message_tool = Arc::new(MessageTool::new(Some(send_cb), channel, chat_id));
+            tools.register(Box::new(ArcToolProxy(message_tool)));
+        }
 
         // Spawn tool - context baked in.
         let subagents_ref = self.subagents.clone();
@@ -355,5 +362,30 @@ impl AgentLoopShared {
         }
 
         (tools, reasoning_engine)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_register_message_tool;
+
+    #[test]
+    fn direct_channels_do_not_register_message_tool() {
+        for channel in ["cli", "voice", "tui", "repl"] {
+            assert!(
+                !should_register_message_tool(channel),
+                "{channel} should use the final response path, not the message tool"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_channels_register_message_tool() {
+        for channel in ["telegram", "whatsapp", "email"] {
+            assert!(
+                should_register_message_tool(channel),
+                "{channel} should allow explicit out-of-band sends"
+            );
+        }
     }
 }
