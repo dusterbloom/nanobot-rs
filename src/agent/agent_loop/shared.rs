@@ -2177,7 +2177,7 @@ impl AgentLoopShared {
         // (different name/server) is unaffected.
         let delegation_reuses_main_model =
             crate::agent::tool_engine::delegation_reuses_main_local_model(
-                ctx.core.is_local,
+                ctx.core.mode().is_local(),
                 &ctx.core.model,
                 delegation_model.as_deref(),
             );

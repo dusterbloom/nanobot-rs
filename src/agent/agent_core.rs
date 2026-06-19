@@ -58,11 +58,9 @@ pub struct SwappableCore {
     pub memory_provider: Arc<dyn LLMProvider>,
     pub memory_model: String,
     pub reflection_threshold: usize,
-    pub is_local: bool,
-    /// Typed runtime descriptor (parallel to `is_local` during the Wave 2 rollout).
-    ///
-    /// Waves 2–4: construction-site derivations consult `mode`; Wave 3 migrates
-    /// downstream readers off `is_local`; Wave 4 removes the bool.
+    /// Typed runtime descriptor. Single source of truth for "is this a local
+    /// backend?" via `mode().is_local()`. The legacy `is_local: bool` field was
+    /// removed in R6 — it duplicated information already carried by this enum.
     pub mode: RuntimeMode,
     pub local_tool_mode: crate::config::schema::LocalToolMode,
     pub lane: Lane,
@@ -627,7 +625,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_provider,
         memory_model,
         reflection_threshold: memory_config.reflection_threshold,
-        is_local,
         mode,
         local_tool_mode,
         lane,

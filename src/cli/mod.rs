@@ -280,7 +280,7 @@ mod tests {
         let core = handle.swappable();
 
         assert!(
-            core.is_local,
+            core.mode().is_local(),
             "local mode should force local provider wiring"
         );
         assert_eq!(core.model, "local:Qwen3-8B");
