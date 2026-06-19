@@ -340,8 +340,7 @@ pub(super) fn make_local_providers(
 /// Build a `SwappableCoreConfig` from shared config + per-call overrides.
 ///
 /// Centralises the 25-field struct construction that was previously copy-pasted
-/// across `build_core_handle`, `build_core_handle_mlx`, `rebuild_core`, and
-/// `rebuild_core_mlx`.
+/// across `build_core_handle` and `rebuild_core`.
 fn core_config_from(
     config: &Config,
     provider: Arc<dyn LLMProvider>,
@@ -465,19 +464,6 @@ pub(crate) fn build_core_handle(
     // Attach lazy auxiliary server (spawns on first delegation/compaction/memory use).
     AgentHandle::new(core, Arc::new(counters))
 }
-
-/// Build a core handle using the in-process MLX provider as the main LLM.
-///
-/// The MLX provider runs inference on Apple Silicon GPU via the same model
-/// that serves perplexity scoring and LoRA training. Context is limited to
-/// 32K tokens (local model default).
-///
-/// `is_local` is set to `false` because MLX speaks proper tool_calls and
-/// does not need the local protocol quirks (user-last, no prefill).
-
-/// Rebuild the shared core for MLX mode (e.g. `/ctx` or `/model` changes).
-///
-/// Like `rebuild_core` but uses the MLX provider instead of LM Studio.
 
 /// Rebuild the shared core for `/local` toggle or `/model` swap.
 ///

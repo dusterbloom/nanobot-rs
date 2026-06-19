@@ -48,7 +48,7 @@
 
 **cli/** - Agent/config command implementations (split into module, 2026-03-04):
 - `mod.rs` - Onboard, gateway, channels, status, cron, tune, tests
-- `core_builder.rs` - `build_core_handle()`, `rebuild_core()`, `create_agent_loop()`, `make_local_providers()`, `start_mlx_provider()`, `build_core_handle_mlx()`, `create_agent_loop_mlx()` (feature = "mlx")
+- `core_builder.rs` - `build_core_handle()`, `rebuild_core()`, `create_agent_loop()`, `make_local_providers()`
 - `provider.rs` - `create_provider()`, `load_oauth_provider()`, `is_claude_model()`
 - `eval.rs` - All `cmd_eval_*` benchmark commands
 - `voice.rs` - All `#[cfg(feature="voice")]` commands
@@ -151,16 +151,6 @@ Modules extracted from or supporting `agent_loop.rs`:
 | `agent_profiles.rs` | Subagent profile loading and management |
 | `lora_bridge.rs` | LoRA adapter hot-swap bridge, experience buffer, heuristic surprise gate |
 | `learn_loop.rs` | Unified learning dispatch: `LearnLoop` trait, `DefaultLearnLoop`, perplexity gate → ANE/HTTP training |
-| `mlx_lora.rs` | MLX model loading, tokenizer, LoRA config, Gated Delta Net, attention (feature = "mlx") |
-| `mlx_server.rs` | Model worker thread, chat template, tokenization, training loop (feature = "mlx") |
-| `ane_mil.rs` | MIL program generation for ANE kernels: SDPA, FFN (fused/tiled), DynMatmul, backward kernels (feature = "ane") |
-| `ane_forward.rs` | ANE forward pass: `CompiledKernels`, `forward_ane_generic` (FFN on ANE, attention on CPU) (feature = "ane") |
-| `ane_backward.rs` | ANE backward pass: `BackwardKernels`, LoRA gradient computation (feature = "ane") |
-| `ane_mlx_bridge.rs` | ANE↔MLX LoRA weight bridge, `BucketKernels`, `spawn_ane_training` (feature = "ane") |
-| `ane_weights.rs` | `WeightSource` trait, quantized model loading, weight packing/unpacking (feature = "ane") |
-| `ane_lora.rs` | LoRA model/adapter structs, Adam optimizer, binary serialization (feature = "ane") |
-| `ane_bridge.rs` | Low-level ANE hardware interface: compile, eval, IOSurface management (feature = "ane") |
-| `ane_train.rs` | CPU-only training fallback path (feature = "ane") |
 | `process_tree.rs` | Persistent execution tree for multi-step processes (Phase 2) |
 | `step_voter.rs` | MAKER voting for step validation (Phase 2) |
 | `reflector.rs` | Self-reflection and learning extraction |
@@ -186,16 +176,9 @@ AnthropicProvider (native Anthropic Messages API)
 ├── Used exclusively for OAuth/Claude Max flows
 └── Speaks native Anthropic API, not OpenAI-compat
 
-MlxProvider (in-process Apple Silicon GPU inference, feature = "mlx")
-├── Owns channel to model worker thread (no HTTP, no separate process)
-├── Same model serves: chat(), perplexity(), train()
-├── Qwen3.5-2B-MLX-8bit default (~2GB, 8-bit quantized)
-└── LoRA training updates live weights — next inference uses them
-
 factory.rs        - Provider instantiation from config
 oauth.rs          - OAuth token management for Anthropic
 transcription.rs  - Audio transcription provider
-mlx.rs            - In-process MLX provider (feature-gated)
 ```
 
 **Provider Selection Priority:**
@@ -742,8 +725,10 @@ VoiceAgent event loop (pure state machine)
 
 - `default` - Core functionality
 - `voice` - Voice mode + realtime pipeline (requires jack-voice, crossterm, lingua). Enables `/voice` REPL mode and `nanobot realtime` continuous/PTT voice sessions.
-- `mlx` - In-process Apple Silicon GPU inference via MLX. Loads Qwen3.5-2B (8-bit) into GPU memory, serves chat/perplexity/LoRA training from the same model worker thread. No HTTP server needed. Perplexity gate auto-enables for online learning. Requires: `mlx-rs`, `tokenizers`, Apple Silicon Mac. Config: `inferenceEngine: "mlx"`.
-- `ane` - Apple Neural Engine accelerated LoRA training. Compiles MIL programs for FFN forward/backward kernels on ANE; attention runs on CPU (supports GQA, QK-norm, attn_output_gate). `BucketKernels` pre-compiles for multiple seq_len buckets. `spawn_ane_training` runs QLoRA on a background thread with CPU fallback. Standalone mode (`ane_model_dir`) works with oMLX/LM Studio (no in-process MLX needed). `/train` REPL commands for manual control. Requires Apple Silicon.
+- `cluster` - Distributed inference routing via mDNS discovery.
+- `semantic` - Local ONNX embeddings + SQLite vector search for semantic recall.
+- `knowledge-graph` - Persistent entity/relation graph (petgraph).
+- `trace-chrome` - Emit a chrome trace file per session under `~/.nanobot/traces/`.
 
 ---
 

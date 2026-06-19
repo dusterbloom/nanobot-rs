@@ -105,64 +105,10 @@ Switch to push-to-talk with `--mode ptt` (hold Space to record).
 
 ### MLX inference (Apple Silicon)
 
-Run a language model directly on your Mac's GPU -- no server, no HTTP, no separate process. The model lives in nanobot's memory and serves inference, perplexity scoring, and LoRA fine-tuning from the same worker thread.
-
-```bash
-cargo build --release --features mlx
-```
-
-Set `inferenceEngine` to `"mlx"` in `~/.nanobot/config.json`:
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "inferenceEngine": "mlx",
-      "mlxModelDir": "~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit",
-      "mlxPreset": "qwen3.5-2b"
-    }
-  }
-}
-```
-
-Default model: **Qwen3.5-2B** (8-bit, ~2GB). The model loads once at startup and stays in GPU memory. All entry points (REPL, gateway, voice, channels) use the same in-process provider.
-
-**Online learning**: When MLX is active, the perplexity gate auto-enables. Each conversation turn is scored for surprise (cross-entropy loss). Surprising exchanges accumulate in an experience buffer; once enough gather, a LoRA training pass fires in the background. The model learns from its mistakes -- next inference uses updated weights. No manual training step needed.
-
-**MLX server** (standalone, OpenAI-compatible):
-
-```bash
-nanobot mlx-serve --port 8766
-```
-
-Exposes `/v1/chat/completions` (OpenAI) + Ex0bit protocol (`/chat` SSE, `/train`, `/status`, `/reset`).
-
-### On-device training (Apple Silicon)
-
-nanobot can train LoRA adapters directly on Apple Silicon using a split-silicon architecture that keeps all three hardware blocks busy simultaneously:
-
-```bash
-cargo build --release --features ane
-```
-
-```
-GPU  (Metal)  -->  inference (uninterrupted)
-ANE  (Neural) -->  training forward pass (projections, FFN, SDPA)
-CPU  (NEON)   -->  backward pass, sequential ops (GDN recurrence)
-```
-
-**ANE SDPA kernel**: For models with gated attention (Qwen3.5), a custom MIL kernel runs the O(n^2) scaled dot-product attention on the Neural Engine. At longer context lengths the ANE advantage compounds -- the kernel scales sub-quadratically while CPU scales quadratically:
-
-| Context length | ANE | CPU | Speedup |
-|---|---|---|---|
-| 512 | 5.6ms | 10.1ms | 1.8x |
-| 1024 | 11.9ms | 39.2ms | 3.3x |
-| 4096 | 127ms | 705ms | 5.5x |
-| 8192 | 517ms | 2917ms | 5.7x |
-
-*Measured on Qwen3.5-35B-A3B dimensions (16 heads, 256 head_dim, 4096 attn_dim).*
-
-Training runs in the background during normal use. Inference on GPU is never blocked by training on ANE -- they are independent hardware blocks with zero interference.
+> **Note:** In-process MLX inference was experimental and has been removed. The
+> code path is preserved on the `claude/pensive-lumiere` branch. To use MLX
+> models today, run them via LM Studio (or any OpenAI-compatible server) and
+> point `local.apiBase` at it.
 
 ### Tools
 
@@ -276,7 +222,6 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 | `nanobot cron add` | Add a scheduled job |
 | `nanobot realtime` | Realtime voice session (continuous mode) |
 | `nanobot realtime --mode ptt` | Realtime voice with push-to-talk |
-| `nanobot mlx-serve` | Start MLX model server (OpenAI-compat + Ex0bit) |
 
 ## Building
 
@@ -286,15 +231,6 @@ cargo build --release
 
 # With voice mode (requires jack-voice + pocket-tts)
 cargo build --release --features voice
-
-# With MLX in-process inference (Apple Silicon only)
-cargo build --release --features mlx
-
-# With ANE on-device training (Apple Silicon only)
-cargo build --release --features ane
-
-# All Apple Silicon features
-cargo build --release --features mlx,ane
 
 # Debug with logging
 RUST_LOG=debug cargo run -- agent -m "Hello"
@@ -312,9 +248,6 @@ Key agent settings in `config.json`:
 | `agents.defaults.maxTokens` | `8192` | Max response tokens |
 | `agents.defaults.maxContextTokens` | `128000` | Context window size |
 | `agents.defaults.maxConcurrentChats` | `4` | Parallel chat limit (gateway) |
-| `agents.defaults.inferenceEngine` | `auto` | Engine: `auto`, `lms`, or `mlx` |
-| `agents.defaults.mlxModelDir` | (auto-detected) | Path to MLX model directory |
-| `agents.defaults.mlxPreset` | `qwen3.5-2b` | Model config preset |
 
 For local mode, install [LM Studio](https://lmstudio.ai/) and its CLI (`lms`). Models are managed through LM Studio.
 

@@ -165,9 +165,6 @@ trace-chrome = ["dep:tracing-chrome", "dep:tracing-tree"]
 cluster = ["dep:mdns-sd"]
 semantic = ["dep:fastembed", "dep:sqlite-vec", "dep:zerocopy"]
 knowledge-graph = ["dep:petgraph"]
-lora = ["dep:qlora-rs", "dep:candle-core"]
-ane = ["dep:half", "dep:memmap2", "dep:rayon"]  # Apple Neural Engine fine-tuning (macOS Apple Silicon only)
-candle = ["dep:candle-core", "dep:candle-nn"]  # Candle Metal GPU inference (GQA attention layers)
 
 [dependencies.jack-voice]
 git = "https://github.com/dusterbloom/jack-voice.git"
@@ -181,20 +178,5 @@ jack-voice = { path = "../jack-voice/jack-voice" }
 
 [dependencies.crossterm]
 version = "0.28"
-optional = true
-
-# QLoRA training: 4-bit quantized LoRA fine-tuning with GGUF export
-[dependencies.qlora-rs]
-version = "1.0"
-optional = true
-features = ["gguf-export"]
-
-[dependencies.candle-core]
-version = "0.9"
-optional = true
-features = ["metal"]
-
-[dependencies.candle-nn]
-version = "0.9"
 optional = true
 
