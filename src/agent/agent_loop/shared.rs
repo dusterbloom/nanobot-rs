@@ -46,9 +46,9 @@ use super::{
     should_strip_tools_for_trio,
 };
 
-#[path = "agent_response.rs"]
-pub(crate) mod agent_response;
-pub(crate) use agent_response::RetryState;
+// `response` is a sibling module declared in `mod.rs`. RetryState is re-exported
+// from there; we just need a local alias for the field type below.
+use super::response::RetryState;
 
 fn send_cache_reset_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, reason: &str) {
     if let Some(tx) = tx {
@@ -317,7 +317,7 @@ pub(crate) struct CompactionHandle {
 ///
 /// Each variant carries only the data needed for that phase.
 /// Transitions are driven by the return value of each step method.
-enum IterationPhase {
+pub(crate) enum IterationPhase {
     /// Pre-LLM housekeeping: context hygiene, proprioception, aha channel,
     /// heartbeat injection, compaction check.
     Preparing,
@@ -337,7 +337,7 @@ enum IterationPhase {
 }
 
 /// Outcome of a single iteration, returned to the outer loop.
-enum IterationOutcome {
+pub(crate) enum IterationOutcome {
     /// Continue to next iteration.
     Continue,
     /// Validation failed and a retry hint was injected. Does NOT consume a
@@ -350,7 +350,7 @@ enum IterationOutcome {
 }
 
 /// What a step function produces: either the next phase or a terminal outcome.
-enum StepResult {
+pub(crate) enum StepResult {
     /// Transition to the next phase within this iteration.
     Next(IterationPhase),
     /// Iteration is done — report outcome to the outer loop.

@@ -37,19 +37,19 @@ pub use crate::agent::agent_core::{
 pub(crate) use crate::agent::agent_core::{history_limit, provenance_warning_role};
 
 // ---------------------------------------------------------------------------
-// Submodules (loaded via #[path] because agent_loop is a file, not a dir)
+// Submodules
 // ---------------------------------------------------------------------------
 
-#[path = "agent_shared.rs"]
-mod agent_shared;
-pub(crate) use agent_shared::*;
+mod shared;
+mod response;
+mod heuristics;
 
-#[path = "agent_heuristics.rs"]
-mod agent_heuristics;
-pub(crate) use agent_heuristics::appears_incomplete;
+pub(crate) use shared::*;
+pub(crate) use response::RetryState;
+pub(crate) use heuristics::appears_incomplete;
 // Re-export remaining heuristic functions at module-private level for use
-// within this module and its submodules (agent_shared uses them via super::).
-use agent_heuristics::{
+// within this module and its submodules (shared uses them via super::).
+use heuristics::{
     adaptive_max_tokens, last_user_message, render_via_protocol, should_strip_tools_for_trio,
 };
 
@@ -764,5 +764,4 @@ impl AgentLoop {
 // ============================================================================
 
 #[cfg(test)]
-#[path = "agent_loop_tests.rs"]
 mod tests;
