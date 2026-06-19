@@ -686,15 +686,6 @@ impl ReplContext {
                     tui::RESET
                 );
             }
-            // Also show learning context if available.
-            let learning = core.learning.get_learning_context();
-            if !learning.is_empty() {
-                println!("  {}Tool Patterns{}\n", tui::BOLD, tui::RESET);
-                for line in learning.lines() {
-                    println!("  {}{}{}", tui::DIM, line, tui::RESET);
-                }
-                println!();
-            }
         }
     }
 

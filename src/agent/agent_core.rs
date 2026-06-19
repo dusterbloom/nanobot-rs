@@ -16,7 +16,6 @@ use crate::agent::circuit_breaker::CircuitBreaker;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
 use crate::agent::lane::Lane;
-use crate::agent::learning::LearningStore;
 use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
@@ -47,7 +46,6 @@ pub struct SwappableCore {
     pub sessions: SessionDb,
     pub token_budget: TokenBudget,
     pub compactor: ContextCompactor,
-    pub learning: LearningStore,
     pub working_memory: WorkingMemoryStore,
     pub working_memory_budget: usize,
     pub brave_api_key: Option<String>,
@@ -550,7 +548,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         compaction_ctx_size = compaction_ctx_size,
         "agent_core: compactor initialized"
     );
-    let learning = LearningStore::new(&workspace);
     let working_memory = WorkingMemoryStore::new(&workspace);
 
     // Build tool runner provider if delegation is enabled.
@@ -612,7 +609,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         sessions,
         token_budget,
         compactor,
-        learning,
         working_memory,
         // Scale working memory like other budgets. If the user left it at
         // the default (600), apply proportional scaling; otherwise respect their override.

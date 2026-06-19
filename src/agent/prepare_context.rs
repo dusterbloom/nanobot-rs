@@ -423,10 +423,6 @@ impl AgentLoopShared {
             .learning_turn_counter
             .fetch_add(1, Ordering::Relaxed)
             + 1;
-        if turn_count % 50 == 0 {
-            core.learning.prune();
-        }
-
         let session_key = msg
             .metadata
             .get("session_key")

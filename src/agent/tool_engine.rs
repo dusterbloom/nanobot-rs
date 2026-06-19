@@ -506,15 +506,6 @@ pub(crate) async fn execute_tools_delegated(
             );
         }
 
-        ctx.core.learning.record_extended(
-            tool_name,
-            ok,
-            &data.chars().take(100).collect::<String>(),
-            if ok { None } else { Some(data) },
-            Some(&tr_model),
-            Some(&tr_model),
-            None,
-        );
         ctx.used_tools.insert(tool_name.clone());
 
         // Taint tracking: mark context tainted when a web tool ran via delegation.
@@ -788,23 +779,6 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
             duration_ms: r.duration_ms,
             result_chars: r.result.data.len(),
         });
-
-    // Learning.
-    let context_str: String = r
-        .arguments
-        .values()
-        .filter_map(|v| v.as_str())
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .take(100)
-        .collect();
-    ctx.core.learning.record(
-        &r.tool_name,
-        r.result.ok,
-        &context_str,
-        r.result.error.as_deref(),
-    );
 
     // NOTE: response-boundary arming is NOT done here. This function sees only
     // one tool result and cannot tell whether the model reported its work in the

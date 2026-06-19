@@ -993,7 +993,8 @@ impl AgentLoopShared {
                     let intent = crate::agent::proactive::extract_intent(&user_text);
                     if intent.confidence >= 0.2 {
                         let budget = (ctx.core.token_budget.max_context() / 20).min(500);
-                        let learning_context = ctx.core.learning.get_learning_context();
+                        // learnings removed; proactive grounding no longer uses tool-pattern hints
+                        let learning_context = String::new();
                         let ks_guard = self.knowledge_store.as_ref().map(|ks| ks.lock());
                         let ks_ref = ks_guard.as_deref();
                         let payload = crate::agent::proactive::retrieve_grounding(

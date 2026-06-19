@@ -30,7 +30,6 @@ pub mod knowledge_graph;
 pub mod knowledge_store;
 pub(crate) mod lane;
 pub mod lcm;
-pub(crate) mod learning;
 pub(crate) mod markers;
 pub(crate) mod memory;
 pub(crate) mod memory_ladder;
