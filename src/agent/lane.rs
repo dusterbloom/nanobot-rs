@@ -121,6 +121,29 @@ impl ToolGateProfile {
             ToolGateProfile::ReadOnly => ModelSizeClass::Small,
         }
     }
+
+    /// Returns the set of tools this profile permits for the given model size,
+    /// or `None` when nothing should be filtered (Large models get every tool).
+    ///
+    /// Unifies the "which size class" decision with the "which tools" decision
+    /// so callers don't need to know about the size-class intermediate.
+    pub fn allowed_tools(&self, actual_size: ModelSizeClass) -> Option<Vec<String>> {
+        use crate::agent::capabilities::{resolve_capabilities, Capability};
+        let caps: &[Capability] = match self.effective_size_class(actual_size) {
+            ModelSizeClass::Small => &[Capability::Read, Capability::Http, Capability::Skills],
+            ModelSizeClass::Medium => &[
+                Capability::Read,
+                Capability::Http,
+                Capability::Skills,
+                Capability::Write,
+                Capability::Memory,
+                Capability::Execute,
+                Capability::Spawn,
+            ],
+            ModelSizeClass::Large => return None,
+        };
+        Some(resolve_capabilities(caps))
+    }
 }
 
 /// Controls memory token budget scaling.
@@ -254,6 +277,90 @@ mod tests {
             ToolGateProfile::SizeClassBased.effective_size_class(ModelSizeClass::Small),
             ModelSizeClass::Small
         );
+    }
+
+    // --- ToolGateProfile::allowed_tools ---
+
+    fn assert_contains(tools: &Option<Vec<String>>, name: &str) {
+        assert!(
+            tools.as_ref().unwrap().contains(&name.to_string()),
+            "expected {name} in {:?}",
+            tools
+        );
+    }
+
+    #[test]
+    fn allowed_tools_small_returns_read_http_skills_only() {
+        let tools = ToolGateProfile::SizeClassBased.allowed_tools(ModelSizeClass::Small);
+        assert!(tools.is_some());
+        // Read tier
+        assert_contains(&tools, "read_file");
+        assert_contains(&tools, "list_dir");
+        // Http tier
+        assert_contains(&tools, "web_search");
+        assert_contains(&tools, "web_fetch");
+        assert_contains(&tools, "browser");
+        // Skills
+        assert_contains(&tools, "read_skill");
+        // Not in tiny tier
+        let list = tools.unwrap();
+        assert!(!list.contains(&"write_file".to_string()), "no Write for Small");
+        assert!(!list.contains(&"exec".to_string()), "no Execute for Small");
+        assert!(!list.contains(&"spawn".to_string()), "no Spawn for Small");
+    }
+
+    #[test]
+    fn allowed_tools_medium_adds_write_execute_memory_spawn() {
+        let tools = ToolGateProfile::SizeClassBased.allowed_tools(ModelSizeClass::Medium);
+        assert!(tools.is_some());
+        // Everything from Small tier
+        assert_contains(&tools, "read_file");
+        assert_contains(&tools, "web_search");
+        assert_contains(&tools, "read_skill");
+        // Plus the balanced additions
+        assert_contains(&tools, "write_file");
+        assert_contains(&tools, "edit_file");
+        assert_contains(&tools, "exec");
+        assert_contains(&tools, "recall");
+        assert_contains(&tools, "remember");
+        assert_contains(&tools, "spawn");
+    }
+
+    #[test]
+    fn allowed_tools_large_returns_none_meaning_no_filter() {
+        // None is the "all tools allowed" sentinel — caller skips the retain() entirely.
+        assert_eq!(
+            ToolGateProfile::SizeClassBased.allowed_tools(ModelSizeClass::Large),
+            None
+        );
+    }
+
+    #[test]
+    fn allowed_tools_read_only_forces_small_tier_regardless_of_actual_size() {
+        // ReadOnly lane should get the tiny tier even on a Large model.
+        let tools = ToolGateProfile::ReadOnly.allowed_tools(ModelSizeClass::Large);
+        assert!(tools.is_some());
+        assert_contains(&tools, "read_file");
+        let list = tools.unwrap();
+        assert!(!list.contains(&"write_file".to_string()));
+        assert!(!list.contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn allowed_tools_is_capability_based_not_hardcoded() {
+        // Adding a tool to Capability::Read must show up in the Small tier, because
+        // the tier resolves dynamically from the capability list, not from a hardcoded
+        // tool-name set. Pin the contract: every Read tool appears in Small tier.
+        use crate::agent::capabilities::Capability;
+        let small = ToolGateProfile::SizeClassBased
+            .allowed_tools(ModelSizeClass::Small)
+            .unwrap();
+        for tool in Capability::Read.tool_names() {
+            assert!(
+                small.contains(&tool.to_string()),
+                "Small tier must contain Read tool {tool} (capability-based resolution)"
+            );
+        }
     }
 
     #[test]

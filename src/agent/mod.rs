@@ -61,7 +61,6 @@ pub(crate) mod system_state;
 pub(crate) mod taint;
 pub mod token_budget;
 pub(crate) mod tool_engine;
-pub(crate) mod tool_gate;
 pub(crate) mod tool_guard;
 pub(crate) mod tool_runner;
 pub(crate) mod tool_wiring;

@@ -26,7 +26,6 @@ use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
 use crate::agent::token_budget::TokenBudget;
-use crate::agent::tool_gate::ToolGate;
 use crate::agent::tool_guard::ToolGuard;
 use crate::agent::tools::reasoning_tools::SharedEngine;
 use crate::agent::tools::registry::ToolRegistry;
@@ -1186,18 +1185,19 @@ impl AgentLoopShared {
         // NOTE: the response boundary deliberately does NOT filter tool_defs.
         // Schema changes invalidate server-side prefix caches (full re-prefill);
         // side-effect calls are rejected at execution time instead.
-        // ToolGate: size-class filtering for cloud models only.
-        // Local models already get condensed descriptions (~350 tokens for
-        // 12 tools, <1.1% of 32K context) and real availability is gated
-        // by `is_available()`, so ToolGate would only remove useful tools.
+        //
+        // Tool gating runs for cloud models only. Local models already get
+        // condensed tool descriptions (~350 tokens for 12 tools, <1.1% of 32K
+        // context) and real availability is enforced by `is_available()`, so
+        // filtering would only remove useful tools.
         if matches!(ctx.core.mode(), RuntimeMode::Cloud) {
-            let effective_size = ctx
+            if let Some(allowed) = ctx
                 .core
                 .lane
                 .policy()
                 .tools
-                .effective_size_class(ctx.core.model_capabilities.size_class);
-            if let Some(allowed) = ToolGate::filter(effective_size, None) {
+                .allowed_tools(ctx.core.model_capabilities.size_class)
+            {
                 let allowed_set: std::collections::HashSet<&str> =
                     allowed.iter().map(|s| s.as_str()).collect();
                 tool_defs.retain(|def| {
