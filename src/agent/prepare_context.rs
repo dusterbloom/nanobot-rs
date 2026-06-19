@@ -202,13 +202,11 @@ impl AgentLoopShared {
             }
         }
 
-        let learning_ctx = core.learning.get_learning_context();
-        if !learning_ctx.is_empty() {
-            blocks.push(crate::agent::context::PromptBlock::new(
-                "Tool Patterns",
-                learning_ctx,
-            ));
-        }
+        // ponytail: dropped the "Tool Patterns" learnings block. It injected
+        // vague global success/failure counts ("- exec: 8/10 succeeded recently")
+        // with no measurable value, and get_learning_context() read the entire
+        // ~947KB learnings.jsonl every turn to keep the last 50. Recording stays;
+        // only this value-less per-turn prompt injection is removed.
 
         let running = self.subagents.list_running().await;
         let recent =
@@ -348,20 +346,9 @@ impl AgentLoopShared {
             }
         }
 
-        // Tool patterns are independent of memory — include regardless of
-        // memory_enabled to match the local prompt path.
-        let learning_ctx = core.learning.get_learning_context();
-        if !learning_ctx.is_empty() {
-            sections.push(SectionEntry {
-                section: PromptSection::ToolPatterns,
-                block: PromptBlock::new("Tool Patterns", &learning_ctx),
-                allocated_tokens: 0,
-                actual_tokens: 0,
-                source: SectionSource::Runtime("learning patterns".to_string()),
-                included: true,
-                shrinkable: PromptSection::ToolPatterns.shrinkable(),
-            });
-        }
+        // ponytail: "Tool Patterns" learnings block dropped on the cloud path too
+        // (see build_local_runtime_blocks) — value-less per-turn injection plus a
+        // full ~947KB learnings.jsonl read every turn.
 
         // 2. Recent daily notes (cloud mode, local-backend only).
         if core.mode().is_local() && core.memory_enabled {
