@@ -3,28 +3,29 @@ gsd_state_version: 1.0
 milestone: v0.4
 milestone_name: milestone
 current_plan: 4
-status: "Wave 2 complete — 4 construction-path derivations in build_swappable_core dispatch through RuntimeMode; Wave 3 ready to migrate downstream is_local readers"
-last_updated: "2026-04-20T14:55:00.000Z"
-last_activity: 2026-04-20
+status: "Phase 09 Wave 3 COMPLETE — 0 swappable().is_local reads remain in src/. Only Wave 4 (delete now-dead is_local/local_tool_mode fields + provenance_warning_role bool) remains. Branch has grown ~6 features beyond the refactor; priority is now LANDING — 208 commits ahead of main, none merged since 2026-03-15."
+last_updated: "2026-06-19T00:00:00.000Z"
+last_activity: 2026-06-19
 progress:
   total_phases: 3
   completed_phases: 0
   total_plans: 5
   completed_plans: 4
-  percent: 80
+  percent: 90
 ---
 
 # State: nanobot
 
 ## Current Position
 
-Milestone v0.4.0 Lean Runtime Refactor — IN PROGRESS (pivoted)
-Phase: 09 (Runtime Mode Spine) — Waves 0, 1, and 2 complete (4 of 5 plans done)
-Current Plan: 4
+Milestone v0.4.0 Lean Runtime Refactor — refactor essentially DONE; branch became a feature drop
+Phase: 09 (Runtime Mode Spine) — Waves 0–3 complete (Wave 4 field-deletion + summaries remain)
+Current Plan: 04 (final-proof)
 Total Plans in Phase: 5
-Status: Wave 2 complete — 4 construction-path derivations in build_swappable_core dispatch through RuntimeMode; Wave 3 ready to migrate downstream is_local readers
-Progress: [████████░░] 80%
-Last activity: 2026-04-20
+Status: Wave 3 complete in code (commits 3b83b0d, e7a3aef, 6a9cc8d) — `rg 'swappable().is_local' src/` = 0. Wave 4 (delete dead fields, let rustc prove zero readers) is the only remainder. Tech-debt Commits A/B/C also shipped (8d8b5f0, 878368e, etc.).
+Progress: [█████████░] 90%
+Last activity: 2026-06-19
+Build: green · Lib tests: 2057 passed / 0 failed (2026-06-19)
 
 ## Project Reference
 
@@ -76,7 +77,25 @@ See: .planning/PROJECT.md (updated 2026-03-21)
   - `context.local_prompt_mode = is_local` reader NOT migrated — Wave 3 scope.
   - `is_local: bool` remains canonical on SwappableCore; both fields reconciled at construction via `debug_assert_eq!(matches!(mode, Local {..}), is_local)`. Wave 3 reader migration relies on this invariant.
   - Higgs smoke transcript still owed — user must configure sidecar and re-run before Wave 4's "final proof" phase.
-- **Wave 3 next:** migrate downstream `is_local` readers (~33 call sites in `agent_shared.rs`, `agent_heuristics.rs`, `context.rs`, `provenance_warning_role`, etc.) to consult `core.mode()` via `match`.
+- **Wave 3 DONE** (commits `3b83b0d`, `e7a3aef`, `6a9cc8d`): all ~33 downstream `is_local` readers migrated to `core.mode()` dispatch. `rg 'swappable().is_local' src/` returns 0. Note: `09-03-SUMMARY.md` was never written — owed (Day 2). The mandated 3-way smoke (Cloud + Higgs + cluster-remote) was also never captured — owed (Day 5).
+- **Wave 4 remaining:** delete `is_local: bool` + `local_tool_mode` from `SwappableCore` (still present at `agent_core.rs:63`), migrate `provenance_warning_role(is_local: bool)` at `agent_core.rs:374` to take `&RuntimeMode`. Single rustc-driven commit — compiler proves zero readers.
+
+## Reality reconciliation — 2026-06-19
+
+STATE.md had drifted ~2 months. Ground truth as of this session:
+
+- **The documented v0.4 refactor is essentially done.** Phase 09 Waves 0–3 complete; TECH_DEBT_AUDIT Commits A/B/C shipped (parsers/ deleted, dead-code sweep, truncation helpers consolidated). Only Wave 4 (cheap) + summaries remain.
+- **The branch outgrew its name.** `refactoring/maximum-speed-with-less-code` now also carries: full ratatui TUI rewrite (`tui_app/` ≈6.7k LOC), voice mode, trio/Apple-FM routing, Higgs sidecar integration, local grammar-constrained tool-calling (Tier 1/2), query-aware skills + lean context, tool observability, and (committed this session) native TUI session snapshot/resume/export + vision detection.
+- **Headline risk = unlanded value.** 208 commits ahead of main; main frozen at `4252a4f` (2026-03-15). Net −20k LOC. Build green, 2057 lib tests green → the branch is landable today.
+- **New code reintroduced gate debt:** `./quality-sentinel.sh` = 11 hits (3 G1 mutable bools, 8 G5 else-if chains), all in new `tui_app/` + `cmd_mutation`; `tui_app/app.rs` is 4,924 LOC (larger than any old refactor target).
+
+### Week plan (set 2026-06-19)
+- **Day 1 [DONE]:** committed WIP feature (`bc62b77`), GitNexus doc refresh (`41bec80`), ignored tooling cruft, moved scratch/SESSION_RESULTS into `.planning/`, this STATE rewrite.
+- **Day 2:** Phase 09 Wave 4 (delete dead fields) + write `09-03/09-04-SUMMARY.md`.
+- **Day 3:** clear the 11 sentinel violations; carve natural seams out of `app.rs` (no full SRP rewrite).
+- **Day 4:** LAND IT — merge strategy decision (rec: squash-drop whole branch vs stack-split), rebase onto main, full suite + release build.
+- **Day 5:** 3-way smoke (Cloud + Higgs + cluster-remote) with transcripts; refresh GitNexus index; buffer.
+- **Deferred (post-merge):** tech-debt D/E/F (require_str, SSE dedup, chat_stream extraction); v0.5.0 self-evolving-harness (blocked on v0.4 landing).
 
 ### v0.5.0 readiness
 
