@@ -15,6 +15,7 @@ pub mod remember;
 pub mod session_search;
 pub mod shell;
 pub mod spawn;
+pub mod system_info;
 pub mod todo;
 pub mod web;
 
@@ -23,7 +24,10 @@ pub use browser::BrowserTool;
 pub use code_execution::CodeExecutionTool;
 pub use cron_tool::CronScheduleTool;
 pub use email::{CheckInboxTool, SendEmailTool};
-pub use filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
+pub use filesystem::{
+    EditFileTool, FileInfoTool, FindFilesTool, ListDirTool, ReadFileTool, SearchFilesTool,
+    WorkspaceDiffTool, WriteFileTool,
+};
 pub use message::{MessageTool, SendCallback};
 pub use read_skill::ReadSkillTool;
 pub use recall::RecallTool;
@@ -35,5 +39,6 @@ pub use spawn::{
     CancelCallback, CheckCallback, ListCallback, LoopCallback, PipelineCallback, SpawnCallback,
     SpawnTool, SpawnToolLite, WaitCallback,
 };
+pub use system_info::SystemInfoTool;
 pub use todo::TodoTool;
 pub use web::{WebFetchTool, WebSearchTool};

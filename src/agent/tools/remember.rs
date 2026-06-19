@@ -1,6 +1,6 @@
-//! Remember tool: append a fact or preference to long-term memory (MEMORY.md).
+//! Remember tool: manage facts and preferences in long-term memory (MEMORY.md).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -10,7 +10,7 @@ use tokio::fs;
 
 use super::base::{PermissionLevel, Tool};
 
-/// Tool that writes a single fact into MEMORY.md under a dated section.
+/// Tool that manages facts in MEMORY.md under dated sections.
 pub struct RememberTool {
     workspace: PathBuf,
 }
@@ -55,6 +55,82 @@ pub fn append_fact(current: &str, fact: &str, date: &str) -> String {
     }
 }
 
+pub fn memory_has_fact(current: &str, fact: &str) -> bool {
+    let needle = normalize_fact(fact);
+    current
+        .lines()
+        .filter_map(fact_text_from_line)
+        .any(|existing| normalize_fact(existing) == needle)
+}
+
+pub fn replace_fact(current: &str, old_fact: &str, new_fact: &str) -> (String, usize) {
+    let needle = normalize_fact(old_fact);
+    let mut replaced = 0usize;
+    let lines: Vec<String> = current
+        .lines()
+        .map(|line| {
+            if fact_text_from_line(line)
+                .map(|fact| normalize_fact(fact) == needle)
+                .unwrap_or(false)
+            {
+                replaced += 1;
+                format!("{}- {}", fact_indent(line), new_fact.trim())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    (join_preserving_final_newline(lines, current), replaced)
+}
+
+pub fn delete_fact(current: &str, fact: &str) -> (String, usize) {
+    let needle = normalize_fact(fact);
+    let mut removed = 0usize;
+    let lines: Vec<String> = current
+        .lines()
+        .filter_map(|line| {
+            let should_remove = fact_text_from_line(line)
+                .map(|existing| normalize_fact(existing) == needle)
+                .unwrap_or(false);
+            if should_remove {
+                removed += 1;
+                None
+            } else {
+                Some(line.to_string())
+            }
+        })
+        .collect();
+    (join_preserving_final_newline(lines, current), removed)
+}
+
+pub fn dedupe_facts(current: &str) -> (String, usize) {
+    let mut seen = HashSet::new();
+    let mut removed = 0usize;
+    let lines: Vec<String> = current
+        .lines()
+        .filter_map(|line| {
+            if let Some(fact) = fact_text_from_line(line) {
+                let key = normalize_fact(fact);
+                if !seen.insert(key) {
+                    removed += 1;
+                    return None;
+                }
+            }
+            Some(line.to_string())
+        })
+        .collect();
+    (join_preserving_final_newline(lines, current), removed)
+}
+
+pub fn list_facts(current: &str, limit: usize) -> Vec<String> {
+    current
+        .lines()
+        .filter_map(fact_text_from_line)
+        .take(limit)
+        .map(|fact| fact.to_string())
+        .collect()
+}
+
 #[async_trait]
 impl Tool for RememberTool {
     fn name(&self) -> &str {
@@ -66,41 +142,132 @@ impl Tool for RememberTool {
     }
 
     fn description(&self) -> &str {
-        "Save a fact or preference to long-term memory (MEMORY.md). \
-         Use when the user says 'remember this', 'note that', or shares \
-         a preference worth keeping."
+        "Manage long-term memory facts in MEMORY.md. Default action is add; also supports list, replace, delete, and dedupe so memory can be maintained instead of only appended."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "list", "replace", "delete", "dedupe"],
+                    "description": "Memory operation. Default: add"
+                },
                 "fact": {
                     "type": "string",
-                    "description": "The fact, preference, or note to remember"
+                    "description": "Fact to add or exact fact to delete"
+                },
+                "old_fact": {
+                    "type": "string",
+                    "description": "Exact fact to replace when action='replace'"
+                },
+                "new_fact": {
+                    "type": "string",
+                    "description": "Replacement fact when action='replace'"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum facts to show for action='list'. Default: 50, max: 200"
                 }
             },
-            "required": ["fact"]
+            "required": []
         })
     }
 
     async fn execute(&self, args: HashMap<String, Value>) -> String {
-        let fact = match args.get("fact").and_then(|v| v.as_str()) {
-            Some(f) => f,
-            None => return "Error: Missing required parameter: fact".to_string(),
-        };
-
-        if fact.trim().is_empty() {
-            return "Error: Fact cannot be empty".to_string();
-        }
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("add")
+            .to_ascii_lowercase();
 
         let memory_path = self.workspace.join("memory").join("MEMORY.md");
 
         // Read existing content (start fresh if file doesn't exist yet).
         let current = fs::read_to_string(&memory_path).await.unwrap_or_default();
 
-        let date = Local::now().format("%Y-%m-%d").to_string();
-        let updated = append_fact(&current, fact, &date);
+        let (updated, message, should_write) = match action.as_str() {
+            "add" => {
+                let fact = match required_string(&args, "fact") {
+                    Ok(f) => f,
+                    Err(e) => return e,
+                };
+                if memory_has_fact(&current, fact) {
+                    return format!("Already remembered: {}", fact.trim());
+                }
+                let date = Local::now().format("%Y-%m-%d").to_string();
+                (
+                    append_fact(&current, fact, &date),
+                    format!("Remembered: {}", fact.trim()),
+                    true,
+                )
+            }
+            "list" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| (v as usize).clamp(1, 200))
+                    .unwrap_or(50);
+                let facts = list_facts(&current, limit);
+                if facts.is_empty() {
+                    return "No memory facts found.".to_string();
+                }
+                let mut out = format!("Memory facts (showing {}):", facts.len());
+                for fact in facts {
+                    out.push_str(&format!("\n- {}", fact));
+                }
+                return out;
+            }
+            "replace" => {
+                let old_fact = match required_string(&args, "old_fact") {
+                    Ok(f) => f,
+                    Err(e) => return e,
+                };
+                let new_fact = match required_string(&args, "new_fact") {
+                    Ok(f) => f,
+                    Err(e) => return e,
+                };
+                let (updated, count) = replace_fact(&current, old_fact, new_fact);
+                if count == 0 {
+                    return format!(
+                        "Error: memory fact not found for replace: {}",
+                        old_fact.trim()
+                    );
+                }
+                (updated, format!("Replaced {} memory fact(s).", count), true)
+            }
+            "delete" => {
+                let fact = match required_string(&args, "fact") {
+                    Ok(f) => f,
+                    Err(e) => return e,
+                };
+                let (updated, count) = delete_fact(&current, fact);
+                if count == 0 {
+                    return format!("Error: memory fact not found for delete: {}", fact.trim());
+                }
+                (updated, format!("Deleted {} memory fact(s).", count), true)
+            }
+            "dedupe" => {
+                let (updated, count) = dedupe_facts(&current);
+                if count == 0 {
+                    return "No duplicate memory facts found.".to_string();
+                }
+                (
+                    updated,
+                    format!("Removed {} duplicate memory fact(s).", count),
+                    true,
+                )
+            }
+            _ => {
+                return "Error: action must be one of: add, list, replace, delete, dedupe"
+                    .to_string()
+            }
+        };
+
+        if !should_write {
+            return message;
+        }
 
         // Write atomically via temp file so a crash never corrupts MEMORY.md.
         let tmp_path = memory_path.with_extension("md.tmp");
@@ -116,8 +283,36 @@ impl Tool for RememberTool {
             return format!("Error: Failed to save: {}", e);
         }
 
-        format!("Remembered: {}", fact.trim())
+        message
     }
+}
+
+fn required_string<'a>(args: &'a HashMap<String, Value>, key: &str) -> Result<&'a str, String> {
+    match args.get(key).and_then(|v| v.as_str()).map(str::trim) {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(format!("Error: Missing required parameter: {}", key)),
+    }
+}
+
+fn fact_text_from_line(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix("- ").map(str::trim)
+}
+
+fn fact_indent(line: &str) -> &str {
+    let trimmed_len = line.trim_start().len();
+    &line[..line.len().saturating_sub(trimmed_len)]
+}
+
+fn normalize_fact(fact: &str) -> String {
+    fact.trim().to_ascii_lowercase()
+}
+
+fn join_preserving_final_newline(lines: Vec<String>, original: &str) -> String {
+    let mut out = lines.join("\n");
+    if original.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -204,7 +399,12 @@ mod tests {
         let tool = RememberTool::new(PathBuf::from("/tmp"));
         let params = tool.parameters();
         let required = params["required"].as_array().unwrap();
-        assert!(required.contains(&json!("fact")));
+        assert!(
+            required.is_empty(),
+            "action-specific parameters are validated at execution time"
+        );
+        assert!(params["properties"]["fact"].is_object());
+        assert!(params["properties"]["action"].is_object());
     }
 
     #[test]
@@ -271,6 +471,65 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join("memory").join("MEMORY.md")).unwrap();
         assert!(content.contains("- First fact"), "first fact missing");
         assert!(content.contains("- Second fact"), "second fact missing");
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_fact_is_not_appended() {
+        let dir = TempDir::new().unwrap();
+        let tool = RememberTool::new(dir.path().to_path_buf());
+
+        let mut args = HashMap::new();
+        args.insert("fact".to_string(), json!("Use concise answers"));
+        assert!(tool.execute(args.clone()).await.starts_with("Remembered:"));
+        let result = tool.execute(args).await;
+        assert!(result.starts_with("Already remembered:"), "got: {result}");
+
+        let content = std::fs::read_to_string(dir.path().join("memory").join("MEMORY.md")).unwrap();
+        assert_eq!(content.matches("Use concise answers").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_replace_delete_and_list_memory_facts() {
+        let dir = TempDir::new().unwrap();
+        let tool = RememberTool::new(dir.path().to_path_buf());
+
+        let mut add = HashMap::new();
+        add.insert("fact".to_string(), json!("Old preference"));
+        tool.execute(add).await;
+
+        let mut replace = HashMap::new();
+        replace.insert("action".to_string(), json!("replace"));
+        replace.insert("old_fact".to_string(), json!("Old preference"));
+        replace.insert("new_fact".to_string(), json!("New preference"));
+        let result = tool.execute(replace).await;
+        assert!(result.starts_with("Replaced 1"), "got: {result}");
+
+        let mut list = HashMap::new();
+        list.insert("action".to_string(), json!("list"));
+        let result = tool.execute(list).await;
+        assert!(result.contains("New preference"), "got: {result}");
+        assert!(!result.contains("Old preference"), "got: {result}");
+
+        let mut delete = HashMap::new();
+        delete.insert("action".to_string(), json!("delete"));
+        delete.insert("fact".to_string(), json!("New preference"));
+        let result = tool.execute(delete).await;
+        assert!(result.starts_with("Deleted 1"), "got: {result}");
+    }
+
+    #[test]
+    fn test_dedupe_facts_removes_later_duplicates() {
+        let current = "\
+## Remembered (2026-03-01)
+- Prefer Rust
+- prefer rust
+- Prefer tests
+";
+        let (updated, removed) = dedupe_facts(current);
+        assert_eq!(removed, 1);
+        assert_eq!(updated.matches("Prefer").count(), 2);
+        assert!(updated.contains("- Prefer Rust"));
+        assert!(updated.contains("- Prefer tests"));
     }
 
     #[tokio::test]

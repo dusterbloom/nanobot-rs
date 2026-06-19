@@ -8,8 +8,9 @@ use serde_json::Value;
 
 use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolExecutionResult};
 use super::{
-    BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, ListDirTool, ReadFileTool,
-    ReadSkillTool, RecallTool, RememberTool, SessionSearchTool, WebFetchTool, WebSearchTool,
+    BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, FileInfoTool, FindFilesTool,
+    ListDirTool, ReadFileTool, ReadSkillTool, RecallTool, RememberTool, SearchFilesTool,
+    SessionSearchTool, SystemInfoTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool,
     WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
@@ -170,11 +171,13 @@ impl ToolRegistry {
         let dir_aliases: &[&str] = &["dir_path", "directory", "dir"];
 
         match canonical_name {
-            "read_file" | "write_file" | "edit_file" => {
+            "read_file" | "write_file" | "edit_file" | "file_info" | "workspace_diff" => {
                 Self::normalize_param_aliases(&mut params, "path", file_aliases);
-                Self::require_non_empty_string(&params, "path", canonical_name)?;
+                if canonical_name != "workspace_diff" {
+                    Self::require_non_empty_string(&params, "path", canonical_name)?;
+                }
             }
-            "list_dir" => {
+            "list_dir" | "find_files" | "search_files" => {
                 Self::normalize_param_aliases(&mut params, "path", dir_aliases);
             }
             _ => {}
@@ -282,6 +285,21 @@ impl ToolRegistry {
         }
         if should_include("list_dir") {
             self.register(Box::new(ListDirTool));
+        }
+        if should_include("find_files") {
+            self.register(Box::new(FindFilesTool));
+        }
+        if should_include("search_files") {
+            self.register(Box::new(SearchFilesTool));
+        }
+        if should_include("file_info") {
+            self.register(Box::new(FileInfoTool));
+        }
+        if should_include("workspace_diff") {
+            self.register(Box::new(WorkspaceDiffTool));
+        }
+        if should_include("system_info") {
+            self.register(Box::new(SystemInfoTool));
         }
         if should_include("exec") {
             let exec_cwd = config.exec_working_dir.clone().unwrap_or_else(|| {
@@ -634,12 +652,25 @@ impl ToolRegistry {
         "write_file",
         "edit_file",
         "list_dir",
+        "search_files",
         "exec",
         "spawn",
     ];
 
     /// Keyword-to-tool mapping for context-triggered tool selection (cloud path).
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
+        (
+            &[
+                "grep",
+                "content search",
+                "search files",
+                "search in files",
+                "find in files",
+                "find text",
+                "where is",
+            ],
+            "search_files",
+        ),
         (
             &[
                 "search",
@@ -1010,10 +1041,26 @@ impl ToolRegistry {
     /// (Idle, Understanding, Planning, Reflection).
     pub fn tools_for_phase(phase: &TaskPhase) -> Option<&'static [&'static str]> {
         match phase {
-            TaskPhase::FileEditing => {
-                Some(&["read_file", "write_file", "edit_file", "list_dir", "exec"])
-            }
-            TaskPhase::CodeExecution => Some(&["exec", "read_file", "list_dir"]),
+            TaskPhase::FileEditing => Some(&[
+                "read_file",
+                "write_file",
+                "edit_file",
+                "list_dir",
+                "find_files",
+                "search_files",
+                "file_info",
+                "workspace_diff",
+                "exec",
+            ]),
+            TaskPhase::CodeExecution => Some(&[
+                "exec",
+                "read_file",
+                "list_dir",
+                "find_files",
+                "search_files",
+                "file_info",
+                "workspace_diff",
+            ]),
             TaskPhase::WebResearch => Some(&["web_search", "web_fetch", "browser", "read_file"]),
             TaskPhase::Communication => Some(&["message", "send_email", "check_inbox"]),
             _ => None, // Idle/Understanding/Planning/Reflection -> all tools
@@ -1750,7 +1797,11 @@ mod tests {
         assert!(tools.contains(&"read_file"));
         assert!(tools.contains(&"edit_file"));
         assert!(tools.contains(&"write_file"));
-        assert_eq!(tools.len(), 5);
+        assert!(tools.contains(&"find_files"));
+        assert!(tools.contains(&"search_files"));
+        assert!(tools.contains(&"file_info"));
+        assert!(tools.contains(&"workspace_diff"));
+        assert_eq!(tools.len(), 9);
     }
 
     #[test]
@@ -1758,7 +1809,9 @@ mod tests {
         let tools = ToolRegistry::tools_for_phase(&TaskPhase::CodeExecution).unwrap();
         assert!(tools.contains(&"exec"));
         assert!(tools.contains(&"read_file"));
-        assert_eq!(tools.len(), 3);
+        assert!(tools.contains(&"search_files"));
+        assert!(tools.contains(&"workspace_diff"));
+        assert_eq!(tools.len(), 7);
     }
 
     #[test]
