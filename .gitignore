@@ -15,3 +15,8 @@ src/.janitor/
 .gitnexus
 node_modules/
 __pycache__/
+
+# Browser/MCP tooling artifacts
+.playwright-mcp/
+/package.json
+/package-lock.json
