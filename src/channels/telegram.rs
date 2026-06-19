@@ -70,6 +70,79 @@ pub async fn tg_edit_message(
         .await;
 }
 
+/// Spawn a background task that streams an LLM response into a Telegram chat
+/// with progressive edits: typing indicator → placeholder message → 500ms-throttled
+/// edits as deltas arrive → final edit on channel close.
+///
+/// Returns `Some(sender)` if streaming was set up (caller pushes text deltas;
+/// dropping the sender signals completion), or `None` if `bot_token` is empty.
+///
+/// The caller is expected to gate this on `msg.channel == "telegram"`; this
+/// function only handles the bot-token non-empty case.
+pub fn spawn_stream_editor(
+    bot_token: &str,
+    chat_id: &str,
+) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
+    if bot_token.is_empty() {
+        return None;
+    }
+    let chat_id_num: i64 = chat_id.parse().unwrap_or(0);
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let stream_client = reqwest::Client::new();
+    let stream_token = bot_token.to_string();
+    tokio::spawn(async move {
+        tg_send_typing_action(&stream_client, &stream_token, chat_id_num).await;
+        let Some(message_id) = tg_send_placeholder(&stream_client, &stream_token, chat_id_num).await
+        else {
+            // Placeholder failed: drain remaining deltas so the LLM stream
+            // doesn't block on a full channel, then exit.
+            while delta_rx.recv().await.is_some() {}
+            return;
+        };
+        let mut accumulated = String::new();
+        let mut dirty = false;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                delta = delta_rx.recv() => match delta {
+                    Some(chunk) => {
+                        accumulated.push_str(&chunk);
+                        dirty = true;
+                    }
+                    None => {
+                        if dirty && !accumulated.is_empty() {
+                            tg_edit_message(
+                                &stream_client,
+                                &stream_token,
+                                chat_id_num,
+                                message_id,
+                                &accumulated,
+                            )
+                            .await;
+                        }
+                        break;
+                    }
+                },
+                _ = interval.tick() => {
+                    if dirty && !accumulated.is_empty() {
+                        tg_edit_message(
+                            &stream_client,
+                            &stream_token,
+                            chat_id_num,
+                            message_id,
+                            &accumulated,
+                        )
+                        .await;
+                        dirty = false;
+                    }
+                }
+            }
+        }
+    });
+    Some(delta_tx)
+}
+
 /// Telegram channel using long-polling.
 pub struct TelegramChannel {
     config: TelegramConfig,

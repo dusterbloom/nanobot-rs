@@ -493,89 +493,20 @@ impl AgentLoop {
                 }
 
                 // For Telegram: set up streaming with typing indicator + progressive edits.
-                let (stream_tx, stream_is_telegram) = if msg.channel == "telegram" {
+                // The actual streaming logic (typing action, placeholder, throttled edits)
+                // lives in channels/telegram.rs::spawn_stream_editor so the hot path
+                // stays channel-agnostic.
+                let stream_tx = if msg.channel == "telegram" {
                     let bot_token = msg
                         .metadata
                         .get("bot_token")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let chat_id_str = msg.chat_id.clone();
-                    if !bot_token.is_empty() {
-                        let chat_id_num: i64 = chat_id_str.parse().unwrap_or(0);
-                        let (delta_tx, mut delta_rx) =
-                            tokio::sync::mpsc::unbounded_channel::<String>();
-                        let stream_client = reqwest::Client::new();
-                        let stream_token = bot_token.clone();
-                        tokio::spawn(async move {
-                            crate::channels::telegram::tg_send_typing_action(
-                                &stream_client,
-                                &stream_token,
-                                chat_id_num,
-                            )
-                            .await;
-                            let msg_id = crate::channels::telegram::tg_send_placeholder(
-                                &stream_client,
-                                &stream_token,
-                                chat_id_num,
-                            )
-                            .await;
-                            let Some(message_id) = msg_id else {
-                                while delta_rx.recv().await.is_some() {}
-                                return;
-                            };
-                            let mut accumulated = String::new();
-                            let mut dirty = false;
-                            let mut interval =
-                                tokio::time::interval(std::time::Duration::from_millis(500));
-                            interval
-                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            loop {
-                                tokio::select! {
-                                    delta = delta_rx.recv() => {
-                                        match delta {
-                                            Some(chunk) => {
-                                                accumulated.push_str(&chunk);
-                                                dirty = true;
-                                            }
-                                            None => {
-                                                if dirty && !accumulated.is_empty() {
-                                                    crate::channels::telegram::tg_edit_message(
-                                                        &stream_client,
-                                                        &stream_token,
-                                                        chat_id_num,
-                                                        message_id,
-                                                        &accumulated,
-                                                    )
-                                                    .await;
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    _ = interval.tick() => {
-                                        if dirty && !accumulated.is_empty() {
-                                            crate::channels::telegram::tg_edit_message(
-                                                &stream_client,
-                                                &stream_token,
-                                                chat_id_num,
-                                                message_id,
-                                                &accumulated,
-                                            )
-                                            .await;
-                                            dirty = false;
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                        (Some(delta_tx), true)
-                    } else {
-                        (None, false)
-                    }
+                        .unwrap_or("");
+                    crate::channels::telegram::spawn_stream_editor(bot_token, &msg.chat_id)
                 } else {
-                    (None, false)
+                    None
                 };
+                let stream_is_telegram = stream_tx.is_some();
 
                 let response = shared
                     .process_message(&msg, stream_tx, None, None, None)
