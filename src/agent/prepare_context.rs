@@ -187,19 +187,24 @@ impl AgentLoopShared {
             }
         }
 
-        // Legacy always-on prefix path keeps query="" (non-query-aware); the
-        // query-aware path is the per-turn tail block (build_local_tail).
+        // Only durable, cross-session memory ("Memory Briefing") goes in the
+        // cold prefix — it's stable, so it stays in the cached prefix.
+        //
+        // ponytail: the WorkingSession layer is deliberately excluded. It mutates
+        // every turn (the background reflector rewrites it) and accretes across a
+        // session, which (a) bloats the cold prefix and (b) is the one thing that
+        // can bust a warm prefix cache mid-session. The live conversation already
+        // carries the session's content; per-turn relevance comes from the
+        // query-aware tail (NANOBOT_LOCAL_TAIL) and the `recall` tool, not an
+        // always-on dump.
         for result in local_memory_results(core, session_key, "") {
-            if !result.content.is_empty() {
-                let title = match result.layer {
-                    MemoryLayer::WorkingSession => "Working Memory",
-                    _ => "Memory Briefing",
-                };
-                blocks.push(crate::agent::context::PromptBlock::new(
-                    title,
-                    &result.content,
-                ));
+            if result.content.is_empty() || matches!(result.layer, MemoryLayer::WorkingSession) {
+                continue;
             }
+            blocks.push(crate::agent::context::PromptBlock::new(
+                "Memory Briefing",
+                &result.content,
+            ));
         }
 
         // ponytail: dropped the "Tool Patterns" learnings block. It injected
