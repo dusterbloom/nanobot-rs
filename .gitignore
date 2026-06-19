@@ -20,3 +20,6 @@ __pycache__/
 .playwright-mcp/
 /package.json
 /package-lock.json
+
+# Embedding model cache (runtime artifact)
+.fastembed_cache/
