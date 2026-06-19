@@ -4,9 +4,9 @@
 //! `localBackend == "higgs"`, nanobot auto-starts Higgs as a detached
 //! background daemon and manages its lifecycle via PID file.
 //!
-//! The server persists between nanobot sessions so model loading only
-//! happens once. Subsequent `nanobot agent -l` invocations detect the
-//! running instance and skip startup.
+//! Clean nanobot exits stop the managed Higgs PID. If nanobot dies before
+//! cleanup, subsequent `nanobot agent -l` invocations detect the running
+//! instance and reuse or replace it through the PID file.
 
 use std::collections::HashSet;
 use std::fs;

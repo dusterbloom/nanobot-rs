@@ -230,17 +230,28 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_max_iterations_local_capped() {
-        // Local models capped at 15 regardless of configured value
-        let result = effective_max_iterations(20, 32_000, true);
-        assert_eq!(result, 15, "Local should cap at 15");
+    fn test_effective_max_iterations_local_scales_with_context() {
+        // Local models scale with the context window (divisor 5000) instead of
+        // a flat min(15): at 128K the default budget rises to 25, so a long tool
+        // chain isn't cut off while context sits near-empty.
+        let result = effective_max_iterations(15, 128_000, true);
+        assert_eq!(result, 25, "128K local should scale to 25 iterations");
+    }
+
+    #[test]
+    fn test_effective_max_iterations_local_ceiling() {
+        // Local scaling is bounded by a ceiling of 30 so a huge context window
+        // can't run the decode-slow local loop away.
+        let result = effective_max_iterations(15, 256_000, true);
+        assert_eq!(result, 30, "Local should cap at the 30-iteration ceiling");
     }
 
     #[test]
     fn test_effective_max_iterations_local_respects_low_config() {
-        // If configured value is already low, don't raise it for local
+        // `configured` is the floor: a small context (scaled = 6 at 32K) must
+        // not drag the budget below the configured value.
         let result = effective_max_iterations(10, 32_000, true);
-        assert_eq!(result, 10, "Local should not raise configured value");
+        assert_eq!(result, 10, "Local should never go below configured value");
     }
 
     #[test]

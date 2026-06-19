@@ -39,17 +39,21 @@ pub(crate) fn effective_max_iterations(
     max_context_tokens: usize,
     is_local: bool,
 ) -> u32 {
-    if is_local {
-        // Local models: cap at 15 to preserve limited context.
-        configured.min(15)
-    } else {
-        // Cloud models: scale up with context. Each tool iteration uses
-        // ~500-1500 tokens on average, so even 50 iterations at 1M context
-        // is only ~5% of the budget.
-        // ~25 at 128K, ~40 at 500K, ~50 at 1M+
-        let context_scaled = (max_context_tokens / 4000).min(50) as u32;
-        configured.max(context_scaled)
-    }
+    // Scale the iteration budget with the context window for both local and
+    // cloud: each tool round trip costs ~500-1500 tokens, so even a generous
+    // cap is a small fraction of a large window. `configured` is the floor;
+    // context scaling only ever raises it.
+    //
+    // Local models decode slower and pay more for context growth, so they get a
+    // larger divisor and a lower ceiling than cloud — but no longer a flat
+    // `min(15)` that cut off long tool chains while the context sat near-empty
+    // (the failure this fixes: a local turn capped at 15 iterations with context
+    // at 1% used).
+    //   cloud: ~32 at 128K, ~40 at 160K, 50 at 200K+
+    //   local: ~25 at 128K, 30 at 150K+
+    let (divisor, ceiling) = if is_local { (5000, 30) } else { (4000, 50) };
+    let context_scaled = (max_context_tokens / divisor).min(ceiling) as u32;
+    configured.max(context_scaled)
 }
 
 /// Models with known large context windows get their full capacity;
