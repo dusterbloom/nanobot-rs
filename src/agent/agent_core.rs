@@ -420,6 +420,11 @@ pub struct SwappableCoreConfig {
     pub health_check_timeout_secs: u64,
     /// Adaptive token budget tuning (formerly hardcoded constants in agent_loop.rs).
     pub adaptive_tokens: AdaptiveTokenConfig,
+    /// Optional override for the sessions SQLite DB path. Production passes
+    /// `None` to use the default `~/.nanobot/sessions.db`; test harnesses pass
+    /// `Some(workspace.join("sessions.db"))` so parallel tests don't contend
+    /// on the user's real session DB.
+    pub sessions_db_path: Option<PathBuf>,
 }
 
 /// Build a `SwappableCore` from the given config.
@@ -459,6 +464,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         tool_heartbeat_secs,
         health_check_timeout_secs,
         adaptive_tokens,
+        sessions_db_path,
     } = cfg;
     let model_capabilities =
         crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
@@ -504,10 +510,12 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     // what agents exist and when to delegate instead of doing everything itself.
     let profiles = agent_profiles::load_profiles(&workspace);
     context.agent_profiles = agent_profiles::profiles_summary(&profiles);
-    let db_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".nanobot")
-        .join("sessions.db");
+    let db_path = sessions_db_path.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nanobot")
+            .join("sessions.db")
+    });
     let sessions = SessionDb::new(&db_path);
 
     // Branch 3 (Wave 2): memory-provider resolution is extracted into a named

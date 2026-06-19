@@ -102,6 +102,9 @@ fn build_test_core(
     config_provider: Option<ProviderConfig>,
 ) -> SwappableCore {
     let workspace = tempfile::tempdir().unwrap().into_path();
+    // Isolate the session DB per test so parallel runs don't contend on the
+    // user's real ~/.nanobot/sessions.db.
+    let sessions_db = workspace.join("sessions.db");
     let main = MockLLM::named("main-provider");
     let td = ToolDelegationConfig {
         enabled: delegation_enabled,
@@ -141,6 +144,7 @@ fn build_test_core(
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(sessions_db),
     })
 }
 
@@ -487,6 +491,7 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
     assert_eq!(
         core.tool_runner_model.as_deref(),
@@ -552,6 +557,7 @@ fn test_delegation_with_is_local_true() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
 
     assert!(core.mode().is_local());
@@ -619,6 +625,7 @@ fn test_delegation_with_is_local_false_cloud() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
 
     // pins agent_core.rs: is_local plumbs through to the core unchanged
@@ -703,6 +710,7 @@ fn test_delegation_with_compaction_and_delegation_providers() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
 
     // Compaction provider goes to memory_provider, delegation to tool_runner
@@ -779,6 +787,7 @@ fn test_delegation_with_compaction_and_delegation_providers_cloud() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
 
     // pins agent_core.rs:486-509 — cloud memory path ignores
@@ -887,6 +896,7 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(2048));
     let core_handle = AgentHandle::new(core, counters);
@@ -1195,6 +1205,7 @@ fn build_trio_e2e_harness(
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
 
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
@@ -1653,6 +1664,7 @@ async fn test_trio_e2e_router_unreachable() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
     let core_handle = AgentHandle::new(core, counters);
@@ -1767,6 +1779,7 @@ async fn test_trio_e2e_specialist_unreachable() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
     let core_handle = AgentHandle::new(core, counters);
@@ -2338,6 +2351,7 @@ fn build_trio_offline_harness(
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
 
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
@@ -2406,6 +2420,7 @@ fn build_local_inline_harness_with_model(
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(workspace.join("sessions.db")),
     });
 
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
@@ -3347,6 +3362,7 @@ async fn test_trio_offline_e2e_health_gate() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
     });
 
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
@@ -3838,6 +3854,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
         });
         assert!(core.mode().is_local(), "fixture is is_local=true");
         assert!(
@@ -3895,6 +3912,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
         });
         // ctx/4 == 4096; min(4096, 4096) == 4096.
         assert_eq!(core.mode().reserve_cap(4096, 16_384), 4096);
@@ -3949,6 +3967,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
         });
         assert!(core.context.local_prompt_mode);
         // set_lite_mode clamps system_prompt_cap to (ctx * 3/10).clamp(500, 4000).
@@ -4004,6 +4023,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
         });
         assert_eq!(core.memory_model, "local-model");
     }
@@ -4046,6 +4066,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
         });
         match core.mode() {
             RuntimeMode::Local { caps } => {
@@ -4120,6 +4141,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
         });
         assert_eq!(core.mode().grounding_role(), "user");
     }
@@ -4170,6 +4192,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: None,
         });
         // mlx: prefix model: mode is Local, but protocol selection still
         // falls through to CloudProtocol via the `!starts_with("mlx:")` guard.

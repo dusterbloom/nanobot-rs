@@ -398,6 +398,7 @@ fn core_config_from(
         tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
         health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
         adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
+        sessions_db_path: None,
     }
 }
 
