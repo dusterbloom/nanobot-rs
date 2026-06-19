@@ -49,7 +49,7 @@ pub fn hygiene_pipeline(messages: &mut Vec<Value>, keep_last_messages: usize) {
     }
 }
 
-pub fn dedup_tool_results(messages: &mut Vec<Value>) {
+fn dedup_tool_results(messages: &mut Vec<Value>) {
     let mut last_positions: HashMap<String, usize> = HashMap::new();
 
     for (idx, message) in messages.iter().enumerate() {
@@ -81,7 +81,7 @@ pub fn dedup_tool_results(messages: &mut Vec<Value>) {
     messages.truncate(write_idx);
 }
 
-pub fn merge_consecutive_same_role(messages: &mut Vec<Value>) {
+fn merge_consecutive_same_role(messages: &mut Vec<Value>) {
     if messages.len() <= 1 {
         return;
     }
@@ -152,7 +152,7 @@ pub fn truncate_old_tool_results(messages: &mut Vec<Value>, keep_last_n: usize) 
     });
 }
 
-pub fn truncate_old_assistant_messages(messages: &mut Vec<Value>, keep_last_n: usize) {
+fn truncate_old_assistant_messages(messages: &mut Vec<Value>, keep_last_n: usize) {
     if keep_last_n == usize::MAX {
         return;
     }

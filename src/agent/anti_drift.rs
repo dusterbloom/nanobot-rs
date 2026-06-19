@@ -24,9 +24,9 @@ use crate::config::schema::AntiDriftConfig;
 // ---------------------------------------------------------------------------
 
 /// Heuristic quality score for a single assistant message.
-pub struct PollutionScore {
-    pub score: f32,
-    pub signals: Vec<&'static str>,
+struct PollutionScore {
+    score: f32,
+    signals: Vec<&'static str>,
 }
 
 /// Filler phrases that inflate responses without adding information.
@@ -65,7 +65,7 @@ const FILLER_PHRASES: &[&str] = &[
 /// - `repetitive` (0.3): trigram Jaccard > 0.4 with recent messages
 /// - `babble_no_action` (0.2): >150 tokens, no tool calls, no code blocks
 /// - `hallucination_marker` (0.2): fake tool XML / claim phrases
-pub fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionScore {
+fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionScore {
     let content = msg_content(msg);
     let mut score = 0.0f32;
     let mut signals = Vec::new();
@@ -122,7 +122,7 @@ pub fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionSc
 }
 
 /// Fraction of words that are filler phrases.
-pub fn filler_ratio(content: &str) -> f32 {
+fn filler_ratio(content: &str) -> f32 {
     let lower = content.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
     if words.is_empty() {
@@ -144,7 +144,7 @@ pub fn filler_ratio(content: &str) -> f32 {
 }
 
 /// Word-trigram Jaccard similarity between two strings.
-pub fn trigram_jaccard(a: &str, b: &str) -> f32 {
+fn trigram_jaccard(a: &str, b: &str) -> f32 {
     let trigrams_a = word_trigrams(a);
     let trigrams_b = word_trigrams(b);
     if trigrams_a.is_empty() && trigrams_b.is_empty() {
