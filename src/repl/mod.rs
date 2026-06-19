@@ -157,8 +157,15 @@ pub(crate) enum ControlMarker {
     FinishReason(String),
     Tokens(u64),
     PromptTokens(u64),
+    /// Real decode time (milliseconds) for the just-finished LLM call, measured
+    /// agent-side as `call_wall_time − ttft`. Renderers sum these to report a
+    /// true decode tok/s that excludes tool-execution and re-prefill time.
+    DecodeMs(u64),
     PrefillEstimate(u64),
-    PrefillProgress { processed: u64, total: u64 },
+    PrefillProgress {
+        processed: u64,
+        total: u64,
+    },
     CacheStatus(CacheStatus),
 }
 
@@ -187,6 +194,7 @@ pub(crate) enum CacheStatus {
 pub(crate) enum CacheResetReason {
     Trim,
     EmergencyTrim,
+    LcmCheckpoint,
 }
 
 /// Parse a delta-channel control marker. `None` means renderable text.
@@ -203,6 +211,9 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
     }
     if let Some(tok) = rest.strip_prefix("prompt_tokens:") {
         return tok.parse().ok().map(ControlMarker::PromptTokens);
+    }
+    if let Some(ms) = rest.strip_prefix("decode_ms:") {
+        return ms.parse().ok().map(ControlMarker::DecodeMs);
     }
     if let Some(tok) = rest.strip_prefix("prefill_estimate:") {
         return tok.parse().ok().map(ControlMarker::PrefillEstimate);
@@ -233,6 +244,7 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
                 let reason = match parts.next()? {
                     "trim" => CacheResetReason::Trim,
                     "emergency_trim" => CacheResetReason::EmergencyTrim,
+                    "lcm_checkpoint" => CacheResetReason::LcmCheckpoint,
                     _ => return None,
                 };
                 Some(ControlMarker::CacheStatus(CacheStatus::Reset { reason }))
@@ -1050,6 +1062,7 @@ async fn stream_and_render_inner(
                                         renderer.finish_reason = Some(fr);
                                     }
                                     ControlMarker::Tokens(n) => renderer.add_tokens(n),
+                                    ControlMarker::DecodeMs(ms) => renderer.add_decode_ms(ms),
                                     ControlMarker::PromptTokens(_) => {}
                                     ControlMarker::PrefillEstimate(_) => {}
                                     ControlMarker::PrefillProgress { processed, total } => {
@@ -1543,10 +1556,11 @@ pub(crate) fn cmd_agent(
         // True when the backend requires LM Studio management (spawn, probe, trio, JIT warmup).
         // False for MLX (in-process), oMLX (externally managed), and Higgs (managed sidecar).
         let needs_lms = is_local && !use_mlx_local && !use_omlx && !use_higgs;
+        let mut higgs_sidecar_port: Option<u16> = None;
 
         // Higgs sidecar: auto-start when backend is "higgs" (single-message or interactive).
         // Start even when localApiBase is set — it may point to the managed Higgs port
-        // from a previous session (Higgs survives nanobot exit but may have been stopped).
+        // from a previous run whose PID file survived or whose server is still loading.
         //
         // Exception: when localApiBase points at a REMOTE host (cluster peer, not
         // localhost), respect the user's explicit endpoint and skip Higgs entirely.
@@ -1574,6 +1588,7 @@ pub(crate) fn cmd_agent(
                     if let Some(bin) = crate::higgs::find_binary() {
                         match crate::higgs::server_start(&bin, higgs_port, &model_dir, &config.agents.defaults.local_model).await {
                             Ok(crate::higgs::StartResult::Ready) => {
+                                higgs_sidecar_port = Some(higgs_port);
                                 config.agents.defaults.local_api_base =
                                     format!("http://127.0.0.1:{higgs_port}/v1");
                                 config.agents.defaults.skip_jit_gate = true;
@@ -1590,6 +1605,7 @@ pub(crate) fn cmd_agent(
                                 }
                             }
                             Ok(crate::higgs::StartResult::Loading { pid, port }) => {
+                                higgs_sidecar_port = Some(port);
                                 eprintln!(
                                     "Warning: Higgs (pid {}) still loading model on port {} — requests will retry until ready",
                                     pid, port
@@ -1716,6 +1732,10 @@ pub(crate) fn cmd_agent(
         // Interactive REPL: detect LMS and set config BEFORE building core,
         // so the initial core handle and SubagentManager get the right URL.
         let mut srv = ServerState::new(local_port.clone());
+        if let Some(port) = higgs_sidecar_port {
+            srv.engine = InferenceEngine::Higgs;
+            srv.local_port = port.to_string();
+        }
         let mut config = config; // shadow to allow mutation
         let is_interactive = message.is_none();
         if is_interactive && use_omlx {
@@ -2061,6 +2081,7 @@ pub(crate) fn cmd_agent(
             )
             .await;
             index_sessions_background();
+            srv.shutdown();
         } else {
             // Interactive REPL mode.
             // Splash and LMS detection already happened above (before core build).
@@ -2634,6 +2655,18 @@ fn index_sessions_background() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `decode_ms` wire marker round-trips through the parser, and the
+    /// leading NUL is required (bare text must never be mistaken for a marker).
+    #[test]
+    fn test_parse_decode_ms_marker() {
+        assert!(matches!(
+            parse_control_marker("\x00decode_ms:227300"),
+            Some(ControlMarker::DecodeMs(227300))
+        ));
+        assert!(parse_control_marker("decode_ms:5").is_none());
+        assert!(parse_control_marker("\x00decode_ms:notanum").is_none());
+    }
 
     // --- prefill_line ---
 

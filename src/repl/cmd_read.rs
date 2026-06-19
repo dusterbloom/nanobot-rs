@@ -698,8 +698,11 @@ impl ReplContext {
         }
     }
 
-    /// /clear — clear working memory and conversation history for the current session.
-    pub(super) async fn cmd_clear(&self) {
+    /// Clear working memory, conversation history, LCM state, and context counters.
+    ///
+    /// Shared by the classic REPL command and the ratatui app so `/clear`
+    /// means the same thing in both surfaces.
+    pub(crate) async fn clear_session_state(&self) {
         let core = self.core_handle.swappable();
         if core.memory_enabled {
             core.working_memory.clear(&self.session_id);
@@ -715,7 +718,11 @@ impl ReplContext {
         counters
             .last_working_memory_tokens
             .store(0, Ordering::Relaxed);
+    }
 
+    /// /clear — clear working memory and conversation history for the current session.
+    pub(super) async fn cmd_clear(&self) {
+        self.clear_session_state().await;
         // Refresh the TUI — clear screen and reprint the logo like a fresh session.
         print!("{}", tui::CLEAR_SCREEN);
         tui::print_logo();

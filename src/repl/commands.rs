@@ -123,6 +123,16 @@ pub(crate) struct ModelEntry {
 }
 
 impl ModelEntry {
+    #[cfg(test)]
+    pub(crate) fn test_local(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            source: ModelSource::LocalLms { port: 1234 },
+            is_active: false,
+            is_loaded: false,
+        }
+    }
+
     /// Short, human label for the model's source (for the TUI picker).
     pub(crate) fn source_tag(&self) -> String {
         match &self.source {
@@ -177,7 +187,7 @@ fn model_direct_match_rank(entry: &ModelEntry, query: &str) -> Option<usize> {
     }
 }
 
-fn unique_direct_model_match<'a>(
+pub(crate) fn unique_direct_model_match<'a>(
     entries: &[&'a ModelEntry],
     query: &str,
 ) -> Option<&'a ModelEntry> {

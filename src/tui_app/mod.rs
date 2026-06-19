@@ -12,7 +12,7 @@
 //! text-delta and tool-event channels, and an animation tick — without ever
 //! holding a blocking read across an `.await`.
 //!
-//! Classic slash commands (`/model`, `/local`, `/think`, `/status`, …) that
+//! Classic slash commands (`/local`, `/think`, `/status`, …) that
 //! print ANSI or open interactive pickers can't run inside the alt-screen, so
 //! they use a suspend/resume bridge: the UI leaves the alt-screen, pauses the
 //! input reader (freeing stdin), runs the real `ReplContext::dispatch`, then
@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::audit::ToolEvent;
-use crate::repl::commands::ReplContext;
+use crate::repl::commands::{unique_direct_model_match, ModelEntry, ReplContext};
 use app::{draw_outro, Action, App, Footer, StreamingAction, SubmittedTurn};
 
 /// Immutable per-session handles a single turn needs to drive the agent.
@@ -272,13 +272,30 @@ async fn event_loop(
                 #[cfg(feature = "voice")]
                 voice_cycle(terminal, app, ctx, ev_rx, paused).await?;
             }
-            Action::PickModel(id) => {
-                // Apply via the proven path: an exact id auto-selects (no
-                // interactive prompt) and loads, showing progress briefly.
-                let cmd = format!("/model {id}");
-                run_classic_command(terminal, app, ctx, &cmd, ev_rx, paused).await?;
-            }
+            Action::PickModel(entry) => apply_model_selection(terminal, app, ctx, entry).await?,
         }
+    }
+    Ok(())
+}
+
+async fn apply_model_selection(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    ctx: &mut ReplContext,
+    entry: ModelEntry,
+) -> std::io::Result<()> {
+    let id = entry.id.clone();
+    app.push_note(format!("switching to {id} ..."));
+    let footer = footer_snapshot(&ctx.core_handle);
+    terminal.draw(|f| app.draw(f, &footer))?;
+    match ctx.apply_model_entry(entry).await {
+        Ok(report) => {
+            for note in report.notes {
+                app.push_note(note);
+            }
+            app.push_note(format!("model switched to {}", report.model_id));
+        }
+        Err(e) => app.push_note(format!("model switch failed: {e}")),
     }
     Ok(())
 }
@@ -298,7 +315,10 @@ async fn slash_command(
     match rest.split_whitespace().next().unwrap_or("") {
         "quit" | "exit" | "q" => return Ok(true),
         "help" | "?" => app.set_help(true),
-        "clear" => app.clear_transcript(),
+        "clear" => {
+            ctx.clear_session_state().await;
+            app.clear_transcript();
+        }
         "mode" => {
             let arg = rest.strip_prefix("mode").map(str::trim).unwrap_or("");
             if arg.is_empty() {
@@ -308,11 +328,25 @@ async fn slash_command(
             }
         }
         "model" | "m" => {
-            if model_command_direct_arg(rest).is_some() {
-                run_classic_command(terminal, app, ctx, full, ev_rx, paused).await?;
-            } else if ctx.model_picker_available() {
-                let entries = ctx.collect_all_models().await;
-                if entries.is_empty() {
+            if ctx.model_picker_available() {
+                let filter = model_command_direct_arg(rest);
+                let mut entries = ctx.collect_all_models().await;
+                if let Some(filter) = filter {
+                    let filter_lower = filter.trim().to_lowercase();
+                    entries.retain(|e| e.id.to_lowercase().contains(&filter_lower));
+                    if entries.is_empty() {
+                        app.push_note(format!("no models matching \"{filter}\""));
+                    } else {
+                        let refs: Vec<&ModelEntry> = entries.iter().collect();
+                        if let Some(selected) =
+                            unique_direct_model_match(&refs, &filter_lower).cloned()
+                        {
+                            apply_model_selection(terminal, app, ctx, selected).await?;
+                        } else {
+                            app.open_model_picker(entries);
+                        }
+                    }
+                } else if entries.is_empty() {
                     app.push_note("no models found".into());
                 } else {
                     app.open_model_picker(entries);
@@ -682,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn model_command_with_argument_goes_to_classic_dispatch() {
+    fn model_command_with_argument_extracts_filter() {
         assert_eq!(
             model_command_direct_arg("model VibeThinker-3B-mlx-8Bit"),
             Some("VibeThinker-3B-mlx-8Bit")

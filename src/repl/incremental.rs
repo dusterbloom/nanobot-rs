@@ -46,6 +46,11 @@ pub struct IncrementalRenderer {
     /// Elapsed time to the first streamed chunk of the turn — the prefill cost
     /// the user waits through (TTFT). `None` until the first `push`.
     ttft: Option<std::time::Duration>,
+    /// Real decode time (seconds) summed across the turn's LLM calls from
+    /// agent-side `decode_ms` markers. Excludes tool-execution and re-prefill
+    /// gaps, so the footer's tok/s is a true decode rate. Zero until the first
+    /// marker; the footer falls back to `elapsed − ttft` when it stays zero.
+    decode_secs: f32,
     first_line: bool,
     /// Track whether we have a visible partial line on the current terminal row.
     has_partial: bool,
@@ -76,6 +81,7 @@ impl IncrementalRenderer {
             total_chars: 0,
             start_time: Instant::now(),
             ttft: None,
+            decode_secs: 0.0,
             first_line: true,
             has_partial: false,
             partial_rows: 0,
@@ -350,11 +356,18 @@ impl IncrementalRenderer {
             self.total_chars / 4
         };
         let ttft = self.ttft.map(|d| d.as_secs_f32());
+        let real_decode = (self.decode_secs > 0.05).then_some(self.decode_secs);
         // Blank line above the stats footer for breathing room.
         println!("\r");
         println!(
             "\r\x1b[2m{}\x1b[0m",
-            format_footer(elapsed, ttft, tokens, self.finish_reason.as_deref())
+            format_footer(
+                elapsed,
+                ttft,
+                tokens,
+                real_decode,
+                self.finish_reason.as_deref()
+            )
         );
         std::io::stdout().flush().ok();
     }
@@ -363,6 +376,13 @@ impl IncrementalRenderer {
     /// Called once per LLM response (markers parsed from the delta stream).
     pub fn add_tokens(&mut self, tokens: u64) {
         self.total_tokens += tokens;
+    }
+
+    /// Accumulate the real decode time (ms) for one finished LLM call, measured
+    /// agent-side as `call_wall_time − ttft`. Summed across the turn so the
+    /// footer reports a true decode tok/s excluding tool-execution gaps.
+    pub fn add_decode_ms(&mut self, ms: u64) {
+        self.decode_secs += ms as f32 / 1000.0;
     }
 
     /// True when un-rendered partial text exists (visible partial row or
@@ -509,16 +529,19 @@ fn format_footer(
     elapsed: f32,
     ttft: Option<f32>,
     tokens: u64,
+    real_decode_secs: Option<f32>,
     finish_reason: Option<&str>,
 ) -> String {
     let ttft_str = match ttft {
         Some(t) => format!("  ttft {:.2}s", t),
         None => String::new(),
     };
-    // Decode rate excludes prefill: tokens stream only after the first token,
-    // so dividing by total elapsed would understate throughput (e.g. 90 tok
-    // after an 89s prefill is ~32 tok/s of decode, not 1 tok/s).
-    let decode_secs = elapsed - ttft.unwrap_or(0.0);
+    // Decode rate excludes prefill: tokens stream only after the first token, so
+    // dividing by total elapsed would understate throughput (e.g. 90 tok after
+    // an 89s prefill is ~32 tok/s of decode, not 1 tok/s). Prefer the real
+    // summed decode time (excludes tool-execution gaps between calls); fall back
+    // to `elapsed − ttft` when no decode markers arrived.
+    let decode_secs = real_decode_secs.unwrap_or_else(|| elapsed - ttft.unwrap_or(0.0));
     let rate = if decode_secs > 0.5 {
         format!("  {:.1} tok/s", tokens as f32 / decode_secs)
     } else {
@@ -852,7 +875,7 @@ mod tests {
     #[test]
     fn test_footer_tokens_and_rate() {
         // 100 tokens in 2.0s → 50 tok/s.
-        let f = format_footer(2.0, None, 100, Some("stop"));
+        let f = format_footer(2.0, None, 100, None, Some("stop"));
         assert!(f.contains("100 tok"), "footer: {f}");
         assert!(f.contains("50.0 tok/s"), "footer: {f}");
         // "stop" is the normal case — no reason suffix.
@@ -864,7 +887,7 @@ mod tests {
     #[test]
     fn test_footer_shows_ttft() {
         // ttft is the prefill cost; surfaced separately from total elapsed.
-        let f = format_footer(53.6, Some(46.2), 352, Some("stop"));
+        let f = format_footer(53.6, Some(46.2), 352, None, Some("stop"));
         assert!(f.contains("ttft 46.20s"), "footer: {f}");
         assert!(f.contains("352 tok"), "footer: {f}");
         // Rate is decode throughput: 352 tok / (53.6 - 46.2)s = 47.6 tok/s,
@@ -873,8 +896,20 @@ mod tests {
     }
 
     #[test]
+    fn test_footer_prefers_real_decode_time() {
+        // A tool turn: 50s wall, ttft 2s, but only 5s of real decoding (the rest
+        // was tool execution). 100 tok / 5s = 20 tok/s — NOT 100/(50-2)=2.1 tok/s.
+        let f = format_footer(50.0, Some(2.0), 100, Some(5.0), Some("stop"));
+        assert!(f.contains("20.0 tok/s"), "footer: {f}");
+        assert!(
+            !f.contains("2.1 tok/s"),
+            "must not divide by wall time: {f}"
+        );
+    }
+
+    #[test]
     fn test_footer_truncated_reason() {
-        let f = format_footer(1.0, None, 10, Some("length"));
+        let f = format_footer(1.0, None, 10, None, Some("length"));
         assert!(f.contains("10 tok"), "footer: {f}");
         assert!(f.contains("[length]"), "footer: {f}");
     }
@@ -882,7 +917,7 @@ mod tests {
     #[test]
     fn test_footer_no_rate_when_too_fast() {
         // Below the 0.5s threshold the rate is omitted (avoids divide-by-tiny).
-        let f = format_footer(0.1, None, 5, None);
+        let f = format_footer(0.1, None, 5, None, None);
         assert!(f.contains("5 tok"), "footer: {f}");
         assert!(!f.contains("tok/s"), "footer: {f}");
     }

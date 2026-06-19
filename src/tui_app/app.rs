@@ -66,8 +66,8 @@ pub(crate) enum Action {
     Submit(SubmittedTurn),
     /// Voice mode: start a record → transcribe → reply → speak cycle.
     Record,
-    /// User picked a model in the native picker; apply it by id.
-    PickModel(String),
+    /// User picked a model in the native picker; apply that exact row.
+    PickModel(ModelEntry),
 }
 
 /// What a key/mouse/paste event means while the assistant is streaming.
@@ -109,7 +109,7 @@ impl SubmittedTurn {
 
 /// One selectable row in the model picker.
 struct PickRow {
-    id: String,
+    entry: ModelEntry,
     label: String,
     active: bool,
 }
@@ -169,6 +169,16 @@ impl Mode {
     fn verbose_meta(self) -> bool {
         !matches!(self, Mode::Calm)
     }
+}
+
+/// Live activity indicator, shown once in the footer.
+#[derive(Clone, Copy)]
+enum Status {
+    Ready,
+    Working,
+    Recording,
+    Speaking,
+    Voice,
 }
 
 /// Reverse-search (Ctrl+R) state.
@@ -279,6 +289,12 @@ pub(crate) struct App {
     prefill_started: Option<Instant>,
     /// Last prefill progress sample `(processed_tokens, timestamp)`.
     prefill_last: Option<(u64, Instant)>,
+    /// Real decode time accumulated this turn, in seconds — the sum of each LLM
+    /// call's `(call_wall_time − ttft)` as measured agent-side and streamed via
+    /// `decode_ms` markers. Excludes the gaps between calls (tool execution +
+    /// re-prefill), so `tokens / turn_decode_secs` is a true decode rate rather
+    /// than `tokens / (wall − first_ttft)`.
+    turn_decode_secs: f32,
     /// True while legacy ANSI-delimited thinking deltas are being received.
     in_thinking_stream: bool,
     /// Rows scrolled up from the bottom; `0` sticks to the latest output.
@@ -338,6 +354,7 @@ impl App {
             prefill_rate_hint: None,
             prefill_started: None,
             prefill_last: None,
+            turn_decode_secs: 0.0,
             in_thinking_stream: false,
             scroll_from_bottom: 0,
             max_scroll: 0,
@@ -386,7 +403,7 @@ impl App {
         let rows: Vec<PickRow> = entries
             .iter()
             .map(|e| PickRow {
-                id: e.id.clone(),
+                entry: e.clone(),
                 label: format!(
                     "{}   {}{}",
                     e.id,
@@ -418,10 +435,10 @@ impl App {
                 Action::Continue
             }
             KeyCode::Enter => {
-                let id = p.rows.get(p.selected).map(|r| r.id.clone());
+                let entry = p.rows.get(p.selected).map(|r| r.entry.clone());
                 self.picker = None;
-                match id {
-                    Some(id) => Action::PickModel(id),
+                match entry {
+                    Some(entry) => Action::PickModel(entry),
                     None => Action::Continue,
                 }
             }
@@ -433,7 +450,7 @@ impl App {
         }
     }
 
-    /// Toggle the "recording" indicator (drawn in the header during a voice turn).
+    /// Toggle the "recording" indicator (shown in the footer during a voice turn).
     pub(crate) fn set_recording(&mut self, on: bool) {
         self.recording = on;
     }
@@ -489,6 +506,7 @@ impl App {
         let now = Instant::now();
         self.prefill_started = Some(now);
         self.prefill_last = None;
+        self.turn_decode_secs = 0.0;
         self.in_thinking_stream = false;
         self.scroll_from_bottom = 0; // jump to bottom for the new turn
     }
@@ -513,6 +531,9 @@ impl App {
             }
             Some(ControlMarker::CacheStatus(status)) => self.upsert_activity_cache(status),
             Some(ControlMarker::Tokens(n)) => self.turn_tokens += n,
+            Some(ControlMarker::DecodeMs(ms)) => {
+                self.turn_decode_secs += ms as f32 / 1000.0;
+            }
             Some(ControlMarker::PromptTokens(n)) => {
                 if self.turn_prompt_tokens == 0 {
                     self.turn_prompt_tokens = n;
@@ -884,11 +905,19 @@ impl App {
                 estimate_tokens(&self.turn_text)
             };
             let elapsed = self.elapsed_s();
-            let gen_time = match self.ttft {
-                Some(t) => (elapsed - t).max(0.05),
-                None => elapsed.max(0.05),
+            // Real decode time, summed per-call agent-side, excludes tool
+            // execution and re-prefill between calls. Fall back to wall−ttft only
+            // when no decode markers arrived (non-streaming / older agent), which
+            // overstates decode time for tool turns but is the best estimate then.
+            let decode_time = if self.turn_decode_secs > 0.05 {
+                self.turn_decode_secs
+            } else {
+                match self.ttft {
+                    Some(t) => (elapsed - t).max(0.05),
+                    None => elapsed.max(0.05),
+                }
             };
-            let tps = (tokens > 0).then(|| tokens as f32 / gen_time);
+            let tps = (tokens > 0).then(|| tokens as f32 / decode_time);
             let prefer_estimated_work = matches!(
                 self.turn_cache,
                 Some(CacheStatus::AppendOnly { .. })
@@ -990,6 +1019,11 @@ impl App {
             }
             KeyCode::Char('t') if ctrl => {
                 self.toggle_thinking_display();
+                Action::Continue
+            }
+            // Shift+Tab cycles the disclosure level (calm → inspect → deep).
+            KeyCode::BackTab => {
+                self.cycle_mode();
                 Action::Continue
             }
             // Esc goes back: clears the input line (and closes help/cancels a
@@ -1220,6 +1254,10 @@ impl App {
                         self.toggle_thinking_display();
                         StreamingAction::Continue
                     }
+                    KeyCode::BackTab => {
+                        self.cycle_mode();
+                        StreamingAction::Continue
+                    }
                     KeyCode::Enter if k.modifiers.is_empty() => match self.submit() {
                         Action::Submit(turn) => StreamingAction::CancelAndSubmit(turn),
                         _ => StreamingAction::Cancel,
@@ -1297,7 +1335,7 @@ impl App {
 
     pub(crate) fn draw(&mut self, f: &mut Frame, footer: &Footer) {
         let area = f.area();
-        let input_h = self.input_height();
+        let input_h = self.input_height(area.width);
         let chunks = Layout::vertical([
             Constraint::Length(2), // header: status + rule
             Constraint::Min(1),    // transcript
@@ -1337,7 +1375,12 @@ impl App {
         self.input.set_block(input_block(title));
         f.render_widget(&self.input, chunks[2]);
         f.render_widget(
-            Paragraph::new(footer_line(footer, self.mode, self.show_thinking)),
+            Paragraph::new(footer_line(
+                footer,
+                self.mode,
+                self.show_thinking,
+                self.status(),
+            )),
             chunks[3],
         );
 
@@ -1349,9 +1392,27 @@ impl App {
         }
     }
 
-    fn input_height(&self) -> u16 {
-        let n = self.input.lines().len().max(1) as u16;
-        n.min(8) + 2 // +2 for the rounded border
+    fn input_height(&self, width: u16) -> u16 {
+        // Inner text width = box width minus borders (2) and horizontal padding (2).
+        let inner = (width as usize).saturating_sub(4);
+        let rows = self.wrapped_row_count(inner) as u16;
+        rows.clamp(2, 8) + 2 // min 2 text rows; grow up to 8; +2 for the border
+    }
+
+    /// Visual rows the input needs at `inner` width — counts wrapped rows, not
+    /// just logical lines, so a single long line grows the box as it fills.
+    fn wrapped_row_count(&self, inner: usize) -> usize {
+        let w = inner.max(1);
+        self.input
+            .lines()
+            .iter()
+            .map(|line| {
+                let mut out = Vec::new();
+                wrap_segments(&[(line.to_string(), Style::default())], w, &mut out);
+                out.len()
+            })
+            .sum::<usize>()
+            .max(1)
     }
 
     fn input_title(&self) -> Option<String> {
@@ -1373,32 +1434,28 @@ impl App {
         }
     }
 
-    fn header_lines(&self, width: usize) -> Text<'static> {
-        let mut status = vec![Span::raw("  ")];
-        status.extend(brand_mark());
-        status.push(Span::styled(" TRENTADUE", style(Color::White, true)));
-        status.push(Span::styled(" \u{b7} 32", dim_color(ACCENT)));
-        status.push(Span::styled("  \u{b7}  ", dim()));
+    /// Live activity for the footer status surface.
+    fn status(&self) -> Status {
         if self.recording {
-            status.push(Span::styled(
-                format!("{DOT} recording"),
-                style(ERR_COLOR, true),
-            ));
-            status.push(Span::styled("  \u{b7}  Enter/Esc to stop", dim()));
+            Status::Recording
         } else if self.speaking {
-            status.push(Span::styled(format!("{DOT} speaking"), style(ACCENT, true)));
-            status.push(Span::styled("  \u{b7}  Enter to interrupt", dim()));
+            Status::Speaking
         } else if self.streaming {
-            status.push(Span::styled("working", dim_color(ACCENT)));
-            status.push(Span::styled("  \u{b7}  type to interrupt", dim()));
+            Status::Working
         } else if self.voice {
-            status.push(Span::styled("voice", style(OK_COLOR, false)));
-            status.push(Span::styled("  ·  Enter to speak", dim()));
+            Status::Voice
         } else {
-            status.push(Span::styled("ready", style(OK_COLOR, false)));
+            Status::Ready
         }
+    }
+
+    /// Brand title bar: wordmark + rule. All live state lives in the footer.
+    fn header_lines(&self, width: usize) -> Text<'static> {
+        let mut brand = vec![Span::raw("  ")];
+        brand.extend(brand_mark());
+        brand.push(Span::styled(" TRENTADUE", style(Color::White, true)));
         let rule = Span::styled(RULE.repeat(width), dim());
-        Text::from(vec![Line::from(status), Line::from(rule)])
+        Text::from(vec![Line::from(brand), Line::from(rule)])
     }
 
     fn transcript_rows(&self, width: usize) -> Vec<Line<'static>> {
@@ -1406,50 +1463,57 @@ impl App {
             return vec![
                 Line::default(),
                 Line::from(Span::styled(
-                    "  Ask nanobot-rs anything.  Enter to send · Alt+Enter newline · Ctrl+C quit",
+                    "  Ask Trentadue anything.  Enter to send · Alt+Enter newline · Ctrl+C quit",
                     dim(),
                 )),
             ];
         }
-        let mut rows: Vec<Line> = Vec::new();
-        let mut prev_was_reply = false;
-        let mut prev_was_tool = false;
+        // Render each visible cell into its own block, trimmed to its content
+        // edges so no cell carries outer padding (a streamed reply often ends in
+        // trailing newlines — those would stack with the gap below it). Spacing
+        // between blocks is then decided in ONE place by `gap_between`, keyed on
+        // the (prev, next) kind pair, so the rhythm reflects grouping instead of
+        // each cell owning a margin that compounds with its neighbour's.
+        let mut blocks: Vec<(Kind, Vec<Line<'static>>)> = Vec::new();
         let mut assistant_mark_used = false;
         for cell in &self.transcript {
             if matches!(cell, Cell::Thinking(_)) && !self.show_thinking {
                 continue;
             }
-            // Blank line before each user turn separates conversation turns.
-            if matches!(cell, Cell::User(_)) && !rows.is_empty() {
-                rows.push(Line::default());
-            }
             if matches!(cell, Cell::User(_)) {
                 assistant_mark_used = false;
-            }
-            if matches!(cell, Cell::Tool { .. }) && prev_was_reply {
-                rows.push(Line::default());
-            }
-            if matches!(cell, Cell::Reply(_)) && prev_was_tool {
-                rows.push(Line::default());
             }
             let consumes_assistant_mark = cell_consumes_assistant_mark(cell);
             let show_reply_mark =
                 (matches!(cell, Cell::Reply(_)) || consumes_assistant_mark) && !assistant_mark_used;
+            let mut block: Vec<Line> = Vec::new();
             for segs in
                 cell_lines_with_reply_mark(cell, self.mode, self.elapsed_s(), show_reply_mark)
             {
-                wrap_segments(&segs, width, &mut rows);
+                wrap_segments(&segs, width, &mut block);
+            }
+            trim_blank_edges(&mut block);
+            if block.is_empty() {
+                continue;
             }
             if matches!(cell, Cell::Reply(_)) || (consumes_assistant_mark && show_reply_mark) {
                 assistant_mark_used = true;
             }
-            // Breathing room between the user turn and the assistant reply.
-            if matches!(cell, Cell::User(_)) {
-                rows.push(Line::default());
-            }
-            prev_was_reply = matches!(cell, Cell::Reply(_));
-            prev_was_tool = matches!(cell, Cell::Tool { .. });
+            blocks.push((cell_kind(cell, show_reply_mark), block));
         }
+
+        let mut rows: Vec<Line> = Vec::new();
+        let mut prev: Option<Kind> = None;
+        for (kind, block) in blocks {
+            if let Some(prev_kind) = prev {
+                for _ in 0..gap_between(prev_kind, kind) {
+                    rows.push(Line::default());
+                }
+            }
+            rows.extend(block);
+            prev = Some(kind);
+        }
+        // Blank row above the input while streaming, so live output never hugs it.
         if self.streaming && self.scroll_from_bottom == 0 {
             rows.push(Line::default());
         }
@@ -1559,7 +1623,6 @@ fn configure_input() -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.set_wrap_mode(WrapMode::WordOrGlyph);
     ta.set_block(input_block(None));
-    ta.set_placeholder_text("Ask nanobot-rs anything");
     ta.set_cursor_line_style(Style::default());
     ta
 }
@@ -1592,6 +1655,63 @@ fn cell_consumes_assistant_mark(cell: &Cell) -> bool {
     )
 }
 
+/// What a rendered block is, for spacing purposes only. Coarser than `Cell`:
+/// spacing cares whether a block opens the assistant turn, is prose, is a tool,
+/// or is something else — not the exact variant.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    User,
+    /// Carries the `▞▞` mark — the opening of an assistant turn.
+    Head,
+    /// Assistant text / thinking continuation.
+    Prose,
+    Tool,
+    /// Live activity row, meta line, or note.
+    Other,
+}
+
+fn cell_kind(cell: &Cell, has_mark: bool) -> Kind {
+    if has_mark {
+        return Kind::Head;
+    }
+    match cell {
+        Cell::User(_) => Kind::User,
+        Cell::Reply(_) | Cell::Thinking(_) => Kind::Prose,
+        Cell::Tool { .. } => Kind::Tool,
+        Cell::Activity { .. } | Cell::Meta { .. } | Cell::Note(_) => Kind::Other,
+    }
+}
+
+/// Blank rows between two adjacent blocks. Spacing encodes grouping: a turn's
+/// opening binds tight to its first tool, tools in a cluster stack with no gap,
+/// and everything else within a turn gets one breathing row. A user line (turn
+/// boundary) gets one row on each side. This single table replaces per-cell
+/// margins so gaps never compound.
+fn gap_between(prev: Kind, next: Kind) -> usize {
+    match (prev, next) {
+        (_, Kind::User) => 1,          // separate the previous turn
+        (Kind::User, _) => 1,          // breathing room before the assistant
+        (Kind::Head, Kind::Tool) => 0, // opening line binds to its first tool
+        (Kind::Tool, Kind::Tool) => 0, // one cluster, no internal gaps
+        _ => 1,
+    }
+}
+
+fn is_blank_row(line: &Line) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+/// Strip leading and trailing blank rows so a block owns no outer padding.
+/// Internal blank rows (e.g. markdown paragraph breaks) are preserved.
+fn trim_blank_edges(block: &mut Vec<Line<'static>>) {
+    while block.first().is_some_and(is_blank_row) {
+        block.remove(0);
+    }
+    while block.last().is_some_and(is_blank_row) {
+        block.pop();
+    }
+}
+
 fn cache_status_label(status: CacheStatus) -> (String, Color) {
     match status {
         CacheStatus::First { messages } => {
@@ -1609,6 +1729,9 @@ fn cache_status_label(status: CacheStatus) -> (String, Color) {
             CacheResetReason::Trim => ("cache reset · trim".to_string(), WARN_COLOR),
             CacheResetReason::EmergencyTrim => {
                 ("cache reset · emergency trim".to_string(), WARN_COLOR)
+            }
+            CacheResetReason::LcmCheckpoint => {
+                ("cache reset · lcm checkpoint".to_string(), WARN_COLOR)
             }
         },
     }
@@ -1776,10 +1899,20 @@ fn strip_ascii_case_insensitive(text: &str, needle: &str) -> String {
     out
 }
 
-/// Quiet footer: cwd · model · mode · ctx usage.
-fn footer_line(footer: &Footer, mode: Mode, show_thinking: bool) -> Line<'static> {
+/// Quiet footer: status · cwd · model · mode · ctx usage. The single surface
+/// for live state — header carries no status.
+fn footer_line(footer: &Footer, mode: Mode, show_thinking: bool, status: Status) -> Line<'static> {
+    let (glyph, word, color, bold) = match status {
+        Status::Ready => (DOT, "ready", OK_COLOR, false),
+        Status::Working => (BRAND, "working", ACCENT, true),
+        Status::Recording => (DOT, "recording", ERR_COLOR, true),
+        Status::Speaking => (DOT, "speaking", ACCENT, true),
+        Status::Voice => (DOT, "voice", OK_COLOR, false),
+    };
     let mut spans = vec![
-        Span::styled("  cwd ", dim()),
+        Span::styled(format!("  {glyph} "), style(color, bold)),
+        Span::styled(word, style(color, bold)),
+        Span::styled("   cwd ", dim()),
         Span::styled(footer.cwd.clone(), style(OK_COLOR, false)),
         Span::styled("   model ", dim()),
         Span::styled(footer.model.clone(), style(OK_COLOR, false)),
@@ -1827,7 +1960,7 @@ fn render_intro(f: &mut Frame, area: Rect) {
             format!("{BRAND}{BRAND}{BRAND}  TRENTADUE"),
             style(ACCENT, true),
         )),
-        Line::from(Span::styled("a calm, local agent  \u{b7}  32", dim())),
+        Line::from(Span::styled("a calm, local agent", dim())),
         Line::default(),
         Line::from(Span::styled(
             "Enter send   \u{b7}   /help keys   \u{b7}   /model switch   \u{b7}   Ctrl+D quit",
@@ -1953,6 +2086,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("Up / Down", "prompt history"),
         key("Ctrl+R", "reverse-search history"),
         key("Ctrl+T", "show / hide thinking"),
+        key("Shift+Tab", "cycle calm / inspect / deep"),
         key("PgUp/PgDn", "scroll transcript"),
         key("Esc", "clear input / cancel turn / close"),
         key("Ctrl+C", "cancel reply / clear input"),
@@ -1960,7 +2094,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::default(),
         head("commands"),
         key("/help  ?", "this overlay"),
-        key("/clear", "clear the transcript"),
+        key("/clear", "clear session state"),
         key("/mode", "calm / inspect / deep (cycle or name)"),
         key("/model", "switch model (opens picker)"),
         key("/local", "toggle local / cloud"),
@@ -1969,11 +2103,11 @@ fn help_lines() -> Vec<Line<'static>> {
         key("/quit", "exit"),
         Line::default(),
         Line::from(Span::styled(
-            "  /model, /local, /think, /status briefly drop to a",
+            "  /local, /think, /status briefly drop to a",
             dim(),
         )),
         Line::from(Span::styled(
-            "  classic view, then return. /voice not in the TUI yet.",
+            "  classic view, then return. /model and /voice stay native.",
             dim(),
         )),
     ]
@@ -2197,29 +2331,36 @@ fn cell_lines_with_reply_mark(
             tps,
             estimated,
         } => {
+            let sep = || (" \u{b7} ".to_string(), dim());
             let mut segs = vec![(format!("  {META} {:.1}s", elapsed_s), dim())];
             if let Some(cache) = cache {
                 let (label, color) = cache_status_label(*cache);
-                segs.push(("  ".to_string(), dim()));
+                segs.push(sep());
                 segs.push((label, dim_color(color)));
             }
             if mode.verbose_meta() {
                 if let Some(t) = ttft_s {
-                    segs.push((format!("  ttft {:.2}s", t), dim()));
+                    segs.push(sep());
+                    segs.push((format!("ttft {:.2}s", t), dim()));
                 }
             }
             let show_prefill = mode.verbose_meta() || ttft_s.map(|t| t >= 1.0).unwrap_or(false);
             if show_prefill {
                 if let Some(rate) = prefill_tps {
-                    segs.push((format!("  prefill {}", format_prefill_rate(*rate)), dim()));
+                    segs.push(sep());
+                    segs.push((format!("prefill {}", format_prefill_rate(*rate)), dim()));
                 }
             }
             if *tokens > 0 {
                 let mark = if *estimated { "~" } else { "" };
-                segs.push((format!("  {mark}{tokens} tok"), dim()));
-                if let Some(tps) = tps {
-                    segs.push((format!("  {mark}{tps:.0} tok/s"), dim()));
-                }
+                // Tokens generated tied to decode speed in one phrase, so it can't
+                // be mistaken for the prefill rate above.
+                let tail = match tps {
+                    Some(tps) => format!("{mark}{tokens} tok @ {mark}{tps:.0} tok/s"),
+                    None => format!("{mark}{tokens} tok"),
+                };
+                segs.push(sep());
+                segs.push((tail, dim()));
             }
             vec![segs]
         }
@@ -2237,20 +2378,89 @@ fn wrap_segments(segs: &[(String, Style)], width: usize, out: &mut Vec<Line<'sta
     let width = width.max(1);
     let indent = continuation_indent(segs, width);
     let mut row: Vec<(char, Style)> = Vec::new();
-    let mut w = 0usize;
+    let mut row_w = 0usize;
+    // Pending word (run of non-spaces) held back until we know it fits, so we
+    // break between words instead of through them.
+    let mut word: Vec<(char, Style)> = Vec::new();
+    let mut word_w = 0usize;
+
     for (text, st) in segs {
         for c in text.chars() {
             let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw > width && !row.is_empty() {
-                out.push(row_to_line(&row));
-                row.clear();
-                w = push_indent(&mut row, indent);
+            if c == ' ' {
+                place_word(
+                    &mut row,
+                    &mut row_w,
+                    &mut word,
+                    &mut word_w,
+                    indent,
+                    width,
+                    out,
+                );
+                if row_w + cw > width && !row.is_empty() {
+                    // Space landed on the wrap boundary: break and drop it.
+                    out.push(row_to_line(&row));
+                    row.clear();
+                    row_w = push_indent(&mut row, indent);
+                } else {
+                    row.push((c, *st));
+                    row_w += cw;
+                }
+            } else {
+                word.push((c, *st));
+                word_w += cw;
             }
-            row.push((c, *st));
-            w += cw;
         }
     }
+    place_word(
+        &mut row,
+        &mut row_w,
+        &mut word,
+        &mut word_w,
+        indent,
+        width,
+        out,
+    );
     out.push(row_to_line(&row));
+}
+
+/// Move the pending `word` onto `row`. Breaks before the word if it doesn't fit
+/// and the row already holds content past the gutter; hard-splits by display
+/// width only when the word is longer than a whole line (long URLs, paths).
+fn place_word(
+    row: &mut Vec<(char, Style)>,
+    row_w: &mut usize,
+    word: &mut Vec<(char, Style)>,
+    word_w: &mut usize,
+    indent: usize,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    if word.is_empty() {
+        return;
+    }
+    if *row_w + *word_w > width && *row_w > indent {
+        out.push(row_to_line(row));
+        row.clear();
+        *row_w = push_indent(row, indent);
+    }
+    if *row_w + *word_w <= width {
+        row.append(word);
+        *row_w += *word_w;
+        *word_w = 0;
+        return;
+    }
+    for (c, st) in word.drain(..) {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if *row_w + cw > width && *row_w > 0 {
+            out.push(row_to_line(row));
+            row.clear();
+            *row_w = push_indent(row, indent);
+        }
+        row.push((c, st));
+        *row_w += cw;
+    }
+    *word_w = 0;
 }
 
 fn continuation_indent(segs: &[(String, Style)], width: usize) -> usize {
@@ -2456,6 +2666,22 @@ mod tests {
     }
 
     #[test]
+    fn wrap_breaks_between_words_not_through_them() {
+        let mut out = Vec::new();
+        wrap_segments(
+            &[("alpha beta gamma".to_string(), Style::default())],
+            12,
+            &mut out,
+        );
+        let rows: Vec<String> = out
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        // "gamma" wraps whole; it is never split into "ga"/"mma".
+        assert_eq!(rows, vec!["alpha beta ".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
     fn wrap_emits_one_row_for_short_line() {
         let mut out = Vec::new();
         wrap_segments(&[("hi".to_string(), Style::default())], 80, &mut out);
@@ -2502,6 +2728,61 @@ mod tests {
         app.on_delta("after tool");
         assert_eq!(kinds(&app), vec!["user", "reply", "tool", "reply"]);
         assert_eq!(reply_text(&app), "before tool|after tool");
+    }
+
+    /// The `tps` in the metadata line divides by *real* decode time (summed from
+    /// `decode_ms` markers), not by `wall − ttft` which is inflated by tool
+    /// execution and re-prefill on a tool turn.
+    #[test]
+    fn meta_tps_uses_real_decode_time_not_wall_clock() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        // ~100s wall, 2s first-call prefill, but only 5s of real decoding.
+        app.turn_start = Some(Instant::now() - std::time::Duration::from_secs(100));
+        app.ttft = Some(2.0);
+        app.turn_tokens = 100;
+        app.on_delta("\u{0}decode_ms:5000"); // 5s real decode from the agent
+        app.turn_produced = true;
+        app.finish_turn(String::new());
+
+        let tps = app
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Cell::Meta { tps, .. } => Some(*tps),
+                _ => None,
+            })
+            .expect("meta cell present");
+        // 100 tok / 5s = 20 tok/s — NOT 100 / (100 − 2) ≈ 1.0.
+        assert_eq!(tps, Some(20.0), "tps must divide by real decode time");
+    }
+
+    /// Without any `decode_ms` markers (non-streaming / older agent) the tps
+    /// falls back to `wall − ttft` so the field is still populated.
+    #[test]
+    fn meta_tps_falls_back_without_decode_markers() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.turn_start = Some(Instant::now() - std::time::Duration::from_secs(10));
+        app.ttft = Some(2.0);
+        app.turn_tokens = 80;
+        // turn_decode_secs stays 0 — no markers arrived.
+        app.turn_produced = true;
+        app.finish_turn(String::new());
+
+        let tps = app
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Cell::Meta { tps, .. } => Some(*tps),
+                _ => None,
+            })
+            .flatten()
+            .expect("tps computable");
+        // Fallback: 80 / (10 − 2) = 10 tok/s.
+        assert!((tps - 10.0).abs() < 0.5, "fallback tps ~10, got {tps}");
     }
 
     #[test]
@@ -3179,6 +3460,35 @@ mod tests {
     }
 
     #[test]
+    fn lcm_checkpoint_reset_is_explicit() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("\u{0}cache:reset:lcm_checkpoint");
+        app.on_delta("real");
+        app.finish_turn(String::new());
+
+        match app.transcript.last() {
+            Some(Cell::Meta {
+                cache:
+                    Some(CacheStatus::Reset {
+                        reason: CacheResetReason::LcmCheckpoint,
+                    }),
+                ..
+            }) => {}
+            _ => panic!("expected lcm checkpoint reset in meta"),
+        }
+        let rendered: String = cell_lines(app.transcript.last().unwrap(), Mode::Calm, 1.0)
+            .iter()
+            .flatten()
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert!(
+            rendered.contains("cache reset · lcm checkpoint"),
+            "lcm checkpoint should be visible: {rendered}"
+        );
+    }
+
+    #[test]
     fn tool_loop_cache_marker_reenters_prefill_activity() {
         let mut app = App::new();
         app.begin_turn("q");
@@ -3290,12 +3600,19 @@ mod tests {
         let second = flatten_text(app.header_lines(80));
 
         assert_eq!(first, second, "streaming header must not animate");
-        assert!(
-            first.contains("working"),
-            "streaming state missing: {first}"
-        );
         assert!(!first.contains("5/10"), "prefill belongs in the turn row");
         assert!(!first.contains("0."), "timer belongs in the turn row");
+        // Live state now lives in the single footer surface, not the header.
+        let footer = flatten_text(Text::from(footer_line(
+            &test_footer(),
+            app.mode,
+            app.show_thinking,
+            app.status(),
+        )));
+        assert!(
+            footer.contains("working"),
+            "streaming status missing from footer: {footer}"
+        );
     }
 
     #[test]
@@ -3485,15 +3802,98 @@ mod tests {
             .iter()
             .position(|line| line.contains("read_file render.rs"))
             .expect("tool rendered");
-        assert!(
-            tool_idx > reply_idx + 1,
-            "tool should have a blank row after reply:\n{}",
+        // "Let me look." is the turn's opening line (carries the ▞▞ mark), so the
+        // first tool binds tight beneath it with no blank row (grouping: the
+        // announce-and-act pair is one unit). Later prose→tool gets a blank.
+        assert_eq!(
+            tool_idx,
+            reply_idx + 1,
+            "first tool binds tight under the opening line:\n{}",
             lines.join("\n")
         );
         assert!(
             lines[tool_idx].starts_with("       ▶"),
             "tool should be indented:\n{}",
             lines[tool_idx]
+        );
+    }
+
+    #[test]
+    fn spacing_encodes_grouping_no_compounding_voids() {
+        let mut app = App::new();
+        app.begin_turn("go");
+        app.on_delta("On it.");
+        // Two-tool cluster directly under the opening line.
+        for (id, path) in [("c1", "alpha.rs"), ("c2", "beta.rs")] {
+            app.on_tool_event(ToolEvent::CallStart {
+                tool_name: "read_file".into(),
+                tool_call_id: id.into(),
+                arguments_preview: format!(r#"{{"path":"{path}"}}"#),
+            });
+            app.on_tool_event(ToolEvent::CallEnd {
+                tool_name: "read_file".into(),
+                tool_call_id: id.into(),
+                result_data: "ok".into(),
+                ok: true,
+                duration_ms: 1,
+            });
+        }
+        // Continuation prose ending in trailing newlines — the classic void
+        // source — then another tool.
+        app.on_delta("Found it.\n\n\n");
+        app.on_tool_event(ToolEvent::CallStart {
+            tool_name: "exec".into(),
+            tool_call_id: "c3".into(),
+            arguments_preview: r#"{"command":"gamma"}"#.into(),
+        });
+        app.on_tool_event(ToolEvent::CallEnd {
+            tool_name: "exec".into(),
+            tool_call_id: "c3".into(),
+            result_data: "ok".into(),
+            ok: true,
+            duration_ms: 1,
+        });
+
+        let rows: Vec<String> = app
+            .transcript_rows(100)
+            .into_iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let idx = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle}:\n{}", rows.join("\n")))
+        };
+        let blanks = |a: usize, b: usize| {
+            rows[a + 1..b]
+                .iter()
+                .filter(|r| r.trim().is_empty())
+                .count()
+        };
+
+        let head = idx("On it.");
+        let t1 = idx("alpha.rs");
+        let t2 = idx("beta.rs");
+        let prose = idx("Found it.");
+        let t3 = idx("gamma");
+
+        assert_eq!(
+            blanks(head, t1),
+            0,
+            "opening line binds tight to first tool"
+        );
+        assert_eq!(blanks(t1, t2), 0, "tools in a cluster stack with no gap");
+        assert_eq!(blanks(t2, prose), 1, "tool result → prose is one row");
+        assert_eq!(
+            blanks(prose, t3),
+            1,
+            "prose → its tools is one row — never the old 3-void:\n{}",
+            rows.join("\n")
         );
     }
 
@@ -3637,6 +4037,32 @@ mod tests {
         assert!(
             text.contains("Type and press Enter or ESC to interrupt"),
             "streaming input border hint missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn idle_input_hides_prompt_and_grows_from_two_rows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new();
+        app.input.insert_str("draft");
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| app.draw(f, &test_footer())).unwrap();
+
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            !text.contains("Ask Trentadue anything"),
+            "idle input must not show the placeholder/title:\n{text}"
+        );
+
+        // One short line → 2 text rows (+2 border). A long line that wraps past
+        // two rows grows the box, even with no explicit newline.
+        assert_eq!(app.input_height(100), 4, "short line should be 2 text rows");
+        app.input.insert_str(&"x".repeat(300));
+        assert!(
+            app.input_height(100) > 4,
+            "a wrapping line should grow the input box"
         );
     }
 
@@ -3851,17 +4277,17 @@ mod tests {
     fn pick_rows() -> Vec<PickRow> {
         vec![
             PickRow {
-                id: "alpha".into(),
+                entry: ModelEntry::test_local("alpha"),
                 label: "alpha   oMLX".into(),
                 active: true,
             },
             PickRow {
-                id: "beta".into(),
+                entry: ModelEntry::test_local("beta"),
                 label: "beta   LM Studio".into(),
                 active: false,
             },
             PickRow {
-                id: "gamma".into(),
+                entry: ModelEntry::test_local("gamma"),
                 label: "gamma   file".into(),
                 active: false,
             },
@@ -3878,7 +4304,7 @@ mod tests {
         app.on_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.on_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         match app.on_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
-            Action::PickModel(id) => assert_eq!(id, "gamma"),
+            Action::PickModel(entry) => assert_eq!(entry.id, "gamma"),
             _ => panic!("expected PickModel"),
         }
         assert!(app.picker.is_none(), "picker closes after selection");

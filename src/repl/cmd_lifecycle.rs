@@ -5,6 +5,25 @@ use std::path::PathBuf;
 
 use super::*;
 
+#[derive(Debug, Clone)]
+pub(crate) struct ModelSwitchReport {
+    pub(crate) model_id: String,
+    pub(crate) notes: Vec<String>,
+}
+
+impl ModelSwitchReport {
+    fn new(model_id: String) -> Self {
+        Self {
+            model_id,
+            notes: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, text: impl Into<String>) {
+        self.notes.push(text.into());
+    }
+}
+
 impl ReplContext {
     /// /provenance — toggle provenance display on/off.
     pub(super) fn cmd_provenance(&mut self) {
@@ -363,6 +382,209 @@ impl ReplContext {
         );
     }
 
+    /// Apply one model picker entry without doing any terminal I/O.
+    ///
+    /// The classic REPL and ratatui picker share this path so model switching
+    /// has one set of load/unload, persistence, and rebuild rules.
+    pub(crate) async fn apply_model_entry(
+        &mut self,
+        selected: ModelEntry,
+    ) -> Result<ModelSwitchReport, String> {
+        let selected_id = selected.id.clone();
+        let mut report = ModelSwitchReport::new(selected_id.clone());
+
+        match selected.source {
+            ModelSource::LocalLms { port } => {
+                let prev_model = self.config.agents.defaults.lms_main_model.clone();
+                if !prev_model.is_empty() && prev_model != selected_id {
+                    match crate::lms::unload_model(
+                        "",
+                        port,
+                        &prev_model,
+                        self.config.timeouts.lms_unload_secs,
+                    )
+                    .await
+                    {
+                        Ok(()) => report.note(format!("unloaded {prev_model}")),
+                        Err(e) => report.note(format!("warning: unload {prev_model}: {e}")),
+                    }
+                }
+
+                let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
+                crate::lms::load_model(
+                    "",
+                    port,
+                    &selected_id,
+                    ctx,
+                    self.config.timeouts.lms_load_secs,
+                )
+                .await
+                .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
+                report.note(format!("loaded {selected_id}"));
+
+                self.config.agents.defaults.local_model = selected_id.clone();
+                self.config.agents.defaults.lms_main_model = selected_id.clone();
+                if !crate::config::schema::is_higgs_backend(
+                    &self.config.agents.defaults.local_backend,
+                ) {
+                    self.config.agents.defaults.local_backend = "lmstudio".to_string();
+                }
+                self.current_model_path = PathBuf::from(&selected_id);
+
+                let mut disk_cfg = load_config(None);
+                disk_cfg.agents.defaults.local_model = selected_id.clone();
+                disk_cfg.agents.defaults.lms_main_model = selected_id.clone();
+                if !crate::config::schema::is_higgs_backend(&disk_cfg.agents.defaults.local_backend)
+                {
+                    disk_cfg.agents.defaults.local_backend = "lmstudio".to_string();
+                }
+                save_config(&disk_cfg, None);
+                self.apply_and_rebuild();
+            }
+            ModelSource::Remote {
+                endpoint,
+                #[cfg(feature = "cluster")]
+                peer_type,
+                #[cfg(not(feature = "cluster"))]
+                    peer_type: _,
+            } => {
+                #[cfg(feature = "cluster")]
+                let is_lms = peer_type == crate::cluster::state::PeerType::LMStudio;
+                #[cfg(not(feature = "cluster"))]
+                let is_lms = false;
+
+                if is_lms {
+                    let Some(port) = Self::extract_endpoint_port(&endpoint) else {
+                        return Err(format!(
+                            "could not parse LM Studio endpoint port from {endpoint}"
+                        ));
+                    };
+
+                    let remote_host = super::super::extract_url_host(&endpoint);
+                    let prev_model = self.config.agents.defaults.lms_main_model.clone();
+                    if !prev_model.is_empty() && prev_model != selected_id {
+                        match crate::lms::unload_model(
+                            &remote_host,
+                            port,
+                            &prev_model,
+                            self.config.timeouts.lms_unload_secs,
+                        )
+                        .await
+                        {
+                            Ok(()) => report.note(format!("unloaded {prev_model}")),
+                            Err(e) => report.note(format!("warning: unload {prev_model}: {e}")),
+                        }
+                    }
+
+                    let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
+                    crate::lms::load_model(
+                        &remote_host,
+                        port,
+                        &selected_id,
+                        ctx,
+                        self.config.timeouts.lms_load_secs,
+                    )
+                    .await
+                    .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
+                    report.note(format!("loaded {selected_id}"));
+                }
+
+                self.config.agents.defaults.local_api_base = endpoint;
+                self.config.agents.defaults.lms_main_model = selected_id.clone();
+                self.config.agents.defaults.local_model = selected_id.clone();
+                if !crate::config::schema::is_higgs_backend(
+                    &self.config.agents.defaults.local_backend,
+                ) && self.config.agents.defaults.local_backend == "mlx"
+                {
+                    self.config.agents.defaults.local_backend = if is_lms {
+                        "lmstudio".to_string()
+                    } else {
+                        "omlx".to_string()
+                    };
+                }
+                if !is_lms {
+                    self.config.agents.defaults.skip_jit_gate = true;
+                }
+                self.srv.lms_managed = false;
+                self.current_model_path = PathBuf::from(&selected_id);
+                self.persist_local_config();
+                self.apply_and_rebuild_with(true);
+            }
+            ModelSource::File { path } => {
+                self.current_model_path = path.clone();
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                self.config.agents.defaults.local_model = name.clone();
+                let mut disk_cfg = load_config(None);
+                disk_cfg.agents.defaults.local_model = name;
+                save_config(&disk_cfg, None);
+                self.apply_and_rebuild();
+            }
+            ModelSource::Omlx { endpoint } => {
+                self.config.agents.defaults.local_api_base = endpoint;
+                self.config.agents.defaults.local_model = selected_id.clone();
+                self.config.agents.defaults.lms_main_model = selected_id.clone();
+                self.config.agents.defaults.local_backend = "omlx".to_string();
+                self.srv.lms_managed = false;
+                self.current_model_path = PathBuf::from(&selected_id);
+                self.persist_local_config();
+                self.apply_and_rebuild_with(true);
+                report.note(format!(
+                    "switched to {selected_id} (oMLX will load on first request)"
+                ));
+            }
+            ModelSource::Higgs {
+                endpoint,
+                path,
+                name,
+            } => {
+                self.config.agents.defaults.local_api_base = endpoint.clone();
+                self.config.agents.defaults.local_backend = "higgs".to_string();
+                self.config.agents.defaults.skip_jit_gate = true;
+                self.srv.lms_managed = false;
+                self.srv.engine = super::super::InferenceEngine::Higgs;
+
+                if let Some(model_path) = path {
+                    let loaded_name = crate::higgs::switch_runtime_model(
+                        &endpoint,
+                        &self.config.agents.defaults.local_api_key,
+                        &model_path,
+                        &name,
+                        self.config.timeouts.lms_load_secs,
+                    )
+                    .await
+                    .map_err(|e| format!("failed to switch Higgs to {selected_id}: {e}"))?;
+                    report.note(format!("Higgs loaded {loaded_name}"));
+
+                    self.config.agents.defaults.local_model = selected_id.clone();
+                    self.config.agents.defaults.lms_main_model = "active".to_string();
+                    self.config.agents.defaults.mlx_model_dir = Some(model_path.clone());
+                    self.current_model_path = PathBuf::from(model_path.as_str());
+                } else {
+                    self.config.agents.defaults.local_model = selected_id.clone();
+                    self.config.agents.defaults.lms_main_model = selected_id.clone();
+                    self.current_model_path = PathBuf::from(&selected_id);
+                    report.note(format!("routing to resident Higgs model {selected_id}"));
+                }
+
+                self.persist_local_config();
+                self.apply_and_rebuild_with(true);
+            }
+        }
+
+        if self.config.trio.enabled {
+            let budget = self.compute_current_vram_budget();
+            if !budget.fits {
+                report.note(format!(
+                    "warning: VRAM usage ({:.1} GB) exceeds limit ({:.1} GB); use /trio budget for details",
+                    budget.total_vram_bytes as f64 / 1e9,
+                    budget.effective_limit_bytes as f64 / 1e9,
+                ));
+            }
+        }
+
+        Ok(report)
+    }
+
     /// /model [filter] — unified model picker across all sources.
     pub(super) async fn cmd_model(&mut self, filter: &str) {
         let has_cluster = {
@@ -498,274 +720,27 @@ impl ReplContext {
         };
 
         println!("\n  Selected: {}", selected.id);
-
-        // Dispatch based on source
-        match selected.source {
-            ModelSource::LocalLms { port } => {
-                // Unload previous model to free VRAM
-                let prev_model = self.config.agents.defaults.lms_main_model.clone();
-                if !prev_model.is_empty() && prev_model != selected.id {
-                    print!("  Unloading {}... ", prev_model);
-                    io::stdout().flush().ok();
-                    match crate::lms::unload_model(
-                        "",
-                        port,
-                        &prev_model,
-                        self.config.timeouts.lms_unload_secs,
-                    )
-                    .await
-                    {
-                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                        Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
-                    }
+        match self.apply_model_entry(selected).await {
+            Ok(report) => {
+                for note in report.notes {
+                    println!("  {note}");
                 }
-                // Load model with context
-                let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
-                print!("  Loading {}... ", selected.id);
-                io::stdout().flush().ok();
-                match crate::lms::load_model(
-                    "",
-                    port,
-                    &selected.id,
-                    ctx,
-                    self.config.timeouts.lms_load_secs,
-                )
-                .await
-                {
-                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                    Err(e) => {
-                        println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
-                        println!(
-                            "  {}Model switch aborted; config was not changed.{}\n",
-                            tui::DIM,
-                            tui::RESET
-                        );
-                        return;
-                    }
-                }
-                // Persist — switch backend away from "mlx" to LM Studio HTTP.
-                // Do NOT overwrite "higgs" backend: Higgs is a managed sidecar
-                // that happens to list models via the LM Studio protocol on its port.
-                self.config.agents.defaults.local_model = selected.id.clone();
-                self.config.agents.defaults.lms_main_model = selected.id.clone();
-                if !crate::config::schema::is_higgs_backend(
-                    &self.config.agents.defaults.local_backend,
-                ) {
-                    self.config.agents.defaults.local_backend = "lmstudio".to_string();
-                }
-                self.current_model_path = PathBuf::from(&selected.id);
-                let mut disk_cfg = load_config(None);
-                disk_cfg.agents.defaults.local_model = selected.id.clone();
-                disk_cfg.agents.defaults.lms_main_model = selected.id;
-                if !crate::config::schema::is_higgs_backend(&disk_cfg.agents.defaults.local_backend)
-                {
-                    disk_cfg.agents.defaults.local_backend = "lmstudio".to_string();
-                }
-                save_config(&disk_cfg, None);
-                self.apply_and_rebuild();
-            }
-            ModelSource::Remote {
-                ref endpoint,
-                #[cfg(feature = "cluster")]
-                ref peer_type,
-                #[cfg(not(feature = "cluster"))]
-                    peer_type: _,
-            } => {
-                // Determine if this is an LM Studio peer that supports load/unload
-                #[cfg(feature = "cluster")]
-                let is_lms = *peer_type == crate::cluster::state::PeerType::LMStudio;
-                #[cfg(not(feature = "cluster"))]
-                let is_lms = false;
-
-                if is_lms {
-                    // LM Studio remote peer: do unload/load like local LMS
-                    let Some(port) = Self::extract_endpoint_port(endpoint) else {
-                        println!(
-                            "  {}FAILED: could not parse LM Studio endpoint port from {}{}",
-                            tui::RED,
-                            endpoint,
-                            tui::RESET
-                        );
-                        println!(
-                            "  {}Model switch aborted; config was not changed.{}\n",
-                            tui::DIM,
-                            tui::RESET
-                        );
-                        return;
-                    };
-
-                    let remote_host = super::super::extract_url_host(endpoint);
-                    let prev_model = self.config.agents.defaults.lms_main_model.clone();
-                    if !prev_model.is_empty() && prev_model != selected.id {
-                        print!("  Unloading {}... ", prev_model);
-                        io::stdout().flush().ok();
-                        match crate::lms::unload_model(
-                            &remote_host,
-                            port,
-                            &prev_model,
-                            self.config.timeouts.lms_unload_secs,
-                        )
-                        .await
-                        {
-                            Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                            Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
-                        }
-                    }
-                    let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
-                    print!("  Loading {}... ", selected.id);
-                    io::stdout().flush().ok();
-                    match crate::lms::load_model(
-                        &remote_host,
-                        port,
-                        &selected.id,
-                        ctx,
-                        self.config.timeouts.lms_load_secs,
-                    )
-                    .await
-                    {
-                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                        Err(e) => {
-                            println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
-                            println!(
-                                "  {}Model switch aborted; config was not changed.{}\n",
-                                tui::DIM,
-                                tui::RESET
-                            );
-                            return;
-                        }
-                    }
-                }
-                // Set endpoint + model (same as /cl use logic).
-                // Switch backend away from "mlx" (in-process) so rebuild uses
-                // the HTTP provider for this remote/oMLX endpoint.
-                // Do NOT overwrite "higgs" backend: a Higgs-managed endpoint may
-                // appear as a Remote source when the cluster peer list includes it.
-                self.config.agents.defaults.local_api_base = endpoint.clone();
-                self.config.agents.defaults.lms_main_model = selected.id.clone();
-                self.config.agents.defaults.local_model = selected.id.clone();
-                if !crate::config::schema::is_higgs_backend(
-                    &self.config.agents.defaults.local_backend,
-                ) {
-                    // Only switch backend when the current value would route
-                    // through in-process MLX. Preserve a valid HTTP backend tag
-                    // (e.g. "lmstudio") so it isn't masked behind "omlx" for
-                    // non-oMLX peers like llama.cpp.
-                    if self.config.agents.defaults.local_backend == "mlx" {
-                        self.config.agents.defaults.local_backend = if is_lms {
-                            "lmstudio".to_string()
-                        } else {
-                            "omlx".to_string()
-                        };
-                    }
-                }
-                // llama.cpp (and other non-LMS remote peers) do not JIT-load
-                // models: a single-permit JitGate would needlessly serialise
-                // requests against the peer with no benefit. Skip it.
-                if !is_lms {
-                    self.config.agents.defaults.skip_jit_gate = true;
-                }
-                // No longer managed by LM Studio — prevent watchdog auto-restart.
-                self.srv.lms_managed = false;
-                self.current_model_path = PathBuf::from(&selected.id);
-                self.persist_local_config();
-                self.apply_and_rebuild_with(true);
-            }
-            ModelSource::File { ref path } => {
-                self.current_model_path = path.clone();
-                let name = path.file_name().unwrap().to_string_lossy().to_string();
-                self.config.agents.defaults.local_model = name.clone();
-                let mut disk_cfg = load_config(None);
-                disk_cfg.agents.defaults.local_model = name;
-                save_config(&disk_cfg, None);
-                self.apply_and_rebuild();
-            }
-            ModelSource::Omlx { ref endpoint } => {
-                // oMLX uses LRU auto-eviction — just update config, no load/unload.
-                // Switch backend away from "mlx" (in-process) so rebuild uses HTTP.
-                self.config.agents.defaults.local_api_base = endpoint.clone();
-                self.config.agents.defaults.local_model = selected.id.clone();
-                self.config.agents.defaults.lms_main_model = selected.id.clone();
-                self.config.agents.defaults.local_backend = "omlx".to_string();
-                // No longer managed by LM Studio — prevent watchdog auto-restart.
-                self.srv.lms_managed = false;
-                self.current_model_path = PathBuf::from(&selected.id);
-                self.persist_local_config();
-                self.apply_and_rebuild_with(true);
                 println!(
-                    "  Switched to {} (oMLX will load on first request).",
-                    selected.id
+                    "  {}Model switched to {}.{}\n",
+                    tui::DIM,
+                    report.model_id,
+                    tui::RESET
                 );
             }
-            ModelSource::Higgs {
-                ref endpoint,
-                ref path,
-                ref name,
-            } => {
-                self.config.agents.defaults.local_api_base = endpoint.clone();
-                self.config.agents.defaults.local_backend = "higgs".to_string();
-                self.config.agents.defaults.skip_jit_gate = true;
-                self.srv.lms_managed = false;
-                self.srv.engine = super::super::InferenceEngine::Higgs;
-
-                if let Some(model_path) = path {
-                    print!("  Switching Higgs to {}... ", selected.id);
-                    io::stdout().flush().ok();
-                    match crate::higgs::switch_runtime_model(
-                        endpoint,
-                        &self.config.agents.defaults.local_api_key,
-                        model_path,
-                        name,
-                        self.config.timeouts.lms_load_secs,
-                    )
-                    .await
-                    {
-                        Ok(loaded_name) => {
-                            println!("{}OK{} ({loaded_name})", tui::GREEN, tui::RESET);
-                        }
-                        Err(e) => {
-                            println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
-                            println!(
-                                "  {}Model switch aborted; config was not changed.{}\n",
-                                tui::DIM,
-                                tui::RESET
-                            );
-                            return;
-                        }
-                    }
-
-                    self.config.agents.defaults.local_model = selected.id.clone();
-                    // Higgs' switch endpoint installs a stable alias for the
-                    // sole resident model; use it so future switches do not
-                    // depend on the loaded model's exposed name.
-                    self.config.agents.defaults.lms_main_model = "active".to_string();
-                    self.config.agents.defaults.mlx_model_dir = Some(model_path.clone());
-                    self.current_model_path = PathBuf::from(model_path.as_str());
-                } else {
-                    self.config.agents.defaults.local_model = selected.id.clone();
-                    self.config.agents.defaults.lms_main_model = selected.id.clone();
-                    self.current_model_path = PathBuf::from(&selected.id);
-                    println!("  Routing to resident Higgs model {}.", selected.id);
-                }
-
-                self.persist_local_config();
-                self.apply_and_rebuild_with(true);
-            }
-        }
-
-        // Warn if VRAM budget exceeded after model change
-        if self.config.trio.enabled {
-            let budget = self.compute_current_vram_budget();
-            if !budget.fits {
+            Err(e) => {
+                println!("  {}FAILED:{} {}", tui::RED, tui::RESET, e);
                 println!(
-                    "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
-                    budget.total_vram_bytes as f64 / 1e9,
-                    budget.effective_limit_bytes as f64 / 1e9,
+                    "  {}Model switch aborted; config was not changed.{}\n",
+                    tui::DIM,
+                    tui::RESET
                 );
-                println!("  Use /trio budget for details.");
             }
         }
-
-        println!("  {}Model switched.{}\n", tui::DIM, tui::RESET);
     }
 
     /// /trio — manage trio mode (router + specialist helpers).
