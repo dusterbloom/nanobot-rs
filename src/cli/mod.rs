@@ -994,6 +994,21 @@ pub(crate) fn cmd_status() {
         workspace.display(),
         if workspace.exists() { "ok" } else { "missing" }
     );
+    let skills = crate::agent::skills::SkillsLoader::new(&workspace, None).validate_all();
+    if !skills.is_empty() {
+        let valid = skills.iter().filter(|s| s.is_valid()).count();
+        let errors: usize = skills.iter().map(|s| s.errors.len()).sum();
+        let warnings: usize = skills.iter().map(|s| s.warnings.len()).sum();
+        let issue_hint = if errors == 0 && warnings == 0 {
+            "ok".to_string()
+        } else {
+            format!(
+                "{} error(s), {} warning(s); run `nanobot skills validate`",
+                errors, warnings
+            )
+        };
+        println!("Skills: {}/{} valid [{}]", valid, skills.len(), issue_hint);
+    }
 
     if config_path.exists() {
         println!("Model: {}", config.agents.defaults.model);

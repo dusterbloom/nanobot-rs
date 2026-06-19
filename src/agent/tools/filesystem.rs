@@ -298,10 +298,11 @@ impl Tool for EditFileTool {
             if patch.trim().is_empty() {
                 return "Error: 'patch' parameter cannot be empty".to_string();
             }
-            let (new_content, hunks) = match apply_unified_patch(&content, patch) {
-                Ok(result) => result,
-                Err(e) => return e,
-            };
+            let (new_content, hunks) =
+                match super::apply_patch::apply_unified_patch_to_content(&content, patch) {
+                    Ok(result) => result,
+                    Err(e) => return e,
+                };
             return match tokio::fs::write(&file_path, new_content).await {
                 Ok(()) => format!("Successfully patched {} ({} hunk(s))", path, hunks),
                 Err(e) => {
@@ -1287,7 +1288,7 @@ fn bounded_u64_param(
         .unwrap_or(default)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
@@ -1433,194 +1434,6 @@ fn truncate_chars_with_notice(s: &str, max_chars: usize) -> String {
     out
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PatchLine {
-    Context(String),
-    Remove(String),
-    Add(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PatchHunk {
-    old_start: usize,
-    lines: Vec<PatchLine>,
-}
-
-fn apply_unified_patch(content: &str, patch: &str) -> Result<(String, usize), String> {
-    let hunks = parse_unified_patch(patch)?;
-    if hunks.is_empty() {
-        return Err("Error: patch contains no @@ hunks".to_string());
-    }
-
-    let newline = if content.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let normalized = content.replace("\r\n", "\n");
-    let had_final_newline = normalized.ends_with('\n');
-    let original: Vec<String> = if normalized.is_empty() {
-        Vec::new()
-    } else {
-        normalized.lines().map(str::to_string).collect()
-    };
-
-    let mut result = Vec::new();
-    let mut src_index = 0usize;
-
-    for hunk in &hunks {
-        let old_lines = hunk_old_lines(hunk);
-        let preferred = hunk.old_start.saturating_sub(1);
-        let match_index = if old_lines.is_empty() {
-            preferred.clamp(src_index, original.len())
-        } else {
-            find_hunk_match(&original, &old_lines, preferred, src_index).ok_or_else(|| {
-                format!(
-                    "Error: patch hunk starting at original line {} did not match file contents. Re-read the file or regenerate the diff.",
-                    hunk.old_start
-                )
-            })?
-        };
-
-        if match_index < src_index {
-            return Err(format!(
-                "Error: patch hunks overlap near original line {}",
-                hunk.old_start
-            ));
-        }
-        result.extend_from_slice(&original[src_index..match_index]);
-
-        let mut hunk_src = match_index;
-        for line in &hunk.lines {
-            match line {
-                PatchLine::Context(text) => {
-                    if original.get(hunk_src) != Some(text) {
-                        return Err(format!(
-                            "Error: patch context mismatch near line {}",
-                            hunk_src + 1
-                        ));
-                    }
-                    result.push(text.clone());
-                    hunk_src += 1;
-                }
-                PatchLine::Remove(text) => {
-                    if original.get(hunk_src) != Some(text) {
-                        return Err(format!(
-                            "Error: patch removal mismatch near line {}",
-                            hunk_src + 1
-                        ));
-                    }
-                    hunk_src += 1;
-                }
-                PatchLine::Add(text) => result.push(text.clone()),
-            }
-        }
-        src_index = hunk_src;
-    }
-
-    result.extend_from_slice(&original[src_index..]);
-    let mut updated = result.join(newline);
-    if had_final_newline && !updated.is_empty() {
-        updated.push_str(newline);
-    }
-    Ok((updated, hunks.len()))
-}
-
-fn parse_unified_patch(patch: &str) -> Result<Vec<PatchHunk>, String> {
-    let normalized = patch.replace("\r\n", "\n");
-    let mut hunks = Vec::new();
-    let mut current: Option<PatchHunk> = None;
-
-    for raw in normalized.lines() {
-        if raw.starts_with("--- ") || raw.starts_with("+++ ") || raw.starts_with("diff ") {
-            continue;
-        }
-        if raw.starts_with("@@") {
-            if let Some(hunk) = current.take() {
-                hunks.push(hunk);
-            }
-            current = Some(PatchHunk {
-                old_start: parse_hunk_old_start(raw)?,
-                lines: Vec::new(),
-            });
-            continue;
-        }
-
-        let Some(hunk) = current.as_mut() else {
-            continue;
-        };
-        if raw == r"\ No newline at end of file" {
-            continue;
-        }
-        let mut chars = raw.chars();
-        let Some(prefix) = chars.next() else {
-            return Err("Error: malformed patch line without prefix".to_string());
-        };
-        let text = chars.as_str().to_string();
-        match prefix {
-            ' ' => hunk.lines.push(PatchLine::Context(text)),
-            '-' => hunk.lines.push(PatchLine::Remove(text)),
-            '+' => hunk.lines.push(PatchLine::Add(text)),
-            _ => {
-                return Err(format!(
-                    "Error: malformed patch line '{}'. Lines inside hunks must start with space, '-', or '+'.",
-                    raw
-                ))
-            }
-        }
-    }
-
-    if let Some(hunk) = current {
-        hunks.push(hunk);
-    }
-    Ok(hunks)
-}
-
-fn parse_hunk_old_start(header: &str) -> Result<usize, String> {
-    let old_part = header
-        .split_whitespace()
-        .find(|part| part.starts_with('-'))
-        .ok_or_else(|| format!("Error: malformed hunk header '{}'", header))?;
-    let start = old_part
-        .trim_start_matches('-')
-        .split(',')
-        .next()
-        .unwrap_or("1")
-        .parse::<usize>()
-        .map_err(|_| format!("Error: malformed hunk header '{}'", header))?;
-    Ok(start.max(1))
-}
-
-fn hunk_old_lines(hunk: &PatchHunk) -> Vec<String> {
-    hunk.lines
-        .iter()
-        .filter_map(|line| match line {
-            PatchLine::Context(text) | PatchLine::Remove(text) => Some(text.clone()),
-            PatchLine::Add(_) => None,
-        })
-        .collect()
-}
-
-fn find_hunk_match(
-    original: &[String],
-    old_lines: &[String],
-    preferred: usize,
-    min_index: usize,
-) -> Option<usize> {
-    if old_lines.is_empty() {
-        return Some(preferred.clamp(min_index, original.len()));
-    }
-    if preferred >= min_index && lines_match_at(original, old_lines, preferred) {
-        return Some(preferred);
-    }
-    let max_start = original.len().saturating_sub(old_lines.len());
-    (min_index..=max_start).find(|&idx| lines_match_at(original, old_lines, idx))
-}
-
-fn lines_match_at(original: &[String], needle: &[String], start: usize) -> bool {
-    start + needle.len() <= original.len() && original[start..start + needle.len()] == *needle
-}
-
 /// Extract a line range from content.
 ///
 /// `range` format: "start:end" (1-indexed, inclusive) or "start:" (to end).
@@ -1717,7 +1530,7 @@ fn render_range(content: &str, start: usize, end: usize, path: &str, total: usiz
 /// Small/delegation models sometimes omit the full workspace prefix and
 /// pass bare filenames like `MEMORY.md`. Resolving against the workspace
 /// makes these succeed instead of failing with "File not found".
-fn expand_path(path: &str) -> PathBuf {
+pub(crate) fn expand_path(path: &str) -> PathBuf {
     if path.starts_with('~') {
         return crate::utils::helpers::expand_tilde(path);
     }
@@ -1734,7 +1547,7 @@ fn expand_path(path: &str) -> PathBuf {
     }
 }
 
-fn resolve_read_path(path: &str) -> PathBuf {
+pub(crate) fn resolve_read_path(path: &str) -> PathBuf {
     let expanded = expand_path(path);
     if expanded.exists() {
         return expanded;
@@ -2518,7 +2331,8 @@ mod tests {
 @@ -1,0 +1,2 @@
 +alpha
 +beta";
-        let (updated, hunks) = apply_unified_patch("", patch).unwrap();
+        let (updated, hunks) =
+            crate::agent::tools::apply_patch::apply_unified_patch_to_content("", patch).unwrap();
         assert_eq!(hunks, 1);
         assert_eq!(updated, "alpha\nbeta");
     }

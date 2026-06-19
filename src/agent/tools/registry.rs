@@ -8,10 +8,10 @@ use serde_json::Value;
 
 use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolExecutionResult};
 use super::{
-    BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, FileInfoTool, FindFilesTool,
-    ListDirTool, ReadFileTool, ReadSkillTool, RecallTool, RememberTool, SearchFilesTool,
-    SessionSearchTool, SystemInfoTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool,
-    WriteFileTool,
+    ApplyPatchTool, BatchTool, BrowserTool, CodeExecutionTool, EditFileTool, ExecTool,
+    FileInfoTool, FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool, ReadSkillTool,
+    RecallTool, RememberTool, SearchContextTool, SearchFilesTool, SessionSearchTool,
+    SystemInfoTool, ToolStatusTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
 use crate::config::schema::CodeExecutionConfig;
@@ -265,7 +265,7 @@ impl ToolRegistry {
     /// after this.
     pub fn register_standard_tools(&mut self, config: &ToolConfig) {
         let should_include = |name: &str| -> bool {
-            if config.read_only && matches!(name, "write_file" | "edit_file") {
+            if config.read_only && matches!(name, "write_file" | "edit_file" | "apply_patch") {
                 return false;
             }
             if let Some(ref filter) = config.tools_filter {
@@ -277,11 +277,17 @@ impl ToolRegistry {
         if should_include("read_file") {
             self.register(Box::new(ReadFileTool));
         }
+        if should_include("file_preview") {
+            self.register(Box::new(FilePreviewTool));
+        }
         if should_include("write_file") {
             self.register(Box::new(WriteFileTool));
         }
         if should_include("edit_file") {
             self.register(Box::new(EditFileTool));
+        }
+        if should_include("apply_patch") {
+            self.register(Box::new(ApplyPatchTool));
         }
         if should_include("list_dir") {
             self.register(Box::new(ListDirTool));
@@ -292,14 +298,29 @@ impl ToolRegistry {
         if should_include("search_files") {
             self.register(Box::new(SearchFilesTool));
         }
+        if should_include("search_context") {
+            self.register(Box::new(SearchContextTool::new(
+                config.workspace.clone(),
+                config.db_path.clone(),
+            )));
+        }
         if should_include("file_info") {
             self.register(Box::new(FileInfoTool));
+        }
+        if should_include("batch") {
+            self.register(Box::new(BatchTool::new(
+                config.workspace.clone(),
+                config.db_path.clone(),
+            )));
         }
         if should_include("workspace_diff") {
             self.register(Box::new(WorkspaceDiffTool));
         }
         if should_include("system_info") {
             self.register(Box::new(SystemInfoTool));
+        }
+        if should_include("tool_status") {
+            self.register(Box::new(ToolStatusTool::new(config.workspace.clone())));
         }
         if should_include("exec") {
             let exec_cwd = config.exec_working_dir.clone().unwrap_or_else(|| {
@@ -731,6 +752,18 @@ impl ToolRegistry {
             &["skill", "capability", "how to", "technique", "method"],
             "read_skill",
         ),
+        (
+            &[
+                "tool status",
+                "tools status",
+                "tool health",
+                "tool usage",
+                "tool observability",
+                "skill validation",
+                "validate skills",
+            ],
+            "tool_status",
+        ),
     ];
 
     /// Shared logic for building filtered tool definitions.
@@ -1043,22 +1076,29 @@ impl ToolRegistry {
         match phase {
             TaskPhase::FileEditing => Some(&[
                 "read_file",
+                "file_preview",
                 "write_file",
                 "edit_file",
+                "apply_patch",
                 "list_dir",
                 "find_files",
                 "search_files",
+                "search_context",
                 "file_info",
+                "batch",
                 "workspace_diff",
                 "exec",
             ]),
             TaskPhase::CodeExecution => Some(&[
                 "exec",
                 "read_file",
+                "file_preview",
                 "list_dir",
                 "find_files",
                 "search_files",
+                "search_context",
                 "file_info",
+                "batch",
                 "workspace_diff",
             ]),
             TaskPhase::WebResearch => Some(&["web_search", "web_fetch", "browser", "read_file"]),
@@ -1794,24 +1834,44 @@ mod tests {
     #[test]
     fn test_tools_for_phase_file_editing() {
         let tools = ToolRegistry::tools_for_phase(&TaskPhase::FileEditing).unwrap();
-        assert!(tools.contains(&"read_file"));
-        assert!(tools.contains(&"edit_file"));
-        assert!(tools.contains(&"write_file"));
-        assert!(tools.contains(&"find_files"));
-        assert!(tools.contains(&"search_files"));
-        assert!(tools.contains(&"file_info"));
-        assert!(tools.contains(&"workspace_diff"));
-        assert_eq!(tools.len(), 9);
+        for t in [
+            "read_file",
+            "file_preview",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "list_dir",
+            "find_files",
+            "search_files",
+            "search_context",
+            "file_info",
+            "batch",
+            "workspace_diff",
+            "exec",
+        ] {
+            assert!(tools.contains(&t), "FileEditing phase missing {t}");
+        }
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]
     fn test_tools_for_phase_code_execution() {
         let tools = ToolRegistry::tools_for_phase(&TaskPhase::CodeExecution).unwrap();
-        assert!(tools.contains(&"exec"));
-        assert!(tools.contains(&"read_file"));
-        assert!(tools.contains(&"search_files"));
-        assert!(tools.contains(&"workspace_diff"));
-        assert_eq!(tools.len(), 7);
+        for t in [
+            "exec",
+            "read_file",
+            "file_preview",
+            "list_dir",
+            "find_files",
+            "search_files",
+            "search_context",
+            "file_info",
+            "batch",
+            "workspace_diff",
+        ] {
+            assert!(tools.contains(&t), "CodeExecution phase missing {t}");
+        }
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]

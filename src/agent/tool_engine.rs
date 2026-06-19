@@ -32,8 +32,9 @@ const INLINE_TOOL_RESULT_HOT_PROMPT_MIN_CHARS: usize = 800;
 /// papers over by fabricating. Keep raw output for these up to ~4000 tokens.
 fn summary_threshold_tokens(tool_name: &str) -> usize {
     match tool_name {
-        "exec" | "list_dir" | "find_files" | "search_files" | "file_info" | "workspace_diff"
-        | "system_info" | "web_search" | "read_file" => 4000,
+        "exec" | "list_dir" | "find_files" | "search_files" | "search_context" | "file_info"
+        | "file_preview" | "batch" | "workspace_diff" | "system_info" | "tool_status"
+        | "web_search" | "read_file" => 4000,
         _ => LARGE_TOOL_RESULT_TOKEN_THRESHOLD,
     }
 }
@@ -551,12 +552,16 @@ fn is_parallel_safe(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "read_file"
+            | "file_preview"
             | "list_dir"
             | "find_files"
             | "search_files"
+            | "search_context"
             | "file_info"
+            | "batch"
             | "workspace_diff"
             | "system_info"
+            | "tool_status"
             | "web_fetch"
             | "web_search"
             | "read_skill"
@@ -1052,12 +1057,16 @@ mod tests {
     fn test_is_parallel_safe_classification() {
         // Parallel-safe tools
         assert!(is_parallel_safe("read_file"));
+        assert!(is_parallel_safe("file_preview"));
         assert!(is_parallel_safe("list_dir"));
         assert!(is_parallel_safe("find_files"));
         assert!(is_parallel_safe("search_files"));
+        assert!(is_parallel_safe("search_context"));
         assert!(is_parallel_safe("file_info"));
+        assert!(is_parallel_safe("batch"));
         assert!(is_parallel_safe("workspace_diff"));
         assert!(is_parallel_safe("system_info"));
+        assert!(is_parallel_safe("tool_status"));
         assert!(is_parallel_safe("web_fetch"));
         assert!(is_parallel_safe("web_search"));
         assert!(is_parallel_safe("read_skill"));
@@ -1065,6 +1074,7 @@ mod tests {
         assert!(!is_parallel_safe("exec"));
         assert!(!is_parallel_safe("write_file"));
         assert!(!is_parallel_safe("edit_file"));
+        assert!(!is_parallel_safe("apply_patch"));
         assert!(!is_parallel_safe("spawn"));
         // Unknown defaults to serial
         assert!(!is_parallel_safe("unknown_tool"));
