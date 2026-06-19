@@ -167,7 +167,7 @@ impl Tool for SpawnToolLite {
 
     fn description(&self) -> &str {
         "Run a background task, list tasks, check results, wait, or cancel.\n\
-         spawn: start task (needs 'task'). list: show all tasks. check: get result (needs 'task_id').\n\
+         spawn: start task (needs 'task'). list: show all tasks. check: get result or running status (needs 'task_id').\n\
          wait: block until done (needs 'task_id'). cancel: abort task (needs 'task_id').\n\
          Example: {\"action\": \"spawn\", \"task\": \"search for all TODO comments\"}"
     }
@@ -179,7 +179,7 @@ impl Tool for SpawnToolLite {
                 "action": {
                     "type": "string",
                     "enum": ["spawn", "list", "check", "wait", "cancel"],
-                    "description": "spawn=start new task, list=show tasks, check=get result, wait=block until done, cancel=abort"
+                    "description": "spawn=start new task, list=show tasks, check=get completed result or running status, wait=block until done, cancel=abort"
                 },
                 "task": {
                     "type": "string",
@@ -210,11 +210,11 @@ impl Tool for SpawnTool {
 
     fn description(&self) -> &str {
         "Spawn a subagent to handle a task in the background, list running and recently completed subagents, \
-         check a specific result, wait for one to finish, cancel one, \
+         check a specific result or running status, wait for one to finish, cancel one, \
          run a multi-step pipeline, or run an autonomous refinement loop. \
          Use action='spawn' (default) to start a new subagent. \
          Use action='list' to see running subagents AND recently completed ones. \
-         Use action='check' with task_id to retrieve a completed subagent's result (non-blocking). \
+         Use action='check' with task_id to retrieve a completed subagent's result or a non-blocking running status. \
          Use action='wait' with task_id to block until a subagent finishes and get its result. \
          Use action='cancel' with task_id to abort a stuck subagent. \
          Use action='pipeline' with steps array for multi-step execution with optional tool use per step. \

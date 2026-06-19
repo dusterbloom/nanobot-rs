@@ -213,20 +213,6 @@ impl AgentLoop {
             lcm_config,
             lcm_compactor,
             health_registry,
-            calibrator: {
-                let cal: Option<Arc<parking_lot::Mutex<_>>> =
-                    match crate::agent::budget_calibrator::BudgetCalibrator::open_default() {
-                        Ok(c) => Some(Arc::new(parking_lot::Mutex::new(c))),
-                        Err(e) => {
-                            tracing::warn!(
-                                "BudgetCalibrator init failed, recording disabled: {}",
-                                e
-                            );
-                            None
-                        }
-                    };
-                cal
-            },
             #[cfg(feature = "cluster")]
             cluster_router: None,
             knowledge_store: crate::agent::knowledge_store::KnowledgeStore::open_default()
@@ -276,7 +262,7 @@ impl AgentLoop {
     /// Spawn a periodic bulletin refresh task (compaction model, when idle).
     fn spawn_bulletin_refresh(shared: &Arc<AgentLoopShared>, running: &Arc<AtomicBool>) {
         let core = shared.core_handle.swappable();
-        if !core.memory_enabled {
+        if !core.memory_enabled || core.mode().is_local() {
             return;
         }
         let provider = core.memory_provider.clone();

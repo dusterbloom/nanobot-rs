@@ -220,6 +220,10 @@ pub struct RuntimeCounters {
     /// extension of the last send. Re-anchored on every send. See
     /// `agent::prefix_guard`.
     pub prompt_cache_watermark: parking_lot::Mutex<std::collections::HashMap<String, usize>>,
+    /// Sessions whose system/runtime prompt already advertised LCM summaries.
+    /// Adding that block after a cache is warm mutates the prompt head, so it is
+    /// introduced only at a cold/checkpoint boundary and then kept stable.
+    pub lcm_prompt_advertised: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 impl RuntimeCounters {
@@ -254,6 +258,7 @@ impl RuntimeCounters {
             ),
             prompt_fingerprints: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_cache_watermark: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            lcm_prompt_advertised: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -455,9 +460,9 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         RuntimeMode::Cloud => context.scale_budgets(max_context_tokens),
     }
     context.model_name = model.clone();
-    // `local_prompt_mode` still reads `is_local` during Wave 2 parallel rollout;
-    // Wave 3 migrates this to `matches!(mode, RuntimeMode::Local { .. })`.
-    context.local_prompt_mode = is_local;
+    // Keep prompt assembly behind the typed runtime descriptor, so local/cloud
+    // behavior has one source of truth while the legacy bool is phased out.
+    context.local_prompt_mode = mode.is_local();
     // Inject provenance verification rules when enabled.
     if provenance.enabled && provenance.system_prompt_rules {
         context.provenance_enabled = true;

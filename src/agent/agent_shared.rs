@@ -57,6 +57,22 @@ fn send_cache_reset_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<String
     }
 }
 
+fn clear_prompt_cache_state(ctx: &TurnContext) -> bool {
+    let had_fingerprint = ctx
+        .counters
+        .prompt_fingerprints
+        .lock()
+        .remove(&ctx.session_key)
+        .is_some();
+    let had_watermark = ctx
+        .counters
+        .prompt_cache_watermark
+        .lock()
+        .remove(&ctx.session_key)
+        .is_some();
+    had_fingerprint || had_watermark
+}
+
 fn send_retract_reply_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>) {
     if let Some(tx) = tx {
         let _ = tx.send("\x00retract_reply".to_string());
@@ -102,9 +118,6 @@ pub(crate) struct AgentLoopShared {
     pub(crate) lcm_compactor: Option<Arc<ContextCompactor>>,
     /// Health probe registry — used to gate LCM compaction when endpoint is degraded.
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
-    /// Budget calibrator for recording execution stats (append-only SQLite).
-    pub(crate) calibrator:
-        Option<Arc<parking_lot::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>>,
     /// Cluster router for distributed inference (feature-gated).
     #[cfg(feature = "cluster")]
     pub(crate) cluster_router: Option<Arc<crate::cluster::router::ClusterRouter>>,
@@ -260,6 +273,13 @@ pub(crate) struct FlowControl {
     /// Consecutive rounds where ALL tool calls were blocked by the guard.
     /// When this reaches the threshold, the loop forces a text response.
     pub(crate) consecutive_all_blocked: u32,
+    /// Set during tool execution when a round executed ZERO tools — every call
+    /// was boundary-rejected or duplicate-blocked. Such a round made no progress,
+    /// so the main loop does not spend a real iteration on it. Reset at the start
+    /// of each iteration. Bounded by construction: the response boundary is
+    /// one-shot (can't re-reject without an intervening successful round) and the
+    /// duplicate circuit breaker forces a text response after 2 all-blocked rounds.
+    pub(crate) round_executed_no_tools: bool,
     /// When the LLM call started — set in step_call_llm, read in step_process_response.
     pub(crate) llm_call_start: Option<std::time::Instant>,
     /// Time to first token (ms) for the current LLM call: elapsed from
@@ -535,6 +555,9 @@ impl AgentLoopShared {
             }
 
             ctx.iterations_used = iteration + 1;
+            // Per-round progress flag; tool execution sets it true if every call
+            // was blocked/rejected (see the Continue arm below).
+            ctx.flow.round_executed_no_tools = false;
             let outcome = self.run_iteration(ctx, iteration).await;
 
             // Check for pending backtrack (set by BacktrackTool during tool execution).
@@ -599,9 +622,22 @@ impl AgentLoopShared {
                     // an empty-response retry. Restoring before the retry runs defeats
                     // the purpose. Restoration happens in the Finished arm instead.
 
-                    // Successful tool execution — reset both counters.
-                    consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
+
+                    // A round where every tool call was blocked/rejected ran no
+                    // tool and made no progress — don't spend a real iteration on
+                    // it (so a behavioral-boundary rejection or a duplicate block
+                    // can't silently eat the budget). Bounded: the boundary is
+                    // one-shot and the duplicate circuit breaker caps it at 2.
+                    if ctx.flow.round_executed_no_tools {
+                        debug!(
+                            "iteration not counted: round executed no tools (all blocked/rejected)"
+                        );
+                        continue;
+                    }
+
+                    // Successful tool execution — reset the empty counter.
+                    consecutive_empty = 0;
                     iteration += 1;
                     // Consume step budget if plan-guided.
                     {
@@ -830,28 +866,11 @@ impl AgentLoopShared {
 
         ctx.flow.iterations_since_compaction += 1;
 
-        // Check if background compaction finished — swap in compacted messages.
-        if let Ok(mut guard) = ctx.compaction.slot.try_lock() {
-            if let Some(pending) = guard.take() {
-                debug!(
-                    "Compaction swap: {} msgs -> {} compacted + {} new",
-                    pending.watermark,
-                    pending.result.messages.len(),
-                    ctx.messages.len().saturating_sub(pending.watermark)
-                );
-                apply_compaction_result(&mut ctx.messages, pending);
-                // After compaction, all messages in the array are "new" from
-                // the perspective of persistence (the session file was rebuilt).
-                ctx.new_start = ctx.messages.len();
-                ctx.flow.iterations_since_compaction = 0;
-                // Bug 5 fix: after compaction ctx.messages shrinks but the LCM
-                // engine's store_len reflects the old count. Override the
-                // skip offset so step_pre_call ingests from index 0 (i.e. all
-                // messages in the new shorter array) instead of skipping past
-                // the end.
-                ctx.lcm_synced_to = Some(0);
-            }
-        }
+        // Install finished compaction only at cold/checkpoint boundaries. LCM may
+        // summarize in the background, but replacing already-sent prompt bytes
+        // while the local prefix cache is warm causes the long re-prefill stalls
+        // this cache watermark is meant to prevent.
+        self.install_pending_compaction(ctx, false).await;
 
         StepResult::Next(IterationPhase::PreCall)
     }
@@ -935,10 +954,7 @@ impl AgentLoopShared {
                 frozen_prefix,
             );
         if !prefix_preserved && frozen_prefix > 0 {
-            ctx.counters
-                .prompt_cache_watermark
-                .lock()
-                .remove(&ctx.session_key);
+            clear_prompt_cache_state(ctx);
             send_cache_reset_marker(&ctx.text_delta_tx, "trim");
             warn!(
                 session = %ctx.session_key,
@@ -949,6 +965,9 @@ impl AgentLoopShared {
             );
         }
         ctx.messages = trimmed_messages;
+        if !prefix_preserved {
+            self.install_pending_compaction(ctx, true).await;
+        }
 
         // Spawn background compaction when threshold exceeded.
         self.manage_compaction(ctx, tool_def_tokens).await;
@@ -1034,10 +1053,7 @@ impl AgentLoopShared {
                 .token_budget
                 .trim_to_fit_with_age_preserving_prefix(&ctx.messages, 0, 0, 0, frozen_prefix);
             if !prefix_preserved && frozen_prefix > 0 {
-                ctx.counters
-                    .prompt_cache_watermark
-                    .lock()
-                    .remove(&ctx.session_key);
+                clear_prompt_cache_state(ctx);
                 send_cache_reset_marker(&ctx.text_delta_tx, "emergency_trim");
                 warn!(
                     session = %ctx.session_key,
@@ -1048,6 +1064,9 @@ impl AgentLoopShared {
                 );
             }
             ctx.messages = trimmed_messages;
+            if !prefix_preserved {
+                self.install_pending_compaction(ctx, true).await;
+            }
             // Re-render after trim to rebuild protocol-correct wire format.
             ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
         }
@@ -1070,11 +1089,6 @@ impl AgentLoopShared {
                     debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
                     tool_defs = saved_tool_defs;
                 }
-            }
-            crate::agent::router::PreflightResult::Pipeline(_steps_json) => {
-                info!("[trio] pipeline action received");
-                // Message already injected by router_preflight.
-                // Continue to main model — full pipeline execution TBD.
             }
         }
 
@@ -1196,6 +1210,70 @@ impl AgentLoopShared {
         (tool_defs, saved_tool_defs)
     }
 
+    /// Install a finished compaction result only when it cannot invalidate a
+    /// warm cached prefix, or when the caller already made an explicit
+    /// checkpoint/reset. Otherwise leave the result pending as sidecar LCM state.
+    async fn install_pending_compaction(
+        &self,
+        ctx: &mut TurnContext,
+        allow_checkpoint: bool,
+    ) -> bool {
+        let Ok(mut guard) = ctx.compaction.slot.try_lock() else {
+            return false;
+        };
+        let Some(pending) = guard.take() else {
+            return false;
+        };
+
+        let frozen_prefix = ctx
+            .counters
+            .prompt_cache_watermark
+            .lock()
+            .get(&ctx.session_key)
+            .copied()
+            .unwrap_or(0);
+        let rewrites_prompt = pending.result.messages.len() < pending.watermark;
+        if rewrites_prompt && frozen_prefix > 0 && !allow_checkpoint {
+            debug!(
+                session = %ctx.session_key,
+                frozen_prefix,
+                compacted_messages = pending.result.messages.len(),
+                watermark = pending.watermark,
+                "lcm_compaction_deferred_for_prompt_cache"
+            );
+            *guard = Some(pending);
+            return false;
+        }
+
+        if rewrites_prompt && clear_prompt_cache_state(ctx) {
+            send_cache_reset_marker(&ctx.text_delta_tx, "lcm_checkpoint");
+            warn!(
+                session = %ctx.session_key,
+                frozen_prefix,
+                compacted_messages = pending.result.messages.len(),
+                watermark = pending.watermark,
+                "prompt_cache_watermark_invalidated_by_lcm_checkpoint"
+            );
+        }
+
+        debug!(
+            "Compaction swap: {} msgs -> {} compacted + {} new",
+            pending.watermark,
+            pending.result.messages.len(),
+            ctx.messages.len().saturating_sub(pending.watermark)
+        );
+        apply_compaction_result(&mut ctx.messages, pending);
+        // After compaction, all messages in the array are "new" from the
+        // perspective of persistence (the session file was rebuilt).
+        ctx.new_start = ctx.messages.len();
+        ctx.flow.iterations_since_compaction = 0;
+        // Bug 5 fix: after compaction ctx.messages shrinks but the LCM engine's
+        // store_len reflects the old count. Override the skip offset so
+        // step_pre_call ingests from index 0 instead of skipping past the end.
+        ctx.lcm_synced_to = Some(0);
+        true
+    }
+
     /// Spawn background compaction when threshold exceeded.
     ///
     /// When LCM is enabled, uses the LCM engine's control loop (with DAG,
@@ -1253,7 +1331,19 @@ impl AgentLoopShared {
             if !lcm_healthy {
                 debug!("LCM compaction skipped: endpoint degraded");
             }
-            if lcm_healthy && !ctx.compaction.in_flight.load(Ordering::Relaxed) {
+            let has_pending_compaction = ctx
+                .compaction
+                .slot
+                .try_lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(true);
+            if has_pending_compaction {
+                debug!("LCM compaction skipped: pending checkpoint not installed yet");
+            }
+            if lcm_healthy
+                && !has_pending_compaction
+                && !ctx.compaction.in_flight.load(Ordering::Relaxed)
+            {
                 let (action, conv_tokens, available, hard_limit, soft_limit) = {
                     let engine = lcm_engine.lock().await;
                     let action = engine.check_thresholds(&ctx.core.token_budget, tool_def_tokens);
@@ -1286,7 +1376,7 @@ impl AgentLoopShared {
                         let bg_session_key = ctx.session_key.clone();
                         let bg_session_id = ctx.session_id.clone();
                         let bg_lcm = lcm_engine.clone();
-                        let mut bg_lcm_compactor = self.lcm_compactor.clone();
+                        let bg_lcm_compactor = self.lcm_compactor.clone();
                         let watermark = ctx.messages.len();
                         let bg_turn_count = ctx.turn_count;
                         in_flight.store(true, Ordering::SeqCst);
@@ -1407,83 +1497,106 @@ impl AgentLoopShared {
             // This is the key innovation: the system decides when to expand,
             // not the model. Uses keyword overlap (no LLM needed).
             {
+                let frozen_prefix = ctx
+                    .counters
+                    .prompt_cache_watermark
+                    .lock()
+                    .get(&ctx.session_key)
+                    .copied()
+                    .unwrap_or(0);
                 let mut engine = lcm_engine.lock().await;
-                if !engine.dag().is_empty() {
+                if !engine.dag().is_empty() && frozen_prefix == 0 {
                     let expanded = engine.auto_expand(&ctx.core.token_budget, tool_def_tokens);
                     if expanded {
                         // Replace ctx.messages with the auto-expanded context.
                         ctx.messages = engine.active_context();
                         debug!("LCM auto_expand: replaced context with expanded messages");
                     }
+                } else if !engine.dag().is_empty() {
+                    debug!(
+                        session = %ctx.session_key,
+                        frozen_prefix,
+                        "LCM auto_expand skipped: prompt cache warm"
+                    );
                 }
             }
-        } else if !ctx.compaction.in_flight.load(Ordering::Relaxed)
-            && ctx.core.compactor.needs_compaction(
-                &ctx.messages,
-                &ctx.core.token_budget,
-                tool_def_tokens,
-            )
-        {
-            tracing::info!(
-                compaction_type = "core_async",
-                msg_count = ctx.messages.len(),
-                "core_compaction_triggered"
-            );
-            let slot = ctx.compaction.slot.clone();
-            let in_flight = ctx.compaction.in_flight.clone();
-            let bg_messages = ctx.messages.clone();
-            let bg_core = ctx.core.clone();
-            let bg_session_key = ctx.session_key.clone();
-            let watermark = ctx.messages.len();
-            let bg_turn_count = ctx.turn_count;
-            in_flight.store(true, Ordering::SeqCst);
+        } else {
+            let has_pending_compaction = ctx
+                .compaction
+                .slot
+                .try_lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(true);
+            if has_pending_compaction {
+                debug!("Core compaction skipped: pending checkpoint not installed yet");
+            } else if !ctx.compaction.in_flight.load(Ordering::Relaxed)
+                && ctx.core.compactor.needs_compaction(
+                    &ctx.messages,
+                    &ctx.core.token_budget,
+                    tool_def_tokens,
+                )
+            {
+                tracing::info!(
+                    compaction_type = "core_async",
+                    msg_count = ctx.messages.len(),
+                    "core_compaction_triggered"
+                );
+                let slot = ctx.compaction.slot.clone();
+                let in_flight = ctx.compaction.in_flight.clone();
+                let bg_messages = ctx.messages.clone();
+                let bg_core = ctx.core.clone();
+                let bg_session_key = ctx.session_key.clone();
+                let watermark = ctx.messages.len();
+                let bg_turn_count = ctx.turn_count;
+                in_flight.store(true, Ordering::SeqCst);
 
-            let bg_proprio = self.proprioception_config.clone();
-            tokio::spawn(async move {
-                let timeout_result = tokio::time::timeout(Duration::from_secs(90), async {
-                    let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
-                        bg_core
-                            .compactor
-                            .compact_gradient(
-                                &bg_messages,
-                                &bg_core.token_budget,
-                                0,
-                                bg_proprio.raw_window,
-                                bg_proprio.light_window,
-                            )
-                            .await
-                    } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
-                        let reader =
-                            crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
-                        bg_core
-                            .compactor
-                            .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
-                            .await
-                    } else {
-                        bg_core
-                            .compactor
-                            .compact(&bg_messages, &bg_core.token_budget, 0)
-                            .await
-                    };
-                    if bg_core.memory_enabled {
-                        if let Some(ref summary) = result.observation {
-                            bg_core.working_memory.update_from_compaction(
-                                &bg_session_key,
-                                summary,
-                                bg_turn_count,
-                            );
+                let bg_proprio = self.proprioception_config.clone();
+                tokio::spawn(async move {
+                    let timeout_result = tokio::time::timeout(Duration::from_secs(90), async {
+                        let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
+                            bg_core
+                                .compactor
+                                .compact_gradient(
+                                    &bg_messages,
+                                    &bg_core.token_budget,
+                                    0,
+                                    bg_proprio.raw_window,
+                                    bg_proprio.light_window,
+                                )
+                                .await
+                        } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
+                            let reader =
+                                crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
+                            bg_core
+                                .compactor
+                                .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
+                                .await
+                        } else {
+                            bg_core
+                                .compactor
+                                .compact(&bg_messages, &bg_core.token_budget, 0)
+                                .await
+                        };
+                        if bg_core.memory_enabled {
+                            if let Some(ref summary) = result.observation {
+                                bg_core.working_memory.update_from_compaction(
+                                    &bg_session_key,
+                                    summary,
+                                    bg_turn_count,
+                                );
+                            }
                         }
+                        if result.messages.len() < bg_messages.len() {
+                            *slot.lock().await = Some(PendingCompaction { result, watermark });
+                        }
+                    })
+                    .await;
+                    if timeout_result.is_err() {
+                        warn!("Core compaction timed out after 90s, resetting in_flight");
                     }
-                    if result.messages.len() < bg_messages.len() {
-                        *slot.lock().await = Some(PendingCompaction { result, watermark });
-                    }
-                })
-                .await;
-                if timeout_result.is_err() {
-                    warn!("Core compaction timed out after 90s, resetting in_flight");
-                }
-                in_flight.store(false, Ordering::SeqCst);
-            });
+                    in_flight.store(false, Ordering::SeqCst);
+                });
+            }
         }
     }
 

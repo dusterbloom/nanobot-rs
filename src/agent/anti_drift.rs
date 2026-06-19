@@ -323,11 +323,23 @@ fn collapse_repetitive_attempts(messages: &mut Vec<Value>, min_count: usize) -> 
     collapsed
 }
 
-/// Inject a format anchor every `interval` iterations.
+/// Inject a format anchor when the model is drifting, at most once per
+/// `interval` iterations.
 ///
-/// The anchor is a short user message re-establishing critical behaviors.
+/// The anchor corrects text-instead-of-tools drift, so it is **need-based, not
+/// blind cadence**: a model that is actively calling tools is on-task, and
+/// re-anchoring it every N iterations is pure context noise that also nudges it
+/// into report→act cycles that burn iterations (observed: 5 anchors in a single
+/// 15-iteration turn while the model called a tool every step). The interval is
+/// only a floor on how often the anchor *can* fire; the drift check gates
+/// whether it actually does.
 fn inject_format_anchor(messages: &mut Vec<Value>, iteration: u32, interval: u32) -> bool {
     if interval == 0 || iteration == 0 || iteration % interval != 0 {
+        return false;
+    }
+    // On-task models don't get nagged: skip when a recent assistant turn made a
+    // tool call. Only genuine drift (recent turns all text-only) earns an anchor.
+    if recent_assistant_used_tools(messages) {
         return false;
     }
     // Don't inject if last message already contains an anchor
@@ -341,6 +353,22 @@ fn inject_format_anchor(messages: &mut Vec<Value>, iteration: u32, interval: u32
         "[format-anchor] Reminder: use tool calls for actions, not text descriptions. Be concise. No XML imitation. If unsure, ask.",
     ));
     true
+}
+
+/// True if any of the last two assistant turns made a tool call — i.e. the model
+/// is acting, not drifting into narration. Two turns (not one) so a single
+/// sanctioned text report after a boundary nudge doesn't read as drift.
+fn recent_assistant_used_tools(messages: &[Value]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .filter(|m| msg_role(m) == "assistant")
+        .take(2)
+        .any(|m| {
+            m.get("tool_calls")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty())
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +602,35 @@ mod tests {
     }
 
     #[test]
+    fn test_format_anchor_skipped_when_model_using_tools() {
+        // Need-based gate: a model that just made a tool call is on-task, so the
+        // anchor must NOT fire even on an interval boundary — this is the root
+        // cause of the scaffolding flood (an anchor every 3 iterations while the
+        // model called a tool every step).
+        let mut acting = vec![
+            json!({"role": "user", "content": "read the files"}),
+            json!({"role": "assistant", "content": "Reading.", "tool_calls": [{"id": "t1", "function": {"name": "read_file"}}]}),
+            json!({"role": "tool", "content": "contents", "tool_call_id": "t1"}),
+        ];
+        assert!(
+            !inject_format_anchor(&mut acting, 3, 3),
+            "anchor must be skipped while the model is actively calling tools"
+        );
+
+        // Genuine drift (consecutive text-only turns) still earns an anchor.
+        let mut drifting = vec![
+            json!({"role": "user", "content": "do it"}),
+            json!({"role": "assistant", "content": "Let me think about how I would approach this."}),
+            json!({"role": "user", "content": "go on"}),
+            json!({"role": "assistant", "content": "I believe it is probably fine, basically."}),
+        ];
+        assert!(
+            inject_format_anchor(&mut drifting, 3, 3),
+            "anchor should fire when recent assistant turns are all text-only"
+        );
+    }
+
+    #[test]
     fn test_collapse_babble() {
         let mut content = "First sentence here. Second sentence here. Third long sentence that goes on and on with many many words to push the count over the limit and trigger condensation of the overall response text. Fourth sentence adds even more words to make it clear. Fifth for good measure with padding words.".to_string();
         collapse_babble(&mut content, 20);
@@ -620,10 +677,10 @@ mod tests {
             // Turn 5: hallucination marker
             json!({"role": "user", "content": "Did it work?"}),
             json!({"role": "assistant", "content": "[Called read_file] I ran the command and I executed the parsing. The results are ready."}),
-            // Turn 6: current clean turn (safe window)
+            // Turn 6: STILL drifting — text-only narration, no tool call. This is
+            // exactly when a format anchor helps (two consecutive text-only turns).
             json!({"role": "user", "content": "Show me"}),
-            json!({"role": "assistant", "content": "Here are the parsed values.", "tool_calls": [{"id": "tc2", "function": {"name": "read_file"}}]}),
-            json!({"role": "tool", "content": "parsed=true", "tool_call_id": "tc2"}),
+            json!({"role": "assistant", "content": "I believe the values are probably correct based on my understanding."}),
             json!({"role": "user", "content": "Thanks"}),
         ]
     }
@@ -858,10 +915,9 @@ mod tests {
             json!({"role": "assistant", "content": "Certainly! Absolutely! Of course! Well, basically, honestly, I understand! I'd be happy to help! Thank you for asking! No problem!"}),
             json!({"role": "user", "content": "Do it"}),
             json!({"role": "assistant", "content": "[Called read_file] I ran the command and I executed it."}),
-            // Safe window
+            // Safe window — still drifting (text-only), so the anchor fires.
             json!({"role": "user", "content": "next"}),
-            json!({"role": "assistant", "content": "Done.", "tool_calls": [{"id": "tc1", "function": {"name": "exec"}}]}),
-            json!({"role": "tool", "content": "ok", "tool_call_id": "tc1"}),
+            json!({"role": "assistant", "content": "I think it is basically done now, probably."}),
             json!({"role": "user", "content": "thanks"}),
         ];
 

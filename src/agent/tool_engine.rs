@@ -944,6 +944,13 @@ pub(crate) async fn execute_tools_inline(
         .chain(sequential.iter())
         .map(|tc| tc.name.as_str())
         .collect();
+
+    // No tool actually ran this round — every call was boundary-rejected. The
+    // round made no progress, so the loop should not count it as an iteration.
+    if executed.is_empty() && !blocked.is_empty() {
+        ctx.flow.round_executed_no_tools = true;
+    }
+
     if should_arm_boundary(response.content.as_deref(), &executed) {
         ctx.flow.boundary = ResponseBoundary::Pending;
     }

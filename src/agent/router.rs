@@ -809,6 +809,27 @@ pub(crate) fn tool_preflight_result(
     }
 }
 
+fn normalize_pipeline_steps_for_spawn(steps: Value) -> Value {
+    match steps {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|mut step| {
+                    if let Some(obj) = step.as_object_mut() {
+                        if !obj.contains_key("prompt") {
+                            if let Some(instruction) = obj.get("instruction").cloned() {
+                                obj.insert("prompt".to_string(), instruction);
+                            }
+                        }
+                    }
+                    step
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// Result of the router preflight check.
 pub(crate) enum PreflightResult {
     /// Router injected a message — continue the main loop.
@@ -817,8 +838,6 @@ pub(crate) enum PreflightResult {
     Break(String),
     /// No router intervention — fall through to normal processing.
     Passthrough,
-    /// Router selected pipeline action — steps JSON injected, continue to main model.
-    Pipeline(String),
 }
 
 /// Router-first preflight for strict trio mode.
@@ -1143,17 +1162,76 @@ pub(crate) async fn router_preflight(
         }
         "pipeline" => {
             tracing::Span::current().record("routing_decision", "pipeline");
-            if ctx.core.trace_log {
-                append_router_decision_trace(&base_trace);
+            let Some(steps) = decision
+                .args
+                .get("steps")
+                .cloned()
+                .or_else(|| decision.args.as_array().map(|_| decision.args.clone()))
+            else {
+                if ctx.core.trace_log {
+                    let mut trace = base_trace.clone();
+                    trace.outcome = Some("ERROR: pipeline action requires args.steps".to_string());
+                    append_router_decision_trace(&trace);
+                }
+                return PreflightResult::Break(
+                    "Router selected pipeline action but did not provide steps.".to_string(),
+                );
+            };
+
+            let steps = normalize_pipeline_steps_for_spawn(steps);
+            let mut params = HashMap::new();
+            params.insert("action".to_string(), json!("pipeline"));
+            params.insert("steps".to_string(), steps);
+            if let Some(k) = decision
+                .args
+                .get("ahead_by_k")
+                .or_else(|| decision.args.get("aheadByK"))
+                .cloned()
+            {
+                params.insert("ahead_by_k".to_string(), k);
             }
-            let steps_json = decision.args.to_string();
-            info!("[trio] pipeline action selected by router, injecting steps");
+
+            if let Err(e) = ctx.flow.tool_guard.allow("spawn", &params) {
+                warn!("{}", e);
+                if ctx.core.trace_log {
+                    let mut trace = base_trace.clone();
+                    trace.outcome = Some(format!("BLOCKED: {}", e));
+                    append_router_decision_trace(&trace);
+                }
+                ctx.messages.push(json!({
+                    "role":"user",
+                    "content": format!("[tool-guard] {}", e),
+                }));
+                return PreflightResult::Continue;
+            }
+
+            info!("[trio] pipeline action selected by router, executing spawn pipeline");
+            let tr = ctx.tools.execute("spawn", params).await;
+            if ctx.core.trace_log {
+                let mut trace = base_trace.clone();
+                trace.outcome = Some(tr.data.clone());
+                append_router_decision_trace(&trace);
+            }
+            let content = extract_tool_content(&tr.data);
+            let truncated = truncate_tool_result(
+                &content,
+                ctx.core
+                    .tool_delegation_config
+                    .router_tuning
+                    .max_tool_result_chars,
+            );
             ctx.messages.push(serde_json::json!({
                 "role": "user",
-                "content": format!("[router:pipeline] {}", steps_json),
+                "content": format!(
+                    "[router:pipeline] Pipeline execution result. \
+                     Summarize the completed steps and outcome for the user:\n\n{}",
+                    truncated
+                ),
                 "_synthetic": true,
             }));
-            PreflightResult::Pipeline(steps_json)
+            *ctx.counters.trio_metrics.tool_dispatched.lock() = Some("spawn:pipeline".to_string());
+            ctx.used_tools.insert("spawn".to_string());
+            PreflightResult::Continue
         }
         _ => {
             tracing::Span::current().record("routing_decision", "unknown_passthrough");
@@ -1509,6 +1587,10 @@ pub(crate) async fn route_tool_calls(
                 return RouteResult::Continue;
             }
             ctx.flow.consecutive_all_blocked += 1;
+            // Every call was blocked and none had a cached result — no tool ran,
+            // so this round made no progress and must not consume a real
+            // iteration (bounded by the circuit breaker below).
+            ctx.flow.round_executed_no_tools = true;
             // Circuit breaker: after 2 consecutive all-blocked rounds, force a
             // text response. The LLM is stuck in a loop requesting the same tools.
             if ctx.flow.consecutive_all_blocked >= 2 {
@@ -1548,6 +1630,17 @@ mod tests {
     fn test_trio_config_specialist_output_schema_default_false() {
         let config = TrioConfig::default();
         assert!(!config.specialist_output_schema);
+    }
+
+    #[test]
+    fn test_normalize_pipeline_steps_accepts_instruction_alias() {
+        let normalized = normalize_pipeline_steps_for_spawn(json!([
+            {"instruction": "fetch weather", "expected": "brief forecast"}
+        ]));
+
+        assert_eq!(normalized[0]["prompt"], "fetch weather");
+        assert_eq!(normalized[0]["instruction"], "fetch weather");
+        assert_eq!(normalized[0]["expected"], "brief forecast");
     }
 
     // T10 — SpecialistResponse success field defaults to true
@@ -2310,16 +2403,6 @@ mod tests {
         match result {
             PreflightResult::Break(text) => assert_eq!(text, "Summary here"),
             _ => panic!("Expected Break with synthesis text"),
-        }
-    }
-
-    #[test]
-    fn test_preflight_pipeline_variant_exists() {
-        let steps_json = r#"[{"instruction":"step 1"}]"#.to_string();
-        let result = PreflightResult::Pipeline(steps_json);
-        match result {
-            PreflightResult::Pipeline(s) => assert!(s.contains("step 1")),
-            _ => panic!("expected Pipeline variant"),
         }
     }
 

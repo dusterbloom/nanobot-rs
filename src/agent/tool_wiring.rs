@@ -164,13 +164,32 @@ impl AgentLoopShared {
                 mgr.wait_for(&task_id, timeout).await
             })
         });
+        let subagents_ref_check = self.subagents.clone();
         let check_workspace = core.workspace.clone();
         let check_cb: CheckCallback = Arc::new(move |task_id: String| {
+            let mgr = subagents_ref_check.clone();
             let ws = check_workspace.clone();
             Box::pin(async move {
                 match SubagentManager::read_event_result(&ws, &task_id) {
                     Some(result) => result,
-                    None => format!("No completed result found for task_id '{}'.", task_id),
+                    None => {
+                        let running = mgr.list_running().await;
+                        if let Some(info) = running
+                            .iter()
+                            .find(|info| info.task_id.starts_with(&task_id))
+                        {
+                            let elapsed = info.started_at.elapsed().as_secs();
+                            format!(
+                                "Subagent '{}' ({}) is still running after {}s. Use action='wait' to block for completion, action='list' for all tasks, or action='cancel' to abort.",
+                                info.label, info.task_id, elapsed
+                            )
+                        } else {
+                            format!(
+                                "No running or completed result found for task_id '{}'.",
+                                task_id
+                            )
+                        }
+                    }
                 }
             })
         });

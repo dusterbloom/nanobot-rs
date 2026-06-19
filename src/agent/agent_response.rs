@@ -200,6 +200,25 @@ fn send_token_count(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, tok
     }
 }
 
+/// Stream the real decode time (ms) for the just-finished LLM call: the call's
+/// wall time minus its prefill (ttft). Renderers sum these across the turn to
+/// report a true decode tok/s that excludes tool-execution and re-prefill gaps
+/// between calls. Skipped when ttft is unknown (non-streaming call) — the
+/// renderer then falls back to `wall − first_ttft`.
+fn send_decode_time(
+    tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    call_start: Option<std::time::Instant>,
+    ttft_ms: Option<u64>,
+) {
+    let (Some(tx), Some(start), Some(ttft)) = (tx, call_start, ttft_ms) else {
+        return;
+    };
+    let decode_ms = (start.elapsed().as_millis() as u64).saturating_sub(ttft);
+    if decode_ms > 0 {
+        let _ = tx.send(format!("\x00decode_ms:{}", decode_ms));
+    }
+}
+
 /// Stream the provider-reported prompt-token count to the TUI. This lets the
 /// UI compute effective prefill throughput even when the local server does not
 /// stream prompt_progress chunks.
@@ -339,6 +358,14 @@ impl AgentLoopShared {
             .unwrap_or(-1);
         if completion_tokens > 0 {
             send_token_count(&ctx.text_delta_tx, completion_tokens as u64);
+            // Pair the token count with this call's real decode time (call wall
+            // time − prefill), so renderers report a true decode tok/s that
+            // excludes the tool-execution and re-prefill time between calls.
+            send_decode_time(
+                &ctx.text_delta_tx,
+                ctx.flow.llm_call_start,
+                ctx.flow.ttft_ms,
+            );
         }
 
         // --- Dispatch ---

@@ -133,6 +133,21 @@ impl AgentLoopShared {
 
         // LCM context awareness for local models.
         if self.lcm_enabled.load(Ordering::Relaxed) {
+            let cache_warm = self
+                .core_handle
+                .counters
+                .prompt_cache_watermark
+                .lock()
+                .get(session_key)
+                .copied()
+                .unwrap_or(0)
+                > 0;
+            let already_advertised = self
+                .core_handle
+                .counters
+                .lcm_prompt_advertised
+                .lock()
+                .contains(session_key);
             let has_summaries = {
                 let engines = self.lcm_engines.lock().await;
                 engines
@@ -140,12 +155,22 @@ impl AgentLoopShared {
                     .map(|e| e.try_lock().map_or(true, |eng| !eng.dag().is_empty()))
                     .unwrap_or(false)
             };
-            if has_summaries {
+            if has_summaries && (!cache_warm || already_advertised) {
+                self.core_handle
+                    .counters
+                    .lcm_prompt_advertised
+                    .lock()
+                    .insert(session_key.to_string());
                 blocks.push(crate::agent::context::PromptBlock::new(
                     "Context Management",
                     "Blocks marked [Summary of messages X-Y] are compressed earlier messages. \
                      Call lcm_expand with message IDs to retrieve originals.",
                 ));
+            } else if has_summaries {
+                tracing::debug!(
+                    session = %session_key,
+                    "lcm_context_block_deferred_for_prompt_cache"
+                );
             }
         }
 
@@ -211,6 +236,21 @@ impl AgentLoopShared {
 
         // LCM context awareness: tell the model about summarized context.
         if self.lcm_enabled.load(Ordering::Relaxed) {
+            let cache_warm = self
+                .core_handle
+                .counters
+                .prompt_cache_watermark
+                .lock()
+                .get(session_key)
+                .copied()
+                .unwrap_or(0)
+                > 0;
+            let already_advertised = self
+                .core_handle
+                .counters
+                .lcm_prompt_advertised
+                .lock()
+                .contains(session_key);
             let has_summaries = {
                 let engines = self.lcm_engines.lock().await;
                 engines
@@ -221,7 +261,12 @@ impl AgentLoopShared {
                     })
                     .unwrap_or(false)
             };
-            if has_summaries {
+            if has_summaries && (!cache_warm || already_advertised) {
+                self.core_handle
+                    .counters
+                    .lcm_prompt_advertised
+                    .lock()
+                    .insert(session_key.to_string());
                 sections.push(SectionEntry {
                     section: PromptSection::ToolUse,
                     block: PromptBlock::new(
@@ -237,6 +282,11 @@ impl AgentLoopShared {
                     included: true,
                     shrinkable: false,
                 });
+            } else if has_summaries {
+                tracing::debug!(
+                    session = %session_key,
+                    "lcm_context_section_deferred_for_prompt_cache"
+                );
             }
         }
 
@@ -695,6 +745,7 @@ impl AgentLoopShared {
                 iterations_since_compaction: 0,
                 content_was_streamed: false,
                 consecutive_all_blocked: 0,
+                round_executed_no_tools: false,
                 llm_call_start: None,
                 ttft_ms: None,
                 retries: crate::agent::agent_loop::RetryState::new(),
