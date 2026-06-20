@@ -12,9 +12,7 @@ use crate::agent::agent_loop::{
 };
 use crate::agent::lane::Lane;
 use crate::bus::events::{InboundMessage, OutboundMessage};
-use crate::config::schema::{
-    is_external_server_backend, is_higgs_backend, AdaptiveTokenConfig, Config,
-};
+use crate::config::schema::{is_higgs_backend, AdaptiveTokenConfig, Config};
 use crate::cron::service::CronService;
 use crate::providers::base::LLMProvider;
 use crate::providers::factory;
@@ -207,8 +205,7 @@ pub(super) fn make_local_providers(
     // ops without preventing any eviction — and serialised cold reloads are
     // exactly the 89–122s prefill outliers we saw.
     // Skip when lms CLI pre-loads models (skip_jit_gate = true).
-    let is_jit_server = !is_external_server_backend(&config.agents.defaults.local_backend)
-        && !is_higgs_backend(&config.agents.defaults.local_backend);
+    let is_jit_server = !is_higgs_backend(&config.agents.defaults.local_backend);
     let jit_gate: Option<Arc<JitGate>> =
         if has_custom_base && is_jit_server && !config.agents.defaults.skip_jit_gate {
             Some(Arc::new(JitGate::new()))

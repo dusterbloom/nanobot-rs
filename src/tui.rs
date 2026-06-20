@@ -609,21 +609,6 @@ pub(crate) fn print_mode_banner(local_port: &str, is_local: bool) {
     println!();
 }
 
-/// oMLX startup splash: clear screen, ASCII logo, oMLX endpoint info.
-pub(crate) fn print_omlx_splash(api_base: &str) {
-    print!("{CLEAR_SCREEN}");
-    std::io::Write::flush(&mut std::io::stdout()).ok();
-
-    print_logo();
-    let short = shorten_url(api_base);
-    print!("  {BOLD}{YELLOW}oMLX{RESET} {DIM}{short}{RESET}\r\n");
-    print!(
-        "  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}\r\n",
-        env!("CARGO_PKG_VERSION")
-    );
-    print!("\r\n");
-}
-
 /// Startup splash for Higgs managed sidecar.
 pub(crate) fn print_higgs_splash(model_name: &str, port: u16) {
     print!("{CLEAR_SCREEN}");

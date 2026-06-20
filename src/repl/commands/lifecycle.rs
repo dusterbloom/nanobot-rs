@@ -494,13 +494,8 @@ impl ReplContext {
                 self.config.agents.defaults.local_model = selected_id.clone();
                 if !crate::config::schema::is_higgs_backend(
                     &self.config.agents.defaults.local_backend,
-                ) && self.config.agents.defaults.local_backend == "mlx"
-                {
-                    self.config.agents.defaults.local_backend = if is_lms {
-                        "lmstudio".to_string()
-                    } else {
-                        "omlx".to_string()
-                    };
+                ) {
+                    self.config.agents.defaults.local_backend = "lmstudio".to_string();
                 }
                 if !is_lms {
                     self.config.agents.defaults.skip_jit_gate = true;
@@ -518,19 +513,6 @@ impl ReplContext {
                 disk_cfg.agents.defaults.local_model = name;
                 save_config(&disk_cfg, None);
                 self.apply_and_rebuild();
-            }
-            ModelSource::Omlx { endpoint } => {
-                self.config.agents.defaults.local_api_base = endpoint;
-                self.config.agents.defaults.local_model = selected_id.clone();
-                self.config.agents.defaults.lms_main_model = selected_id.clone();
-                self.config.agents.defaults.local_backend = "omlx".to_string();
-                self.srv.lms_managed = false;
-                self.current_model_path = PathBuf::from(&selected_id);
-                self.persist_local_config();
-                self.apply_and_rebuild_with(true);
-                report.note(format!(
-                    "switched to {selected_id} (oMLX will load on first request)"
-                ));
             }
             ModelSource::Higgs {
                 endpoint,
@@ -663,13 +645,6 @@ impl ReplContext {
                         }
                     }
                     ModelSource::File { .. } => "~/models/".to_string(),
-                    ModelSource::Omlx { ref endpoint } => {
-                        let short = crate::tui::shorten_url(endpoint)
-                            .split('/')
-                            .next()
-                            .unwrap_or(endpoint);
-                        format!("oMLX ({})", short)
-                    }
                     ModelSource::Higgs { ref endpoint, .. } => {
                         let short = crate::tui::shorten_url(endpoint)
                             .split('/')
@@ -1309,9 +1284,8 @@ impl ReplContext {
                     }
                 } else {
                     // LM Studio path
-                    let preference = &self.config.agents.defaults.inference_engine;
                     if let Some((super::super::InferenceEngine::Lms, bin)) =
-                        super::super::resolve_inference_engine(preference)
+                        super::super::resolve_inference_engine()
                     {
                         let lms_port = self.config.agents.defaults.lms_port;
                         println!(

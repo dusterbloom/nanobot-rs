@@ -93,8 +93,6 @@ enum ModelSource {
     },
     /// Filesystem GGUF file.
     File { path: PathBuf },
-    /// oMLX server (external, auto-discovery via LRU eviction).
-    Omlx { endpoint: String },
     /// Higgs server. `path` is present for runtime switchable models.
     Higgs {
         endpoint: String,
@@ -137,11 +135,6 @@ impl ModelEntry {
                 .unwrap_or(endpoint)
                 .to_string(),
             ModelSource::File { .. } => "file".to_string(),
-            ModelSource::Omlx { endpoint } => {
-                let short = crate::tui::shorten_url(endpoint);
-                let host = short.split('/').next().unwrap_or(&short);
-                format!("oMLX {host}")
-            }
             ModelSource::Higgs { endpoint, .. } => {
                 let short = crate::tui::shorten_url(endpoint);
                 let host = short.split('/').next().unwrap_or(&short);
@@ -604,10 +597,6 @@ impl ReplContext {
             #[cfg(not(feature = "cluster"))]
             let covered_by_cluster = false;
 
-            let is_omlx = crate::config::schema::is_external_server_backend(
-                &self.config.agents.defaults.local_backend,
-            );
-
             if !base.is_empty() && !already_covered && (!covered_by_cluster || is_higgs) {
                 let api_key = &self.config.agents.defaults.local_api_key;
                 if is_higgs {
@@ -697,18 +686,12 @@ impl ReplContext {
                                         &[id.clone()],
                                         &current_model,
                                     );
-                                    let source = if is_omlx {
-                                        ModelSource::Omlx {
-                                            endpoint: base.clone(),
-                                        }
-                                    } else {
-                                        ModelSource::Remote {
-                                            endpoint: base.clone(),
-                                            #[cfg(feature = "cluster")]
-                                            peer_type: crate::cluster::state::PeerType::Unknown,
-                                            #[cfg(not(feature = "cluster"))]
-                                            peer_type: (),
-                                        }
+                                    let source = ModelSource::Remote {
+                                        endpoint: base.clone(),
+                                        #[cfg(feature = "cluster")]
+                                        peer_type: crate::cluster::state::PeerType::Unknown,
+                                        #[cfg(not(feature = "cluster"))]
+                                        peer_type: (),
                                     };
                                     entries.push(ModelEntry {
                                         id,

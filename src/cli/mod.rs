@@ -167,15 +167,6 @@ mod tests {
     // -- inference engine detection tests --
 
     #[test]
-    fn test_inference_engine_mlx_detected() {
-        let mut cfg = Config::default();
-        cfg.agents.defaults.inference_engine = "mlx".to_string();
-        assert_eq!(cfg.agents.defaults.inference_engine, "mlx");
-        // MLX preset should default to qwen3.5-2b
-        assert_eq!(cfg.agents.defaults.mlx_preset, "qwen3.5-2b");
-    }
-
-    #[test]
     fn test_inference_engine_mlx_model_dir_default() {
         let cfg = Config::default();
         assert!(

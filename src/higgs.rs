@@ -114,14 +114,21 @@ pub(crate) async fn server_start(
     }
 
     if wait_for_ready(port, 1).await {
-        if is_serving_expected_model(port, model_dir, local_model).await {
+        // An externally-managed higgs (one nanobot did not spawn) is the user's
+        // server, reached via the localApiBase they configured. Trust it: a
+        // model-name mismatch is a warning, not a hard error. Returning Err here
+        // made the caller clear localApiBase and silently fall back to a dead
+        // default port (the :8080 bug).
+        if !is_serving_expected_model(port, model_dir, local_model).await {
+            tracing::warn!(
+                port,
+                "externally-managed higgs is serving a model that does not match the \
+                 configured mlxModelDir/localModel; using it anyway (run /model to switch)"
+            );
+        } else {
             tracing::info!(port, "higgs port already responding (externally managed)");
-            return Ok(StartResult::Ready);
         }
-        return Err(format!(
-            "port {port} is serving a different model than configured.\n\
-             Stop the existing server and retry, or update mlxModelDir to match."
-        ));
+        return Ok(StartResult::Ready);
     }
 
     if let Some(existing_pid) = find_existing_higgs_process() {

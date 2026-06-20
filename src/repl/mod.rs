@@ -1411,9 +1411,7 @@ impl ServerState {
 /// Returns `(engine_kind, binary_path)` for the first available engine.
 /// Currently only resolves LM Studio. Higgs is handled separately via
 /// `use_higgs` / `is_higgs_backend` in the startup and `/l` paths.
-pub(crate) fn resolve_inference_engine(
-    _preference: &str,
-) -> Option<(InferenceEngine, std::path::PathBuf)> {
+pub(crate) fn resolve_inference_engine() -> Option<(InferenceEngine, std::path::PathBuf)> {
     crate::lms::find_lms_binary().map(|b| (InferenceEngine::Lms, b))
 }
 
@@ -1457,20 +1455,6 @@ pub(crate) struct ActiveChannel {
     pub handle: tokio::task::JoinHandle<()>,
 }
 
-/// Quick reachability probe for an OpenAI-compatible base URL (≤2s). Used to
-/// avoid a long warmup hang when the oMLX server isn't up.
-async fn omlx_reachable(base: &str) -> bool {
-    let url = format!("{}/models", base.trim_end_matches('/'));
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            reqwest::Client::new().get(&url).send(),
-        )
-        .await,
-        Ok(Ok(_))
-    )
-}
-
 pub(crate) fn cmd_agent(
     message: Option<String>,
     session_id: String,
@@ -1496,7 +1480,11 @@ pub(crate) fn cmd_agent(
     let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
     let is_local = local_flag || local_env || has_remote_local;
 
-    let local_port = std::env::var("NANOBOT_LOCAL_PORT").unwrap_or_else(|_| "8080".to_string());
+    // Fallback local port when no localApiBase is set. Defaults to the LM Studio
+    // port (the only remaining JIT backend), never a hardcoded :8080 that nothing
+    // listens on. NANOBOT_LOCAL_PORT still overrides.
+    let local_port = std::env::var("NANOBOT_LOCAL_PORT")
+        .unwrap_or_else(|_| config.agents.defaults.lms_port.to_string());
     if !is_local {
         let api_key = config.get_api_key();
         let model = &config.agents.defaults.model;
@@ -1539,23 +1527,12 @@ pub(crate) fn cmd_agent(
             config.agents.defaults.local_model.clone()
         };
 
-        // When localBackend is "mlx" and we're in local mode, skip all LM Studio
-        // setup and use in-process MLX inference instead.
-        let use_mlx_local = is_local && config.agents.defaults.local_backend == "mlx";
-        // When localBackend is "omlx", skip LM Studio spawn and
-        // peer probing — the user manages the server externally at localApiBase.
-        let use_omlx = is_local
-            && crate::config::schema::is_external_server_backend(
-                &config.agents.defaults.local_backend,
-            );
         // When localBackend is "higgs", auto-start Higgs as a managed sidecar.
         let use_higgs = is_local
-            && crate::config::schema::is_higgs_backend(
-                &config.agents.defaults.local_backend,
-            );
+            && crate::config::schema::is_higgs_backend(&config.agents.defaults.local_backend);
         // True when the backend requires LM Studio management (spawn, probe, trio, JIT warmup).
-        // False for MLX (in-process), oMLX (externally managed), and Higgs (managed sidecar).
-        let needs_lms = is_local && !use_mlx_local && !use_omlx && !use_higgs;
+        // False for Higgs (managed sidecar) and any pre-configured external server (localApiBase).
+        let needs_lms = is_local && !use_higgs;
         let mut higgs_sidecar_port: Option<u16> = None;
 
         // Higgs sidecar: auto-start when backend is "higgs" (single-message or interactive).
@@ -1576,6 +1553,12 @@ pub(crate) fn cmd_agent(
                 && !host_port.starts_with("localhost:")
                 && !host_port.starts_with("127.0.0.1:")
         };
+        // A pre-configured remote base is not a nanobot-managed JIT server, so don't
+        // serialise its requests behind the JIT gate (what the removed "omlx" backend
+        // used to signal). Resident servers stall under a single-permit gate.
+        if api_base_is_remote_host {
+            config.agents.defaults.skip_jit_gate = true;
+        }
         if use_higgs && api_base_is_remote_host {
             info!(
                 api_base = %config.agents.defaults.local_api_base,
@@ -1615,8 +1598,10 @@ pub(crate) fn cmd_agent(
                                 config.agents.defaults.skip_jit_gate = true;
                             }
                             Err(e) => {
+                                // Don't clear a user-set localApiBase on failure — falling back
+                                // to a default port silently routes to a dead server (the :8080
+                                // bug). Surface the error; let requests fail against the real URL.
                                 eprintln!("Warning: failed to start Higgs: {e}");
-                                config.agents.defaults.local_api_base.clear();
                             }
                         }
                     } else {
@@ -1639,11 +1624,10 @@ pub(crate) fn cmd_agent(
         let mut trio_state: Option<ServerState> = None;
         // Recompute has_remote_local — Higgs auto-start may have filled local_api_base.
         let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
-        if !use_mlx_local && !use_higgs && !has_remote_local && is_local && message.is_some() {
+        if !use_higgs && !has_remote_local && is_local && message.is_some() {
             // Single-message local mode: start LMS if available.
             let mut srv = ServerState::new(local_port.clone());
-            let preference = &config.agents.defaults.inference_engine;
-            if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine(preference) {
+            if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine() {
                 let lms_port = config.agents.defaults.lms_port;
                 match crate::lms::server_start(&bin, lms_port).await {
                     Ok(()) => {
@@ -1738,27 +1722,6 @@ pub(crate) fn cmd_agent(
         }
         let mut config = config; // shadow to allow mutation
         let is_interactive = message.is_none();
-        if is_interactive && use_omlx {
-            tui::register_resize_handler();
-            let base = config.agents.defaults.local_api_base.clone();
-            tui::print_omlx_splash(&base);
-            // Warm the oMLX model now so the first message isn't a cold load.
-            // (The JIT warmup further below is LMS-only; oMLX otherwise loads
-            // the model lazily on the first real request → slow first TTFT.)
-            let warm_model = if !config.agents.defaults.lms_main_model.is_empty() {
-                config.agents.defaults.lms_main_model.clone()
-            } else {
-                config.agents.defaults.local_model.clone()
-            };
-            if !warm_model.is_empty() && omlx_reachable(&base).await {
-                use std::io::Write as _;
-                print!("  {}Warming up {}...{} ", tui::DIM, warm_model, tui::RESET);
-                io::stdout().flush().ok();
-                let key = config.agents.defaults.local_api_key.clone();
-                crate::providers::jit_gate::warmup_jit_models(&base, &key, &[&warm_model]).await;
-                println!("{}done{}", tui::DIM, tui::RESET);
-            }
-        }
         if is_interactive && use_higgs {
             tui::register_resize_handler();
             let higgs_port = config.agents.defaults.higgs_port;
@@ -1768,8 +1731,7 @@ pub(crate) fn cmd_agent(
             tui::register_resize_handler();
             tui::print_startup_splash(&local_port, is_local);
 
-            let preference = &config.agents.defaults.inference_engine;
-            if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine(preference) {
+            if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine() {
                 let lms_port = config.agents.defaults.lms_port;
                 println!(
                     "  {}{}LM Studio{} detected, starting server on port {}...",

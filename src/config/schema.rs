@@ -252,14 +252,9 @@ pub struct AgentDefaults {
     /// Port for the LM Studio server when managed by lms CLI (default: 1234).
     #[serde(default = "default_lms_port")]
     pub lms_port: u16,
-    /// Inference engine preference: "auto" | "lms" | "mlx".
-    /// "mlx" uses the MLX provider with external mlx-lm/vllm-mlx/oMLX inference.
-    #[serde(default = "default_inference_engine")]
-    pub inference_engine: String,
-    /// Local backend for `-l` mode: "lmstudio" (default, HTTP to LM Studio),
-    /// "mlx" (MLX model dir + managed/external mlx-lm inference),
-    /// "omlx" (external oMLX server at `localApiBase`, no managed spawn), or
+    /// Local backend for `-l` mode: "lmstudio" (default, HTTP to LM Studio) or
     /// "higgs" (managed Higgs Rust MLX server, auto-started on `higgsPort`).
+    /// Any other OpenAI-compatible server is reached by setting `localApiBase`.
     #[serde(default = "default_local_backend")]
     pub local_backend: String,
     /// Port for the managed Higgs server (default: 8091).
@@ -281,13 +276,6 @@ pub struct AgentDefaults {
     /// MLX model config preset: "qwen3-1.7b" or "qwen3.5-2b". Default: "qwen3.5-2b".
     #[serde(default = "default_mlx_preset")]
     pub mlx_preset: String,
-    /// MLX inference server URL or backend selector.
-    /// - `"auto"`: spawn managed `mlx_lm.server` on port 8090 (default when unset and `localApiBase` is empty)
-    /// - `"vllm-mlx"`: spawn managed `vllm-mlx serve` on port 8090 (continuous batching, tool calling)
-    /// - `"http://..."`: connect to an external server
-    /// - `null`/absent: prefer `localApiBase` if set, else behave like `"auto"`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mlx_lm_url: Option<String>,
     /// Path to a YAML instruction profiles file for model-specific prompt
     /// engineering. When set, profiles are loaded at startup and applied to
     /// every LLM call based on the active model name and task kind.
@@ -387,22 +375,12 @@ fn default_local_model() -> String {
     "gemma-3n-e4b-it-Q4_K_M.gguf".to_string()
 }
 
-fn default_inference_engine() -> String {
-    "auto".to_string()
-}
-
 fn default_local_api_key() -> String {
     "local".to_string()
 }
 
 fn default_local_backend() -> String {
     "lmstudio".to_string()
-}
-
-/// Whether the local backend is an externally managed server (oMLX).
-/// These skip LM Studio spawn, peer probing, and in-process MLX setup.
-pub fn is_external_server_backend(backend: &str) -> bool {
-    backend == "omlx"
 }
 
 /// Whether the local backend is a managed Higgs server.
@@ -467,13 +445,11 @@ impl Default for AgentDefaults {
             lms_main_model: String::new(),
             lms_port: default_lms_port(),
             higgs_port: default_higgs_port(),
-            inference_engine: default_inference_engine(),
             local_backend: default_local_backend(),
             mlx_model_dir: None,
             draft_model: None,
             num_draft_tokens: None,
             mlx_preset: default_mlx_preset(),
-            mlx_lm_url: None,
             instructions_path: None,
             skip_jit_gate: false,
             local_thinking_reserve_tokens: default_local_thinking_reserve_tokens(),
