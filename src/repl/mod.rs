@@ -1722,14 +1722,20 @@ pub(crate) fn cmd_agent(
         }
         let mut config = config; // shadow to allow mutation
         let is_interactive = message.is_none();
-        if is_interactive && use_higgs {
+        // The full-screen TUI renders its own intro; suppress the legacy stdout
+        // splash (CLEAR_SCREEN + logo) so the old screen never flashes before
+        // ratatui takes the alternate screen.
+        let show_splash = !crate::tui_app::enabled();
+        if is_interactive && use_higgs && show_splash {
             tui::register_resize_handler();
             let higgs_port = config.agents.defaults.higgs_port;
             tui::print_higgs_splash(&local_model_name, higgs_port);
         }
         if is_interactive && needs_lms && !has_remote_local {
-            tui::register_resize_handler();
-            tui::print_startup_splash(&local_port, is_local);
+            if show_splash {
+                tui::register_resize_handler();
+                tui::print_startup_splash(&local_port, is_local);
+            }
 
             if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine() {
                 let lms_port = config.agents.defaults.lms_port;
@@ -2048,7 +2054,7 @@ pub(crate) fn cmd_agent(
             // Interactive REPL mode.
             // Splash and LMS detection already happened above (before core build).
             // Skip for MLX/oMLX local — already printed banner above.
-            if (needs_lms || !is_local) && (!is_local || has_remote_local) {
+            if (needs_lms || !is_local) && (!is_local || has_remote_local) && show_splash {
                 tui::register_resize_handler();
                 tui::print_startup_splash(&local_port, is_local);
             }
