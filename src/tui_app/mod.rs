@@ -859,19 +859,21 @@ async fn run_turn(
     let (tool_tx, mut tool_rx) = unbounded_channel::<ToolEvent>();
     let cancel = CancellationToken::new();
 
-    let fut = session.agent.process_direct_streaming(
-        &turn.text,
-        session.session_id,
-        channel,
-        "direct",
-        session.lang,
+    // Spawn the agent on its own task so this render loop keeps drawing while a
+    // CPU-heavy turn runs — otherwise synchronous stretches inside the turn
+    // (prompt build, JSON encode, parsing) would starve the `tick` branch and
+    // freeze the spinner/elapsed clock. We select on the JoinHandle instead.
+    let mut handle = session.agent.spawn_direct_streaming(
+        turn.text.clone(),
+        session.session_id.to_string(),
+        channel.to_string(),
+        "direct".to_string(),
+        session.lang.map(|s| s.to_string()),
         delta_tx,
         Some(tool_tx),
         Some(cancel.clone()),
-        None,
-        (!turn.media.is_empty()).then_some(turn.media.as_slice()),
+        (!turn.media.is_empty()).then(|| turn.media.clone()),
     );
-    tokio::pin!(fut);
 
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -898,7 +900,7 @@ async fn run_turn(
                     }
                 }
             }
-            resp = &mut fut => break resp,
+            joined = &mut handle => break joined.unwrap_or_default(),
             Some(d) = delta_rx.recv(), if !cancel_requested => app.on_delta(&d),
             Some(e) = tool_rx.recv(), if !cancel_requested => {
                 drain_pending_deltas(app, &mut delta_rx);

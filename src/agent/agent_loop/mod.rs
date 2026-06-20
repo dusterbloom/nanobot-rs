@@ -662,16 +662,14 @@ impl AgentLoop {
             Self::spawn_background_reflection(&self.shared);
         }
 
-        let mut msg = InboundMessage::new(channel, "user", chat_id, content);
-        msg.metadata
-            .insert("session_key".to_string(), json!(session_key));
-        if let Some(lang) = detected_language {
-            msg.metadata
-                .insert("detected_language".to_string(), json!(lang));
-        }
-        if let Some(media) = media_paths.filter(|paths| !paths.is_empty()) {
-            msg.metadata.insert("media".to_string(), json!(media));
-        }
+        let msg = Self::build_direct_message(
+            channel,
+            chat_id,
+            content,
+            session_key,
+            detected_language,
+            media_paths,
+        );
 
         match self
             .shared
@@ -687,6 +685,77 @@ impl AgentLoop {
             Some(response) => response.content,
             None => String::new(),
         }
+    }
+
+    /// Build the `InboundMessage` for a direct (CLI/TUI) turn. Shared by
+    /// [`Self::process_direct_streaming`] and [`Self::spawn_direct_streaming`].
+    fn build_direct_message(
+        channel: &str,
+        chat_id: &str,
+        content: &str,
+        session_key: &str,
+        detected_language: Option<&str>,
+        media_paths: Option<&[String]>,
+    ) -> InboundMessage {
+        let mut msg = InboundMessage::new(channel, "user", chat_id, content);
+        msg.metadata
+            .insert("session_key".to_string(), json!(session_key));
+        if let Some(lang) = detected_language {
+            msg.metadata
+                .insert("detected_language".to_string(), json!(lang));
+        }
+        if let Some(media) = media_paths.filter(|paths| !paths.is_empty()) {
+            msg.metadata.insert("media".to_string(), json!(media));
+        }
+        msg
+    }
+
+    /// Spawn a direct streaming turn on its own task, returning a handle to the
+    /// final response text. Unlike [`Self::process_direct_streaming`] (awaited
+    /// inline), the agent work runs on a separate task — so a caller driving its
+    /// own loop (the TUI render loop) keeps redrawing while a CPU-heavy turn
+    /// runs, and the animation never stalls behind the model. Args are owned so
+    /// the spawned future is `'static`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_direct_streaming(
+        &self,
+        content: String,
+        session_key: String,
+        channel: String,
+        chat_id: String,
+        detected_language: Option<String>,
+        text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent::audit::ToolEvent>>,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        media_paths: Option<Vec<String>>,
+    ) -> tokio::task::JoinHandle<String> {
+        if !self.reflection_spawned.swap(true, Ordering::SeqCst) {
+            Self::spawn_background_reflection(&self.shared);
+        }
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            let msg = Self::build_direct_message(
+                &channel,
+                &chat_id,
+                &content,
+                &session_key,
+                detected_language.as_deref(),
+                media_paths.as_deref(),
+            );
+            match shared
+                .process_message(
+                    &msg,
+                    Some(text_delta_tx),
+                    tool_event_tx,
+                    cancellation_token,
+                    None,
+                )
+                .await
+            {
+                Some(response) => response.content,
+                None => String::new(),
+            }
+        })
     }
 }
 
