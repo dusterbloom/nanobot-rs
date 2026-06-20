@@ -274,7 +274,7 @@ async fn event_loop(
                             turn.media.clear();
                         }
                     }
-                    queued = run_turn(terminal, app, &session, &turn, ev_rx)
+                    queued = run_turn(terminal, app, &session, &turn, "cli", ev_rx)
                         .await?
                         .queued_turn;
                     save_current_snapshot(app, ctx).await;
@@ -802,6 +802,7 @@ async fn voice_cycle(
                     text: text.clone(),
                     media: Vec::new(),
                 },
+                "voice",
                 ev_rx,
             )
             .await?;
@@ -849,6 +850,7 @@ async fn run_turn(
     app: &mut App,
     session: &Session<'_>,
     turn: &SubmittedTurn,
+    channel: &str,
     ev_rx: &mut UnboundedReceiver<Event>,
 ) -> std::io::Result<TurnOutcome> {
     app.begin_turn(&turn.display_text());
@@ -860,7 +862,7 @@ async fn run_turn(
     let fut = session.agent.process_direct_streaming(
         &turn.text,
         session.session_id,
-        "cli",
+        channel,
         "direct",
         session.lang,
         delta_tx,
