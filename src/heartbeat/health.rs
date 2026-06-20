@@ -327,6 +327,71 @@ impl HealthProbe for TrioEndpointProbe {
     }
 }
 
+// --- SearXNGProbe ---
+
+/// Health probe for a SearXNG search backend.
+///
+/// Pings `{base_url}/health` every 60s with a 5s timeout. SearXNG instances
+/// that expose `/health` (the default Docker image does) return HTTP 200 when
+/// alive. A stuck/unreachable container produces a connection error or 5xx,
+/// which after `DEGRADED_THRESHOLD` consecutive failures surfaces as
+/// `Degraded` in `/status`. This catches the failure mode where the container
+/// is technically running but no longer responding to queries — the symptom
+/// is `web_search` silently returning zero results.
+pub struct SearXNGProbe {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl SearXNGProbe {
+    pub fn new(base_url: &str) -> Self {
+        let base = base_url.trim_end_matches('/').to_string();
+        Self {
+            base_url: base,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HealthProbe for SearXNGProbe {
+    fn name(&self) -> &str {
+        "searxng"
+    }
+
+    fn interval_secs(&self) -> u64 {
+        60
+    }
+
+    async fn check(&self) -> ProbeResult {
+        let url = format!("{}/health", self.base_url);
+        let start = Instant::now();
+        match self.client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => ProbeResult {
+                healthy: true,
+                latency_ms: start.elapsed().as_millis() as u64,
+                detail: None,
+            },
+            Ok(resp) => ProbeResult {
+                healthy: false,
+                latency_ms: start.elapsed().as_millis() as u64,
+                detail: Some(format!("HTTP {}", resp.status())),
+            },
+            Err(e) => {
+                warn!("SearXNG health check failed: {}", e);
+                ProbeResult {
+                    healthy: false,
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    detail: Some(e.to_string()),
+                }
+            }
+        }
+    }
+}
+
 // --- Config-driven factory ---
 
 pub fn build_registry(config: &crate::config::schema::Config) -> HealthRegistry {
@@ -351,6 +416,16 @@ pub fn build_registry(config: &crate::config::schema::Config) -> HealthRegistry 
                 &ep.model,
             )));
         }
+    }
+    // SearXNG liveness probe — registered when web search is configured to
+    // use SearXNG and a non-empty URL is provided. Catches stuck containers
+    // (the failure mode where `docker ps` shows "Up" but queries hang/empty).
+    if config.tools.web.search.provider == "searxng"
+        && !config.tools.web.search.searxng_url.is_empty()
+    {
+        reg.register(Box::new(SearXNGProbe::new(
+            &config.tools.web.search.searxng_url,
+        )));
     }
     reg
 }
@@ -593,7 +668,8 @@ mod tests {
 
     #[test]
     fn test_build_registry_empty_config() {
-        let config = crate::config::schema::Config::default();
+        let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.searxng_url = String::new();
         let reg = build_registry(&config);
         assert_eq!(reg.probe_count(), 0);
     }
@@ -601,6 +677,7 @@ mod tests {
     #[test]
     fn test_build_registry_lcm_disabled() {
         let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.searxng_url = String::new();
         config.lcm.enabled = Some(false);
         config.lcm.compaction_endpoint = Some(crate::config::schema::ModelEndpoint {
             url: "http://localhost:1234/v1".to_string(),
@@ -613,6 +690,7 @@ mod tests {
     #[test]
     fn test_build_registry_with_lcm_endpoint() {
         let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.searxng_url = String::new();
         config.lcm.enabled = Some(true);
         config.lcm.compaction_endpoint = Some(crate::config::schema::ModelEndpoint {
             url: "http://localhost:1234/v1".to_string(),
@@ -625,6 +703,7 @@ mod tests {
     #[test]
     fn test_build_registry_lcm_no_endpoint() {
         let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.searxng_url = String::new();
         config.lcm.enabled = Some(true);
         // No compaction_endpoint set
         let reg = build_registry(&config);
@@ -667,6 +746,7 @@ mod tests {
     #[test]
     fn test_build_registry_trio_disabled_no_probes() {
         let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.searxng_url = String::new();
         config.trio.enabled = false;
         config.trio.router_endpoint = Some(crate::config::schema::ModelEndpoint {
             url: "http://localhost:1234/v1".to_string(),
@@ -679,6 +759,7 @@ mod tests {
     #[test]
     fn test_build_registry_trio_enabled_with_both_endpoints() {
         let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.searxng_url = String::new();
         config.trio.enabled = true;
         config.trio.router_endpoint = Some(crate::config::schema::ModelEndpoint {
             url: "http://localhost:8094/v1".to_string(),
@@ -695,6 +776,7 @@ mod tests {
     #[test]
     fn test_build_registry_trio_enabled_router_only() {
         let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.searxng_url = String::new();
         config.trio.enabled = true;
         config.trio.router_endpoint = Some(crate::config::schema::ModelEndpoint {
             url: "http://localhost:8094/v1".to_string(),
@@ -702,5 +784,67 @@ mod tests {
         });
         let reg = build_registry(&config);
         assert_eq!(reg.probe_count(), 1);
+    }
+
+    // --- SearXNGProbe tests ---
+
+    #[test]
+    fn searxng_probe_strips_trailing_slash() {
+        let probe = SearXNGProbe::new("http://localhost:8888/");
+        assert_eq!(probe.base_url, "http://localhost:8888");
+    }
+
+    #[test]
+    fn searxng_probe_name_and_interval() {
+        let probe = SearXNGProbe::new("http://localhost:8888");
+        assert_eq!(probe.name(), "searxng");
+        assert_eq!(probe.interval_secs(), 60);
+    }
+
+    #[tokio::test]
+    async fn searxng_probe_connection_error_reports_unhealthy() {
+        // Port 1 is reserved/blocked on most systems — guaranteed to refuse.
+        let probe = SearXNGProbe::new("http://127.0.0.1:1");
+        let result = probe.check().await;
+        assert!(!result.healthy, "expected unhealthy on connection error");
+        assert!(
+            result.detail.is_some(),
+            "connection error must populate detail"
+        );
+    }
+
+    #[test]
+    fn build_registry_with_searxng() {
+        let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.provider = "searxng".to_string();
+        config.tools.web.search.searxng_url = "http://localhost:8888".to_string();
+        let reg = build_registry(&config);
+        assert_eq!(reg.probe_count(), 1);
+    }
+
+    #[test]
+    fn build_registry_searxng_not_registered_for_brave() {
+        let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.provider = "brave".to_string();
+        config.tools.web.search.searxng_url = "http://localhost:8888".to_string();
+        let reg = build_registry(&config);
+        assert_eq!(
+            reg.probe_count(),
+            0,
+            "SearXNG probe must not register when provider != searxng"
+        );
+    }
+
+    #[test]
+    fn build_registry_searxng_skipped_when_url_empty() {
+        let mut config = crate::config::schema::Config::default();
+        config.tools.web.search.provider = "searxng".to_string();
+        config.tools.web.search.searxng_url = String::new();
+        let reg = build_registry(&config);
+        assert_eq!(
+            reg.probe_count(),
+            0,
+            "SearXNG probe must not register when searxng_url is empty"
+        );
     }
 }
