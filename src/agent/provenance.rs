@@ -22,17 +22,14 @@ static RE_QUOTED_OUTPUT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(output|result|returns?|shows?|returned|produced)\b[:\s]*\n?```[^\n]*\n([\s\S]*?)```").unwrap()
 });
 static RE_ACTION_PAST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|verified|built|compiled|installed|copied)\b[^.\n]{0,80}").unwrap()
+    Regex::new(r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|verified|built|compiled|installed|copied)\b").unwrap()
 });
 static RE_ACTION_PRESENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b[Ll]et me (check|run|verify|look|see|test|try|build|install|copy)\b[^.\n]{0,80}",
-    )
-    .unwrap()
+    Regex::new(r"(?i)\b[Ll]et me (check|run|verify|look|see|test|try|build|install|copy)\b")
+        .unwrap()
 });
 static RE_ACTION_WHEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b[^.\n]{0,80}")
-        .unwrap()
+    Regex::new(r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b").unwrap()
 });
 static RE_NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(\d+)\s+(files?|lines?|errors?|tests?|warnings?|results?|matches?|items?)\b")
@@ -43,6 +40,8 @@ static RE_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {
 });
 static RE_TIMESTAMP: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").unwrap());
+
+const ACTION_CLAIM_MAX_TAIL_CHARS: usize = 240;
 
 /// Classification of how well a claim is supported by the audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,11 +200,12 @@ impl<'a> ClaimVerifier<'a> {
                 let action_str = action.as_str().to_lowercase();
                 let tool_hint = Self::action_to_tool_hint(&action_str);
                 let status = self.match_action_against_entries(&action_str, tool_hint);
+                let (start, end) = action_claim_span(text, full.start(), full.end());
                 claims.push(AnnotatedClaim {
-                    span: (full.start(), full.end()),
+                    span: (start, end),
                     claim_type: "action_claim".to_string(),
                     status,
-                    text: full.as_str().to_string(),
+                    text: text[start..end].to_string(),
                 });
             }
         }
@@ -216,11 +216,12 @@ impl<'a> ClaimVerifier<'a> {
                 let action_str = action.as_str().to_lowercase();
                 let tool_hint = Self::action_to_tool_hint(&action_str);
                 let status = self.match_action_against_entries(&action_str, tool_hint);
+                let (start, end) = action_claim_span(text, full.start(), full.end());
                 claims.push(AnnotatedClaim {
-                    span: (full.start(), full.end()),
+                    span: (start, end),
                     claim_type: "action_claim".to_string(),
                     status,
-                    text: full.as_str().to_string(),
+                    text: text[start..end].to_string(),
                 });
             }
         }
@@ -231,11 +232,12 @@ impl<'a> ClaimVerifier<'a> {
                 let action_str = action.as_str().to_lowercase();
                 let tool_hint = Self::action_to_tool_hint(&action_str);
                 let status = self.match_action_against_entries(&action_str, tool_hint);
+                let (start, end) = action_claim_span(text, full.start(), full.end());
                 claims.push(AnnotatedClaim {
-                    span: (full.start(), full.end()),
+                    span: (start, end),
                     claim_type: "action_claim".to_string(),
                     status,
-                    text: full.as_str().to_string(),
+                    text: text[start..end].to_string(),
                 });
             }
         }
@@ -249,9 +251,10 @@ impl<'a> ClaimVerifier<'a> {
             "read" => Some("read_file"),
             "wrote" | "created" | "modified" | "updated" => Some("write_file"),
             "deleted" | "removed" => Some("exec"),
-            "executed" | "ran" | "run" | "checked" | "check" | "verified" | "verify" | "built"
-            | "build" | "compiled" | "installed" | "install" | "copied" | "copy" | "tested"
-            | "test" | "try" | "look" | "see" => Some("exec"),
+            "executed" | "ran" | "run" | "verified" | "verify" | "built" | "build" | "compiled"
+            | "installed" | "install" | "copied" | "copy" | "tested" | "test" | "try" => {
+                Some("exec")
+            }
             "searched" => Some("web_search"),
             "fetched" => Some("web_fetch"),
             "edited" => Some("edit_file"),
@@ -465,9 +468,20 @@ impl<'a> ClaimVerifier<'a> {
                 vec!["write_file", "write", "edit_file"]
             }
             "deleted" | "removed" => vec!["exec"],
-            "executed" | "ran" | "run" | "checked" | "check" | "verified" | "verify" | "built"
-            | "build" | "compiled" | "installed" | "install" | "copied" | "copy" | "tested"
-            | "test" | "try" | "look" | "see" => vec!["exec"],
+            "checked" | "check" | "look" | "see" => {
+                vec![
+                    "exec",
+                    "web_search",
+                    "web_fetch",
+                    "search",
+                    "fetch",
+                    "browser",
+                ]
+            }
+            "executed" | "ran" | "run" | "verified" | "verify" | "built" | "build" | "compiled"
+            | "installed" | "install" | "copied" | "copy" | "tested" | "test" | "try" => {
+                vec!["exec"]
+            }
             "searched" => vec!["web_search", "search"],
             "fetched" => vec!["web_fetch", "fetch"],
             "edited" => vec!["edit_file", "edit"],
@@ -482,6 +496,54 @@ impl<'a> ClaimVerifier<'a> {
 
         ClaimStatus::Claimed
     }
+}
+
+fn action_claim_span(text: &str, start: usize, trigger_end: usize) -> (usize, usize) {
+    // Regex only finds the action trigger. Sentence scanning keeps model names
+    // like North-Mini-Code-1.0 and Qwen3.6 intact instead of splitting on dots.
+    let mut end = trigger_end;
+    let mut tail_chars = 0usize;
+
+    for (offset, ch) in text[trigger_end..].char_indices() {
+        if ch == '\n' {
+            break;
+        }
+
+        let idx = trigger_end + offset;
+        end = idx + ch.len_utf8();
+
+        if is_sentence_terminal(text, idx, ch) {
+            break;
+        }
+
+        tail_chars += 1;
+        if tail_chars >= ACTION_CLAIM_MAX_TAIL_CHARS {
+            break;
+        }
+    }
+
+    (start, end)
+}
+
+fn is_sentence_terminal(text: &str, idx: usize, ch: char) -> bool {
+    match ch {
+        '!' | '?' => next_char(text, idx + ch.len_utf8()).map_or(true, char::is_whitespace),
+        '.' => is_period_sentence_terminal(text, idx),
+        _ => false,
+    }
+}
+
+fn is_period_sentence_terminal(text: &str, idx: usize) -> bool {
+    let next = next_char(text, idx + 1);
+    if next.is_some_and(|c| !c.is_whitespace()) {
+        return false;
+    }
+
+    true
+}
+
+fn next_char(text: &str, start: usize) -> Option<char> {
+    text.get(start..)?.chars().next()
 }
 
 /// Verify claims in a response against audit entries from this turn.
@@ -837,6 +899,46 @@ mod tests {
             .collect();
         assert!(!action_claims.is_empty());
         // Tool WAS called → Observed, not Claimed.
+        assert_eq!(action_claims[0].status, ClaimStatus::Observed);
+    }
+
+    #[test]
+    fn test_action_claim_span_keeps_version_numbers_intact() {
+        let entries: Vec<AuditEntry> = vec![];
+        let verifier = ClaimVerifier::new(&entries);
+        let text = "Let me check if there's an MLX quantized version of North-Mini-Code-1.0 and compare it with Qwen3.6 35B.";
+        let claims = verifier.verify(text);
+        let action_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim")
+            .collect();
+
+        assert_eq!(action_claims.len(), 1);
+        assert_eq!(action_claims[0].text, text);
+
+        let (redacted, count) = redact_fabrications(text, &claims);
+        assert_eq!(count, 1);
+        assert_eq!(redacted, "[unverified claim removed]");
+    }
+
+    #[test]
+    fn test_let_me_check_with_web_search_tool_call() {
+        let entries = vec![make_entry(
+            "web_search",
+            "c1",
+            json!({"query": "CohereLabs North-Mini-Code-1.0 MLX quantized version"}),
+            "mlx-community/North-Mini-Code-1.0-4bit",
+            true,
+        )];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier
+            .verify("Let me check if there's an MLX quantized version of North-Mini-Code-1.0.");
+        let action_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim")
+            .collect();
+
+        assert_eq!(action_claims.len(), 1);
         assert_eq!(action_claims[0].status, ClaimStatus::Observed);
     }
 

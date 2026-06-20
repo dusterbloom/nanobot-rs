@@ -3684,11 +3684,11 @@ mod nudge_tests {
                 .unwrap_or("");
             if !last_assistant.trim().is_empty() {
                 format!(
-                    "{}\n\n[Note: Tool iteration limit reached. This response may be incomplete.]",
+                    "{}\n\n[Note: The turn ended before a final answer was produced. This response may be incomplete.]",
                     last_assistant.trim()
                 )
             } else {
-                "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string()
+                "The turn ended before I could produce a final answer. The actions above may be incomplete.".to_string()
             }
         } else {
             final_content.clone()
@@ -3699,7 +3699,7 @@ mod nudge_tests {
             "rescue should start with the last assistant content, got: {result}"
         );
         assert!(
-            result.contains("[Note: Tool iteration limit reached."),
+            result.contains("[Note: The turn ended before a final answer"),
             "rescue should append the incomplete note, got: {result}"
         );
     }
@@ -3723,11 +3723,11 @@ mod nudge_tests {
                 .unwrap_or("");
             if !last_assistant.trim().is_empty() {
                 format!(
-                    "{}\n\n[Note: Tool iteration limit reached. This response may be incomplete.]",
+                    "{}\n\n[Note: The turn ended before a final answer was produced. This response may be incomplete.]",
                     last_assistant.trim()
                 )
             } else {
-                "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string()
+                "The turn ended before I could produce a final answer. The actions above may be incomplete.".to_string()
             }
         } else {
             final_content.clone()
@@ -3735,7 +3735,7 @@ mod nudge_tests {
 
         assert_eq!(
             result,
-            "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.",
+            "The turn ended before I could produce a final answer. The actions above may be incomplete.",
             "should use static fallback when no assistant message found"
         );
     }

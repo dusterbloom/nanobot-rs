@@ -14,6 +14,13 @@ use crate::agent::agent_loop::{AgentLoopShared, TurnContext};
 use crate::agent::token_budget::TokenBudget;
 use crate::bus::events::OutboundMessage;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncompleteTurnReason {
+    Cancelled,
+    IterationLimit,
+    Unknown,
+}
+
 impl AgentLoopShared {
     /// Phase 3: Finalize the response -- persist session, build outbound message.
     ///
@@ -80,30 +87,18 @@ impl AgentLoopShared {
         // so observers see final content after rescue/sanitization).
         let turn_tool_entries = std::mem::take(&mut ctx.turn_tool_entries);
 
+        let mut rescued_incomplete_assistant = false;
         if ctx.final_content.is_empty() && ctx.messages.len() > 2 {
-            // Try to surface the last meaningful assistant message as a rescue
-            // rather than emitting a generic fallback. This happens when the
-            // model exhausted iterations without producing a text-only response
-            // (e.g. ended on a tool result with no follow-up assistant turn).
-            let last_assistant = ctx
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-                .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-                .unwrap_or("");
-            if !last_assistant.trim().is_empty() {
-                ctx.final_content = format!(
-                    "{}\n\n[Note: Tool iteration limit reached. This response may be incomplete.]",
-                    last_assistant.trim()
-                );
-            } else {
-                ctx.final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
+            let reason = incomplete_turn_reason(&ctx);
+            if let Some(rescued) = rescue_incomplete_response(&ctx.messages, reason) {
+                ctx.final_content = rescued;
+                rescued_incomplete_assistant = true;
             }
         }
 
         // Phase 3+4: Claim verification and context hygiene.
         if !ctx.final_content.is_empty()
+            && !rescued_incomplete_assistant
             && ctx.core.provenance_config.enabled
             && ctx.core.provenance_config.verify_claims
         {
@@ -134,7 +129,10 @@ impl AgentLoopShared {
         }
 
         // Phantom tool call detection: check if LLM claims tool results without calling tools.
-        if !ctx.final_content.is_empty() && ctx.core.provenance_config.enabled {
+        if !ctx.final_content.is_empty()
+            && !rescued_incomplete_assistant
+            && ctx.core.provenance_config.enabled
+        {
             let tools_list: Vec<String> = ctx.used_tools.iter().cloned().collect();
             if let Some(detection) =
                 crate::agent::provenance::detect_phantom_claims(&ctx.final_content, &tools_list)
@@ -303,5 +301,101 @@ impl AgentLoopShared {
             }
             Some(outbound)
         }
+    }
+}
+
+fn incomplete_turn_reason(ctx: &TurnContext) -> IncompleteTurnReason {
+    if ctx.is_cancelled() {
+        IncompleteTurnReason::Cancelled
+    } else if ctx.core.max_iterations > 0 && ctx.iterations_used >= ctx.core.max_iterations {
+        IncompleteTurnReason::IterationLimit
+    } else {
+        IncompleteTurnReason::Unknown
+    }
+}
+
+fn rescue_incomplete_response(
+    messages: &[serde_json::Value],
+    reason: IncompleteTurnReason,
+) -> Option<String> {
+    let note = incomplete_response_note(reason)?;
+    let last_assistant = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+        .unwrap_or("");
+
+    if !last_assistant.trim().is_empty() {
+        Some(format!("{}\n\n{}", last_assistant.trim(), note))
+    } else {
+        Some(match reason {
+            IncompleteTurnReason::IterationLimit => {
+                "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string()
+            }
+            IncompleteTurnReason::Unknown => {
+                "The turn ended before I could produce a final answer. The actions above may be incomplete.".to_string()
+            }
+            IncompleteTurnReason::Cancelled => return None,
+        })
+    }
+}
+
+fn incomplete_response_note(reason: IncompleteTurnReason) -> Option<&'static str> {
+    match reason {
+        IncompleteTurnReason::Cancelled => None,
+        IncompleteTurnReason::IterationLimit => {
+            Some("[Note: Tool iteration limit reached. This response may be incomplete.]")
+        }
+        IncompleteTurnReason::Unknown => {
+            Some("[Note: The turn ended before a final answer was produced. This response may be incomplete.]")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cancelled_turn_does_not_rescue_or_claim_iteration_limit() {
+        let messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "Let me check that.", "tool_calls": []}),
+            json!({"role": "tool", "content": "result"}),
+        ];
+
+        assert_eq!(
+            rescue_incomplete_response(&messages, IncompleteTurnReason::Cancelled),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_incomplete_turn_uses_generic_note() {
+        let messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "Let me check that.", "tool_calls": []}),
+            json!({"role": "tool", "content": "result"}),
+        ];
+
+        let rescued = rescue_incomplete_response(&messages, IncompleteTurnReason::Unknown).unwrap();
+        assert!(rescued.contains("Let me check that."));
+        assert!(rescued.contains("ended before a final answer"));
+        assert!(!rescued.contains("Tool iteration limit reached"));
+    }
+
+    #[test]
+    fn iteration_limit_note_is_only_for_iteration_limit() {
+        let messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "Working."}),
+            json!({"role": "tool", "content": "result"}),
+        ];
+
+        let rescued =
+            rescue_incomplete_response(&messages, IncompleteTurnReason::IterationLimit).unwrap();
+        assert!(rescued.contains("Tool iteration limit reached"));
     }
 }
