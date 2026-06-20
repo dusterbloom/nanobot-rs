@@ -1368,6 +1368,14 @@ pub(crate) struct ServerState {
     pub engine: InferenceEngine,
 }
 
+/// What [`ServerState::shutdown`] will tear down. Pure, so the teardown policy
+/// is unit-testable without spawning real servers.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ShutdownPlan {
+    stop_lms: bool,
+    stop_higgs: bool,
+}
+
 impl ServerState {
     pub fn new(port: String) -> Self {
         Self {
@@ -1389,16 +1397,30 @@ impl ServerState {
         self.engine = InferenceEngine::None;
     }
 
-    /// Full shutdown: stop LM Studio or Higgs server.
+    /// What [`Self::shutdown`] tears down. LM Studio is stopped only when nanobot
+    /// manages it. Higgs is a resident sidecar — kept warm by the keepalive ping
+    /// and reused across launches — so it is NEVER stopped on exit, neither the
+    /// instance nanobot spawned nor one the user started externally. (Was:
+    /// `self.engine == Higgs`, which SIGKILLed it every exit and reloaded the
+    /// 35B on the next launch.)
+    fn shutdown_plan(&self) -> ShutdownPlan {
+        ShutdownPlan {
+            stop_lms: self.lms_managed,
+            stop_higgs: false,
+        }
+    }
+
+    /// Full shutdown: stop only the servers [`Self::shutdown_plan`] selects.
     pub fn shutdown(&mut self) {
-        if self.lms_managed {
+        let plan = self.shutdown_plan();
+        if plan.stop_lms {
             if let Some(ref bin) = self.lms_binary {
                 println!("Stopping LM Studio server...");
                 crate::lms::server_stop(bin).ok();
             }
             self.lms_managed = false;
         }
-        if self.engine == InferenceEngine::Higgs {
+        if plan.stop_higgs {
             println!("Stopping Higgs server...");
             crate::higgs::server_stop().ok();
         }
@@ -2623,6 +2645,29 @@ fn index_sessions_background() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_never_stops_resident_higgs() {
+        // Higgs is a resident sidecar — kept warm by the keepalive ping and
+        // reused across launches. A nanobot exit must NEVER stop it: not the
+        // instance nanobot spawned, not one the user started externally.
+        // Regression: shutdown SIGKILLed Higgs on every exit, reloading the 35B
+        // each launch and killing user-started servers.
+        let mut higgs = ServerState::new("8000".to_string());
+        higgs.engine = InferenceEngine::Higgs;
+        assert!(
+            !higgs.shutdown_plan().stop_higgs,
+            "resident Higgs must survive a nanobot shutdown"
+        );
+
+        // LM Studio policy is unchanged: stop only when nanobot manages it,
+        // never an externally-run instance.
+        let mut managed_lms = ServerState::new("1234".to_string());
+        managed_lms.lms_managed = true;
+        assert!(managed_lms.shutdown_plan().stop_lms);
+        let external_lms = ServerState::new("1234".to_string());
+        assert!(!external_lms.shutdown_plan().stop_lms);
+    }
 
     /// The `decode_ms` wire marker round-trips through the parser, and the
     /// leading NUL is required (bare text must never be mistaken for a marker).
