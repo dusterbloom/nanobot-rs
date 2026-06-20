@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use html2md::rewrite_html;
 use regex::Regex;
 use reqwest::Client;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use super::base::{PermissionLevel, Tool, ToolExecutionContext};
@@ -104,6 +104,11 @@ pub struct WebSearchTool {
     provider: String,
     searxng_url: String,
     client: Client,
+    /// Optional handle to the heartbeat registry. When set, `execute_searxng`
+    /// checks the "searxng" probe first; on `Degraded` it returns a clear
+    /// "stuck container, try `docker restart`" message instead of silently
+    /// producing zero results.
+    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 }
 
 impl WebSearchTool {
@@ -131,7 +136,20 @@ impl WebSearchTool {
             provider,
             searxng_url,
             client: Client::new(),
+            health_registry: None,
         }
+    }
+
+    /// Attach a health registry so `web_search` can short-circuit with a
+    /// clear "SearXNG degraded" message when the probe has marked the
+    /// backend unhealthy. Builder-style: returns `self` for chaining at
+    /// the registration site.
+    pub fn with_health_registry(
+        mut self,
+        registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
+    ) -> Self {
+        self.health_registry = registry;
+        self
     }
 }
 
@@ -222,6 +240,22 @@ impl WebSearchTool {
     /// Execute a search via SearXNG. Falls back to Brave if SearXNG is unreachable
     /// and a Brave API key is configured.
     async fn execute_searxng(&self, query: &str, count: u32) -> String {
+        // Pre-flight: if the heartbeat probe has marked SearXNG Degraded
+        // (3+ consecutive /health failures), short-circuit with a clear
+        // message. Otherwise we'd hang for the full HTTP timeout and either
+        // return an opaque connection error or, worse, silently return zero
+        // results — the failure mode that motivated this check.
+        if let Some(reg) = &self.health_registry {
+            if !reg.is_healthy("searxng") {
+                return format!(
+                    "Error: SearXNG backend is degraded (health probe failing). \
+                     The container may be stuck. Try: docker restart searxng\n\
+                     Then retry the search. Query was: {:?}",
+                    query
+                );
+            }
+        }
+
         let result = self
             .client
             .get(format!("{}/search", self.searxng_url))
@@ -916,6 +950,90 @@ mod tests {
             "http://localhost:8888".to_string(),
         );
         assert_eq!(tool.name(), "web_search");
+    }
+
+    #[tokio::test]
+    async fn test_web_search_searxng_degraded_short_circuits() {
+        // Build a registry with threshold=1 so a single failed probe marks
+        // "searxng" as Degraded. Register a stub probe that always reports
+        // unhealthy, then run_due_probes to populate state.
+        use crate::heartbeat::health::{HealthRegistry, HealthProbe, ProbeResult};
+        use async_trait::async_trait;
+
+        struct UnhealthyProbe;
+        #[async_trait]
+        impl HealthProbe for UnhealthyProbe {
+            fn name(&self) -> &str { "searxng" }
+            fn interval_secs(&self) -> u64 { 60 }
+            async fn check(&self) -> ProbeResult {
+                ProbeResult {
+                    healthy: false,
+                    latency_ms: 0,
+                    detail: Some("simulated stuck container".to_string()),
+                }
+            }
+        }
+
+        let mut reg = HealthRegistry::new_with_threshold(1);
+        reg.register(Box::new(UnhealthyProbe));
+        reg.run_due_probes().await;
+        assert!(!reg.is_healthy("searxng"));
+
+        let tool = WebSearchTool::new(
+            None,
+            5,
+            "searxng".to_string(),
+            // Point at a port nothing listens on; if the short-circuit fails
+            // the test will hang for 10s then return a connection error.
+            "http://127.0.0.1:1".to_string(),
+        )
+        .with_health_registry(Some(Arc::new(reg)));
+
+        let mut params = HashMap::new();
+        params.insert("query".to_string(), serde_json::json!("test"));
+        let result = tool.execute(params).await;
+
+        assert!(
+            result.contains("SearXNG backend is degraded"),
+            "expected degraded short-circuit message, got: {result}"
+        );
+        assert!(
+            result.contains("docker restart searxng"),
+            "expected actionable restart hint, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_web_search_searxng_healthy_proceeds_to_call() {
+        // When the probe is healthy (or absent), the tool proceeds to the
+        // HTTP call. We assert it reaches the network layer by checking that
+        // the error is a connection error, NOT the degraded short-circuit.
+        use crate::heartbeat::health::HealthRegistry;
+
+        let reg = HealthRegistry::new();
+        // No probes registered -> is_healthy returns true (optimistic default).
+
+        let tool = WebSearchTool::new(
+            None,
+            5,
+            "searxng".to_string(),
+            "http://127.0.0.1:1".to_string(), // unreachable
+        )
+        .with_health_registry(Some(Arc::new(reg)));
+
+        let mut params = HashMap::new();
+        params.insert("query".to_string(), serde_json::json!("test"));
+        let result = tool.execute(params).await;
+
+        // Reaches the network layer -> connection error, NOT the degraded msg.
+        assert!(
+            !result.contains("degraded"),
+            "healthy probe must not short-circuit, got: {result}"
+        );
+        assert!(
+            result.contains("Error:") || result.contains("No results"),
+            "expected network error or empty-results path, got: {result}"
+        );
     }
 
     #[test]

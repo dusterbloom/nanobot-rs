@@ -79,6 +79,7 @@ impl AgentLoopShared {
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),
             db_path: Some(db_path),
+            health_registry: self.health_registry.clone(),
             ..ToolConfig::new(&core.workspace)
         };
         let mut tools = ToolRegistry::with_standard_tools(&tool_config);

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -43,6 +44,10 @@ pub struct ToolConfig {
     pub db_path: Option<PathBuf>,
     /// Code execution tool config. Disabled by default.
     pub code_execution: CodeExecutionConfig,
+    /// Optional health-registry handle. When set, the web_search tool checks
+    /// the "searxng" probe before calling SearXNG and returns a clear
+    /// "degraded, restart the container" message instead of silent zero results.
+    pub health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 }
 
 impl ToolConfig {
@@ -62,6 +67,7 @@ impl ToolConfig {
             search_max_results: 5,
             db_path: None,
             code_execution: CodeExecutionConfig::default(),
+            health_registry: None,
         }
     }
 }
@@ -338,12 +344,15 @@ impl ToolRegistry {
             )));
         }
         if should_include("web_search") {
-            self.register(Box::new(WebSearchTool::new(
-                config.brave_api_key.clone(),
-                config.search_max_results,
-                config.search_provider.clone(),
-                config.searxng_url.clone(),
-            )));
+            self.register(Box::new(
+                WebSearchTool::new(
+                    config.brave_api_key.clone(),
+                    config.search_max_results,
+                    config.search_provider.clone(),
+                    config.searxng_url.clone(),
+                )
+                .with_health_registry(config.health_registry.clone()),
+            ));
         }
         if should_include("web_fetch") {
             self.register(Box::new(WebFetchTool::new(config.max_tool_result_chars)));
