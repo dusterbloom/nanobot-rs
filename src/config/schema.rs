@@ -1769,6 +1769,9 @@ pub enum TtsEngineConfig {
     Pocket,
     Supertonic,
     Kokoro,
+    /// macOS `say` command — native system TTS (Siri-quality neural voices).
+    /// No model is loaded; `speak()` shells out per turn. macOS only.
+    Say,
 }
 
 /// Configuration for voice mode TTS/STT.

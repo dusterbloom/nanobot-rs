@@ -317,6 +317,65 @@ fn play_chunks_native(
     Ok(())
 }
 
+/// Pick a `say` voice for a language. A configured `ttsVoice` (e.g.
+/// "Ava (Premium)") always wins; otherwise a per-language default that ships
+/// with macOS. `None` means "use the system voice" (System Settings > Spoken
+/// Content). ponytail: standard voices only — Premium/Enhanced ones must be
+/// downloaded once in System Settings or `say` substitutes a basic voice.
+#[cfg(target_os = "macos")]
+fn say_voice_for(lang: &str, configured: Option<&str>) -> Option<String> {
+    if let Some(v) = configured.map(str::trim).filter(|v| !v.is_empty()) {
+        return Some(v.to_string());
+    }
+    let base = lang
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(lang)
+        .to_ascii_lowercase();
+    let voice = match base.as_str() {
+        "it" => "Alice",
+        "en" => "Samantha",
+        "fr" => "Thomas",
+        "de" => "Anna",
+        "es" => "Mónica",
+        "pt" => "Luciana",
+        _ => return None,
+    };
+    Some(voice.to_string())
+}
+
+/// Speak text through the macOS `say` binary, killing it on barge-in (the
+/// shared cancel flag). `say` plays straight to the default output device, so
+/// no synthesis/playback threads or model are involved.
+#[cfg(target_os = "macos")]
+fn speak_via_say(text: &str, voice: Option<&str>, cancel: &AtomicBool) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let mut cmd = Command::new("say");
+    if let Some(v) = voice {
+        cmd.arg("-v").arg(v);
+    }
+    // `--` so a reply starting with '-' isn't parsed as a flag.
+    cmd.arg("--").arg(text);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("`say` failed to start: {e}"))?;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+            Err(e) => return Err(format!("`say` wait failed: {e}")),
+        }
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn pulse_server() -> String {
     if std::path::Path::new("/mnt/wslg/PulseServer").exists() {
@@ -1264,6 +1323,22 @@ impl VoicePipeline {
 
         let stt = SpeechToText::new(SttMode::Batch).map_err(|e| format!("STT init failed: {e}"))?;
 
+        // macOS `say`: native system TTS, nothing to load. Build STT only and
+        // return early — speak() shells out to the `say` binary each turn.
+        #[cfg(target_os = "macos")]
+        if engine == TtsEngineConfig::Say {
+            info!("TTS engine: macOS `say` (no TTS model loaded)");
+            return Ok(Self {
+                stt: Arc::new(Mutex::new(stt)),
+                tts_en: None,
+                tts_multi: None,
+                tts_pocket_by_lang: Arc::new(Mutex::new(HashMap::new())),
+                engine_config: engine,
+                configured_voice: tts_voice.map(|s| s.to_string()),
+                cancel: Arc::new(AtomicBool::new(false)),
+            });
+        }
+
         let (tts_en, tts_multi) = match engine {
             TtsEngineConfig::Pocket => {
                 models::ensure_kokoro_model(progress)
@@ -1362,6 +1437,11 @@ impl VoicePipeline {
                         .map_err(|e| format!("Kokoro TTS init failed: {e}"))?;
                 info!("Kokoro TTS ready (multilingual)");
                 (None, Some(Arc::new(Mutex::new(tts))))
+            }
+            // On macOS this is handled by the early return above; the arm exists
+            // for match exhaustiveness and guards the unsupported non-macOS case.
+            TtsEngineConfig::Say => {
+                return Err("ttsEngine \"say\" is only supported on macOS".to_string());
             }
         };
 
@@ -1588,6 +1668,14 @@ impl VoicePipeline {
             return Ok(());
         }
 
+        // macOS `say`: hand the whole (markdown-stripped) reply to the system TTS.
+        #[cfg(target_os = "macos")]
+        if self.engine_config == TtsEngineConfig::Say {
+            let spoken = crate::tui::strip_markdown_for_tts(&sentences.join(" "));
+            let voice = say_voice_for(lang, self.configured_voice.as_deref());
+            return speak_via_say(&spoken, voice.as_deref(), &self.cancel);
+        }
+
         let (tts, voice_id) = self.select_tts(lang)?;
         let cancel = self.cancel.clone();
 
@@ -1649,6 +1737,37 @@ impl VoicePipeline {
         _lang: &str,
         display_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Result<(std_mpsc::Sender<TtsCommand>, std::thread::JoinHandle<()>), String> {
+        // macOS `say`: stream sentence-by-sentence through the system TTS, no
+        // synth/playback threads or audio channel. One `say` child at a time
+        // (so sentences stay ordered), killed on barge-in via the cancel flag.
+        #[cfg(target_os = "macos")]
+        if self.engine_config == TtsEngineConfig::Say {
+            let (sentence_tx, sentence_rx) = std_mpsc::channel::<TtsCommand>();
+            let cancel = self.cancel.clone();
+            let configured_voice = self.configured_voice.clone();
+            let join_handle = std::thread::spawn(move || {
+                #[cfg(unix)]
+                mask_sigint();
+                for cmd in sentence_rx {
+                    let TtsCommand::Synthesize { text, language } = cmd else {
+                        break; // Finish
+                    };
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(ref dtx) = display_tx {
+                        let _ = dtx.send(text.clone());
+                    }
+                    let spoken = crate::tui::strip_markdown_for_tts(&text);
+                    let voice = say_voice_for(&language, configured_voice.as_deref());
+                    if let Err(e) = speak_via_say(&spoken, voice.as_deref(), &cancel) {
+                        tracing::error!("`say` streaming chunk failed (skipping): {}", e);
+                    }
+                }
+            });
+            return Ok((sentence_tx, join_handle));
+        }
+
         let tts_en = self.tts_en.clone();
         let tts_multi = self.tts_multi.clone();
         let tts_pocket_by_lang = self.tts_pocket_by_lang.clone();
@@ -2197,6 +2316,23 @@ mod tests {
             Ok(())
         });
         assert_eq!(spoken, vec!["a", "b"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn say_voice_for_override_default_and_unknown() {
+        // Configured voice always wins, even for a known language.
+        assert_eq!(
+            say_voice_for("en", Some("Ava (Premium)")).as_deref(),
+            Some("Ava (Premium)")
+        );
+        // Per-language default when nothing configured; locale suffix is ignored.
+        assert_eq!(say_voice_for("it", None).as_deref(), Some("Alice"));
+        assert_eq!(say_voice_for("it-IT", None).as_deref(), Some("Alice"));
+        // Blank configured voice falls through to the default.
+        assert_eq!(say_voice_for("en", Some("  ")).as_deref(), Some("Samantha"));
+        // Unknown language → None (let `say` use the system voice).
+        assert_eq!(say_voice_for("ja", None), None);
     }
 
     #[test]
