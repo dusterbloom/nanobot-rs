@@ -45,10 +45,124 @@ const TURN: &str = "\u{21b3}"; // ↳
 const META: &str = "\u{25b8}"; // ▸
 const RULE: &str = "\u{2500}"; // ─
 const TOOL_BRIDGE_TEXT: &str = "Sure, on it ...";
-const ACCENT: Color = Color::Rgb(0x28, 0xB3, 0xC1);
 const OK_COLOR: Color = Color::Rgb(0x39, 0xB8, 0x45);
 const WARN_COLOR: Color = Color::Rgb(0xC8, 0xA1, 0x3A);
 const ERR_COLOR: Color = Color::Rgb(0xE0, 0x66, 0x66);
+
+/// Number of rotatable color schemes (Ctrl+P cycles through them).
+const THEME_COUNT: u8 = 32;
+
+/// Commands offered by the `/` autocomplete popup (name, one-line help).
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/model", "switch the active model"),
+    ("/local", "toggle local LLM mode"),
+    ("/think", "show / hide thinking"),
+    ("/nothink", "disable thinking (local)"),
+    ("/mode", "cycle calm / inspect / deep"),
+    ("/status", "mode, model, channels"),
+    ("/context", "context window usage"),
+    ("/sessions", "resume a past session"),
+    ("/clear", "clear the transcript"),
+    ("/voice", "toggle voice mode"),
+    ("/skill", "run a skill"),
+    ("/agents", "list running subagents"),
+    ("/provenance", "tool provenance log"),
+    ("/cluster", "cluster peers"),
+    ("/restart", "restart the local server"),
+    ("/whatsapp", "WhatsApp channel"),
+    ("/telegram", "Telegram channel"),
+    ("/help", "keys & commands"),
+    ("/quit", "exit nanobot"),
+];
+
+/// The rotating identity colors. Under "identity-only rotation" ONLY these shift
+/// between schemes; semantic (`OK/WARN/ERR_COLOR`) and neutral colors stay fixed
+/// so a red error always reads as an error. The cursor and the markdown heading
+/// accent both reuse `accent`.
+#[derive(Clone, Copy)]
+pub(crate) struct Palette {
+    pub accent: Color,
+    pub shine: Color,
+    pub glow: Color,
+    /// Secondary identity color (footer), a fixed hue offset from `accent` so the
+    /// two always harmonize as the wheel rotates.
+    pub accent2: Color,
+}
+
+impl Palette {
+    /// Scheme `i` of [`THEME_COUNT`]. Index 0 is the original nanobot teal
+    /// (`#28B3C1` ≈ hue 187°) returned exactly so the default look never drifts;
+    /// indices 1..32 rotate the hue evenly around the wheel.
+    pub(crate) fn from_index(i: u8) -> Self {
+        let i = i % THEME_COUNT;
+        // Index 0 is monochrome — the calm default; color is opt-in via Ctrl+P.
+        if i == 0 {
+            return Palette {
+                accent: Color::Rgb(0xD7, 0xD7, 0xD7),
+                shine: Color::Rgb(0xF2, 0xF2, 0xF2),
+                glow: Color::Rgb(0xB8, 0xB8, 0xB8),
+                accent2: Color::Rgb(0x8E, 0x8E, 0x8E),
+            };
+        }
+        // Walk the hue wheel for the accent; accent2 is the +160° companion that
+        // rotates in lockstep so the pairing always holds.
+        let hue = (187.0 + i as f32 * (360.0 / THEME_COUNT as f32)) % 360.0;
+        Palette {
+            accent: hsl_to_rgb(hue, 0.66, 0.46),
+            shine: hsl_to_rgb(hue, 0.90, 0.95),
+            glow: hsl_to_rgb(hue, 0.62, 0.72),
+            accent2: hsl_to_rgb((hue + 160.0) % 360.0, 0.55, 0.58),
+        }
+    }
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Palette::from_index(0)
+    }
+}
+
+// ponytail: the active palette is a render-only global, not threaded through
+// every render fn. The whole render tree reads it via `pal()`; `App` owns the
+// index and pushes the derived palette here on Ctrl+P. Upgrade path: thread a
+// `Palette` param if per-widget themes are ever needed.
+static CURRENT_PALETTE: Lazy<std::sync::RwLock<Palette>> =
+    Lazy::new(|| std::sync::RwLock::new(Palette::from_index(0)));
+
+/// The active rotating palette (render-only).
+fn pal() -> Palette {
+    *CURRENT_PALETTE.read().unwrap()
+}
+
+/// Swap the active palette; called by [`App::set_theme_index`].
+fn set_pal(p: Palette) {
+    *CURRENT_PALETTE.write().unwrap() = p;
+}
+
+/// The active accent color, exposed for the sibling markdown renderer so its
+/// headings rotate with the theme too.
+pub(super) fn accent_color() -> Color {
+    pal().accent
+}
+
+/// HSL (`h` degrees 0..360, `s`/`l` in 0..1) → RGB. Standard conversion; used to
+/// generate the rotated schemes from a single hue.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h6 = h / 60.0;
+    let x = c * (1.0 - (h6 % 2.0 - 1.0).abs());
+    let (r, g, b) = match h6 as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color::Rgb(to(r), to(g), to(b))
+}
 
 /// Quiet, stateful footer data, snapshotted from the agent core each frame.
 pub(crate) struct Footer {
@@ -394,6 +508,13 @@ pub(crate) struct App {
     recent_paths: Vec<String>,
     /// Recently used native slash commands, restored by snapshots.
     recent_commands: Vec<String>,
+    /// Active color-scheme index (0..THEME_COUNT). Cycled by Ctrl+P, persisted to
+    /// config. The derived [`Palette`] lives in a render-only global (`set_pal`).
+    theme_index: u8,
+    /// Cursor blink phase (idle only): flipped ~every 530ms by the event loop.
+    cursor_on: bool,
+    /// Highlighted row in the `/` autocomplete popup.
+    slash_sel: usize,
 }
 
 impl App {
@@ -441,6 +562,9 @@ impl App {
             attachments: Vec::new(),
             recent_paths: Vec::new(),
             recent_commands: Vec::new(),
+            theme_index: 0,
+            cursor_on: true,
+            slash_sel: 0,
         }
     }
 
@@ -458,6 +582,27 @@ impl App {
             }
             None => false,
         }
+    }
+
+    /// Advance to the next color scheme (Ctrl+P). Wraps at [`THEME_COUNT`].
+    pub(crate) fn cycle_theme(&mut self) {
+        self.set_theme_index(self.theme_index.wrapping_add(1));
+    }
+
+    /// Set the active scheme by index (used to restore from config at startup).
+    pub(crate) fn set_theme_index(&mut self, i: u8) {
+        self.theme_index = i % THEME_COUNT;
+        set_pal(Palette::from_index(self.theme_index));
+    }
+
+    /// The active scheme index, for persistence.
+    pub(crate) fn theme_index(&self) -> u8 {
+        self.theme_index
+    }
+
+    /// Flip the cursor blink phase (called by the idle loop's blink tick).
+    pub(crate) fn toggle_cursor(&mut self) {
+        self.cursor_on = !self.cursor_on;
     }
 
     pub(crate) fn mode_label(&self) -> &'static str {
@@ -764,6 +909,7 @@ impl App {
             cache: None,
         });
         self.streaming = true;
+        self.cursor_on = true; // solid cursor while streaming (blink is idle-only)
         self.awaiting_first = true;
         self.got_text = false;
         self.turn_produced = false;
@@ -1291,6 +1437,13 @@ impl App {
         if self.search.is_some() {
             return self.on_search_key(k, ctrl);
         }
+        // `/` autocomplete: when the popup is open it steers ↑/↓/Tab/Enter/Esc.
+        // Ctrl-combos (theme, jobs, quit…) still pass through to the main match.
+        if !ctrl && self.slash_active() {
+            if let Some(action) = self.on_slash_key(k) {
+                return action;
+            }
+        }
         match k.code {
             // Ctrl+D is the explicit quit (EOF). Ctrl+C is NOT a kill switch:
             // it clears a typed line, otherwise does nothing.
@@ -1305,6 +1458,10 @@ impl App {
             }
             KeyCode::Char('t') if ctrl => {
                 self.toggle_thinking_display();
+                Action::Continue
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.cycle_theme();
                 Action::Continue
             }
             KeyCode::Char('j') if ctrl => {
@@ -1407,6 +1564,93 @@ impl App {
         self.input = configure_input();
         self.attachments.clear();
         self.hist_pos = None;
+    }
+
+    /// The slash token being typed: `Some` only when the input is a single line
+    /// starting with `/` and not yet containing a space (still naming the command,
+    /// not typing args). Drives the `/` autocomplete popup.
+    fn slash_token(&self) -> Option<String> {
+        let lines = self.input.lines();
+        if lines.len() != 1 {
+            return None;
+        }
+        let line = &lines[0];
+        if line.starts_with('/') && !line.contains(' ') {
+            Some(line.to_lowercase())
+        } else {
+            None
+        }
+    }
+
+    /// Commands whose name starts with the current slash token. Empty = no popup.
+    fn slash_matches(&self) -> Vec<(&'static str, &'static str)> {
+        let Some(tok) = self.slash_token() else {
+            return Vec::new();
+        };
+        SLASH_COMMANDS
+            .iter()
+            .filter(|(cmd, _)| cmd.starts_with(&tok))
+            .copied()
+            .collect()
+    }
+
+    fn slash_active(&self) -> bool {
+        !self.slash_matches().is_empty()
+    }
+
+    /// Handle a key while the `/` popup is open. `Some` = popup consumed it;
+    /// `None` = fall through to normal input (typing/deleting edits the filter).
+    fn on_slash_key(&mut self, k: KeyEvent) -> Option<Action> {
+        let n = self.slash_matches().len();
+        match k.code {
+            KeyCode::Up => {
+                self.slash_sel = self.slash_sel.saturating_sub(1);
+                Some(Action::Continue)
+            }
+            KeyCode::Down => {
+                self.slash_sel = (self.slash_sel + 1).min(n.saturating_sub(1));
+                Some(Action::Continue)
+            }
+            KeyCode::Tab => {
+                self.slash_complete();
+                Some(Action::Continue)
+            }
+            KeyCode::Enter => {
+                // Complete to the highlighted command and run it.
+                let matches = self.slash_matches();
+                let sel = self.slash_sel.min(matches.len().saturating_sub(1));
+                if let Some((cmd, _)) = matches.get(sel) {
+                    self.input = configure_input();
+                    self.input.insert_str(*cmd);
+                    return Some(self.submit());
+                }
+                Some(Action::Continue)
+            }
+            KeyCode::Esc => {
+                self.clear_input();
+                Some(Action::Continue)
+            }
+            // Anything else (a char, Backspace) changes the filter — reset the
+            // highlight and let the normal handler edit the text.
+            _ => {
+                self.slash_sel = 0;
+                None
+            }
+        }
+    }
+
+    /// Tab: replace the input with the highlighted command + a trailing space,
+    /// ready for arguments. The space ends the token, so the popup closes.
+    fn slash_complete(&mut self) {
+        let matches = self.slash_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let sel = self.slash_sel.min(matches.len() - 1);
+        let cmd = matches[sel].0;
+        self.input = configure_input();
+        self.input.insert_str(format!("{cmd} "));
+        self.slash_sel = 0;
     }
 
     fn load_input(&mut self, text: &str) {
@@ -1544,6 +1788,10 @@ impl App {
                         self.toggle_thinking_display();
                         StreamingAction::Continue
                     }
+                    KeyCode::Char('p') if ctrl => {
+                        self.cycle_theme();
+                        StreamingAction::Continue
+                    }
                     KeyCode::Char('j') if ctrl => {
                         self.toggle_jobs();
                         StreamingAction::Continue
@@ -1666,7 +1914,15 @@ impl App {
         }
 
         let title = self.input_title();
-        self.input.set_block(input_block(title));
+        let input_state = if self.streaming {
+            InputState::Streaming
+        } else {
+            InputState::Idle
+        };
+        self.input.set_block(input_block(title, input_state));
+        // Re-apply each frame so the cursor tracks the active palette (Ctrl+P)
+        // and the blink phase (toggled by the idle loop).
+        self.input.set_cursor_style(cursor_style(self.cursor_on));
         f.render_widget(&self.input, chunks[2]);
         f.render_widget(
             Paragraph::new(footer_line(
@@ -1679,6 +1935,9 @@ impl App {
             chunks[3],
         );
 
+        if self.slash_active() {
+            render_slash_popup(f, chunks[2], &self.slash_matches(), self.slash_sel);
+        }
         if self.show_help {
             render_help(f, area);
         }
@@ -1697,7 +1956,7 @@ impl App {
         // Inner text width = box width minus borders (2) and horizontal padding (2).
         let inner = (width as usize).saturating_sub(4);
         let rows = self.wrapped_row_count(inner) as u16;
-        rows.clamp(2, 8) + 2 // min 2 text rows; grow up to 8; +2 for the border
+        rows.clamp(1, 8) + 2 // 1 text row when empty (compact); grow to 8; +2 border
     }
 
     /// Visual rows the input needs at `inner` width — counts wrapped rows, not
@@ -2011,14 +2270,38 @@ fn dedupe(items: &mut Vec<String>) {
     *items = out;
 }
 
-fn input_block(title: Option<String>) -> Block<'static> {
+/// Visual state of the input box, signalled through its border color.
+#[derive(Clone, Copy)]
+enum InputState {
+    /// Resting: calm dim border (the cursor's accent provides the identity cue).
+    Idle,
+    /// Agent is streaming and Enter interrupts: warn border reinforces the title.
+    Streaming,
+}
+
+/// The themed cursor block — accent background, dark glyph. Re-applied each
+/// frame in `draw` so it tracks the active palette after a Ctrl+P switch.
+/// `on == false` is the blink's off-phase: render the cell like normal text.
+fn cursor_style(on: bool) -> Style {
+    if on {
+        Style::default().bg(pal().accent).fg(Color::Black)
+    } else {
+        Style::default()
+    }
+}
+
+fn input_block(title: Option<String>, state: InputState) -> Block<'static> {
+    let border = match state {
+        InputState::Idle => dim(),
+        InputState::Streaming => style(WARN_COLOR, false),
+    };
     let mut b = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(dim())
+        .border_style(border)
         .padding(Padding::horizontal(1));
     if let Some(t) = title {
-        b = b.title(Span::styled(t, style(ACCENT, false)));
+        b = b.title(Span::styled(t, style(pal().accent, false)));
     }
     b
 }
@@ -2026,8 +2309,11 @@ fn input_block(title: Option<String>) -> Block<'static> {
 fn configure_input() -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.set_wrap_mode(WrapMode::WordOrGlyph);
-    ta.set_block(input_block(None));
+    ta.set_block(input_block(None, InputState::Idle));
     ta.set_cursor_line_style(Style::default());
+    ta.set_cursor_style(cursor_style(true));
+    ta.set_placeholder_text("Message nanobot · / for commands");
+    ta.set_placeholder_style(dim());
     ta
 }
 
@@ -2041,11 +2327,15 @@ fn clip(s: &str, _max: usize) -> String {
 }
 
 fn activity_marker(elapsed_s: f32) -> String {
+    // A single mark sweeping back and forth across a 3-cell track — one coherent
+    // motion, with no duplicate adjacent frames like the old wobble (which
+    // repeated `▞▞` on frames 1 and 3 and so encoded nothing). Driven by elapsed
+    // time so it stays smooth between animation ticks.
     match ((elapsed_s * 6.0) as usize) % 4 {
-        0 => format!("{BRAND} "),
-        1 => format!("{BRAND}{BRAND}"),
-        2 => format!(" {BRAND}"),
-        _ => format!("{BRAND}{BRAND}"),
+        0 => format!("{BRAND}  "),
+        1 => format!(" {BRAND} "),
+        2 => format!("  {BRAND}"),
+        _ => format!(" {BRAND} "),
     }
 }
 
@@ -2067,10 +2357,6 @@ enum Kind {
     User,
     /// Carries the `▞▞` mark — the opening of an assistant turn.
     Head,
-    /// The synthetic "Sure, on it ..." opening of a tool-first turn. Carries the
-    /// `▞▞` mark like `Head`, but gets one breathing row before its tools instead
-    /// of binding tight.
-    Bridge,
     /// Assistant text / thinking continuation.
     Prose,
     Tool,
@@ -2080,17 +2366,6 @@ enum Kind {
 
 fn cell_kind(cell: &Cell, has_mark: bool) -> Kind {
     if has_mark {
-        // The synthetic "Sure, on it ..." bridge opens a tool-first turn but, unlike
-        // a prose head, should get one breathing row before its tools.
-        if matches!(
-            cell,
-            Cell::Activity {
-                phase: ActivityPhase::Decoding,
-                ..
-            }
-        ) {
-            return Kind::Bridge;
-        }
         return Kind::Head;
     }
     match cell {
@@ -2101,19 +2376,17 @@ fn cell_kind(cell: &Cell, has_mark: bool) -> Kind {
     }
 }
 
-/// Blank rows between two adjacent blocks. Spacing encodes grouping: a turn's
-/// opening binds tight to its first tool, tools in a cluster stack with no gap,
-/// and everything else within a turn gets one breathing row. A user line (turn
-/// boundary) gets one row on each side. This single table replaces per-cell
-/// margins so gaps never compound.
+/// Blank rows between two adjacent blocks. Spacing encodes grouping: tools in a
+/// cluster stack with no gap; everything else within a turn — including the
+/// opening line before its first tool — gets one breathing row. A user line
+/// (turn boundary) gets one row on each side. This single table replaces
+/// per-cell margins so gaps never compound.
 fn gap_between(prev: Kind, next: Kind) -> usize {
     match (prev, next) {
         (_, Kind::User) => 1,          // separate the previous turn
         (Kind::User, _) => 1,          // breathing room before the assistant
-        (Kind::Head, Kind::Tool) => 0, // opening line binds to its first tool
-        (Kind::Bridge, Kind::Tool) => 1, // but the "Sure, on it ..." bridge breathes
         (Kind::Tool, Kind::Tool) => 0, // one cluster, no internal gaps
-        _ => 1,
+        _ => 1,                        // everything else, incl. head → first tool
     }
 }
 
@@ -2139,9 +2412,9 @@ fn cache_status_label(status: CacheStatus) -> (String, Color) {
         }
         CacheStatus::AppendOnly { added, .. } => {
             if added == 0 {
-                ("cache warm".to_string(), OK_COLOR)
+                ("cache warm".to_string(), pal().accent2)
             } else {
-                (format!("cache warm · +{} msg", added), OK_COLOR)
+                (format!("cache warm · +{} msg", added), pal().accent2)
             }
         }
         CacheStatus::Diverged { at, .. } => (format!("cache reset · msg {}", at), WARN_COLOR),
@@ -2370,11 +2643,11 @@ fn footer_line(
     frame: u64,
 ) -> Line<'static> {
     let (glyph, word, color, bold) = match status {
-        Status::Ready => (DOT, "ready", OK_COLOR, false),
-        Status::Working => (BRAND, "working", ACCENT, true),
+        Status::Ready => (DOT, "ready", pal().accent2, false),
+        Status::Working => (BRAND, "working", pal().accent, true),
         Status::Recording => (DOT, "recording", ERR_COLOR, true),
-        Status::Speaking => (DOT, "speaking", ACCENT, true),
-        Status::Voice => (DOT, "voice", OK_COLOR, false),
+        Status::Speaking => (DOT, "speaking", pal().accent, true),
+        Status::Voice => (DOT, "voice", pal().accent2, false),
     };
     let mut spans = vec![Span::styled(format!("  {glyph} "), style(color, bold))];
     // Only the working word moves: a single light sweeps across it. Every other
@@ -2385,13 +2658,19 @@ fn footer_line(
         spans.push(Span::styled(word, style(color, bold)));
     }
     spans.push(Span::styled("   cwd ", dim()));
-    spans.push(Span::styled(footer.cwd.clone(), style(OK_COLOR, false)));
+    spans.push(Span::styled(
+        footer.cwd.clone(),
+        style(pal().accent2, false),
+    ));
     spans.push(Span::styled("   model ", dim()));
-    spans.push(Span::styled(footer.model.clone(), style(OK_COLOR, false)));
+    spans.push(Span::styled(
+        footer.model.clone(),
+        style(pal().accent2, false),
+    ));
     spans.push(Span::styled("   mode ", dim()));
     for m in [Mode::Calm, Mode::Inspect, Mode::Deep] {
         let st = if m == mode {
-            Style::default().fg(Color::Black).bg(OK_COLOR)
+            Style::default().fg(Color::Black).bg(pal().accent2)
         } else {
             dim()
         };
@@ -2405,9 +2684,9 @@ fn footer_line(
     if footer.ctx_max > 0 {
         let pct = footer.ctx_used * 100 / footer.ctx_max;
         let ctx_color = match pct {
-            0..=49 => OK_COLOR,
-            50..=79 => WARN_COLOR,
-            _ => ERR_COLOR,
+            0..=49 => pal().accent2, // plenty of room: themed, not a "green = good" signal
+            50..=79 => WARN_COLOR,   // getting full
+            _ => ERR_COLOR,          // nearly full
         };
         spans.push(Span::styled(
             crate::tui::format_tokens(footer.ctx_used),
@@ -2429,8 +2708,7 @@ fn footer_line(
 /// accent elsewhere — then rests briefly before the next pass. One moving
 /// element, calm and alive. (Inspired by skeleton-shimmer loaders.)
 fn shimmer(word: &str, frame: u64) -> Vec<Span<'static>> {
-    const SHINE: Color = Color::Rgb(0xE6, 0xFB, 0xFF); // the crest
-    const GLOW: Color = Color::Rgb(0x8A, 0xDD, 0xE7); // the falloff
+    let p = pal();
     let len = word.chars().count() as i64;
     let span = (len + 5).max(1); // +rest gap so passes pulse rather than chase
     let head = (frame / 2 % span as u64) as i64;
@@ -2438,9 +2716,9 @@ fn shimmer(word: &str, frame: u64) -> Vec<Span<'static>> {
         .enumerate()
         .map(|(i, c)| {
             let color = match (i as i64 - head).abs() {
-                0 => SHINE,
-                1 => GLOW,
-                _ => ACCENT,
+                0 => p.shine,
+                1 => p.glow,
+                _ => p.accent,
             };
             Span::styled(
                 c.to_string(),
@@ -2455,7 +2733,7 @@ fn render_intro(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(Span::styled(
             format!("{BRAND}{BRAND}{BRAND}  TRENTADUE"),
-            style(ACCENT, true),
+            style(pal().accent, true),
         )),
         Line::from(Span::styled("a calm, local agent", dim())),
         Line::default(),
@@ -2484,7 +2762,7 @@ pub(crate) fn draw_outro(f: &mut Frame) {
     let lines = vec![
         Line::from(Span::styled(
             format!("{BRAND}{BRAND}{BRAND}  TRENTADUE"),
-            style(ACCENT, true),
+            style(pal().accent, true),
         )),
         Line::from(Span::styled("session ended  \u{b7}  see you soon", dim())),
     ];
@@ -2512,14 +2790,65 @@ fn render_help(f: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(style(ACCENT, false))
-        .title(Span::styled(" help ", style(ACCENT, true)))
+        .border_style(style(pal().accent, false))
+        .title(Span::styled(" help ", style(pal().accent, true)))
         .padding(Padding::horizontal(1));
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
 }
 
 /// Draw the native model picker as a centered, scrollable, selectable list.
+/// Floating `/`-command autocomplete, anchored just above the input box.
+fn render_slash_popup(
+    f: &mut Frame,
+    input_area: Rect,
+    matches: &[(&'static str, &'static str)],
+    sel: usize,
+) {
+    if matches.is_empty() {
+        return;
+    }
+    let max_vis = 8usize;
+    let total = matches.len();
+    let sel = sel.min(total - 1);
+    // Scrolling window that keeps the selection in view.
+    let start = if sel < max_vis { 0 } else { sel + 1 - max_vis };
+    let vis = &matches[start..(start + max_vis).min(total)];
+
+    let height = vis.len() as u16 + 2; // + rounded border
+    let width = input_area.width.min(46);
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height), // float above the input box
+        width,
+        height,
+    };
+
+    let lines: Vec<Line> = vis
+        .iter()
+        .enumerate()
+        .map(|(i, (cmd, desc))| {
+            let cmd_span = if start + i == sel {
+                Span::styled(
+                    format!(" {cmd} "),
+                    Style::default().fg(Color::Black).bg(pal().accent),
+                )
+            } else {
+                Span::styled(format!(" {cmd} "), style(pal().accent, true))
+            };
+            Line::from(vec![cmd_span, Span::styled(format!(" {desc}"), dim())])
+        })
+        .collect();
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(style(pal().accent, false))
+        .title(Span::styled(" / ", style(pal().accent, false)));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn render_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
     let w = 72.min(area.width.saturating_sub(4));
     let inner_max = (area.height.saturating_sub(6) as usize).max(1);
@@ -2548,10 +2877,10 @@ fn render_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(style(ACCENT, false))
+        .border_style(style(pal().accent, false))
         .title(Span::styled(
             " select model  ·  \u{2191}\u{2193} Enter Esc ",
-            style(ACCENT, true),
+            style(pal().accent, true),
         ))
         .padding(Padding::horizontal(1));
     f.render_widget(Clear, popup);
@@ -2567,7 +2896,7 @@ fn render_jobs(f: &mut Frame, area: Rect, tools: &[BackgroundJob], agents: &[Bac
     } else {
         for job in tools.iter().chain(agents.iter()) {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<8}", job.kind), style(ACCENT, false)),
+                Span::styled(format!("  {:<8}", job.kind), style(pal().accent, false)),
                 Span::styled(format!("{:<12}", clip(&job.id, 12)), style(OK_COLOR, false)),
                 Span::raw(" "),
                 Span::styled(clip(&job.label, 80), Style::default()),
@@ -2582,10 +2911,10 @@ fn render_jobs(f: &mut Frame, area: Rect, tools: &[BackgroundJob], agents: &[Bac
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(style(ACCENT, false))
+        .border_style(style(pal().accent, false))
         .title(Span::styled(
             " jobs  ·  /kill <id> cancels ",
-            style(ACCENT, true),
+            style(pal().accent, true),
         ))
         .padding(Padding::horizontal(1));
     f.render_widget(Clear, popup);
@@ -2649,7 +2978,10 @@ fn render_session_picker(f: &mut Frame, area: Rect, p: &SessionPicker) {
     }
     if let Some(preview) = preview {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled("  preview", style(ACCENT, true))));
+        lines.push(Line::from(Span::styled(
+            "  preview",
+            style(pal().accent, true),
+        )));
         for line in preview.lines().take(8) {
             lines.push(Line::from(Span::styled(
                 format!("  {}", clip(line, 120)),
@@ -2660,10 +2992,10 @@ fn render_session_picker(f: &mut Frame, area: Rect, p: &SessionPicker) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(style(ACCENT, false))
+        .border_style(style(pal().accent, false))
         .title(Span::styled(
             " sessions  ·  Enter preview  ·  Ctrl+Enter resume ",
-            style(ACCENT, true),
+            style(pal().accent, true),
         ))
         .padding(Padding::horizontal(1));
     f.render_widget(Clear, popup);
@@ -2696,7 +3028,7 @@ fn help_lines() -> Vec<Line<'static>> {
             Span::styled(d, Style::default()),
         ])
     };
-    let head = |t: &'static str| Line::from(Span::styled(t, style(ACCENT, true)));
+    let head = |t: &'static str| Line::from(Span::styled(t, style(pal().accent, true)));
     vec![
         head("keys"),
         key("Enter", "send message"),
@@ -2704,6 +3036,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("Up / Down", "prompt history"),
         key("Ctrl+R", "reverse-search history"),
         key("Ctrl+T", "show / hide thinking"),
+        key("Ctrl+P", "cycle color theme"),
         key("Ctrl+J", "jobs"),
         key("Shift+Tab", "cycle calm / inspect / deep"),
         key("PgUp/PgDn", "scroll transcript"),
@@ -2737,7 +3070,7 @@ fn help_lines() -> Vec<Line<'static>> {
 /// The TRENTADUE brand mark `▞▞▞`, always stable in the header.
 fn brand_mark() -> Vec<Span<'static>> {
     (0..3)
-        .map(|_| Span::styled(BRAND, style(ACCENT, true)))
+        .map(|_| Span::styled(BRAND, style(pal().accent, true)))
         .collect()
 }
 
@@ -2759,7 +3092,7 @@ fn cell_lines_with_reply_mark(
             .enumerate()
             .map(|(i, l)| {
                 let head = if i == 0 {
-                    (format!("  {DOT} "), style(OK_COLOR, true))
+                    (format!("  {DOT} "), style(pal().accent2, true))
                 } else {
                     ("    ".to_string(), Style::default())
                 };
@@ -2776,12 +3109,12 @@ fn cell_lines_with_reply_mark(
         } => {
             let mut segs = vec![
                 ("  ".to_string(), Style::default()),
-                (activity_marker(elapsed_s), dim_color(ACCENT)),
+                (activity_marker(elapsed_s), dim_color(pal().accent)),
                 (" ".to_string(), Style::default()),
             ];
             match phase {
                 ActivityPhase::Prefill => {
-                    segs.push(("prefill".to_string(), dim_color(ACCENT)));
+                    segs.push(("prefill".to_string(), dim_color(pal().accent)));
                     if let Some(cache) = cache {
                         let (label, color) = cache_status_label(*cache);
                         segs.push((" · ".to_string(), dim()));
@@ -2825,7 +3158,7 @@ fn cell_lines_with_reply_mark(
                             } else {
                                 format_prefill_rate(*tps)
                             };
-                            segs.push((label, dim_color(ACCENT)));
+                            segs.push((label, dim_color(pal().accent)));
                         }
                     }
                     segs.push((format!(" · {:.1}s", elapsed_s), dim()));
@@ -2837,11 +3170,11 @@ fn cell_lines_with_reply_mark(
                 ActivityPhase::Decoding => {
                     if show_reply_mark {
                         return vec![vec![
-                            (format!("  {BRAND}{BRAND} "), style(ACCENT, true)),
+                            (format!("  {BRAND}{BRAND} "), style(pal().accent, true)),
                             (TOOL_BRIDGE_TEXT.to_string(), Style::default()),
                         ]];
                     }
-                    segs.push(("decoding".to_string(), dim_color(ACCENT)));
+                    segs.push(("decoding".to_string(), dim_color(pal().accent)));
                     segs.push((format!(" · {:.1}s", elapsed_s), dim()));
                 }
             }
@@ -2852,7 +3185,7 @@ fn cell_lines_with_reply_mark(
             .enumerate()
             .map(|(i, mut segs)| {
                 let head = if i == 0 && show_reply_mark {
-                    (format!("  {BRAND}{BRAND} "), style(ACCENT, true))
+                    (format!("  {BRAND}{BRAND} "), style(pal().accent, true))
                 } else {
                     ("     ".to_string(), Style::default())
                 };
@@ -2886,8 +3219,8 @@ fn cell_lines_with_reply_mark(
                 format!("{name}({})", clip(args, 48))
             };
             let mut head = vec![
-                (format!("       {RUN} "), style(ACCENT, false)),
-                (label, style(ACCENT, false)),
+                (format!("       {RUN} "), style(pal().accent, false)),
+                (label, style(pal().accent, false)),
             ];
             match state {
                 ToolState::Running => {
@@ -3218,6 +3551,56 @@ fn compact_output_line(line: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn palette_index_0_is_monochrome() {
+        // The default scheme is intentionally black/grey/white — color is opt-in.
+        let p = Palette::from_index(0);
+        assert_eq!(p.accent, Color::Rgb(0xD7, 0xD7, 0xD7));
+        assert_eq!(p.accent2, Color::Rgb(0x8E, 0x8E, 0x8E));
+    }
+
+    #[test]
+    fn palette_wraps_at_theme_count() {
+        // Cycling past the last scheme returns to the first.
+        assert_eq!(
+            Palette::from_index(THEME_COUNT).accent,
+            Palette::from_index(0).accent
+        );
+        assert_eq!(
+            Palette::from_index(THEME_COUNT + 1).accent,
+            Palette::from_index(1).accent
+        );
+    }
+
+    #[test]
+    fn palette_rotation_changes_the_accent() {
+        // Distinct schemes must actually look different — the point of rotation.
+        assert_ne!(Palette::from_index(0).accent, Palette::from_index(8).accent);
+        assert_ne!(
+            Palette::from_index(8).accent,
+            Palette::from_index(16).accent
+        );
+    }
+
+    #[test]
+    fn slash_popup_filters_and_completes() {
+        let mut app = App::new();
+        app.input.insert_str("/mod");
+        assert!(app.slash_active(), "popup active while naming a command");
+        let names: Vec<&str> = app.slash_matches().iter().map(|(c, _)| *c).collect();
+        assert!(
+            names.contains(&"/model") && names.contains(&"/mode"),
+            "prefix filter should include /model and /mode: {names:?}"
+        );
+        app.slash_sel = 0;
+        app.slash_complete();
+        assert_eq!(app.input.lines()[0], "/model ", "Tab fills command + space");
+        assert!(
+            !app.slash_active(),
+            "the trailing space ends the token, so the popup closes"
+        );
+    }
+
     fn test_footer() -> Footer {
         Footer {
             cwd: "~/Dev/nanobot-rs".into(),
@@ -3321,7 +3704,7 @@ mod tests {
         let mut out = Vec::new();
         wrap_segments(
             &[
-                (format!("  {BRAND}{BRAND} "), style(ACCENT, true)),
+                (format!("  {BRAND}{BRAND} "), style(pal().accent, true)),
                 ("abcdef".to_string(), Style::default()),
             ],
             8,
@@ -4453,13 +4836,12 @@ mod tests {
             .iter()
             .position(|line| line.contains("read_file render.rs"))
             .expect("tool rendered");
-        // "Let me look." is the turn's opening line (carries the ▞▞ mark), so the
-        // first tool binds tight beneath it with no blank row (grouping: the
-        // announce-and-act pair is one unit). Later prose→tool gets a blank.
+        // "Let me look." is the turn's opening line (carries the ▞▞ mark); the
+        // first tool now gets one breathing row beneath it before binding.
         assert_eq!(
             tool_idx,
-            reply_idx + 1,
-            "first tool binds tight under the opening line:\n{}",
+            reply_idx + 2,
+            "one blank row between the opening line and its first tool:\n{}",
             lines.join("\n")
         );
         assert!(
@@ -4535,8 +4917,8 @@ mod tests {
 
         assert_eq!(
             blanks(head, t1),
-            0,
-            "opening line binds tight to first tool"
+            1,
+            "opening line gets one breathing row before its first tool"
         );
         assert_eq!(blanks(t1, t2), 0, "tools in a cluster stack with no gap");
         assert_eq!(blanks(t2, prose), 1, "tool result → prose is one row");
@@ -4745,7 +5127,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_input_hides_prompt_and_grows_from_two_rows() {
+    fn idle_input_hides_prompt_and_grows_from_one_row() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -4760,12 +5142,12 @@ mod tests {
             "idle input must not show the placeholder/title:\n{text}"
         );
 
-        // One short line → 2 text rows (+2 border). A long line that wraps past
-        // two rows grows the box, even with no explicit newline.
-        assert_eq!(app.input_height(100), 4, "short line should be 2 text rows");
+        // One short line → 1 text row (+2 border). A long line that wraps grows
+        // the box, even with no explicit newline.
+        assert_eq!(app.input_height(100), 3, "short line should be 1 text row");
         app.input.insert_str(&"x".repeat(300));
         assert!(
-            app.input_height(100) > 4,
+            app.input_height(100) > 3,
             "a wrapping line should grow the input box"
         );
     }

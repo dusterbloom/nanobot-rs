@@ -242,6 +242,9 @@ pub struct AgentDefaults {
     pub max_context_tokens: usize,
     #[serde(default = "default_max_concurrent_chats")]
     pub max_concurrent_chats: usize,
+    /// TUI color-scheme index (0..32), cycled with Ctrl+P. Defaults to 0 (teal).
+    #[serde(default)]
+    pub theme_index: u8,
     /// Max characters for inline tool results before truncation (default: 30000).
     #[serde(default = "default_max_tool_result_chars")]
     pub max_tool_result_chars: usize,
@@ -440,6 +443,7 @@ impl Default for AgentDefaults {
             max_tool_iterations: default_max_tool_iterations(),
             max_context_tokens: default_max_context_tokens(),
             max_concurrent_chats: default_max_concurrent_chats(),
+            theme_index: 0,
             max_tool_result_chars: default_max_tool_result_chars(),
             max_continuations: default_max_continuations(),
             lms_main_model: String::new(),

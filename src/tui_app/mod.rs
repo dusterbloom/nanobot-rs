@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::audit::ToolEvent;
+use crate::config::loader::{load_config, save_config};
 use crate::repl::commands::{unique_direct_model_match, ModelEntry, ReplContext};
 use app::{
     draw_outro, Action, App, BackgroundJob, Footer, SessionPick, SessionRow, StreamingAction,
@@ -115,9 +116,17 @@ pub(crate) async fn run(ctx: &mut ReplContext) -> std::io::Result<()> {
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
 
     let mut app = App::new();
+    app.set_theme_index(ctx.config.agents.defaults.theme_index);
     load_current_session_state(&mut app, ctx).await;
     let result = event_loop(&mut terminal, &mut app, ctx, &mut ev_rx, &paused).await;
     save_current_snapshot(&app, ctx).await;
+
+    // Persist the chosen color scheme (Ctrl+P) so it survives restarts.
+    let mut disk = load_config(None);
+    if disk.agents.defaults.theme_index != app.theme_index() {
+        disk.agents.defaults.theme_index = app.theme_index();
+        save_config(&disk, None);
+    }
 
     // Native farewell frame before the terminal is restored.
     if result.is_ok() {
@@ -210,11 +219,24 @@ async fn event_loop(
     ev_rx: &mut UnboundedReceiver<Event>,
     paused: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    // Blink tick: at idle the loop otherwise only redraws on input, so the
+    // cursor would sit static. A slow interval wakes the loop to flip the blink.
+    let mut blink = tokio::time::interval(Duration::from_millis(530));
+    blink.set_missed_tick_behavior(MissedTickBehavior::Skip);
     'ui: loop {
         refresh_background_jobs(app, &ctx.agent_loop).await;
         let footer = footer_snapshot(&ctx.core_handle);
         terminal.draw(|f| app.draw(f, &footer))?;
-        let Some(ev) = ev_rx.recv().await else { break };
+        let ev = tokio::select! {
+            ev = ev_rx.recv() => match ev {
+                Some(e) => e,
+                None => break,
+            },
+            _ = blink.tick() => {
+                app.toggle_cursor();
+                continue;
+            }
+        };
         match app.on_idle_event(ev) {
             Action::Quit => break,
             Action::Continue => {}

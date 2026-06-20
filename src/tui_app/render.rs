@@ -24,7 +24,11 @@ static THEME: Lazy<Theme> =
 /// Inline code foreground (soft amber) — distinct without a background fill,
 /// which keeps soft-wrapping clean.
 const CODE_FG: Color = Color::Rgb(0xD7, 0xBA, 0x7D);
-const MARKDOWN_ACCENT: Color = Color::Rgb(0x28, 0xB3, 0xC1);
+
+/// Markdown heading accent — follows the active theme (rotates with Ctrl+P).
+fn markdown_accent() -> Color {
+    super::app::accent_color()
+}
 // Wrap oversized table cells here so the transcript never has to hide them.
 const TABLE_CELL_WIDTH_CAP: usize = 64;
 
@@ -111,7 +115,7 @@ fn inline_line(line: &str) -> Vec<Seg> {
         return seg;
     }
     if let Some((marker, rest)) = list_marker(trimmed, indent) {
-        let mut segs = vec![(marker, Style::default().fg(MARKDOWN_ACCENT))];
+        let mut segs = vec![(marker, Style::default().fg(markdown_accent()))];
         segs.extend(inline_spans(rest));
         return segs;
     }
@@ -129,10 +133,10 @@ fn heading(trimmed: &str) -> Option<Vec<Seg>> {
     let rest = trimmed[level..].strip_prefix(' ')?;
     let style = if level <= 2 {
         Style::default()
-            .fg(MARKDOWN_ACCENT)
+            .fg(markdown_accent())
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(MARKDOWN_ACCENT)
+        Style::default().fg(markdown_accent())
     };
     Some(vec![(rest.to_string(), style)])
 }
@@ -235,7 +239,7 @@ fn table_row(row: &[String], widths: &[usize], header: bool) -> Vec<Vec<Seg>> {
             };
             let style = if header {
                 Style::default()
-                    .fg(MARKDOWN_ACCENT)
+                    .fg(markdown_accent())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -392,7 +396,7 @@ fn match_span(chars: &[char], i: usize) -> Option<(Vec<Seg>, usize)> {
                 (
                     label,
                     Style::default()
-                        .fg(MARKDOWN_ACCENT)
+                        .fg(markdown_accent())
                         .add_modifier(Modifier::BOLD),
                 ),
                 (format!(" ({url})"), Style::default().fg(Color::DarkGray)),
@@ -407,7 +411,7 @@ fn match_span(chars: &[char], i: usize) -> Option<(Vec<Seg>, usize)> {
                 (
                     label,
                     Style::default()
-                        .fg(MARKDOWN_ACCENT)
+                        .fg(markdown_accent())
                         .add_modifier(Modifier::UNDERLINED),
                 ),
                 (format!(" ({url})"), Style::default().fg(Color::DarkGray)),
@@ -516,7 +520,7 @@ mod tests {
     fn heading_is_cyan_and_strips_hashes() {
         let lines = markdown("## Title");
         assert_eq!(flat(&lines[0]), "Title");
-        assert_eq!(lines[0][0].1.fg, Some(MARKDOWN_ACCENT));
+        assert_eq!(lines[0][0].1.fg, Some(markdown_accent()));
     }
 
     #[test]
