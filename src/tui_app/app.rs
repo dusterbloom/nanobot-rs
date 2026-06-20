@@ -2067,6 +2067,10 @@ enum Kind {
     User,
     /// Carries the `▞▞` mark — the opening of an assistant turn.
     Head,
+    /// The synthetic "Sure, on it ..." opening of a tool-first turn. Carries the
+    /// `▞▞` mark like `Head`, but gets one breathing row before its tools instead
+    /// of binding tight.
+    Bridge,
     /// Assistant text / thinking continuation.
     Prose,
     Tool,
@@ -2076,6 +2080,17 @@ enum Kind {
 
 fn cell_kind(cell: &Cell, has_mark: bool) -> Kind {
     if has_mark {
+        // The synthetic "Sure, on it ..." bridge opens a tool-first turn but, unlike
+        // a prose head, should get one breathing row before its tools.
+        if matches!(
+            cell,
+            Cell::Activity {
+                phase: ActivityPhase::Decoding,
+                ..
+            }
+        ) {
+            return Kind::Bridge;
+        }
         return Kind::Head;
     }
     match cell {
@@ -2096,6 +2111,7 @@ fn gap_between(prev: Kind, next: Kind) -> usize {
         (_, Kind::User) => 1,          // separate the previous turn
         (Kind::User, _) => 1,          // breathing room before the assistant
         (Kind::Head, Kind::Tool) => 0, // opening line binds to its first tool
+        (Kind::Bridge, Kind::Tool) => 1, // but the "Sure, on it ..." bridge breathes
         (Kind::Tool, Kind::Tool) => 0, // one cluster, no internal gaps
         _ => 1,
     }
@@ -2821,7 +2837,7 @@ fn cell_lines_with_reply_mark(
                 ActivityPhase::Decoding => {
                     if show_reply_mark {
                         return vec![vec![
-                            (format!("  {BRAND}{BRAND}   "), style(ACCENT, true)),
+                            (format!("  {BRAND}{BRAND} "), style(ACCENT, true)),
                             (TOOL_BRIDGE_TEXT.to_string(), Style::default()),
                         ]];
                     }
@@ -3862,6 +3878,11 @@ mod tests {
         assert!(
             bridge_idx < tool_idx && tool_idx < reply_idx,
             "expected bridge, then tool, then reply:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows[bridge_idx + 1].trim().is_empty(),
+            "expected one blank row after the \"Sure, on it ...\" bridge:\n{}",
             rows.join("\n")
         );
         assert_eq!(
