@@ -71,22 +71,6 @@ impl AgentLoopShared {
             }
         }
 
-        // Pre-compute cost from token counters (async ModelPrices::load).
-        let prompt_tokens = counters.last_actual_prompt_tokens.load(Ordering::Relaxed) as i64;
-        let completion_tokens = counters
-            .last_actual_completion_tokens
-            .load(Ordering::Relaxed) as i64;
-        let cost_usd = if prompt_tokens > 0 || completion_tokens > 0 {
-            let prices = crate::agent::model_prices::ModelPrices::load().await;
-            prices.cost_of(&ctx.core.model, prompt_tokens, completion_tokens)
-        } else {
-            0.0
-        };
-
-        // Save turn_tool_entries before post-processing (moved from TurnOutcome construction
-        // so observers see final content after rescue/sanitization).
-        let turn_tool_entries = std::mem::take(&mut ctx.turn_tool_entries);
-
         let mut rescued_incomplete_assistant = false;
         if ctx.final_content.is_empty() && ctx.messages.len() > 2 {
             let reason = incomplete_turn_reason(&ctx);
@@ -272,14 +256,6 @@ impl AgentLoopShared {
                 }
             }
         }
-
-        // Capture reasoning trace BEFORE sanitization strips <think> blocks.
-        // Training data benefits from seeing the model's reasoning process.
-        let reasoning_trace = if ctx.final_content.contains("<think>") {
-            Some(ctx.final_content.clone())
-        } else {
-            None
-        };
 
         ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
 

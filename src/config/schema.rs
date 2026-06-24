@@ -991,7 +991,7 @@ pub struct AntiDriftConfig {
     /// Inject a format anchor every N iterations (default: 3).
     #[serde(default = "default_anchor_interval")]
     pub anchor_interval: u32,
-    /// Pollution score threshold to evict a turn (default: 0.6, requires 2+ signals).
+    /// Pollution score threshold to evict a turn (default: 0.6).
     #[serde(default = "default_pollution_threshold")]
     pub pollution_threshold: f32,
     /// Max word count before babble collapse fires (default: 500).
@@ -1760,15 +1760,8 @@ impl Default for ProprioceptionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum TtsEngineConfig {
-    // DEPRECATED(pocket): Pocket is no longer used in practice — Supertonic is the
-    // active engine. Kept as #[default] for now only to avoid a behavioral change.
-    // TODO(pocket-removal): switch #[default] to Supertonic and delete the Pocket
-    // code paths in voice_pipeline.rs (route_tts, pocket_tts_language, init/fallback)
-    // plus the CLI/main refs. Tracked in .planning/HANDOFF-tui-ratatui-rewrite.md.
     #[default]
-    Pocket,
     Supertonic,
-    Kokoro,
     /// macOS `say` command — native system TTS (Siri-quality neural voices).
     /// No model is loaded; `speak()` shells out per turn. macOS only.
     Say,
@@ -1778,16 +1771,15 @@ pub enum TtsEngineConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceConfig {
-    /// Default language for TTS. "en" = Pocket only (fast), "auto" or None = both engines.
+    /// Default language for TTS. `None` means auto-detect per utterance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
-    /// TTS engine selection. Default: "pocket" (fast English).
+    /// TTS engine selection. Default: "supertonic".
     #[serde(default)]
     pub tts_engine: TtsEngineConfig,
     /// Voice ID for the selected TTS engine.
-    /// - Pocket: "alba", "marius", "javert", etc.
     /// - Supertonic: "F1", "F2", "M1", "M2", etc.
-    /// - Kokoro: numeric string "0"-"10"
+    /// - Say: macOS voice name, e.g. "Samantha" or "Alice"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_voice: Option<String>,
 }
@@ -2584,17 +2576,9 @@ mod tests {
     }
 
     #[test]
-    fn test_voice_config_tts_engine_default_is_pocket() {
+    fn test_voice_config_tts_engine_default_is_supertonic() {
         let vc = VoiceConfig::default();
-        assert_eq!(vc.tts_engine, TtsEngineConfig::Pocket);
-    }
-
-    #[test]
-    fn test_voice_config_tts_engine_kokoro_from_json() {
-        let json = r#"{"voice": {"ttsEngine": "kokoro", "ttsVoice": "3"}}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::Kokoro);
-        assert_eq!(cfg.voice.tts_voice.as_deref(), Some("3"));
+        assert_eq!(vc.tts_engine, TtsEngineConfig::Supertonic);
     }
 
     #[test]
@@ -2607,40 +2591,34 @@ mod tests {
     fn test_voice_config_roundtrip() {
         let vc = VoiceConfig {
             language: Some("en".to_string()),
-            tts_engine: TtsEngineConfig::Pocket,
-            tts_voice: Some("alba".to_string()),
+            tts_engine: TtsEngineConfig::Supertonic,
+            tts_voice: Some("M2".to_string()),
         };
         let json = serde_json::to_string(&vc).unwrap();
         let vc2: VoiceConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(vc2.language.as_deref(), Some("en"));
-        assert_eq!(vc2.tts_engine, TtsEngineConfig::Pocket);
-        assert_eq!(vc2.tts_voice.as_deref(), Some("alba"));
+        assert_eq!(vc2.tts_engine, TtsEngineConfig::Supertonic);
+        assert_eq!(vc2.tts_voice.as_deref(), Some("M2"));
     }
 
     #[test]
     fn test_tts_engine_config_serialization() {
         assert_eq!(
-            serde_json::to_string(&TtsEngineConfig::Pocket).unwrap(),
-            r#""pocket""#
-        );
-        assert_eq!(
             serde_json::to_string(&TtsEngineConfig::Supertonic).unwrap(),
             r#""supertonic""#
         );
         assert_eq!(
-            serde_json::to_string(&TtsEngineConfig::Kokoro).unwrap(),
-            r#""kokoro""#
+            serde_json::to_string(&TtsEngineConfig::Say).unwrap(),
+            r#""say""#
         );
     }
 
     #[test]
     fn test_tts_engine_config_deserialization() {
-        let pocket: TtsEngineConfig = serde_json::from_str(r#""pocket""#).unwrap();
         let supertonic: TtsEngineConfig = serde_json::from_str(r#""supertonic""#).unwrap();
-        let kokoro: TtsEngineConfig = serde_json::from_str(r#""kokoro""#).unwrap();
-        assert_eq!(pocket, TtsEngineConfig::Pocket);
+        let say: TtsEngineConfig = serde_json::from_str(r#""say""#).unwrap();
         assert_eq!(supertonic, TtsEngineConfig::Supertonic);
-        assert_eq!(kokoro, TtsEngineConfig::Kokoro);
+        assert_eq!(say, TtsEngineConfig::Say);
     }
 
     #[test]

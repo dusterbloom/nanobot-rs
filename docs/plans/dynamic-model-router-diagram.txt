@@ -91,7 +91,7 @@
   ├────────────────────────────────────────────────────────────────────────────┤
   │                                                                           │
   │  💸 Zero Budget      Flash free + OR free + local 3B          $0/mo      │
-  │  🔧 Hybrid Hacker    Opus rare + local 8B + Kokoro         $5-12/mo      │
+  │  🔧 Hybrid Hacker    Opus rare + local 8B + Supertonic     $5-12/mo      │
   │  👥 Team (5 devs)    Opus/Sonnet pool + Haiku bulk        $30-50/mo      │
   │  ✈️  Offline           Best local available, sync later       $0/mo      │
   │  🧬 Kernel (future)  Personal LoRA + Opus on-demand        $1-2/mo      │

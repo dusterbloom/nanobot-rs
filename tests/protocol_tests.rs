@@ -4,7 +4,7 @@
 use serde_json::json;
 
 use nanobot::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
-use nanobot::agent::turn::{turn_from_legacy, MediaAttachment, ToolCall, Turn};
+use nanobot::agent::turn::{turn_from_legacy, ToolCall, Turn};
 
 // ─────────────────────────────────────────────────────────────
 // Phase 1: Turn enum serialization and legacy conversion

@@ -28,8 +28,6 @@ pub struct HookResult {
     pub allowed: bool,
     /// Combined stdout + stderr from the hook (truncated).
     pub output: String,
-    /// Exit code of the hook process (None if it was killed/timed out).
-    pub exit_code: Option<i32>,
 }
 
 /// Maximum time a hook script is allowed to run before being killed.
@@ -83,7 +81,6 @@ pub async fn run_hook(
             return Some(HookResult {
                 allowed: true, // fail-open: don't block on hook errors
                 output: format!("hook error: {}", e),
-                exit_code: None,
             });
         }
         Err(_) => {
@@ -95,7 +92,6 @@ pub async fn run_hook(
             return Some(HookResult {
                 allowed: true, // fail-open on timeout
                 output: "hook timed out".to_string(),
-                exit_code: None,
             });
         }
     };
@@ -110,7 +106,6 @@ pub async fn run_hook(
     }
     combined.truncate(MAX_OUTPUT_BYTES);
 
-    let exit_code = output.status.code();
     let allowed = match phase {
         HookPhase::PreToolUse => output.status.success(),
         HookPhase::PostToolUse => true, // post hooks are observational
@@ -119,7 +114,6 @@ pub async fn run_hook(
     Some(HookResult {
         allowed,
         output: combined,
-        exit_code,
     })
 }
 
@@ -167,7 +161,6 @@ mod tests {
         .unwrap();
 
         assert!(result.allowed);
-        assert_eq!(result.exit_code, Some(0));
     }
 
     #[tokio::test]
@@ -188,7 +181,6 @@ mod tests {
         .unwrap();
 
         assert!(!result.allowed);
-        assert_eq!(result.exit_code, Some(1));
         assert!(result.output.contains("blocked by policy"));
     }
 
@@ -211,7 +203,6 @@ mod tests {
 
         // Post hooks are observational — always allowed even on non-zero exit.
         assert!(result.allowed);
-        assert_eq!(result.exit_code, Some(1));
     }
 
     #[tokio::test]

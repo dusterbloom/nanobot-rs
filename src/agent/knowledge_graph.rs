@@ -15,6 +15,7 @@ use petgraph::Direction;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "knowledge-graph")]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

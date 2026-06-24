@@ -6,10 +6,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::*;
-use crate::agent::agent_loop::{
-    build_swappable_core, AgentHandle, AgentLoop, RuntimeCounters, SharedCoreHandle,
-    SwappableCoreConfig,
+use crate::agent::agent_core::{
+    build_swappable_core, AgentHandle, RuntimeCounters, SwappableCoreConfig,
 };
+use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::lane::Lane;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::config::schema::{is_higgs_backend, AdaptiveTokenConfig, Config};
@@ -72,6 +72,26 @@ pub(super) fn model_context_size(model: &str, config_default: usize) -> usize {
         config_default.max(131_072)
     } else {
         config_default
+    }
+}
+
+const APPLE_FM_CONTEXT_TOKENS: usize = 4_096;
+
+fn is_apple_fm_model(model: &str) -> bool {
+    matches!(model.trim().to_ascii_lowercase().as_str(), "system" | "pcc")
+}
+
+fn resolved_local_context_tokens(
+    model_id: &str,
+    detected_context_tokens: Option<usize>,
+    fallback_context_tokens: usize,
+) -> usize {
+    if is_apple_fm_model(model_id) {
+        detected_context_tokens
+            .unwrap_or(APPLE_FM_CONTEXT_TOKENS)
+            .min(APPLE_FM_CONTEXT_TOKENS)
+    } else {
+        detected_context_tokens.unwrap_or(fallback_context_tokens)
     }
 }
 
@@ -227,13 +247,16 @@ pub(super) fn make_local_providers(
     // The cluster path (custom base, possibly remote) needs a URL-aware probe so
     // peers exposing /props (llama-server) get their real n_ctx instead of the
     // 32k schema default.
-    let max_context_tokens = if has_custom_base {
+    let detected_context_tokens = if has_custom_base {
         crate::server::query_context_size_from_url(&base_url)
-            .unwrap_or(config.agents.defaults.local_max_context_tokens)
     } else {
         crate::server::query_local_context_size(local_port)
-            .unwrap_or(config.agents.defaults.local_max_context_tokens)
     };
+    let max_context_tokens = resolved_local_context_tokens(
+        &model_id,
+        detected_context_tokens,
+        config.agents.defaults.local_max_context_tokens,
+    );
 
     // Compaction provider (separate port only).
     let compaction: Option<Arc<dyn LLMProvider>> =
@@ -450,7 +473,7 @@ pub(crate) fn build_core_handle(
         dp,
         sp,
     ));
-    let mut counters =
+    let counters =
         RuntimeCounters::new_with_config(max_context_tokens, &config.trio.circuit_breaker);
     // When main_no_think is enabled, suppress thinking display from the start
     // so the user doesn't need to run /nothink manually each session.
@@ -557,7 +580,7 @@ pub(crate) fn create_agent_loop(
         lcm_config.enabled = Some(true);
     }
 
-    let mut agent_loop = AgentLoop::new(
+    let agent_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
         outbound_tx,
@@ -621,6 +644,27 @@ mod matching_tests {
         assert_eq!(
             shared_local_role_model("Qwen3.5-0.8B-8bit", "Qwen3.6-35B-A3B-4bit"),
             "Qwen3.5-0.8B-8bit"
+        );
+    }
+
+    #[test]
+    fn test_resolved_local_context_tokens_caps_apple_fm() {
+        assert_eq!(resolved_local_context_tokens("system", None, 32_768), 4_096);
+        assert_eq!(
+            resolved_local_context_tokens("pcc", Some(32_768), 32_768),
+            4_096
+        );
+    }
+
+    #[test]
+    fn test_resolved_local_context_tokens_keeps_detected_non_apple_ctx() {
+        assert_eq!(
+            resolved_local_context_tokens("qwen36-35b", Some(131_072), 32_768),
+            131_072
+        );
+        assert_eq!(
+            resolved_local_context_tokens("qwen36-35b", None, 32_768),
+            32_768
         );
     }
 }

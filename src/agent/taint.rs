@@ -10,15 +10,12 @@
 //! can be audited or blocked by a future policy layer.
 
 use std::collections::HashSet;
-use std::time::SystemTime;
 
 /// A record of a taint source.
 #[derive(Debug, Clone)]
 pub struct TaintSpan {
     /// Which tool introduced the taint (e.g., "web_fetch", "web_search")
     pub source_tool: String,
-    /// When the taint was introduced
-    pub timestamp: SystemTime,
     /// Optional: URL or query that was the source
     pub source_detail: Option<String>,
 }
@@ -58,7 +55,6 @@ impl TaintState {
         if self.taint_sources.contains(tool_name) {
             self.spans.push(TaintSpan {
                 source_tool: tool_name.to_string(),
-                timestamp: SystemTime::now(),
                 source_detail: detail,
             });
         }
@@ -96,16 +92,6 @@ impl TaintState {
             .collect::<Vec<_>>()
             .join(", ")
     }
-
-    /// Clear all taint spans (e.g., on conversation reset).
-    pub fn clear(&mut self) {
-        self.spans.clear();
-    }
-
-    /// Get the number of active taint spans.
-    pub fn span_count(&self) -> usize {
-        self.spans.len()
-    }
 }
 
 #[cfg(test)]
@@ -123,7 +109,7 @@ mod tests {
         let mut state = TaintState::new();
         state.mark_tainted("web_fetch", Some("https://example.com".into()));
         assert!(state.is_tainted());
-        assert_eq!(state.span_count(), 1);
+        assert_eq!(state.check_sensitive("exec").unwrap().len(), 1);
     }
 
     #[test]
@@ -171,20 +157,11 @@ mod tests {
     }
 
     #[test]
-    fn test_clear() {
-        let mut state = TaintState::new();
-        state.mark_tainted("web_fetch", None);
-        assert!(state.is_tainted());
-        state.clear();
-        assert!(!state.is_tainted());
-    }
-
-    #[test]
     fn test_multiple_taint_spans() {
         let mut state = TaintState::new();
         state.mark_tainted("web_fetch", Some("url1".into()));
         state.mark_tainted("web_fetch", Some("url2".into()));
-        assert_eq!(state.span_count(), 2);
+        assert_eq!(state.check_sensitive("exec").unwrap().len(), 2);
     }
 
     // --- Integration scenario tests: simulating tool_engine.rs call sequence ---

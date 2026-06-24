@@ -622,6 +622,12 @@ fn switch_url_from_base(api_base: &str) -> String {
     }
 }
 
+fn health_url_from_base(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{base}/health")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HiggsConfigModel {
     path: String,
@@ -807,6 +813,45 @@ pub(crate) async fn list_served_models_at(api_base: &str, api_key: &str) -> Vec<
     model_ids_from_models_json(&json)
 }
 
+/// List resident model ids, dropping entries the endpoint health marks unavailable.
+pub(crate) async fn list_available_served_models_at(api_base: &str, api_key: &str) -> Vec<String> {
+    let served = list_served_models_at(api_base, api_key).await;
+    if served.is_empty() {
+        return served;
+    }
+    let unavailable = unavailable_models_at(api_base, api_key).await;
+    filter_available_model_ids(served, &unavailable)
+}
+
+/// Probe whether this endpoint implements Higgs' runtime switch API.
+///
+/// A real switch-capable Higgs answers GET /v1/models/switch with 405 and
+/// Allow: POST. Plain OpenAI-compatible resident endpoints commonly return
+/// 404; those must not receive filesystem switch candidates.
+pub(crate) async fn supports_runtime_model_switch_at(api_base: &str, api_key: &str) -> bool {
+    let url = switch_url_from_base(api_base);
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let Ok(resp) = req.timeout(std::time::Duration::from_secs(3)).send().await else {
+        return false;
+    };
+    if resp.status() != reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        return false;
+    }
+    resp.headers()
+        .get(reqwest::header::ALLOW)
+        .and_then(|value| value.to_str().ok())
+        .map(|allow| {
+            allow
+                .split(',')
+                .any(|method| method.trim().eq_ignore_ascii_case("POST"))
+        })
+        .unwrap_or(true)
+}
+
 /// Switch Higgs to one runtime model using the free-then-load endpoint.
 pub(crate) async fn switch_runtime_model(
     api_base: &str,
@@ -923,6 +968,59 @@ fn model_ids_from_models_json(json: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+async fn unavailable_models_at(api_base: &str, api_key: &str) -> Vec<String> {
+    let url = health_url_from_base(api_base);
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let Ok(resp) = req.timeout(std::time::Duration::from_secs(3)).send().await else {
+        return Vec::new();
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    unavailable_models_from_health_json(&json)
+}
+
+fn unavailable_models_from_health_json(json: &serde_json::Value) -> Vec<String> {
+    json.get("models")
+        .and_then(|models| models.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter(|model| {
+                    model
+                        .get("available")
+                        .and_then(|available| available.as_bool())
+                        == Some(false)
+                })
+                .filter_map(|model| {
+                    model
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn filter_available_model_ids(models: Vec<String>, unavailable: &[String]) -> Vec<String> {
+    if unavailable.is_empty() {
+        return models;
+    }
+    models
+        .into_iter()
+        .filter(|id| {
+            !unavailable
+                .iter()
+                .any(|blocked| model_id_matches(id, blocked))
+        })
+        .collect()
 }
 
 /// Resolve the served model id that best matches `preferred`.
@@ -1210,6 +1308,43 @@ mod tests {
         assert_eq!(
             model_ids_from_models_json(&json),
             vec!["qwen".to_string(), "llama".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_health_url_from_base() {
+        assert_eq!(
+            health_url_from_base("http://127.0.0.1:8000/v1"),
+            "http://127.0.0.1:8000/health"
+        );
+        assert_eq!(
+            health_url_from_base("http://127.0.0.1:8000"),
+            "http://127.0.0.1:8000/health"
+        );
+    }
+
+    #[test]
+    fn test_unavailable_models_from_health_json() {
+        let json = serde_json::json!({
+            "status": "fm serve is running",
+            "models": [
+                { "name": "system", "available": true },
+                { "name": "pcc", "available": false, "reason": "not available here" }
+            ]
+        });
+        assert_eq!(
+            unavailable_models_from_health_json(&json),
+            vec!["pcc".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_filter_available_model_ids_uses_health_unavailable() {
+        let models = vec!["system".to_string(), "pcc".to_string()];
+        let unavailable = vec!["PCC".to_string()];
+        assert_eq!(
+            filter_available_model_ids(models, &unavailable),
+            vec!["system".to_string()]
         );
     }
 }

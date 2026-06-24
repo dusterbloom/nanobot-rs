@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_coalesce_two_messages_adds_timing() {
-        let mut m1 = InboundMessage::new("telegram", "user1", "chat1", "hello");
+        let m1 = InboundMessage::new("telegram", "user1", "chat1", "hello");
         let mut m2 = InboundMessage::new("telegram", "user1", "chat1", "world");
         // Simulate 200ms gap
         m2.timestamp = m1.timestamp + chrono::Duration::milliseconds(200);

@@ -1061,7 +1061,7 @@ mod tests {
     #[test]
     fn test_verify_turn_claims_with_fabrication() {
         let entries = vec![make_entry("read_file", "c1", json!({}), "data", true)];
-        let (claims, has_fab) = verify_turn_claims("I deleted the old backups.", &entries);
+        let (_claims, has_fab) = verify_turn_claims("I deleted the old backups.", &entries);
         assert!(has_fab);
     }
 

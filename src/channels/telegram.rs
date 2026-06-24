@@ -92,7 +92,8 @@ pub fn spawn_stream_editor(
     let stream_token = bot_token.to_string();
     tokio::spawn(async move {
         tg_send_typing_action(&stream_client, &stream_token, chat_id_num).await;
-        let Some(message_id) = tg_send_placeholder(&stream_client, &stream_token, chat_id_num).await
+        let Some(message_id) =
+            tg_send_placeholder(&stream_client, &stream_token, chat_id_num).await
         else {
             // Placeholder failed: drain remaining deltas so the LLM stream
             // doesn't block on a full channel, then exit.

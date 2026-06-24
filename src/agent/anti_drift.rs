@@ -26,7 +26,6 @@ use crate::config::schema::AntiDriftConfig;
 /// Heuristic quality score for a single assistant message.
 struct PollutionScore {
     score: f32,
-    signals: Vec<&'static str>,
 }
 
 /// Filler phrases that inflate responses without adding information.
@@ -60,7 +59,7 @@ const FILLER_PHRASES: &[&str] = &[
 
 /// Score how "polluted" an assistant message is.
 ///
-/// Returns 0.0 (clean) to 1.0 (pure noise). Four weighted signals:
+/// Returns 0.0 (clean) to 1.0 (pure noise). Weighted heuristics:
 /// - `filler_heavy` (0.3): >30% filler words
 /// - `repetitive` (0.3): trigram Jaccard > 0.4 with recent messages
 /// - `babble_no_action` (0.2): >150 tokens, no tool calls, no code blocks
@@ -68,12 +67,10 @@ const FILLER_PHRASES: &[&str] = &[
 fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionScore {
     let content = msg_content(msg);
     let mut score = 0.0f32;
-    let mut signals = Vec::new();
 
     // Signal 1: filler-heavy
     if filler_ratio(&content) > 0.30 {
         score += 0.3;
-        signals.push("filler_heavy");
     }
 
     // Signal 2: repetitive (trigram overlap with recent assistant messages)
@@ -81,7 +78,6 @@ fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionScore 
         let prev_content = msg_content(prev);
         if trigram_jaccard(&content, &prev_content) > 0.4 {
             score += 0.3;
-            signals.push("repetitive");
             break;
         }
     }
@@ -95,7 +91,6 @@ fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionScore 
     let has_code_block = content.contains("```");
     if word_count > 150 && !has_tool_calls && !has_code_block {
         score += 0.2;
-        signals.push("babble_no_action");
     }
 
     // Signal 4: hallucination markers
@@ -106,18 +101,15 @@ fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionScore 
     // Only flag claims if there's no preceding tool result in the message itself
     if has_fake_tool_xml || (has_claim_without_evidence && !has_tool_calls) {
         score += 0.2;
-        signals.push("hallucination_marker");
     }
 
     // Signal 5: condensed response markers from previous babble collapse
     if content.contains("[response condensed]") {
         score += 0.4;
-        signals.push("condensed_marker");
     }
 
     PollutionScore {
         score: score.min(1.0),
-        signals,
     }
 }
 
@@ -515,8 +507,9 @@ mod tests {
         let msg = json!({"role": "assistant", "content": "Certainly! Absolutely! Of course! I'd be happy to help! Well, basically, essentially, honestly, thank you for asking!"});
         let score = score_message(&msg, &[]);
         assert!(
-            score.signals.contains(&"filler_heavy"),
-            "Expected filler_heavy signal"
+            score.score >= 0.3,
+            "Expected filler-heavy message to score at least 0.3, got {}",
+            score.score
         );
     }
 
@@ -528,10 +521,6 @@ mod tests {
             score.score >= 0.4,
             "Condensed marker message scored {}",
             score.score
-        );
-        assert!(
-            score.signals.contains(&"condensed_marker"),
-            "Expected condensed_marker signal"
         );
     }
 
@@ -723,7 +712,7 @@ mod tests {
     fn test_e2e_disabled_config_is_noop() {
         let mut messages = build_drifting_conversation();
         let original = messages.clone();
-        let config = AntiDriftConfig {
+        let _config = AntiDriftConfig {
             enabled: false,
             ..Default::default()
         };
@@ -1006,11 +995,6 @@ mod tests {
             score.score >= 0.6,
             "Message with multiple signals should score >= 0.6, got {}",
             score.score
-        );
-        assert!(
-            score.signals.len() >= 2,
-            "Should have 2+ signals, got {:?}",
-            score.signals
         );
     }
 

@@ -24,8 +24,10 @@ pub enum MemoryLayer {
     /// Per-session working memory -- always available.
     WorkingSession = 1,
     /// Knowledge graph entities -- requires `knowledge-graph` feature.
+    #[cfg_attr(not(feature = "knowledge-graph"), allow(dead_code))]
     DurablePersonal = 2,
     /// FTS5 semantic search -- requires `semantic` feature.
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
     SearchIndex = 3,
     /// Session history search -- always available.
     Scratch = 4,
@@ -43,7 +45,6 @@ pub struct MemoryQuery<'a> {
 pub struct LayerResult {
     pub layer: MemoryLayer,
     pub content: String,
-    pub tokens_used: usize,
 }
 
 /// Priority-ordered memory facade over all available stores.
@@ -53,6 +54,7 @@ pub struct LayerResult {
 pub struct MemoryLadder<'a> {
     workspace: PathBuf,
     working_memory: &'a WorkingMemoryStore,
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
     knowledge_store: Option<&'a KnowledgeStore>,
     session_db: &'a SessionDb,
 }
@@ -119,11 +121,7 @@ impl<'a> MemoryLadder<'a> {
             if !content.is_empty() {
                 let tokens_used = TokenBudget::estimate_str_tokens(&content);
                 remaining = remaining.saturating_sub(tokens_used);
-                results.push(LayerResult {
-                    layer,
-                    content,
-                    tokens_used,
-                });
+                results.push(LayerResult { layer, content });
             }
         }
 
@@ -145,6 +143,9 @@ impl<'a> MemoryLadder<'a> {
             }
             MemoryLayer::WorkingSession => self.working_memory.get_context(session_key, budget),
             MemoryLayer::DurablePersonal => {
+                if query.trim().is_empty() {
+                    return String::new();
+                }
                 #[cfg(feature = "knowledge-graph")]
                 {
                     use crate::agent::knowledge_graph::KnowledgeGraph;
@@ -169,6 +170,9 @@ impl<'a> MemoryLadder<'a> {
                 }
             }
             MemoryLayer::SearchIndex => {
+                if query.trim().is_empty() {
+                    return String::new();
+                }
                 #[cfg(feature = "semantic")]
                 {
                     if let Some(ks) = self.knowledge_store {
@@ -243,17 +247,63 @@ fn truncate_to_token_budget(content: &str, budget: usize) -> String {
         return content.to_string();
     }
 
-    let mut kept = Vec::new();
-    let mut accumulated = 0;
+    let mut kept = String::new();
     for line in content.lines() {
-        let line_tokens = TokenBudget::estimate_str_tokens(line) + 1; // +1 for newline
-        if accumulated + line_tokens > budget && !kept.is_empty() {
+        let candidate = if kept.is_empty() {
+            line.to_string()
+        } else {
+            format!("{kept}\n{line}")
+        };
+
+        if TokenBudget::estimate_str_tokens(&candidate) > budget {
+            if kept.is_empty() {
+                return truncate_line_to_token_budget(line, budget);
+            }
             break;
         }
-        kept.push(line);
-        accumulated += line_tokens;
+
+        kept = candidate;
     }
-    kept.join("\n")
+    kept
+}
+
+fn truncate_line_to_token_budget(line: &str, budget: usize) -> String {
+    let mut kept = String::new();
+    for word in line.split_whitespace() {
+        let candidate = if kept.is_empty() {
+            word.to_string()
+        } else {
+            format!("{kept} {word}")
+        };
+
+        if TokenBudget::estimate_str_tokens(&candidate) > budget {
+            if kept.is_empty() {
+                return truncate_chars_to_token_budget(word, budget);
+            }
+            break;
+        }
+
+        kept = candidate;
+    }
+
+    if kept.is_empty() {
+        truncate_chars_to_token_budget(line, budget)
+    } else {
+        kept
+    }
+}
+
+fn truncate_chars_to_token_budget(text: &str, budget: usize) -> String {
+    let mut kept = String::new();
+    for ch in text.chars() {
+        let mut candidate = kept.clone();
+        candidate.push(ch);
+        if TokenBudget::estimate_str_tokens(&candidate) > budget {
+            break;
+        }
+        kept = candidate;
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -288,8 +338,6 @@ mod tests {
 
     #[test]
     fn test_available_layers_feature_gated() {
-        // In the default test build (no knowledge-graph, no semantic features),
-        // only GroundTruth, WorkingSession, and Scratch should be available.
         let tmp = TempDir::new().unwrap();
         let wm = WorkingMemoryStore::new(tmp.path());
         let db_path = tmp.path().join("sessions.db");
@@ -298,14 +346,14 @@ mod tests {
         let ladder = MemoryLadder::new(tmp.path(), &wm, None, &session_db);
         let layers = ladder.available_layers();
 
-        assert_eq!(
-            layers,
-            vec![
-                MemoryLayer::GroundTruth,
-                MemoryLayer::WorkingSession,
-                MemoryLayer::Scratch,
-            ]
-        );
+        let mut expected = vec![MemoryLayer::GroundTruth, MemoryLayer::WorkingSession];
+        #[cfg(feature = "knowledge-graph")]
+        expected.push(MemoryLayer::DurablePersonal);
+        #[cfg(feature = "semantic")]
+        expected.push(MemoryLayer::SearchIndex);
+        expected.push(MemoryLayer::Scratch);
+
+        assert_eq!(layers, expected);
     }
 
     #[test]
@@ -343,7 +391,10 @@ mod tests {
         );
 
         // Total tokens used should not exceed budget.
-        let total: usize = results.iter().map(|r| r.tokens_used).sum();
+        let total: usize = results
+            .iter()
+            .map(|r| TokenBudget::estimate_str_tokens(&r.content))
+            .sum();
         assert!(
             total <= 20,
             "Total tokens {} should not exceed budget 20",
@@ -379,11 +430,12 @@ mod tests {
         });
 
         for result in &results {
+            let tokens_used = TokenBudget::estimate_str_tokens(&result.content);
             assert!(
-                result.tokens_used <= 50,
+                tokens_used <= 50,
                 "Layer {:?} used {} tokens, exceeding 50% soft cap",
                 result.layer,
-                result.tokens_used
+                tokens_used
             );
         }
     }
@@ -437,5 +489,14 @@ mod tests {
         let result = truncate_to_token_budget(&content, 10);
         assert!(result.len() < content.len(), "should be truncated");
         assert!(result.contains("Line 0"), "should keep from head");
+        assert!(TokenBudget::estimate_str_tokens(&result) <= 10);
+    }
+
+    #[test]
+    fn test_truncate_to_token_budget_splits_oversized_first_line() {
+        let content = "This first line is intentionally too large for the tiny budget.";
+        let result = truncate_to_token_budget(content, 3);
+        assert!(!result.is_empty());
+        assert!(TokenBudget::estimate_str_tokens(&result) <= 3);
     }
 }

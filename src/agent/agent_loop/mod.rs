@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(test)]
+use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info};
@@ -29,24 +31,24 @@ use crate::cron::service::CronService;
 // ---------------------------------------------------------------------------
 // Core types re-exported from agent_core module
 // ---------------------------------------------------------------------------
-pub use crate::agent::agent_core::{
-    build_swappable_core, AgentHandle, RuntimeCounters, SharedCoreHandle, SwappableCore,
-    SwappableCoreConfig,
-};
+pub use crate::agent::agent_core::SharedCoreHandle;
 // Re-export for test use (agent_loop_tests.rs uses `use super::*`).
-pub(crate) use crate::agent::agent_core::{history_limit, provenance_warning_role};
+#[cfg(test)]
+pub(crate) use crate::agent::agent_core::{
+    build_swappable_core, provenance_warning_role, AgentHandle, SwappableCore, SwappableCoreConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Submodules
 // ---------------------------------------------------------------------------
 
-mod shared;
-mod response;
 mod heuristics;
+mod response;
+mod shared;
 
-pub(crate) use shared::*;
-pub(crate) use response::RetryState;
 pub(crate) use heuristics::appears_incomplete;
+pub(crate) use response::RetryState;
+pub(crate) use shared::*;
 // Re-export remaining heuristic functions at module-private level for use
 // within this module and its submodules (shared uses them via super::).
 use heuristics::{
@@ -195,7 +197,7 @@ impl AgentLoop {
             ))
         });
 
-        let mut shared = Arc::new(AgentLoopShared {
+        let shared = Arc::new(AgentLoopShared {
             core_handle,
             subagents,
             bus_outbound_tx,

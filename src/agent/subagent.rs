@@ -1431,7 +1431,7 @@ mod tests {
     #[tokio::test]
     async fn test_subagent_adds_user_continuation_after_tool_results() {
         let provider = Arc::new(SubagentCapturingProvider::new());
-        let workspace = tempfile::tempdir().unwrap().into_path();
+        let workspace = tempfile::tempdir().unwrap().keep();
         let config = default_test_config("mock-model");
 
         let result = SubagentManager::_run_subagent(
@@ -1509,7 +1509,7 @@ mod tests {
             }
         }
 
-        let workspace = tempfile::tempdir().unwrap().into_path();
+        let workspace = tempfile::tempdir().unwrap().keep();
         let config = default_test_config("mock");
         let result = SubagentManager::_run_subagent(
             "test-id",

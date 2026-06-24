@@ -56,6 +56,15 @@ impl LLMProvider for MockLLM {
     }
 }
 
+fn test_runtime_counters(
+    max_context_tokens: usize,
+) -> Arc<crate::agent::agent_core::RuntimeCounters> {
+    Arc::new(crate::agent::agent_core::RuntimeCounters::new_with_config(
+        max_context_tokens,
+        &crate::config::schema::CircuitBreakerConfig::default(),
+    ))
+}
+
 struct StaticResponseLLM {
     name: String,
     body: String,
@@ -101,7 +110,7 @@ fn build_test_core(
     delegation_provider: Option<Arc<dyn LLMProvider>>,
     config_provider: Option<ProviderConfig>,
 ) -> SwappableCore {
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     // Isolate the session DB per test so parallel runs don't contend on the
     // user's real ~/.nanobot/sessions.db.
     let sessions_db = workspace.join("sessions.db");
@@ -452,7 +461,7 @@ fn test_delegation_model_uses_config_model() {
 
 #[test]
 fn test_delegation_model_falls_back_to_main_when_empty() {
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     let main = MockLLM::named("main-provider");
     let td = ToolDelegationConfig {
         enabled: true,
@@ -517,7 +526,7 @@ fn test_delegation_disabled_ignores_passed_provider() {
 #[test]
 fn test_delegation_with_is_local_true() {
     // Verify wiring works when is_local=true (uses lite context builder)
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     let main = MockLLM::named("local-main");
     let dp = MockLLM::named("local-delegation");
     let td = ToolDelegationConfig {
@@ -585,7 +594,7 @@ fn test_delegation_with_is_local_false_cloud() {
     // Verify wiring + cloud-specific derivations when is_local=false.
     // MockLLM returns `None` from `get_api_base()` — treated as Anthropic
     // native → memory_model defaults to "haiku" (cheap summarisation).
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     let main = MockLLM::named("cloud-main");
     let dp = MockLLM::named("cloud-delegation");
     let td = ToolDelegationConfig {
@@ -629,7 +638,10 @@ fn test_delegation_with_is_local_false_cloud() {
     });
 
     // pins agent_core.rs: is_local plumbs through to the core unchanged
-    assert!(!core.mode().is_local(), "cloud core must carry is_local=false");
+    assert!(
+        !core.mode().is_local(),
+        "cloud core must carry is_local=false"
+    );
 
     // pins agent_core.rs: delegation provider still wired through in cloud mode
     assert!(
@@ -669,7 +681,7 @@ fn test_delegation_with_is_local_false_cloud() {
 #[test]
 fn test_delegation_with_compaction_and_delegation_providers() {
     // Both compaction and delegation providers set — should not interfere
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     let main = MockLLM::named("main");
     let compaction = MockLLM::named("compaction");
     let delegation = MockLLM::named("delegation");
@@ -746,7 +758,7 @@ fn test_delegation_with_compaction_and_delegation_providers_cloud() {
     // compaction_provider is ignored by memory wiring (memory falls back to
     // haiku via Anthropic-native branch), but delegation_provider still wires
     // through to tool_runner.
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     let main = MockLLM::named("main");
     let compaction = MockLLM::named("compaction");
     let delegation = MockLLM::named("delegation");
@@ -898,7 +910,7 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: None,
     });
-    let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(2048));
+    let counters = test_runtime_counters(2048);
     let core_handle = AgentHandle::new(core, counters);
 
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
@@ -1159,7 +1171,7 @@ fn build_trio_e2e_harness(
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
 
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
 
     let mut td = ToolDelegationConfig {
         mode: crate::config::schema::DelegationMode::Trio,
@@ -1208,7 +1220,7 @@ fn build_trio_e2e_harness(
         sessions_db_path: None,
     });
 
-    let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+    let counters = test_runtime_counters(4096);
     let core_handle = AgentHandle::new(core, counters);
 
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
@@ -1277,7 +1289,7 @@ async fn test_trio_e2e_preflight() {
     eprintln!("trio E2E preflight: base={}", base);
 
     // 1. Verify LM Studio /models endpoint is reachable
-    let models_url = format!(
+    let _models_url = format!(
         "{}/models",
         base.trim_end_matches("/v1").trim_end_matches('/')
     );
@@ -1619,7 +1631,7 @@ async fn test_trio_e2e_router_unreachable() {
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
 
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     let mut td = ToolDelegationConfig {
         mode: DelegationMode::Trio,
         ..Default::default()
@@ -1666,7 +1678,7 @@ async fn test_trio_e2e_router_unreachable() {
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: None,
     });
-    let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+    let counters = test_runtime_counters(4096);
     let core_handle = AgentHandle::new(core, counters);
 
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
@@ -1734,7 +1746,7 @@ async fn test_trio_e2e_specialist_unreachable() {
         Some("dead-specialist"),
     ));
 
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     let mut td = ToolDelegationConfig {
         mode: DelegationMode::Trio,
         ..Default::default()
@@ -1781,7 +1793,7 @@ async fn test_trio_e2e_specialist_unreachable() {
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: None,
     });
-    let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+    let counters = test_runtime_counters(4096);
     let core_handle = AgentHandle::new(core, counters);
 
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
@@ -2302,7 +2314,7 @@ fn build_trio_offline_harness(
 ) -> (AgentLoop, std::path::PathBuf) {
     use crate::config::schema::LcmSchemaConfig;
 
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
 
     let mut td = ToolDelegationConfig {
         mode: crate::config::schema::DelegationMode::Trio,
@@ -2354,7 +2366,7 @@ fn build_trio_offline_harness(
         sessions_db_path: None,
     });
 
-    let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+    let counters = test_runtime_counters(4096);
     let core_handle = AgentHandle::new(core, counters);
 
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
@@ -2388,7 +2400,7 @@ fn build_local_inline_harness_with_model(
 ) -> (AgentLoop, std::path::PathBuf) {
     use crate::config::schema::LcmSchemaConfig;
 
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     let core = build_swappable_core(SwappableCoreConfig {
         provider: main,
         workspace: workspace.clone(),
@@ -2423,7 +2435,7 @@ fn build_local_inline_harness_with_model(
         sessions_db_path: Some(workspace.join("sessions.db")),
     });
 
-    let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+    let counters = test_runtime_counters(4096);
     let core_handle = AgentHandle::new(core, counters);
 
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
@@ -3315,7 +3327,7 @@ async fn test_trio_offline_e2e_health_gate() {
     ));
 
     // Build harness manually so we can wire in the health registry.
-    let workspace = tempfile::tempdir().unwrap().into_path();
+    let workspace = tempfile::tempdir().unwrap().keep();
     let mut td = ToolDelegationConfig {
         mode: crate::config::schema::DelegationMode::Trio,
         ..Default::default()
@@ -3365,7 +3377,7 @@ async fn test_trio_offline_e2e_health_gate() {
         sessions_db_path: None,
     });
 
-    let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+    let counters = test_runtime_counters(4096);
     let core_handle = AgentHandle::new(core, counters);
 
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
@@ -3821,7 +3833,7 @@ mod runtime_mode_parity_tests {
     /// the accessor returns `Local { caps }`.
     #[test]
     fn mode_accessor_local_matches_is_local_true() {
-        let workspace = tempfile::tempdir().unwrap().into_path();
+        let workspace = tempfile::tempdir().unwrap().keep();
         let main = MockLLM::named("local-main");
         let core = build_swappable_core(SwappableCoreConfig {
             provider: main,
@@ -3854,7 +3866,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: None,
+            sessions_db_path: None,
         });
         assert!(core.mode().is_local(), "fixture is is_local=true");
         assert!(
@@ -3879,7 +3891,7 @@ mod runtime_mode_parity_tests {
     #[test]
     fn build_core_reserve_cap_local_clamped_to_25_pct() {
         // Local fixture with a tight 16K ctx + 4096 max_tokens: reserve clamps to 4096 (ctx/4).
-        let workspace = tempfile::tempdir().unwrap().into_path();
+        let workspace = tempfile::tempdir().unwrap().keep();
         let main = MockLLM::named("local-main");
         let core = build_swappable_core(SwappableCoreConfig {
             provider: main,
@@ -3912,7 +3924,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: None,
+            sessions_db_path: None,
         });
         // ctx/4 == 4096; min(4096, 4096) == 4096.
         assert_eq!(core.mode().reserve_cap(4096, 16_384), 4096);
@@ -3934,7 +3946,7 @@ mod runtime_mode_parity_tests {
 
     #[test]
     fn build_core_context_cap_local_uses_lite_mode() {
-        let workspace = tempfile::tempdir().unwrap().into_path();
+        let workspace = tempfile::tempdir().unwrap().keep();
         let main = MockLLM::named("local-main");
         let core = build_swappable_core(SwappableCoreConfig {
             provider: main,
@@ -3967,7 +3979,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: None,
+            sessions_db_path: None,
         });
         assert!(core.context.local_prompt_mode);
         // set_lite_mode clamps system_prompt_cap to (ctx * 3/10).clamp(500, 4000).
@@ -3990,7 +4002,7 @@ mod runtime_mode_parity_tests {
     /// the local path returns the main model name.
     #[test]
     fn build_core_memory_provider_local_defaults_to_main_without_trio() {
-        let workspace = tempfile::tempdir().unwrap().into_path();
+        let workspace = tempfile::tempdir().unwrap().keep();
         let main = MockLLM::named("local-main");
         let core = build_swappable_core(SwappableCoreConfig {
             provider: main,
@@ -4023,7 +4035,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: None,
+            sessions_db_path: None,
         });
         assert_eq!(core.memory_model, "local-model");
     }
@@ -4033,7 +4045,7 @@ mod runtime_mode_parity_tests {
     /// construction inputs are consistent with the mode's payload.
     #[test]
     fn mode_accessor_round_trip_local_caps_match_lookup() {
-        let workspace = tempfile::tempdir().unwrap().into_path();
+        let workspace = tempfile::tempdir().unwrap().keep();
         let main = MockLLM::named("local-main");
         let core = build_swappable_core(SwappableCoreConfig {
             provider: main,
@@ -4066,7 +4078,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: None,
+            sessions_db_path: None,
         });
         match core.mode() {
             RuntimeMode::Local { caps } => {
@@ -4108,7 +4120,7 @@ mod runtime_mode_parity_tests {
 
     #[test]
     fn wave3_grounding_role_local_matches_pre_migration() {
-        let workspace = tempfile::tempdir().unwrap().into_path();
+        let workspace = tempfile::tempdir().unwrap().keep();
         let main = MockLLM::named("local-main");
         let core = build_swappable_core(SwappableCoreConfig {
             provider: main,
@@ -4141,7 +4153,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: None,
+            sessions_db_path: None,
         });
         assert_eq!(core.mode().grounding_role(), "user");
     }
@@ -4159,7 +4171,7 @@ mod runtime_mode_parity_tests {
         // (behavior-preserving: is_local && !starts_with("mlx:")).
         // This test pins the `mode.is_local()` half; the mlx: prefix check
         // is string-based and not affected by the migration.
-        let workspace = tempfile::tempdir().unwrap().into_path();
+        let workspace = tempfile::tempdir().unwrap().keep();
         let main = MockLLM::named("mlx-main");
         let local_mlx = build_swappable_core(SwappableCoreConfig {
             provider: main,
@@ -4192,7 +4204,7 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: None,
+            sessions_db_path: None,
         });
         // mlx: prefix model: mode is Local, but protocol selection still
         // falls through to CloudProtocol via the `!starts_with("mlx:")` guard.

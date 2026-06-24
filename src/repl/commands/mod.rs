@@ -148,6 +148,87 @@ fn model_short_id(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
 
+fn normalized_endpoint(endpoint: &str) -> String {
+    endpoint.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    let lower = endpoint.trim().to_ascii_lowercase();
+    let host_port = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or(&lower);
+    host_port.starts_with("localhost:")
+        || host_port.starts_with("127.0.0.1:")
+        || host_port.starts_with("[::1]:")
+}
+
+fn push_unique_endpoint(bases: &mut Vec<String>, endpoint: String) {
+    if endpoint.trim().is_empty() {
+        return;
+    }
+    let normalized = normalized_endpoint(&endpoint);
+    if bases
+        .iter()
+        .any(|base| normalized_endpoint(base) == normalized)
+    {
+        return;
+    }
+    bases.push(endpoint.trim().to_string());
+}
+
+fn higgs_model_bases(
+    current_base: &str,
+    configured_higgs_base: &str,
+    backend_is_higgs: bool,
+) -> Vec<String> {
+    let mut bases = Vec::new();
+    let current_base = current_base.trim();
+    let current_norm = normalized_endpoint(current_base);
+    let configured_norm = normalized_endpoint(configured_higgs_base);
+
+    if backend_is_higgs {
+        if current_base.is_empty() {
+            push_unique_endpoint(&mut bases, configured_higgs_base.to_string());
+        } else {
+            push_unique_endpoint(&mut bases, current_base.to_string());
+            if endpoint_is_loopback(current_base) && current_norm != configured_norm {
+                push_unique_endpoint(&mut bases, configured_higgs_base.to_string());
+            }
+        }
+    } else if !current_base.is_empty() && current_norm == configured_norm {
+        push_unique_endpoint(&mut bases, current_base.to_string());
+    }
+
+    bases
+}
+
+fn push_remote_model_entry(
+    entries: &mut Vec<ModelEntry>,
+    endpoint: &str,
+    id: String,
+    active_hint: &str,
+    is_loaded: bool,
+) {
+    if id.is_empty() || id.to_lowercase().contains("embedding") {
+        return;
+    }
+    let is_active = crate::lms::is_model_available(std::slice::from_ref(&id), active_hint);
+    let source = ModelSource::Remote {
+        endpoint: endpoint.to_string(),
+        #[cfg(feature = "cluster")]
+        peer_type: crate::cluster::state::PeerType::Unknown,
+        #[cfg(not(feature = "cluster"))]
+        peer_type: (),
+    };
+    entries.push(ModelEntry {
+        id,
+        source,
+        is_active,
+        is_loaded,
+    });
+}
+
 fn model_direct_match_rank(entry: &ModelEntry, query: &str) -> Option<usize> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -490,18 +571,14 @@ impl ReplContext {
             "http://127.0.0.1:{}/v1",
             self.config.agents.defaults.higgs_port
         );
-        let current_base_norm = current_base.trim().trim_end_matches('/');
-        let configured_higgs_base_norm = configured_higgs_base.trim_end_matches('/');
+        let higgs_bases = higgs_model_bases(current_base, &configured_higgs_base, backend_is_higgs);
         // Older configs may still say "omlx" after pointing localApiBase at the
         // managed Higgs port. Treat that exact localhost endpoint as Higgs so
-        // the picker can show runtime-switchable model directories.
-        let use_higgs_model_discovery = backend_is_higgs
-            || (!current_base_norm.is_empty() && current_base_norm == configured_higgs_base_norm);
-        let higgs_base = if current_base_norm.is_empty() && backend_is_higgs {
-            configured_higgs_base.clone()
-        } else {
-            current_base.trim().to_string()
-        };
+        // the picker can show runtime-switchable model directories. For sticky
+        // Higgs configs that point at another loopback service, query that
+        // resident endpoint too, but only add Higgs switch candidates if the
+        // endpoint proves it supports /v1/models/switch.
+        let use_higgs_model_discovery = !higgs_bases.is_empty();
 
         // 1. Local LMS (if lms_managed)
         let mut covered_endpoint: Option<String> = None;
@@ -543,9 +620,9 @@ impl ReplContext {
                 // peer. Let the Higgs-specific branch own it so it can include
                 // filesystem candidates that are switchable via /v1/models/switch.
                 if use_higgs_model_discovery
-                    && !higgs_base.is_empty()
-                    && peer.endpoint.trim().trim_end_matches('/')
-                        == higgs_base.trim_end_matches('/')
+                    && higgs_bases.iter().any(|base| {
+                        normalized_endpoint(&peer.endpoint) == normalized_endpoint(base)
+                    })
                 {
                     continue;
                 }
@@ -573,21 +650,19 @@ impl ReplContext {
         // on another machine), the cluster peer list may not include it.
         {
             let is_higgs = use_higgs_model_discovery;
-            let base = if current_base_norm.is_empty() && is_higgs {
-                higgs_base.clone()
-            } else {
-                current_base.trim().to_string()
-            };
+            let base = current_base.trim().to_string();
             let already_covered = covered_endpoint
                 .as_deref()
-                .map(|c| c == base)
+                .map(|c| normalized_endpoint(c) == normalized_endpoint(&base))
                 .unwrap_or(false);
 
             #[cfg(feature = "cluster")]
             let covered_by_cluster = if !already_covered {
                 if let Some(ref cs) = self.cluster_state {
                     let peers = cs.get_healthy_peers().await;
-                    peers.iter().any(|p| p.endpoint == base)
+                    peers
+                        .iter()
+                        .any(|p| normalized_endpoint(&p.endpoint) == normalized_endpoint(&base))
                 } else {
                     false
                 }
@@ -597,17 +672,33 @@ impl ReplContext {
             #[cfg(not(feature = "cluster"))]
             let covered_by_cluster = false;
 
-            if !base.is_empty() && !already_covered && (!covered_by_cluster || is_higgs) {
+            if is_higgs {
                 let api_key = &self.config.agents.defaults.local_api_key;
-                if is_higgs {
-                    let loaded = crate::higgs::list_served_models_at(&base, api_key).await;
-                    let active_hint = if current_model == "active" {
-                        self.config.agents.defaults.local_model.as_str()
-                    } else {
-                        current_model.as_str()
-                    };
-                    let mut covered_loaded = HashSet::new();
+                let active_hint = if current_model == "active" {
+                    self.config.agents.defaults.local_model.as_str()
+                } else {
+                    current_model.as_str()
+                };
+                for base in &higgs_bases {
+                    let already_covered = covered_endpoint
+                        .as_deref()
+                        .map(|c| normalized_endpoint(c) == normalized_endpoint(base))
+                        .unwrap_or(false);
+                    if base.is_empty() || already_covered {
+                        continue;
+                    }
+                    let loaded = crate::higgs::list_available_served_models_at(base, api_key).await;
+                    let switch_supported =
+                        crate::higgs::supports_runtime_model_switch_at(base, api_key).await;
 
+                    if !switch_supported {
+                        for id in loaded {
+                            push_remote_model_entry(&mut entries, base, id, active_hint, true);
+                        }
+                        continue;
+                    }
+
+                    let mut covered_loaded = HashSet::new();
                     for candidate in crate::higgs::discover_runtime_model_candidates(&self.config) {
                         let is_loaded = loaded.iter().any(|id| {
                             crate::lms::model_matches(id, &candidate.id)
@@ -653,53 +744,52 @@ impl ReplContext {
                             is_loaded: true,
                         });
                     }
-                } else {
-                    let models_url = {
-                        let b = base.trim_end_matches('/');
-                        if b.ends_with("/v1") {
-                            format!("{}/models", b)
-                        } else {
-                            format!("{}/v1/models", b)
-                        }
-                    };
+                }
+            } else if !base.is_empty() && !already_covered && !covered_by_cluster {
+                let api_key = &self.config.agents.defaults.local_api_key;
+                let models_url = {
+                    let b = base.trim_end_matches('/');
+                    if b.ends_with("/v1") {
+                        format!("{}/models", b)
+                    } else {
+                        format!("{}/v1/models", b)
+                    }
+                };
 
-                    let client = reqwest::Client::new();
-                    if let Ok(resp) = client
-                        .get(&models_url)
-                        .header("Authorization", format!("Bearer {}", api_key))
-                        .timeout(Duration::from_secs(3))
-                        .send()
-                        .await
-                    {
-                        if let Ok(json) = resp.json::<serde_json::Value>().await {
-                            if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                                for item in data {
-                                    let id = item
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    if id.is_empty() || id.to_lowercase().contains("embedding") {
-                                        continue;
-                                    }
-                                    let is_active = crate::lms::is_model_available(
-                                        &[id.clone()],
-                                        &current_model,
-                                    );
-                                    let source = ModelSource::Remote {
-                                        endpoint: base.clone(),
-                                        #[cfg(feature = "cluster")]
-                                        peer_type: crate::cluster::state::PeerType::Unknown,
-                                        #[cfg(not(feature = "cluster"))]
-                                        peer_type: (),
-                                    };
-                                    entries.push(ModelEntry {
-                                        id,
-                                        source,
-                                        is_active,
-                                        is_loaded: false,
-                                    });
+                let client = reqwest::Client::new();
+                if let Ok(resp) = client
+                    .get(&models_url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                            for item in data {
+                                let id = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if id.is_empty() || id.to_lowercase().contains("embedding") {
+                                    continue;
                                 }
+                                let is_active =
+                                    crate::lms::is_model_available(&[id.clone()], &current_model);
+                                let source = ModelSource::Remote {
+                                    endpoint: base.clone(),
+                                    #[cfg(feature = "cluster")]
+                                    peer_type: crate::cluster::state::PeerType::Unknown,
+                                    #[cfg(not(feature = "cluster"))]
+                                    peer_type: (),
+                                };
+                                entries.push(ModelEntry {
+                                    id,
+                                    source,
+                                    is_active,
+                                    is_loaded: false,
+                                });
                             }
                         }
                     }
@@ -950,6 +1040,7 @@ impl ReplContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::DelegationMode;
 
     #[test]
     fn test_normalize_alias_all_aliases() {
@@ -1022,6 +1113,41 @@ mod tests {
     }
 
     #[test]
+    fn test_higgs_model_bases_adds_configured_sidecar_for_sticky_loopback() {
+        let bases = higgs_model_bases("http://127.0.0.1:1976/v1", "http://127.0.0.1:8000/v1", true);
+
+        assert_eq!(
+            bases,
+            vec![
+                "http://127.0.0.1:1976/v1".to_string(),
+                "http://127.0.0.1:8000/v1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_higgs_model_bases_respects_remote_higgs_endpoint() {
+        let bases = higgs_model_bases(
+            "http://192.168.1.22:8000/v1",
+            "http://127.0.0.1:8000/v1",
+            true,
+        );
+
+        assert_eq!(bases, vec!["http://192.168.1.22:8000/v1".to_string()]);
+    }
+
+    #[test]
+    fn test_higgs_model_bases_accepts_exact_configured_endpoint_for_old_backend_tag() {
+        let bases = higgs_model_bases(
+            "http://127.0.0.1:8000/v1",
+            "http://127.0.0.1:8000/v1",
+            false,
+        );
+
+        assert_eq!(bases, vec!["http://127.0.0.1:8000/v1".to_string()]);
+    }
+
+    #[test]
     fn test_command_arg_parsing() {
         // Verify split_once behavior used in dispatch
         let input = "/ctx 32K";
@@ -1077,7 +1203,7 @@ mod tests {
 
     #[test]
     fn test_trio_enable_sets_all_strict_flags() {
-        use crate::config::schema::{Config, DelegationMode};
+        use crate::config::schema::Config;
 
         let mut cfg = Config::default();
         trio_enable(&mut cfg);
@@ -1095,7 +1221,7 @@ mod tests {
 
     #[test]
     fn test_trio_disable_clears_strict_flags() {
-        use crate::config::schema::{Config, DelegationMode};
+        use crate::config::schema::Config;
 
         let mut cfg = Config::default();
         trio_enable(&mut cfg);
@@ -1111,7 +1237,7 @@ mod tests {
 
     #[test]
     fn test_trio_double_enable_is_idempotent() {
-        use crate::config::schema::{Config, DelegationMode};
+        use crate::config::schema::Config;
 
         let mut cfg = Config::default();
         trio_enable(&mut cfg);
@@ -1124,7 +1250,7 @@ mod tests {
 
     #[test]
     fn test_trio_double_disable_is_idempotent() {
-        use crate::config::schema::{Config, DelegationMode};
+        use crate::config::schema::Config;
 
         let mut cfg = Config::default();
         trio_disable(&mut cfg);
@@ -1252,7 +1378,7 @@ mod tests {
 
     #[test]
     fn test_persist_trio_fields_does_not_clobber_other_config() {
-        use crate::config::schema::{Config, DelegationMode};
+        use crate::config::schema::Config;
 
         let live = Config::default();
         let mut disk = Config::default();
@@ -1275,7 +1401,7 @@ mod tests {
 
     #[test]
     fn test_trio_roundtrip_enable_disable_enable() {
-        use crate::config::schema::{Config, DelegationMode};
+        use crate::config::schema::Config;
 
         let mut cfg = Config::default();
         cfg.trio.router_model = "qwen3-1.7b".to_string();

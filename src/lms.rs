@@ -172,7 +172,7 @@ pub(crate) async fn load_model(
     port: u16,
     model: &str,
     context_length: Option<usize>,
-    timeout_secs: u64,
+    _timeout_secs: u64,
 ) -> Result<(), String> {
     load_model_at(&rest_base(host, port), model, context_length).await
 }
@@ -208,14 +208,14 @@ pub(crate) async fn reload_model_with_context(
     port: u16,
     model: &str,
     context_length: usize,
-    load_timeout_secs: u64,
-    unload_timeout_secs: u64,
+    _load_timeout_secs: u64,
+    _unload_timeout_secs: u64,
 ) -> Result<(), String> {
     reload_model_with_context_at(
         &rest_base(host, port),
         model,
         context_length,
-        unload_timeout_secs,
+        _unload_timeout_secs,
     )
     .await
 }
@@ -225,7 +225,7 @@ pub(crate) async fn reload_model_with_context_at(
     base_url: &str,
     model: &str,
     context_length: usize,
-    unload_timeout_secs: u64,
+    _unload_timeout_secs: u64,
 ) -> Result<(), String> {
     let models = list_models_full_at(base_url).await;
     let loaded_keys: Vec<String> = models
@@ -264,16 +264,6 @@ fn should_skip_load(models: &[ModelInfo], model: &str, context_length: Option<us
             Some(requested) => info.loaded_context == Some(requested),
         },
     }
-}
-
-async fn post_load_model(
-    host: &str,
-    port: u16,
-    model: &str,
-    context_length: Option<usize>,
-    timeout_secs: u64,
-) -> Result<(), String> {
-    post_load_model_at(&rest_base(host, port), model, context_length).await
 }
 
 async fn post_load_model_at(
@@ -333,7 +323,7 @@ pub(crate) async fn unload_model(
     host: &str,
     port: u16,
     model: &str,
-    timeout_secs: u64,
+    _timeout_secs: u64,
 ) -> Result<(), String> {
     unload_model_at(&rest_base(host, port), model).await
 }

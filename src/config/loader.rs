@@ -85,29 +85,31 @@ pub fn load_config(config_path: Option<&Path>) -> Config {
 
     if path.exists() {
         match fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<Config>(&strip_jsonc_comments(&contents)) {
-                Ok(mut cfg) => {
-                    cfg.tool_delegation.apply_mode();
-                    return cfg;
-                }
-                Err(e) => {
-                    // A config that EXISTS but fails to parse means every user
-                    // setting (provider keys, model, localBackend, voice) is about
-                    // to be replaced by defaults — e.g. silently routing to a cloud
-                    // provider the user never selected. The tracing warn! is
-                    // invisible under the TUI, so also shout to stderr (pre-TUI).
-                    warn!(
-                        "Failed to parse config from {}: {}. Using default configuration.",
-                        path.display(),
-                        e
-                    );
-                    eprintln!(
+            Ok(contents) => {
+                match serde_json::from_str::<Config>(&strip_jsonc_comments(&contents)) {
+                    Ok(mut cfg) => {
+                        cfg.tool_delegation.apply_mode();
+                        return cfg;
+                    }
+                    Err(e) => {
+                        // A config that EXISTS but fails to parse means every user
+                        // setting (provider keys, model, localBackend, voice) is about
+                        // to be replaced by defaults — e.g. silently routing to a cloud
+                        // provider the user never selected. The tracing warn! is
+                        // invisible under the TUI, so also shout to stderr (pre-TUI).
+                        warn!(
+                            "Failed to parse config from {}: {}. Using default configuration.",
+                            path.display(),
+                            e
+                        );
+                        eprintln!(
                         "\x1b[31mnanobot: config at {} is invalid ({}).\n  Running with DEFAULTS — your model, localBackend, and keys are NOT applied.\x1b[0m",
                         path.display(),
                         e
                     );
+                    }
                 }
-            },
+            }
             Err(e) => {
                 warn!(
                     "Failed to read config from {}: {}. Using default configuration.",

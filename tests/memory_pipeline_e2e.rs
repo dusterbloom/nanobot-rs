@@ -6,25 +6,38 @@
 //! Tests 1, 2, 5 run without LM Studio (CI-safe).
 //! Tests 3, 4 are `#[ignore]` and require a local OpenAI-compatible endpoint.
 
+#[cfg(feature = "semantic")]
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "semantic")]
+use std::path::Path;
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
+use std::path::PathBuf;
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 use std::process::Command;
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 use std::thread;
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 use std::time::Duration;
 
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 use chrono::Local;
-use serde_json::Value;
+#[cfg(feature = "semantic")]
 use tempfile::TempDir;
 
+#[cfg(feature = "semantic")]
 use nanobot::agent::knowledge_store::KnowledgeStore;
+#[cfg(feature = "semantic")]
 use nanobot::agent::session_indexer::index_sessions;
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 use nanobot::config::schema::Config;
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 use nanobot::utils::helpers::safe_filename;
 
 // =============================================================================
 // Helpers (shared with agent_local_cli_smoke.rs pattern)
 // =============================================================================
 
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 fn resolve_nanobot_bin() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_nanobot") {
         return PathBuf::from(path);
@@ -46,6 +59,7 @@ fn resolve_nanobot_bin() -> PathBuf {
     candidate
 }
 
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 fn write_isolated_config(home: &Path, local_api_base: &str, local_model: &str) {
     let nanobot_dir = home.join(".nanobot");
     let workspace = nanobot_dir.join("workspace");
@@ -66,6 +80,7 @@ fn write_isolated_config(home: &Path, local_api_base: &str, local_model: &str) {
     fs::write(cfg_path, cfg_json).expect("write config");
 }
 
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 fn expected_session_path(home: &Path, session_key: &str) -> PathBuf {
     let safe = safe_filename(&session_key.replace(':', "_"));
     let date = Local::now().format("%Y-%m-%d");
@@ -74,6 +89,7 @@ fn expected_session_path(home: &Path, session_key: &str) -> PathBuf {
         .join(format!("{}_{}.jsonl", safe, date))
 }
 
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 fn run_local_agent_once(
     bin: &Path,
     home: &Path,
@@ -92,6 +108,7 @@ fn run_local_agent_once(
         .expect("failed to run nanobot agent -l")
 }
 
+#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 fn run_local_agent_with_retry(
     bin: &Path,
     home: &Path,
@@ -118,6 +135,7 @@ fn run_local_agent_with_retry(
 }
 
 /// Write a realistic JSONL session file with metadata + user/assistant turns.
+#[cfg(feature = "semantic")]
 fn write_session_jsonl(dir: &Path, filename: &str, session_key: &str, turns: &[(&str, &str)]) {
     let mut lines = vec![format!(
         r#"{{"_type":"metadata","session_key":"{}","created_at":"2026-02-27T10:00:00Z","updated_at":"2026-02-27T10:30:00Z"}}"#,

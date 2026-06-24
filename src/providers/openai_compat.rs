@@ -396,6 +396,12 @@ fn ensure_required_keys(schema: &mut serde_json::Value) {
     if is_object_schema && !obj.contains_key("required") {
         obj.insert("required".to_string(), serde_json::Value::Array(vec![]));
     }
+    if is_object_schema && !obj.contains_key("properties") {
+        obj.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+    }
     if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
         for (_, v) in props.iter_mut() {
             ensure_required_keys(v);
@@ -406,7 +412,91 @@ fn ensure_required_keys(schema: &mut serde_json::Value) {
     }
 }
 
-/// Apply `ensure_required_keys` to every tool's `function.parameters` in `body`.
+fn is_apple_fm_request(body: &serde_json::Value) -> bool {
+    matches!(
+        body.get("model").and_then(|m| m.as_str()),
+        Some("system" | "pcc")
+    )
+}
+
+fn apple_fm_tool_parameters_supported(params: &serde_json::Value) -> bool {
+    let Some(obj) = params.as_object() else {
+        return false;
+    };
+    if obj.get("type").and_then(|t| t.as_str()) != Some("object") {
+        return false;
+    }
+    let Some(props) = obj.get("properties").and_then(|p| p.as_object()) else {
+        return true;
+    };
+    props.values().all(apple_fm_property_schema_supported)
+}
+
+fn apple_fm_property_schema_supported(schema: &serde_json::Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    match obj.get("type").and_then(|t| t.as_str()) {
+        Some("string" | "integer" | "number" | "boolean") => true,
+        Some("array") => obj
+            .get("items")
+            .map(apple_fm_array_item_schema_supported)
+            .unwrap_or(false),
+        // Live `fm serve` rejects nested object parameters and arrays of
+        // objects with HTTP 400 "Invalid tool definition" before generation.
+        Some("object") => false,
+        _ => false,
+    }
+}
+
+fn apple_fm_array_item_schema_supported(schema: &serde_json::Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    matches!(
+        obj.get("type").and_then(|t| t.as_str()),
+        Some("string" | "integer" | "number" | "boolean")
+    )
+}
+
+fn filter_apple_fm_tool_schemas(body: &mut serde_json::Value) {
+    if !is_apple_fm_request(body) {
+        return;
+    }
+
+    let mut had_tools = false;
+    let mut remaining = 0usize;
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        had_tools = true;
+        tools.retain(|tool| {
+            let supported = tool
+                .get("function")
+                .and_then(|f| f.get("parameters"))
+                .map(apple_fm_tool_parameters_supported)
+                .unwrap_or(false);
+            if !supported {
+                let name = tool
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("<unknown>");
+                tracing::debug!(tool = name, "apple_fm_tool_schema_filtered");
+            }
+            supported
+        });
+        remaining = tools.len();
+    }
+
+    if had_tools && remaining == 0 {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+            obj.remove("parallel_tool_calls");
+        }
+    }
+}
+
+/// Apply provider compatibility normalization to every tool in `body`.
 fn normalize_tool_schemas(body: &mut serde_json::Value) {
     if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
         for tool in tools.iter_mut() {
@@ -418,6 +508,7 @@ fn normalize_tool_schemas(body: &mut serde_json::Value) {
             }
         }
     }
+    filter_apple_fm_tool_schemas(body);
 }
 
 /// For local thinking-capable models with thinking disabled: prefill the
@@ -1350,7 +1441,6 @@ async fn parse_sse_stream(
     let mut full_inline_thinking = String::new(); // inline <think> tags — fallback when content empty
     let mut split_state = ThinkSplitState::default();
     let mut finish_reason = String::from("stop");
-    let mut got_done = false;
     let mut usage: HashMap<String, i64> = HashMap::new();
 
     // Tool call accumulation: index → (id, name, arguments_json_str)
@@ -1388,7 +1478,6 @@ async fn parse_sse_stream(
             let data = &line[6..];
 
             if data == "[DONE]" {
-                got_done = true;
                 let (tail_content, tail_reasoning) = flush_thinking_split_state(&mut split_state);
                 if !tail_reasoning.is_empty() {
                     full_inline_thinking.push_str(&tail_reasoning);
@@ -1585,7 +1674,7 @@ async fn parse_sse_stream(
     // Stream ended without [DONE] — SLM may have crashed or dropped connection.
     // Treat an abnormal termination during content generation as "length" so
     // the auto-continue mechanism can detect and recover from it.
-    if !got_done && finish_reason == "stop" {
+    if finish_reason == "stop" {
         finish_reason = String::from("length");
     }
     warn!(
@@ -1706,6 +1795,126 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_normalize_tool_schemas_filters_apple_fm_nested_objects() {
+        let mut body = serde_json::json!({
+            "model": "system",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "lines": {"type": "array", "items": {"type": "integer"}}
+                            },
+                            "required": ["path"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "batch",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "operations": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "tool": {"type": "string"},
+                                            "args": {"type": "object"}
+                                        },
+                                        "required": ["tool", "args"]
+                                    }
+                                }
+                            },
+                            "required": ["operations"]
+                        }
+                    }
+                }
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false
+        });
+
+        normalize_tool_schemas(&mut body);
+
+        let tools = body["tools"].as_array().expect("tools kept");
+        assert_eq!(tools.len(), 1, "Apple FM should keep only flat schemas");
+        assert_eq!(tools[0]["function"]["name"], serde_json::json!("read_file"));
+        assert_eq!(body["tool_choice"], serde_json::json!("auto"));
+    }
+
+    #[test]
+    fn test_normalize_tool_schemas_removes_empty_apple_fm_tool_set() {
+        let mut body = serde_json::json!({
+            "model": "pcc",
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "nested",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "args": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"]
+                            }
+                        },
+                        "required": ["args"]
+                    }
+                }
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false
+        });
+
+        normalize_tool_schemas(&mut body);
+
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_normalize_tool_schemas_keeps_nested_tools_for_non_apple_models() {
+        let mut body = serde_json::json!({
+            "model": "qwen36-35b",
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "batch",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "operations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"tool": {"type": "string"}},
+                                    "required": ["tool"]
+                                }
+                            }
+                        },
+                        "required": ["operations"]
+                    }
+                }
+            }]
+        });
+
+        normalize_tool_schemas(&mut body);
+
+        let tools = body["tools"].as_array().expect("tools kept");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], serde_json::json!("batch"));
+    }
+
     // e2e (live, gated) — proves R1 end-to-end through the real provider→Apple FM
     // send path: a no-arg tool whose schema omits `required` (free-form object)
     // previously 400'd ("Invalid tool definition"); after normalize_tool_schemas
@@ -1736,6 +1945,49 @@ mod tests {
         assert!(
             res.is_ok(),
             "no-arg tool must be accepted by Apple FM after schema normalization; got: {:?}",
+            res.err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_e2e_applefm_filters_nested_tool_schema() {
+        let base = std::env::var("NANOBOT_APPLEFM_BASE")
+            .unwrap_or_else(|_| "http://127.0.0.1:1976/v1".to_string());
+        let model = std::env::var("NANOBOT_APPLEFM_MODEL").unwrap_or_else(|_| "system".to_string());
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some(&model));
+        let messages = vec![serde_json::json!({"role": "user", "content": "Reply with only: ok"})];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "batch",
+                "description": "Run several tool operations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "operations": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tool": {"type": "string"},
+                                    "args": {"type": "object"}
+                                },
+                                "required": ["tool", "args"]
+                            }
+                        }
+                    },
+                    "required": ["operations"]
+                }
+            }
+        })];
+
+        let res = provider
+            .chat(&messages, Some(&tools), Some(&model), 16, 0.0, None, None)
+            .await;
+        assert!(
+            res.is_ok(),
+            "nested tool schema must be filtered before Apple FM request; got: {:?}",
             res.err()
         );
     }
@@ -2061,7 +2313,7 @@ mod tests {
         assert_eq!(r2, ", this is a test.");
 
         // Flush also goes to reasoning.
-        let (v3, r3) = flush_thinking_split_state(&mut state);
+        let (v3, _r3) = flush_thinking_split_state(&mut state);
         assert!(v3.is_empty());
         // Carry may have trailing partial-tag buffer; reasoning gets the rest.
         // The key point: nothing ever becomes visible.

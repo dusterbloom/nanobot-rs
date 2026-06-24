@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_registry_degraded_probe_not_healthy() {
-        let mut reg = HealthRegistry::new();
+        let reg = HealthRegistry::new();
         // Manually insert a degraded state
         {
             let mut states = reg.states.write();
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_registry_healthy_probe_is_healthy() {
-        let mut reg = HealthRegistry::new();
+        let reg = HealthRegistry::new();
         {
             let mut states = reg.states.write();
             let mut state = ProbeState::new("test_probe".to_string());

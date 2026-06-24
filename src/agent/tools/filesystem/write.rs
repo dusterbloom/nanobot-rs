@@ -75,8 +75,8 @@ impl Tool for WriteFileTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::make_params;
+    use super::*;
     use tempfile::TempDir;
 
     #[tokio::test]

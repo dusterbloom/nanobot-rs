@@ -5,14 +5,12 @@
 //!
 //! Single `VoicePipeline` service used by all voice consumers:
 //! - REPL `/voice` toggle (mic + speaker)
-//! - `nanobot realtime` CLI (mic + speaker + LLM loop)
 //! - Channel adapters (file I/O, no audio hardware)
 //!
 //! Replaces the former `voice.rs` (VoiceSession) and channel-only `VoicePipeline`.
 //! Uses cross-platform `AudioCapture`/`AudioPlayer` from jack-voice (cpal-based),
 //! no `parec` dependency.
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,56 +64,9 @@ pub(crate) fn detect_language(text: &str) -> String {
             Language::Portuguese => "pt",
             Language::Chinese => "zh",
             Language::Vietnamese => "vi",
-            _ => "en",
         })
         .unwrap_or("en")
         .to_string()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PocketLanguageSpec {
-    language: &'static str,
-    default_voice: &'static str,
-}
-
-fn pocket_tts_language(lang: &str) -> Option<PocketLanguageSpec> {
-    let lang = lang.trim();
-    if lang.is_empty() {
-        return None;
-    }
-    let base = lang
-        .split(['-', '_'])
-        .next()
-        .unwrap_or(lang)
-        .to_ascii_lowercase();
-
-    match base.as_str() {
-        "en" | "english" => Some(PocketLanguageSpec {
-            language: "en",
-            default_voice: "alba",
-        }),
-        "fr" | "french" => Some(PocketLanguageSpec {
-            language: "fr",
-            default_voice: "estelle",
-        }),
-        "de" | "german" => Some(PocketLanguageSpec {
-            language: "de",
-            default_voice: "juergen",
-        }),
-        "it" | "italian" => Some(PocketLanguageSpec {
-            language: "it",
-            default_voice: "giovanni",
-        }),
-        "pt" | "portuguese" => Some(PocketLanguageSpec {
-            language: "pt",
-            default_voice: "rafael",
-        }),
-        "es" | "spanish" => Some(PocketLanguageSpec {
-            language: "es",
-            default_voice: "lola",
-        }),
-        _ => None,
-    }
 }
 
 // ============================================================================
@@ -184,29 +135,6 @@ pub(crate) fn split_tts_sentences(text: &str) -> Vec<String> {
     chunks
 }
 
-/// Normalize samples to a target peak level so all sentences have consistent volume.
-pub(crate) fn normalize_peak(samples: &mut [f32], target_peak: f32) {
-    let peak = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-    if peak > 1e-6 {
-        let gain = target_peak / peak;
-        for s in samples.iter_mut() {
-            *s *= gain;
-        }
-    }
-}
-
-/// Apply fade-in and fade-out envelopes to eliminate clicks at sentence boundaries.
-pub(crate) fn apply_fade_envelope(samples: &mut [f32], fade_samples: usize) {
-    let len = samples.len();
-    let fade = fade_samples.min(len / 2);
-    for i in 0..fade {
-        samples[i] *= i as f32 / fade as f32;
-    }
-    for i in 0..fade {
-        samples[len - 1 - i] *= i as f32 / fade as f32;
-    }
-}
-
 /// Convert f32 samples to raw little-endian bytes.
 fn samples_to_f32le_bytes(samples: &[f32]) -> Vec<u8> {
     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
@@ -258,20 +186,6 @@ fn f32le_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
-}
-
-/// Map ISO 639-1 language code to a default Kokoro voice ID and language code.
-fn language_to_kokoro_voice(lang: &str) -> (&'static str, &'static str) {
-    match lang {
-        "es" => ("28", "es"),
-        "fr" => ("30", "fr"),
-        "hi" => ("31", "hi"),
-        "it" => ("35", "it"),
-        "ja" => ("37", "ja"),
-        "pt" => ("42", "pt"),
-        "zh" => ("45", "zh"),
-        _ => ("3", "en-us"),
-    }
 }
 
 // ============================================================================
@@ -512,12 +426,14 @@ pub(crate) struct SentenceAccumulator {
 }
 
 impl SentenceAccumulator {
+    #[cfg(test)]
     pub fn new(sentence_tx: std_mpsc::Sender<TtsCommand>) -> Self {
         Self::with_mode(sentence_tx, false, None)
     }
 
     /// Create an accumulator that sends each sentence immediately for low-latency
     /// streaming TTS.
+    #[cfg(test)]
     pub fn new_streaming(sentence_tx: std_mpsc::Sender<TtsCommand>) -> Self {
         Self::with_mode(sentence_tx, true, None)
     }
@@ -1012,92 +928,34 @@ fn strip_inline_markdown(text: &str) -> String {
 ///
 /// Per-sentence TTS routing: select engine + voice based on detected language.
 ///
-/// Shared by `VoicePipeline::select_tts`, `start_streaming_speak`, and
-/// `start_tts_playback` so language changes mid-session always switch voices.
+/// Shared by `VoicePipeline::select_tts` and `start_streaming_speak` so language
+/// changes mid-session always switch voices.
 fn route_tts(
     lang: &str,
-    engine_config: &TtsEngineConfig,
     configured_voice: Option<&str>,
-    tts_en: &Option<Arc<Mutex<TextToSpeech>>>,
-    tts_multi: &Option<Arc<Mutex<TextToSpeech>>>,
-    tts_pocket_by_lang: &Arc<Mutex<HashMap<String, Arc<Mutex<TextToSpeech>>>>>,
+    tts: &Option<Arc<Mutex<TextToSpeech>>>,
 ) -> Result<(Arc<Mutex<TextToSpeech>>, String), String> {
-    if *engine_config == TtsEngineConfig::Supertonic {
-        let tts = tts_en
-            .as_ref()
-            .or(tts_multi.as_ref())
-            .ok_or("No TTS engine available")?
-            .clone();
-        let engine_type = {
-            let mut guard = tts.lock();
-            let engine_type = guard.engine_type().to_string();
-            if engine_type == "supertonic" {
-                // Per-message language switch: tell Supertonic to wrap the input
-                // with the language tag (<it>…</it>, <es>…</es>, etc.). The model
-                // is multilingual; voice stays the same across languages.
-                if let Err(e) = guard.set_language(lang) {
-                    tracing::warn!("Supertonic language switch to {} failed: {}", lang, e);
-                }
-            }
-            engine_type
-        };
-        let voice_id = if engine_type == "supertonic" {
-            // Voice selection — single persona across all languages:
-            //   1. Explicit ttsVoice from config (e.g. "F5") — user's choice.
-            //   2. Curated per-language pick from jack_voice when nothing set.
-            configured_voice.map(|s| s.to_string()).unwrap_or_else(|| {
-                jack_voice::tts::recommended_supertonic_voice(Some(lang)).to_string()
-            })
-        } else if engine_type == "pocket" {
-            pocket_tts_language(lang)
-                .map(|spec| spec.default_voice)
-                .unwrap_or("alba")
-                .to_string()
-        } else {
-            let (vid, _) = language_to_kokoro_voice(lang);
-            vid.to_string()
-        };
-        return Ok((tts, voice_id));
-    }
+    let tts = tts
+        .as_ref()
+        .ok_or("No Supertonic TTS engine available")?
+        .clone();
 
-    if *engine_config != TtsEngineConfig::Kokoro {
-        if let Some(spec) = pocket_tts_language(lang) {
-            if let Some(tts) = tts_pocket_by_lang.lock().get(spec.language).cloned() {
-                return Ok((tts, spec.default_voice.to_string()));
-            }
-            match TextToSpeech::new_pocket_with_language(spec.language) {
-                Ok(tts) => {
-                    let tts = Arc::new(Mutex::new(tts));
-                    tts_pocket_by_lang
-                        .lock()
-                        .insert(spec.language.to_string(), tts.clone());
-                    return Ok((tts, spec.default_voice.to_string()));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Pocket TTS init failed for {}: {e}; falling back",
-                        spec.language
-                    );
-                }
-            }
+    {
+        let mut guard = tts.lock();
+        // Per-message language switch: tell Supertonic to wrap the input with
+        // the language tag (<it>...</it>, <es>...</es>, etc.). The model is
+        // multilingual; voice stays the same across languages.
+        if let Err(e) = guard.set_language(lang) {
+            tracing::warn!("Supertonic language switch to {} failed: {}", lang, e);
         }
     }
 
-    let tts = tts_multi
-        .as_ref()
-        .or(tts_en.as_ref())
-        .ok_or("No TTS engine available")?
-        .clone();
-
-    let voice_id = if tts.lock().engine_type() == "pocket" {
-        pocket_tts_language(lang)
-            .map(|spec| spec.default_voice)
-            .unwrap_or("alba")
-            .to_string()
-    } else {
-        let (vid, _) = language_to_kokoro_voice(lang);
-        vid.to_string()
-    };
+    // Voice selection — single persona across all languages:
+    //   1. Explicit ttsVoice from config (e.g. "F5") — user's choice.
+    //   2. Curated per-language pick from jack_voice when nothing set.
+    let voice_id = configured_voice
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| jack_voice::tts::recommended_supertonic_voice(Some(lang)).to_string());
 
     Ok((tts, voice_id))
 }
@@ -1108,9 +966,7 @@ fn route_tts(
 /// - `for_channels()` — file I/O only, no audio hardware
 pub struct VoicePipeline {
     stt: Arc<Mutex<SpeechToText>>,
-    tts_en: Option<Arc<Mutex<TextToSpeech>>>,
-    tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
-    tts_pocket_by_lang: Arc<Mutex<HashMap<String, Arc<Mutex<TextToSpeech>>>>>,
+    tts: Option<Arc<Mutex<TextToSpeech>>>,
     engine_config: TtsEngineConfig,
     /// User-configured voice ID from `~/.nanobot/config.json` (`voice.ttsVoice`).
     /// Applied to Supertonic across all languages — "single persona, multilingual".
@@ -1144,126 +1000,9 @@ impl VoicePipeline {
         .await
     }
 
-    /// Create a pipeline with optional language-based engine selection (mic mode).
-    ///
-    /// - `None` → load Pocket (English) and Kokoro fallback; other Pocket languages load lazily
-    /// - `Some("en" | "fr" | "de" | "it" | "pt" | "es")` → load Pocket for that language
-    /// - `Some(_)` → load only Kokoro
+    /// Create a Supertonic pipeline with an optional initial language (mic mode).
     pub async fn with_lang(lang: Option<&str>) -> Result<Self, String> {
-        let pocket_lang = lang.and_then(pocket_tts_language);
-        let load_pocket = lang.is_none() || pocket_lang.is_some();
-        let load_kokoro = lang.is_none() || pocket_lang.is_none();
-        let initial_pocket_lang = pocket_lang.map(|spec| spec.language).unwrap_or("en");
-
-        if load_kokoro && std::env::var("PIPER_ESPEAKNG_DATA_DIRECTORY").is_err() {
-            let home = dirs::home_dir().unwrap_or_default();
-            let local_data = home.join(".local/share/espeak-ng-data");
-            if local_data.exists() {
-                std::env::set_var("PIPER_ESPEAKNG_DATA_DIRECTORY", home.join(".local/share"));
-            }
-        }
-
-        let label = match lang {
-            Some(lang) if pocket_tts_language(lang).is_some() => "Pocket multilingual",
-            Some(_) => "Kokoro only",
-            None => "Pocket multilingual + Kokoro fallback",
-        };
-        info!("Initializing voice pipeline ({label})...");
-
-        let progress = &TerminalProgress;
-
-        // Ensure base models (VAD, Whisper, SmartTurn)
-        for bundle in models::MODEL_BUNDLES {
-            let target = if bundle.extract_dir.is_empty() {
-                bundle.name
-            } else {
-                bundle.extract_dir
-            };
-            if !models::model_exists(target) {
-                progress.on_download_start(bundle.name, bundle.size_mb);
-                models::download_model(bundle, progress)
-                    .await
-                    .map_err(|e| format!("Model download failed: {e}"))?;
-                progress.on_download_complete(bundle.name);
-            }
-        }
-
-        if load_kokoro {
-            models::ensure_kokoro_model(progress)
-                .await
-                .map_err(|e| format!("Model download failed: {e}"))?;
-        }
-
-        let stt = SpeechToText::new(SttMode::Batch).map_err(|e| format!("STT init failed: {e}"))?;
-
-        let tts_en = if load_pocket {
-            match tokio::task::spawn_blocking(move || {
-                TextToSpeech::new_pocket_with_language(initial_pocket_lang)
-            })
-            .await
-            .map_err(|e| format!("spawn_blocking join error: {e}"))?
-            {
-                Ok(tts) => {
-                    info!(
-                        "{} TTS ready ({initial_pocket_lang}) [engine: {}]",
-                        if tts.engine_type() == "pocket" {
-                            "Pocket"
-                        } else {
-                            tts.engine_type()
-                        },
-                        tts.engine_type()
-                    );
-                    Some(Arc::new(Mutex::new(tts)))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Pocket TTS init failed for {initial_pocket_lang}, fallback may be used: {e}"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let tts_multi = if load_kokoro {
-            match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
-                .await
-                .map_err(|e| format!("spawn_blocking join error: {e}"))?
-            {
-                Ok(tts) => {
-                    info!("Kokoro TTS ready (multilingual)");
-                    Some(Arc::new(Mutex::new(tts)))
-                }
-                Err(e) => {
-                    tracing::warn!("Kokoro TTS init failed: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let tts_pocket_by_lang = Arc::new(Mutex::new(HashMap::new()));
-        if let Some(tts) = &tts_en {
-            tts_pocket_by_lang
-                .lock()
-                .insert(initial_pocket_lang.to_string(), tts.clone());
-        }
-
-        if tts_en.is_none() && tts_multi.is_none() {
-            return Err("No TTS engine could be initialized".to_string());
-        }
-
-        Ok(Self {
-            stt: Arc::new(Mutex::new(stt)),
-            tts_en,
-            tts_multi,
-            tts_pocket_by_lang,
-            engine_config: TtsEngineConfig::Pocket,
-            configured_voice: None,
-            cancel: Arc::new(AtomicBool::new(false)),
-        })
+        Self::init_pipeline(TtsEngineConfig::Supertonic, lang, None, &TerminalProgress).await
     }
 
     /// Create a pipeline with a specific TTS engine (mic mode).
@@ -1281,7 +1020,6 @@ impl VoicePipeline {
     ///   - If `tts_voice` is None and the engine is Supertonic, we look up
     ///     `jack_voice::tts::recommended_supertonic_voice(language)` to get
     ///     the curated per-language pick (M2 for Italian/English, etc.).
-    ///   - For Kokoro/Pocket, None means "engine's default voice".
     pub async fn with_voice_config(
         cfg: &crate::config::schema::VoiceConfig,
     ) -> Result<Self, String> {
@@ -1330,113 +1068,27 @@ impl VoicePipeline {
             info!("TTS engine: macOS `say` (no TTS model loaded)");
             return Ok(Self {
                 stt: Arc::new(Mutex::new(stt)),
-                tts_en: None,
-                tts_multi: None,
-                tts_pocket_by_lang: Arc::new(Mutex::new(HashMap::new())),
+                tts: None,
                 engine_config: engine,
                 configured_voice: tts_voice.map(|s| s.to_string()),
                 cancel: Arc::new(AtomicBool::new(false)),
             });
         }
 
-        let (tts_en, tts_multi) = match engine {
-            TtsEngineConfig::Pocket => {
-                models::ensure_kokoro_model(progress)
-                    .await
-                    .map_err(|e| format!("Model download failed: {e}"))?;
-
-                let tts_en = match tokio::task::spawn_blocking(|| {
-                    TextToSpeech::new_pocket_with_language("en")
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking join error: {e}"))?
-                {
-                    Ok(tts) => {
-                        info!("Pocket TTS ready (en)");
-                        Some(Arc::new(Mutex::new(tts)))
-                    }
-                    Err(e) => {
-                        info!("Pocket TTS not available: {e}");
-                        None
-                    }
-                };
-
-                let tts_multi = match tokio::task::spawn_blocking(|| {
-                    TextToSpeech::with_engine(TtsEngine::Kokoro)
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking join error: {e}"))?
-                {
-                    Ok(tts) => {
-                        info!("Kokoro TTS ready (multilingual fallback)");
-                        Some(Arc::new(Mutex::new(tts)))
-                    }
-                    Err(e) => {
-                        info!("Kokoro TTS not available: {e}");
-                        None
-                    }
-                };
-
-                (tts_en, tts_multi)
-            }
+        let tts = match engine {
             TtsEngineConfig::Supertonic => {
                 models::ensure_supertonic_models(progress)
                     .await
                     .map_err(|e| format!("Model download failed: {e}"))?;
 
-                let tts_en = match tokio::task::spawn_blocking(|| {
+                let tts = tokio::task::spawn_blocking(|| {
                     TextToSpeech::with_engine(TtsEngine::Supertonic)
                 })
                 .await
                 .map_err(|e| format!("spawn_blocking join error: {e}"))?
-                {
-                    Ok(tts) => {
-                        info!("Supertonic TTS ready (44.1kHz)");
-                        Some(Arc::new(Mutex::new(tts)))
-                    }
-                    Err(e) => {
-                        info!("Supertonic TTS not available: {e}");
-                        None
-                    }
-                };
-
-                let tts_multi = if tts_en.is_none() {
-                    models::ensure_kokoro_model(progress)
-                        .await
-                        .map_err(|e| format!("Model download failed: {e}"))?;
-
-                    match tokio::task::spawn_blocking(|| {
-                        TextToSpeech::with_engine(TtsEngine::Kokoro)
-                    })
-                    .await
-                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
-                    {
-                        Ok(tts) => {
-                            info!("Kokoro TTS ready (Supertonic fallback)");
-                            Some(Arc::new(Mutex::new(tts)))
-                        }
-                        Err(e) => {
-                            info!("Kokoro TTS fallback not available: {e}");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                (tts_en, tts_multi)
-            }
-            TtsEngineConfig::Kokoro => {
-                models::ensure_kokoro_model(progress)
-                    .await
-                    .map_err(|e| format!("Model download failed: {e}"))?;
-                let tts =
-                    tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
-                        .await
-                        .map_err(|e| format!("spawn_blocking join error: {e}"))?
-                        .map_err(|e| format!("Kokoro TTS init failed: {e}"))?;
-                info!("Kokoro TTS ready (multilingual)");
-                (None, Some(Arc::new(Mutex::new(tts))))
+                .map_err(|e| format!("Supertonic TTS init failed: {e}"))?;
+                info!("Supertonic TTS ready (44.1kHz)");
+                Some(Arc::new(Mutex::new(tts)))
             }
             // On macOS this is handled by the early return above; the arm exists
             // for match exhaustiveness and guards the unsupported non-macOS case.
@@ -1445,50 +1097,34 @@ impl VoicePipeline {
             }
         };
 
-        // Apply configured voice (or curated per-language default) to the
-        // primary TTS handle. We do NOT touch tts_multi here — that's the
-        // multilingual fallback (typically Kokoro) which uses its own voice
-        // selection based on detected language at synth time.
-        if let Some(tts) = &tts_en {
-            let voice_to_apply: Option<String> = match (tts_voice, engine) {
+        // Apply configured voice or curated per-language default.
+        if let Some(tts) = &tts {
+            let voice_to_apply: String = match tts_voice {
                 // Explicit voice from config always wins.
-                (Some(v), _) => Some(v.to_string()),
+                Some(v) => v.to_string(),
                 // Supertonic + no explicit voice → curated per-language pick.
-                (None, TtsEngineConfig::Supertonic) => {
-                    Some(jack_voice::tts::recommended_supertonic_voice(lang).to_string())
-                }
-                // Other engines: leave their own default in place.
-                (None, _) => None,
+                None => jack_voice::tts::recommended_supertonic_voice(lang).to_string(),
             };
-            if let Some(voice_id) = voice_to_apply {
-                let mut guard = tts.lock();
-                match guard.set_speaker(&voice_id) {
-                    Ok(()) => {
-                        info!(
-                            "Applied configured TTS voice: engine={:?}, voice={}",
-                            engine, voice_id
-                        );
-                    }
-                    Err(e) => {
-                        // Don't fail the whole pipeline — log and proceed with the engine's
-                        // default voice. The user will hear *something* and see the warning.
-                        tracing::warn!(
-                            "Failed to apply configured voice {:?} for engine {:?}: {}. Falling back to engine default.",
-                            voice_id, engine, e
-                        );
-                    }
+            let mut guard = tts.lock();
+            match guard.set_speaker(&voice_to_apply) {
+                Ok(()) => {
+                    info!(
+                        "Applied configured TTS voice: engine={:?}, voice={}",
+                        engine, voice_to_apply
+                    );
+                }
+                Err(e) => {
+                    // Don't fail the whole pipeline — log and proceed with the engine's
+                    // default voice. The user will hear something and see the warning.
+                    tracing::warn!(
+                        "Failed to apply configured voice {:?} for engine {:?}: {}. Falling back to engine default.",
+                        voice_to_apply, engine, e
+                    );
                 }
             }
         }
 
-        let tts_pocket_by_lang = Arc::new(Mutex::new(HashMap::new()));
-        if let Some(tts) = &tts_en {
-            tts_pocket_by_lang
-                .lock()
-                .insert("en".to_string(), tts.clone());
-        }
-
-        if tts_en.is_none() && tts_multi.is_none() {
+        if tts.is_none() {
             return Err("No TTS engine could be initialized".to_string());
         }
 
@@ -1496,9 +1132,7 @@ impl VoicePipeline {
 
         Ok(Self {
             stt: Arc::new(Mutex::new(stt)),
-            tts_en,
-            tts_multi,
-            tts_pocket_by_lang,
+            tts,
             engine_config: engine,
             // Stash the user's configured voice (None if they didn't set one).
             // route_tts() reads this on every synthesis so the persona stays
@@ -1633,33 +1267,9 @@ impl VoicePipeline {
     // Mic mode: speak (blocking)
     // ----------------------------------------------------------------
 
-    fn get_or_init_pocket_tts(
-        &self,
-        spec: PocketLanguageSpec,
-    ) -> Result<Arc<Mutex<TextToSpeech>>, String> {
-        if let Some(tts) = self.tts_pocket_by_lang.lock().get(spec.language).cloned() {
-            return Ok(tts);
-        }
-
-        let tts = TextToSpeech::new_pocket_with_language(spec.language)
-            .map_err(|e| format!("Pocket TTS init failed for {}: {e}", spec.language))?;
-        let tts = Arc::new(Mutex::new(tts));
-        self.tts_pocket_by_lang
-            .lock()
-            .insert(spec.language.to_string(), tts.clone());
-        Ok(tts)
-    }
-
     /// Select the appropriate TTS engine based on language and config.
     fn select_tts(&self, lang: &str) -> Result<(Arc<Mutex<TextToSpeech>>, String), String> {
-        route_tts(
-            lang,
-            &self.engine_config,
-            self.configured_voice.as_deref(),
-            &self.tts_en,
-            &self.tts_multi,
-            &self.tts_pocket_by_lang,
-        )
+        route_tts(lang, self.configured_voice.as_deref(), &self.tts)
     }
 
     pub fn speak(&mut self, text: &str, lang: &str) -> Result<(), String> {
@@ -1732,7 +1342,7 @@ impl VoicePipeline {
     }
 
     /// Start a streaming speak session driven by external `TtsCommand`s.
-    pub fn start_streaming_speak(
+    pub(crate) fn start_streaming_speak(
         &mut self,
         _lang: &str,
         display_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -1768,10 +1378,7 @@ impl VoicePipeline {
             return Ok((sentence_tx, join_handle));
         }
 
-        let tts_en = self.tts_en.clone();
-        let tts_multi = self.tts_multi.clone();
-        let tts_pocket_by_lang = self.tts_pocket_by_lang.clone();
-        let engine_config = self.engine_config.clone();
+        let tts = self.tts.clone();
         let configured_voice = self.configured_voice.clone();
         let cancel = self.cancel.clone();
 
@@ -1796,20 +1403,14 @@ impl VoicePipeline {
                         if let Some(ref dtx) = display_tx {
                             let _ = dtx.send(sentence.clone());
                         }
-                        let (tts, voice_id) = match route_tts(
-                            &language,
-                            &engine_config,
-                            configured_voice.as_deref(),
-                            &tts_en,
-                            &tts_multi,
-                            &tts_pocket_by_lang,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::error!("TTS routing failed: {}", e);
-                                continue;
-                            }
-                        };
+                        let (tts, voice_id) =
+                            match route_tts(&language, configured_voice.as_deref(), &tts) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::error!("TTS routing failed: {}", e);
+                                    continue;
+                                }
+                            };
                         let mut guard = tts.lock();
                         if let Err(e) = guard.set_speaker(&voice_id) {
                             tracing::warn!("Voice switch to {} failed: {}", voice_id, e);
@@ -1975,18 +1576,10 @@ impl Drop for VoicePipeline {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
 
-        // Some native TTS backends (notably Kokoro in jack-voice) own a Tokio
-        // runtime internally. Channel pipelines are dropped during async gateway
-        // shutdown, and dropping that runtime from async context panics. This
-        // mirrors `shutdown()`: leak the long-lived native TTS handles and let
-        // the OS reclaim them when the process exits.
-        if let Some(tts) = self.tts_en.take() {
-            std::mem::forget(tts);
-        }
-        if let Some(tts) = self.tts_multi.take() {
-            std::mem::forget(tts);
-        }
-        for (_, tts) in self.tts_pocket_by_lang.lock().drain() {
+        // Channel pipelines are dropped during async gateway shutdown. Keep the
+        // long-lived native TTS handle out of that shutdown path and let the OS
+        // reclaim it when the process exits.
+        if let Some(tts) = self.tts.take() {
             std::mem::forget(tts);
         }
     }
@@ -2126,155 +1719,6 @@ impl ModelProgressCallback for TerminalProgress {
 }
 
 // ============================================================================
-// Standalone TTS playback (used by realtime voice agent)
-// ============================================================================
-
-/// Start a standalone TTS synthesis+playback pipeline from a raw TTS engine handle.
-///
-/// Returns a `TtsCommand` sender and a cancel flag. Send `TtsCommand::Synthesize(text)`
-/// for each sentence, then `TtsCommand::Finish` when done. The cancel flag can be set
-/// to interrupt playback (barge-in).
-///
-/// This is used by `VoiceAgent` which owns the TTS via `RealtimeSession` and needs
-/// to pipe LLM streaming deltas to audio output.
-pub(crate) fn start_tts_playback(
-    tts_en: Option<Arc<Mutex<TextToSpeech>>>,
-    tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
-    tts_playing: Arc<AtomicBool>,
-) -> (std_mpsc::Sender<TtsCommand>, Arc<AtomicBool>) {
-    let cancel = Arc::new(AtomicBool::new(false));
-
-    let (sentence_tx, sentence_rx) = std_mpsc::channel::<TtsCommand>();
-    let (audio_tx, audio_rx) = std_mpsc::sync_channel::<AudioChunk>(2);
-
-    let cancel_synth = cancel.clone();
-    let tts_pocket_by_lang = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    std::thread::spawn(move || {
-        #[cfg(unix)]
-        mask_sigint();
-
-        // Pre-warm: lock each engine once, set default voices, then release.
-        // This forces model loading to happen NOW, not on first synthesis.
-        if let Some(ref tts) = tts_en {
-            let mut g = tts.lock();
-            let _ = g.set_speaker("alba");
-            tracing::debug!("[tts-synth] Pocket pre-warmed (English)");
-        }
-        if let Some(ref tts) = tts_multi {
-            let mut g = tts.lock();
-            let _ = g.set_speaker("35");
-            tracing::debug!("[tts-synth] Kokoro pre-warmed (multilingual)");
-        }
-
-        for cmd in sentence_rx {
-            match cmd {
-                TtsCommand::Finish => {
-                    tracing::debug!("[tts-synth] received Finish, waiting for next turn");
-                    continue;
-                }
-                TtsCommand::Synthesize {
-                    text: sentence,
-                    language,
-                } => {
-                    if cancel_synth.load(Ordering::Relaxed) {
-                        continue;
-                    }
-
-                    let (tts, voice_id) = match route_tts(
-                        &language,
-                        &TtsEngineConfig::Pocket,
-                        None, // legacy path — no configured voice plumbed here
-                        &tts_en,
-                        &tts_multi,
-                        &tts_pocket_by_lang,
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("[tts-synth] TTS routing failed: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let mut guard = tts.lock();
-                    if let Err(e) = guard.set_speaker(&voice_id) {
-                        tracing::warn!("[tts-synth] voice switch to {} failed: {}", voice_id, e);
-                    }
-
-                    let cancel_ref = &cancel_synth;
-                    let mut all_samples: Vec<f32> = Vec::new();
-                    let mut sr = 0u32;
-                    let mut cancelled = false;
-                    if let Err(e) = guard.synthesize_streaming(&sentence, |samples, sample_rate| {
-                        if cancel_ref.load(Ordering::Relaxed) {
-                            cancelled = true;
-                            return false;
-                        }
-                        sr = sample_rate;
-                        all_samples.extend_from_slice(samples);
-                        true
-                    }) {
-                        tracing::error!("[tts-synth] synthesis failed: {}", e);
-                    }
-                    if !cancelled && !all_samples.is_empty() {
-                        let chunk = AudioChunk {
-                            data: samples_to_f32le_bytes(&all_samples),
-                            sample_rate: sr,
-                        };
-                        let _ = audio_tx.send(chunk);
-                    }
-                }
-            }
-        }
-    });
-
-    // Playback thread — long-lived, reads audio chunks until sender drops
-    let cancel_play = cancel.clone();
-    let tts_playing_play = tts_playing;
-    std::thread::spawn(move || {
-        #[cfg(unix)]
-        mask_sigint();
-
-        let mut player: Option<AudioPlayer> = None;
-
-        tracing::debug!("[tts-play] playback thread started, waiting for audio chunks");
-        for chunk in audio_rx {
-            if cancel_play.load(Ordering::Relaxed) {
-                tracing::debug!("[tts-play] cancelled, stopping immediately");
-                if let Some(ref mut p) = player {
-                    p.stop();
-                }
-                tts_playing_play.store(false, Ordering::SeqCst);
-                // Reset cancel flag so next turn can play
-                cancel_play.store(false, Ordering::Relaxed);
-                continue;
-            }
-            let samples = f32le_bytes_to_samples(&chunk.data);
-            if samples.is_empty() {
-                tracing::debug!("[tts-play] empty chunk, skipping");
-                continue;
-            }
-            tracing::debug!(
-                "[tts-play] received {} samples @ {}Hz",
-                samples.len(),
-                chunk.sample_rate
-            );
-            tts_playing_play.store(true, Ordering::SeqCst);
-            let p = player.get_or_insert_with(|| {
-                tracing::debug!("[tts-play] creating AudioPlayer");
-                AudioPlayer::new().expect("Failed to create audio player")
-            });
-            p.play(samples, chunk.sample_rate);
-            // Block until this chunk finishes playing, then clear the flag.
-            // This ensures echo suppression only applies during actual playback.
-            p.wait();
-            tts_playing_play.store(false, Ordering::SeqCst);
-        }
-    });
-
-    (sentence_tx, cancel)
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2355,7 +1799,7 @@ mod tests {
 
     #[test]
     fn test_lingua_detects_short_english() {
-        let text = "You just tell me a joke testing uh your pocket";
+        let text = "You just tell me a joke testing the voice path";
         let detected = detect_language(text);
         assert_eq!(detected, "en");
     }
@@ -2377,35 +1821,6 @@ mod tests {
     #[test]
     fn test_lingua_detects_japanese() {
         assert_eq!(detect_language("今日の天気はどうですか？"), "ja");
-    }
-
-    #[test]
-    fn test_pocket_tts_language_supports_multilingual_defaults() {
-        let cases = [
-            ("en", "en", "alba"),
-            ("en-US", "en", "alba"),
-            ("fr", "fr", "estelle"),
-            ("de", "de", "juergen"),
-            ("it", "it", "giovanni"),
-            ("pt", "pt", "rafael"),
-            ("es", "es", "lola"),
-        ];
-
-        for (input, expected_lang, expected_voice) in cases {
-            let spec = pocket_tts_language(input).expect("language should be supported by Pocket");
-            assert_eq!(spec.language, expected_lang);
-            assert_eq!(spec.default_voice, expected_voice);
-        }
-    }
-
-    #[test]
-    fn test_pocket_tts_language_rejects_kokoro_fallback_languages() {
-        for lang in ["ja", "zh", "hi", "vi", ""] {
-            assert!(
-                pocket_tts_language(lang).is_none(),
-                "{lang:?} should use Kokoro fallback, not Pocket"
-            );
-        }
     }
 
     #[test]
@@ -2607,10 +2022,4 @@ mod tests {
         assert!(!stripped.contains("command"));
         assert!(!stripped.contains("query"));
     }
-
-    // DEPRECATED(pocket): the Pocket engine synth/streaming tests were removed —
-    // Pocket is no longer used (Supertonic is the active engine) and these tests
-    // require Pocket model assets that aren't shipped, so they only ever failed in
-    // CI/dev. Full Pocket removal is tracked in the TtsEngineConfig note and the
-    // TUI handoff doc.
 }

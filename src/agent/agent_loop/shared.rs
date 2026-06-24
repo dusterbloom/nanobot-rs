@@ -21,7 +21,7 @@ use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
 use crate::agent::policy;
 use crate::agent::prefix_guard;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
-use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
+use crate::agent::reasoning::{ReasoningEngine, ReasoningMode};
 use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
@@ -34,7 +34,7 @@ use crate::bus::events::OutboundMessage;
 use crate::config::schema::{EmailConfig, LcmSchemaConfig, ProprioceptionConfig};
 use crate::cron::service::CronService;
 use crate::errors::is_retryable_provider_error;
-use crate::providers::base::{LLMResponse, StreamChunk, ToolCallRequest, ToolChoice};
+use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
 
 use crate::agent::agent_core::{
     append_to_system_prompt, apply_compaction_result, PendingCompaction, RuntimeCounters,
@@ -42,8 +42,7 @@ use crate::agent::agent_core::{
 };
 
 use super::{
-    adaptive_max_tokens, appears_incomplete, last_user_message, render_via_protocol,
-    should_strip_tools_for_trio,
+    adaptive_max_tokens, last_user_message, render_via_protocol, should_strip_tools_for_trio,
 };
 
 // `response` is a sibling module declared in `mod.rs`. RetryState is re-exported
@@ -680,34 +679,11 @@ impl AgentLoopShared {
                 }
                 IterationOutcome::Error(msg) => {
                     ctx.flow.retries.validation = 0;
-                    iteration += 1;
-                    // Try backtracking before giving up.
-                    let should_backtrack = {
+                    {
                         let mut engine = ctx.reasoning.lock();
                         if *engine.mode() != ReasoningMode::Linear {
                             engine.mark_current_failed(&msg);
-                            if engine.find_alternative().is_some() {
-                                if let Some(cp) = engine.pop_checkpoint() {
-                                    engine.record_branch(BranchAttempt {
-                                        step_id: 0,
-                                        approach: "previous".into(),
-                                        outcome: StepStatus::Failed(msg.clone()),
-                                        iterations_consumed: iteration,
-                                    });
-                                    Some(cp.messages)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
                         }
-                    };
-                    if let Some(restored) = should_backtrack {
-                        ctx.messages = restored;
-                        continue;
                     }
                     ctx.final_content = msg;
                     break;

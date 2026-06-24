@@ -25,7 +25,7 @@ pub mod tool_status;
 pub mod web;
 
 pub use apply_patch::ApplyPatchTool;
-pub use base::{PermissionLevel, Tool};
+pub use base::Tool;
 pub use batch::BatchTool;
 pub use browser::BrowserTool;
 pub use code_execution::CodeExecutionTool;

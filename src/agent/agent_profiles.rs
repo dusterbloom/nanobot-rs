@@ -29,12 +29,6 @@ pub struct AgentProfile {
     pub max_iterations: Option<u32>,
     /// If true, exclude write/edit tools even if listed.
     pub read_only: bool,
-    /// When true, capabilities are inherited from the parent context
-    /// (minus `deny_capabilities`). Explicit `capabilities` in frontmatter
-    /// takes priority over this flag.
-    pub inherit: bool,
-    /// Capabilities stripped from inherited set when `inherit: true`.
-    pub deny_capabilities: Vec<Capability>,
 }
 
 /// Raw YAML frontmatter (deserialized from the --- block).
@@ -55,13 +49,6 @@ struct ProfileFrontmatter {
     max_iterations: Option<u32>,
     #[serde(default)]
     read_only: bool,
-    /// When true, the subagent inherits capabilities from the parent (minus `deny_capabilities`).
-    /// Explicit `capabilities` takes priority over `inherit`.
-    #[serde(default)]
-    inherit: bool,
-    /// Capabilities to remove when `inherit: true` is set.
-    #[serde(default)]
-    deny_capabilities: Option<Vec<Capability>>,
 }
 
 /// Parse a markdown file with YAML frontmatter into an AgentProfile.
@@ -110,11 +97,6 @@ pub fn parse_profile(content: &str, fallback_name: &str) -> Option<AgentProfile>
     // Merge capability-derived tools with any explicit tool list.
     // If both are absent, the result is None (all tools available).
     // If either is present, produce a merged, sorted, deduplicated list.
-    //
-    // `inherit: true` is a runtime hint — the actual parent capability list is
-    // only known at spawn time, not at parse time.  We store `inherit` and
-    // `deny_capabilities` on the profile and leave `tools` as None so that
-    // callers can apply `inherit_capabilities(parent, deny)` themselves.
     let resolved_tools = match (fm.tools, fm.capabilities) {
         (None, None) => None,
         (Some(explicit), None) => Some(explicit),
@@ -131,8 +113,6 @@ pub fn parse_profile(content: &str, fallback_name: &str) -> Option<AgentProfile>
         }
     };
 
-    let deny_capabilities = fm.deny_capabilities.unwrap_or_default();
-
     Some(AgentProfile {
         name,
         description,
@@ -141,8 +121,6 @@ pub fn parse_profile(content: &str, fallback_name: &str) -> Option<AgentProfile>
         model: fm.model,
         max_iterations: fm.max_iterations,
         read_only: fm.read_only,
-        inherit: fm.inherit,
-        deny_capabilities,
     })
 }
 
@@ -435,41 +413,6 @@ Do stuff."#;
         );
     }
 
-    // ----- inherit / deny_capabilities -----
-
-    #[test]
-    fn test_profile_inherit_flag_parsed() {
-        let yaml =
-            "---\ninherit: true\ndeny_capabilities: [write, execute]\n---\nDo restricted work.";
-        let profile = parse_profile(yaml, "restricted").unwrap();
-        assert!(profile.inherit, "inherit flag should be true");
-        assert!(profile.deny_capabilities.contains(&Capability::Write));
-        assert!(profile.deny_capabilities.contains(&Capability::Execute));
-        // tools should be None because no explicit capabilities/tools listed
-        assert!(profile.tools.is_none());
-    }
-
-    #[test]
-    fn test_profile_inherit_false_by_default() {
-        let yaml = "---\ndescription: normal agent\n---\nDo stuff.";
-        let profile = parse_profile(yaml, "normal").unwrap();
-        assert!(!profile.inherit);
-        assert!(profile.deny_capabilities.is_empty());
-    }
-
-    #[test]
-    fn test_profile_explicit_capabilities_override_inherit() {
-        // When `capabilities` are explicit, they define `tools` regardless of `inherit`.
-        let yaml =
-            "---\ncapabilities: [read]\ninherit: true\ndeny_capabilities: [http]\n---\nDo stuff.";
-        let profile = parse_profile(yaml, "mixed").unwrap();
-        let tools = profile.tools.expect("should have tools from capabilities");
-        assert!(tools.contains(&"read_file".to_string()));
-        // inherit flag is recorded but explicit capabilities win for tools
-        assert!(profile.inherit);
-        assert!(profile.deny_capabilities.contains(&Capability::Http));
-    }
-
     #[test]
     fn test_profiles_summary_empty() {
         let profiles = HashMap::new();
@@ -489,8 +432,6 @@ Do stuff."#;
                 model: Some("haiku".to_string()),
                 max_iterations: Some(10),
                 read_only: true,
-                inherit: false,
-                deny_capabilities: vec![],
             },
         );
         let summary = profiles_summary(&profiles);

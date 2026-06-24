@@ -15,30 +15,6 @@ pub fn pids_dir() -> PathBuf {
         .join("pids")
 }
 
-/// Write a PID file for a managed child process.
-pub fn write_pid(name: &str, port: u16, pid: u32) {
-    let dir = pids_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("{name}-{port}.pid"));
-    let _ = std::fs::write(&path, pid.to_string());
-    tracing::debug!(pid, path = %path.display(), "wrote PID file");
-}
-
-/// Read a PID from a PID file, returning `None` if missing or malformed.
-pub fn read_pid(name: &str, port: u16) -> Option<u32> {
-    let path = pids_dir().join(format!("{name}-{port}.pid"));
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-}
-
-/// Remove a PID file (ignores errors if file doesn't exist).
-pub fn remove_pid(name: &str, port: u16) {
-    let path = pids_dir().join(format!("{name}-{port}.pid"));
-    let _ = std::fs::remove_file(&path);
-    tracing::debug!(path = %path.display(), "removed PID file");
-}
-
 /// Send SIGTERM, wait up to 2s, then SIGKILL if still alive.
 fn graceful_kill(pid: u32) {
     if !platform::is_process_alive(pid) {
@@ -187,17 +163,14 @@ mod tests {
         // Use a unique port unlikely to collide with parallel tests.
         let name = "test-roundtrip";
         let port = 59997;
+        let dir = pids_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}-{port}.pid"));
 
-        // 1) roundtrip: write → read → remove → read
-        write_pid(name, port, 12345);
-        assert_eq!(read_pid(name, port), Some(12345));
-        remove_pid(name, port);
-        assert_eq!(read_pid(name, port), None);
-
-        // 2) stale cleanup: write a PID for a process that doesn't exist,
-        //    verify cleanup removes the file.
-        write_pid(name, port, 4_000_000);
+        // Write a PID for a process that doesn't exist, then verify cleanup
+        // removes the stale file through the real startup path.
+        std::fs::write(&path, "4000000").unwrap();
         cleanup_stale_pids();
-        assert_eq!(read_pid(name, port), None);
+        assert!(!path.exists());
     }
 }

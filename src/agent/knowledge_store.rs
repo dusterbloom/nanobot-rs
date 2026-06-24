@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-use crate::agent::embedder::{self, Embedding, EMBEDDING_DIM};
+#[cfg(feature = "semantic")]
+use crate::agent::embedder::{self, EMBEDDING_DIM};
 
 /// Persistent knowledge store backed by SQLite + FTS5.
 ///
@@ -898,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_vec_to_bytes_roundtrip() {
-        let original = vec![1.0f32, -2.5, 0.0, 3.14159];
+        let original = vec![1.0f32, -2.5, 0.0, 3.125];
         let bytes = vec_to_bytes(&original);
         assert_eq!(bytes.len(), original.len() * 4);
         // Roundtrip

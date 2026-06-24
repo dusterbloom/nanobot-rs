@@ -227,6 +227,15 @@ impl ContextBuilder {
 
     /// Convert this builder to lite mode (for local models).
     pub fn set_lite_mode(&mut self, max_context_tokens: usize) {
+        if max_context_tokens <= 4_096 {
+            self.bootstrap_budget = 160;
+            self.long_term_memory_budget = 80;
+            self.skills_budget = 100;
+            self.profiles_budget = 80;
+            self.system_prompt_cap = 800;
+            return;
+        }
+
         // Local models: scale down but with tighter clamps.
         self.bootstrap_budget = (max_context_tokens / 50).clamp(300, 2_000); // 2%
         self.long_term_memory_budget = (max_context_tokens / 100).clamp(100, 1_000); // 1%
@@ -2251,7 +2260,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_binary_detection() {
-        let mut data = "some text\0with null bytes".to_string();
+        let data = "some text\0with null bytes".to_string();
         let result = sanitize_tool_result(&data, 30000);
         assert!(result.starts_with("[Binary content,"));
     }
@@ -2305,6 +2314,19 @@ mod tests {
             prompt.contains("AAAA"),
             "without cap, large content should pass through"
         );
+    }
+
+    #[test]
+    fn test_set_lite_mode_4k_uses_ultra_tight_prompt_budget() {
+        let tmp = TempDir::new().unwrap();
+        let mut cb = ContextBuilder::new_lite(tmp.path());
+        cb.set_lite_mode(4_096);
+
+        assert_eq!(cb.system_prompt_cap, 800);
+        assert_eq!(cb.bootstrap_budget, 160);
+        assert_eq!(cb.long_term_memory_budget, 80);
+        assert_eq!(cb.skills_budget, 100);
+        assert_eq!(cb.profiles_budget, 80);
     }
 
     #[test]
@@ -2538,14 +2560,10 @@ task_profiles:
       - role: developer
         content: "You are the main agent."
 "#;
-        let profiles_path = tmp.path().join("instructions.yaml");
-        fs::write(&profiles_path, profiles_yaml).unwrap();
-
         let mut cb = ContextBuilder::new(tmp.path());
         cb.model_name = "qwen-2.5-coder-32b".to_string();
         cb.task_kind = "main".to_string();
-        cb.instruction_profiles =
-            Some(crate::agent::instructions::InstructionProfiles::load(&profiles_path).unwrap());
+        cb.instruction_profiles = Some(serde_yaml::from_str(profiles_yaml).unwrap());
 
         let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
 
@@ -2591,14 +2609,10 @@ model_profiles:
       - role: developer
         content: "Llama-specific."
 "#;
-        let profiles_path = tmp.path().join("instructions.yaml");
-        fs::write(&profiles_path, profiles_yaml).unwrap();
-
         let mut cb = ContextBuilder::new(tmp.path());
         cb.model_name = "deepseek-r1".to_string(); // doesn't match llama*
         cb.task_kind = "main".to_string();
-        cb.instruction_profiles =
-            Some(crate::agent::instructions::InstructionProfiles::load(&profiles_path).unwrap());
+        cb.instruction_profiles = Some(serde_yaml::from_str(profiles_yaml).unwrap());
 
         let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
 

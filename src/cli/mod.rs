@@ -12,12 +12,12 @@ mod voice;
 #[cfg(feature = "cluster")]
 pub(crate) use core_builder::setup_cluster_for_repl;
 pub(crate) use core_builder::{
-    build_core_handle, create_agent_loop, effective_max_iterations, rebuild_core, strip_gguf_suffix,
+    build_core_handle, create_agent_loop, rebuild_core, strip_gguf_suffix,
 };
 pub(crate) use provider::{check_api_key, create_provider};
 pub(crate) use skills::{cmd_skill_add, cmd_skill_remove};
 #[cfg(feature = "voice")]
-pub(crate) use voice::{cmd_voice_clone, cmd_voice_config, cmd_voice_list};
+pub(crate) use voice::{cmd_voice_config, cmd_voice_list};
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -37,12 +37,12 @@ use crate::cron::types::CronSchedule;
 use crate::heartbeat::service::{
     HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS,
 };
-use crate::providers::base::LLMProvider;
 use crate::utils::helpers::get_workspace_path;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::core_builder::effective_max_iterations;
     use tempfile::tempdir;
 
     #[test]
@@ -464,7 +464,7 @@ fn setup_voice_libs() {
     let src_onnx = lib_dir.join("libonnxruntime.dylib");
     let dst_onnx = dest_dir.join("libonnxruntime.dylib");
     if src_onnx.exists() && !dst_onnx.exists() {
-        if let Err(e) = std::os::unix::fs::symlink(&src_onnx, &dst_onnx) {
+        if let Err(_e) = std::os::unix::fs::symlink(&src_onnx, &dst_onnx) {
             // If symlink fails, try copying
             if std::fs::copy(&src_onnx, &dst_onnx).is_ok() {
                 println!("  Installed voice library: libonnxruntime.dylib");
@@ -631,7 +631,6 @@ pub(crate) async fn run_gateway_async(
         lcm_config.enabled = Some(true);
     }
 
-    let shutdown_counters = core_handle.counters.clone();
     let mut agent_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
@@ -673,7 +672,6 @@ pub(crate) async fn run_gateway_async(
     // Initialize voice pipeline for channels (when voice feature is enabled).
     #[cfg(feature = "voice")]
     let voice_pipeline: Option<Arc<crate::voice_pipeline::VoicePipeline>> = {
-        use crate::config::schema::TtsEngineConfig;
         use tracing::warn;
 
         // Use configured TTS engine + voice + language from config.
@@ -692,24 +690,7 @@ pub(crate) async fn run_gateway_async(
                     "Voice pipeline init failed with {:?} (voice messages will not be transcribed): {}",
                     tts_engine, e
                 );
-                // Try fallback to Pocket if Qwen/Kokoro failed
-                if tts_engine != TtsEngineConfig::Pocket {
-                    warn!("Falling back to Pocket TTS...");
-                    match crate::voice_pipeline::VoicePipeline::with_engine(TtsEngineConfig::Pocket)
-                        .await
-                    {
-                        Ok(vp) => {
-                            info!("Voice pipeline initialized with Pocket TTS (fallback)");
-                            Some(Arc::new(vp))
-                        }
-                        Err(e2) => {
-                            warn!("Pocket fallback also failed: {}", e2);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
+                None
             }
         }
     };

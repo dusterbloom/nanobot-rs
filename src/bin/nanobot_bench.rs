@@ -31,42 +31,34 @@ use clap::Parser;
 const TASKS: &[BenchTask] = &[
     BenchTask {
         id: "t01_noop",
-        description: "What is 2+2?",
         kind: TaskKind::NoTools,
     },
     BenchTask {
         id: "t02_read",
-        description: "Read README.md and return its first H1 heading.",
         kind: TaskKind::SingleTool,
     },
     BenchTask {
         id: "t03_search",
-        description: "Find the definition of `AgentLoop` in src/agent/.",
         kind: TaskKind::MultiTool,
     },
     BenchTask {
         id: "t04_long_in",
-        description: "Summarize the attached 5,000-char text in one sentence.",
         kind: TaskKind::LongInput,
     },
     BenchTask {
         id: "t05_chain",
-        description: "Save 'hello' to /tmp/nanobot_bench.txt, then read it back, return content.",
         kind: TaskKind::ChainedTools,
     },
     BenchTask {
         id: "t06_resume",
-        description: "Continue from the saved session at fixtures/bench_session.jsonl.",
         kind: TaskKind::SessionResume,
     },
     BenchTask {
         id: "t07_skill",
-        description: "Use the foo skill from the workspace to do X.",
         kind: TaskKind::Skill,
     },
     BenchTask {
         id: "t08_router",
-        description: "Trigger a specialist route via a fixed prompt pattern.",
         kind: TaskKind::Router,
     },
 ];
@@ -74,7 +66,6 @@ const TASKS: &[BenchTask] = &[
 #[derive(Debug)]
 struct BenchTask {
     id: &'static str,
-    description: &'static str,
     kind: TaskKind,
 }
 

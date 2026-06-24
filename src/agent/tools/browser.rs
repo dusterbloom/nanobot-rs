@@ -16,9 +16,6 @@ use super::base::{PermissionLevel, Tool};
 /// Default command timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-/// Maximum output length returned to the LLM.
-const MAX_OUTPUT_CHARS: usize = 16_000;
-
 /// Cached result of checking whether `agent-browser` is on PATH.
 static BINARY_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
@@ -319,15 +316,17 @@ fn truncate_output(output: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    const TEST_MAX_OUTPUT_CHARS: usize = 16_000;
+
     #[test]
     fn test_browser_tool_name() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         assert_eq!(tool.name(), "browser");
     }
 
     #[test]
     fn test_browser_tool_parameters_schema() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         let action = &params["properties"]["action"];
@@ -345,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_browser_tool_schema() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let schema = tool.to_schema();
         assert_eq!(schema["type"], "function");
         assert_eq!(schema["function"]["name"], "browser");
@@ -353,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_action() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let result = tool.execute(HashMap::new()).await;
         assert!(result.starts_with("Error:"));
         // If binary available, error mentions "action"; otherwise install hint.
@@ -364,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_action() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("fly".to_string()));
         let result = tool.execute(params).await;
@@ -376,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_requires_url() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("open".to_string()));
         let result = tool.execute(params).await;
@@ -388,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_click_requires_ref() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("click".to_string()));
         let result = tool.execute(params).await;
@@ -400,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_type_requires_ref_and_text() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("type".to_string()));
         params.insert("ref".to_string(), Value::String("@e1".to_string()));
@@ -414,7 +413,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_requires_query() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("search".to_string()));
         let result = tool.execute(params).await;
@@ -426,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scroll_invalid_direction() {
-        let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("scroll".to_string()));
         params.insert(

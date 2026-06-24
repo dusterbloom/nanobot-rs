@@ -140,7 +140,7 @@ Constraint: rate limits only. Queue + backoff handles this.
 | Subagents | Sonnet or Gemini Flash free | ~$2/month or $0 |
 | RLM / Tool delegation | Nanbeige4.1-3B Q8 (~3.5GB) | electricity |
 | Memory | Qwen3-0.6B Q4 (~0.4GB) | electricity |
-| Voice | Local Whisper + Kokoro | electricity |
+| Voice | Local Whisper + Supertonic | electricity |
 | **Total** | | **~$5-12/month** |
 
 80% of tasks stay local. Cloud only for genuine reasoning.

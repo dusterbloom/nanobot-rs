@@ -82,26 +82,11 @@ It's currently about two in the morning in Tokyo.
 
 Voice mode uses on-device models -- no cloud STT/TTS:
 - **Speech-to-text**: Whisper (via jack-voice)
-- **Text-to-speech**: Pocket TTS (Candle, 24kHz, CPU real-time)
+- **Text-to-speech**: SuperTonic 3, or macOS `say`
 
 Audio is streamed sentence-by-sentence through PulseAudio. First audio plays in ~300-500ms while remaining sentences synthesize in the background.
 
 **Interrupt anytime**: press Enter during playback to cut the response short and start speaking. The assistant stops talking and listens.
-
-### Realtime voice (continuous)
-
-```bash
-nanobot realtime --engine pocket --voice alba
-```
-
-Hands-free conversation with VAD-based turn detection. No keys needed -- just speak. The pipeline:
-
-1. **Listen** -- Silero VAD detects speech, SmartTurn v3 determines when you're done
-2. **Process** -- Whisper transcribes, LLM streams response
-3. **Speak** -- Sentences stream to TTS as they arrive (~300ms to first audio)
-4. **Barge-in** -- Start speaking during a response to interrupt immediately
-
-Switch to push-to-talk with `--mode ptt` (hold Space to record).
 
 ### MLX inference (Apple Silicon)
 
@@ -220,8 +205,8 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 | `nanobot channels status` | Channel status |
 | `nanobot cron list` | List scheduled jobs |
 | `nanobot cron add` | Add a scheduled job |
-| `nanobot realtime` | Realtime voice session (continuous mode) |
-| `nanobot realtime --mode ptt` | Realtime voice with push-to-talk |
+| `nanobot voice list --engine supertonic` | List Supertonic voices |
+| `nanobot voice config` | Show voice configuration help |
 
 ## Building
 
@@ -229,7 +214,7 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 # Standard build
 cargo build --release
 
-# With voice mode (requires jack-voice + pocket-tts)
+# With voice mode (requires jack-voice)
 cargo build --release --features voice
 
 # Debug with logging
@@ -265,9 +250,9 @@ For local mode, install [LM Studio](https://lmstudio.ai/) and its CLI (`lms`). M
 
 | Key | Values | Effect |
 |-----|--------|--------|
-| `ttsEngine` | `pocket` (default), `supertonic`, `kokoro` | Which TTS backend to load. SuperTonic 3 supports 31 languages at 44.1 kHz, ~4× realtime on M-series. |
+| `ttsEngine` | `supertonic` (default), `say` | Which TTS backend to load. SuperTonic 3 supports 31 languages at 44.1 kHz; `say` uses the native macOS voice. |
 | `ttsVoice` | engine-specific ID, or `null` | If `null` and engine is `supertonic`, the curated per-language voice is auto-selected (see below). |
-| `language` | ISO-639-1 code (`"it"`, `"en"`, `"es"`, `"de"`, …) or `null` | Used to pick the curated voice when `ttsVoice` is `null`, and to bias multilingual fallback. |
+| `language` | ISO-639-1 code (`"it"`, `"en"`, `"es"`, `"de"`, …) or `null` | Used to pick the curated Supertonic voice when `ttsVoice` is `null`. |
 
 **SuperTonic 3 voice IDs (ear-checked May 2026):**
 

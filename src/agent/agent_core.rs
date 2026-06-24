@@ -64,11 +64,7 @@ pub struct SwappableCore {
     pub mode: RuntimeMode,
     pub local_tool_mode: crate::config::schema::LocalToolMode,
     pub lane: Lane,
-    /// Whether the current main provider is a cluster peer (feature-gated).
-    #[cfg(feature = "cluster")]
-    pub is_cluster_peer: bool,
     pub anti_drift: AntiDriftConfig,
-    pub main_no_think: bool,
     pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
     pub tool_runner_model: Option<String>,
     pub router_provider: Option<Arc<dyn LLMProvider>>,
@@ -138,16 +134,6 @@ impl Default for TrioMetrics {
             specialist_dispatched: AtomicBool::new(false),
             tool_dispatched: parking_lot::Mutex::new(None),
         }
-    }
-}
-
-impl TrioMetrics {
-    /// Reset all metrics for a new turn/test.
-    pub fn reset(&self) {
-        self.router_preflight_fired.store(false, Ordering::Relaxed);
-        *self.router_action.lock() = None;
-        self.specialist_dispatched.store(false, Ordering::Relaxed);
-        *self.tool_dispatched.lock() = None;
     }
 }
 
@@ -227,10 +213,6 @@ pub struct RuntimeCounters {
 }
 
 impl RuntimeCounters {
-    pub fn new(max_context_tokens: usize) -> Self {
-        Self::new_with_config(max_context_tokens, &CircuitBreakerConfig::default())
-    }
-
     pub fn new_with_config(max_context_tokens: usize, cb_config: &CircuitBreakerConfig) -> Self {
         Self {
             learning_turn_counter: AtomicU64::new(0),
@@ -636,10 +618,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         mode,
         local_tool_mode,
         lane,
-        #[cfg(feature = "cluster")]
-        is_cluster_peer: false,
         anti_drift: trio_config.anti_drift.clone(),
-        main_no_think: trio_config.main_no_think,
         tool_runner_provider,
         tool_runner_model,
         router_provider,

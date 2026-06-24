@@ -136,41 +136,6 @@ fn main() {
                     }
                 }
             }
-
-            // Copy espeak-ng-data to ~/.local/share/espeak-ng-data/ so Kokoro TTS
-            // works when the binary is installed outside the build tree.
-            // espeak-rs-sys bakes the build-time path which breaks after `cp`.
-            let build_dir = target_dir.join("build");
-            if build_dir.exists() {
-                for entry in walkdir(&build_dir) {
-                    if entry.ends_with("share/espeak-ng-data/phontab") {
-                        if let Some(espeak_data_dir) = entry.parent() {
-                            let local_share =
-                                std::path::PathBuf::from(&home).join(".local/share/espeak-ng-data");
-                            copy_dir_recursive(espeak_data_dir, &local_share);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Recursively copy a directory tree.
-#[allow(dead_code)]
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
-    #[cfg(feature = "voice")]
-    let _ = std::fs::create_dir_all(dst);
-    if let Ok(entries) = std::fs::read_dir(src) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let dest = dst.join(entry.file_name());
-            if path.is_dir() {
-                copy_dir_recursive(&path, &dest);
-            } else {
-                let _ = std::fs::copy(&path, &dest);
-            }
         }
     }
 }

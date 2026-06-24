@@ -605,10 +605,6 @@ impl App {
         self.cursor_on = !self.cursor_on;
     }
 
-    pub(crate) fn mode_label(&self) -> &'static str {
-        self.mode.label()
-    }
-
     fn toggle_thinking_display(&mut self) {
         self.show_thinking = !self.show_thinking;
     }
@@ -778,11 +774,13 @@ impl App {
     }
 
     /// Toggle the "recording" indicator (shown in the footer during a voice turn).
+    #[cfg(feature = "voice")]
     pub(crate) fn set_recording(&mut self, on: bool) {
         self.recording = on;
     }
 
     /// Toggle the "speaking" indicator (TTS playing; Enter barges in).
+    #[cfg(feature = "voice")]
     pub(crate) fn set_speaking(&mut self, on: bool) {
         self.speaking = on;
     }
@@ -793,6 +791,7 @@ impl App {
     }
 
     /// Reflect whether voice mode is active (set after a `/voice` toggle).
+    #[cfg(feature = "voice")]
     pub(crate) fn set_voice(&mut self, on: bool) {
         self.voice = on;
     }
@@ -5285,7 +5284,7 @@ mod tests {
         let mut restored = App::new();
         restored.apply_snapshot(&snapshot);
 
-        assert_eq!(restored.mode_label(), "inspect");
+        assert_eq!(restored.mode.label(), "inspect");
         assert!(!restored.show_thinking);
         assert_eq!(input_text(&restored), "draft prompt");
         assert_eq!(restored.recent_commands, vec!["/sessions native"]);
@@ -5528,17 +5527,17 @@ mod tests {
     #[test]
     fn mode_cycles_and_sets_by_name() {
         let mut app = App::new();
-        assert_eq!(app.mode_label(), "calm");
+        assert_eq!(app.mode.label(), "calm");
         app.cycle_mode();
-        assert_eq!(app.mode_label(), "inspect");
+        assert_eq!(app.mode.label(), "inspect");
         app.cycle_mode();
-        assert_eq!(app.mode_label(), "deep");
+        assert_eq!(app.mode.label(), "deep");
         app.cycle_mode();
-        assert_eq!(app.mode_label(), "calm");
+        assert_eq!(app.mode.label(), "calm");
         assert!(app.set_mode("Deep"));
-        assert_eq!(app.mode_label(), "deep");
+        assert_eq!(app.mode.label(), "deep");
         assert!(!app.set_mode("bogus"));
-        assert_eq!(app.mode_label(), "deep");
+        assert_eq!(app.mode.label(), "deep");
     }
 
     #[test]

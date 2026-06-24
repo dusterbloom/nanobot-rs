@@ -957,14 +957,18 @@ mod tests {
         // Build a registry with threshold=1 so a single failed probe marks
         // "searxng" as Degraded. Register a stub probe that always reports
         // unhealthy, then run_due_probes to populate state.
-        use crate::heartbeat::health::{HealthRegistry, HealthProbe, ProbeResult};
+        use crate::heartbeat::health::{HealthProbe, HealthRegistry, ProbeResult};
         use async_trait::async_trait;
 
         struct UnhealthyProbe;
         #[async_trait]
         impl HealthProbe for UnhealthyProbe {
-            fn name(&self) -> &str { "searxng" }
-            fn interval_secs(&self) -> u64 { 60 }
+            fn name(&self) -> &str {
+                "searxng"
+            }
+            fn interval_secs(&self) -> u64 {
+                60
+            }
             async fn check(&self) -> ProbeResult {
                 ProbeResult {
                     healthy: false,
@@ -1246,8 +1250,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     fn test_web_fetch_passthrough_vs_summarized() {
         use crate::agent::context_gate::ContentGate;
         use crate::agent::context_store::ContextStore;
-        use std::path::PathBuf;
-
         let raw = bbc_web_fetch_fixture();
         let passthrough = raw.clone();
 

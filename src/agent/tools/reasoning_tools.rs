@@ -271,7 +271,6 @@ impl Tool for PlanTool {
                 goal,
                 status: StepStatus::Pending,
                 result: None,
-                max_iterations: step_budget,
                 iterations_used: 0,
             });
             node_indices.push(idx);
@@ -531,8 +530,10 @@ mod tests {
 
         // Engine should now be in plan-guided mode.
         let engine_guard = engine.lock();
-        let step = engine_guard.current_step().unwrap();
-        assert_eq!(step.goal, "Research the topic");
+        assert!(engine_guard
+            .step_instruction()
+            .unwrap()
+            .contains("Research the topic"));
     }
 
     #[tokio::test]
@@ -559,7 +560,10 @@ mod tests {
 
         // Verify the plan advances in order.
         let mut engine_guard = engine.lock();
-        assert_eq!(engine_guard.current_step().unwrap().goal, "Fetch data");
+        assert!(engine_guard
+            .step_instruction()
+            .unwrap()
+            .contains("Fetch data"));
         engine_guard.mark_current_completed(None);
         let next = engine_guard.advance().unwrap();
         assert_eq!(next.goal, "Process data");

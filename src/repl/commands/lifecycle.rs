@@ -492,11 +492,7 @@ impl ReplContext {
                 self.config.agents.defaults.local_api_base = endpoint;
                 self.config.agents.defaults.lms_main_model = selected_id.clone();
                 self.config.agents.defaults.local_model = selected_id.clone();
-                if !crate::config::schema::is_higgs_backend(
-                    &self.config.agents.defaults.local_backend,
-                ) {
-                    self.config.agents.defaults.local_backend = "lmstudio".to_string();
-                }
+                self.config.agents.defaults.local_backend = "lmstudio".to_string();
                 if !is_lms {
                     self.config.agents.defaults.skip_jit_gate = true;
                 }

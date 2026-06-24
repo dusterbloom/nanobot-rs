@@ -1,7 +1,7 @@
 //! Lane-based policy: Answer vs Action execution lanes.
 //!
-//! Each [`Lane`] maps to a [`LanePolicy`] containing 5 profile types that
-//! control prompt assembly, tool gating, memory budgets, learning, and parsing.
+//! Each [`Lane`] maps to a [`LanePolicy`] controlling prompt assembly, tool
+//! gating, and memory budgets.
 
 use crate::agent::model_capabilities::ModelSizeClass;
 use crate::agent::prompt_contract::PromptSection;
@@ -54,8 +54,6 @@ impl Lane {
                 memory: MemoryProfile {
                     budget_multiplier: 1.5,
                 },
-                learn: LearnProfile::Full,
-                parser: ParserProfile::Default,
             },
             Lane::Action => LanePolicy {
                 prompt: PromptProfile::Action,
@@ -63,8 +61,6 @@ impl Lane {
                 memory: MemoryProfile {
                     budget_multiplier: 1.0,
                 },
-                learn: LearnProfile::Full,
-                parser: ParserProfile::Default,
             },
         }
     }
@@ -76,8 +72,6 @@ pub struct LanePolicy {
     pub prompt: PromptProfile,
     pub tools: ToolGateProfile,
     pub memory: MemoryProfile,
-    pub learn: LearnProfile,
-    pub parser: ParserProfile,
 }
 
 /// Controls which prompt sections are included.
@@ -152,20 +146,6 @@ pub struct MemoryProfile {
     pub budget_multiplier: f64,
 }
 
-/// Controls learning behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LearnProfile {
-    /// Full learning enabled.
-    Full,
-}
-
-/// Controls response parsing behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParserProfile {
-    /// Default parsing.
-    Default,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,8 +161,6 @@ mod tests {
         assert_eq!(policy.prompt, PromptProfile::Answer);
         assert_eq!(policy.tools, ToolGateProfile::ReadOnly);
         assert!((policy.memory.budget_multiplier - 1.5).abs() < f64::EPSILON);
-        assert_eq!(policy.learn, LearnProfile::Full);
-        assert_eq!(policy.parser, ParserProfile::Default);
     }
 
     #[test]
@@ -191,8 +169,6 @@ mod tests {
         assert_eq!(policy.prompt, PromptProfile::Action);
         assert_eq!(policy.tools, ToolGateProfile::SizeClassBased);
         assert!((policy.memory.budget_multiplier - 1.0).abs() < f64::EPSILON);
-        assert_eq!(policy.learn, LearnProfile::Full);
-        assert_eq!(policy.parser, ParserProfile::Default);
     }
 
     #[test]
@@ -304,7 +280,10 @@ mod tests {
         assert_contains(&tools, "read_skill");
         // Not in tiny tier
         let list = tools.unwrap();
-        assert!(!list.contains(&"write_file".to_string()), "no Write for Small");
+        assert!(
+            !list.contains(&"write_file".to_string()),
+            "no Write for Small"
+        );
         assert!(!list.contains(&"exec".to_string()), "no Execute for Small");
         assert!(!list.contains(&"spawn".to_string()), "no Spawn for Small");
     }

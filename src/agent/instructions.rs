@@ -7,7 +7,6 @@
 //! `task_profiles`. All matching sections are concatenated in that order.
 
 use serde::Deserialize;
-use std::path::Path;
 
 /// A single instruction message to inject into the prompt.
 #[derive(Debug, Clone, Deserialize)]
@@ -51,13 +50,6 @@ pub struct InstructionProfiles {
 }
 
 impl InstructionProfiles {
-    /// Load profiles from a YAML file path.
-    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path)?;
-        let profiles: InstructionProfiles = serde_yaml::from_str(&content)?;
-        Ok(profiles)
-    }
-
     /// Resolve messages for a given model name and task kind.
     ///
     /// Returns base + matching model profiles + matching task profiles, in that
@@ -359,28 +351,5 @@ task_profiles:
         assert_eq!(msgs[0].content, "first");
         assert_eq!(msgs[1].content, "second");
         assert_eq!(msgs[2].content, "third");
-    }
-
-    // ----- load from file -----
-
-    #[test]
-    fn test_load_from_nonexistent_file_returns_error() {
-        let result = InstructionProfiles::load(std::path::Path::new("/nonexistent/path.yaml"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_load_from_temp_file() {
-        use std::io::Write;
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        let yaml = r#"
-base:
-  - role: developer
-    content: "From file."
-"#;
-        file.write_all(yaml.as_bytes()).unwrap();
-        let profiles = InstructionProfiles::load(file.path()).unwrap();
-        assert_eq!(profiles.base.len(), 1);
-        assert_eq!(profiles.base[0].content, "From file.");
     }
 }

@@ -37,10 +37,6 @@ struct Fixture {
 #[derive(Clone)]
 struct BenchProfile {
     name: &'static str,
-    temperature: f64,
-    top_p: Option<f64>,
-    thinking_budget: Option<u32>,
-    strict_no_reasoning: bool,
 }
 
 #[derive(Clone)]
@@ -283,36 +279,12 @@ fn profiles_for(model: &str) -> Vec<BenchProfile> {
     let lower = model.to_ascii_lowercase();
     if lower.contains("nanbeige") {
         vec![
-            BenchProfile {
-                name: "quality",
-                temperature: 0.6,
-                top_p: Some(0.95),
-                thinking_budget: None,
-                strict_no_reasoning: false,
-            },
-            BenchProfile {
-                name: "concise",
-                temperature: 0.2,
-                top_p: Some(0.9),
-                thinking_budget: None,
-                strict_no_reasoning: true,
-            },
-            BenchProfile {
-                name: "balanced",
-                temperature: 0.35,
-                top_p: Some(0.92),
-                thinking_budget: None,
-                strict_no_reasoning: true,
-            },
+            BenchProfile { name: "quality" },
+            BenchProfile { name: "concise" },
+            BenchProfile { name: "balanced" },
         ]
     } else {
-        vec![BenchProfile {
-            name: "default",
-            temperature: 0.2,
-            top_p: Some(0.95),
-            thinking_budget: None,
-            strict_no_reasoning: true,
-        }]
+        vec![BenchProfile { name: "default" }]
     }
 }
 
@@ -594,7 +566,6 @@ async fn summarize_once(
     model: &str,
     source_content: &str,
     target_tokens: usize,
-    _profile: &BenchProfile,
     mode: BenchMode,
 ) -> anyhow::Result<(String, usize, usize)> {
     let input_tokens = TokenBudget::estimate_str_tokens(source_content);
@@ -741,7 +712,6 @@ async fn bench_specialist_summaries_small_to_3b() {
                         model,
                         &trimmed_fixture,
                         target_tokens,
-                        profile,
                         mode,
                     )
                     .await

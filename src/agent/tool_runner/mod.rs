@@ -645,8 +645,8 @@ pub async fn run_tool_loop(
         seen_calls.insert(call_key);
     }
 
-    for iteration in 0..config.max_iterations {
-        iterations_used = iteration + 1;
+    if config.max_iterations > 0 {
+        iterations_used = 1;
 
         // Check cancellation before each iteration.
         if config
@@ -663,7 +663,12 @@ pub async fn run_tool_loop(
         }
 
         if pending_calls.is_empty() {
-            break;
+            return ToolRunResult {
+                tool_results: all_results,
+                summary: None,
+                iterations_used,
+                error: None,
+            };
         }
 
         // Mistral/Ministral models require tool call IDs to be exactly
@@ -1011,7 +1016,7 @@ pub async fn run_tool_loop(
         // loop problem where small models don't know what to do with
         // one-line results. Set short_circuit_chars to 0 to disable.
         // Verbatim mode: skip delegation entirely, return raw results.
-        if config.verbatim && iteration == 0 {
+        if config.verbatim {
             debug!("Verbatim mode — skipping delegation LLM, returning raw results");
             return ToolRunResult {
                 tool_results: all_results,
@@ -1021,7 +1026,7 @@ pub async fn run_tool_loop(
             };
         }
 
-        if config.short_circuit_chars > 0 && iteration == 0 {
+        if config.short_circuit_chars > 0 {
             let threshold = config.short_circuit_chars;
             let all_short = all_results
                 .iter()
@@ -1049,34 +1054,28 @@ pub async fn run_tool_loop(
         // scratch pad analysis. Each analysis round is a fresh single-turn
         // LLM call with the ContextStore's memory acting as persistent state.
         // This replaces the growing-message loop that caused context saturation.
-        if iteration == 0 {
-            let scratch_rounds = scratch_pad_round_budget(config);
-            debug!(
-                "Handing off to scratch pad analysis (up to {} rounds, model={})",
-                scratch_rounds, config.model
-            );
-            let summary = analyze_via_scratch_pad(
-                config,
-                &mut context_store,
-                &tool_defs,
-                &allowed_tools,
-                tools,
-                &task_context,
-                &mut all_results,
-                scratch_rounds,
-            )
-            .await;
-            return ToolRunResult {
-                tool_results: all_results,
-                summary,
-                iterations_used: 1,
-                error: None,
-            };
-        }
-
-        // Fallback: iterations > 0 should not be reached (scratch pad
-        // takes over after iteration 0), but kept for safety.
-        break;
+        let scratch_rounds = scratch_pad_round_budget(config);
+        debug!(
+            "Handing off to scratch pad analysis (up to {} rounds, model={})",
+            scratch_rounds, config.model
+        );
+        let summary = analyze_via_scratch_pad(
+            config,
+            &mut context_store,
+            &tool_defs,
+            &allowed_tools,
+            tools,
+            &task_context,
+            &mut all_results,
+            scratch_rounds,
+        )
+        .await;
+        return ToolRunResult {
+            tool_results: all_results,
+            summary,
+            iterations_used,
+            error: None,
+        };
     }
 
     // Ran out of iterations or broke out of loop.
