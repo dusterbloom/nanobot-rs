@@ -2049,7 +2049,7 @@ impl App {
             return vec![
                 Line::default(),
                 Line::from(Span::styled(
-                    "  Ask Trentadue anything.  Enter to send · Alt+Enter newline · Ctrl+C quit",
+                    "  Ask Trentadue anything.  Enter to send · Alt+Enter newline · Ctrl+D quit",
                     dim(),
                 )),
             ];
@@ -5106,6 +5106,16 @@ mod tests {
         let text = buffer_text(term.backend().buffer());
         assert!(text.contains("TRENTADUE"), "intro brand missing");
         assert!(text.contains("/help"), "intro hints missing");
+
+        let transcript_text = flatten_text(Text::from(app.transcript_rows(100)));
+        assert!(
+            transcript_text.contains("Ctrl+D quit"),
+            "empty transcript hint should show the real quit key: {transcript_text}"
+        );
+        assert!(
+            !transcript_text.contains("Ctrl+C quit"),
+            "empty transcript hint must not advertise cancel as quit: {transcript_text}"
+        );
     }
 
     #[test]
