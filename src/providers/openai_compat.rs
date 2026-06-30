@@ -378,6 +378,26 @@ fn apply_local_tool_call_controls(
     }
 }
 
+/// Suppress degenerate repetition loops on local servers.
+///
+/// Local models (especially smaller GGUF/Q4 ones) can enter a sampling
+/// failure mode where a token sequence — e.g. an exec command containing a
+/// near-duplicate path pair — echoes until `max_tokens` is exhausted. The
+/// OpenAI-compatible request body carries no repetition-control parameter,
+/// so once the pattern is seeded nothing breaks it. llama.cpp / higgs / LM
+/// Studio OpenAI-compat layers all accept `repeat_penalty` (>1.0 suppresses
+/// repeats; 1.1 is the widely used default, same as Ollama). Applied to
+/// local servers only — cloud APIs manage their own anti-repetition and
+/// would reject llama.cpp-native fields.
+fn apply_repetition_controls(body: &mut serde_json::Value, api_base: &str) {
+    if !is_local_api_base(api_base) {
+        return;
+    }
+    // 1.1 is the llama.cpp default and matches Ollama's hardcoded value; it
+    // suppresses repeats without distorting coherent output.
+    body["repeat_penalty"] = serde_json::json!(1.1);
+}
+
 /// Ensure every object schema carries a `required` key (recursively).
 ///
 /// Apple FM's guided generation returns HTTP 400 ("Invalid tool definition")
@@ -759,6 +779,9 @@ impl OpenAICompatProvider {
             }
         }
         apply_local_tool_call_controls(&mut body, &self.api_base, request_has_tools);
+        // Local models can enter a sampling loop where a token sequence echoes
+        // until max_tokens; repeat_penalty breaks it. No-op for cloud APIs.
+        apply_repetition_controls(&mut body, &self.api_base);
         // Strict-validation servers (Apple FM) reject object schemas that omit a
         // `required` key; normalize every outgoing tool schema (no-op elsewhere).
         normalize_tool_schemas(&mut body);
@@ -1058,6 +1081,9 @@ impl LLMProvider for OpenAICompatProvider {
             }
         }
         apply_local_tool_call_controls(&mut body, &self.api_base, request_has_tools);
+        // Local models can enter a sampling loop where a token sequence echoes
+        // until max_tokens; repeat_penalty breaks it. No-op for cloud APIs.
+        apply_repetition_controls(&mut body, &self.api_base);
         // Strict-validation servers (Apple FM) reject object schemas that omit a
         // `required` key; normalize every outgoing tool schema (no-op elsewhere).
         normalize_tool_schemas(&mut body);
@@ -2727,6 +2753,24 @@ mod tests {
         let mut no_tools_body = serde_json::json!({"model": "qwen36-35b", "messages": []});
         apply_local_tool_call_controls(&mut no_tools_body, "http://localhost:1234", false);
         assert!(no_tools_body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_repetition_controls_added_for_local_server() {
+        // Local llama.cpp/higgs/LM Studio server must receive repeat_penalty
+        // to break degenerate sampling loops.
+        let mut body = serde_json::json!({"model": "qwen36-35b", "messages": []});
+        apply_repetition_controls(&mut body, "http://localhost:1234");
+        assert_eq!(body["repeat_penalty"], 1.1);
+    }
+
+    #[test]
+    fn test_repetition_controls_absent_for_cloud_api() {
+        // Cloud APIs manage their own anti-repetition and would reject
+        // llama.cpp-native fields, so they must not be sent.
+        let mut body = serde_json::json!({"model": "gpt-4o", "messages": []});
+        apply_repetition_controls(&mut body, "https://api.openai.com/v1");
+        assert!(body.get("repeat_penalty").is_none());
     }
 
     #[test]
