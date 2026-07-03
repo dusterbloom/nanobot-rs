@@ -325,7 +325,7 @@ impl ConversationProtocol for LocalProtocol {
         }
 
         // Merge consecutive same-role messages (avoids "consecutive user" violations).
-        out = merge_consecutive_role(out);
+        out = repair_role_alternation(out);
 
         // Must always end with user.
         if out.last().map(|m| m["role"] != "user").unwrap_or(true) {
@@ -629,68 +629,34 @@ fn tool_call_to_openai_json(tc: &ToolCall) -> Value {
 ///
 /// This operates on an already-built wire-format `Vec<Value>`.
 /// The leading system message (index 0) is preserved as-is.
-fn merge_consecutive_role(messages: Vec<Value>) -> Vec<Value> {
-    if messages.is_empty() {
-        return messages;
-    }
-    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+/// Repair user/assistant alternation by inserting an empty opposite-role
+/// separator between consecutive same-role messages.
+///
+/// This deliberately replaces the old `merge_consecutive_role` concatenation.
+/// Merging is not append-stable: when a same-role turn lands later (async tool
+/// completion, parallel tool results, a dropped empty assistant reply), it
+/// folds into an EARLIER message and changes its bytes across renders. That
+/// mutation busts server-side prefix caches — the agent loop's
+/// `prompt_prefix_diverged` warning, measured as ~60s full re-prefills per
+/// affected turn on local models — and under higgs's message-boundary splice
+/// it silently hides the folded content from the model instead. Separators are
+/// position-stable by construction: whether a separator exists between log
+/// entries i and i+1 depends only on those two entries, so a rendered prefix
+/// never changes once written.
+fn repair_role_alternation(messages: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len() * 2);
     for msg in messages {
-        let role = msg["role"].as_str().unwrap_or("").to_string();
-        let content = msg["content"].as_str().unwrap_or("").to_string();
-
-        // The system message at index 0 is never merged.
-        if let Some(last) = out.last_mut() {
+        if let Some(last) = out.last() {
             let last_role = last["role"].as_str().unwrap_or("");
-            // Don't merge system messages.
+            let role = msg["role"].as_str().unwrap_or("");
             if last_role == role && role != "system" {
-                if !is_merge_safe(last, &msg, &role) {
-                    out.push(msg);
-                    continue;
-                }
-                let last_content = last["content"].as_str().unwrap_or("").to_string();
-                let merged = if last_content.is_empty() {
-                    content
-                } else if content.is_empty() {
-                    last_content
-                } else {
-                    format!("{}\n\n{}", last_content, content)
-                };
-                last["content"] = Value::String(merged);
-                continue;
+                let sep = if role == "user" { "assistant" } else { "user" };
+                out.push(json!({"role": sep, "content": ""}));
             }
         }
         out.push(msg);
     }
     out
-}
-
-fn is_merge_safe(last: &Value, current: &Value, role: &str) -> bool {
-    if role == "assistant" {
-        // Assistant metadata like tool_calls must never be dropped by merge.
-        let last_has_tool_calls = last
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .map(|arr| !arr.is_empty())
-            .unwrap_or(false);
-        let current_has_tool_calls = current
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .map(|arr| !arr.is_empty())
-            .unwrap_or(false);
-        if last_has_tool_calls || current_has_tool_calls {
-            return false;
-        }
-    }
-
-    let last_has_extra_fields = has_non_content_fields(last);
-    let current_has_extra_fields = has_non_content_fields(current);
-    !(last_has_extra_fields || current_has_extra_fields)
-}
-
-fn has_non_content_fields(msg: &Value) -> bool {
-    msg.as_object()
-        .map(|obj| obj.keys().any(|k| k != "role" && k != "content"))
-        .unwrap_or(false)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -823,21 +789,44 @@ mod tests {
     }
 
     #[test]
-    fn merge_consecutive_role_helper() {
+    fn alternation_repair_separates_consecutive_users_without_mutation() {
         let msgs = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "hello"}),
             json!({"role": "user", "content": "world"}),
             json!({"role": "assistant", "content": "hi"}),
         ];
-        let merged = merge_consecutive_role(msgs);
-        assert_eq!(merged.len(), 3); // system + merged_user + assistant
-        assert!(merged[1]["content"].as_str().unwrap().contains("hello"));
-        assert!(merged[1]["content"].as_str().unwrap().contains("world"));
+        let repaired = repair_role_alternation(msgs);
+        // system, user(hello), empty assistant separator, user(world), assistant(hi)
+        assert_eq!(repaired.len(), 5);
+        assert_eq!(repaired[1]["content"], "hello");
+        assert_eq!(repaired[2]["role"], "assistant");
+        assert_eq!(repaired[2]["content"], "");
+        assert_eq!(repaired[3]["content"], "world");
     }
 
     #[test]
-    fn merge_consecutive_role_preserves_assistant_tool_call_metadata() {
+    fn alternation_repair_is_append_stable() {
+        // The rendered prefix must not change when a same-role message lands
+        // later (async tool completion) — this is the prefix-cache contract.
+        let base = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "tool result 1"}),
+        ];
+        let mut grown = base.clone();
+        grown.push(json!({"role": "user", "content": "tool result 2"}));
+
+        let repaired_base = repair_role_alternation(base);
+        let repaired_grown = repair_role_alternation(grown);
+        assert_eq!(
+            &repaired_grown[..repaired_base.len()],
+            &repaired_base[..],
+            "growing the log must only append rendered messages"
+        );
+    }
+
+    #[test]
+    fn alternation_repair_preserves_assistant_tool_call_metadata() {
         let msgs = vec![
             json!({"role": "system", "content": "sys"}),
             json!({
@@ -853,13 +842,13 @@ mod tests {
             json!({"role": "user", "content": "continue"}),
         ];
 
-        let merged = merge_consecutive_role(msgs);
-        assert_eq!(
-            merged.len(),
-            4,
-            "assistant entries with metadata must not merge"
-        );
-        assert!(merged[1].get("tool_calls").is_some());
+        let repaired = repair_role_alternation(msgs);
+        // A user separator lands between the two assistant messages; the
+        // tool_calls metadata is untouched.
+        assert_eq!(repaired.len(), 5);
+        assert!(repaired[1].get("tool_calls").is_some());
+        assert_eq!(repaired[2]["role"], "user");
+        assert_eq!(repaired[3]["content"], "Calling tool now");
     }
 
     #[test]
