@@ -19,6 +19,7 @@ use crate::agent::protocol::{
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::validation;
 use crate::providers::base::{LLMResponse, ToolCallRequest};
+use crate::turn_stream::ControlMarker;
 
 use super::{AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnContext};
 
@@ -188,7 +189,7 @@ pub(crate) fn classify_response(
 
 fn send_finish_reason(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, reason: &str) {
     if let Some(ref tx) = tx {
-        let _ = tx.send(format!("\x00finish_reason:{}", reason));
+        let _ = tx.send(ControlMarker::FinishReason(reason.to_string()).encode());
     }
 }
 
@@ -196,7 +197,7 @@ fn send_finish_reason(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, r
 /// The renderer accumulates these across a turn's LLM calls to show tok/s.
 fn send_token_count(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, tokens: u64) {
     if let Some(ref tx) = tx {
-        let _ = tx.send(format!("\x00tokens:{}", tokens));
+        let _ = tx.send(ControlMarker::Tokens(tokens).encode());
     }
 }
 
@@ -215,7 +216,7 @@ fn send_decode_time(
     };
     let decode_ms = (start.elapsed().as_millis() as u64).saturating_sub(ttft);
     if decode_ms > 0 {
-        let _ = tx.send(format!("\x00decode_ms:{}", decode_ms));
+        let _ = tx.send(ControlMarker::DecodeMs(decode_ms).encode());
     }
 }
 
@@ -224,7 +225,7 @@ fn send_decode_time(
 /// stream prompt_progress chunks.
 fn send_prompt_token_count(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, tokens: u64) {
     if let Some(ref tx) = tx {
-        let _ = tx.send(format!("\x00prompt_tokens:{}", tokens));
+        let _ = tx.send(ControlMarker::PromptTokens(tokens).encode());
     }
 }
 

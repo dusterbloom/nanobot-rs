@@ -280,6 +280,162 @@ fn try_recv_opt<T>(rx: &mut Option<UnboundedReceiver<T>>) -> Option<T> {
 }
 
 // ============================================================================
+// Control-marker wire protocol
+// ============================================================================
+//
+// Telemetry smuggled through the text-delta channel as `\x00`-prefixed
+// strings (never rendered). This module owns BOTH directions: the agent loop
+// emits via [`ControlMarker::encode`], the frontends decode via
+// [`parse_control_marker`]. Hand-written `format!("\x00...")` at emit sites
+// is what let the two ends drift — the round-trip test below makes the
+// protocol correct by construction.
+
+/// Control markers carried on the delta channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlMarker {
+    RetractReply,
+    FinishReason(String),
+    Tokens(u64),
+    PromptTokens(u64),
+    /// Real decode time (milliseconds) for the just-finished LLM call, measured
+    /// agent-side as `call_wall_time − ttft`. Renderers sum these to report a
+    /// true decode tok/s that excludes tool-execution and re-prefill time.
+    DecodeMs(u64),
+    PrefillEstimate(u64),
+    PrefillProgress {
+        processed: u64,
+        total: u64,
+    },
+    CacheStatus(CacheStatus),
+}
+
+/// Prompt-cache relationship between this LLM call and the previous one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheStatus {
+    First {
+        messages: usize,
+    },
+    AppendOnly {
+        added: usize,
+        messages: usize,
+    },
+    Diverged {
+        at: usize,
+        prev: usize,
+        messages: usize,
+    },
+    Reset {
+        reason: CacheResetReason,
+    },
+}
+
+/// Why the agent knowingly invalidated the prompt-cache prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheResetReason {
+    Trim,
+    EmergencyTrim,
+    LcmCheckpoint,
+}
+
+impl CacheResetReason {
+    fn as_wire(self) -> &'static str {
+        match self {
+            CacheResetReason::Trim => "trim",
+            CacheResetReason::EmergencyTrim => "emergency_trim",
+            CacheResetReason::LcmCheckpoint => "lcm_checkpoint",
+        }
+    }
+}
+
+impl ControlMarker {
+    /// Render this marker in the wire syntax [`parse_control_marker`] reads.
+    /// The round-trip test pins `parse(encode(m)) == m` for every variant.
+    pub(crate) fn encode(&self) -> String {
+        match self {
+            ControlMarker::RetractReply => "\x00retract_reply".to_string(),
+            ControlMarker::FinishReason(fr) => format!("\x00finish_reason:{fr}"),
+            ControlMarker::Tokens(n) => format!("\x00tokens:{n}"),
+            ControlMarker::PromptTokens(n) => format!("\x00prompt_tokens:{n}"),
+            ControlMarker::DecodeMs(ms) => format!("\x00decode_ms:{ms}"),
+            ControlMarker::PrefillEstimate(n) => format!("\x00prefill_estimate:{n}"),
+            ControlMarker::PrefillProgress { processed, total } => {
+                format!("\x00prefill:{processed}/{total}")
+            }
+            ControlMarker::CacheStatus(status) => match status {
+                CacheStatus::First { messages } => format!("\x00cache:first:{messages}"),
+                CacheStatus::AppendOnly { added, messages } => {
+                    format!("\x00cache:append:{added}:{messages}")
+                }
+                CacheStatus::Diverged { at, prev, messages } => {
+                    format!("\x00cache:diverged:{at}:{prev}:{messages}")
+                }
+                CacheStatus::Reset { reason } => {
+                    format!("\x00cache:reset:{}", reason.as_wire())
+                }
+            },
+        }
+    }
+}
+
+/// Parse a delta-channel control marker. `None` means renderable text.
+pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
+    let rest = d.strip_prefix('\x00')?;
+    if rest == "retract_reply" {
+        return Some(ControlMarker::RetractReply);
+    }
+    if let Some(fr) = rest.strip_prefix("finish_reason:") {
+        return Some(ControlMarker::FinishReason(fr.to_string()));
+    }
+    if let Some(tok) = rest.strip_prefix("tokens:") {
+        return tok.parse().ok().map(ControlMarker::Tokens);
+    }
+    if let Some(tok) = rest.strip_prefix("prompt_tokens:") {
+        return tok.parse().ok().map(ControlMarker::PromptTokens);
+    }
+    if let Some(ms) = rest.strip_prefix("decode_ms:") {
+        return ms.parse().ok().map(ControlMarker::DecodeMs);
+    }
+    if let Some(tok) = rest.strip_prefix("prefill_estimate:") {
+        return tok.parse().ok().map(ControlMarker::PrefillEstimate);
+    }
+    if let Some(pp) = rest.strip_prefix("prefill:") {
+        let (p, t) = pp.split_once('/')?;
+        return Some(ControlMarker::PrefillProgress {
+            processed: p.parse().ok()?,
+            total: t.parse().ok()?,
+        });
+    }
+    if let Some(cache) = rest.strip_prefix("cache:") {
+        let mut parts = cache.split(':');
+        return match parts.next()? {
+            "first" => Some(ControlMarker::CacheStatus(CacheStatus::First {
+                messages: parts.next()?.parse().ok()?,
+            })),
+            "append" => Some(ControlMarker::CacheStatus(CacheStatus::AppendOnly {
+                added: parts.next()?.parse().ok()?,
+                messages: parts.next()?.parse().ok()?,
+            })),
+            "diverged" => Some(ControlMarker::CacheStatus(CacheStatus::Diverged {
+                at: parts.next()?.parse().ok()?,
+                prev: parts.next()?.parse().ok()?,
+                messages: parts.next()?.parse().ok()?,
+            })),
+            "reset" => {
+                let reason = match parts.next()? {
+                    "trim" => CacheResetReason::Trim,
+                    "emergency_trim" => CacheResetReason::EmergencyTrim,
+                    "lcm_checkpoint" => CacheResetReason::LcmCheckpoint,
+                    _ => return None,
+                };
+                Some(ControlMarker::CacheStatus(CacheStatus::Reset { reason }))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -315,6 +471,55 @@ mod tests {
             result
         });
         (handle, tx)
+    }
+
+    /// The protocol is correct by construction: every variant must survive
+    /// encode → parse unchanged. Adding a marker without wiring both ends
+    /// fails here, not in production drift.
+    #[test]
+    fn control_marker_round_trips_every_variant() {
+        let variants = vec![
+            ControlMarker::RetractReply,
+            ControlMarker::FinishReason("stop".into()),
+            ControlMarker::Tokens(42),
+            ControlMarker::PromptTokens(30_000),
+            ControlMarker::DecodeMs(5_120),
+            ControlMarker::PrefillEstimate(1_000),
+            ControlMarker::PrefillProgress {
+                processed: 1_200,
+                total: 2_400,
+            },
+            ControlMarker::CacheStatus(CacheStatus::First { messages: 3 }),
+            ControlMarker::CacheStatus(CacheStatus::AppendOnly {
+                added: 2,
+                messages: 9,
+            }),
+            ControlMarker::CacheStatus(CacheStatus::Diverged {
+                at: 2,
+                prev: 140,
+                messages: 209,
+            }),
+            ControlMarker::CacheStatus(CacheStatus::Reset {
+                reason: CacheResetReason::Trim,
+            }),
+            ControlMarker::CacheStatus(CacheStatus::Reset {
+                reason: CacheResetReason::EmergencyTrim,
+            }),
+            ControlMarker::CacheStatus(CacheStatus::Reset {
+                reason: CacheResetReason::LcmCheckpoint,
+            }),
+        ];
+        for m in variants {
+            let wire = m.encode();
+            assert!(wire.starts_with('\x00'), "markers are NUL-prefixed: {wire:?}");
+            assert_eq!(
+                parse_control_marker(&wire),
+                Some(m.clone()),
+                "round-trip failed for {m:?} (wire: {wire:?})"
+            );
+        }
+        // Plain text never parses as a marker.
+        assert_eq!(parse_control_marker("hello"), None);
     }
 
     #[tokio::test]

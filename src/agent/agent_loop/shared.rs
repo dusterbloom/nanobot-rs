@@ -48,10 +48,14 @@ use super::{
 // `response` is a sibling module declared in `mod.rs`. RetryState is re-exported
 // from there; we just need a local alias for the field type below.
 use super::response::RetryState;
+use crate::turn_stream::{CacheResetReason, CacheStatus, ControlMarker};
 
-fn send_cache_reset_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, reason: &str) {
+fn send_cache_reset_marker(
+    tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    reason: CacheResetReason,
+) {
     if let Some(tx) = tx {
-        let _ = tx.send(format!("\x00cache:reset:{reason}"));
+        let _ = tx.send(ControlMarker::CacheStatus(CacheStatus::Reset { reason }).encode());
     }
 }
 
@@ -73,7 +77,7 @@ fn clear_prompt_cache_state(ctx: &TurnContext) -> bool {
 
 fn send_retract_reply_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>) {
     if let Some(tx) = tx {
-        let _ = tx.send("\x00retract_reply".to_string());
+        let _ = tx.send(ControlMarker::RetractReply.encode());
     }
 }
 
@@ -950,7 +954,7 @@ impl AgentLoopShared {
             );
         if !prefix_preserved && frozen_prefix > 0 {
             clear_prompt_cache_state(ctx);
-            send_cache_reset_marker(&ctx.text_delta_tx, "trim");
+            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::Trim);
             warn!(
                 session = %ctx.session_key,
                 frozen_prefix,
@@ -1050,7 +1054,7 @@ impl AgentLoopShared {
                 .trim_to_fit_with_age_preserving_prefix(&ctx.messages, 0, 0, 0, frozen_prefix);
             if !prefix_preserved && frozen_prefix > 0 {
                 clear_prompt_cache_state(ctx);
-                send_cache_reset_marker(&ctx.text_delta_tx, "emergency_trim");
+                send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::EmergencyTrim);
                 warn!(
                     session = %ctx.session_key,
                     frozen_prefix,
@@ -1265,7 +1269,7 @@ impl AgentLoopShared {
         }
 
         if rewrites_prompt && clear_prompt_cache_state(ctx) {
-            send_cache_reset_marker(&ctx.text_delta_tx, "lcm_checkpoint");
+            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::LcmCheckpoint);
             warn!(
                 session = %ctx.session_key,
                 frozen_prefix,
@@ -1820,10 +1824,12 @@ impl AgentLoopShared {
                         %role_snippet,
                         "prompt_prefix_diverged — server re-prefills past this point"
                     );
-                    format!(
-                        "\x00cache:diverged:{}:{}:{}",
-                        first_divergent_msg, prev_msgs, new_msgs,
-                    )
+                    ControlMarker::CacheStatus(CacheStatus::Diverged {
+                        at: first_divergent_msg,
+                        prev: prev_msgs,
+                        messages: new_msgs,
+                    })
+                    .encode()
                 }
                 PromptDelta::AppendOnly { added_msgs } => {
                     debug!(
@@ -1832,14 +1838,21 @@ impl AgentLoopShared {
                         prefill_estimate,
                         "prompt_append_only"
                     );
-                    format!("\x00cache:append:{}:{}", added_msgs, prompt_msg_count)
+                    ControlMarker::CacheStatus(CacheStatus::AppendOnly {
+                        added: added_msgs,
+                        messages: prompt_msg_count,
+                    })
+                    .encode()
                 }
-                PromptDelta::First => format!("\x00cache:first:{}", prompt_msg_count),
+                PromptDelta::First => ControlMarker::CacheStatus(CacheStatus::First {
+                    messages: prompt_msg_count,
+                })
+                .encode(),
             };
             if let Some(ref delta_tx) = ctx.text_delta_tx {
                 let _ = delta_tx.send(cache_marker);
                 if prefill_estimate > 0 {
-                    let _ = delta_tx.send(format!("\x00prefill_estimate:{prefill_estimate}"));
+                    let _ = delta_tx.send(ControlMarker::PrefillEstimate(prefill_estimate as u64).encode());
                 }
             }
         }
@@ -1967,7 +1980,10 @@ impl AgentLoopShared {
                                 // mark_first_token. Forward to the REPL spinner
                                 // as a control marker.
                                 let _ =
-                                    delta_tx.send(format!("\x00prefill:{}/{}", processed, total));
+                                    delta_tx.send(
+                                        ControlMarker::PrefillProgress { processed, total }
+                                            .encode(),
+                                    );
                             }
                             Some(StreamChunk::Done(resp)) => {
                                 if in_thinking {

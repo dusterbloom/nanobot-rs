@@ -150,111 +150,11 @@ impl PrefillSpinner {
     }
 }
 
-/// Control markers smuggled through the text-delta channel (`\x00`-prefixed,
-/// never rendered). One enum so the print task dispatches with a `match`
-/// and the wire syntax is parsed in exactly one place.
-pub(crate) enum ControlMarker {
-    RetractReply,
-    FinishReason(String),
-    Tokens(u64),
-    PromptTokens(u64),
-    /// Real decode time (milliseconds) for the just-finished LLM call, measured
-    /// agent-side as `call_wall_time − ttft`. Renderers sum these to report a
-    /// true decode tok/s that excludes tool-execution and re-prefill time.
-    DecodeMs(u64),
-    PrefillEstimate(u64),
-    PrefillProgress {
-        processed: u64,
-        total: u64,
-    },
-    CacheStatus(CacheStatus),
-}
-
-/// Prompt-cache relationship between this LLM call and the previous one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheStatus {
-    First {
-        messages: usize,
-    },
-    AppendOnly {
-        added: usize,
-        messages: usize,
-    },
-    Diverged {
-        at: usize,
-        prev: usize,
-        messages: usize,
-    },
-    Reset {
-        reason: CacheResetReason,
-    },
-}
-
-/// Why the agent knowingly invalidated the prompt-cache prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheResetReason {
-    Trim,
-    EmergencyTrim,
-    LcmCheckpoint,
-}
-
-/// Parse a delta-channel control marker. `None` means renderable text.
-pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
-    let rest = d.strip_prefix('\x00')?;
-    if rest == "retract_reply" {
-        return Some(ControlMarker::RetractReply);
-    }
-    if let Some(fr) = rest.strip_prefix("finish_reason:") {
-        return Some(ControlMarker::FinishReason(fr.to_string()));
-    }
-    if let Some(tok) = rest.strip_prefix("tokens:") {
-        return tok.parse().ok().map(ControlMarker::Tokens);
-    }
-    if let Some(tok) = rest.strip_prefix("prompt_tokens:") {
-        return tok.parse().ok().map(ControlMarker::PromptTokens);
-    }
-    if let Some(ms) = rest.strip_prefix("decode_ms:") {
-        return ms.parse().ok().map(ControlMarker::DecodeMs);
-    }
-    if let Some(tok) = rest.strip_prefix("prefill_estimate:") {
-        return tok.parse().ok().map(ControlMarker::PrefillEstimate);
-    }
-    if let Some(pp) = rest.strip_prefix("prefill:") {
-        let (p, t) = pp.split_once('/')?;
-        return Some(ControlMarker::PrefillProgress {
-            processed: p.parse().ok()?,
-            total: t.parse().ok()?,
-        });
-    }
-    if let Some(cache) = rest.strip_prefix("cache:") {
-        let mut parts = cache.split(':');
-        return match parts.next()? {
-            "first" => Some(ControlMarker::CacheStatus(CacheStatus::First {
-                messages: parts.next()?.parse().ok()?,
-            })),
-            "append" => Some(ControlMarker::CacheStatus(CacheStatus::AppendOnly {
-                added: parts.next()?.parse().ok()?,
-                messages: parts.next()?.parse().ok()?,
-            })),
-            "diverged" => Some(ControlMarker::CacheStatus(CacheStatus::Diverged {
-                at: parts.next()?.parse().ok()?,
-                prev: parts.next()?.parse().ok()?,
-                messages: parts.next()?.parse().ok()?,
-            })),
-            "reset" => {
-                let reason = match parts.next()? {
-                    "trim" => CacheResetReason::Trim,
-                    "emergency_trim" => CacheResetReason::EmergencyTrim,
-                    "lcm_checkpoint" => CacheResetReason::LcmCheckpoint,
-                    _ => return None,
-                };
-                Some(ControlMarker::CacheStatus(CacheStatus::Reset { reason }))
-            }
-            _ => None,
-        };
-    }
-    None
-}
+/// Control-marker wire protocol — owned by `turn_stream` (single home for
+/// both encode and parse); re-exported here for the many existing users.
+pub(crate) use crate::turn_stream::{
+    parse_control_marker, CacheResetReason, CacheStatus, ControlMarker,
+};
 
 #[cfg(any(test, feature = "voice"))]
 fn thinking_delta_should_skip_tts(delta: &str, in_thinking: &mut bool) -> bool {
