@@ -153,9 +153,9 @@ pub(crate) async fn server_start(
         fs::File::open("/dev/null").map_err(|e| format!("failed to open /dev/null: {e}"))?;
 
     let mut cmd = std::process::Command::new(bin);
-    // Maximise local-MLX throughput: throughput profile, TurboQuant KV @ 4-bit.
-    // TurboQuant activates above its internal threshold (2048 tokens) so short
-    // turns are unaffected; long-context decode benefits from compressed KV.
+    // Throughput profile only. TurboQuant KV @ 4-bit was tried here and
+    // removed: the dequant overhead on long-context decode made everything
+    // slower in practice on this workload — full-precision KV wins.
     // HIGGS_CHUNKED_PREFILL_CHUNK_SIZE overrides the hardcoded 1024 floor
     // for throughput profile (384 *max(1024) = 1024 for huge+MoE).
     cmd.env("HIGGS_CHUNKED_PREFILL_CHUNK_SIZE", "4096");
@@ -167,10 +167,6 @@ pub(crate) async fn server_start(
         &port.to_string(),
         "--mlx-profile",
         "throughput",
-        "--kv-cache",
-        "turboquant",
-        "--kv-bits",
-        "4",
     ]);
     cmd.stdin(devnull);
     cmd.stdout(log_file);
