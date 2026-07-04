@@ -770,9 +770,28 @@ impl AgentLoopShared {
             .get("completion_tokens")
             .copied()
             .unwrap_or(-1);
+        // Provider prompt-cache telemetry (Anthropic/Zhipu native names). Absent
+        // or zero on providers that don't report caching → None, so the JSONL
+        // field is omitted and cache hit-rate is measurable per-provider.
+        let cache_read_tokens = response
+            .usage
+            .get("cache_read_input_tokens")
+            .copied()
+            .filter(|&n| n > 0)
+            .map(|n| n as u64);
+        let cache_creation_tokens = response
+            .usage
+            .get("cache_creation_input_tokens")
+            .copied()
+            .filter(|&n| n > 0)
+            .map(|n| n as u64);
         info!(
-            "tokens: estimated_prompt={}, actual_prompt={}, actual_completion={}",
-            estimated_prompt, actual_prompt, actual_completion
+            "tokens: estimated_prompt={}, actual_prompt={}, actual_completion={}, cache_read={}, cache_creation={}",
+            estimated_prompt,
+            actual_prompt,
+            actual_completion,
+            cache_read_tokens.unwrap_or(0),
+            cache_creation_tokens.unwrap_or(0),
         );
         if actual_prompt > 0 {
             counters
@@ -802,6 +821,8 @@ impl AgentLoopShared {
             ttft_ms: ctx.flow.ttft_ms,
             prompt_tokens: actual_prompt.max(0) as u64,
             completion_tokens: actual_completion.max(0) as u64,
+            cache_read_tokens,
+            cache_creation_tokens,
             status: "ok".into(),
             error_detail: None,
             anti_drift_score: None,

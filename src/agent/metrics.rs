@@ -24,6 +24,15 @@ pub struct RequestMetrics {
     pub ttft_ms: Option<u64>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Prompt-cache tokens served from the provider's KV/prefix cache this call
+    /// (Anthropic/Zhipu `cache_read_input_tokens`). `None` when the provider
+    /// does not report caching, so cache health is observable per-provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written into the provider's cache this call
+    /// (`cache_creation_input_tokens`). `None` when unreported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
@@ -106,6 +115,8 @@ mod tests {
             ttft_ms: Some(420),
             prompt_tokens: 2048,
             completion_tokens: 256,
+            cache_read_tokens: Some(1500),
+            cache_creation_tokens: Some(400),
             status: "ok".into(),
             error_detail: None,
             anti_drift_score: Some(0.3),
@@ -125,6 +136,8 @@ mod tests {
         assert!(parsed.get("validation_result").is_none());
         assert_eq!(parsed["anti_drift_score"], 0.3);
         assert_eq!(parsed["ttft_ms"], 420);
+        assert_eq!(parsed["cache_read_tokens"], 1500);
+        assert_eq!(parsed["cache_creation_tokens"], 400);
     }
 
     #[test]
@@ -139,6 +152,8 @@ mod tests {
             ttft_ms: None,
             prompt_tokens: 0,
             completion_tokens: 0,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
             status: "error:reasoning_config_rejected".into(),
             error_detail: Some("reasoning_budget not supported".into()),
             anti_drift_score: None,
@@ -205,6 +220,8 @@ mod tests {
             ttft_ms: Some(33),
             prompt_tokens: 10,
             completion_tokens: 5,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
             status: "ok".into(),
             error_detail: None,
             anti_drift_score: None,
