@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use super::base::{PermissionLevel, Tool};
+use crate::cron::executor::initial_next_run;
 use crate::cron::service::CronService;
+use crate::cron::types::CronSchedule;
 
 /// Tool to schedule reminders and recurring tasks.
 pub struct CronScheduleTool {
@@ -32,7 +34,7 @@ impl CronScheduleTool {
         *self.chat_id.lock().await = chat_id.to_string();
     }
 
-    /// Handle the "add" action.
+    /// Handle the "add" action: persist a real job through the shared service.
     async fn add_job(
         &self,
         message: &str,
@@ -50,23 +52,36 @@ impl CronScheduleTool {
             return "Error: no session context (channel/chat_id)".to_string();
         }
 
-        // Validate schedule parameters.
-        let schedule_desc = if let Some(secs) = every_seconds {
-            format!("every {}s", secs)
-        } else if let Some(expr) = cron_expr {
-            expr.to_string()
-        } else {
+        let Some(schedule) = build_schedule(every_seconds, cron_expr) else {
             return "Error: either every_seconds or cron_expr is required".to_string();
+        };
+
+        // Validate before persisting: an unschedulable job (bad cron expr,
+        // non-positive interval) would sit in the store and never fire.
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let Some(next_run_ms) = initial_next_run(&schedule, now_ms) else {
+            return "Error: invalid schedule (check cron expression / interval)".to_string();
         };
 
         // Truncate name to 30 chars.
         let name: String = message.chars().take(30).collect();
 
-        // CronService::add_job requires &mut self, but we only have Arc<CronService>.
-        // Report back that CLI should be used for persistent scheduling.
+        // Deliver the fired reminder back to the chat that scheduled it.
+        let job = self.cron_service.add_job(
+            &name,
+            schedule,
+            message,
+            true,
+            Some(&channel),
+            Some(&chat_id),
+            false,
+        );
+
         format!(
-            "Scheduled: '{}' (schedule: {}). Note: use CLI `nanobot cron add` for persistent scheduling.",
-            name, schedule_desc,
+            "Scheduled '{}' (id: {}, next run: {})",
+            job.name,
+            job.id,
+            format_local(next_run_ms)
         )
     }
 
@@ -89,13 +104,40 @@ impl CronScheduleTool {
             Some(id) if !id.is_empty() => id,
             _ => return "Error: job_id is required for remove".to_string(),
         };
-        // remove_job requires &mut self, but we only have Arc<CronService>.
-        // Report that CLI should be used for removal.
-        format!(
-            "To remove job {}, use CLI: `nanobot cron remove {}`",
-            job_id, job_id
-        )
+        if self.cron_service.remove_job(job_id) {
+            format!("Removed job {}", job_id)
+        } else {
+            format!("Job {} not found", job_id)
+        }
     }
+}
+
+/// Map tool parameters onto a schedule; `None` when neither is given.
+fn build_schedule(every_seconds: Option<i64>, cron_expr: Option<&str>) -> Option<CronSchedule> {
+    match (every_seconds, cron_expr) {
+        (Some(secs), _) => Some(CronSchedule {
+            kind: "every".to_string(),
+            every_ms: Some(secs.saturating_mul(1000)),
+            ..Default::default()
+        }),
+        (None, Some(expr)) if !expr.is_empty() => Some(CronSchedule {
+            kind: "cron".to_string(),
+            expr: Some(expr.to_string()),
+            ..Default::default()
+        }),
+        _ => None,
+    }
+}
+
+/// Human-readable local timestamp for the model to relay.
+fn format_local(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| format!("{} ms", ms))
 }
 
 #[async_trait]
@@ -162,5 +204,137 @@ impl Tool for CronScheduleTool {
             }
             other => format!("Unknown action: {}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::NamedTempFile;
+
+    fn temp_tool() -> (CronScheduleTool, Arc<CronService>, NamedTempFile) {
+        let tmp = NamedTempFile::new().expect("temp file");
+        std::fs::remove_file(tmp.path()).ok();
+        let service = Arc::new(CronService::new(tmp.path().to_path_buf()));
+        (CronScheduleTool::new(service.clone()), service, tmp)
+    }
+
+    fn params(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_add_interval_job_persists_through_service() {
+        let (tool, service, _tmp) = temp_tool();
+        tool.set_context("telegram", "12345").await;
+
+        let result = tool
+            .execute(params(&[
+                ("action", json!("add")),
+                ("message", json!("water break")),
+                ("every_seconds", json!(3600)),
+            ]))
+            .await;
+
+        let jobs = service.list_jobs(true);
+        assert_eq!(jobs.len(), 1, "tool add must persist a real job");
+        let job = &jobs[0];
+        assert_eq!(job.schedule.kind, "every");
+        assert_eq!(job.schedule.every_ms, Some(3_600_000));
+        assert_eq!(job.payload.kind, "agent_turn");
+        assert_eq!(job.payload.message, "water break");
+        // Reminder is delivered back to the chat that scheduled it.
+        assert!(job.payload.deliver);
+        assert_eq!(job.payload.channel.as_deref(), Some("telegram"));
+        assert_eq!(job.payload.to.as_deref(), Some("12345"));
+        // The model needs id + next-run time to report back to the user.
+        assert!(result.contains(&job.id), "result must contain job id: {result}");
+        assert!(result.contains("next run"), "result must report next run: {result}");
+        assert!(
+            !result.contains("use CLI") && !result.contains("nanobot cron"),
+            "placeholder text must be gone: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_cron_expr_job_persists() {
+        let (tool, service, _tmp) = temp_tool();
+        tool.set_context("whatsapp", "+491234").await;
+
+        let result = tool
+            .execute(params(&[
+                ("action", json!("add")),
+                ("message", json!("morning digest")),
+                ("cron_expr", json!("0 9 * * *")),
+            ]))
+            .await;
+
+        let jobs = service.list_jobs(true);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].schedule.kind, "cron");
+        assert_eq!(jobs[0].schedule.expr.as_deref(), Some("0 9 * * *"));
+        assert!(result.contains(&jobs[0].id), "got: {result}");
+        assert!(result.contains("next run"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_add_invalid_cron_expr_rejected_without_persisting() {
+        let (tool, service, _tmp) = temp_tool();
+        tool.set_context("telegram", "1").await;
+
+        let result = tool
+            .execute(params(&[
+                ("action", json!("add")),
+                ("message", json!("bad")),
+                ("cron_expr", json!("not a cron")),
+            ]))
+            .await;
+
+        assert!(result.starts_with("Error"), "got: {result}");
+        assert!(
+            service.list_jobs(true).is_empty(),
+            "invalid job must not persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_job_actually_removes() {
+        let (tool, service, _tmp) = temp_tool();
+        let job = service.add_job(
+            "temp",
+            crate::cron::types::CronSchedule {
+                kind: "every".to_string(),
+                every_ms: Some(60_000),
+                ..Default::default()
+            },
+            "msg",
+            false,
+            None,
+            None,
+            false,
+        );
+
+        let result = tool
+            .execute(params(&[
+                ("action", json!("remove")),
+                ("job_id", json!(job.id)),
+            ]))
+            .await;
+
+        assert!(result.contains("Removed"), "got: {result}");
+        assert!(service.list_jobs(true).is_empty());
+
+        // Unknown id: clear feedback, no panic.
+        let missing = tool
+            .execute(params(&[
+                ("action", json!("remove")),
+                ("job_id", json!("nope1234")),
+            ]))
+            .await;
+        assert!(missing.contains("not found"), "got: {missing}");
     }
 }

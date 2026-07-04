@@ -15,7 +15,7 @@ pub(crate) use core_builder::{
     build_core_handle, create_agent_loop, rebuild_core, strip_gguf_suffix,
 };
 pub(crate) use provider::{check_api_key, create_provider};
-pub(crate) use skills::{cmd_skill_add, cmd_skill_remove};
+pub(crate) use skills::{cmd_skill_add, cmd_skill_remove, cmd_skill_search};
 #[cfg(feature = "voice")]
 pub(crate) use voice::{cmd_voice_config, cmd_voice_list};
 
@@ -33,7 +33,7 @@ use crate::channels::manager::ChannelManager;
 use crate::config::loader::{get_config_path, get_data_dir, load_config, save_config};
 use crate::config::schema::Config;
 use crate::cron::service::CronService;
-use crate::cron::types::CronSchedule;
+use crate::cron::types::{CronPayload, CronSchedule, PayloadKind};
 use crate::heartbeat::service::{
     HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS,
 };
@@ -504,8 +504,11 @@ pub(crate) fn cmd_onboard() {
 
     println!("\n{} nanobot is ready!", crate::LOGO);
     println!("\nNext steps:");
-    println!("  1. Add your API key to ~/.nanobot/config.json");
-    println!("     Get one at: https://openrouter.ai/keys");
+    println!("  1. Add an API key to ~/.nanobot/config.json, e.g.:");
+    println!("     providers.anthropic.apiKey   https://console.anthropic.com");
+    println!("     providers.openrouter.apiKey  https://openrouter.ai/keys");
+    println!("     providers.openai.apiKey      https://platform.openai.com/api-keys");
+    println!("     (first non-empty key wins: OpenRouter > DeepSeek > Anthropic > OpenAI > ...)");
     println!("  2. Chat: nanobot agent -m \"Hello!\"");
 }
 
@@ -615,10 +618,23 @@ pub(crate) async fn run_gateway_async(
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
     let cron_store_path = get_data_dir().join("cron").join("jobs.json");
-    let mut cron_service = CronService::new(cron_store_path);
+    let cron_service = CronService::new(cron_store_path);
     cron_service.start().await;
     let cron_status = cron_service.status();
     let cron_arc = Arc::new(cron_service);
+
+    // Cron executor: fires due jobs in the background. `agent_turn` payloads
+    // are injected on the same inbound bus `agent_loop.run()` consumes below;
+    // `reflect` payloads distill working memory via the reflector. Gateway
+    // mode only — see `cron::executor` module docs for why REPL/TUI direct
+    // mode cannot consume injected turns.
+    let cron_executor = crate::cron::executor::spawn_executor(
+        cron_arc.clone(),
+        crate::cron::executor::ExecutorHooks {
+            inbound_tx: Some(inbound_tx.clone()),
+            reflect: Some(build_cron_reflect_hook(core_handle.clone())),
+        },
+    );
 
     let health_registry = Arc::new(crate::heartbeat::health::build_registry(&config));
 
@@ -770,6 +786,9 @@ pub(crate) async fn run_gateway_async(
     }
 
     agent_loop.stop();
+    // Abort is safe: job state persists at every advance, and the misfire
+    // policy fires anything missed once on next startup.
+    cron_executor.abort();
     heartbeat.stop().await;
     channel_manager.stop_all().await;
 
@@ -777,6 +796,31 @@ pub(crate) async fn run_gateway_async(
     // have fired (e.g. Arc still held elsewhere).
     crate::agent::pid_file::cleanup_stale_pids();
     crate::agent::pid_file::release_agent_singleton();
+}
+
+/// Build the cron executor's `reflect` hook from the live core handle, so
+/// `/model` and `/local` swaps are honored at fire time. Memory disabled →
+/// silent skip. Threshold 0: distill whatever accumulated since the last run.
+fn build_cron_reflect_hook(core_handle: SharedCoreHandle) -> crate::cron::executor::ReflectFn {
+    Arc::new(move || {
+        let core = core_handle.swappable();
+        Box::pin(async move {
+            if !core.memory_enabled {
+                tracing::debug!("Cron reflect: memory disabled — skipped");
+                return;
+            }
+            let reflector = crate::agent::reflector::Reflector::new(
+                core.memory_provider.clone(),
+                core.memory_model.clone(),
+                &core.workspace,
+                0,
+            );
+            match reflector.reflect().await {
+                Ok(()) => tracing::info!("Cron reflect: memory distillation complete"),
+                Err(e) => tracing::warn!("Cron reflect failed: {}", e),
+            }
+        })
+    })
 }
 
 // ============================================================================
@@ -1031,6 +1075,10 @@ pub(crate) fn cmd_status() {
     if config_path.exists() {
         println!("Model: {}", config.agents.defaults.model);
         println!(
+            "Active provider: {}",
+            config.active_provider_name().unwrap_or("none")
+        );
+        println!(
             "OpenRouter API: {}",
             if config.providers.openrouter.api_key.is_empty() {
                 "not set"
@@ -1234,12 +1282,27 @@ pub(crate) fn cmd_cron_list(include_all: bool) {
             _ => "one-time".to_string(),
         };
         let status = if job.enabled { "enabled" } else { "disabled" };
+        // Stored next_run is set by the gateway executor; for jobs it hasn't
+        // touched yet, compute the same value it will use so the column is
+        // never blank.
         let next_run = job
             .state
             .next_run_at_ms
+            .or_else(|| {
+                crate::cron::executor::initial_next_run(
+                    &job.schedule,
+                    crate::agent::agent_core::RuntimeCounters::now_epoch_ms() as i64,
+                )
+            })
             .map(|ms| {
+                // Local time, matching the timezone cron expressions are
+                // evaluated in — a "0 3 * * *" job must display as 03:00.
                 chrono::DateTime::from_timestamp(ms / 1000, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                    .map(|dt| {
+                        dt.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
                     .unwrap_or_default()
             })
             .unwrap_or_default();
@@ -1250,14 +1313,16 @@ pub(crate) fn cmd_cron_list(include_all: bool) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_cron_add(
     name: String,
-    message: String,
+    message: Option<String>,
     every: Option<u64>,
     cron_expr: Option<String>,
     deliver: bool,
     to: Option<String>,
     channel: Option<String>,
+    kind: PayloadKind,
 ) {
     let schedule = if let Some(secs) = every {
         CronSchedule {
@@ -1276,23 +1341,33 @@ pub(crate) fn cmd_cron_add(
         std::process::exit(1);
     };
 
-    let store_path = get_data_dir().join("cron").join("jobs.json");
-    let mut service = CronService::new(store_path);
-    let job = service.add_job(
-        &name,
-        schedule,
-        &message,
+    let message = match (kind, message) {
+        (PayloadKind::AgentTurn, Some(m)) => m,
+        (PayloadKind::AgentTurn, None) => {
+            eprintln!("Error: --message is required (unless --reflect)");
+            std::process::exit(1);
+        }
+        // Reflection needs no prompt; keep any note the user attached.
+        (PayloadKind::Reflect, m) => m.unwrap_or_default(),
+    };
+
+    let payload = CronPayload {
+        kind: kind.as_str().to_string(),
+        message,
         deliver,
-        channel.as_deref(),
-        to.as_deref(),
-        false,
-    );
+        channel,
+        to,
+    };
+
+    let store_path = get_data_dir().join("cron").join("jobs.json");
+    let service = CronService::new(store_path);
+    let job = service.add_job_with_payload(&name, schedule, payload, false);
     println!("  Added job '{}' ({})", job.name, job.id);
 }
 
 pub(crate) fn cmd_cron_remove(job_id: String) {
     let store_path = get_data_dir().join("cron").join("jobs.json");
-    let mut service = CronService::new(store_path);
+    let service = CronService::new(store_path);
     if service.remove_job(&job_id) {
         println!("  Removed job {}", job_id);
     } else {
@@ -1302,7 +1377,7 @@ pub(crate) fn cmd_cron_remove(job_id: String) {
 
 pub(crate) fn cmd_cron_enable(job_id: String, disable: bool) {
     let store_path = get_data_dir().join("cron").join("jobs.json");
-    let mut service = CronService::new(store_path);
+    let service = CronService::new(store_path);
     if let Some(job) = service.enable_job(&job_id, !disable) {
         let status = if disable { "disabled" } else { "enabled" };
         println!("  Job '{}' {}", job.name, status);

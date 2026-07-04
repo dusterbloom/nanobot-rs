@@ -225,6 +225,11 @@ enum SkillsAction {
         /// Skill name to remove
         name: String,
     },
+    /// Search the skills.sh registry for installable skills.
+    Find {
+        /// Search query
+        query: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -240,9 +245,9 @@ enum CronAction {
         /// Job name.
         #[arg(short, long)]
         name: String,
-        /// Message for agent.
+        /// Message for agent (required unless --reflect).
         #[arg(short, long)]
-        message: String,
+        message: Option<String>,
         /// Run every N seconds.
         #[arg(short, long)]
         every: Option<u64>,
@@ -258,6 +263,9 @@ enum CronAction {
         /// Channel for delivery.
         #[arg(long)]
         channel: Option<String>,
+        /// Schedule a memory reflection instead of an agent message.
+        #[arg(long)]
+        reflect: bool,
     },
     /// Remove a scheduled job.
     Remove {
@@ -514,6 +522,26 @@ pub fn run() {
                         std::process::exit(1);
                     }
                 },
+                SkillsAction::Find { query } => {
+                    let query = query.join(" ");
+                    let rt =
+                        tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                    match rt.block_on(cli::cmd_skill_search(&query)) {
+                        Ok(hits) if hits.is_empty() => {
+                            println!("No skills found for \"{}\".", query);
+                        }
+                        Ok(hits) => {
+                            for h in hits.iter().take(10) {
+                                println!("  {:>7} installs  {}@{}", h.installs, h.source, h.skill);
+                            }
+                            println!("\nInstall with: nanobot skills add <source>@<skill>");
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
             }
         }
         Commands::Cron { action } => match action {
@@ -526,7 +554,16 @@ pub fn run() {
                 deliver,
                 to,
                 channel,
-            } => cli::cmd_cron_add(name, message, every, cron, deliver, to, channel),
+                reflect,
+            } => {
+                // CLI flag → enum at the boundary (G1): payload kind, not a bool.
+                let kind = if reflect {
+                    crate::cron::types::PayloadKind::Reflect
+                } else {
+                    crate::cron::types::PayloadKind::AgentTurn
+                };
+                cli::cmd_cron_add(name, message, every, cron, deliver, to, channel, kind)
+            }
             CronAction::Remove { job_id } => cli::cmd_cron_remove(job_id),
             CronAction::Enable { job_id, disable } => cli::cmd_cron_enable(job_id, disable),
         },

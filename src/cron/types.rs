@@ -59,6 +59,39 @@ fn default_payload_kind() -> String {
     "agent_turn".to_string()
 }
 
+/// Parsed payload kind (G1: enum dispatch instead of scattered string
+/// comparisons on `CronPayload::kind`).
+///
+/// The stored `kind` stays a `String` for serde back-compat with existing
+/// job files; parse at the point of execution. Unknown kinds parse to `None`
+/// and are skipped with a warning — never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadKind {
+    /// Inject `payload.message` into the agent as an inbound turn.
+    AgentTurn,
+    /// Run the memory reflector (threshold 0: distill whatever accumulated).
+    Reflect,
+}
+
+impl PayloadKind {
+    /// Parse a stored payload kind string. Unknown kinds return `None`.
+    pub fn parse(kind: &str) -> Option<Self> {
+        match kind {
+            "agent_turn" => Some(Self::AgentTurn),
+            "reflect" => Some(Self::Reflect),
+            _ => None,
+        }
+    }
+
+    /// The canonical string stored in `CronPayload::kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentTurn => "agent_turn",
+            Self::Reflect => "reflect",
+        }
+    }
+}
+
 impl Default for CronPayload {
     fn default() -> Self {
         Self {
@@ -290,6 +323,25 @@ mod tests {
         assert_eq!(payload.kind, "agent_turn");
         assert_eq!(payload.message, "");
         assert!(!payload.deliver);
+    }
+
+    // ── PayloadKind ───────────────────────────────────────────────
+
+    #[test]
+    fn test_payload_kind_parse_known_and_unknown() {
+        assert_eq!(PayloadKind::parse("agent_turn"), Some(PayloadKind::AgentTurn));
+        assert_eq!(PayloadKind::parse("reflect"), Some(PayloadKind::Reflect));
+        // Unknown kinds must parse to None (logged skip downstream, no panic).
+        assert_eq!(PayloadKind::parse("system_event"), None);
+        assert_eq!(PayloadKind::parse(""), None);
+        assert_eq!(PayloadKind::parse("bogus"), None);
+    }
+
+    #[test]
+    fn test_payload_kind_as_str_roundtrip() {
+        for kind in [PayloadKind::AgentTurn, PayloadKind::Reflect] {
+            assert_eq!(PayloadKind::parse(kind.as_str()), Some(kind));
+        }
     }
 
     // ── CronJobState ──────────────────────────────────────────────
