@@ -94,6 +94,7 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
             timeout_secs: config.timeouts.provider_http_secs,
             lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
             constrained_tool_calls: config.agents.defaults.constrained_tool_calls,
+            higgs_session_cache: false,
         });
     }
 
@@ -141,6 +142,7 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
         timeout_secs: config.timeouts.provider_http_secs,
         lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
         constrained_tool_calls: config.agents.defaults.constrained_tool_calls,
+        higgs_session_cache: false,
     })
 }
 
@@ -185,8 +187,10 @@ pub(crate) fn check_api_key(config: &Config) {
         && !has_oauth_credentials()
     {
         eprintln!("Error: No API key configured.");
-        eprintln!("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey");
-        eprintln!("Or authenticate with Claude CLI: claude login");
+        eprintln!(
+            "Set one in ~/.nanobot/config.json, e.g. providers.anthropic.apiKey or providers.openrouter.apiKey"
+        );
+        eprintln!("Or log in with the Claude CLI (`claude login`) to use Claude Max OAuth credentials");
         std::process::exit(1);
     }
 }

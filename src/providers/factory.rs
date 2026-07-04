@@ -34,6 +34,8 @@ pub struct ProviderSpec {
     /// Whether grammar-constrained tool calls are enabled for local backends
     /// (default: true). The config escape hatch sets this false.
     pub constrained_tool_calls: bool,
+    /// Whether to send Higgs' `session_id` extension for cache-resident turns.
+    pub higgs_session_cache: bool,
 }
 
 impl ProviderSpec {
@@ -53,6 +55,7 @@ impl ProviderSpec {
             timeout_secs: 120,
             lms_native_probe_secs: 2,
             constrained_tool_calls: true,
+            higgs_session_cache: false,
         }
     }
 
@@ -71,6 +74,7 @@ impl ProviderSpec {
             timeout_secs: 120,
             lms_native_probe_secs: 2,
             constrained_tool_calls: true,
+            higgs_session_cache: false,
         }
     }
 
@@ -98,6 +102,12 @@ impl ProviderSpec {
         self.constrained_tool_calls = enabled;
         self
     }
+
+    /// Enable Higgs' cache-resident continuation extension for this provider.
+    pub fn with_higgs_session_cache(mut self, enabled: bool) -> Self {
+        self.higgs_session_cache = enabled;
+        self
+    }
 }
 
 /// Create an OpenAI-compatible provider from a spec.
@@ -123,6 +133,7 @@ pub fn create_openai_compat(spec: ProviderSpec) -> Arc<dyn LLMProvider> {
         spec.retry.jit_max_secs,
     );
     prov = prov.with_constrained_tool_calls(spec.constrained_tool_calls);
+    prov = prov.with_higgs_session_cache(spec.higgs_session_cache);
     Arc::new(prov)
 }
 
@@ -295,6 +306,7 @@ mod tests {
             timeout_secs: 120,
             lms_native_probe_secs: 2,
             constrained_tool_calls: true,
+            higgs_session_cache: false,
         };
         let provider = create_openai_compat(spec);
         assert_eq!(provider.get_default_model(), "gpt-4");

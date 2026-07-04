@@ -130,6 +130,7 @@ impl ClusterRouter {
                     timeout_secs: 120,
                     lms_native_probe_secs: 2,
                     constrained_tool_calls: true,
+                    higgs_session_cache: false,
                 };
                 let provider = factory::create_openai_compat(spec);
                 tracing::info!(

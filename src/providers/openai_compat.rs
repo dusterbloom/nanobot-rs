@@ -47,7 +47,12 @@ pub struct OpenAICompatProvider {
     /// requests [`ToolChoice::Required`]. Default `true`; the config escape hatch
     /// (`agents.defaults.constrained_tool_calls = false`) sets it `false`.
     constrained_tool_calls: bool,
+    /// Whether to forward nanobot's internal per-conversation marker as Higgs'
+    /// top-level `session_id` extension. Disabled for every non-Higgs provider.
+    higgs_session_cache: bool,
 }
+
+pub(crate) const NANOBOT_HIGGS_SESSION_ID_FIELD: &str = "_nanobot_higgs_session_id";
 
 /// Normalize Claude model short-names so the API always gets the canonical ID.
 ///
@@ -141,6 +146,7 @@ impl OpenAICompatProvider {
             retry_jit_max_secs: 8,
             lms_native_probe_secs: 2,
             constrained_tool_calls: true,
+            higgs_session_cache: false,
         }
     }
 
@@ -150,6 +156,12 @@ impl OpenAICompatProvider {
     /// escape hatch). No effect on cloud providers.
     pub fn with_constrained_tool_calls(mut self, enabled: bool) -> Self {
         self.constrained_tool_calls = enabled;
+        self
+    }
+
+    /// Enable Higgs' cache-resident continuation extension for this provider.
+    pub fn with_higgs_session_cache(mut self, enabled: bool) -> Self {
+        self.higgs_session_cache = enabled;
         self
     }
 
@@ -272,6 +284,26 @@ fn is_private_ip(url: &str) -> bool {
         }
     }
     false
+}
+
+fn request_messages_and_higgs_session_id(
+    messages: &[serde_json::Value],
+) -> (Vec<serde_json::Value>, Option<u64>) {
+    let mut session_id = None;
+    let cleaned = messages
+        .iter()
+        .map(|msg| {
+            let mut msg = msg.clone();
+            if let Some(obj) = msg.as_object_mut() {
+                let marker = obj.remove(NANOBOT_HIGGS_SESSION_ID_FIELD);
+                if session_id.is_none() {
+                    session_id = marker.and_then(|v| v.as_u64());
+                }
+            }
+            msg
+        })
+        .collect();
+    (cleaned, session_id)
 }
 
 /// Check if a model name indicates thinking/reasoning capability.
@@ -717,11 +749,13 @@ impl OpenAICompatProvider {
 
         let url = format!("{}/chat/completions", self.api_base);
 
+        let (request_messages, higgs_session_id) = request_messages_and_higgs_session_id(messages);
+
         // Inject cache_control breakpoints for Anthropic prompt caching.
         let (cached_msgs, cached_tools) = if self.supports_cache_control(model) {
-            inject_cache_control(messages, tools)
+            inject_cache_control(&request_messages, tools)
         } else {
-            (messages.to_vec(), tools.map(|t| t.to_vec()))
+            (request_messages, tools.map(|t| t.to_vec()))
         };
 
         // Build request body.
@@ -751,6 +785,11 @@ impl OpenAICompatProvider {
         });
         if let Some(tp) = top_p {
             body["top_p"] = serde_json::json!(tp);
+        }
+        if self.higgs_session_cache {
+            if let Some(session_id) = higgs_session_id {
+                body["session_id"] = serde_json::json!(session_id);
+            }
         }
         let supports_thinking = model_supports_thinking(policy_model);
         apply_local_reasoning_controls(
@@ -1018,11 +1057,13 @@ impl LLMProvider for OpenAICompatProvider {
 
         let url = format!("{}/chat/completions", self.api_base);
 
+        let (request_messages, higgs_session_id) = request_messages_and_higgs_session_id(messages);
+
         // Inject cache_control breakpoints for Anthropic prompt caching.
         let (cached_msgs, cached_tools) = if self.supports_cache_control(model) {
-            inject_cache_control(messages, tools)
+            inject_cache_control(&request_messages, tools)
         } else {
-            (messages.to_vec(), tools.map(|t| t.to_vec()))
+            (request_messages, tools.map(|t| t.to_vec()))
         };
 
         // Log message roles for debugging chat template errors from local servers.
@@ -1048,6 +1089,11 @@ impl LLMProvider for OpenAICompatProvider {
         });
         if let Some(tp) = top_p {
             body["top_p"] = serde_json::json!(tp);
+        }
+        if self.higgs_session_cache {
+            if let Some(session_id) = higgs_session_id {
+                body["session_id"] = serde_json::json!(session_id);
+            }
         }
         if is_local_api_base(&self.api_base) {
             // Ask llama.cpp/higgs servers to stream prefill progress
@@ -1773,6 +1819,25 @@ async fn parse_sse_stream(
 mod tests {
     use super::super::base::LLMProvider;
     use super::*;
+
+    #[test]
+    fn test_request_messages_extracts_higgs_session_marker() {
+        let messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "stable prefix",
+                NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+            }),
+            serde_json::json!({"role": "user", "content": "hello"}),
+        ];
+
+        let (cleaned, session_id) = request_messages_and_higgs_session_id(&messages);
+
+        assert_eq!(session_id, Some(42));
+        assert!(cleaned[0].get(NANOBOT_HIGGS_SESSION_ID_FIELD).is_none());
+        assert_eq!(cleaned[0]["content"], serde_json::json!("stable prefix"));
+        assert_eq!(cleaned[1], messages[1]);
+    }
 
     // R1 — Apple FM rejects object schemas missing `required` (HTTP 400, verified
     // live). ensure_required_keys must add `required:[]` recursively while

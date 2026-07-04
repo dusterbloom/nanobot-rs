@@ -188,6 +188,7 @@ impl AgentLoop {
                         timeout_secs: 120,
                         lms_native_probe_secs: 2,
                         constrained_tool_calls: true,
+                        higgs_session_cache: false,
                     },
                 );
             Arc::new(ContextCompactor::new(

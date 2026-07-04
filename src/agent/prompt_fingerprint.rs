@@ -59,6 +59,21 @@ pub fn fingerprint(messages: &[Value]) -> PromptFingerprint {
     }
 }
 
+/// Hash the tool-definition array actually sent to the provider.
+///
+/// Unlike [`fingerprint`], this DOES track tool schemas, because chat templates
+/// render the tool block into the token stream (often at the prompt head), so a
+/// changing tool block busts the prefix cache even when messages are append-only.
+/// Use this alongside the message fingerprint to catch that case.
+pub fn hash_tools(tools: &[Value]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for t in tools {
+        // Serialized form is what reaches the template; hash exactly that.
+        t.to_string().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Classify the new fingerprint against the session's previous one.
 pub fn compare(prev: Option<&PromptFingerprint>, new: &PromptFingerprint) -> PromptDelta {
     let Some(prev) = prev else {
