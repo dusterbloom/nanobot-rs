@@ -12,7 +12,7 @@
 //! beneath each turn. The async event loop lives in `mod.rs`; this file is pure
 //! state + rendering with no terminal I/O, which keeps it unit-testable.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -64,13 +64,26 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/sessions", "resume a past session"),
     ("/clear", "clear the transcript"),
     ("/voice", "toggle voice mode"),
-    ("/skill", "run a skill"),
+    ("/skill", "manage skills (list, find, add)"),
+    ("/learn", "distill sessions into memory now"),
     ("/agents", "list running subagents"),
+    ("/memory", "show working memory"),
+    ("/replay", "show session history"),
+    ("/audit", "tool audit log"),
+    ("/verify", "verify audit hash chain"),
+    ("/kill", "cancel a subagent by id"),
+    ("/stop", "stop background channels"),
+    ("/long", "toggle long-output mode"),
+    ("/ctx", "context management"),
+    ("/lane", "switch policy lane"),
+    ("/lcm", "lossless context management"),
+    ("/trio", "trio routing status"),
     ("/provenance", "tool provenance log"),
     ("/cluster", "cluster peers"),
     ("/restart", "restart the local server"),
     ("/whatsapp", "WhatsApp channel"),
     ("/telegram", "Telegram channel"),
+    ("/email", "email channel"),
     ("/help", "keys & commands"),
     ("/quit", "exit nanobot"),
 ];
@@ -1276,16 +1289,23 @@ impl App {
                     *m = ms;
                 }
             }
-            None => self.transcript.push(Cell::Tool {
-                id: id.to_string(),
-                name: name.to_string(),
-                args: String::new(),
-                state,
-                summary,
-                output,
-                preview: None,
-                ms,
-            }),
+            None => {
+                // Orphan CallEnd (no prior CallStart). Keep the invariant that
+                // the live activity row is always the transcript tail — pushing
+                // the tool below it would strand the activity mid-transcript,
+                // animating forever on the shared turn timer.
+                self.remove_trailing_activity();
+                self.transcript.push(Cell::Tool {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    args: String::new(),
+                    state,
+                    summary,
+                    output,
+                    preview: None,
+                    ms,
+                });
+            }
         }
         if self.streaming {
             self.upsert_activity(ActivityPhase::Decoding, None);
@@ -2230,25 +2250,12 @@ fn normalize_image_path(raw: &str) -> Option<String> {
     if !has_image_extension(pathish) {
         return None;
     }
-    let expanded = expand_home(pathish);
-    let path = Path::new(&expanded);
+    let path = crate::utils::helpers::expand_tilde(pathish);
     if !path.is_file() {
         return None;
     }
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
     Some(canonical.to_string_lossy().to_string())
-}
-
-fn expand_home(path: &str) -> String {
-    if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }
 
 fn has_image_extension(path: &str) -> bool {
@@ -2325,17 +2332,14 @@ fn clip(s: &str, _max: usize) -> String {
     s.to_string()
 }
 
+/// The activity spinner: the brand quadrant-pair rotating in place.
+/// `▞ ▐ ▚ ▌` — every adjacent frame shares exactly one quadrant with the
+/// next, so the mark reads as one shape rotating clockwise rather than
+/// four unrelated glyphs. The cycle passes through the brand `▞` once per
+/// revolution. Driven by elapsed time so it stays smooth between ticks.
 fn activity_marker(elapsed_s: f32) -> String {
-    // A single mark sweeping back and forth across a 3-cell track — one coherent
-    // motion, with no duplicate adjacent frames like the old wobble (which
-    // repeated `▞▞` on frames 1 and 3 and so encoded nothing). Driven by elapsed
-    // time so it stays smooth between animation ticks.
-    match ((elapsed_s * 6.0) as usize) % 4 {
-        0 => format!("{BRAND}  "),
-        1 => format!(" {BRAND} "),
-        2 => format!("  {BRAND}"),
-        _ => format!(" {BRAND} "),
-    }
+    const FRAMES: [&str; 4] = ["\u{259e}", "\u{2590}", "\u{259a}", "\u{258c}"]; // ▞ ▐ ▚ ▌
+    FRAMES[((elapsed_s * 6.0) as usize) % 4].to_string()
 }
 
 fn cell_consumes_assistant_mark(cell: &Cell) -> bool {
@@ -4058,6 +4062,44 @@ mod tests {
     }
 
     #[test]
+    fn orphan_tool_callend_does_not_strand_activity_row() {
+        let mut app = App::new();
+        app.begin_turn("run it");
+        app.on_delta("\u{0}prefill:5/10"); // live prefill activity row at the tail
+
+        // A CallEnd with no prior CallStart (e.g. an agent-side rejection)
+        // must not push its tool row below the activity row — that stranded
+        // the activity mid-transcript, animating forever on the turn timer.
+        app.on_tool_event(ToolEvent::CallEnd {
+            tool_name: "exec".into(),
+            tool_call_id: "orphan-1".into(),
+            result_data: "response boundary: exec was not executed".into(),
+            ok: false,
+            duration_ms: 0,
+        });
+
+        let activity_positions: Vec<usize> = app
+            .transcript
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, Cell::Activity { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            activity_positions.len() <= 1,
+            "at most one live activity row, found {}",
+            activity_positions.len()
+        );
+        if let Some(&i) = activity_positions.first() {
+            assert_eq!(
+                i,
+                app.transcript.len() - 1,
+                "the activity row must be the transcript tail"
+            );
+        }
+    }
+
+    #[test]
     fn tool_callend_updates_matching_cell_in_place() {
         let mut app = App::new();
         app.begin_turn("go");
@@ -4621,6 +4663,43 @@ mod tests {
         assert!(
             footer.contains("working"),
             "streaming status missing from footer: {footer}"
+        );
+    }
+
+    #[test]
+    fn slash_autocomplete_covers_dispatchable_commands() {
+        // Every command the shared REPL dispatcher handles must be
+        // discoverable from the TUI's `/` popup — hidden-but-working
+        // commands are the bug this pins down. /mode and /quit are
+        // TUI-native extras on top of this set.
+        // ponytail: list duplicated from dispatch() by hand; a data-driven
+        // command registry would make this parity structural.
+        const REQUIRED: &[&str] = &[
+            "/model", "/local", "/think", "/nothink", "/status", "/context",
+            "/memory", "/sessions", "/clear", "/skill", "/learn", "/agents",
+            "/audit", "/verify", "/replay", "/kill", "/stop", "/long", "/ctx",
+            "/provenance", "/lane", "/lcm", "/trio", "/email", "/whatsapp",
+            "/telegram", "/cluster", "/restart", "/help",
+        ];
+        let names: Vec<&str> = SLASH_COMMANDS.iter().map(|(n, _)| *n).collect();
+        for cmd in REQUIRED {
+            assert!(names.contains(cmd), "{cmd} missing from SLASH_COMMANDS");
+        }
+    }
+
+    #[test]
+    fn activity_marker_rotates_through_distinct_frames() {
+        // Sample the middle of each of the four frame windows.
+        let frames: Vec<String> = (0..4)
+            .map(|i| activity_marker((i as f32 + 0.5) / 6.0))
+            .collect();
+        let unique: std::collections::HashSet<&String> = frames.iter().collect();
+        assert_eq!(unique.len(), 4, "all rotation frames must be distinct");
+        assert_eq!(frames[0], "\u{259e}", "cycle starts on the brand ▞");
+        assert_eq!(
+            activity_marker(4.5 / 6.0),
+            frames[0],
+            "rotation must repeat after a full cycle"
         );
     }
 
