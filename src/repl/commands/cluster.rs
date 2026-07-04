@@ -332,12 +332,32 @@ impl ReplContext {
                 Ok(()) => println!("\n  Removed skill: {}\n", name),
                 Err(e) => println!("\n  Error: {}\n", e),
             },
+            ["find", query @ ..] | ["search", query @ ..] if !query.is_empty() => {
+                let query = query.join(" ");
+                match cli::cmd_skill_search(&query).await {
+                    Ok(hits) if hits.is_empty() => {
+                        println!("\n  No skills found for \"{}\".\n", query);
+                    }
+                    Ok(hits) => {
+                        println!("\n  Skills matching \"{}\" (skills.sh):\n", query);
+                        for h in hits.iter().take(10) {
+                            println!(
+                                "    {:>7} installs  {}@{}",
+                                h.installs, h.source, h.skill
+                            );
+                        }
+                        println!("\n  Install with: /skill add <source>@<skill>\n");
+                    }
+                    Err(e) => println!("\n  Error: {}\n", e),
+                }
+            }
             _ => {
                 println!(
                     "
   Usage: /skill [subcommand]
     /skill              List installed skills
     /skill list         List installed skills
+    /skill find <q>     Search the skills.sh registry
     /skill add <src>    Install from GitHub (owner/repo or owner/repo@skill)
     /skill remove <n>   Remove a skill by name
 "

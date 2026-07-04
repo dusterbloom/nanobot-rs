@@ -1,12 +1,22 @@
-//! Skill management -- install from GitHub and remove.
+//! Skill management -- search (skills.sh), install from GitHub, and remove.
+
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("nanobot")
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))
+}
 
 /// Install skills from a GitHub repository.
 ///
 /// `source` can be:
-/// - `owner/repo`         -- install all skills found in the repo's `skills/` dir
+/// - `owner/repo`         -- install all skills found in the repo
 /// - `owner/repo@skill`   -- install a specific skill by name
 ///
-/// Skills are saved to `{workspace}/skills/{name}/SKILL.md`.
+/// Skill locations are discovered via the git trees API, so any repo layout
+/// works (`skills/{name}/SKILL.md`, `skills/.curated/{name}/SKILL.md`, root
+/// `SKILL.md`, ...). Skills are saved to `{workspace}/skills/{name}/SKILL.md`.
 pub(crate) async fn cmd_skill_add(
     workspace: &std::path::Path,
     source: &str,
@@ -27,34 +37,32 @@ pub(crate) async fn cmd_skill_add(
     }
     let (owner, repo_name) = (parts[0], parts[1]);
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("nanobot")
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let client = http_client()?;
+    let found = find_repo_skills(&client, owner, repo_name).await?;
+    if found.is_empty() {
+        return Err(format!("No SKILL.md files found in {owner}/{repo_name}"));
+    }
+
+    let selected: Vec<&(String, String)> = match specific_skill {
+        Some(name) => {
+            let hit = found
+                .iter()
+                .find(|(n, _)| n == name)
+                .ok_or_else(|| format!("Skill '{name}' not found in {owner}/{repo_name}"))?;
+            vec![hit]
+        }
+        None => found.iter().collect(),
+    };
 
     let mut installed: Vec<String> = Vec::new();
-
-    if let Some(skill_name) = specific_skill {
-        // Install a specific skill
-        let content = fetch_skill_md(&client, owner, repo_name, skill_name).await?;
-        save_skill(workspace, skill_name, &content)?;
-        installed.push(skill_name.to_string());
-    } else {
-        // List skills/ directory in the repo
-        let skills = list_repo_skills(&client, owner, repo_name).await?;
-        if skills.is_empty() {
-            return Err(format!("No skills found in {owner}/{repo_name}/skills/"));
-        }
-        for skill_name in &skills {
-            match fetch_skill_md(&client, owner, repo_name, skill_name).await {
-                Ok(content) => {
-                    save_skill(workspace, skill_name, &content)?;
-                    installed.push(skill_name.clone());
-                }
-                Err(e) => {
-                    eprintln!("  Skipping {skill_name}: {e}");
-                }
+    for (name, path) in selected {
+        match fetch_raw_file(&client, owner, repo_name, path).await {
+            Ok(content) => {
+                save_skill(workspace, name, &content)?;
+                installed.push(name.clone());
+            }
+            Err(e) => {
+                eprintln!("  Skipping {name}: {e}");
             }
         }
     }
@@ -62,80 +70,113 @@ pub(crate) async fn cmd_skill_add(
     Ok(installed)
 }
 
-/// Fetch SKILL.md content for a specific skill from a GitHub repo.
-async fn fetch_skill_md(
-    client: &reqwest::Client,
-    owner: &str,
-    repo: &str,
-    skill_name: &str,
-) -> Result<String, String> {
-    // Try raw.githubusercontent.com (no API rate limits, no auth needed)
-    // Try multiple common paths: skills/{name}/SKILL.md, then root SKILL.md
-    let paths = [
-        format!(
-            "https://raw.githubusercontent.com/{owner}/{repo}/HEAD/skills/{skill_name}/SKILL.md"
-        ),
-        format!(
-            "https://raw.githubusercontent.com/{owner}/{repo}/main/skills/{skill_name}/SKILL.md"
-        ),
-        format!(
-            "https://raw.githubusercontent.com/{owner}/{repo}/master/skills/{skill_name}/SKILL.md"
-        ),
-    ];
-
-    for url in &paths {
-        match client.get(url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                return resp
-                    .text()
-                    .await
-                    .map_err(|e| format!("Failed to read response: {e}"));
-            }
-            _ => continue,
-        }
-    }
-
-    Err(format!(
-        "SKILL.md not found for '{skill_name}' in {owner}/{repo}"
-    ))
+/// A skill found on the skills.sh registry.
+pub(crate) struct SkillHit {
+    /// GitHub `owner/repo` the skill lives in.
+    pub source: String,
+    /// Skill name within the repo (install as `source@skill`).
+    pub skill: String,
+    /// Registry install count (popularity signal).
+    pub installs: u64,
 }
 
-/// List skill directories in a GitHub repo's skills/ folder via the GitHub API.
-async fn list_repo_skills(
+/// Search the skills.sh registry (the agentskills.io ecosystem index).
+pub(crate) async fn cmd_skill_search(query: &str) -> Result<Vec<SkillHit>, String> {
+    let client = http_client()?;
+    let resp = client
+        .get("https://skills.sh/api/search")
+        .query(&[("q", query)])
+        .send()
+        .await
+        .map_err(|e| format!("skills.sh request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("skills.sh returned {}", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse skills.sh response: {e}"))?;
+    Ok(parse_skill_search(&body))
+}
+
+fn parse_skill_search(body: &serde_json::Value) -> Vec<SkillHit> {
+    let Some(skills) = body.get("skills").and_then(|s| s.as_array()) else {
+        return Vec::new();
+    };
+    skills
+        .iter()
+        .filter_map(|s| {
+            Some(SkillHit {
+                source: s.get("source")?.as_str()?.to_string(),
+                skill: s.get("skillId")?.as_str()?.to_string(),
+                installs: s.get("installs").and_then(|i| i.as_u64()).unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+/// Find every skill in a repo as `(name, path-to-SKILL.md)`, via the git
+/// trees API (one request, any directory layout, any default branch).
+async fn find_repo_skills(
     client: &reqwest::Client,
     owner: &str,
     repo: &str,
-) -> Result<Vec<String>, String> {
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/contents/skills");
+) -> Result<Vec<(String, String)>, String> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1");
     let resp = client
         .get(&url)
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
         .map_err(|e| format!("GitHub API request failed: {e}"))?;
-
     if !resp.status().is_success() {
-        return Err(format!(
-            "GitHub API returned {} for {owner}/{repo}/skills/",
-            resp.status()
-        ));
+        return Err(format!("GitHub API returned {} for {owner}/{repo}", resp.status()));
     }
-
-    let entries: Vec<serde_json::Value> = resp
+    let body: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| format!("Failed to parse GitHub API response: {e}"))?;
 
     let mut skills = Vec::new();
-    for entry in &entries {
-        if entry.get("type").and_then(|v| v.as_str()) == Some("dir") {
-            if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
-                skills.push(name.to_string());
-            }
+    for entry in body.get("tree").and_then(|t| t.as_array()).unwrap_or(&Vec::new()) {
+        let Some(path) = entry.get("path").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        if let Some(name) = skill_name_from_path(path, repo) {
+            skills.push((name.to_string(), path.to_string()));
         }
     }
-
     Ok(skills)
+}
+
+/// The skill name is the directory containing SKILL.md; a root-level
+/// SKILL.md takes the repo name. Non-SKILL.md paths yield `None`.
+fn skill_name_from_path<'a>(path: &'a str, repo: &'a str) -> Option<&'a str> {
+    match path.strip_suffix("/SKILL.md") {
+        Some(dir) => Some(dir.rsplit('/').next().unwrap_or(dir)),
+        None if path == "SKILL.md" => Some(repo),
+        None => None,
+    }
+}
+
+async fn fetch_raw_file(
+    client: &reqwest::Client,
+    owner: &str,
+    repo: &str,
+    path: &str,
+) -> Result<String, String> {
+    let url = format!("https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{path}");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
+    resp.text()
+        .await
+        .map_err(|e| format!("Failed to read response: {e}"))
 }
 
 /// Save a SKILL.md to the workspace skills directory.
@@ -160,4 +201,42 @@ pub(crate) fn cmd_skill_remove(workspace: &std::path::Path, name: &str) -> Resul
     std::fs::remove_dir_all(&skill_dir)
         .map_err(|e| format!("Failed to remove skill '{}': {e}", name))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_skill_search_extracts_hits() {
+        let body = json!({
+            "query": "pdf",
+            "skills": [
+                {"id": "openai/skills/pdf", "skillId": "pdf", "name": "pdf",
+                 "installs": 9254, "source": "openai/skills"},
+                {"skillId": "broken-no-source", "installs": 1},
+            ]
+        });
+        let hits = parse_skill_search(&body);
+        assert_eq!(hits.len(), 1, "entries missing fields are skipped");
+        assert_eq!(hits[0].source, "openai/skills");
+        assert_eq!(hits[0].skill, "pdf");
+        assert_eq!(hits[0].installs, 9254);
+        assert!(parse_skill_search(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn skill_name_from_path_handles_all_layouts() {
+        assert_eq!(
+            skill_name_from_path("skills/pdf/SKILL.md", "repo"),
+            Some("pdf")
+        );
+        assert_eq!(
+            skill_name_from_path("skills/.curated/cli-creator/SKILL.md", "repo"),
+            Some("cli-creator")
+        );
+        assert_eq!(skill_name_from_path("SKILL.md", "my-skill"), Some("my-skill"));
+        assert_eq!(skill_name_from_path("README.md", "repo"), None);
+    }
 }

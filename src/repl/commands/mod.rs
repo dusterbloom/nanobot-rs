@@ -887,6 +887,9 @@ impl ReplContext {
             "/memory" => {
                 self.cmd_memory();
             }
+            "/learn" | "/reflect" => {
+                self.cmd_learn().await;
+            }
             "/agents" => {
                 self.cmd_agents().await;
             }
@@ -953,7 +956,7 @@ impl ReplContext {
                 self.cmd_cluster(arg).await;
             }
             "/lcm" => {
-                self.cmd_lcm();
+                self.cmd_lcm(arg);
             }
             "/skill" | "/skills" => {
                 self.cmd_skill(arg).await;

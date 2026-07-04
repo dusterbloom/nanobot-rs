@@ -766,6 +766,7 @@ pub(crate) fn print_help() {
     println!("  /status, /s     - Show current mode, model, and channel info");
     println!("  /context        - Show context breakdown (tokens, messages, memory)");
     println!("  /memory         - Show working memory for current session");
+    println!("  /learn          - Distill accumulated sessions into MEMORY.md now");
     println!("  /clear, /c      - Clear working memory for current session");
     println!("  /replay         - Show session message history (/replay full | /replay N)");
     println!("  /restart, /rd   - Restart local servers (or delegation in cloud mode)");
@@ -774,7 +775,7 @@ pub(crate) fn print_help() {
     println!("  /verify         - Re-verify claims in last response");
     println!("  /provenance     - Toggle provenance display on/off");
     println!("  /cluster, /cl   - Show cluster peers, models, and routing status");
-    println!("  /skill, /sk     - Manage skills (list, add, remove)");
+    println!("  /skill, /sk     - Manage skills (list, find, add, remove)");
     println!("  /help, /h       - Show this help");
     println!("  Ctrl+C          - Exit\n");
 }

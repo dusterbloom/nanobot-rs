@@ -145,12 +145,67 @@ impl ReplContext {
     }
 
     /// /lcm — toggle Lossless Context Management on/off.
-    pub(super) fn cmd_lcm(&self) {
-        let enabled = self.agent_loop.toggle_lcm();
-        if enabled {
-            println!("\n  LCM \x1b[32menabled\x1b[0m — compaction active.\n");
-        } else {
-            println!("\n  LCM \x1b[33mdisabled\x1b[0m.\n");
+    /// /lcm stats — show compaction statistics without toggling.
+    pub(super) fn cmd_lcm(&self, arg: &str) {
+        match LcmAction::parse(arg) {
+            LcmAction::Toggle => {
+                let enabled = self.agent_loop.toggle_lcm();
+                if enabled {
+                    println!("\n  LCM \x1b[32menabled\x1b[0m — compaction active.\n");
+                } else {
+                    println!("\n  LCM \x1b[33mdisabled\x1b[0m.\n");
+                }
+            }
+            LcmAction::Stats => {
+                println!("{}", format_lcm_stats(&self.gather_lcm_stats()));
+            }
+            LcmAction::Usage => {
+                println!("\n  Usage: /lcm [stats]\n");
+            }
+        }
+    }
+
+    /// Snapshot the LCM counters for display.
+    fn gather_lcm_stats(&self) -> LcmStats {
+        use crate::agent::agent_core::RuntimeCounters;
+
+        let counters = &self.core_handle.counters;
+        let last_ms = counters.lcm_last_compaction_ms.load(Ordering::Relaxed);
+        let last_secs_ago = (last_ms > 0)
+            .then(|| RuntimeCounters::now_epoch_ms().saturating_sub(last_ms) / 1000);
+        LcmStats {
+            enabled: self.agent_loop.lcm_enabled(),
+            compactions: counters.lcm_compaction_count.load(Ordering::Relaxed),
+            tokens_before: counters.lcm_tokens_before.load(Ordering::Relaxed),
+            tokens_after: counters.lcm_tokens_after.load(Ordering::Relaxed),
+            last_secs_ago,
+        }
+    }
+
+    /// /learn — trigger a reflection pass now: distill accumulated working
+    /// sessions and observations into MEMORY.md (and the knowledge graph)
+    /// without waiting for the token threshold or session exit.
+    pub(super) async fn cmd_learn(&self) {
+        let core = self.core_handle.swappable();
+        if !core.memory_enabled {
+            println!("\n  Memory system is disabled.\n");
+            return;
+        }
+        // threshold=0: reflect whenever there is any accumulated content.
+        let reflector = crate::agent::reflector::Reflector::new(
+            core.memory_provider.clone(),
+            core.memory_model.clone(),
+            &core.workspace,
+            0,
+        );
+        if !reflector.should_reflect() {
+            println!("\n  Nothing to learn yet — no working sessions or observations accumulated.\n");
+            return;
+        }
+        println!("\n  Reflecting on accumulated sessions...");
+        match reflector.reflect().await {
+            Ok(()) => println!("  Learned. MEMORY.md updated.\n"),
+            Err(e) => println!("  Reflection failed: {}\n", e),
         }
     }
 
@@ -445,5 +500,105 @@ impl ReplContext {
                 tui::RESET
             );
         }
+    }
+}
+
+/// What `/lcm <arg>` should do.
+#[derive(Debug, PartialEq)]
+enum LcmAction {
+    /// No argument — flip LCM on/off (existing behavior).
+    Toggle,
+    /// `stats` — display counters, never toggles.
+    Stats,
+    /// Anything else — show usage, never toggles.
+    Usage,
+}
+
+impl LcmAction {
+    fn parse(arg: &str) -> Self {
+        match arg.trim() {
+            "" => Self::Toggle,
+            "stats" => Self::Stats,
+            _ => Self::Usage,
+        }
+    }
+}
+
+/// Snapshot of session LCM compaction statistics for display.
+struct LcmStats {
+    enabled: bool,
+    compactions: u64,
+    tokens_before: u64,
+    tokens_after: u64,
+    last_secs_ago: Option<u64>,
+}
+
+/// Render LCM stats for the terminal. Pure — unit-tested below.
+fn format_lcm_stats(stats: &LcmStats) -> String {
+    let state = if stats.enabled {
+        "\x1b[32menabled\x1b[0m"
+    } else {
+        "\x1b[33mdisabled\x1b[0m"
+    };
+    let mut out = format!("\n  LCM {}\n", state);
+
+    if stats.compactions == 0 {
+        out.push_str("  No compactions this session.\n");
+        return out;
+    }
+
+    let saved = stats.tokens_before.saturating_sub(stats.tokens_after);
+    out.push_str(&format!(
+        "  Compactions this session: {}\n  Tokens: {} → {} (saved {})\n",
+        stats.compactions, stats.tokens_before, stats.tokens_after, saved
+    ));
+    if let Some(secs) = stats.last_secs_ago {
+        out.push_str(&format!("  Last compaction: {}s ago\n", secs));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lcm_action_parse() {
+        assert_eq!(LcmAction::parse(""), LcmAction::Toggle);
+        assert_eq!(LcmAction::parse("stats"), LcmAction::Stats);
+        assert_eq!(LcmAction::parse(" stats "), LcmAction::Stats);
+        // Unknown args must not toggle — they fall through to usage.
+        assert_eq!(LcmAction::parse("bogus"), LcmAction::Usage);
+    }
+
+    #[test]
+    fn test_format_lcm_stats_zero_compactions() {
+        let s = format_lcm_stats(&LcmStats {
+            enabled: false,
+            compactions: 0,
+            tokens_before: 0,
+            tokens_after: 0,
+            last_secs_ago: None,
+        });
+        assert!(s.contains("disabled"));
+        assert!(s.to_lowercase().contains("no compactions"));
+        assert!(!s.to_lowercase().contains("last compaction"));
+    }
+
+    #[test]
+    fn test_format_lcm_stats_with_compactions() {
+        let s = format_lcm_stats(&LcmStats {
+            enabled: true,
+            compactions: 3,
+            tokens_before: 45000,
+            tokens_after: 12000,
+            last_secs_ago: Some(42),
+        });
+        assert!(s.contains("enabled"));
+        assert!(s.contains('3'));
+        assert!(s.contains("45000"));
+        assert!(s.contains("12000"));
+        assert!(s.contains("33000"), "should show tokens saved: {}", s);
+        assert!(s.contains("42s"));
     }
 }
