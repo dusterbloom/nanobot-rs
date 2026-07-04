@@ -18,6 +18,7 @@ pub(crate) mod capabilities;
 pub(crate) mod circuit_breaker;
 pub mod compaction;
 pub(crate) mod context;
+pub(crate) mod continuity;
 pub mod context_gate;
 pub(crate) mod context_hygiene;
 pub(crate) mod context_store;

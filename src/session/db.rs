@@ -126,6 +126,17 @@ pub struct SearchResult {
     pub rank: f64,
 }
 
+/// The final user/assistant exchange of a past session, used for
+/// cross-session continuity (prompt injection and `recall mode=latest`).
+#[derive(Debug, Clone)]
+pub struct SessionTail {
+    pub session_id: String,
+    pub session_key: String,
+    pub updated_at: DateTime<Utc>,
+    pub last_user: String,
+    pub last_assistant: String,
+}
+
 /// UI/workspace state restored when the TUI resumes a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -708,6 +719,56 @@ impl SessionDb {
                 Vec::new()
             }
         }
+    }
+
+    /// Return the last user/assistant exchange of the `n` most recently
+    /// updated sessions, excluding `exclude_session_id` and sessions without
+    /// any real (non-synthetic, non-empty) user or assistant message.
+    ///
+    /// Deterministic, pure SQL — ordered by `updated_at` descending.
+    pub async fn latest_session_tails(
+        &self,
+        exclude_session_id: &str,
+        n: usize,
+    ) -> Vec<SessionTail> {
+        const SQL: &str = "\
+            SELECT * FROM ( \
+                SELECT s.id, s.session_key, s.updated_at, \
+                    (SELECT m.content FROM messages m \
+                     WHERE m.session_id = s.id AND m.role = 'user' \
+                       AND m.synthetic = 0 AND m.content IS NOT NULL AND m.content != '' \
+                     ORDER BY m.id DESC LIMIT 1) AS last_user, \
+                    (SELECT m.content FROM messages m \
+                     WHERE m.session_id = s.id AND m.role = 'assistant' \
+                       AND m.synthetic = 0 AND m.content IS NOT NULL AND m.content != '' \
+                     ORDER BY m.id DESC LIMIT 1) AS last_assistant \
+                FROM sessions s WHERE s.id != ?1 \
+                ORDER BY s.updated_at DESC \
+            ) WHERE last_user IS NOT NULL OR last_assistant IS NOT NULL \
+            LIMIT ?2";
+
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(SQL) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("latest_session_tails prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+        stmt.query_map(params![exclude_session_id, n as i64], |row| {
+            let updated_str: String = row.get(2)?;
+            Ok(SessionTail {
+                session_id: row.get(0)?,
+                session_key: row.get(1)?,
+                updated_at: DateTime::parse_from_rfc3339(&updated_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                last_user: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                last_assistant: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
     }
 
     pub async fn rebuild_fts_index(&self) {
@@ -1524,6 +1585,99 @@ mod tests {
         assert_eq!(text1, "Summary of technical discussion.");
         assert_eq!(*tokens1, 12);
         assert_eq!(*level1, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // latest_session_tails
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_latest_session_tails_empty_db() {
+        let (db, _dir) = make_db();
+        let tails = db.latest_session_tails("nonexistent", 3).await;
+        assert!(tails.is_empty(), "empty db must yield no tails");
+    }
+
+    #[tokio::test]
+    async fn test_latest_session_tails_picks_most_recent() {
+        let (db, _dir) = make_db();
+
+        let older = db.create_session("cli:oneshot-1").await;
+        db.add_messages(
+            &older.id,
+            &[
+                json!({"role": "user", "content": "old question"}),
+                json!({"role": "assistant", "content": "old answer"}),
+            ],
+        )
+        .await;
+
+        let newer = db.create_session("cli:oneshot-2").await;
+        db.add_messages(
+            &newer.id,
+            &[
+                json!({"role": "user", "content": "new question"}),
+                json!({"role": "assistant", "content": "new answer"}),
+            ],
+        )
+        .await;
+
+        let tails = db.latest_session_tails("some-other-id", 1).await;
+        assert_eq!(tails.len(), 1);
+        assert_eq!(tails[0].session_key, "cli:oneshot-2");
+        assert_eq!(tails[0].last_user, "new question");
+        assert_eq!(tails[0].last_assistant, "new answer");
+
+        // With n=2, both come back, most recent first.
+        let tails = db.latest_session_tails("some-other-id", 2).await;
+        assert_eq!(tails.len(), 2);
+        assert_eq!(tails[0].session_key, "cli:oneshot-2");
+        assert_eq!(tails[1].session_key, "cli:oneshot-1");
+    }
+
+    #[tokio::test]
+    async fn test_latest_session_tails_excludes_current_session() {
+        let (db, _dir) = make_db();
+
+        let prior = db.create_session("cli:oneshot-prior").await;
+        db.add_messages(
+            &prior.id,
+            &[
+                json!({"role": "user", "content": "prior question"}),
+                json!({"role": "assistant", "content": "prior answer"}),
+            ],
+        )
+        .await;
+
+        let current = db.create_session("cli:oneshot-current").await;
+        db.add_message(&current.id, &json!({"role": "user", "content": "hello"}))
+            .await;
+
+        let tails = db.latest_session_tails(&current.id, 3).await;
+        assert_eq!(tails.len(), 1, "current session must be excluded");
+        assert_eq!(tails[0].session_key, "cli:oneshot-prior");
+    }
+
+    #[tokio::test]
+    async fn test_latest_session_tails_skips_empty_sessions() {
+        let (db, _dir) = make_db();
+
+        // A session with content, then a newer session with no messages at all
+        // (e.g. created but crashed before the first exchange).
+        let real = db.create_session("cli:real").await;
+        db.add_messages(
+            &real.id,
+            &[
+                json!({"role": "user", "content": "real question"}),
+                json!({"role": "assistant", "content": "real answer"}),
+            ],
+        )
+        .await;
+        let _empty = db.create_session("cli:empty").await;
+
+        let tails = db.latest_session_tails("other", 3).await;
+        assert_eq!(tails.len(), 1, "message-less sessions must be skipped");
+        assert_eq!(tails[0].session_key, "cli:real");
     }
 
     #[tokio::test]

@@ -211,6 +211,7 @@ impl AgentLoop {
             aha_rx: Arc::new(Mutex::new(aha_rx)),
             aha_tx,
             session_policies: Arc::new(Mutex::new(HashMap::new())),
+            continuity_notes: Arc::new(Mutex::new(HashMap::new())),
             lcm_engines: Arc::new(Mutex::new(HashMap::new())),
             lcm_enabled: AtomicBool::new(lcm_config.is_enabled()),
             lcm_config,

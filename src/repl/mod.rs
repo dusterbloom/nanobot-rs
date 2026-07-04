@@ -1966,6 +1966,12 @@ pub(crate) fn cmd_agent(
             srv.shutdown();
         } else {
             // Interactive REPL mode.
+            // Catch-up session indexing at startup — same reconciliation the
+            // exit path runs, so sessions from crashed runs become searchable
+            // via recall. Already-indexed sessions are skipped (idempotent);
+            // spawn_blocking keeps the fs work off the first-prompt path.
+            tokio::task::spawn_blocking(index_sessions_background);
+
             // Splash and LMS detection already happened above (before core build).
             // Skip for MLX/oMLX local — already printed banner above.
             if (needs_lms || !is_local) && (!is_local || has_remote_local) && show_splash {

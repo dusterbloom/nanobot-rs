@@ -367,7 +367,9 @@ impl ToolRegistry {
             self.register(Box::new(BrowserTool::new(config.max_tool_result_chars)));
         }
         if should_include("recall") {
-            self.register(Box::new(RecallTool::new(&config.workspace)));
+            self.register(Box::new(
+                RecallTool::new(&config.workspace).with_db(config.db_path.clone()),
+            ));
         }
         if should_include("remember") {
             self.register(Box::new(RememberTool::new(config.workspace.clone())));

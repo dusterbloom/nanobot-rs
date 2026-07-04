@@ -123,6 +123,21 @@ fn local_tail_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Append the previous-session continuity note to the system message.
+///
+/// Callers must pass the SAME note on every turn of a session (it is cached
+/// per session key) so the system prompt stays byte-identical and the prompt
+/// prefix remains append-only across turns.
+fn append_continuity_to_system(messages: &mut [serde_json::Value], note: &str) {
+    let Some(first) = messages.first_mut() else {
+        return;
+    };
+    let Some(content) = first.get("content").and_then(|v| v.as_str()) else {
+        return;
+    };
+    first["content"] = json!(format!("{content}\n\n## Previous Session\n{note}"));
+}
+
 fn apply_session_prompt_epoch(messages: &mut [serde_json::Value], epoch: u64) {
     if epoch == 0 {
         return;
@@ -137,6 +152,32 @@ fn apply_session_prompt_epoch(messages: &mut [serde_json::Value], epoch: u64) {
 }
 
 impl AgentLoopShared {
+    /// Resolve the previous-session continuity note for this session.
+    ///
+    /// Computed exactly once per session key (on its first turn): a FRESH
+    /// session (no prior history) gets a one-line tail of the most recent
+    /// other session; a resumed session gets `None`. Later turns replay the
+    /// cached value so the injected system prompt stays byte-identical.
+    async fn session_continuity_note(
+        &self,
+        core: &Arc<SwappableCore>,
+        session_key: &str,
+        session_id: &str,
+        prior_history_len: usize,
+    ) -> Option<String> {
+        use crate::agent::continuity::{classify_session_start, continuity_note};
+
+        let mut notes = self.continuity_notes.lock().await;
+        if let Some(cached) = notes.get(session_key) {
+            return cached.clone();
+        }
+        let start = classify_session_start(prior_history_len);
+        let tails = core.sessions.latest_session_tails(session_id, 1).await;
+        let note = continuity_note(start, tails.first(), chrono::Utc::now());
+        notes.insert(session_key.to_string(), note.clone());
+        note
+    }
+
     pub(crate) async fn build_local_runtime_blocks(
         &self,
         core: &Arc<SwappableCore>,
@@ -635,6 +676,16 @@ impl AgentLoopShared {
             }
         }
 
+        // Previous-session continuity: a fresh session's first turn resolves
+        // the tail of the most recent prior session; the identical cached line
+        // is re-appended every later turn (prefix-stable within the session).
+        if let Some(note) = self
+            .session_continuity_note(&core, &session_key, &session_id, history.len())
+            .await
+        {
+            append_continuity_to_system(&mut messages, &note);
+        }
+
         // `/clear` and model switches must invalidate resident-server prompt
         // caches even when the user starts with identical text (`hi` after
         // `hi`). Keep the marker stable within an epoch so later turns remain
@@ -767,7 +818,7 @@ impl AgentLoopShared {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_session_prompt_epoch, turn_query};
+    use super::{append_continuity_to_system, apply_session_prompt_epoch, turn_query};
     use crate::agent::prompt_fingerprint::{compare, fingerprint, PromptDelta};
     use serde_json::json;
 
@@ -904,6 +955,48 @@ mod tests {
             ),
             other => panic!("expected epoch marker to diverge at the prompt head, got {other:?}"),
         }
+    }
+
+    /// Injecting the SAME cached continuity note on every turn keeps the
+    /// system prompt byte-identical, so the prompt prefix stays append-only
+    /// across turns within the session.
+    #[test]
+    fn test_continuity_note_injection_is_prefix_stable_across_turns() {
+        let note = "Previous session (2h ago, key cli:oneshot-1): q → a";
+
+        let mut turn_n = vec![
+            json!({"role": "system", "content": "STATIC PREFIX"}),
+            json!({"role": "user", "content": "first question"}),
+        ];
+        let mut turn_n1 = vec![
+            json!({"role": "system", "content": "STATIC PREFIX"}),
+            json!({"role": "user", "content": "first question"}),
+            json!({"role": "assistant", "content": "first answer"}),
+            json!({"role": "user", "content": "second question"}),
+        ];
+
+        append_continuity_to_system(&mut turn_n, note);
+        append_continuity_to_system(&mut turn_n1, note);
+
+        assert!(turn_n[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Previous session"));
+
+        let fp_n = fingerprint(&turn_n);
+        let fp_n1 = fingerprint(&turn_n1);
+        assert_eq!(
+            compare(Some(&fp_n), &fp_n1),
+            PromptDelta::AppendOnly { added_msgs: 2 },
+            "cached continuity note must not bust the prompt prefix"
+        );
+    }
+
+    #[test]
+    fn test_continuity_note_injection_noop_on_empty_messages() {
+        let mut empty: Vec<serde_json::Value> = Vec::new();
+        append_continuity_to_system(&mut empty, "note");
+        assert!(empty.is_empty());
     }
 
     #[test]

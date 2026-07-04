@@ -21,6 +21,52 @@ enum QueryMode {
     Hybrid,
 }
 
+/// Top-level routing for a recall call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallRoute {
+    /// Deterministic: the N most recent sessions straight from sessions.db —
+    /// no FTS, no vectors, no query needed.
+    Latest { count: usize },
+    /// Search the knowledge store with the given query mode.
+    Search(QueryMode),
+}
+
+/// Route a recall call. `mode="latest"` goes straight to the session DB
+/// (count defaults to 3, clamped to 1..=10); everything else searches.
+fn choose_route(
+    explicit: Option<&str>,
+    count: Option<u64>,
+    query: &str,
+    semantic_available: bool,
+) -> RecallRoute {
+    match explicit {
+        Some("latest") => RecallRoute::Latest {
+            count: count.unwrap_or(3).clamp(1, 10) as usize,
+        },
+        other => RecallRoute::Search(choose_query_mode(other, query, semantic_available)),
+    }
+}
+
+/// Render the most recent sessions as one line each (key, age, last exchange).
+fn format_latest_sessions(
+    tails: &[crate::session::db::SessionTail],
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    if tails.is_empty() {
+        return "No previous sessions found in the session database.".to_string();
+    }
+    tails
+        .iter()
+        .map(|t| {
+            format!(
+                "- {}",
+                crate::agent::continuity::format_continuity_line(t, now)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Pick the query mode. An explicit `mode` param wins; otherwise multi-word
 /// queries (≥2 whitespace-separated tokens) use hybrid when the semantic
 /// capability is compiled in, and single-word queries stay keyword.
@@ -42,13 +88,33 @@ fn choose_query_mode(explicit: Option<&str>, query: &str, semantic_available: bo
 /// Tool that searches across all nanobot memory layers.
 pub struct RecallTool {
     workspace: PathBuf,
+    /// Path to sessions.db — enables the deterministic `mode="latest"` route.
+    db_path: Option<PathBuf>,
 }
 
 impl RecallTool {
     pub fn new(workspace: &Path) -> Self {
         Self {
             workspace: workspace.to_path_buf(),
+            db_path: None,
         }
+    }
+
+    /// Attach the session database used by `mode="latest"`.
+    pub fn with_db(mut self, db_path: Option<PathBuf>) -> Self {
+        self.db_path = db_path;
+        self
+    }
+
+    /// Deterministic latest-session listing straight from sessions.db.
+    async fn latest_sessions(&self, count: usize) -> String {
+        let Some(ref db_path) = self.db_path else {
+            return "Latest-session recall unavailable: no session database configured."
+                .to_string();
+        };
+        let db = crate::session::db::SessionDb::new(db_path);
+        let tails = db.latest_session_tails("", count).await;
+        format_latest_sessions(&tails, chrono::Utc::now())
     }
 
     /// Search the knowledge store (hybrid BM25 + vector when semantic feature is enabled).
@@ -153,7 +219,9 @@ impl Tool for RecallTool {
          Run /sessions index first to make historical conversations searchable. \
          Use this to find past context, user preferences, or previous decisions. \
          Multi-word queries automatically use hybrid keyword+semantic search when available; \
-         pass mode='keyword' for exact matches or mode='semantic' to force meaning-based search."
+         pass mode='keyword' for exact matches or mode='semantic' to force meaning-based search. \
+         Pass mode='latest' (no query needed) to list the most recent sessions with their \
+         last exchange — use this to continue from a previous session."
     }
 
     fn parameters(&self) -> Value {
@@ -162,27 +230,43 @@ impl Tool for RecallTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query — what you want to recall from memory"
+                    "description": "Search query — what you want to recall from memory. \
+                                   Required except for mode='latest'."
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["auto", "keyword", "semantic"],
+                    "enum": ["auto", "keyword", "semantic", "latest"],
                     "description": "Search mode: 'auto' tries hybrid BM25+semantic (default), \
-                                   'keyword' for BM25-only exact matches, 'semantic' for meaning-based search"
+                                   'keyword' for BM25-only exact matches, 'semantic' for meaning-based search, \
+                                   'latest' for the most recent sessions (deterministic, no search)"
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "For mode='latest': how many recent sessions to return (default 3, max 10)"
                 }
             },
-            "required": ["query"]
+            "required": []
         })
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let query = match params.get("query").and_then(|v| v.as_str()) {
-            Some(q) if !q.trim().is_empty() => q.trim(),
-            _ => return "Error: 'query' parameter is required and must be non-empty.".to_string(),
-        };
-
         let explicit_mode = params.get("mode").and_then(|v| v.as_str());
-        let mode = choose_query_mode(explicit_mode, query, cfg!(feature = "semantic"));
+        let count = params.get("count").and_then(|v| v.as_u64());
+        let query = params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+
+        let route = choose_route(explicit_mode, count, query, cfg!(feature = "semantic"));
+        let mode = match route {
+            RecallRoute::Latest { count } => return self.latest_sessions(count).await,
+            RecallRoute::Search(_) if query.is_empty() => {
+                return "Error: 'query' parameter is required and must be non-empty."
+                    .to_string()
+            }
+            RecallRoute::Search(mode) => mode,
+        };
 
         let n = 5;
         let mut sections: Vec<String> = Vec::new();
@@ -277,6 +361,126 @@ mod tests {
             QueryMode::Hybrid
         );
         assert_eq!(choose_query_mode(Some("auto"), "one", true), QueryMode::Keyword);
+    }
+
+    // --- choose_route: mode="latest" is deterministic, never a search ---
+
+    #[test]
+    fn test_choose_route_latest_never_hits_search() {
+        // "latest" routes to the deterministic DB path regardless of query
+        // shape or semantic capability.
+        assert_eq!(
+            choose_route(Some("latest"), None, "anything at all", true),
+            RecallRoute::Latest { count: 3 }
+        );
+        assert_eq!(
+            choose_route(Some("latest"), None, "", false),
+            RecallRoute::Latest { count: 3 }
+        );
+    }
+
+    #[test]
+    fn test_choose_route_latest_count_default_and_cap() {
+        assert_eq!(
+            choose_route(Some("latest"), Some(5), "", true),
+            RecallRoute::Latest { count: 5 }
+        );
+        // Capped at 10.
+        assert_eq!(
+            choose_route(Some("latest"), Some(99), "", true),
+            RecallRoute::Latest { count: 10 }
+        );
+        // Zero is nonsensical → clamp to 1.
+        assert_eq!(
+            choose_route(Some("latest"), Some(0), "", true),
+            RecallRoute::Latest { count: 1 }
+        );
+    }
+
+    #[test]
+    fn test_choose_route_non_latest_delegates_to_query_mode() {
+        assert_eq!(
+            choose_route(Some("keyword"), None, "several words", true),
+            RecallRoute::Search(QueryMode::Keyword)
+        );
+        assert_eq!(
+            choose_route(None, None, "how compaction works", true),
+            RecallRoute::Search(QueryMode::Hybrid)
+        );
+    }
+
+    // --- format_latest_sessions ---
+
+    #[test]
+    fn test_format_latest_sessions_zero_sessions() {
+        let out = format_latest_sessions(&[], chrono::Utc::now());
+        assert!(out.contains("No previous sessions"), "got: {out}");
+    }
+
+    #[test]
+    fn test_format_latest_sessions_lists_key_age_and_tail() {
+        use crate::session::db::SessionTail;
+        let now = chrono::Utc::now();
+        let tails = vec![
+            SessionTail {
+                session_id: "s2".into(),
+                session_key: "cli:oneshot-2".into(),
+                updated_at: now - chrono::Duration::hours(1),
+                last_user: "second q".into(),
+                last_assistant: "second a".into(),
+            },
+            SessionTail {
+                session_id: "s1".into(),
+                session_key: "cli:oneshot-1".into(),
+                updated_at: now - chrono::Duration::days(1),
+                last_user: "first q".into(),
+                last_assistant: "first a".into(),
+            },
+        ];
+        let out = format_latest_sessions(&tails, now);
+        assert!(out.contains("cli:oneshot-2"), "got: {out}");
+        assert!(out.contains("1h ago"), "got: {out}");
+        assert!(out.contains("second q"), "got: {out}");
+        assert!(out.contains("cli:oneshot-1"), "got: {out}");
+        assert!(out.contains("1d ago"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_recall_latest_without_db_reports_unavailable() {
+        let (_tmp, tool) = make_tool(); // no db configured
+        let mut params = HashMap::new();
+        params.insert("mode".to_string(), json!("latest"));
+        let result = tool.execute(params).await;
+        assert!(
+            result.contains("no session database"),
+            "latest without db must degrade clearly, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_latest_reads_sessions_db() {
+        use crate::session::db::SessionDb;
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let db_path = tmp.path().join("sessions.db");
+        {
+            let db = SessionDb::new(&db_path);
+            let meta = db.create_session("cli:oneshot-77").await;
+            db.add_messages(
+                &meta.id,
+                &[
+                    json!({"role": "user", "content": "unique latest question"}),
+                    json!({"role": "assistant", "content": "unique latest answer"}),
+                ],
+            )
+            .await;
+        }
+        let tool = RecallTool::new(tmp.path()).with_db(Some(db_path));
+        let mut params = HashMap::new();
+        params.insert("mode".to_string(), json!("latest"));
+        let result = tool.execute(params).await;
+        assert!(result.contains("cli:oneshot-77"), "got: {result}");
+        assert!(result.contains("unique latest question"), "got: {result}");
     }
 
     #[test]

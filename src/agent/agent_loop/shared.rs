@@ -127,6 +127,11 @@ pub(crate) struct AgentLoopShared {
     pub(crate) aha_tx: tokio::sync::mpsc::UnboundedSender<AhaSignal>,
     /// Sticky per-session policy flags (e.g. local_only).
     pub(crate) session_policies: Arc<Mutex<HashMap<String, policy::SessionPolicy>>>,
+    /// Per-session previous-session continuity note. Computed once on the
+    /// first turn of a fresh session (None for resumed sessions) and replayed
+    /// byte-identically on every later turn so the system-prompt prefix stays
+    /// stable within a session.
+    pub(crate) continuity_notes: Arc<Mutex<HashMap<String, Option<String>>>>,
     /// Per-session LCM engines for lossless context management.
     pub(crate) lcm_engines: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<LcmEngine>>>>>,
     /// LCM configuration.

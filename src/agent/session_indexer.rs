@@ -493,6 +493,30 @@ mod tests {
         assert_eq!(skipped, 1);
     }
 
+    /// Startup catch-up indexing runs on every launch, so a second run over
+    /// the same sessions must be a cheap no-op: everything already indexed is
+    /// skipped (no re-write, no re-ingestion).
+    #[test]
+    fn test_index_double_run_is_idempotent() {
+        let sessions_dir = tempdir().unwrap();
+        let memory_dir = tempdir().unwrap();
+
+        let jsonl = r#"{"_type":"metadata","session_key":"cli:double","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T01:00:00Z"}
+{"role":"user","content":"only once please"}
+{"role":"assistant","content":"indexed exactly once"}"#;
+        fs::write(sessions_dir.path().join("cli_double_2026-01-01.jsonl"), jsonl).unwrap();
+
+        let (first_indexed, _, first_errors) =
+            index_sessions(sessions_dir.path(), memory_dir.path());
+        assert_eq!((first_indexed, first_errors), (1, 0));
+
+        let (second_indexed, second_skipped, second_errors) =
+            index_sessions(sessions_dir.path(), memory_dir.path());
+        assert_eq!(second_indexed, 0, "second run must not re-index");
+        assert_eq!(second_skipped, 1, "second run must skip the existing summary");
+        assert_eq!(second_errors, 0);
+    }
+
     #[test]
     fn test_index_skips_test_rotate() {
         let sessions_dir = tempdir().unwrap();
