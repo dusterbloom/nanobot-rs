@@ -31,6 +31,7 @@ use crate::heartbeat::service::{
 };
 use crate::syntax;
 use crate::tui;
+use crate::turn_stream::{Completion, TurnEvent, TurnStream};
 
 // ============================================================================
 // Streaming TTS type (feature-gated)
@@ -977,7 +978,7 @@ async fn stream_and_render_inner(
         )
     };
 
-    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Create the tool-event channel when provenance display is on (text REPL)
     // OR when streaming to TTS — voice mode needs CallStart events to narrate
@@ -1004,8 +1005,6 @@ async fn stream_and_render_inner(
 
     // Spawn unified print task: incremental renderer for text deltas,
     // tool events interleaved via clear_partial/restore_partial.
-    let has_tool_rx = tool_rx_opt.is_some();
-    let mut tool_rx_opt = tool_rx_opt;
     let print_task = tokio::spawn(async move {
         use std::io::Write as _;
         #[cfg(feature = "voice")]
@@ -1024,8 +1023,6 @@ async fn stream_and_render_inner(
         let mut full_text = String::new();
         let mut tool_lines = 0usize;
         let mut collected: Vec<String> = Vec::new();
-        let mut delta_done = false;
-        let mut tool_done = !has_tool_rx;
         // Track previous CallEnd to coalesce repeated status-check calls.
         let mut prev_call_end: Option<(String, usize)> = None;
         // Arguments captured at CallStart, keyed by tool_call_id, so the
@@ -1040,15 +1037,18 @@ async fn stream_and_render_inner(
         let mut prefill = PrefillSpinner::new();
         prefill.start();
 
+        // Shared engine, REPL completion policy: the agent future is awaited
+        // by the caller (`process_direct_streaming` below) rather than owned
+        // here, so the turn finishes when both channels close
+        // (`Completion::ChannelClose`). The TUI passes its agent JoinHandle
+        // instead (`Completion::AgentHandle`).
+        let mut stream = TurnStream::new(delta_rx, tool_rx_opt, Completion::ChannelClose, None);
         loop {
-            if delta_done && tool_done {
-                break;
-            }
             tokio::select! {
                 biased;
-                delta = delta_rx.recv(), if !delta_done => {
-                    match delta {
-                        Some(d) => {
+                event = stream.next() => match event {
+                    TurnEvent::Finished(_) => break,
+                    TurnEvent::Delta(d) => {
                             // Control markers are consumed here; only real
                             // text falls through to the renderer/TTS.
                             if let Some(marker) = parse_control_marker(&d) {
@@ -1089,25 +1089,9 @@ async fn stream_and_render_inner(
                                     }
                                 }
                             }
-                        }
-                        None => {
-                            delta_done = true;
-                            renderer.finish();
-                            #[cfg(feature = "voice")]
-                            if let Some(acc) = tts_acc.take() {
-                                acc.flush();
-                            }
-                        },
                     }
-                }
-                event = async {
-                    match tool_rx_opt {
-                        Some(ref mut rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                }, if !tool_done => {
-                    match event {
-                        Some(ToolEvent::CallStart { ref tool_name, ref tool_call_id, ref arguments_preview }) => {
+                    TurnEvent::Tool(event) => match event {
+                        ToolEvent::CallStart { ref tool_name, ref tool_call_id, ref arguments_preview } => {
                             prefill.clear();
                             // Stash args so the CallEnd line can show the command/path.
                             args_by_id.insert(tool_call_id.clone(), arguments_preview.clone());
@@ -1130,7 +1114,7 @@ async fn stream_and_render_inner(
                             std::io::stdout().flush().ok();
                             renderer.restore_partial();
                         }
-                        Some(ToolEvent::Progress { ref tool_name, elapsed_ms, ref output_preview, .. }) => {
+                        ToolEvent::Progress { ref tool_name, elapsed_ms, ref output_preview, .. } => {
                             prefill.clear();
                             renderer.flush_pending();
                             renderer.clear_partial();
@@ -1150,7 +1134,7 @@ async fn stream_and_render_inner(
                             std::io::stdout().flush().ok();
                             renderer.restore_partial();
                         }
-                        Some(ToolEvent::CallEnd { ref tool_name, ref tool_call_id, ok, duration_ms, ref result_data }) => {
+                        ToolEvent::CallEnd { ref tool_name, ref tool_call_id, ok, duration_ms, ref result_data } => {
                             prefill.clear();
                             renderer.flush_pending();
                             renderer.clear_partial();
@@ -1226,10 +1210,9 @@ async fn stream_and_render_inner(
                             std::io::stdout().flush().ok();
                             renderer.restore_partial();
                         }
-                        None => tool_done = true,
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(100)), if !delta_done => {
+                    },
+                },
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     renderer.tick();
                     // Keep the prefill spinner's elapsed time live (no-op
                     // unless the spinner is showing).
@@ -1240,6 +1223,14 @@ async fn stream_and_render_inner(
                     }
                 }
             }
+        }
+        // Turn over (both channels closed): finalize the streamed answer.
+        // This ran inside the delta-close select arm before the TurnStream
+        // extraction; the engine now surfaces closure as `Finished`.
+        renderer.finish();
+        #[cfg(feature = "voice")]
+        if let Some(acc) = tts_acc.take() {
+            acc.flush();
         }
         // Use \r\n — raw mode (input watcher) makes \n LF-only.
         print!("\r\n");

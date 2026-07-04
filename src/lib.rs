@@ -26,6 +26,7 @@ pub(crate) mod sessions_cmd;
 pub(crate) mod syntax;
 pub mod tui;
 pub(crate) mod tui_app;
+pub(crate) mod turn_stream;
 pub mod utils;
 #[cfg(feature = "voice")]
 pub mod voice_pipeline;

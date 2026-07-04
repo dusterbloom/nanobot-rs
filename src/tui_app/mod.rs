@@ -44,6 +44,7 @@ use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::audit::ToolEvent;
 use crate::config::loader::{load_config, save_config};
 use crate::repl::commands::{unique_direct_model_match, ModelEntry, ReplContext};
+use crate::turn_stream::{Completion, TurnEvent, TurnStream};
 use app::{
     draw_outro, Action, App, BackgroundJob, Footer, SessionPick, SessionRow, StreamingAction,
     SubmittedTurn,
@@ -851,15 +852,15 @@ async fn run_turn(
 ) -> std::io::Result<TurnOutcome> {
     app.begin_turn(&turn.display_text());
 
-    let (delta_tx, mut delta_rx) = unbounded_channel::<String>();
-    let (tool_tx, mut tool_rx) = unbounded_channel::<ToolEvent>();
+    let (delta_tx, delta_rx) = unbounded_channel::<String>();
+    let (tool_tx, tool_rx) = unbounded_channel::<ToolEvent>();
     let cancel = CancellationToken::new();
 
     // Spawn the agent on its own task so this render loop keeps drawing while a
     // CPU-heavy turn runs — otherwise synchronous stretches inside the turn
     // (prompt build, JSON encode, parsing) would starve the `tick` branch and
     // freeze the spinner/elapsed clock. We select on the JoinHandle instead.
-    let mut handle = session.agent.spawn_direct_streaming(
+    let handle = session.agent.spawn_direct_streaming(
         turn.text.clone(),
         session.session_id.to_string(),
         channel.to_string(),
@@ -871,11 +872,20 @@ async fn run_turn(
         (!turn.media.is_empty()).then(|| turn.media.clone()),
     );
 
+    // The shared engine owns the turn lifecycle: biased delta-first ordering,
+    // deltas-before-tool-rows, post-completion drains, and cancel-discards-
+    // everything (a cancelled turn finishes with an empty response).
+    let mut stream = TurnStream::new(
+        delta_rx,
+        Some(tool_rx),
+        Completion::AgentHandle(handle),
+        Some(cancel),
+    );
+
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut queued_turn = None;
-    let mut cancel_requested = false;
     let response = loop {
         refresh_background_jobs(app, session.agent).await;
         let footer = footer_snapshot(session.core);
@@ -885,51 +895,24 @@ async fn run_turn(
             Some(ev) = ev_rx.recv() => {
                 match app.on_streaming_event(ev) {
                     StreamingAction::Continue => {}
-                    StreamingAction::Cancel => {
-                        cancel_requested = true;
-                        cancel.cancel();
-                    }
+                    StreamingAction::Cancel => stream.cancel(),
                     StreamingAction::CancelAndSubmit(turn) => {
                         queued_turn = Some(turn);
-                        cancel_requested = true;
-                        cancel.cancel();
+                        stream.cancel();
                     }
                 }
             }
-            joined = &mut handle => break joined.unwrap_or_default(),
-            Some(d) = delta_rx.recv(), if !cancel_requested => app.on_delta(&d),
-            Some(e) = tool_rx.recv(), if !cancel_requested => {
-                drain_pending_deltas(app, &mut delta_rx);
-                app.on_tool_event(e);
-            }
+            event = stream.next() => match event {
+                TurnEvent::Delta(d) => app.on_delta(&d),
+                TurnEvent::Tool(e) => app.on_tool_event(e),
+                TurnEvent::Finished(response) => break response,
+            },
             _ = tick.tick() => app.tick(0.08),
         }
     };
 
-    // Drain anything buffered after the agent returned (deltas can land just
-    // before the future resolves under `biased`).
-    if cancel_requested {
-        while delta_rx.try_recv().is_ok() {}
-        while tool_rx.try_recv().is_ok() {}
-    } else {
-        drain_pending_deltas(app, &mut delta_rx);
-        while let Ok(e) = tool_rx.try_recv() {
-            drain_pending_deltas(app, &mut delta_rx);
-            app.on_tool_event(e);
-        }
-        drain_pending_deltas(app, &mut delta_rx);
-    }
     #[cfg(feature = "voice")]
-    let reply = if cancel_requested {
-        String::new()
-    } else {
-        response.clone()
-    };
-    let response = if cancel_requested {
-        String::new()
-    } else {
-        response
-    };
+    let reply = response.clone();
     app.finish_turn(response);
     let footer = footer_snapshot(session.core);
     terminal.draw(|f| app.draw(f, &footer))?;
@@ -940,17 +923,20 @@ async fn run_turn(
     })
 }
 
-fn drain_pending_deltas(app: &mut App, delta_rx: &mut UnboundedReceiver<String>) {
-    while let Ok(d) = delta_rx.try_recv() {
-        app.on_delta(&d);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    /// The delta-flush rule `run_turn` used to enforce inline and now gets
+    /// structurally from [`TurnStream`]; kept here so the render-order pin
+    /// below stays a pure `App` test.
+    fn drain_pending_deltas(app: &mut App, delta_rx: &mut UnboundedReceiver<String>) {
+        while let Ok(d) = delta_rx.try_recv() {
+            app.on_delta(&d);
+        }
+    }
 
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
         let area = *buf.area();
