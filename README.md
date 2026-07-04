@@ -11,7 +11,7 @@ A personal AI assistant that runs on your terms. Cloud or local. Text or voice. 
 
 ## Why
 
-Most AI assistants are cloud-locked SaaS products. nanobot is a single binary that talks to whatever LLM you point it at -- Claude, GPT, Gemini, Groq, or a model running on your own hardware. Add voice and it becomes a conversational assistant you can interrupt mid-sentence. Add channels and it lives in your Telegram, WhatsApp, or Feishu.
+Most AI assistants are cloud-locked SaaS products. nanobot is a single binary that talks to whatever LLM you point it at -- Claude, GPT, Gemini, Groq, or a model running on your own hardware. Add voice and it becomes a conversational assistant you can interrupt mid-sentence. Add channels and it lives in your Telegram, WhatsApp, or email.
 
 No containers. No Python. No dependencies beyond what `cargo build` pulls in.
 
@@ -28,6 +28,10 @@ nanobot onboard
 # Start chatting
 nanobot agent
 ```
+
+**Provider selection:** the first non-empty API key wins, in priority order
+OpenRouter → DeepSeek → Anthropic → OpenAI → Gemini → Zhipu → ZhipuCoding → Groq → vLLM.
+To force a specific provider, keep only its key in the config. `nanobot status` shows which provider is active.
 
 ## Features
 
@@ -93,7 +97,7 @@ Audio is streamed sentence-by-sentence through PulseAudio. First audio plays in 
 > **Note:** In-process MLX inference was experimental and has been removed. The
 > code path is preserved on the `claude/pensive-lumiere` branch. To use MLX
 > models today, run them via LM Studio (or any OpenAI-compatible server) and
-> point `local.apiBase` at it.
+> point `agents.defaults.localApiBase` in `~/.nanobot/config.json` at it.
 
 ### Tools
 
@@ -146,7 +150,6 @@ Deploy as a bot on your messaging platforms -- or start them right from the REPL
 | Telegram | Long-polling (POST) | `/telegram` or `/tg` |
 | WhatsApp | WebSocket bridge | `/whatsapp` or `/wa` |
 | Email | IMAP polling + SMTP | `/email` |
-| Feishu (Lark) | WebSocket | gateway mode |
 
 Channels run in the background while you keep chatting. Inbound messages and bot responses are displayed in the REPL as they flow through:
 
@@ -272,7 +275,7 @@ When `ttsVoice: null` and `ttsEngine: "supertonic"`, the curated picker resolves
 ## Architecture
 
 ```
-              Channels (Telegram / WhatsApp / Feishu)
+              Channels (Telegram / WhatsApp / Email)
                               |
                               v
 User --> CLI / Voice / Realtime --> AgentLoop --> LLM Provider

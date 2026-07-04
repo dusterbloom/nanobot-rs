@@ -19,6 +19,7 @@ use nanobot::agent::router::{build_conversation_tail, request_strict_router_deci
 use nanobot::config::loader::load_config;
 use nanobot::providers::base::LLMProvider;
 use nanobot::providers::openai_compat::OpenAICompatProvider;
+use nanobot::utils::helpers::truncate_string as truncate_to;
 
 // ---------------------------------------------------------------------------
 // Sweep configurations
@@ -201,17 +202,6 @@ fn build_provider_messages(scenario: &Scenario) -> Vec<Value> {
         build_context_history(scenario.idx)
     } else {
         vec![json!({"role": "user", "content": scenario.prompt})]
-    }
-}
-
-fn truncate_to(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!(
-            "{}…",
-            &s[..nanobot::utils::helpers::floor_char_boundary(s, max)]
-        )
     }
 }
 

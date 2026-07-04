@@ -90,16 +90,25 @@ impl ChannelManager {
             return;
         }
 
-        // Start each channel.
+        // Start each channel, collecting failures for a startup summary.
+        let mut handles = Vec::new();
         for (name, channel) in &self.channels {
             let ch = channel.clone();
             let channel_name = name.clone();
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let mut guard = ch.lock().await;
-                if let Err(e) = guard.start().await {
-                    error!("Failed to start {} channel: {}", channel_name, e);
-                }
-            });
+                guard
+                    .start()
+                    .await
+                    .err()
+                    .map(|e| (channel_name, e.to_string()))
+            }));
+        }
+        for handle in handles {
+            if let Ok(Some((name, err))) = handle.await {
+                error!("Failed to start {} channel: {}", name, err);
+                eprintln!("channel {} failed to start: {}", name, err);
+            }
         }
 
         // Start the outbound dispatcher.

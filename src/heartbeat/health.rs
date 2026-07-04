@@ -14,8 +14,6 @@ const DEGRADED_THRESHOLD: u32 = 3;
 pub struct ProbeResult {
     pub healthy: bool,
     pub latency_ms: u64,
-    #[allow(dead_code)]
-    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,19 +236,16 @@ impl HealthProbe for LcmCompactionProbe {
             Ok(resp) if resp.status().is_success() => ProbeResult {
                 healthy: true,
                 latency_ms: start.elapsed().as_millis() as u64,
-                detail: None,
             },
-            Ok(resp) => ProbeResult {
+            Ok(_) => ProbeResult {
                 healthy: false,
                 latency_ms: start.elapsed().as_millis() as u64,
-                detail: Some(format!("HTTP {}", resp.status())),
             },
             Err(e) => {
                 warn!("LCM compaction health check failed: {}", e);
                 ProbeResult {
                     healthy: false,
                     latency_ms: start.elapsed().as_millis() as u64,
-                    detail: Some(e.to_string()),
                 }
             }
         }
@@ -308,19 +303,16 @@ impl HealthProbe for TrioEndpointProbe {
             Ok(resp) if resp.status().as_u16() == 200 => ProbeResult {
                 healthy: true,
                 latency_ms: start.elapsed().as_millis() as u64,
-                detail: Some("ok".to_string()),
             },
-            Ok(resp) => ProbeResult {
+            Ok(_) => ProbeResult {
                 healthy: false,
                 latency_ms: start.elapsed().as_millis() as u64,
-                detail: Some(format!("HTTP {}", resp.status())),
             },
             Err(e) => {
                 warn!("Trio endpoint health check '{}' failed: {}", self.name, e);
                 ProbeResult {
                     healthy: false,
                     latency_ms: start.elapsed().as_millis() as u64,
-                    detail: Some(e.to_string()),
                 }
             }
         }
@@ -373,19 +365,16 @@ impl HealthProbe for SearXNGProbe {
             Ok(resp) if resp.status().is_success() => ProbeResult {
                 healthy: true,
                 latency_ms: start.elapsed().as_millis() as u64,
-                detail: None,
             },
-            Ok(resp) => ProbeResult {
+            Ok(_) => ProbeResult {
                 healthy: false,
                 latency_ms: start.elapsed().as_millis() as u64,
-                detail: Some(format!("HTTP {}", resp.status())),
             },
             Err(e) => {
                 warn!("SearXNG health check failed: {}", e);
                 ProbeResult {
                     healthy: false,
                     latency_ms: start.elapsed().as_millis() as u64,
-                    detail: Some(e.to_string()),
                 }
             }
         }
@@ -452,7 +441,6 @@ mod tests {
         state.record_result(ProbeResult {
             healthy: true,
             latency_ms: 10,
-            detail: None,
         });
         assert_eq!(state.status, ProbeStatus::Healthy);
         assert_eq!(state.consecutive_failures, 0);
@@ -466,7 +454,6 @@ mod tests {
             state.record_result(ProbeResult {
                 healthy: false,
                 latency_ms: 0,
-                detail: None,
             });
         }
         assert_eq!(state.status, ProbeStatus::Degraded);
@@ -480,7 +467,6 @@ mod tests {
             state.record_result(ProbeResult {
                 healthy: false,
                 latency_ms: 0,
-                detail: None,
             });
         }
         assert_ne!(state.status, ProbeStatus::Degraded);
@@ -495,7 +481,6 @@ mod tests {
             state.record_result(ProbeResult {
                 healthy: false,
                 latency_ms: 0,
-                detail: None,
             });
         }
         assert_eq!(state.status, ProbeStatus::Degraded);
@@ -503,7 +488,6 @@ mod tests {
         state.record_result(ProbeResult {
             healthy: true,
             latency_ms: 5,
-            detail: None,
         });
         assert_eq!(state.status, ProbeStatus::Healthy);
         assert_eq!(state.consecutive_failures, 0);
@@ -515,18 +499,15 @@ mod tests {
         state.record_result(ProbeResult {
             healthy: false,
             latency_ms: 0,
-            detail: None,
         });
         state.record_result(ProbeResult {
             healthy: false,
             latency_ms: 0,
-            detail: None,
         });
         assert_eq!(state.consecutive_failures, 2);
         state.record_result(ProbeResult {
             healthy: true,
             latency_ms: 5,
-            detail: None,
         });
         assert_eq!(state.consecutive_failures, 0);
     }
@@ -550,7 +531,6 @@ mod tests {
                 state.record_result(ProbeResult {
                     healthy: false,
                     latency_ms: 0,
-                    detail: None,
                 });
             }
             states.insert("test_probe".to_string(), state);
@@ -567,7 +547,6 @@ mod tests {
             state.record_result(ProbeResult {
                 healthy: true,
                 latency_ms: 10,
-                detail: None,
             });
             states.insert("test_probe".to_string(), state);
         }
@@ -594,7 +573,6 @@ mod tests {
             ProbeResult {
                 healthy: self.healthy,
                 latency_ms: 1,
-                detail: None,
             }
         }
     }
@@ -807,10 +785,6 @@ mod tests {
         let probe = SearXNGProbe::new("http://127.0.0.1:1");
         let result = probe.check().await;
         assert!(!result.healthy, "expected unhealthy on connection error");
-        assert!(
-            result.detail.is_some(),
-            "connection error must populate detail"
-        );
     }
 
     #[test]
