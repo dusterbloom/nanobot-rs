@@ -196,6 +196,12 @@ pub struct RuntimeCounters {
     pub prompt_fingerprints: parking_lot::Mutex<
         std::collections::HashMap<String, crate::agent::prompt_fingerprint::PromptFingerprint>,
     >,
+    /// Per-session hash of the tool-definition array sent to the provider.
+    /// The message fingerprint deliberately excludes tool schemas, so this
+    /// catches the case where messages are append-only but the rendered token
+    /// stream still diverges because the tool block (rendered at the prompt
+    /// head by chat templates) changed — busting the prefix cache invisibly.
+    pub prompt_tool_hashes: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
     /// Per-session prefix-cache watermark: the number of leading messages
     /// already sent (hence warm on the inference server). Mid-turn cleanup is
     /// frozen below this index so the rendered prompt stays an append-only
@@ -210,6 +216,14 @@ pub struct RuntimeCounters {
     /// resident local server cannot keep continuing from a stale KV cache when
     /// the next user prompt happens to be a prefix of the old conversation.
     pub prompt_session_epoch: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+    /// Number of installed compactions this session (see `record_compaction`).
+    pub lcm_compaction_count: AtomicU64,
+    /// Cumulative estimated tokens of compacted prefixes before compaction.
+    pub lcm_tokens_before: AtomicU64,
+    /// Cumulative estimated tokens of the same prefixes after compaction.
+    pub lcm_tokens_after: AtomicU64,
+    /// Epoch ms of the most recently installed compaction (0 = never).
+    pub lcm_last_compaction_ms: AtomicU64,
 }
 
 impl RuntimeCounters {
@@ -239,9 +253,14 @@ impl RuntimeCounters {
                 crate::agent::router::SpecialistMemory::default(),
             ),
             prompt_fingerprints: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            prompt_tool_hashes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_cache_watermark: parking_lot::Mutex::new(std::collections::HashMap::new()),
             lcm_prompt_advertised: parking_lot::Mutex::new(std::collections::HashSet::new()),
             prompt_session_epoch: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            lcm_compaction_count: AtomicU64::new(0),
+            lcm_tokens_before: AtomicU64::new(0),
+            lcm_tokens_after: AtomicU64::new(0),
+            lcm_last_compaction_ms: AtomicU64::new(0),
         }
     }
 
@@ -252,6 +271,7 @@ impl RuntimeCounters {
     /// a fresh prefix even when the user starts with identical text like `hi`.
     pub fn reset_session_prompt_state(&self, session_key: &str) -> u64 {
         self.prompt_fingerprints.lock().remove(session_key);
+        self.prompt_tool_hashes.lock().remove(session_key);
         self.prompt_cache_watermark.lock().remove(session_key);
         self.lcm_prompt_advertised.lock().remove(session_key);
 
@@ -280,6 +300,18 @@ impl RuntimeCounters {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    /// Record an installed compaction for `/lcm stats`: bump the count,
+    /// accumulate before/after token estimates, and stamp the time.
+    pub fn record_compaction(&self, tokens_before: u64, tokens_after: u64) {
+        self.lcm_compaction_count.fetch_add(1, Ordering::Relaxed);
+        self.lcm_tokens_before
+            .fetch_add(tokens_before, Ordering::Relaxed);
+        self.lcm_tokens_after
+            .fetch_add(tokens_after, Ordering::Relaxed);
+        self.lcm_last_compaction_ms
+            .store(Self::now_epoch_ms(), Ordering::Relaxed);
     }
 
     pub fn mark_inference_started(&self) {

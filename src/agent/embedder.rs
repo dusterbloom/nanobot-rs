@@ -11,7 +11,7 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 #[cfg(feature = "semantic")]
 use parking_lot::Mutex;
 #[cfg(feature = "semantic")]
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Embedding vector type alias.
 pub type Embedding = Vec<f32>;
@@ -21,21 +21,36 @@ pub const EMBEDDING_DIM: usize = 384;
 
 /// Global singleton — model loads once on first embed call.
 /// Uses Mutex<Option<>> because embed() requires &mut self and OnceLock::get_or_try_init is unstable.
+/// Holds `None` when init failed (e.g. model download unavailable offline) so
+/// callers get an `Err` and degrade to keyword search instead of panicking.
 #[cfg(feature = "semantic")]
-static MODEL: once_cell::sync::Lazy<Mutex<TextEmbedding>> = once_cell::sync::Lazy::new(|| {
-    info!("Loading embedding model (AllMiniLML6V2)...");
-    let model = TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
-    )
-    .expect("Failed to initialize fastembed model");
-    info!("Embedding model loaded ({}d)", EMBEDDING_DIM);
-    Mutex::new(model)
-});
+static MODEL: once_cell::sync::Lazy<Mutex<Option<TextEmbedding>>> =
+    once_cell::sync::Lazy::new(|| {
+        info!("Loading embedding model (AllMiniLML6V2)...");
+        match TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
+        ) {
+            Ok(model) => {
+                info!("Embedding model loaded ({}d)", EMBEDDING_DIM);
+                Mutex::new(Some(model))
+            }
+            Err(e) => {
+                warn!(
+                    "Embedding model init failed ({}); semantic search degrades to keyword",
+                    e
+                );
+                Mutex::new(None)
+            }
+        }
+    });
 
 /// Embed a single text string. Returns a vector of EMBEDDING_DIM floats.
 #[cfg(feature = "semantic")]
 pub fn embed_one(text: &str) -> Result<Embedding> {
-    let mut model = MODEL.lock();
+    let mut guard = MODEL.lock();
+    let model = guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Embedding model unavailable"))?;
     let mut results = model.embed(vec![text], None).context("Embedding failed")?;
     debug!("Embedded 1 text ({} chars)", text.len());
     results
@@ -49,7 +64,10 @@ pub fn embed_batch(texts: &[&str]) -> Result<Vec<Embedding>> {
     if texts.is_empty() {
         return Ok(vec![]);
     }
-    let mut model = MODEL.lock();
+    let mut guard = MODEL.lock();
+    let model = guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Embedding model unavailable"))?;
     let results = model
         .embed(texts.to_vec(), None)
         .context("Batch embedding failed")?;

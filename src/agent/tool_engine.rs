@@ -90,15 +90,11 @@ fn compact_inline_tool_result(
     let source = tool_arg_summary(args);
     let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
     let header = format!(
-        "[tool result compacted for hot prompt]\n\
-         tool: {tool_name}\n\
-         args: {source}\n\
-         full_output: {total_chars} chars, ~{estimated_tokens} tokens\n\
-         guidance: do not repeat the same broad call; request a narrow line range, search term, or URL section only if the omitted bytes are required.\n\n\
-         --- head preview ---\n"
+        "[truncated: {tool_name}({source}) returned {total_chars} chars (~{estimated_tokens} tokens); \
+         head+tail shown — re-request with a narrower range/query if the middle is needed]\n"
     );
 
-    let footer = "\n\n--- tail preview ---\n";
+    let footer = "\n[...]\n";
     let fixed_chars = header.chars().count() + footer.chars().count();
     let preview_budget = max_chars.saturating_sub(fixed_chars).max(200);
     let head_chars = preview_budget * 2 / 3;
@@ -158,6 +154,19 @@ fn should_arm_boundary(assistant_content: Option<&str>, executed_tools: &[&str])
     let reported = assistant_content.is_some_and(|c| !c.trim().is_empty());
     let ran_side_effect = executed_tools.iter().any(|n| is_side_effect_tool(n));
     ran_side_effect && !reported
+}
+
+/// Decide whether an armed boundary blocks this response's side-effect calls.
+///
+/// Behavioral, mirroring [`should_arm_boundary`]: the armed call was nudged to
+/// report as text. A response that carries a text report HAS complied — its
+/// side-effect calls run normally. Only a silent armed response is rejected.
+/// (The prior check was positional — Armed rejected every side-effect call,
+/// so a model that narrated AND acted in one response ate a guaranteed
+/// spurious rejection: the "always a bad exec before a good one" pattern.)
+fn boundary_blocks_side_effects(armed: bool, assistant_content: Option<&str>) -> bool {
+    let reported = assistant_content.is_some_and(|c| !c.trim().is_empty());
+    armed && !reported
 }
 
 /// Execute tool calls via the delegation (tool-runner) path.
@@ -810,6 +819,20 @@ fn inject_boundary_rejection(ctx: &mut TurnContext, tc: &ToolCallRequest) {
     // ClaimedButNotExecuted validation for this turn.
     ctx.flow.tool_guard.had_blocked_calls = true;
     if let Some(ref tx) = ctx.tool_event_tx {
+        // Emit CallStart too (same as execute_single_tool): renderers key the
+        // tool row off CallStart's arguments preview, and an orphan CallEnd
+        // both drops the command text and breaks the renderer's expectation
+        // that new tool rows only appear at CallStart.
+        let preview: String = serde_json::to_string(&tc.arguments)
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        let _ = tx.send(ToolEvent::CallStart {
+            tool_name: tc.name.clone(),
+            tool_call_id: tc.id.clone(),
+            arguments_preview: preview,
+        });
         let _ = tx.send(ToolEvent::CallEnd {
             tool_name: tc.name.clone(),
             tool_call_id: tc.id.clone(),
@@ -847,10 +870,13 @@ pub(crate) async fn execute_tools_inline(
     // been stripped from the schema (schema churn changes the prompt head
     // and breaks server-side prefix caching; an error result appends at the
     // tail and is cache-safe).
-    let boundary_armed = ctx.flow.boundary == ResponseBoundary::Armed;
+    let blocks = boundary_blocks_side_effects(
+        ctx.flow.boundary == ResponseBoundary::Armed,
+        response.content.as_deref(),
+    );
     let (blocked, allowed): (Vec<&ToolCallRequest>, Vec<&ToolCallRequest>) = routed_tool_calls
         .iter()
-        .partition(|tc| boundary_armed && is_side_effect_tool(&tc.name));
+        .partition(|tc| blocks && is_side_effect_tool(&tc.name));
     for tc in &blocked {
         inject_boundary_rejection(ctx, tc);
     }
@@ -1005,13 +1031,11 @@ mod tests {
         let compacted = compact_inline_tool_result("read_file", &args, &data, 900);
 
         assert!(compacted.chars().count() <= 900);
-        assert!(compacted.contains("[tool result compacted for hot prompt]"));
-        assert!(compacted.contains("tool: read_file"));
+        assert!(compacted.contains("[truncated: read_file("));
         assert!(compacted.contains("path=src/lib.rs"));
         assert!(compacted.contains("lines=1:1000"));
-        assert!(compacted.contains("do not repeat the same broad call"));
-        assert!(compacted.contains("--- head preview ---"));
-        assert!(compacted.contains("--- tail preview ---"));
+        assert!(compacted.contains("re-request with a narrower range/query"));
+        assert!(compacted.contains("\n[...]\n"));
         assert!(!compacted.contains("MIDDLE_SHOULD_BE_OMITTED"));
     }
 
@@ -1119,6 +1143,26 @@ mod tests {
             &["read_file"]
         ));
         assert!(!should_arm_boundary(None, &[]));
+    }
+
+    #[test]
+    fn test_boundary_blocks_side_effects_is_behavioral() {
+        // Armed + silent response -> block (the nudge was ignored).
+        assert!(boundary_blocks_side_effects(true, None));
+        assert!(boundary_blocks_side_effects(true, Some("")));
+        assert!(boundary_blocks_side_effects(true, Some("  \n ")));
+
+        // Armed + text report in the same response -> the model complied;
+        // its side-effect calls must run (no spurious "bad exec before a
+        // good one").
+        assert!(!boundary_blocks_side_effects(
+            true,
+            Some("Empty response — let me check the service.")
+        ));
+
+        // Not armed -> never blocks.
+        assert!(!boundary_blocks_side_effects(false, None));
+        assert!(!boundary_blocks_side_effects(false, Some("hi")));
     }
 
     #[test]

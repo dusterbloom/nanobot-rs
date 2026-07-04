@@ -97,6 +97,73 @@ pub struct SubagentInfo {
 }
 
 /// Manages background subagent tasks.
+/// Subagent launch settings after applying precedence rules.
+///
+/// Model precedence: explicit override > profile model > default subagent
+/// model > parent model (last resort — expensive, warns).
+#[derive(Debug)]
+pub(crate) struct SpawnSettings {
+    pub model: String,
+    pub system_prompt: Option<String>,
+    pub tools_filter: Option<Vec<String>>,
+    pub read_only: bool,
+    pub base_iterations: u32,
+}
+
+/// Pure resolution of spawn settings from a profile and explicit overrides.
+pub(crate) fn resolve_spawn_settings(
+    profile: Option<&AgentProfile>,
+    explicit_model: Option<&str>,
+    default_subagent_model: Option<&str>,
+    parent_model: &str,
+    is_local: bool,
+    default_max_iterations: u32,
+) -> SpawnSettings {
+    let resolve = |m: &str| agent_profiles::resolve_model_for_env(m, is_local, parent_model);
+    let model = explicit_model
+        .map(resolve)
+        .or_else(|| profile.and_then(|p| p.model.as_deref()).map(resolve))
+        .or_else(|| default_subagent_model.map(str::to_string))
+        .unwrap_or_else(|| {
+            warn!(
+                "EXPENSIVE: Using main model '{}' as subagent — set defaultSubagentModel in config",
+                parent_model
+            );
+            parent_model.to_string()
+        });
+
+    SpawnSettings {
+        model,
+        system_prompt: profile.map(|p| p.system_prompt.clone()),
+        tools_filter: profile.and_then(|p| p.tools.clone()),
+        read_only: profile.map(|p| p.read_only).unwrap_or(false),
+        base_iterations: profile
+            .and_then(|p| p.max_iterations)
+            .unwrap_or(default_max_iterations),
+    }
+}
+
+/// Error message for an unknown profile name, listing what's available.
+pub(crate) fn unknown_profile_error(
+    name: &str,
+    profiles: &HashMap<String, AgentProfile>,
+) -> String {
+    if profiles.is_empty() {
+        return format!(
+            "Error: unknown agent profile '{}' — no profiles are loaded. \
+             Add profile .md files under ~/.nanobot/agents/ or omit the profile.",
+            name
+        );
+    }
+    let mut names: Vec<&str> = profiles.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    format!(
+        "Error: unknown agent profile '{}'. Available profiles: {}",
+        name,
+        names.join(", ")
+    )
+}
+
 pub struct SubagentManager {
     provider: Arc<dyn LLMProvider>,
     workspace: PathBuf,
@@ -279,6 +346,15 @@ impl SubagentManager {
         &self.profiles
     }
 
+    /// Resolve a profile name to a profile, or an error message listing
+    /// what's available so the model can correct itself.
+    fn resolve_profile(&self, name: &str) -> Result<AgentProfile, String> {
+        match self.profiles.get(name) {
+            Some(p) => Ok(p.clone()),
+            None => Err(unknown_profile_error(name, &self.profiles)),
+        }
+    }
+
     /// Spawn a background subagent task.
     ///
     /// `agent_name` — optional profile name from `.nanobot/agents/`.
@@ -317,14 +393,15 @@ impl SubagentManager {
             "subagent_spawn"
         );
 
-        // Resolve agent profile if specified.
-        let profile = agent_name.as_ref().and_then(|name| {
-            let p = self.profiles.get(name);
-            if p.is_none() {
-                warn!("Agent profile '{}' not found, using defaults", name);
-            }
-            p.cloned()
-        });
+        // Resolve agent profile if specified. Unknown names are a hard error
+        // listing available profiles so the model can correct itself.
+        let profile = match agent_name.as_ref() {
+            Some(name) => match self.resolve_profile(name) {
+                Ok(p) => Some(p),
+                Err(e) => return e,
+            },
+            None => None,
+        };
 
         let display_label = label.clone().unwrap_or_else(|| {
             if let Some(ref name) = agent_name {
@@ -334,46 +411,32 @@ impl SubagentManager {
             }
         });
 
-        // Build config: model_override > profile.model > default_subagent_model > self.model (last resort)
-        let effective_model = if let Some(ref m) = model_override {
-            agent_profiles::resolve_model_for_env(m, self.is_local, &self.model)
-        } else if let Some(ref p) = profile {
-            p.model
-                .as_ref()
-                .map(|m| agent_profiles::resolve_model_for_env(m, self.is_local, &self.model))
-                .unwrap_or_else(|| {
-                    self.default_subagent_model.clone().unwrap_or_else(|| {
-                        warn!("EXPENSIVE: Using main model '{}' as subagent — set defaultSubagentModel in config", self.model);
-                        self.model.clone()
-                    })
-                })
-        } else {
-            self.default_subagent_model.clone().unwrap_or_else(|| {
-                warn!("EXPENSIVE: Using main model '{}' as subagent — set defaultSubagentModel in config", self.model);
-                self.model.clone()
-            })
-        };
+        // Precedence: model_override > profile.model > default_subagent_model > self.model.
+        let settings = resolve_spawn_settings(
+            profile.as_ref(),
+            model_override.as_deref(),
+            self.default_subagent_model.as_deref(),
+            &self.model,
+            self.is_local,
+            self.subagent_tuning.max_iterations,
+        );
 
         // Budget halving: each depth level gets half the iterations.
         // depth 0 → full budget, depth 1 → half, depth 2 → quarter.
-        let base_iterations = profile
-            .as_ref()
-            .and_then(|p| p.max_iterations)
-            .unwrap_or(self.subagent_tuning.max_iterations);
-        let depth_budget = base_iterations >> self.depth; // halve per depth level
+        let depth_budget = settings.base_iterations >> self.depth; // halve per depth level
         let effective_iterations = depth_budget.max(3); // minimum 3 iterations
         if self.depth > 0 {
             info!(
                 "Subagent depth={}, budget={} iterations (base={}, halved {} times)",
-                self.depth, effective_iterations, base_iterations, self.depth
+                self.depth, effective_iterations, settings.base_iterations, self.depth
             );
         }
 
         let mut config = SubagentConfig {
-            model: effective_model,
-            system_prompt: profile.as_ref().map(|p| p.system_prompt.clone()),
-            tools_filter: profile.as_ref().and_then(|p| p.tools.clone()),
-            read_only: profile.as_ref().map(|p| p.read_only).unwrap_or(false),
+            model: settings.model,
+            system_prompt: settings.system_prompt,
+            tools_filter: settings.tools_filter,
+            read_only: settings.read_only,
             max_iterations: effective_iterations,
             max_tool_result_chars: self.max_tool_result_chars,
         };
@@ -841,6 +904,7 @@ impl SubagentManager {
                             timeout_secs: 120,
                             lms_native_probe_secs: 2,
                             constrained_tool_calls: true,
+                            higgs_session_cache: false,
                         },
                     );
                 return (provider, rest, targets_local);
@@ -1338,6 +1402,100 @@ mod tests {
             None
         );
         assert_eq!(extract_local_port_from_api_base("not-a-url"), None);
+    }
+
+    fn make_profile(name: &str, model: Option<&str>) -> AgentProfile {
+        AgentProfile {
+            name: name.to_string(),
+            description: format!("{} agent", name),
+            system_prompt: format!("You are {}.", name),
+            tools: Some(vec!["read_file".to_string()]),
+            model: model.map(|m| m.to_string()),
+            max_iterations: Some(10),
+            read_only: true,
+        }
+    }
+
+    #[test]
+    fn test_resolve_spawn_settings_model_precedence() {
+        let profile = make_profile("explore", Some("haiku"));
+
+        // Explicit model beats profile model.
+        let s = resolve_spawn_settings(
+            Some(&profile),
+            Some("groq/llama-3.3-70b"),
+            Some("default-model"),
+            "parent-model",
+            false,
+            20,
+        );
+        assert_eq!(s.model, "groq/llama-3.3-70b");
+
+        // Profile model beats default subagent model.
+        let s = resolve_spawn_settings(
+            Some(&profile),
+            None,
+            Some("default-model"),
+            "parent-model",
+            false,
+            20,
+        );
+        assert_eq!(s.model, agent_profiles::resolve_model_alias("haiku"));
+
+        // No explicit, no profile → default subagent model.
+        let s = resolve_spawn_settings(None, None, Some("default-model"), "parent-model", false, 20);
+        assert_eq!(s.model, "default-model");
+
+        // Nothing at all → parent model (last resort).
+        let s = resolve_spawn_settings(None, None, None, "parent-model", false, 20);
+        assert_eq!(s.model, "parent-model");
+
+        // Profile without a model falls through to default.
+        let no_model = make_profile("reviewer", None);
+        let s = resolve_spawn_settings(
+            Some(&no_model),
+            None,
+            Some("default-model"),
+            "parent-model",
+            false,
+            20,
+        );
+        assert_eq!(s.model, "default-model");
+    }
+
+    #[test]
+    fn test_resolve_spawn_settings_applies_profile_constraints() {
+        let profile = make_profile("explore", Some("haiku"));
+        let s = resolve_spawn_settings(Some(&profile), None, None, "parent-model", false, 20);
+        assert_eq!(s.tools_filter, Some(vec!["read_file".to_string()]));
+        assert!(s.read_only);
+        assert_eq!(s.base_iterations, 10);
+        assert_eq!(s.system_prompt.as_deref(), Some("You are explore."));
+
+        // No profile → no constraints, default iteration budget.
+        let s = resolve_spawn_settings(None, None, None, "parent-model", false, 20);
+        assert!(s.tools_filter.is_none());
+        assert!(!s.read_only);
+        assert_eq!(s.base_iterations, 20);
+        assert!(s.system_prompt.is_none());
+    }
+
+    #[test]
+    fn test_unknown_profile_error_lists_available_names() {
+        let mut profiles = HashMap::new();
+        profiles.insert("explore".to_string(), make_profile("explore", None));
+        profiles.insert("builder".to_string(), make_profile("builder", None));
+
+        let err = unknown_profile_error("resercher", &profiles);
+        assert!(err.contains("Error"));
+        assert!(err.contains("resercher"));
+        assert!(err.contains("explore"));
+        assert!(err.contains("builder"));
+
+        // No profiles loaded at all.
+        let err = unknown_profile_error("anything", &HashMap::new());
+        assert!(err.contains("Error"));
+        assert!(err.contains("anything"));
     }
 
     #[test]

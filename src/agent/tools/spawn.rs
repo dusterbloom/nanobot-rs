@@ -209,18 +209,9 @@ impl Tool for SpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a subagent to handle a task in the background, list running and recently completed subagents, \
-         check a specific result or running status, wait for one to finish, cancel one, \
-         run a multi-step pipeline, or run an autonomous refinement loop. \
-         Use action='spawn' (default) to start a new subagent. \
-         Use action='list' to see running subagents AND recently completed ones. \
-         Use action='check' with task_id to retrieve a completed subagent's result or a non-blocking running status. \
-         Use action='wait' with task_id to block until a subagent finishes and get its result. \
-         Use action='cancel' with task_id to abort a stuck subagent. \
-         Use action='pipeline' with steps array for multi-step execution with optional tool use per step. \
-         Use action='loop' with task and max_rounds for autonomous iterative refinement with tools. \
-         Use 'agent' to pick a specialized profile (explore, reviewer, builder, researcher) \
-         and 'model' to control cost (e.g. 'haiku' for cheap/fast tasks)."
+        "Run background subagents: spawn a task, list running/completed ones, check/wait/cancel by \
+         task_id, or run a multi-step pipeline or refinement loop (see 'action'). \
+         Use 'agent' to pick a specialized profile and 'model' to control cost."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -229,73 +220,77 @@ impl Tool for SpawnTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action to perform: 'spawn' (default, requires 'task'), 'check'/'wait'/'cancel' (require 'task_id'), 'pipeline' (requires 'steps'), 'loop' (requires 'task'), or 'list'",
+                    "description": "'spawn' (default) and 'loop' require 'task'; 'check'/'wait'/'cancel' require 'task_id'; 'pipeline' requires 'steps'",
                     "enum": ["spawn", "list", "check", "wait", "cancel", "pipeline", "loop"]
                 },
                 "steps": {
                     "type": "array",
-                    "description": "Pipeline steps array (for action='pipeline'). Each step: {prompt, expected?, tools?, max_iterations?}",
+                    "description": "Pipeline steps (pipeline)",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "prompt": { "type": "string", "description": "The prompt/task for this step" },
+                            "prompt": { "type": "string", "description": "Step prompt" },
                             "expected": { "type": "string", "description": "Expected answer for verification" },
                             "tools": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Tool names this step can use (e.g. ['exec', 'read_file']). Omit for text-only steps."
+                                "description": "Allowed tool names; omit for text-only"
                             },
                             "max_iterations": {
                                 "type": "integer",
-                                "description": "Max tool iterations for this step (default: 5). Only used when tools are specified."
+                                "description": "Max tool iterations (default: 5)"
                             }
                         }
                     }
                 },
                 "ahead_by_k": {
                     "type": "integer",
-                    "description": "MAKER voting margin (for action='pipeline'). 0 = no voting. Default: 0"
+                    "description": "MAKER voting margin (pipeline). 0 = no voting (default)"
                 },
                 "task": {
                     "type": "string",
-                    "description": "The task for the subagent to complete (required for action='spawn')"
+                    "description": "Task description (spawn/loop)"
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Task ID or prefix to wait for or cancel (required for action='wait' and action='cancel')"
+                    "description": "Task ID or prefix (check/wait/cancel)"
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds for action='wait' (default: 120)"
+                    "description": "Wait timeout in seconds (default: 120)"
                 },
                 "label": {
                     "type": "string",
-                    "description": "Optional short label for the task (for display)"
+                    "description": "Short display label"
                 },
                 "agent": {
                     "type": "string",
-                    "description": "Agent profile name (e.g. 'explore', 'reviewer', 'builder', 'researcher'). Omit for general-purpose."
+                    "description": "Profile: 'explore', 'reviewer', 'builder', 'researcher'. Omit for general-purpose."
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Named agent profile — available profiles are listed in your system prompt under 'Subagent Profiles'. Explicit 'model'/'tools' params override the profile's values. Unknown names return an error listing valid profiles."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model override. Use 'haiku' for fast/cheap, 'sonnet' for balanced, 'opus' for complex reasoning, 'local' for local model. Use provider prefix for external models: 'groq/llama-3.3-70b-versatile', 'gemini/gemini-2.0-flash', 'openai/gpt-4o'. Omit to use profile default or parent model."
+                    "description": "Model override: 'haiku'/'sonnet'/'opus'/'local', or provider-prefixed (e.g. 'groq/llama-3.3-70b-versatile'). Omit for profile/parent default."
                 },
                 "working_dir": {
                     "type": "string",
-                    "description": "Working directory for the subagent's exec tool. Defaults to the workspace directory."
+                    "description": "Subagent exec working directory (default: workspace)"
                 },
                 "max_rounds": {
                     "type": "integer",
-                    "description": "Maximum rounds for action='loop' (default: 5). Each round runs a full agent iteration."
+                    "description": "Max loop rounds (default: 5)"
                 },
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Tool names for action='loop' (e.g. ['read_file', 'exec', 'write_file'])"
+                    "description": "Allowed tool names (loop)"
                 },
                 "stop_condition": {
                     "type": "string",
-                    "description": "Stop condition text for action='loop'. Loop stops when output contains this text or 'DONE'."
+                    "description": "Loop stops when output contains this text or 'DONE'"
                 }
             },
             "required": []
@@ -446,8 +441,12 @@ impl Tool for SpawnTool {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
+                // 'profile' and 'agent' are synonyms; 'profile' wins when both
+                // are given. Resolution (and unknown-name errors) happens in
+                // SubagentManager::spawn via the existing agent_name plumbing.
                 let agent = params
-                    .get("agent")
+                    .get("profile")
+                    .or_else(|| params.get("agent"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
@@ -519,6 +518,38 @@ mod tests {
         assert!(required.is_empty());
         // No oneOf — Anthropic rejects it. Requirements are in action description.
         assert!(params.get("oneOf").is_none());
+    }
+
+    #[test]
+    fn test_spawn_tool_parameters_contains_profile() {
+        let tool = SpawnTool::new();
+        let params = tool.parameters();
+        assert!(params["properties"]["profile"].is_object());
+        let desc = params["properties"]["profile"]["description"]
+            .as_str()
+            .unwrap();
+        // The model must learn where profiles are listed and what overrides them.
+        assert!(desc.to_lowercase().contains("system prompt"));
+        assert!(desc.contains("model"));
+    }
+
+    #[tokio::test]
+    async fn test_profile_param_routes_to_agent_slot() {
+        let tool = SpawnTool::new();
+        let callback: SpawnCallback = Arc::new(
+            |_task, _label, agent: Option<String>, _model, _channel, _chat_id, _wd| {
+                Box::pin(async move {
+                    format!("agent={}", agent.unwrap_or_else(|| "none".to_string()))
+                })
+            },
+        );
+        tool.set_callback(callback).await;
+
+        let mut params = HashMap::new();
+        params.insert("task".to_string(), serde_json::json!("investigate"));
+        params.insert("profile".to_string(), serde_json::json!("researcher"));
+        let result = tool.execute(params).await;
+        assert!(result.contains("agent=researcher"));
     }
 
     #[tokio::test]

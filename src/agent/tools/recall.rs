@@ -12,6 +12,33 @@ use serde_json::{json, Value};
 use super::base::Tool;
 use crate::agent::knowledge_store::KnowledgeStore;
 
+/// How a recall query is executed against the knowledge store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryMode {
+    /// BM25/FTS only — exact-match shaped queries.
+    Keyword,
+    /// BM25 + vector fusion (degrades to BM25 when vectors are unavailable).
+    Hybrid,
+}
+
+/// Pick the query mode. An explicit `mode` param wins; otherwise multi-word
+/// queries (≥2 whitespace-separated tokens) use hybrid when the semantic
+/// capability is compiled in, and single-word queries stay keyword.
+fn choose_query_mode(explicit: Option<&str>, query: &str, semantic_available: bool) -> QueryMode {
+    match explicit {
+        Some("keyword") => QueryMode::Keyword,
+        Some("semantic") | Some("hybrid") => QueryMode::Hybrid,
+        _ => {
+            let multi_word = query.split_whitespace().nth(1).is_some();
+            if multi_word && semantic_available {
+                QueryMode::Hybrid
+            } else {
+                QueryMode::Keyword
+            }
+        }
+    }
+}
+
 /// Tool that searches across all nanobot memory layers.
 pub struct RecallTool {
     workspace: PathBuf,
@@ -25,12 +52,12 @@ impl RecallTool {
     }
 
     /// Search the knowledge store (hybrid BM25 + vector when semantic feature is enabled).
-    fn knowledge_search(&self, query: &str, n: usize, mode: &str) -> Option<String> {
+    fn knowledge_search(&self, query: &str, n: usize, mode: QueryMode) -> Option<String> {
         let store = KnowledgeStore::open_default().ok()?;
 
         let hits = match mode {
-            "keyword" => store.search(query, n).ok()?,
-            _ => store.hybrid_search(query, n).ok()?,
+            QueryMode::Keyword => store.search(query, n).ok()?,
+            QueryMode::Hybrid => store.hybrid_search(query, n).ok()?,
         };
 
         if hits.is_empty() {
@@ -124,7 +151,9 @@ impl Tool for RecallTool {
     fn description(&self) -> &str {
         "Search memory: long-term facts (MEMORY.md), session summaries, and archived sessions. \
          Run /sessions index first to make historical conversations searchable. \
-         Use this to find past context, user preferences, or previous decisions."
+         Use this to find past context, user preferences, or previous decisions. \
+         Multi-word queries automatically use hybrid keyword+semantic search when available; \
+         pass mode='keyword' for exact matches or mode='semantic' to force meaning-based search."
     }
 
     fn parameters(&self) -> Value {
@@ -152,10 +181,8 @@ impl Tool for RecallTool {
             _ => return "Error: 'query' parameter is required and must be non-empty.".to_string(),
         };
 
-        let mode = params
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("auto");
+        let explicit_mode = params.get("mode").and_then(|v| v.as_str());
+        let mode = choose_query_mode(explicit_mode, query, cfg!(feature = "semantic"));
 
         let n = 5;
         let mut sections: Vec<String> = Vec::new();
@@ -163,9 +190,8 @@ impl Tool for RecallTool {
         // Try knowledge store first (hybrid BM25 + vector search).
         if let Some(results) = self.knowledge_search(query, n, mode) {
             let label = match mode {
-                "keyword" => "Keyword Search Results",
-                "semantic" => "Hybrid Search Results",
-                _ => "Search Results",
+                QueryMode::Keyword => "Keyword Search Results",
+                QueryMode::Hybrid => "Hybrid Search Results",
             };
             sections.push(format!("## {}\n{}", label, results));
         }
@@ -216,6 +242,47 @@ mod tests {
     fn test_recall_tool_name() {
         let (_tmp, tool) = make_tool();
         assert_eq!(tool.name(), "recall");
+    }
+
+    #[test]
+    fn test_choose_query_mode_explicit_wins() {
+        // Explicit mode always wins, regardless of word count or capability.
+        assert_eq!(
+            choose_query_mode(Some("keyword"), "several words here", true),
+            QueryMode::Keyword
+        );
+        assert_eq!(
+            choose_query_mode(Some("semantic"), "word", false),
+            QueryMode::Hybrid
+        );
+    }
+
+    #[test]
+    fn test_choose_query_mode_heuristic_word_count() {
+        // Single-word queries are exact-match shaped → keyword.
+        assert_eq!(choose_query_mode(None, "rust", true), QueryMode::Keyword);
+        // Multi-word queries use hybrid when semantic capability is compiled in.
+        assert_eq!(
+            choose_query_mode(None, "how compaction was configured", true),
+            QueryMode::Hybrid
+        );
+        // ... but degrade to keyword when it is not.
+        assert_eq!(
+            choose_query_mode(None, "how compaction was configured", false),
+            QueryMode::Keyword
+        );
+        // "auto" behaves like no explicit mode.
+        assert_eq!(
+            choose_query_mode(Some("auto"), "one two three", true),
+            QueryMode::Hybrid
+        );
+        assert_eq!(choose_query_mode(Some("auto"), "one", true), QueryMode::Keyword);
+    }
+
+    #[test]
+    fn test_recall_description_mentions_mode() {
+        let (_tmp, tool) = make_tool();
+        assert!(tool.description().contains("mode"));
     }
 
     #[test]
@@ -331,7 +398,7 @@ mod tests {
         let tool = RecallTool::new(Path::new("/tmp/nonexistent"));
         // Should gracefully return None when knowledge store has nothing.
         // (open_default will create an empty DB, hybrid_search returns empty)
-        let result = tool.knowledge_search("test query", 5, "auto");
+        let result = tool.knowledge_search("test query", 5, QueryMode::Hybrid);
         // Either None (no hits) or Some with empty — both are fine.
         if let Some(ref text) = result {
             assert!(!text.is_empty());

@@ -387,6 +387,47 @@ pub fn parse_textual_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     result
 }
 
+/// Marker heading of the textual-tools prompt block. Callers use it to check
+/// whether the block was already appended to a system prompt (idempotence).
+pub const TEXTUAL_TOOLS_MARKER: &str = "## Tool Calls (textual)";
+
+/// Render tool definitions as a system-prompt block that teaches the textual
+/// call syntax parsed by [`parse_textual_tool_calls`].
+///
+/// For models with no tool-calling training (e.g. VibeThinker) the native
+/// `tools` request parameter is useless — their chat templates either ignore
+/// or reject it. Instead, the caller drops the `tools` parameter and appends
+/// this block so the model can still act through the textual protocol.
+pub fn textual_tools_block(tool_defs: &[Value]) -> String {
+    let mut out = format!(
+        "\n\n{TEXTUAL_TOOLS_MARKER}\n\
+         You do not have native tool calling. To use a tool, write this exact \
+         pattern on its own line, then stop and wait:\n\
+         [I called: tool_name({{\"arg\": \"value\"}})]\n\
+         The result arrives in the next user message. One call per turn, \
+         arguments as strict JSON.\n\
+         Available tools:\n"
+    );
+    for def in tool_defs {
+        let name = def
+            .pointer("/function/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let desc = def
+            .pointer("/function/description")
+            .and_then(|v| v.as_str())
+            .and_then(|d| d.lines().next())
+            .unwrap_or("");
+        let params: Vec<&str> = def
+            .pointer("/function/parameters/properties")
+            .and_then(|p| p.as_object())
+            .map(|o| o.keys().map(|k| k.as_str()).collect())
+            .unwrap_or_default();
+        out.push_str(&format!("- {}({}) — {}\n", name, params.join(", "), desc));
+    }
+    out
+}
+
 /// Strip textual tool call brackets from response content.
 ///
 /// Removes all `[I called: ...]` / `[Called: ...]` patterns, trims, and returns
@@ -692,6 +733,24 @@ mod tests {
     }
 
     // ---- LocalProtocol unit tests ----
+
+    #[test]
+    fn textual_tools_block_teaches_parseable_syntax() {
+        let defs = vec![json!({"type": "function", "function": {
+            "name": "read_file",
+            "description": "Read a file.\nSecond line is dropped.",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+        }})];
+        let block = textual_tools_block(&defs);
+        assert!(block.contains(TEXTUAL_TOOLS_MARKER));
+        assert!(block.contains("- read_file(path) — Read a file."));
+        assert!(!block.contains("Second line"));
+        // Self-consistency: the exact syntax the block teaches must round-trip
+        // through our own parser.
+        let parsed = parse_textual_tool_calls(r#"[I called: tool_name({"arg": "value"})]"#);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].tool, "tool_name");
+    }
 
     #[test]
     fn local_no_tool_role() {

@@ -77,6 +77,24 @@ fn send_retract_reply_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<Stri
     }
 }
 
+fn stable_higgs_session_id(session_id: &str, epoch: u64) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in session_id.bytes().chain(epoch.to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn attach_higgs_session_marker(messages: &mut [Value], session_id: u64) {
+    if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
+        first.insert(
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD.to_string(),
+            json!(session_id),
+        );
+    }
+}
+
 fn proactive_grounding_preserves_prefix_cache(is_local: bool, local_tail_opt_in: bool) -> bool {
     !is_local || local_tail_opt_in
 }
@@ -232,7 +250,9 @@ pub(crate) enum ResponseBoundary {
     Off,
     /// A side-effect tool just ran; arm the boundary on the next call.
     Pending,
-    /// This call was nudged to respond; side-effect tool calls are rejected.
+    /// This call was nudged to respond; side-effect tool calls are rejected
+    /// unless the response also carries a text report (compliance is
+    /// behavioral — see `tool_engine::boundary_blocks_side_effects`).
     Armed,
 }
 
@@ -1104,6 +1124,28 @@ impl AgentLoopShared {
                 }
             }
         };
+        // Tool-averse models (no tool-calling training, e.g. VibeThinker):
+        // the native `tools` parameter confuses or errors their chat
+        // templates, and nothing else would teach them the textual syntax the
+        // response parser expects. Move the tool catalog into the system
+        // prompt as a textual-protocol lesson and send no `tools` at all.
+        if ctx.protocol.is_textual_replay()
+            && !ctx.core.model_capabilities.tool_calling
+            && !tool_defs.is_empty()
+        {
+            let already_taught = ctx
+                .messages
+                .first()
+                .and_then(|m| m["content"].as_str())
+                .is_some_and(|s| s.contains(crate::agent::protocol::TEXTUAL_TOOLS_MARKER));
+            if !already_taught {
+                append_to_system_prompt(
+                    &mut ctx.messages,
+                    &crate::agent::protocol::textual_tools_block(&tool_defs),
+                );
+            }
+            tool_defs.clear();
+        }
         // Save tool_defs before potential stripping so we can restore them if
         // the router preflight returns Passthrough (router said "respond") — in
         // that case the main model must have tools as fallback.
@@ -1238,6 +1280,13 @@ impl AgentLoopShared {
             pending.watermark,
             pending.result.messages.len(),
             ctx.messages.len().saturating_sub(pending.watermark)
+        );
+        // Record stats for `/lcm stats`: tokens of the replaced prefix vs its
+        // compacted form (estimates, same estimator as budget accounting).
+        let prefix_end = pending.watermark.min(ctx.messages.len());
+        ctx.counters.record_compaction(
+            TokenBudget::estimate_tokens(&ctx.messages[..prefix_end]) as u64,
+            TokenBudget::estimate_tokens(&pending.result.messages) as u64,
         );
         apply_compaction_result(&mut ctx.messages, pending);
         // After compaction, all messages in the array are "new" from the
@@ -1705,7 +1754,7 @@ impl AgentLoopShared {
 
         // Use the protocol-rendered wire format for the provider call.
         // `ctx.rendered_messages` was computed by `render_via_protocol()` in step_pre_call.
-        let messages_for_llm = if ctx.rendered_messages.is_empty() {
+        let mut messages_for_llm = if ctx.rendered_messages.is_empty() {
             // Fallback: render now if step_pre_call was bypassed (should not happen in practice).
             render_via_protocol(&*ctx.protocol, &ctx.messages)
         } else {
@@ -1745,12 +1794,30 @@ impl AgentLoopShared {
                     prev_msgs,
                     new_msgs,
                 } => {
-                    tracing::info!(
+                    // WARN (not info): the default subscriber filter is `warn`,
+                    // and a prefix divergence costs ~60s/turn on local — this must
+                    // be visible in the log without RUST_LOG=info. Self-suppresses
+                    // once the cause is fixed (the AppendOnly branch stays debug).
+                    //
+                    // `role_snippet` names the mutated message so the cache-busting
+                    // field is identifiable without a separate dump: e.g. a tool
+                    // result being re-compacted, or a provenance notice shifting.
+                    let role_snippet = messages_for_llm
+                        .get(first_divergent_msg)
+                        .map(|m| {
+                            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let snippet: String = content.chars().take(70).collect();
+                            format!("[{role}] {snippet}")
+                        })
+                        .unwrap_or_else(|| "(out of range)".to_string());
+                    tracing::warn!(
                         session = %ctx.session_key,
                         at_msg = first_divergent_msg,
                         prev_msgs,
                         new_msgs,
                         prefill_estimate,
+                        %role_snippet,
                         "prompt_prefix_diverged — server re-prefills past this point"
                     );
                     format!(
@@ -1775,6 +1842,37 @@ impl AgentLoopShared {
                     let _ = delta_tx.send(format!("\x00prefill_estimate:{prefill_estimate}"));
                 }
             }
+        }
+
+        // Tool-block divergence diagnostic. The message fingerprint above is
+        // blind to tool schemas by design, yet chat templates render the tool
+        // block at the prompt head — so a tool block that changes between turns
+        // busts the prefix cache invisibly (server re-prefills everything). This
+        // catches that case: WARN when the serialized tool array hash changes.
+        {
+            let tool_count = tool_defs_opt.map_or(0, |t| t.len());
+            let new_tool_hash = prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
+            let mut tool_store = counters.prompt_tool_hashes.lock();
+            if let Some(prev) = tool_store.get(&ctx.session_key) {
+                if *prev != new_tool_hash {
+                    tracing::warn!(
+                        session = %ctx.session_key,
+                        tool_count,
+                        prev_hash = prev,
+                        new_hash = new_tool_hash,
+                        "tool_block_changed — chat template re-renders tool head, busting prefix cache"
+                    );
+                }
+            }
+            tool_store.insert(ctx.session_key.to_string(), new_tool_hash);
+        }
+
+        if ctx.core.mode().is_local() && ctx.core.provider.get_api_base().is_some() {
+            let provider_session_id = stable_higgs_session_id(
+                &ctx.session_id,
+                counters.session_prompt_epoch(&ctx.session_key),
+            );
+            attach_higgs_session_marker(&mut messages_for_llm, provider_session_id);
         }
 
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {

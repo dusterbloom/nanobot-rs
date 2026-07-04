@@ -321,6 +321,23 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             vision: false,
         };
     }
+    // Reasoning-only local models: strong chain-of-thought, zero tool-calling
+    // training. Tools reach them as a textual-protocol lesson in the system
+    // prompt (see protocol::textual_tools_block) instead of the `tools` param.
+    if lower.contains("vibethinker") {
+        return ModelCapabilities {
+            size_class: ModelSizeClass::Small,
+            tool_calling: false,
+            thinking: true,
+            needs_native_lms_api: false,
+            strict_alternation: true,
+            max_reliable_output: 4096,
+            scratch_pad_rounds: 4,
+            reader_tier: ReaderTier::Minimal,
+            parser: None,
+            vision: false,
+        };
+    }
     // Generic small model patterns (catch-all for size indicators)
     // Use has_size_marker to avoid false positives like "35b" matching "3b"
     // or "a3b" (MoE active-param suffix) matching "3b".
@@ -451,6 +468,14 @@ mod tests {
         assert_eq!(caps.size_class, ModelSizeClass::Medium);
         assert!(caps.thinking);
         assert!(caps.strict_alternation);
+    }
+
+    #[test]
+    fn test_vibethinker_is_tool_averse_reasoning_model() {
+        let caps = lookup("usermma/VibeThinker-3B-mlx-8Bit", &empty_overrides());
+        assert_eq!(caps.size_class, ModelSizeClass::Small);
+        assert!(!caps.tool_calling, "no tool-calling training");
+        assert!(caps.thinking, "reasoning-first model");
     }
 
     #[test]
