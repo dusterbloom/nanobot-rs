@@ -152,6 +152,18 @@ enum VoiceAction {
     Config,
 }
 
+/// Commands that hand the terminal to the interactive REPL/TUI. Tracing must
+/// go to the log file for these, never to stderr.
+fn launches_interactive_ui(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Agent { message: None, .. }
+            | Commands::Sessions {
+                action: SessionsAction::Resume { .. } | SessionsAction::New { .. },
+            }
+    )
+}
+
 #[derive(Subcommand)]
 enum SessionsAction {
     /// List all sessions with date, size, and message count.
@@ -306,9 +318,12 @@ pub fn run() {
 
     let cli = Cli::parse();
 
-    // Detect interactive REPL mode: `nanobot agent` with no -m message and a TTY.
-    let is_interactive_repl = matches!(&cli.command, Commands::Agent { message: None, .. })
-        && std::io::stdout().is_terminal();
+    // Detect interactive REPL/TUI mode and a TTY. Every command that runs the
+    // interactive UI must be listed here: with the terminal owned by the TUI,
+    // a stderr tracing layer splatters WARN lines across the transcript and
+    // input box (the `sessions resume` log-corruption bug).
+    let is_interactive_repl =
+        launches_interactive_ui(&cli.command) && std::io::stdout().is_terminal();
 
     // Always suppress noisy crates regardless of RUST_LOG setting.
     // When RUST_LOG is set (e.g. "debug"), append mandatory filters so html5ever
@@ -631,6 +646,26 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_launches_interactive_ui_covers_all_repl_entrypoints() {
+        // Interactive: the TUI owns the terminal, tracing must go to file.
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        assert!(launches_interactive_ui(&parse(&["nanobot", "agent"])));
+        assert!(launches_interactive_ui(&parse(&[
+            "nanobot", "sessions", "resume", "20260704_072151_f06df0"
+        ])));
+        assert!(launches_interactive_ui(&parse(&["nanobot", "sessions", "new"])));
+
+        // Non-interactive: stderr logging is fine (and wanted).
+        assert!(!launches_interactive_ui(&parse(&[
+            "nanobot", "agent", "-m", "hi"
+        ])));
+        assert!(!launches_interactive_ui(&parse(&["nanobot", "status"])));
+        assert!(!launches_interactive_ui(&parse(&[
+            "nanobot", "sessions", "list"
+        ])));
+    }
 
     #[test]
     fn test_cli_parses_tune_command() {

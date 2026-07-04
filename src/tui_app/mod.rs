@@ -381,11 +381,7 @@ async fn slash_command(
         }
         "mode" => {
             let arg = rest.strip_prefix("mode").map(str::trim).unwrap_or("");
-            if arg.is_empty() {
-                app.cycle_mode();
-            } else if !app.set_mode(arg) {
-                app.push_note(format!("unknown mode '{arg}' — use calm | inspect | deep"));
-            }
+            app.apply_mode_command(arg);
         }
         "model" | "m" => {
             if ctx.model_picker_available() {

@@ -206,6 +206,7 @@ pub(crate) enum Action {
 }
 
 /// What a key/mouse/paste event means while the assistant is streaming.
+#[derive(Debug)]
 pub(crate) enum StreamingAction {
     Continue,
     Cancel,
@@ -299,7 +300,7 @@ pub(crate) struct BackgroundJob {
 }
 
 /// Disclosure level — how much tool output and metadata the transcript shows.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Mode {
     /// Minimal: collapsed tool summaries, compact metadata.
     Calm,
@@ -1786,6 +1787,42 @@ impl App {
     }
 
     /// Handle an event while a turn is streaming.
+    /// Apply a `/mode` argument: empty cycles, a name selects. Shared by the
+    /// idle slash-command handler and the streaming-safe path.
+    pub(crate) fn apply_mode_command(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.cycle_mode();
+        } else if !self.set_mode(arg) {
+            self.push_note(format!("unknown mode '{arg}' — use calm | inspect | deep"));
+        }
+    }
+
+    /// Execute the typed input as a UI-only slash command, if it is one.
+    /// Returns true when consumed. Only commands that touch pure display
+    /// state belong here — anything that reaches the agent, providers, or
+    /// session must keep the Enter-interrupts-turn semantics.
+    fn try_ui_command_during_stream(&mut self) -> bool {
+        let line = self.input.lines().join("\n");
+        let trimmed = line.trim();
+        let Some(cmd) = trimmed.strip_prefix('/') else {
+            return false;
+        };
+        match cmd.split_whitespace().next().unwrap_or("") {
+            "mode" => {
+                let arg = cmd.strip_prefix("mode").map(str::trim).unwrap_or("");
+                self.apply_mode_command(arg);
+                self.clear_input();
+                true
+            }
+            "help" => {
+                self.show_help = true;
+                self.clear_input();
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn on_streaming_event(&mut self, ev: Event) -> StreamingAction {
         match ev {
             Event::Key(k) if is_press(&k) => {
@@ -1819,10 +1856,19 @@ impl App {
                         self.cycle_mode();
                         StreamingAction::Continue
                     }
-                    KeyCode::Enter if k.modifiers.is_empty() => match self.submit() {
-                        Action::Submit(turn) => StreamingAction::CancelAndSubmit(turn),
-                        _ => StreamingAction::Cancel,
-                    },
+                    KeyCode::Enter if k.modifiers.is_empty() => {
+                        // UI-only commands (/mode, /help) act on the display,
+                        // not the agent — apply them in place. Everything else
+                        // keeps interrupt semantics: Enter cancels the turn
+                        // (and resubmits when the input was a message).
+                        if self.try_ui_command_during_stream() {
+                            return StreamingAction::Continue;
+                        }
+                        match self.submit() {
+                            Action::Submit(turn) => StreamingAction::CancelAndSubmit(turn),
+                            _ => StreamingAction::Cancel,
+                        }
+                    }
                     KeyCode::PageUp => {
                         self.scroll_up(10);
                         StreamingAction::Continue
@@ -3975,6 +4021,63 @@ mod tests {
         assert!(matches!(action, Action::Continue));
         let shown = flatten_text(Text::from(app.transcript_rows(100)));
         assert!(shown.contains("private thought"));
+    }
+
+    #[test]
+    fn mode_command_during_streaming_applies_without_cancel() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.input.insert_str("/mode deep");
+
+        let action = app.on_streaming_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+        )));
+
+        assert!(
+            matches!(action, StreamingAction::Continue),
+            "a UI-only command must not cancel the running turn"
+        );
+        assert_eq!(app.mode, Mode::Deep, "the mode change must be applied");
+        assert!(app.input_is_empty(), "the command input must be consumed");
+
+        // Bare /mode cycles, still without cancelling.
+        app.input.insert_str("/mode");
+        let action = app.on_streaming_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+        )));
+        assert!(matches!(action, StreamingAction::Continue));
+        assert_eq!(app.mode, Mode::Calm, "deep cycles to calm");
+    }
+
+    #[test]
+    fn message_during_streaming_still_cancels_and_submits() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.input.insert_str("actually stop and do this instead");
+        let action = app.on_streaming_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+        )));
+        match action {
+            StreamingAction::CancelAndSubmit(turn) => {
+                assert_eq!(turn.text, "actually stop and do this instead");
+            }
+            other => panic!("plain message must cancel-and-submit, got {other:?}"),
+        }
+        // Agent-affecting commands keep interrupt semantics too: /model must
+        // NOT run mid-turn, so Enter cancels like before.
+        app.begin_turn("q2");
+        app.input.insert_str("/model gpt-x");
+        let action = app.on_streaming_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+        )));
+        assert!(
+            !matches!(action, StreamingAction::Continue),
+            "non-UI commands must keep cancel semantics"
+        );
     }
 
     #[test]
