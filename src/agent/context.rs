@@ -65,6 +65,15 @@ pub fn sanitize_tool_result(result: &str, max_chars: usize) -> String {
 /// loaded into every prompt.
 const BOOTSTRAP_FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md"];
 
+/// Provenance rules injected when provenance mode is on. Shared by the
+/// system-prompt and section-assembler paths (no "## " header — callers add
+/// their own title).
+const VERIFICATION_PROTOCOL: &str =
+    "Tool calls are audit-logged and mechanically verified; unverified claims are redacted. \
+     Quote tool output verbatim from the [VERBATIM TOOL OUTPUT] blocks — never fabricate \
+     paths, outputs, or numbers, and never claim an action without a matching tool call. \
+     Report exact error messages, and state uncertainty when output was truncated or timed out.";
+
 #[derive(Debug, Clone)]
 pub struct PromptBlock {
     title: String,
@@ -270,22 +279,13 @@ impl ContextBuilder {
         let mut parts: Vec<String> = Vec::new();
 
         // Core identity.
-        parts.push(self._get_identity());
+        parts.push(self._get_identity(false));
 
         // Provenance verification rules.
         if self.provenance_enabled {
-            parts.push(
-                "## Verification Protocol\n\n\
-                 Tool calls are audit-logged and mechanically verified. Unverified claims are redacted.\n\
-                 1. QUOTE VERBATIM — exact tool output, no paraphrasing.\n\
-                 2. NEVER FABRICATE — no invented paths, outputs, or numbers.\n\
-                 3. REPORT ERRORS — exact error messages from tools.\n\
-                 4. NO PHANTOM ACTIONS — only claim actions with matching tool calls.\n\
-                 5. STATE UNCERTAINTY — say \"truncated\" or \"timed out\" when applicable.\n\
-                 6. USE [VERBATIM TOOL OUTPUT] markers — quote from these blocks directly.\n\
-                 Every \"let me\" is a PROMISE requiring an immediate tool call."
-                    .to_string(),
-            );
+            parts.push(format!(
+                "## Verification Protocol\n\n{VERIFICATION_PROTOCOL}"
+            ));
         }
 
         // Bootstrap files — include complete files in priority order, skip the rest.
@@ -333,78 +333,11 @@ impl ContextBuilder {
             }
         }
 
-        // Skills -- progressive loading (3-tier disclosure model).
-        // Tier selection is driven by `skill_disclosure`:
-        //   "compact" (default): one-line index in system prompt, full content on demand via read_skill
-        //   "xml": full XML summary with descriptions and metadata
-        //   "eager": full skill content loaded immediately (legacy behaviour)
-        // `lazy_skills` is kept for backward compat and treated as "xml" disclosure.
-        let effective_disclosure = if self.skill_disclosure == "eager" {
-            "eager"
-        } else if self.skill_disclosure == "xml"
-            || (!self.skill_disclosure.is_empty() && self.skill_disclosure != "compact")
-        {
-            "xml"
-        } else {
-            // "compact" is default; also applied when lazy_skills=true (unless overridden)
-            "compact"
-        };
-
-        let mut skills_parts: Vec<String> = Vec::new();
-
-        match effective_disclosure {
-            "eager" => {
-                // Eager mode: always-loaded skills get full content, others as XML summary.
-                let always_skills = self.skills.get_always_skills();
-                if !always_skills.is_empty() {
-                    let always_content = self.skills.load_skills_for_context(&always_skills);
-                    if !always_content.is_empty() {
-                        skills_parts.push(format!("# Active Skills\n\n{}", always_content));
-                    }
-                }
-                let skills_summary = self.skills.build_skills_summary();
-                if !skills_summary.is_empty() {
-                    skills_parts.push(format!(
-                        "# Skills\n\n\
-                         The following skills extend your capabilities. \
-                         To use a skill, read its SKILL.md file using the read_file tool.\n\
-                         Skills with available=\"false\" need dependencies installed first \
-                         - you can try installing them with apt/brew.\n\n\
-                         {}",
-                        skills_summary
-                    ));
-                }
-            }
-            "xml" => {
-                // XML mode: full XML summary, agent fetches full content via read_skill.
-                let skills_summary = self.skills.build_skills_summary();
-                if !skills_summary.is_empty() {
-                    skills_parts.push(format!(
-                        "# Skills\n\n\
-                         The following skills extend your capabilities. \
-                         Use the read_skill tool to load a skill's full instructions.\n\
-                         Skills with available=\"false\" need dependencies installed first \
-                         - you can try installing them with apt/brew.\n\n\
-                         {}",
-                        skills_summary
-                    ));
-                }
-            }
-            _ => {
-                // "compact" (default): one-line index, full content on demand.
-                let index = self.skills.build_compact_index();
-                if !index.is_empty() {
-                    skills_parts.push(format!("# Skills\n\n{}", index));
-                }
-            }
-        }
-
-        if !skills_parts.is_empty() {
-            let combined = skills_parts.join("\n\n");
-            let capped = Self::_truncate_to_budget_head(&combined, self.skills_budget);
-            if !capped.is_empty() {
-                parts.push(capped);
-            }
+        // Skills — progressive loading; see `_build_skills_content` for the
+        // 3-tier disclosure model (compact/xml/eager).
+        let skills_content = self._build_skills_content(skill_names);
+        if !skills_content.is_empty() {
+            parts.push(format!("# Skills\n\n{}", skills_content));
         }
 
         // Subagent profiles — tells the model what agents exist and when to delegate.
@@ -620,7 +553,7 @@ impl ContextBuilder {
         let mut sections = Vec::new();
 
         // Identity prefix.
-        let identity = self._get_local_identity();
+        let identity = self._get_identity(true);
         if !identity.is_empty() {
             sections.push(SectionEntry {
                 section: PromptSection::Identity,
@@ -701,7 +634,7 @@ impl ContextBuilder {
         let mut sections = Vec::new();
 
         // --- Identity section (core identity text) ---
-        let identity_text = self._get_identity();
+        let identity_text = self._get_identity(false);
         if !identity_text.is_empty() {
             sections.push(SectionEntry {
                 section: PromptSection::Identity,
@@ -716,19 +649,9 @@ impl ContextBuilder {
 
         // --- Verification section (provenance rules) ---
         if self.provenance_enabled {
-            let verification_text =
-                "## Verification Protocol\n\n\
-                 Tool calls are audit-logged and mechanically verified. Unverified claims are redacted.\n\
-                 1. QUOTE VERBATIM — exact tool output, no paraphrasing.\n\
-                 2. NEVER FABRICATE — no invented paths, outputs, or numbers.\n\
-                 3. REPORT ERRORS — exact error messages from tools.\n\
-                 4. NO PHANTOM ACTIONS — only claim actions with matching tool calls.\n\
-                 5. STATE UNCERTAINTY — say \"truncated\" or \"timed out\" when applicable.\n\
-                 6. USE [VERBATIM TOOL OUTPUT] markers — quote from these blocks directly.\n\
-                 Every \"let me\" is a PROMISE requiring an immediate tool call.";
             sections.push(SectionEntry {
                 section: PromptSection::Verification,
-                block: PromptBlock::new("Verification Protocol", verification_text),
+                block: PromptBlock::new("Verification Protocol", VERIFICATION_PROTOCOL),
                 allocated_tokens: 0,
                 actual_tokens: 0,
                 source: SectionSource::Static("provenance rules"),
@@ -897,6 +820,12 @@ impl ContextBuilder {
     }
 
     /// Build the skills content string based on the disclosure mode.
+    ///
+    /// Tier selection is driven by `skill_disclosure`:
+    ///   "compact" (default): one-line index, full content on demand via read_skill
+    ///   "xml": full XML summary with descriptions and metadata
+    ///   "eager": always-on skills loaded in full, others as XML summary (legacy)
+    /// `lazy_skills` is kept for backward compat and treated as "xml" disclosure.
     fn _build_skills_content(&self, _skill_names: Option<&[String]>) -> String {
         let effective_disclosure = if self.skill_disclosure == "eager" {
             "eager"
@@ -911,36 +840,30 @@ impl ContextBuilder {
         let mut parts: Vec<String> = Vec::new();
 
         match effective_disclosure {
-            "eager" => {
-                let always_skills = self.skills.get_always_skills();
-                if !always_skills.is_empty() {
-                    let always_content = self.skills.load_skills_for_context(&always_skills);
-                    if !always_content.is_empty() {
-                        parts.push(format!("# Active Skills\n\n{}", always_content));
+            mode @ ("eager" | "xml") => {
+                if mode == "eager" {
+                    // Eager mode additionally inlines always-on skills in full.
+                    let always_skills = self.skills.get_always_skills();
+                    if !always_skills.is_empty() {
+                        let always_content = self.skills.load_skills_for_context(&always_skills);
+                        if !always_content.is_empty() {
+                            parts.push(format!("# Active Skills\n\n{}", always_content));
+                        }
                     }
                 }
                 let skills_summary = self.skills.build_skills_summary();
                 if !skills_summary.is_empty() {
+                    // One shared intro; only the load mechanism differs per mode.
+                    let load_hint = if mode == "eager" {
+                        "To use a skill, read its SKILL.md file using the read_file tool."
+                    } else {
+                        "Use the read_skill tool to load a skill's full instructions."
+                    };
                     parts.push(format!(
-                        "The following skills extend your capabilities. \
-                         To use a skill, read its SKILL.md file using the read_file tool.\n\
+                        "The following skills extend your capabilities. {load_hint}\n\
                          Skills with available=\"false\" need dependencies installed first \
                          - you can try installing them with apt/brew.\n\n\
-                         {}",
-                        skills_summary
-                    ));
-                }
-            }
-            "xml" => {
-                let skills_summary = self.skills.build_skills_summary();
-                if !skills_summary.is_empty() {
-                    parts.push(format!(
-                        "The following skills extend your capabilities. \
-                         Use the read_skill tool to load a skill's full instructions.\n\
-                         Skills with available=\"false\" need dependencies installed first \
-                         - you can try installing them with apt/brew.\n\n\
-                         {}",
-                        skills_summary
+                         {skills_summary}"
                     ));
                 }
             }
@@ -1177,130 +1100,120 @@ impl ContextBuilder {
     // Private helpers
     // ------------------------------------------------------------------
 
-    /// Core identity section including current time, time awareness, and workspace info.
-    fn _get_identity(&self) -> String {
+    /// Core identity section shared by the cloud and local prompt paths.
+    ///
+    /// `local` selects the compact variant for small-context local models:
+    /// terse model line, no Home/Memory sections, and a byte-stable prefix.
+    /// The timestamp is intentionally omitted in both variants — it is
+    /// appended as the LAST section of the prompt so the stable prefix hashes
+    /// identically across turns (prefix-cache hits; see
+    /// `_collect_local_sections` and `session_date_stamp`).
+    fn _get_identity(&self, local: bool) -> String {
         let workspace_path = Self::display_path(
             &self
                 .workspace
                 .canonicalize()
                 .unwrap_or_else(|_| self.workspace.clone()),
         );
-        let home_dir = dirs::home_dir()
-            .map(|p| Self::display_path(&p))
-            .unwrap_or_else(|| "~".to_string());
         let cwd = std::env::current_dir()
             .map(|p| Self::display_path(&p))
             .unwrap_or_else(|_| ".".to_string());
 
-        let model_section = if self.model_name.is_empty() {
-            String::new()
-        } else if let Some(gguf_name) = self.model_name.strip_prefix("local:") {
-            format!(
-                "\n\n## Model\nYou are running locally via LM Studio. \
-                 Your model file: {}. You are NOT Claude or any cloud AI. \
-                 Respond as nanobot powered by this local model.\n\n\
-                 ## Local Mode Constraints\n\
-                 - Cloud models (claude-*, gpt-*, etc.) are **not available** in this session.\n\
-                 - When spawning subagents, omit the `model` parameter to use the local model, \
-                 or specify it by name: `{}`.\n\
-                 - Do not request cloud-specific model tiers (haiku, sonnet, opus) — \
-                 they will automatically resolve to the local model.",
-                gguf_name, gguf_name
+        // Genuinely divergent pieces: intro/model line, extra rules, tail sections.
+        let (intro, home_line, extra_rules, tail) = if local {
+            let model_line = if self.model_name.is_empty() {
+                "Model: local".to_string()
+            } else {
+                format!("Model: {}", self.model_name)
+            };
+            let claim_hint = if self.model_name.starts_with("local:")
+                || self.model_name.starts_with("mlx:")
+            {
+                "\n- This is a local session. Do not claim to be Claude, GPT, or another cloud model."
+            } else {
+                ""
+            };
+            (
+                format!("You are nanobot, a local tool-using assistant.\n{model_line}"),
+                String::new(),
+                format!(
+                    "\n- `exec`, `list_dir`, `read_file`, `write_file` take project-directory \
+                     paths; the workspace is only for `recall`, `remember`, `read_skill`.\
+                     {claim_hint}"
+                ),
+                String::new(),
             )
         } else {
-            format!("\n\n## Model\nYou are powered by: {}", self.model_name)
-        };
+            let home_dir = dirs::home_dir()
+                .map(|p| Self::display_path(&p))
+                .unwrap_or_else(|| "~".to_string());
 
-        // Cost-aware delegation hint for expensive models.
-        let is_expensive = self.model_name.contains("opus")
-            || self.model_name.contains("gpt-4o")
-            || self.model_name.contains("claude-max");
-        let delegation_hint = if is_expensive && !self.agent_profiles.is_empty() {
-            "\n\n## Cost Efficiency\n\
-             You are an expensive model. Delegate mechanical tasks to cheap subagents via `spawn`:\n\
-             - File writes, web fetches, shell commands whose output you don't need immediately\n\
-             - Multi-step research that would burn >1000 tokens of intermediate results\n\
-             - Build/test cycles\n\
-             Only do it yourself when the result feeds directly into your next sentence."
-        } else {
-            ""
+            let model_section = if self.model_name.is_empty() {
+                String::new()
+            } else if let Some(gguf_name) = self.model_name.strip_prefix("local:") {
+                format!(
+                    "\n\n## Model\nYou are running locally via LM Studio. \
+                     Your model file: {}. You are NOT Claude or any cloud AI. \
+                     Respond as nanobot powered by this local model.\n\n\
+                     ## Local Mode Constraints\n\
+                     - Cloud models (claude-*, gpt-*, etc.) are **not available** in this session.\n\
+                     - When spawning subagents, omit the `model` parameter to use the local model, \
+                     or specify it by name: `{}`.\n\
+                     - Do not request cloud-specific model tiers (haiku, sonnet, opus) — \
+                     they will automatically resolve to the local model.",
+                    gguf_name, gguf_name
+                )
+            } else {
+                format!("\n\n## Model\nYou are powered by: {}", self.model_name)
+            };
+
+            // Cost-aware delegation hint for expensive models.
+            let is_expensive = self.model_name.contains("opus")
+                || self.model_name.contains("gpt-4o")
+                || self.model_name.contains("claude-max");
+            let delegation_hint = if is_expensive && !self.agent_profiles.is_empty() {
+                "\n\n## Cost Efficiency\n\
+                 You are an expensive model. Delegate mechanical tasks to cheap subagents via `spawn`:\n\
+                 - File writes, web fetches, shell commands whose output you don't need immediately\n\
+                 - Multi-step research that would burn >1000 tokens of intermediate results\n\
+                 - Build/test cycles\n\
+                 Only do it yourself when the result feeds directly into your next sentence."
+            } else {
+                ""
+            };
+
+            (
+                format!(
+                    "You are nanobot, a helpful AI assistant with tools for file I/O, shell, \
+                     web, messaging, and subagents.{model_section}"
+                ),
+                format!("Home: {home_dir}\n"),
+                "\n- Reply directly for conversation; use 'message' tool only for chat channels.\n\
+                 - Use absolute paths or paths relative to the project directory."
+                    .to_string(),
+                format!(
+                    "{delegation_hint}\n\n## Memory\n\
+                     Working Memory is injected automatically (session state). \
+                     Long-term facts: {workspace_path}/memory/MEMORY.md.\n\
+                     Use `recall` to search all memory (sessions, facts, archives).\n\n\
+                     If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your \
+                     approach — it takes precedence."
+                ),
+            )
         };
 
         format!(
             r#"# nanobot
 
-You are nanobot, a helpful AI assistant with tools for file I/O, shell, web, messaging, and subagents.
+{intro}
 
-## Context{model_section}
-Home: {home_dir}
-Working directory: {cwd}
-Workspace: {workspace_path}
+## Directories
+{home_line}Project directory: {cwd} — the user's files live HERE. Always start here; only go outside it when the user explicitly asks.
+Workspace: {workspace_path} — your internal state (memory, skills, config). NOT the user's project.
 
 ## Rules
-1. ALWAYS use tools. NEVER guess file contents, command output, or system state. Run the command, read the file, check with a tool. If you don't know, use a tool to find out — do not make up an answer.
-2. Be concise (1-5 sentences) unless asked for detail.
-3. Reply directly for conversation; use 'message' tool only for chat channels.
-
-## File Operations
-The user's project is at the **working directory** ({cwd}). Always look here first.
-Only access files outside it when the user explicitly asks.
-Your workspace ({workspace_path}) is for your internal state (memory, skills, config) — not the user's project.
-Use absolute paths or paths relative to the working directory.{delegation_hint}
-
-## Memory
-Working Memory is injected automatically (session state). Long-term facts: {workspace_path}/memory/MEMORY.md.
-Use `recall` to search all memory (sessions, facts, archives).
-
-If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach — it takes precedence."#
-        )
-    }
-
-    fn _get_local_identity(&self) -> String {
-        let workspace_path = Self::display_path(
-            &self
-                .workspace
-                .canonicalize()
-                .unwrap_or_else(|_| self.workspace.clone()),
-        );
-        let cwd = std::env::current_dir()
-            .map(|p| Self::display_path(&p))
-            .unwrap_or_else(|_| ".".to_string());
-
-        let model_line = if self.model_name.is_empty() {
-            "Model: local".to_string()
-        } else {
-            format!("Model: {}", self.model_name)
-        };
-
-        let local_mode_hint = if self.model_name.starts_with("local:")
-            || self.model_name.starts_with("mlx:")
-        {
-            "\n- This is a local session. Do not claim to be Claude, GPT, or another cloud model."
-        } else {
-            ""
-        };
-
-        // NOTE: Timestamp is intentionally omitted from the identity prefix.
-        // It is appended as the LAST section in the system prompt so the stable
-        // prefix (identity + bootstrap + skills + tools) hashes identically
-        // across turns, enabling oMLX/vLLM prefix-cache hits on the first
-        // 1024-token block(s). See `_collect_local_sections` for the injection.
-        format!(
-            r#"# nanobot
-
-You are nanobot, a local tool-using assistant.
-{model_line}
-
-## IMPORTANT: Directories
-**Project directory: {cwd}** ← The user's code lives HERE. Always start here.
-Internal workspace: {workspace_path} ← Your memory/skills/config only. NOT the user's project.
-
-When running `exec`, `list_dir`, `read_file`, or `write_file`, use paths under the **project directory** ({cwd}).
-Only access the workspace for `recall`, `remember`, or `read_skill` — never for the user's files.
-
-Rules:
-- Use tools to inspect files, commands, and memory. Never invent outputs, paths, or results.
-- Keep replies short unless the user asks for detail.{local_mode_hint}"#
+- ALWAYS use tools. NEVER guess file contents, command output, or system state — if you don't know, use a tool to find out.
+- Be concise (1-5 sentences) unless asked for detail.{extra_rules}{tail}"#
         )
     }
 
