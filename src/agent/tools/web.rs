@@ -130,12 +130,41 @@ impl WebSearchTool {
             None => std::env::var("BRAVE_API_KEY").unwrap_or_default(),
         };
 
+        // Build a client with browser-like headers. SearXNG's botdetection
+        // (http_accept / http_accept_encoding / http_accept_language /
+        // http_user_agent / http_sec_fetch) rejects requests that don't look
+        // like a real browser, returning HTTP 429. A bare `Client::new()` sends
+        // a reqwest default UA and no Accept/Sec-Fetch headers, so it is flagged.
+        //
+        // `X-Forwarded-For` is required by the limiter's trusted_proxies check:
+        // without a client IP header, botdetection refuses the request even
+        // when the real source is localhost. We are a trusted local client, so
+        // we declare ourselves.
+        let client = Client::builder()
+            .user_agent(USER_AGENT)
+            .default_headers(
+                std::collections::HashMap::from([
+                    ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                    ("accept-language", "en-US,en;q=0.9"),
+                    ("accept-encoding", "gzip, deflate, br"),
+                    ("sec-fetch-dest", "document"),
+                    ("sec-fetch-mode", "navigate"),
+                    ("sec-fetch-site", "none"),
+                    ("x-forwarded-for", "127.0.0.1"),
+                ])
+                .into_iter()
+                .map(|(k, v)| (reqwest::header::HeaderName::from_static(k), reqwest::header::HeaderValue::from_static(v)))
+                .collect(),
+            )
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         Self {
             api_key: resolved_key,
             max_results,
             provider,
             searxng_url,
-            client: Client::new(),
+            client,
             health_registry: None,
         }
     }
@@ -160,7 +189,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web. Returns titles, URLs, and snippets. Use web_fetch to read full content from URLs."
+        "Search the web. Returns titles, URLs, and snippets."
     }
 
     fn permission(&self) -> PermissionLevel {
@@ -236,6 +265,47 @@ impl Tool for WebSearchTool {
     }
 }
 
+/// Epoch seconds of the last background SearXNG heal attempt (0 = never).
+static LAST_SEARXNG_HEAL_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Minimum gap between background heal attempts.
+const SEARXNG_HEAL_GAP_S: u64 = 60;
+
+/// Debounce for the background heal: at most one attempt per gap window.
+fn should_attempt_heal(last_epoch_s: u64, now_epoch_s: u64) -> bool {
+    now_epoch_s.saturating_sub(last_epoch_s) >= SEARXNG_HEAL_GAP_S
+}
+
+/// Fire-and-forget SearXNG recovery. `ensure_searxng` handles the whole
+/// chain (start Docker Desktop → start/create container → fix config), so a
+/// search that fails because Docker isn't running yet self-repairs — the
+/// dominant "search is always down" cause is Docker Desktop not being up,
+/// not SearXNG itself. Debounced so retry storms don't stack Docker dances.
+fn trigger_searxng_heal(searxng_url: &str) {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_SEARXNG_HEAL_S.load(Ordering::Relaxed);
+    if !should_attempt_heal(last, now) {
+        return;
+    }
+    if LAST_SEARXNG_HEAL_S
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // another caller won the race
+    }
+    let url = searxng_url.to_string();
+    tokio::spawn(async move {
+        match crate::searxng::ensure_searxng(&url).await {
+            Ok(()) => tracing::info!("SearXNG background heal succeeded"),
+            Err(e) => tracing::warn!("SearXNG background heal failed: {e}"),
+        }
+    });
+}
+
 impl WebSearchTool {
     /// Execute a search via SearXNG. Falls back to Brave if SearXNG is unreachable
     /// and a Brave API key is configured.
@@ -247,10 +317,11 @@ impl WebSearchTool {
         // results — the failure mode that motivated this check.
         if let Some(reg) = &self.health_registry {
             if !reg.is_healthy("searxng") {
+                trigger_searxng_heal(&self.searxng_url);
                 return format!(
                     "Error: SearXNG backend is degraded (health probe failing). \
-                     The container may be stuck. Try: docker restart searxng\n\
-                     Then retry the search. Query was: {:?}",
+                     An automatic restart was just triggered — retry this \
+                     search in ~30-60 seconds. Query was: {:?}",
                     query
                 );
             }
@@ -314,7 +385,10 @@ impl WebSearchTool {
                 }
             }
             Err(e) => {
-                // Connection error — try Brave fallback if available.
+                // Connection error — usually Docker (and thus the SearXNG
+                // container) is not running. Kick the self-heal chain so a
+                // retry succeeds, then fall back to Brave if configured.
+                trigger_searxng_heal(&self.searxng_url);
                 if !self.api_key.is_empty() {
                     tracing::warn!("SearXNG unavailable ({}), falling back to Brave Search", e);
                     let mut result = self.execute_brave(query, count).await;
@@ -323,8 +397,8 @@ impl WebSearchTool {
                 }
                 // No Brave key - return error
                 format!(
-                    "Error: SearXNG unavailable ({}) and no Brave API key configured. \
-                     Set 'braveApiKey' in config.json or fix SearXNG URL.",
+                    "Error: SearXNG unavailable ({}). An automatic restart was \
+                     just triggered — retry this search in ~30-60 seconds.",
                     e
                 )
             }
@@ -401,13 +475,70 @@ impl WebSearchTool {
 // ---------------------------------------------------------------------------
 // WebFetchTool
 // ---------------------------------------------------------------------------
-// WebFetchTool
-// ---------------------------------------------------------------------------
+
+/// Truncate at a char boundary at or before `max_chars`.
+/// Returns the (possibly shortened) text and whether truncation happened.
+fn truncate_at_boundary(text: String, max_chars: usize) -> (String, bool) {
+    if text.len() <= max_chars {
+        return (text, false);
+    }
+    let mut end = max_chars;
+    while !text.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
+}
+
+/// Map a crw-server `/v1/scrape` response into the web_fetch result envelope.
+///
+/// Returns `None` when the response is not a successful scrape with markdown —
+/// the caller falls back to the plain fetcher. The envelope shape matches the
+/// plain path exactly (`url`/`finalUrl`/`status`/`extractor`/`truncated`/
+/// `length`/`text`) so downstream consumers cannot tell the paths apart.
+fn crw_envelope(resp: &serde_json::Value, url: &str, max_chars: usize) -> Option<String> {
+    if resp.get("success").and_then(|s| s.as_bool()) != Some(true) {
+        return None;
+    }
+    let data = resp.get("data")?;
+    let markdown = data.get("markdown").and_then(|m| m.as_str())?;
+    if markdown.trim().is_empty() {
+        return None;
+    }
+    let meta = data.get("metadata");
+    let final_url = meta
+        .and_then(|m| m.get("sourceURL"))
+        .and_then(|u| u.as_str())
+        .unwrap_or(url);
+    let status = meta
+        .and_then(|m| m.get("statusCode"))
+        .and_then(|s| s.as_u64())
+        .unwrap_or(200);
+
+    let (text, truncated) = truncate_at_boundary(markdown.to_string(), max_chars);
+    Some(
+        serde_json::json!({
+            "url": url,
+            "finalUrl": final_url,
+            "status": status,
+            "extractor": "crw",
+            "truncated": truncated,
+            "length": text.len(),
+            "text": text
+        })
+        .to_string(),
+    )
+}
 
 /// Fetch and extract content from a URL.
+///
+/// When a local crw-server (fastCRW) is configured and reachable, fetching
+/// goes through its `/v1/scrape` (better extraction, markdown-native).
+/// Any crw failure falls back to the plain HTTP fetcher below.
 pub struct WebFetchTool {
     max_chars: usize,
     client: Client,
+    /// Base URL of a local crw-server; empty = disabled.
+    crw_url: String,
 }
 
 impl WebFetchTool {
@@ -420,7 +551,34 @@ impl WebFetchTool {
             .build()
             .unwrap_or_else(|_| Client::new());
 
-        Self { max_chars, client }
+        Self {
+            max_chars,
+            client,
+            crw_url: String::new(),
+        }
+    }
+
+    /// Route fetches through a local crw-server at `url` (with fallback).
+    pub fn with_crw(mut self, url: String) -> Self {
+        self.crw_url = url;
+        self
+    }
+
+    /// Try `/v1/scrape` on the configured crw-server. `None` on any failure.
+    async fn fetch_via_crw(&self, url: &str, max_chars: usize) -> Option<String> {
+        if self.crw_url.is_empty() {
+            return None;
+        }
+        let resp = self
+            .client
+            .post(format!("{}/v1/scrape", self.crw_url))
+            .json(&serde_json::json!({"url": url, "formats": ["markdown"]}))
+            .timeout(std::time::Duration::from_secs(25))
+            .send()
+            .await
+            .ok()?;
+        let body: serde_json::Value = resp.json().await.ok()?;
+        crw_envelope(&body, url, max_chars)
     }
 }
 
@@ -490,6 +648,12 @@ impl Tool for WebFetchTool {
             .to_string();
         }
 
+        // Prefer the local crw-server when configured — better extraction,
+        // markdown-native. Falls through to the plain fetcher on any failure.
+        if let Some(envelope) = self.fetch_via_crw(url, max_chars).await {
+            return envelope;
+        }
+
         match self.client.get(url).send().await {
             Ok(response) => {
                 let status = response.status().as_u16();
@@ -554,17 +718,7 @@ impl Tool for WebFetchTool {
                     (body, "raw")
                 };
 
-                let truncated = text.len() > max_chars;
-                let final_text = if truncated {
-                    // Find a valid char boundary at or before max_chars.
-                    let mut end = max_chars;
-                    while !text.is_char_boundary(end) && end > 0 {
-                        end -= 1;
-                    }
-                    text[..end].to_string()
-                } else {
-                    text
-                };
+                let (final_text, truncated) = truncate_at_boundary(text, max_chars);
 
                 serde_json::json!({
                     "url": url,
@@ -698,6 +852,104 @@ fn fallback_extract(html: &str, mode: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // crw scrape envelope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_crw_envelope_maps_successful_scrape() {
+        let resp = serde_json::json!({
+            "success": true,
+            "data": {
+                "markdown": "# Example Domain\n\nSome content.",
+                "metadata": {
+                    "title": "Example Domain",
+                    "sourceURL": "https://example.com",
+                    "statusCode": 200
+                }
+            }
+        });
+        let envelope = crw_envelope(&resp, "https://example.com", 4000)
+            .expect("successful scrape must map to an envelope");
+        let v: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        assert_eq!(v["url"], "https://example.com");
+        assert_eq!(v["finalUrl"], "https://example.com");
+        assert_eq!(v["status"], 200);
+        assert_eq!(v["extractor"], "crw");
+        assert_eq!(v["truncated"], false);
+        assert!(v["text"].as_str().unwrap().contains("Example Domain"));
+        // Same envelope keys as the plain path — extract_web_content works.
+        assert_eq!(extract_web_content(&envelope), v["text"].as_str().unwrap());
+    }
+
+    #[test]
+    fn test_crw_envelope_truncates_and_rejects_failures() {
+        let long = serde_json::json!({
+            "success": true,
+            "data": {"markdown": "x".repeat(500), "metadata": {"statusCode": 200}}
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&crw_envelope(&long, "https://e.com", 100).unwrap()).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["text"].as_str().unwrap().len(), 100);
+
+        // Failure / malformed responses → None (caller falls back).
+        assert!(crw_envelope(&serde_json::json!({"success": false}), "u", 100).is_none());
+        assert!(crw_envelope(&serde_json::json!({"data": {}}), "u", 100).is_none());
+        assert!(
+            crw_envelope(
+                &serde_json::json!({"success": true, "data": {"markdown": ""}}),
+                "u",
+                100
+            )
+            .is_none(),
+            "empty markdown must fall back to the plain fetcher"
+        );
+    }
+
+    #[test]
+    fn test_truncate_at_boundary_respects_char_boundaries() {
+        let (t, cut) = truncate_at_boundary("héllo wörld".to_string(), 6);
+        assert!(cut);
+        assert!(t.len() <= 6);
+        assert!(String::from_utf8(t.into_bytes()).is_ok());
+        let (t2, cut2) = truncate_at_boundary("short".to_string(), 100);
+        assert_eq!(t2, "short");
+        assert!(!cut2);
+    }
+
+    // -----------------------------------------------------------------------
+    // searxng heal debounce
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_attempt_heal_debounces() {
+        assert!(should_attempt_heal(0, 1000), "never healed → attempt");
+        assert!(
+            !should_attempt_heal(1000, 1000 + SEARXNG_HEAL_GAP_S - 1),
+            "inside the gap → hold"
+        );
+        assert!(
+            should_attempt_heal(1000, 1000 + SEARXNG_HEAL_GAP_S),
+            "gap elapsed → attempt"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires a running local crw-server (port 3000) + network
+    async fn live_web_fetch_routes_through_crw() {
+        let tool = WebFetchTool::new(4000).with_crw("http://localhost:3000".to_string());
+        let mut params = HashMap::new();
+        params.insert(
+            "url".to_string(),
+            serde_json::Value::String("https://example.com".to_string()),
+        );
+        let out = tool.execute(params).await;
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["extractor"], "crw", "fetch must route through crw: {out}");
+        assert!(v["text"].as_str().unwrap().contains("Example Domain"));
+    }
 
     // -----------------------------------------------------------------------
     // validate_url tests
@@ -973,7 +1225,6 @@ mod tests {
                 ProbeResult {
                     healthy: false,
                     latency_ms: 0,
-                    detail: Some("simulated stuck container".to_string()),
                 }
             }
         }
@@ -1002,8 +1253,8 @@ mod tests {
             "expected degraded short-circuit message, got: {result}"
         );
         assert!(
-            result.contains("docker restart searxng"),
-            "expected actionable restart hint, got: {result}"
+            result.contains("automatic restart") && result.contains("retry"),
+            "expected self-heal notice with retry hint, got: {result}"
         );
     }
 
@@ -1145,8 +1396,8 @@ mod tests {
         );
         let result = tool.execute(params).await;
         assert!(
-            result.contains("Error:") && result.contains("no Brave API key configured"),
-            "Expected error about no Brave key, got: {}",
+            result.contains("Error: SearXNG unavailable") && result.contains("automatic restart"),
+            "Expected unavailable error with self-heal notice, got: {}",
             result
         );
     }

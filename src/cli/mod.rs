@@ -614,6 +614,15 @@ pub(crate) async fn run_gateway_async(
         }
     }
 
+    // Auto-start crw-server (fastCRW) for web_fetch — single binary, no
+    // Docker. Absence is fine: web_fetch falls back to the plain fetcher.
+    if config.tools.web.fetch.auto_start && !config.tools.web.fetch.crw_url.is_empty() {
+        match crate::crw::ensure_crw(&config.tools.web.fetch.crw_url).await {
+            Ok(()) => info!("crw-server ready"),
+            Err(e) => tracing::debug!("crw-server not available: {e}"),
+        }
+    }
+
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 

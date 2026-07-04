@@ -18,6 +18,7 @@ pub(crate) mod higgs;
 pub mod lms;
 pub mod providers;
 pub(crate) mod repl;
+pub mod crw;
 pub mod searxng;
 pub mod server;
 pub mod session;

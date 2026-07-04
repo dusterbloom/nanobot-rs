@@ -37,6 +37,8 @@ pub struct ToolConfig {
     pub search_provider: String,
     /// Base URL of the SearXNG instance (default: "http://localhost:8888").
     pub searxng_url: String,
+    /// Base URL of a local crw-server for web_fetch; empty = disabled.
+    pub crw_url: String,
     /// Maximum search results to return (default: 5).
     pub search_max_results: u32,
     /// Path to the SQLite sessions database for session_search tool.
@@ -64,6 +66,7 @@ impl ToolConfig {
             exec_working_dir: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
+            crw_url: String::new(),
             search_max_results: 5,
             db_path: None,
             code_execution: CodeExecutionConfig::default(),
@@ -355,7 +358,10 @@ impl ToolRegistry {
             ));
         }
         if should_include("web_fetch") {
-            self.register(Box::new(WebFetchTool::new(config.max_tool_result_chars)));
+            self.register(Box::new(
+                WebFetchTool::new(config.max_tool_result_chars)
+                    .with_crw(config.crw_url.clone()),
+            ));
         }
         if should_include("browser") {
             self.register(Box::new(BrowserTool::new(config.max_tool_result_chars)));
@@ -2314,20 +2320,33 @@ mod tests {
     /// Verify condensation truncates to two sentences (not one, not all).
     #[test]
     fn test_local_defs_condense_truncates_multi_sentence() {
-        // Use a real tool that has a 3-sentence description.
-        // WebSearchTool: "Search the web. Returns titles, URLs, and snippets. Use web_fetch..."
-        let tool = super::WebSearchTool::new(
-            None,
-            5,
-            "searxng".to_string(),
-            "http://localhost:8888".to_string(),
-        );
+        // Inline mock with a 3-sentence description so this test doesn't
+        // depend on any real tool's prose.
+        struct ThreeSentenceTool;
+
+        #[async_trait]
+        impl Tool for ThreeSentenceTool {
+            fn name(&self) -> &str {
+                "three_sentence"
+            }
+            fn description(&self) -> &str {
+                "Does a thing. Returns the result. This third sentence should be dropped."
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object", "properties": {} })
+            }
+            async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
+                String::new()
+            }
+        }
+
+        let tool = ThreeSentenceTool;
         let full_desc = tool.description().to_string();
         // Count sentences in full description (periods followed by space).
         let sentence_breaks = full_desc.matches(". ").count();
         assert!(
             sentence_breaks >= 2,
-            "WebSearchTool should have 3+ sentences, got {} breaks in: {}",
+            "fixture should have 3+ sentences, got {} breaks in: {}",
             sentence_breaks,
             full_desc,
         );

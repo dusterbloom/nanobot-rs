@@ -240,7 +240,8 @@ pub(super) fn make_local_providers(
         factory::ProviderSpec::local_with_key(&base_url, Some(&model_id), api_key)
             .with_jit_gate_opt(jit_gate.clone())
             .with_timeout_config(&config.timeouts)
-            .with_retry(config.retry.clone()),
+            .with_retry(config.retry.clone())
+            .with_higgs_session_cache(is_higgs_backend(&config.agents.defaults.local_backend)),
     );
 
     // Auto-detect context size from the active server; fall back to config default.
@@ -288,6 +289,7 @@ pub(super) fn make_local_providers(
                 timeout_secs: config.timeouts.provider_http_secs,
                 lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
                 constrained_tool_calls: constrained,
+                higgs_session_cache: false,
             }));
         }
 
@@ -399,6 +401,7 @@ fn core_config_from(
         brave_api_key: brave_key,
         search_provider: config.tools.web.search.provider.clone(),
         searxng_url: config.tools.web.search.searxng_url.clone(),
+        crw_url: config.tools.web.fetch.crw_url.clone(),
         search_max_results: config.tools.web.search.max_results,
         exec_timeout: config.tools.exec_.timeout,
         restrict_to_workspace: config.tools.exec_.restrict_to_workspace,

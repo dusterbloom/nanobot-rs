@@ -387,8 +387,10 @@ fn render_local_settings(secret_key: &str) -> String {
          use_default_settings: true\n\
          server:\n\
          \x20 secret_key: \"{secret_key}\"\n\
-         \x20 limiter: false\n\
+         \x20 limiter: true\n\
          \x20 public_instance: false\n\
+         redis:\n\
+         \x20 url: valkey://valkey:6379/0\n\
          search:\n\
          \x20 formats:\n\
          \x20   - html\n\
@@ -407,7 +409,8 @@ fn render_local_settings(secret_key: &str) -> String {
 /// Runs whenever the API is blocked or the container crash-loops — regardless
 /// of who created it (nanobot, docker compose, an older nanobot). The config:
 /// - disables the limiter entirely (bot detection 403s local API calls that
-///   lack X-Forwarded-For headers — pointless protection on localhost)
+///   lack browser-like headers — pointless protection on localhost now that
+///   WebSearchTool sends a real User-Agent + Sec-Fetch/Accept headers)
 /// - enables the `json` output format (off by default → 403 on format=json)
 /// - shortens engine suspension times so one upstream 403/CAPTCHA doesn't
 ///   bench an engine for up to a day; with several engines active, a single
@@ -503,12 +506,15 @@ mod tests {
     }
 
     #[test]
-    fn test_render_local_settings_enables_json_and_disables_limiter() {
+    fn test_render_local_settings_enables_json_api() {
         let s = render_local_settings("k");
         assert!(s.contains("use_default_settings: true"));
-        assert!(s.contains("limiter: false"));
-        assert!(s.contains("- json"));
+        assert!(s.contains("- json"), "json format must be enabled");
         assert!(s.contains("secret_key: \"k\""));
+        assert!(
+            s.contains("suspended_times"),
+            "fast engine-ban recovery must be configured"
+        );
     }
 
     #[test]

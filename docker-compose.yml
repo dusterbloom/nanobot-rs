@@ -1,18 +1,43 @@
-# Minimal SearXNG setup for nanobot web search.
+# Minimal SearXNG + Valkey setup for nanobot web search.
 # Usage: docker compose up -d
-# SearXNG will be available at http://localhost:8888
+# SearXNG will be available at http://localhost:8080
+#
+# Valkey backs the SearXNG limiter (botdetection), which rate-limits our own
+# requests to avoid being banned by upstream engines (Brave, Google, ...).
+# Both services sit on the `nanobot` network so SearXNG can reach Valkey by
+# the stable hostname `valkey` — no brittle container IPs.
 
 services:
   searxng:
     image: searxng/searxng:latest
     container_name: nanobot-searxng
     ports:
-      - "8888:8080"
+      - "8080:8080"
     volumes:
       - searxng-data:/etc/searxng
     environment:
-      - SEARXNG_BASE_URL=http://localhost:8888
+      - SEARXNG_BASE_URL=http://localhost:8080
+    depends_on:
+      - valkey
+    networks:
+      - nanobot
+    restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:9.1-alpine
+    container_name: nanobot-valkey
+    # No port mapping: only reachable from inside the `nanobot` network.
+    # SearXNG connects via valkey://valkey:6379/0
+    volumes:
+      - valkey-data:/data
+    networks:
+      - nanobot
     restart: unless-stopped
 
 volumes:
   searxng-data:
+  valkey-data:
+
+networks:
+  nanobot:
+    driver: bridge

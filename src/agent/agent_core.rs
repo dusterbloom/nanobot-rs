@@ -51,6 +51,8 @@ pub struct SwappableCore {
     pub brave_api_key: Option<String>,
     pub search_provider: String,
     pub searxng_url: String,
+    /// Base URL of a local crw-server for web_fetch; empty = disabled.
+    pub crw_url: String,
     pub search_max_results: u32,
     pub exec_timeout: u64,
     pub restrict_to_workspace: bool,
@@ -409,6 +411,8 @@ pub struct SwappableCoreConfig {
     pub brave_api_key: Option<String>,
     pub search_provider: String,
     pub searxng_url: String,
+    /// Base URL of a local crw-server for web_fetch; empty = disabled.
+    pub crw_url: String,
     pub search_max_results: u32,
     pub exec_timeout: u64,
     pub restrict_to_workspace: bool,
@@ -459,6 +463,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         brave_api_key,
         search_provider,
         searxng_url,
+        crw_url,
         search_max_results,
         exec_timeout,
         restrict_to_workspace,
@@ -640,6 +645,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         brave_api_key,
         search_provider,
         searxng_url,
+        crw_url,
         search_max_results,
         exec_timeout,
         restrict_to_workspace,

@@ -712,11 +712,39 @@ impl Default for WebSearchConfig {
 }
 
 /// Web tools configuration.
+/// Web fetch tool configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebFetchConfig {
+    /// Base URL of a local crw-server (fastCRW) used for `/v1/scrape`;
+    /// empty string disables crw and web_fetch uses the plain fetcher.
+    #[serde(default = "default_crw_url")]
+    pub crw_url: String,
+    /// Auto-start crw-server at startup when the binary is installed.
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
+}
+
+fn default_crw_url() -> String {
+    "http://localhost:3000".to_string()
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self {
+            crw_url: default_crw_url(),
+            auto_start: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebToolsConfig {
     #[serde(default)]
     pub search: WebSearchConfig,
+    #[serde(default)]
+    pub fetch: WebFetchConfig,
 }
 
 /// Shell exec tool configuration.
@@ -2197,26 +2225,34 @@ impl Config {
         expand_tilde(ws)
     }
 
-    /// Get the API key in priority order:
-    /// OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM.
-    pub fn get_api_key(&self) -> Option<String> {
+    /// The active provider (name, key) in priority order:
+    /// OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > ZhipuCoding > Groq > vLLM.
+    fn active_provider(&self) -> Option<(&'static str, &str)> {
         let candidates = [
-            &self.providers.openrouter.api_key,
-            &self.providers.deepseek.api_key,
-            &self.providers.anthropic.api_key,
-            &self.providers.openai.api_key,
-            &self.providers.gemini.api_key,
-            &self.providers.zhipu.api_key,
-            &self.providers.zhipu_coding.api_key,
-            &self.providers.groq.api_key,
-            &self.providers.vllm.api_key,
+            ("openrouter", &self.providers.openrouter.api_key),
+            ("deepseek", &self.providers.deepseek.api_key),
+            ("anthropic", &self.providers.anthropic.api_key),
+            ("openai", &self.providers.openai.api_key),
+            ("gemini", &self.providers.gemini.api_key),
+            ("zhipu", &self.providers.zhipu.api_key),
+            ("zhipu-coding", &self.providers.zhipu_coding.api_key),
+            ("groq", &self.providers.groq.api_key),
+            ("vllm", &self.providers.vllm.api_key),
         ];
-        for key in candidates {
-            if Self::is_provider_key_enabled(key) {
-                return Some(key.clone());
-            }
-        }
-        None
+        candidates
+            .into_iter()
+            .find(|(_, key)| Self::is_provider_key_enabled(key))
+            .map(|(name, key)| (name, key.as_str()))
+    }
+
+    /// Name of the provider `get_api_key()` resolves to, if any.
+    pub fn active_provider_name(&self) -> Option<&'static str> {
+        self.active_provider().map(|(name, _)| name)
+    }
+
+    /// Get the API key of the active provider (see `active_provider`).
+    pub fn get_api_key(&self) -> Option<String> {
+        self.active_provider().map(|(_, key)| key.to_string())
     }
 
     /// Resolve a model string with a provider prefix to (api_key, api_base, stripped_model).
