@@ -209,13 +209,21 @@ pub struct AgentDefaults {
     pub workspace: String,
     #[serde(default = "default_model")]
     pub model: String,
-    /// Preferred local GGUF model filename (e.g. "Qwen3-8B-Q4_K_M.gguf").
+    /// Preferred local model name (e.g. "Qwen3.6-35B-A3B-4bit"; historically a
+    /// GGUF filename like "Qwen3-8B-Q4_K_M.gguf").
+    ///
+    /// LEGACY: since discovery-first startup this is only the EXPECTED-model
+    /// hint for endpoint selection (and the model-dir hint when spawning
+    /// Higgs). The model actually requested is adopted from the discovered
+    /// endpoint's served list, paired with that endpoint.
     #[serde(default = "default_local_model")]
     pub local_model: String,
     /// Custom API base for local inference (e.g. "http://192.168.1.22:1234/v1").
-    /// When set, local mode uses this instead of LM Studio on localhost.
-    /// All trio roles (main, router, specialist) share this endpoint; model
-    /// differentiation happens via the `model` field in each API request (JIT loading).
+    /// Highest-priority discovery candidate: when set AND healthy, local mode
+    /// uses it. When empty or dead, startup discovers Higgs / LM Studio /
+    /// cluster peers instead. All trio roles (main, router, specialist) share
+    /// this endpoint; model differentiation happens via the `model` field in
+    /// each API request (JIT loading).
     #[serde(default)]
     pub local_api_base: String,
     /// API key for local inference server (default: "local").
@@ -250,14 +258,27 @@ pub struct AgentDefaults {
     pub max_tool_result_chars: usize,
     /// LM Studio model identifier for the main model (e.g. "gemma-3n-e4b-it").
     /// When empty, derived from local_model via strip_gguf_suffix.
+    ///
+    /// LEGACY: since discovery-first startup, the served model id is adopted
+    /// from the discovered endpoint at runtime; this field is only a hint for
+    /// the expected model and a compat sink for the adopted id.
     #[serde(default)]
     pub lms_main_model: String,
+    /// Autonomous local-server spawning policy for `-l` mode (default: off).
+    /// Discovery always runs first; this only governs what happens when NO
+    /// healthy endpoint is found. Explicit user actions (/restart, /local)
+    /// may still start servers regardless of this setting.
+    #[serde(default)]
+    pub local_autostart: LocalAutostart,
     /// Port for the LM Studio server when managed by lms CLI (default: 1234).
     #[serde(default = "default_lms_port")]
     pub lms_port: u16,
-    /// Local backend for `-l` mode: "lmstudio" (default, HTTP to LM Studio) or
-    /// "higgs" (managed Higgs Rust MLX server, auto-started on `higgsPort`).
-    /// Any other OpenAI-compatible server is reached by setting `localApiBase`.
+    /// Local backend tag: "lmstudio" (default) or "higgs".
+    ///
+    /// LEGACY as a startup selector: discovery-first startup derives this tag
+    /// from the discovered endpoint (or the `localAutostart` spawn decision);
+    /// a stale value can no longer route requests to a dead port. Still read
+    /// by the provider layer (Higgs session cache, JIT-gate policy).
     #[serde(default = "default_local_backend")]
     pub local_backend: String,
     /// Port for the managed Higgs server (default: 8091).
@@ -392,6 +413,25 @@ pub fn is_higgs_backend(backend: &str) -> bool {
     backend == "higgs"
 }
 
+/// Autonomous local-server spawning policy (`agents.defaults.localAutostart`).
+///
+/// `Off` is the default: nanobot never spawns an inference server on its own —
+/// startup discovers running endpoints and shows a note when none is found.
+/// Unknown config values deserialize to `Off` (never silently enable spawning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalAutostart {
+    /// Spawn the managed Higgs sidecar when discovery finds nothing.
+    Higgs,
+    /// Spawn LM Studio when discovery finds nothing.
+    Lmstudio,
+    /// Never spawn autonomously (default). `#[serde(other)]` folds unknown
+    /// config values here so a typo can't enable spawning.
+    #[default]
+    #[serde(other)]
+    Off,
+}
+
 fn default_mlx_preset() -> String {
     "qwen3.5-2b".to_string()
 }
@@ -447,6 +487,7 @@ impl Default for AgentDefaults {
             max_tool_result_chars: default_max_tool_result_chars(),
             max_continuations: default_max_continuations(),
             lms_main_model: String::new(),
+            local_autostart: LocalAutostart::default(),
             lms_port: default_lms_port(),
             higgs_port: default_higgs_port(),
             local_backend: default_local_backend(),
@@ -2688,6 +2729,51 @@ mod tests {
         let json = r#"{}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.agents.defaults.local_api_base.is_empty());
+    }
+
+    #[test]
+    fn test_local_autostart_defaults_to_off() {
+        let json = r#"{}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.agents.defaults.local_autostart, LocalAutostart::Off);
+    }
+
+    #[test]
+    fn test_local_autostart_parses_known_values() {
+        let higgs: Config = serde_json::from_str(
+            r#"{"agents": {"defaults": {"localAutostart": "higgs"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(higgs.agents.defaults.local_autostart, LocalAutostart::Higgs);
+
+        let lms: Config = serde_json::from_str(
+            r#"{"agents": {"defaults": {"localAutostart": "lmstudio"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(lms.agents.defaults.local_autostart, LocalAutostart::Lmstudio);
+
+        let off: Config =
+            serde_json::from_str(r#"{"agents": {"defaults": {"localAutostart": "off"}}}"#)
+                .unwrap();
+        assert_eq!(off.agents.defaults.local_autostart, LocalAutostart::Off);
+    }
+
+    #[test]
+    fn test_local_autostart_unknown_value_falls_back_to_off() {
+        // An unknown value must not brick config loading — and must never
+        // silently enable spawning. It degrades to Off.
+        let cfg: Config = serde_json::from_str(
+            r#"{"agents": {"defaults": {"localAutostart": "omlx"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.agents.defaults.local_autostart, LocalAutostart::Off);
+    }
+
+    #[test]
+    fn test_local_autostart_serializes_camel_case() {
+        let cfg = Config::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""localAutostart":"off""#));
     }
 
     #[test]

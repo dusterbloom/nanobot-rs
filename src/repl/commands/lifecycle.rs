@@ -1179,6 +1179,51 @@ impl ReplContext {
         save_config(&disk_cfg, None);
     }
 
+    /// Discovery-first for explicit local actions: probe candidates and adopt
+    /// a healthy endpoint + served model as a pair instead of spawning.
+    /// Returns the adopted pair, or None when nothing healthy was found.
+    async fn adopt_discovered_endpoint(&mut self) -> Option<crate::local_discovery::AdoptedLocal> {
+        let expected = if !self.config.agents.defaults.lms_main_model.is_empty() {
+            self.config.agents.defaults.lms_main_model.clone()
+        } else {
+            self.config.agents.defaults.local_model.clone()
+        };
+        let candidates = crate::local_discovery::discover_endpoints(&self.config).await;
+        let pair = crate::local_discovery::select_endpoint(&candidates, &expected)?;
+
+        self.config.agents.defaults.local_api_base = pair.base_url.clone();
+        self.config.agents.defaults.lms_main_model = pair.model.clone();
+        match pair.source {
+            crate::local_discovery::EndpointSource::Higgs => {
+                self.config.agents.defaults.local_backend = "higgs".to_string();
+                self.config.agents.defaults.skip_jit_gate = true;
+                self.srv.engine = super::super::InferenceEngine::Higgs;
+                self.srv.local_port = self.config.agents.defaults.higgs_port.to_string();
+            }
+            crate::local_discovery::EndpointSource::LmStudio => {
+                self.config.agents.defaults.local_backend = "lmstudio".to_string();
+            }
+            _ => {}
+        }
+        tracing::info!(
+            endpoint = %pair.base_url,
+            model = %pair.model,
+            "local inference: using {} serving {} (discovered)",
+            pair.base_url,
+            pair.model
+        );
+        println!(
+            "\n  local inference: using {}{}{} serving {}{}{} (discovered)",
+            tui::BOLD,
+            pair.base_url,
+            tui::RESET,
+            tui::BOLD,
+            pair.model,
+            tui::RESET
+        );
+        Some(pair)
+    }
+
     /// /local — toggle between local and cloud mode.
     pub(super) async fn cmd_local(&mut self) {
         // migrated from swappable().is_local — phase 09-03
@@ -1190,12 +1235,18 @@ impl ReplContext {
             // overlapping servers).
             crate::agent::pid_file::cleanup_stale_pids();
 
+            // Discovery-first: reuse a healthy running endpoint (don't restart
+            // or double-spawn a server that is already serving). Explicit /local
+            // MAY spawn below — but only when discovery finds nothing.
+            let discovered = self.adopt_discovered_endpoint().await;
+
             // Try to start a local inference engine if none is active.
             // For Higgs: always attempt start regardless of local_api_base — it may
             // be stale from a previous session and Higgs may have stopped.
             let is_higgs =
                 crate::config::schema::is_higgs_backend(&self.config.agents.defaults.local_backend);
-            if (self.config.agents.defaults.local_api_base.is_empty() || is_higgs)
+            if discovered.is_none()
+                && (self.config.agents.defaults.local_api_base.is_empty() || is_higgs)
                 && !self.srv.lms_managed
                 && self.srv.engine == super::super::InferenceEngine::None
             {

@@ -1457,13 +1457,91 @@ pub(crate) fn cmd_agent(
             config.agents.defaults.local_model.clone()
         };
 
-        // When localBackend is "higgs", auto-start Higgs as a managed sidecar.
-        let use_higgs = is_local
-            && crate::config::schema::is_higgs_backend(&config.agents.defaults.local_backend);
-        // True when the backend requires LM Studio management (spawn, probe, trio, JIT warmup).
-        // False for Higgs (managed sidecar) and any pre-configured external server (localApiBase).
-        let needs_lms = is_local && !use_higgs;
+        // --- Discovery-first local inference ---
+        // Probe candidates in parallel (configured localApiBase, higgs port,
+        // LM Studio port, cluster peers; ≤1s each) BEFORE any spawn decision.
+        // Endpoint and model are adopted as a PAIR from one discovery result,
+        // never resolved independently (the ":1234 vs adopted model" bug).
+        let startup_action: Option<crate::local_discovery::StartupAction> = if is_local {
+            let candidates = crate::local_discovery::discover_endpoints(&config).await;
+            let selected = crate::local_discovery::select_endpoint(&candidates, &local_model_name);
+            Some(crate::local_discovery::decide_startup(
+                selected,
+                config.agents.defaults.local_autostart,
+            ))
+        } else {
+            None
+        };
+        log_startup_phase("local_discovery_done", startup_t0, &mut startup_last);
+
+        let discovered_local = match &startup_action {
+            Some(crate::local_discovery::StartupAction::UseDiscovered(pair)) => Some(pair.clone()),
+            _ => None,
+        };
+        let no_local_server_note = matches!(
+            startup_action,
+            Some(crate::local_discovery::StartupAction::NoServerNote)
+        );
+        // Spawn intents — ONLY set when discovery found nothing AND the user
+        // opted in via `localAutostart` (explicit ≠ autonomous).
+        let use_higgs = matches!(
+            startup_action,
+            Some(crate::local_discovery::StartupAction::SpawnHiggs)
+        );
+        let needs_lms = matches!(
+            startup_action,
+            Some(crate::local_discovery::StartupAction::SpawnLmStudio)
+        );
         let mut higgs_sidecar_port: Option<u16> = None;
+
+        // Adopt endpoint + model together from the discovery result.
+        if let Some(pair) = &discovered_local {
+            config.agents.defaults.local_api_base = pair.base_url.clone();
+            config.agents.defaults.lms_main_model = pair.model.clone();
+            local_model_name = pair.model.clone();
+            match pair.source {
+                crate::local_discovery::EndpointSource::Higgs => {
+                    config.agents.defaults.local_backend = "higgs".to_string();
+                    config.agents.defaults.skip_jit_gate = true;
+                    higgs_sidecar_port = Some(config.agents.defaults.higgs_port);
+                }
+                crate::local_discovery::EndpointSource::LmStudio => {
+                    config.agents.defaults.local_backend = "lmstudio".to_string();
+                }
+                _ => {}
+            }
+            info!(
+                endpoint = %pair.base_url,
+                model = %pair.model,
+                "local inference: using {} serving {} (discovered)",
+                pair.base_url,
+                pair.model
+            );
+        }
+        // Plain REPL / single-message: print the note now. TUI: delivered via
+        // display_tx below (stdout is swallowed by the alternate screen).
+        if no_local_server_note && !crate::tui_app::enabled() {
+            eprintln!(
+                "  {}{}{}{}",
+                tui::BOLD,
+                tui::YELLOW,
+                crate::local_discovery::NO_SERVER_NOTE,
+                tui::RESET
+            );
+        }
+        // Keep the backend tag consistent with the spawn decision so the
+        // provider layer (session cache, JIT gate) sees the right backend
+        // even when a stale tag survived in config.
+        if use_higgs {
+            config.agents.defaults.local_backend = "higgs".to_string();
+        } else if needs_lms {
+            config.agents.defaults.local_backend = "lmstudio".to_string();
+        }
+        // Non-higgs local endpoints keep the LM Studio feature set (remote
+        // probe, prewarm, trio auto-activation, JIT warmup) whether spawned or
+        // discovered — only SPAWNING is gated by `localAutostart`.
+        let lms_features = is_local
+            && !crate::config::schema::is_higgs_backend(&config.agents.defaults.local_backend);
 
         // Higgs sidecar: auto-start when backend is "higgs" (single-message or interactive).
         // Start even when localApiBase is set — it may point to the managed Higgs port
@@ -1552,9 +1630,10 @@ pub(crate) fn cmd_agent(
         // Trio is for interactive sessions - single messages use inline tools.
         // When localApiBase is set, skip all local server spawning — use remote server.
         let mut trio_state: Option<ServerState> = None;
-        // Recompute has_remote_local — Higgs auto-start may have filled local_api_base.
+        // Recompute has_remote_local — discovery adoption or Higgs auto-start
+        // may have filled local_api_base.
         let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
-        if !use_higgs && !has_remote_local && is_local && message.is_some() {
+        if needs_lms && !has_remote_local && message.is_some() {
             // Single-message local mode: start LMS if available.
             let mut srv = ServerState::new(local_port.clone());
             if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine() {
@@ -1656,7 +1735,8 @@ pub(crate) fn cmd_agent(
         // splash (CLEAR_SCREEN + logo) so the old screen never flashes before
         // ratatui takes the alternate screen.
         let show_splash = !crate::tui_app::enabled();
-        if is_interactive && use_higgs && show_splash {
+        // Higgs splash for both a spawned sidecar and a discovered instance.
+        if is_interactive && (use_higgs || higgs_sidecar_port.is_some()) && show_splash {
             tui::register_resize_handler();
             let higgs_port = config.agents.defaults.higgs_port;
             tui::print_higgs_splash(&local_model_name, higgs_port);
@@ -1771,7 +1851,9 @@ pub(crate) fn cmd_agent(
         // while the local server receives nothing.  Instead, warn and clear the
         // dead endpoint so the user knows what happened.
         // Skip entirely when using MLX or oMLX local backend — no LM Studio involved.
-        if needs_lms && has_remote_local && !srv.lms_managed {
+        // Also skip when discovery just validated this endpoint (<1s ago) and
+        // adopted its served model — re-probing would only add latency.
+        if lms_features && has_remote_local && !srv.lms_managed && discovered_local.is_none() {
             let peer_url = config.agents.defaults.local_api_base.clone();
             let peer_host = extract_url_host(&peer_url);
             let peer_port = peer_url
@@ -1842,7 +1924,7 @@ pub(crate) fn cmd_agent(
         // Remote LM Studio base: proactively prewarm main/router/specialist models
         // to avoid first-turn latency spikes from JIT loading.
         // Skip for oMLX — it uses LRU auto-eviction, not JIT loading.
-        if needs_lms && has_remote_local && !srv.lms_managed {
+        if lms_features && has_remote_local && !srv.lms_managed {
             // Background: prewarming is a latency optimization for the FIRST
             // turn; it must not delay first paint (JIT loads can take 30s+).
             let cfg = config.clone();
@@ -1857,7 +1939,7 @@ pub(crate) fn cmd_agent(
         // specialist models are configured.  The downgrade block below will
         // revert strict flags if the router turns out to be unreachable.
         // Skip for MLX/oMLX local — no LM Studio trio support.
-        if needs_lms && commands::should_auto_activate_trio(
+        if lms_features && commands::should_auto_activate_trio(
             is_local,
             &config.trio.router_model,
             &config.trio.specialist_model,
@@ -1877,7 +1959,7 @@ pub(crate) fn cmd_agent(
         // When no trio router is available, disable strict mode so the single model
         // can handle tools directly. Must happen BEFORE build_core_handle so the core
         // gets the updated tool_delegation_config.
-        if needs_lms
+        if lms_features
             && config.tool_delegation.strict_no_tools_main
             && config.tool_delegation.strict_router_schema
         {
@@ -1980,6 +2062,12 @@ pub(crate) fn cmd_agent(
         // Channel for subagents/background gateways to send display lines to the REPL.
         let (display_tx, display_rx) = mpsc::unbounded_channel::<String>();
 
+        // TUI swallows pre-alt-screen stdout, so deliver the no-server note
+        // as a display line where it lands in the transcript.
+        if no_local_server_note && crate::tui_app::enabled() {
+            let _ = display_tx.send(crate::local_discovery::NO_SERVER_NOTE.to_string());
+        }
+
         let health_registry = std::sync::Arc::new(crate::heartbeat::health::build_registry(&config));
 
         // Must be `mut` for the cluster-feature code path below, which passes
@@ -2029,7 +2117,7 @@ pub(crate) fn cmd_agent(
 
             // Splash and LMS detection already happened above (before core build).
             // Skip for MLX/oMLX local — already printed banner above.
-            if (needs_lms || !is_local) && (!is_local || has_remote_local) && show_splash {
+            if (lms_features || !is_local) && (!is_local || has_remote_local) && show_splash {
                 tui::register_resize_handler();
                 tui::print_startup_splash(&local_port, is_local);
             }
@@ -2089,7 +2177,7 @@ pub(crate) fn cmd_agent(
             // avoiding concurrent model-switch crashes and cold-start latency.
             // Fires for any JIT server (localApiBase set), not just trio mode.
             // Skip for MLX/oMLX local — no remote JIT server involved.
-            if needs_lms && has_remote_local && !ctx.srv.lms_managed {
+            if lms_features && has_remote_local && !ctx.srv.lms_managed {
                 use crate::providers::jit_gate::warmup_jit_models;
 
                 let base = ctx.config.agents.defaults.local_api_base.clone();
@@ -2157,7 +2245,12 @@ pub(crate) fn cmd_agent(
             // no local server to monitor and the watchdog would spam the remote.
             // Higgs is a managed sidecar so it DOES need the watchdog despite
             // setting local_api_base.
-            if is_local && (!has_remote_local || use_higgs) {
+            if is_local
+                && (!has_remote_local
+                    || crate::config::schema::is_higgs_backend(
+                        &ctx.config.agents.defaults.local_backend,
+                    ))
+            {
                 ctx.restart_watchdog();
             }
 

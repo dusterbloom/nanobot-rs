@@ -940,7 +940,7 @@ async fn is_serving_expected_model(port: u16, expected_dir: &str, preferred: &st
 /// Separator punctuation is ignored so a served alias like `qwen36-35b` still
 /// matches the model dir `Qwen3.6-35B-A3B-4bit` — a false mismatch here made
 /// startup restart a healthy server or reject its served id.
-fn model_id_matches(a: &str, b: &str) -> bool {
+pub(crate) fn model_id_matches(a: &str, b: &str) -> bool {
     let a = normalize_model_id(a);
     let b = normalize_model_id(b);
     !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
