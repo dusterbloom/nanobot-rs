@@ -118,6 +118,18 @@ pub(crate) async fn run(ctx: &mut ReplContext) -> std::io::Result<()> {
 
     let mut app = App::new();
     app.set_theme_index(ctx.config.agents.defaults.theme_index);
+
+    // Paint a clean first frame (header + welcome + input) BEFORE the session
+    // load below. Entering the alternate screen does not reliably erase what a
+    // previous TUI run left in that buffer on every terminal, and the session
+    // load can take a while (snapshot model restore may switch models) — without
+    // this, stale content (e.g. an old jobs overlay + displaced header) stays
+    // visible until the event loop's first draw.
+    terminal.clear()?;
+    let footer = footer_snapshot(&ctx.core_handle);
+    terminal.draw(|f| app.draw(f, &footer))?;
+    tracing::info!("tui_first_frame_drawn");
+
     load_current_session_state(&mut app, ctx).await;
     let result = event_loop(&mut terminal, &mut app, ctx, &mut ev_rx, &paused).await;
     save_current_snapshot(&app, ctx).await;
@@ -981,6 +993,28 @@ mod tests {
             reply < tool,
             "setup text should render before tool:\n{text}"
         );
+    }
+
+    #[test]
+    fn first_frame_of_fresh_app_is_clean() {
+        // First paint must be: header, welcome hint, input box — never the
+        // jobs overlay (regression: stale alt-screen content / overlay text
+        // visible at startup without ever toggling /jobs).
+        let mut app = App::new();
+        let footer = Footer {
+            cwd: "~".into(),
+            model: "local:test".into(),
+            ctx_used: 0,
+            ctx_max: 0,
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| app.draw(f, &footer)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            !text.contains("no running jobs"),
+            "jobs overlay leaked into first frame:\n{text}"
+        );
+        assert!(text.contains("TRENTADUE"), "brand header missing:\n{text}");
     }
 
     #[test]

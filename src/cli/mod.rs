@@ -238,6 +238,27 @@ mod tests {
     }
 
     #[test]
+    fn interactive_startup_does_not_await_web_service_ensure() {
+        // Regression guard for first-paint latency: ensure_searxng/ensure_crw
+        // can poll Docker Desktop for ~a minute. They must only run inside the
+        // detached spawn_web_service_autostart task — never inline on the
+        // cmd_agent path before the TUI/REPL first draws.
+        let repl_src = include_str!("../repl/mod.rs");
+        assert!(
+            !repl_src.contains("ensure_searxng"),
+            "cmd_agent must not call ensure_searxng inline — use cli::spawn_web_service_autostart"
+        );
+        assert!(
+            !repl_src.contains("ensure_crw"),
+            "cmd_agent must not call ensure_crw inline — use cli::spawn_web_service_autostart"
+        );
+        assert!(
+            repl_src.contains("spawn_web_service_autostart"),
+            "cmd_agent must start web services via the detached helper"
+        );
+    }
+
+    #[test]
     fn test_effective_max_iterations_local_respects_low_config() {
         // `configured` is the floor: a small context (scaled = 6 at 32K) must
         // not drag the budget below the configured value.
@@ -589,6 +610,39 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
     runtime.block_on(run_gateway_async(config, core_handle, None, None, setup));
 }
 
+/// Fire-and-forget auto-start of the web helper services (SearXNG via Docker,
+/// crw-server). Detached on purpose: SearXNG setup can poll Docker Desktop for
+/// up to ~65s, and web tools self-heal mid-session (`trigger_searxng_heal`) if
+/// these come up later — first paint must never wait on them.
+pub(crate) fn spawn_web_service_autostart(
+    config: &Config,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let search_url = (config.tools.web.search.provider == "searxng"
+        && config.tools.web.search.auto_start)
+        .then(|| config.tools.web.search.searxng_url.clone());
+    let crw_url = (config.tools.web.fetch.auto_start && !config.tools.web.fetch.crw_url.is_empty())
+        .then(|| config.tools.web.fetch.crw_url.clone());
+    if search_url.is_none() && crw_url.is_none() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        if let Some(url) = search_url {
+            match crate::searxng::ensure_searxng(&url).await {
+                Ok(()) => tracing::info!("SearXNG ready"),
+                Err(e) => {
+                    tracing::warn!("SearXNG auto-setup failed: {e} — web search will use fallback")
+                }
+            }
+        }
+        if let Some(url) = crw_url {
+            match crate::crw::ensure_crw(&url).await {
+                Ok(()) => tracing::info!("crw-server ready"),
+                Err(e) => tracing::debug!("crw-server not available: {e}"),
+            }
+        }
+    }))
+}
+
 /// Shared async gateway: creates channels, provider, cron, agent loop, and runs until stopped.
 ///
 /// If `stop_signal` is `Some`, watches the flag for shutdown (used when spawned from REPL).
@@ -601,27 +655,13 @@ pub(crate) async fn run_gateway_async(
     setup_fn: Option<Box<dyn FnOnce(&mut AgentLoop) + Send>>,
 ) {
     use std::time::Duration;
-    use tracing::{info, warn};
+    use tracing::info;
 
     // Singleton guard: kill any stale agent process from a previous crashed run.
     crate::agent::pid_file::acquire_agent_singleton();
 
-    // Auto-start SearXNG if configured
-    if config.tools.web.search.provider == "searxng" && config.tools.web.search.auto_start {
-        match crate::searxng::ensure_searxng(&config.tools.web.search.searxng_url).await {
-            Ok(()) => info!("SearXNG ready"),
-            Err(e) => warn!("SearXNG auto-setup failed: {e} — web search will use fallback"),
-        }
-    }
-
-    // Auto-start crw-server (fastCRW) for web_fetch — single binary, no
-    // Docker. Absence is fine: web_fetch falls back to the plain fetcher.
-    if config.tools.web.fetch.auto_start && !config.tools.web.fetch.crw_url.is_empty() {
-        match crate::crw::ensure_crw(&config.tools.web.fetch.crw_url).await {
-            Ok(()) => info!("crw-server ready"),
-            Err(e) => tracing::debug!("crw-server not available: {e}"),
-        }
-    }
+    // Auto-start SearXNG / crw-server in the background — never block startup.
+    spawn_web_service_autostart(&config);
 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();

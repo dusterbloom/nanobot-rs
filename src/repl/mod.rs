@@ -382,6 +382,19 @@ pub(crate) fn extract_url_host(url: &str) -> String {
     }
 }
 
+/// INFO-log one interactive-startup phase: ms since the previous phase and
+/// since process entry. Greppable as `startup_phase` in ~/.nanobot/logs.
+fn log_startup_phase(phase: &str, t0: std::time::Instant, last: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    info!(
+        phase,
+        phase_ms = now.duration_since(*last).as_millis() as u64,
+        total_ms = now.duration_since(t0).as_millis() as u64,
+        "startup_phase"
+    );
+    *last = now;
+}
+
 async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
     let base = config.agents.defaults.local_api_base.trim();
     if base.is_empty() {
@@ -1423,13 +1436,16 @@ pub(crate) fn cmd_agent(
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
     runtime.block_on(async {
-        // Auto-start SearXNG if configured
-        if config.tools.web.search.provider == "searxng" && config.tools.web.search.auto_start {
-            match crate::searxng::ensure_searxng(&config.tools.web.search.searxng_url).await {
-                Ok(()) => info!("SearXNG ready"),
-                Err(e) => warn!("SearXNG auto-setup failed: {e} — web search will use fallback"),
-            }
-        }
+        // Startup phase timings land in ~/.nanobot/logs so first-paint
+        // regressions are visible: grep for "startup_phase".
+        let startup_t0 = std::time::Instant::now();
+        let mut startup_last = startup_t0;
+
+        // Auto-start SearXNG / crw-server in the background — these used to be
+        // awaited here and could stall first paint for ~a minute when Docker
+        // Desktop was down. Web tools self-heal mid-session if they come up late.
+        cli::spawn_web_service_autostart(&config);
+        log_startup_phase("web_autostart_spawned", startup_t0, &mut startup_last);
 
         // Create shared core and initial agent loop.
         // Use persisted local model name if available, else hardcoded default.
@@ -1743,6 +1759,8 @@ pub(crate) fn cmd_agent(
             }
         }
 
+        log_startup_phase("local_backend_ready", startup_t0, &mut startup_last);
+
         // Recompute has_remote_local after potential lms setup
         let mut has_remote_local = !config.agents.defaults.local_api_base.is_empty();
 
@@ -1763,13 +1781,39 @@ pub(crate) fn cmd_agent(
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(18080);
 
-            let probe = crate::lms::list_available(&peer_host, peer_port).await;
+            let mut probe = crate::lms::list_available(&peer_host, peer_port).await;
             if !probe.is_empty() && config.agents.defaults.lms_main_model.is_empty() {
                 // Remote is alive but lms_main_model is not configured: use the
                 // first loaded model reported by the remote instead of the stale
                 // local_model config value (which may be a GGUF filename like
                 // "GLM-4.7-Flash-Q4_K_S.gguf" that refers to a different model).
                 local_model_name = probe[0].clone();
+            }
+            if probe.is_empty() {
+                // Not an LM Studio native API — the endpoint may still be a
+                // healthy OpenAI-compatible resident server (e.g. Higgs left at
+                // localApiBase after a `/model` pick re-tagged the backend as
+                // "lmstudio"). Ask /v1/models directly; if it answers, adopt the
+                // model id the server ACTUALLY serves so the first request can't
+                // 404 on a stale configured name (this is what previously forced
+                // a manual /model before anything worked).
+                let served = crate::higgs::list_served_models_at(
+                    &peer_url,
+                    &config.agents.defaults.local_api_key,
+                )
+                .await;
+                if let Some(adopted) =
+                    crate::higgs::adopt_served_model(&local_model_name, &served)
+                {
+                    info!(
+                        configured = %local_model_name,
+                        adopted = %adopted,
+                        "startup: adopted served model from local endpoint"
+                    );
+                    local_model_name = adopted.clone();
+                    config.agents.defaults.lms_main_model = adopted;
+                }
+                probe = served;
             }
             if probe.is_empty() {
                 // Remote is unreachable.  Because localApiBase is explicitly
@@ -1799,7 +1843,14 @@ pub(crate) fn cmd_agent(
         // to avoid first-turn latency spikes from JIT loading.
         // Skip for oMLX — it uses LRU auto-eviction, not JIT loading.
         if needs_lms && has_remote_local && !srv.lms_managed {
-            prewarm_remote_lms_models(&config, &local_model_name).await;
+            // Background: prewarming is a latency optimization for the FIRST
+            // turn; it must not delay first paint (JIT loads can take 30s+).
+            let cfg = config.clone();
+            let model = local_model_name.clone();
+            tokio::spawn(async move {
+                prewarm_remote_lms_models(&cfg, &model).await;
+                info!("remote_lms_prewarm_done");
+            });
         }
 
         // Auto-activate trio mode for local sessions when both router and
@@ -1867,6 +1918,8 @@ pub(crate) fn cmd_agent(
             is_local,
             "delegation_config_at_core_build"
         );
+
+        log_startup_phase("endpoint_probe_done", startup_t0, &mut startup_last);
 
         let core_handle = cli::build_core_handle(
             &config,
@@ -1947,6 +2000,8 @@ pub(crate) fn cmd_agent(
         // Returns the ClusterState so /cluster commands can query it.
         #[cfg(feature = "cluster")]
         let cluster_state = cli::setup_cluster_for_repl(&mut agent_loop, &config);
+
+        log_startup_phase("core_and_agent_built", startup_t0, &mut startup_last);
 
         if let Some(msg) = message {
             // Single-message mode: process and exit.
@@ -2037,47 +2092,49 @@ pub(crate) fn cmd_agent(
             if needs_lms && has_remote_local && !ctx.srv.lms_managed {
                 use crate::providers::jit_gate::warmup_jit_models;
 
-                let base = &ctx.config.agents.defaults.local_api_base;
-                let mut models_to_warm: Vec<&str> = Vec::new();
+                let base = ctx.config.agents.defaults.local_api_base.clone();
+                let mut models_to_warm: Vec<String> = Vec::new();
 
-                // Main model — always warm so first message is fast.
-                let main_model_ref = &ctx.config.agents.defaults.local_model;
-                let main_id = cli::strip_gguf_suffix(main_model_ref);
-                models_to_warm.push(main_id);
+                // Main model — always warm so first message is fast. Prefer the
+                // resolved/adopted id (lms_main_model) over the raw localModel,
+                // which may be a stale name the server never loaded.
+                let main_model_ref = if !ctx.config.agents.defaults.lms_main_model.is_empty() {
+                    &ctx.config.agents.defaults.lms_main_model
+                } else {
+                    &ctx.config.agents.defaults.local_model
+                };
+                models_to_warm.push(cli::strip_gguf_suffix(main_model_ref).to_string());
 
                 // Trio models (router + specialist) when enabled.
                 if ctx.config.trio.enabled {
                     // Router: prefer explicit endpoint model, fall back to trio config.
                     if let Some(ref ep) = ctx.config.trio.router_endpoint {
-                        models_to_warm.push(&ep.model);
+                        models_to_warm.push(ep.model.clone());
                     } else if !ctx.config.trio.router_model.is_empty() {
-                        models_to_warm.push(&ctx.config.trio.router_model);
+                        models_to_warm.push(ctx.config.trio.router_model.clone());
                     }
                     // Specialist: prefer explicit endpoint model, fall back to trio config.
                     if let Some(ref ep) = ctx.config.trio.specialist_endpoint {
-                        models_to_warm.push(&ep.model);
+                        models_to_warm.push(ep.model.clone());
                     } else if !ctx.config.trio.specialist_model.is_empty() {
-                        models_to_warm.push(&ctx.config.trio.specialist_model);
+                        models_to_warm.push(ctx.config.trio.specialist_model.clone());
                     }
                 }
 
                 // LCM compaction model when configured.
                 if let Some(ref ep) = ctx.config.lcm.compaction_endpoint {
                     if ctx.config.lcm.is_enabled() {
-                        models_to_warm.push(&ep.model);
+                        models_to_warm.push(ep.model.clone());
                     }
                 }
 
-                print!(
-                    "  {}Warming up {} model(s)...{} ",
-                    tui::DIM,
-                    models_to_warm.len(),
-                    tui::RESET
-                );
-                io::stdout().flush().ok();
-
-                warmup_jit_models(base, "local", &models_to_warm).await;
-                println!("{}done{}", tui::DIM, tui::RESET);
+                // Background: warming can take 30s per model — if it hasn't
+                // finished by the first message, that request JIT-loads anyway.
+                tokio::spawn(async move {
+                    let refs: Vec<&str> = models_to_warm.iter().map(String::as_str).collect();
+                    warmup_jit_models(&base, "local", &refs).await;
+                    info!("jit_warmup_done");
+                });
             }
 
             // Start heartbeat: maintenance commands run on every tick (no LLM).
@@ -2129,6 +2186,8 @@ pub(crate) fn cmd_agent(
                     Arc::clone(&keepalive_stop),
                 )
             });
+
+            log_startup_phase("interactive_ready", startup_t0, &mut startup_last);
 
             // First bar render pushes content up to make room; all subsequent
             // renders refresh in place so we never get a duplicate bar.

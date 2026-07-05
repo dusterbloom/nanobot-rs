@@ -430,7 +430,16 @@ async fn list_models_full(host: &str, port: u16) -> Vec<ModelInfo> {
 
 async fn list_models_full_at(base_url: &str) -> Vec<ModelInfo> {
     let url = format!("{}/api/v1/models", base_url);
-    let resp = match reqwest::get(&url).await {
+    // Time-boxed: this probe sits on the interactive startup path, and a bare
+    // `reqwest::get` against an unreachable host can hang for the OS connect
+    // timeout (75s on macOS) before the first prompt ever paints.
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(),
     };

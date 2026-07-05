@@ -935,12 +935,38 @@ async fn is_serving_expected_model(port: u16, expected_dir: &str, preferred: &st
 /// Case-insensitive fuzzy match between two model identifiers.
 ///
 /// Model ids reach us as full paths, directory basenames, or short names, so a
-/// match is accepted when either id contains the other after lowercasing
+/// match is accepted when either id contains the other after normalization
 /// (e.g. dir basename `MiniCPM5-1B-4bit` matches served id `minicpm5-1b`).
+/// Separator punctuation is ignored so a served alias like `qwen36-35b` still
+/// matches the model dir `Qwen3.6-35B-A3B-4bit` — a false mismatch here made
+/// startup restart a healthy server or reject its served id.
 fn model_id_matches(a: &str, b: &str) -> bool {
-    let a = a.to_lowercase();
-    let b = b.to_lowercase();
+    let a = normalize_model_id(a);
+    let b = normalize_model_id(b);
     !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
+}
+
+/// Lowercase and drop everything but ASCII alphanumerics for fuzzy id compares.
+fn normalize_model_id(id: &str) -> String {
+    id.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Decide which served model id nanobot should adopt at startup.
+///
+/// `None` = keep the configured id: the server reported nothing (down or not
+/// OpenAI-compatible), or the configured id already IS a served id verbatim.
+/// `Some(id)` = the endpoint is healthy but the configured id is stale or
+/// non-canonical — use `id` (the server's own identifier) so the first
+/// request cannot 404 on a name the server never loaded.
+pub(crate) fn adopt_served_model(configured: &str, served: &[String]) -> Option<String> {
+    match served.iter().find(|id| model_id_matches(id, configured)) {
+        Some(id) if id.as_str() == configured => None,
+        Some(id) => Some(id.clone()),
+        None => served.first().cloned(),
+    }
 }
 
 /// List every model id a running Higgs instance is serving (via /v1/models).
@@ -1100,6 +1126,41 @@ mod tests {
         // Empty ids never match (avoids vacuous substring hits).
         assert!(!model_id_matches("", "minicpm5-1b"));
         assert!(!model_id_matches("minicpm5-1b", ""));
+    }
+
+    #[test]
+    fn model_id_matches_ignores_separator_punctuation() {
+        // Served alias "qwen36-35b" vs model dir "Qwen3.6-35B-A3B-4bit": the
+        // dot in "3.6" must not defeat the match (regression: startup
+        // restarted a healthy Higgs over this false mismatch).
+        assert!(model_id_matches("qwen36-35b", "Qwen3.6-35B-A3B-4bit"));
+        assert!(model_id_matches("Qwen3.6-35B-A3B-4bit", "qwen36-35b"));
+        // Distinct models still don't match.
+        assert!(!model_id_matches("bonsai-8b-mlx", "Qwen3.6-35B-A3B-4bit"));
+    }
+
+    #[test]
+    fn adopt_served_model_replaces_stale_configured_name() {
+        let served = vec!["qwen36-35b".to_string()];
+        // Stale configured name → adopt what the server actually serves.
+        assert_eq!(
+            adopt_served_model("vibethinker3", &served),
+            Some("qwen36-35b".to_string())
+        );
+        // Configured id is already the served id verbatim → keep.
+        assert_eq!(adopt_served_model("qwen36-35b", &served), None);
+        // Fuzzy match to a different canonical id → adopt the server's form.
+        assert_eq!(
+            adopt_served_model("Qwen3.6-35B-A3B-4bit", &served),
+            Some("qwen36-35b".to_string())
+        );
+        // Server reported nothing → no adoption, keep configured.
+        assert_eq!(adopt_served_model("vibethinker3", &[]), None);
+        // Higgs "active" transport already configured and served → keep.
+        assert_eq!(
+            adopt_served_model("active", &["active".to_string()]),
+            None
+        );
     }
 
     #[test]
