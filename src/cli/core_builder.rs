@@ -95,6 +95,55 @@ fn resolved_local_context_tokens(
     }
 }
 
+/// Physical-memory ceiling on context tokens for a locally-served model whose
+/// server does not advertise its own context window (e.g. higgs/MLX has no
+/// `/props`).
+///
+/// Estimates weights + KV cost from the model name(s) and the machine's memory,
+/// then reuses the VRAM budget solver — so the trio's co-resident router and
+/// specialist models (when they share this endpoint) are subtracted too, and
+/// the main model gets a context that actually fits. The user's configured
+/// `localMaxContextTokens` is honoured as the architectural upper bound; memory
+/// is the real binding constraint below it.
+fn memory_context_ceiling(config: &Config, main_model: &str) -> usize {
+    use crate::server;
+
+    let (vram, ram) = server::detect_available_memory();
+    // Reserve ~20% of total for the OS, the serving runtime, and nanobot itself.
+    let available = ((vram.unwrap_or(ram) as f64) * 0.80) as u64;
+
+    let mut main = server::estimate_model_profile_from_name(main_model);
+    // Honour the user's stated architectural max; let memory bind below it
+    // rather than the estimator's conservative 32K default.
+    main.max_context_length = config.agents.defaults.local_max_context_tokens;
+    // This is a *memory* ceiling: only physical memory and the arch max should
+    // bind it. Neutralise the file-size "practical cap" quality heuristic, which
+    // would otherwise pin small models far below what their memory allows.
+    main.practical_cap = usize::MAX;
+
+    // Co-resident trio models share the same unified memory only when they have
+    // no separate endpoint of their own. Subtract their weight footprint.
+    let coresident = |model: &str, endpoint: &Option<crate::config::schema::ModelEndpoint>| {
+        (config.trio.enabled && !model.is_empty() && endpoint.is_none())
+            .then(|| server::estimate_model_profile_from_name(model))
+    };
+    let router = coresident(&config.trio.router_model, &config.trio.router_endpoint);
+    let specialist = coresident(&config.trio.specialist_model, &config.trio.specialist_endpoint);
+
+    let input = server::VramBudgetInput {
+        available_memory: available,
+        // Real memory governs here — don't apply the trio's fixed VRAM cap,
+        // which is tuned for discrete GPUs and would wrongly shrink the budget
+        // on a large unified-memory machine.
+        vram_cap: available,
+        overhead_per_model: 512 * 1_000_000,
+        main,
+        router,
+        specialist,
+    };
+    server::compute_vram_budget(&input).main_ctx
+}
+
 /// Strip GGUF quantisation suffix and extension from a model filename to get
 /// the bare model identifier that LM Studio / remote servers recognise.
 ///
@@ -258,6 +307,25 @@ pub(super) fn make_local_providers(
         detected_context_tokens,
         config.agents.defaults.local_max_context_tokens,
     );
+    // When the server can't report its own context window (no /props — e.g.
+    // higgs/MLX), the value above is the model's architectural max, unrelated
+    // to how much unified memory this machine has. Bound it by a memory-derived
+    // ceiling so history compacts before the engine gets OOM-killed. Servers
+    // that DO report n_ctx (llama-server) are trusted and left untouched.
+    let max_context_tokens = if detected_context_tokens.is_none() && !is_apple_fm_model(&model_id) {
+        let ceiling = memory_context_ceiling(config, &model_id);
+        if ceiling < max_context_tokens {
+            tracing::info!(
+                configured = max_context_tokens,
+                memory_ceiling = ceiling,
+                model = %model_id,
+                "Local endpoint has no /props; clamping context to memory-safe ceiling"
+            );
+        }
+        max_context_tokens.min(ceiling)
+    } else {
+        max_context_tokens
+    };
 
     // Compaction provider (separate port only).
     let compaction: Option<Arc<dyn LLMProvider>> =

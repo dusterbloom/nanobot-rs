@@ -235,6 +235,35 @@ pub(crate) fn parse_gguf_metadata(path: &Path) -> Option<GgufModelInfo> {
 /// Detect available VRAM (via nvidia-smi) and RAM (via /proc/meminfo).
 /// Returns (vram_bytes, ram_bytes).
 pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
+    // Apple Silicon: unified memory, no discrete VRAM and no /proc/meminfo.
+    // Report total physical memory as the RAM figure; callers apply their own
+    // headroom reserve. Without this, macOS falls through to the 8 GB fallback
+    // below and wildly under-budgets context on 32/64/128 GB machines.
+    #[cfg(target_os = "macos")]
+    {
+        let total = Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or(8 * 1024 * 1024 * 1024);
+        (None, total)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        detect_available_memory_linux()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_available_memory_linux() -> (Option<u64>, u64) {
     let vram = Command::new("nvidia-smi")
         .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
         .output()
@@ -419,7 +448,10 @@ pub(crate) fn build_model_profile(
             let kv = 2u64 * info.n_layers as u64 * info.n_kv_heads as u64 * head_dim as u64 * 2; // fp16
             (kv, info.context_length as usize)
         }
-        None => (0, 32768),
+        // No GGUF metadata (e.g. an MLX/adopted model known only by name):
+        // estimate KV cost so memory budgeting still works. 32K is a safe
+        // architectural-context default when the real max is unknown.
+        None => (estimate_kv_bytes_per_token_from_name(name), 32768),
     };
     ModelProfile {
         name: name.to_string(),
@@ -430,41 +462,64 @@ pub(crate) fn build_model_profile(
     }
 }
 
-/// Estimate file size from model name (e.g. "qwen3-1.7b" -> ~1.1GB Q4_K_M).
-pub(crate) fn estimate_file_size_from_name(name: &str) -> u64 {
+/// Parse a parameter count in billions from a model name (e.g. "qwen3-1.7b" -> 1.7).
+///
+/// Scans `-`/`_`/space-separated tokens for a `<number>b` suffix. Returns the
+/// first plausible match (0.1B..1000B), else None.
+pub(crate) fn parse_param_billions(name: &str) -> Option<f64> {
     let lower = name.to_lowercase();
-    // Extract param count from common patterns: "1.7b", "3b", "8b", "9b", "14b", "70b"
-    let param_billions: Option<f64> = {
-        let mut result = None;
-        // Try patterns like "-1.7b", "-3b", "_8b", etc.
-        for separator in &["-", "_", " "] {
-            for part in lower.split(separator) {
-                if let Some(num_str) = part.strip_suffix('b') {
-                    if let Ok(n) = num_str.parse::<f64>() {
-                        if n > 0.1 && n < 1000.0 {
-                            result = Some(n);
-                            break;
-                        }
+    for separator in ["-", "_", " "] {
+        for part in lower.split(separator) {
+            if let Some(num_str) = part.strip_suffix('b') {
+                if let Ok(n) = num_str.parse::<f64>() {
+                    if n > 0.1 && n < 1000.0 {
+                        return Some(n);
                     }
                 }
             }
-            if result.is_some() {
-                break;
-            }
-        }
-        result
-    };
-
-    match param_billions {
-        Some(params) => {
-            // Q4_K_M is roughly 0.6 bytes per param
-            (params * 0.6 * 1e9) as u64
-        }
-        None => {
-            // Conservative fallback: assume ~3B model
-            2_000_000_000
         }
     }
+    None
+}
+
+/// Estimate file size from model name (e.g. "qwen3-1.7b" -> ~1.1GB Q4_K_M).
+pub(crate) fn estimate_file_size_from_name(name: &str) -> u64 {
+    match parse_param_billions(name) {
+        // Q4_K_M is roughly 0.6 bytes per param
+        Some(params) => (params * 0.6 * 1e9) as u64,
+        // Conservative fallback: assume ~3B model
+        None => 2_000_000_000,
+    }
+}
+
+/// Conservative fp16 KV-cache cost per token for a model of the given name.
+///
+/// True cost is `2 (K+V) * 2 bytes * n_layers * n_kv_heads * head_dim`, but the
+/// geometry isn't knowable from the name alone. We approximate a modern GQA
+/// transformer (head_dim 128, ~8 KV heads, layer count by size band) and add
+/// ~16% headroom. The result is used to bound context downward, so erring high
+/// is the safe direction — it caps context slightly low (earlier compaction)
+/// rather than risking an out-of-memory kill.
+///
+/// ponytail: name-based estimate; a server that reports real geometry (GGUF
+/// `/props`, or a future higgs capacity endpoint) should be preferred over this.
+pub(crate) fn estimate_kv_bytes_per_token_from_name(name: &str) -> u64 {
+    let params_b = parse_param_billions(name).unwrap_or(8.0);
+    let n_layers: u64 = if params_b < 3.0 {
+        28
+    } else if params_b < 10.0 {
+        32
+    } else if params_b < 30.0 {
+        48
+    } else if params_b < 50.0 {
+        64
+    } else {
+        80
+    };
+    const KV_HEADS: u64 = 8;
+    const HEAD_DIM: u64 = 128;
+    let base = 2 * 2 * n_layers * KV_HEADS * HEAD_DIM; // fp16 bytes/token
+    base + base / 6 // ~+16% headroom
 }
 
 /// Compute optimal context sizes for all models to fit within VRAM budget.
@@ -1141,6 +1196,55 @@ mod tests {
         }
     }
 
+    // -- memory-derived context ceiling (adopt path, no /props) --
+
+    /// Reproduces `core_builder::memory_context_ceiling` using only public
+    /// server fns, proving the general clamp logic: a big model on a modest
+    /// machine is bounded well below its OOM point, and a small model is bound
+    /// by the arch max (not file size) when memory is ample.
+    fn ceiling_for(model: &str, total_mem: u64, arch_max: usize) -> usize {
+        let available = ((total_mem as f64) * 0.80) as u64;
+        let mut main = estimate_model_profile_from_name(model);
+        main.max_context_length = arch_max;
+        main.practical_cap = usize::MAX;
+        let input = VramBudgetInput {
+            available_memory: available,
+            vram_cap: available,
+            overhead_per_model: 512 * 1_000_000,
+            main,
+            router: None,
+            specialist: None,
+        };
+        compute_vram_budget(&input).main_ctx
+    }
+
+    #[test]
+    fn test_memory_ceiling_clamps_large_model_below_wall() {
+        // 35B-class model on a 32 GB machine: must land well below the ~50k
+        // token point where higgs/MLX was OOM-killed, and stay above the floor.
+        let ctx = ceiling_for("qwen3.5-35b-a3b", 32 * GB, 131_072);
+        assert!(
+            (4096..40_000).contains(&ctx),
+            "35B/32GB ceiling {} not in safe band",
+            ctx
+        );
+    }
+
+    #[test]
+    fn test_memory_ceiling_small_model_bound_by_arch_not_filesize() {
+        // A tiny model with ample memory should reach the arch max, not be
+        // pinned low by the file-size heuristic.
+        let ctx = ceiling_for("qwen3-1.7b", 32 * GB, 131_072);
+        assert_eq!(ctx, 131_072, "small model should hit arch max, got {}", ctx);
+    }
+
+    #[test]
+    fn test_memory_ceiling_floors_when_weights_exceed_memory() {
+        // A 70B won't fit a 32 GB machine with usable KV; clamp to the floor.
+        let ctx = ceiling_for("llama-70b", 32 * GB, 131_072);
+        assert_eq!(ctx, 4096, "oversized model should floor at MIN_MAIN_CTX");
+    }
+
     // -- VRAM budget tests --
 
     const GB: u64 = 1_000_000_000;
@@ -1177,7 +1281,13 @@ mod tests {
     #[test]
     fn test_build_model_profile_no_gguf() {
         let profile = build_model_profile("unknown", 2 * GB, None);
-        assert_eq!(profile.kv_bytes_per_token, 0);
+        // No GGUF -> KV cost is estimated from the name (defaults to ~8B
+        // geometry here), not zero, so memory budgeting still works.
+        assert!(
+            profile.kv_bytes_per_token > 100_000 && profile.kv_bytes_per_token < 200_000,
+            "estimated KV/token out of expected band: {}",
+            profile.kv_bytes_per_token
+        );
         assert_eq!(profile.max_context_length, 32768);
     }
 
