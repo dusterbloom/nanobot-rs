@@ -63,7 +63,9 @@ fn validate_url(url_str: &str) -> Result<(), String> {
     }
     let host = parsed.host_str().ok_or("Missing domain")?;
 
-    // Block known private/local hostnames.
+    // Block known private/local hostnames. Loopback IPs (127.0.0.0/8) are
+    // caught by the IP check below; `localhost` is a name, not an IP, so it
+    // must be blocked here too — otherwise it slips through as an SSRF vector.
     let lower = host.to_lowercase();
     if lower == "localhost"
         || lower == "0.0.0.0"
