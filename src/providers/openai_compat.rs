@@ -258,6 +258,50 @@ pub(crate) fn is_local_api_base(api_base: &str) -> bool {
         || is_private_ip(&lower)
 }
 
+/// Fold `role:"developer"` messages into the system message for local endpoints.
+///
+/// Local servers (higgs, llama.cpp chat templates) only speak
+/// system|user|assistant|tool and return 500 on `developer` — which surfaced as
+/// "I encountered an error: Server error" assistant turns. Cloud APIs that
+/// understand `developer` (OpenAI) receive it unchanged. Same pattern as the
+/// Anthropic mid-conversation `system` handling: adapt at the wire, not in the
+/// assembler.
+fn fold_developer_role_for_local(messages: Vec<serde_json::Value>, api_base: &str) -> Vec<serde_json::Value> {
+    if !is_local_api_base(api_base)
+        || !messages.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("developer"))
+    {
+        return messages;
+    }
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+    let mut dev_texts: Vec<String> = Vec::new();
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("developer") {
+            if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                if !text.is_empty() {
+                    dev_texts.push(text.to_string());
+                }
+            }
+            continue; // never forward the developer role itself
+        }
+        out.push(msg);
+    }
+    if dev_texts.is_empty() {
+        return out;
+    }
+    let folded = dev_texts.join("\n\n");
+    match out
+        .iter_mut()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+    {
+        Some(sys) => {
+            let existing = sys.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            sys["content"] = serde_json::json!(format!("{existing}\n\n{folded}"));
+        }
+        None => out.insert(0, serde_json::json!({"role": "system", "content": folded})),
+    }
+    out
+}
+
 /// Check if a URL contains a private/LAN IP (RFC 1918).
 fn is_private_ip(url: &str) -> bool {
     // Extract host portion from URL (between :// and next : or /)
@@ -304,14 +348,6 @@ fn request_messages_and_higgs_session_id(
         })
         .collect();
     (cleaned, session_id)
-}
-
-/// Check if a model name indicates thinking/reasoning capability.
-///
-/// Delegates to the centralized `model_capabilities` registry so the logic
-/// stays in one place.
-fn model_supports_thinking(model: &str) -> bool {
-    crate::agent::model_capabilities::lookup_default(model).thinking
 }
 
 /// Models that should keep template thinking enabled by default on local
@@ -361,7 +397,6 @@ fn apply_local_reasoning_controls(
     api_base: &str,
     model: &str,
     thinking_budget: Option<u32>,
-    supports_thinking: bool,
 ) {
     if !is_local_api_base(api_base) {
         return;
@@ -383,12 +418,15 @@ fn apply_local_reasoning_controls(
             "enable_thinking": true
         });
         body["reasoning_format"] = serde_json::json!("deepseek");
-    } else if supports_thinking {
+    } else {
         // Models like Qwen3.5 think by default (template-level). Without
         // explicit `enable_thinking: false` they burn all output tokens on
         // `<think>` blocks and produce no visible response.
-        // The assistant-prefill approach (`<think>\n</think>`) doesn't work
-        // on servers like oMLX that reject assistant message prefill.
+        // Sent unconditionally: name-based thinking detection misses fine-tunes
+        // whose served name hides the family (e.g. "qwythos-9b" is a Qwen3.5
+        // template), and templates that don't define `enable_thinking` ignore
+        // the kwarg. The assistant-prefill approach (`<think>\n</think>`)
+        // doesn't work on servers like oMLX that reject assistant prefill.
         body["chat_template_kwargs"] = serde_json::json!({
             "enable_thinking": false
         });
@@ -563,58 +601,6 @@ fn normalize_tool_schemas(body: &mut serde_json::Value) {
     filter_apple_fm_tool_schemas(body);
 }
 
-/// For local thinking-capable models with thinking disabled: prefill the
-/// assistant response with a pre-closed `<think>` block so the model
-/// skips reasoning and responds (or tool-calls) directly.
-///
-/// Works universally — with and without tools. The pre-closed block
-/// satisfies the template's expected `<think>` structure while placing
-/// the continuation point at the response/tool-call position.
-///
-/// Tested against NanBeige4.1-3B (see experiments/tool-calling/nanbeige-prefill-tests.md):
-/// - `"\n"` does NOT prevent thinking (indistinguishable from template format)
-/// - `"Sure, "` works for chat but breaks tool calling
-/// - `"<tool_call>"` skips thinking but breaks tool selection on ambiguous prompts
-/// - `"<think>\n</think>\n\n"` works for all cases: chat, tool selection, and
-///   correctly declines tools when not needed. 9/10 stress test pass rate.
-///
-/// Skipped when thinking is explicitly enabled (`/think` / `/t`) so the
-/// user can toggle reasoning on demand.
-///
-/// When `supports_thinking` is false the function returns immediately.
-/// Prefilling a `<think>` block into a model that has no thinking template
-/// would inject garbage into the prompt.
-fn apply_local_thinking_prefill(
-    body: &mut serde_json::Value,
-    api_base: &str,
-    thinking_budget: Option<u32>,
-    supports_thinking: bool,
-) {
-    if !is_local_api_base(api_base) || thinking_budget.is_some() {
-        return;
-    }
-    if !supports_thinking {
-        return;
-    }
-    // Skip prefill when chat_template_kwargs already makes an explicit choice.
-    // The prefill hack (`<think>\n</think>`) is an LM Studio workaround;
-    // servers like oMLX reject assistant message prefill entirely.
-    if body
-        .get("chat_template_kwargs")
-        .and_then(|v| v.get("enable_thinking"))
-        .and_then(|v| v.as_bool())
-        .is_some()
-    {
-        return;
-    }
-    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        messages.push(serde_json::json!({
-            "role": "assistant",
-            "content": "<think>\n</think>\n\n"
-        }));
-    }
-}
-
 fn find_first_tag(haystack: &str, tags: &[&str]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
     for tag in tags {
@@ -750,6 +736,7 @@ impl OpenAICompatProvider {
         let url = format!("{}/chat/completions", self.api_base);
 
         let (request_messages, higgs_session_id) = request_messages_and_higgs_session_id(messages);
+        let request_messages = fold_developer_role_for_local(request_messages, &self.api_base);
 
         // Inject cache_control breakpoints for Anthropic prompt caching.
         let (cached_msgs, cached_tools) = if self.supports_cache_control(model) {
@@ -791,14 +778,7 @@ impl OpenAICompatProvider {
                 body["session_id"] = serde_json::json!(session_id);
             }
         }
-        let supports_thinking = model_supports_thinking(policy_model);
-        apply_local_reasoning_controls(
-            &mut body,
-            &self.api_base,
-            policy_model,
-            thinking_budget,
-            supports_thinking,
-        );
+        apply_local_reasoning_controls(&mut body, &self.api_base, policy_model, thinking_budget);
 
         // Forced tool calls ("required") only engage for local backends with
         // constrained tool calls enabled; elsewhere this is "auto" (unchanged).
@@ -824,13 +804,6 @@ impl OpenAICompatProvider {
         // Strict-validation servers (Apple FM) reject object schemas that omit a
         // `required` key; normalize every outgoing tool schema (no-op elsewhere).
         normalize_tool_schemas(&mut body);
-        apply_local_thinking_prefill(
-            &mut body,
-            &self.api_base,
-            thinking_budget,
-            supports_thinking,
-        );
-
         // JIT gate: serialise access to JIT-loading servers.
         // Measure JIT wait separately from the actual API call.
         let jit_wait_start = std::time::Instant::now();
@@ -1058,6 +1031,7 @@ impl LLMProvider for OpenAICompatProvider {
         let url = format!("{}/chat/completions", self.api_base);
 
         let (request_messages, higgs_session_id) = request_messages_and_higgs_session_id(messages);
+        let request_messages = fold_developer_role_for_local(request_messages, &self.api_base);
 
         // Inject cache_control breakpoints for Anthropic prompt caching.
         let (cached_msgs, cached_tools) = if self.supports_cache_control(model) {
@@ -1103,14 +1077,7 @@ impl LLMProvider for OpenAICompatProvider {
             // (LM Studio) ignore the field.
             body["return_progress"] = serde_json::json!(true);
         }
-        let supports_thinking = model_supports_thinking(policy_model);
-        apply_local_reasoning_controls(
-            &mut body,
-            &self.api_base,
-            policy_model,
-            thinking_budget,
-            supports_thinking,
-        );
+        apply_local_reasoning_controls(&mut body, &self.api_base, policy_model, thinking_budget);
 
         let mut request_has_tools = false;
         if let Some(ref tool_defs) = cached_tools {
@@ -1133,13 +1100,6 @@ impl LLMProvider for OpenAICompatProvider {
         // Strict-validation servers (Apple FM) reject object schemas that omit a
         // `required` key; normalize every outgoing tool schema (no-op elsewhere).
         normalize_tool_schemas(&mut body);
-        apply_local_thinking_prefill(
-            &mut body,
-            &self.api_base,
-            thinking_budget,
-            supports_thinking,
-        );
-
         // JIT gate: serialise access to JIT-loading servers.
         // For streaming, the permit is moved into the spawned task so it's held
         // for the entire stream duration, preventing model switches mid-stream.
@@ -2608,6 +2568,37 @@ mod tests {
     }
 
     #[test]
+    fn test_fold_developer_role_for_local() {
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "developer", "content": "protocol"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        // Local endpoint: developer folded into system, role never forwarded.
+        let local = fold_developer_role_for_local(msgs.clone(), "http://127.0.0.1:8000/v1");
+        assert_eq!(local.len(), 2);
+        assert_eq!(local[0]["role"], "system");
+        let sys = local[0]["content"].as_str().unwrap();
+        assert!(sys.contains("sys") && sys.contains("protocol"));
+        assert!(local.iter().all(|m| m["role"] != "developer"));
+
+        // Remote endpoint: untouched (OpenAI understands developer).
+        let remote = fold_developer_role_for_local(msgs, "https://api.openai.com/v1");
+        assert_eq!(remote.len(), 3);
+        assert_eq!(remote[1]["role"], "developer");
+
+        // Local, no system message: a system message is synthesized at front.
+        let no_sys = vec![
+            serde_json::json!({"role": "developer", "content": "protocol"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let folded = fold_developer_role_for_local(no_sys, "http://localhost:1234/v1");
+        assert_eq!(folded[0]["role"], "system");
+        assert_eq!(folded[0]["content"], "protocol");
+        assert_eq!(folded[1]["role"], "user");
+    }
+
+    #[test]
     fn test_apply_local_reasoning_controls_local_and_remote() {
         let mut local_body = serde_json::json!({"model": "qwen3-1.7b"});
         apply_local_reasoning_controls(
@@ -2615,117 +2606,43 @@ mod tests {
             "http://localhost:18080/v1",
             "qwen3-1.7b",
             Some(4096),
-            true,
         );
         assert_eq!(local_body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(local_body["reasoning_budget"], 4096);
         assert_eq!(local_body["reasoning_format"], "deepseek");
 
         let mut remote_body = serde_json::json!({"model": "gpt-4o"});
-        apply_local_reasoning_controls(
-            &mut remote_body,
-            "https://api.openai.com/v1",
-            "gpt-4o",
-            Some(4096),
-            true,
-        );
+        apply_local_reasoning_controls(&mut remote_body, "https://api.openai.com/v1", "gpt-4o", Some(4096));
         assert!(remote_body.get("chat_template_kwargs").is_none());
         assert!(remote_body.get("reasoning_budget").is_none());
         assert!(remote_body.get("reasoning_format").is_none());
     }
 
-    #[test]
-    fn test_thinking_prefill_added_for_local_no_tools() {
-        let mut body = serde_json::json!({
-            "model": "qwen3-1.7b",
-            "messages": [
-                {"role": "user", "content": "Hello"}
-            ]
-        });
-        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None, true);
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[1]["role"], "assistant");
-        assert_eq!(msgs[1]["content"], "<think>\n</think>\n\n");
-    }
+
+
+
+
+    // --- reasoning-controls tests ---
 
     #[test]
-    fn test_thinking_prefill_added_when_tools_present() {
-        let mut body = serde_json::json!({
-            "model": "qwen3-1.7b",
-            "messages": [
-                {"role": "user", "content": "Hello"}
-            ],
-            "tools": [{"type": "function", "function": {"name": "test"}}]
-        });
-        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None, true);
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(
-            msgs.len(),
-            2,
-            "pre-closed think prefill works with tools too"
-        );
-        assert_eq!(msgs[1]["content"], "<think>\n</think>\n\n");
-    }
-
-    #[test]
-    fn test_thinking_prefill_skipped_when_thinking_enabled() {
-        let mut body = serde_json::json!({
-            "model": "qwen3-1.7b",
-            "messages": [
-                {"role": "user", "content": "Hello"}
-            ]
-        });
-        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", Some(4096), true);
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(
-            msgs.len(),
-            1,
-            "prefill should NOT be added when thinking is enabled"
-        );
-    }
-
-    #[test]
-    fn test_thinking_prefill_skipped_for_remote() {
-        let mut body = serde_json::json!({
-            "model": "gpt-4o",
-            "messages": [
-                {"role": "user", "content": "Hello"}
-            ]
-        });
-        apply_local_thinking_prefill(&mut body, "https://api.openai.com/v1", None, true);
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 1, "prefill should NOT be added for remote APIs");
-    }
-
-    // --- supports_thinking guard tests ---
-
-    #[test]
-    fn test_reasoning_params_not_sent_for_non_thinking_model() {
-        let mut body = serde_json::json!({"model": "nanbeige-16b", "messages": []});
-        apply_local_reasoning_controls(
-            &mut body,
-            "http://localhost:1234",
-            "nanbeige-16b",
-            None,
-            false,
-        );
-        assert!(body.get("reasoning_budget").is_none());
-        assert!(body.get("reasoning_format").is_none());
-        assert!(body.get("chat_template_kwargs").is_none());
+    fn test_thinking_disabled_by_default_regardless_of_model_name() {
+        // Name-based detection misses fine-tunes (e.g. "qwythos-9b" is a
+        // Qwen3.5 template that thinks by default). enable_thinking:false is
+        // sent unconditionally; templates without the flag ignore it.
+        for model in ["nanbeige-16b", "qwythos-9b"] {
+            let mut body = serde_json::json!({"model": model, "messages": []});
+            apply_local_reasoning_controls(&mut body, "http://localhost:1234", model, None);
+            assert!(body.get("reasoning_budget").is_none());
+            assert!(body.get("reasoning_format").is_none());
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        }
     }
 
     #[test]
     fn test_reasoning_params_sent_for_thinking_model() {
         let mut body =
             serde_json::json!({"model": "qwen3-1.7b", "messages": [], "temperature": 0.2});
-        apply_local_reasoning_controls(
-            &mut body,
-            "http://localhost:1234",
-            "qwen3-1.7b",
-            Some(1024),
-            true,
-        );
+        apply_local_reasoning_controls(&mut body, "http://localhost:1234", "qwen3-1.7b", Some(1024));
         assert_eq!(body["reasoning_budget"], 1024);
         assert_eq!(body["reasoning_format"], "deepseek");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
@@ -2735,13 +2652,7 @@ mod tests {
     #[test]
     fn test_reasoning_disabled_for_thinking_model() {
         let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": []});
-        apply_local_reasoning_controls(
-            &mut body,
-            "http://localhost:1234",
-            "qwen3-1.7b",
-            None,
-            true,
-        );
+        apply_local_reasoning_controls(&mut body, "http://localhost:1234", "qwen3-1.7b", None);
         assert!(
             body.get("reasoning_budget").is_none(),
             "reasoning_budget should not be sent"
@@ -2764,7 +2675,6 @@ mod tests {
             "http://127.0.0.1:8000/v1",
             "VibeThinker-3B-mlx-8Bit",
             None,
-            false,
         );
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(body["reasoning_format"], "deepseek");
@@ -2779,31 +2689,10 @@ mod tests {
     fn test_non_reasoning_local_model_keeps_configured_temperature() {
         let mut body =
             serde_json::json!({"model": "nanbeige-16b", "messages": [], "temperature": 0.2});
-        apply_local_reasoning_controls(
-            &mut body,
-            "http://localhost:1234",
-            "nanbeige-16b",
-            None,
-            false,
-        );
+        apply_local_reasoning_controls(&mut body, "http://localhost:1234", "nanbeige-16b", None);
         assert_eq!(body["temperature"], 0.2);
     }
 
-    #[test]
-    fn test_thinking_prefill_skips_explicit_enable_true() {
-        let mut body = serde_json::json!({
-            "model": "VibeThinker-3B-mlx-8Bit",
-            "chat_template_kwargs": {"enable_thinking": true},
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        apply_local_thinking_prefill(&mut body, "http://localhost:1234", None, true);
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(
-            messages.len(),
-            1,
-            "prefill must not close a think block when thinking is explicitly enabled"
-        );
-    }
 
     #[test]
     fn test_local_tool_call_controls_disable_parallel_calls() {
@@ -2838,38 +2727,8 @@ mod tests {
         assert!(body.get("repeat_penalty").is_none());
     }
 
-    #[test]
-    fn test_prefill_not_added_for_non_thinking_model() {
-        let mut body = serde_json::json!({"model": "nanbeige-16b", "messages": [{"role": "user", "content": "hi"}]});
-        apply_local_thinking_prefill(&mut body, "http://localhost:1234", None, false);
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(
-            messages.len(),
-            1,
-            "prefill must not be added for non-thinking models"
-        );
-    }
 
-    #[test]
-    fn test_prefill_added_for_thinking_model() {
-        let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": [{"role": "user", "content": "hi"}]});
-        apply_local_thinking_prefill(&mut body, "http://localhost:1234", None, true);
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(
-            messages.len(),
-            2,
-            "prefill must be added for thinking models"
-        );
-        assert_eq!(messages[1]["content"], "<think>\n</think>\n\n");
-    }
 
-    #[test]
-    fn test_model_supports_thinking_helper() {
-        assert!(model_supports_thinking("qwen3-1.7b-q4_k_m"));
-        assert!(model_supports_thinking("qwen36-35b"));
-        assert!(!model_supports_thinking("nanbeige-2-8b"));
-        assert!(!model_supports_thinking("ministral-3b-instruct"));
-    }
 
     #[test]
     fn test_is_local_api_base_private_ips() {

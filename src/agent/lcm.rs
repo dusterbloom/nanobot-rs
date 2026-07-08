@@ -20,7 +20,6 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::agent::compaction::ContextCompactor;
-use crate::agent::protocol::ConversationProtocol;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::turn::Turn;
 use crate::config::schema::LcmSchemaConfig;
@@ -31,7 +30,11 @@ use crate::config::schema::LcmSchemaConfig;
 
 /// Unique ID for a message in the immutable store.
 ///
-/// Index into the session's message array (0-based, monotonically increasing).
+/// This is the SQLite `messages.id` rowid (`_db_id` on reconstructed message
+/// Values) — stable across restarts and independent of any windowing or
+/// filtering applied to the live context. Messages that have not been
+/// persisted yet carry no `_db_id` and are not ingested; they are picked up
+/// on the next turn, after persistence.
 pub type MessageId = usize;
 
 /// A summary node in the DAG.
@@ -184,6 +187,17 @@ impl From<&LcmSchemaConfig> for LcmConfig {
     }
 }
 
+/// Recent raw entries kept uncompacted by default (test helper / fallback).
+const DEFAULT_PROTECT_COUNT: usize = 4;
+
+/// Tier-aware count of recent raw entries to keep verbatim, scaled to the
+/// available context budget: ~2 on a 4K window, ~8 on 32K, capped at 16 on very
+/// large windows. A fixed 4 protected too much on tiny tiers and too little on
+/// large ones.
+fn protect_count_for_budget(available_tokens: usize) -> usize {
+    (available_tokens / 4096).clamp(2, 16)
+}
+
 /// The LCM engine: manages the active context with lossless compaction.
 pub struct LcmEngine {
     config: LcmConfig,
@@ -191,11 +205,16 @@ pub struct LcmEngine {
     dag: SummaryDag,
     /// Active context entries (system prompt + summaries + raw messages).
     active: Vec<ContextEntry>,
-    /// All raw messages in the immutable store (indexed by MessageId).
-    /// This is the in-memory mirror; the session JSONL is the durable copy.
-    store: Vec<Value>,
+    /// All raw messages in the immutable store, keyed by their stable DB
+    /// rowid (`_db_id`). Ordered iteration (BTreeMap) preserves session order
+    /// for rebuild and active-context assembly. This is the in-memory mirror;
+    /// the session DB is the durable copy.
+    store: std::collections::BTreeMap<MessageId, Value>,
     /// Whether async compaction has been requested but not yet completed.
     async_compaction_pending: bool,
+    /// Summary node IDs already auto-expanded into the tail this session, so the
+    /// per-turn auto_expand pass doesn't append the same detail repeatedly.
+    auto_expanded: std::collections::HashSet<usize>,
 }
 
 impl LcmEngine {
@@ -204,183 +223,30 @@ impl LcmEngine {
             config,
             dag: SummaryDag::new(),
             active: Vec::new(),
-            store: Vec::new(),
+            store: std::collections::BTreeMap::new(),
             async_compaction_pending: false,
+            auto_expanded: std::collections::HashSet::new(),
         }
     }
 
-    /// Replace the engine's store and active context from a new message array.
+    /// Ingest a message into the immutable store and active context.
     ///
-    /// Used after compaction swap: ctx.messages was rebuilt from the engine's
-    /// own active_context(), so re-ingesting via `ingest()` would duplicate
-    /// everything. This method replaces instead of appending.
-    pub fn reset_from_messages(&mut self, messages: &[serde_json::Value]) {
-        self.store.clear();
-        self.active.clear();
-        for msg in messages {
-            self.ingest(msg.clone());
+    /// The MessageId is the message's `_db_id` (SQLite rowid), so IDs are
+    /// stable across restarts regardless of how the live context was
+    /// windowed. Ingest is an idempotent upsert:
+    /// - No `_db_id` → the message has not been persisted yet; it is NOT
+    ///   ingested (returns `None`). Such messages are always the newest, live
+    ///   inside the protect window, and are ingested on the next turn once
+    ///   `get_history` supplies their rowid.
+    /// - `_db_id` already in the store → skipped (returns the existing id).
+    pub fn ingest(&mut self, message: Value) -> Option<MessageId> {
+        let msg_id = message.get("_db_id").and_then(|v| v.as_u64())? as usize;
+        if self.store.contains_key(&msg_id) {
+            return Some(msg_id);
         }
-    }
-
-    /// Rebuild the LCM engine from persisted turns (including summaries).
-    ///
-    /// This is called when loading a session that has `Turn::Summary` entries.
-    /// It reconstructs the summary DAG and builds the active context from:
-    /// - All summary nodes (representing compacted older messages)
-    /// - Raw messages after the last summary
-    ///
-    /// Respects `Turn::Clear` markers: everything before the last clear marker
-    /// is ignored, starting fresh from that point.
-    ///
-    /// # Arguments
-    /// * `turns` - All turns from the session, including `Turn::Summary` entries
-    /// * `protocol` - The conversation protocol for rendering
-    /// * `system_prompt` - System prompt to prepend to active context
-    pub fn rebuild_from_turns(
-        turns: &[Turn],
-        config: LcmConfig,
-        _protocol: &dyn ConversationProtocol,
-        _system_prompt: &str,
-    ) -> Self {
-        let mut engine = Self::new(config.clone());
-
-        // Find the last clear marker - everything before it is ignored.
-        let clear_idx = turns.iter().rposition(|t| matches!(t, Turn::Clear));
-        let start_idx = clear_idx.map(|i| i + 1).unwrap_or(0);
-        let turns_to_process = &turns[start_idx..];
-
-        // Track which raw message IDs have been summarized
-        let mut summarized_ids: std::collections::HashSet<MessageId> =
-            std::collections::HashSet::new();
-
-        // First pass: ingest all raw messages into store, track summaries
-        for turn in turns_to_process {
-            match turn {
-                Turn::User { content, media: _ } => {
-                    let msg = serde_json::json!({"role": "user", "content": content});
-                    engine.store.push(msg);
-                }
-                Turn::Assistant { text, tool_calls } => {
-                    let content = text.clone().unwrap_or_default();
-                    let tc_json: Vec<Value> = tool_calls.iter().map(|tc| {
-                        serde_json::json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.tool,
-                                "arguments": serde_json::to_string(&tc.args).unwrap_or_default(),
-                            }
-                        })
-                    }).collect();
-                    let msg = if tc_json.is_empty() {
-                        serde_json::json!({"role": "assistant", "content": content})
-                    } else {
-                        serde_json::json!({"role": "assistant", "content": content, "tool_calls": tc_json})
-                    };
-                    engine.store.push(msg);
-                }
-                Turn::ToolResult {
-                    call_id,
-                    tool,
-                    result,
-                    ok: _,
-                } => {
-                    let msg = serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "name": tool,
-                        "content": result,
-                    });
-                    engine.store.push(msg);
-                }
-                Turn::System { content } => {
-                    let msg = serde_json::json!({"role": "system", "content": content});
-                    engine.store.push(msg);
-                }
-                Turn::Summary {
-                    text,
-                    source_ids,
-                    level,
-                } => {
-                    // Create summary node in DAG
-                    let _node = engine
-                        .dag
-                        .create_node(source_ids.clone(), text.clone(), *level);
-
-                    // Track which raw messages are covered by summaries
-                    for &id in source_ids {
-                        summarized_ids.insert(id);
-                    }
-
-                    // Summaries are NOT added to store - they reference store entries
-                }
-                Turn::Clear => {
-                    // Should not happen since we sliced turns_to_process,
-                    // but handle defensively by resetting the engine.
-                    debug!("LCM rebuild: unexpected Clear marker in processed turns, resetting");
-                    return Self::new(config);
-                }
-            }
-        }
-
-        // Second pass: build active context
-        // Start with system prompt (as ContextEntry, not from store)
-        // Then add summary nodes, then raw messages not covered by summaries
-
-        // Add summary entries to active context
-        for node in &engine.dag.nodes {
-            let id_list: String = node
-                .source_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let summary_message = serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "[Summary of messages {}-{} (IDs: {}). Use lcm_expand to retrieve originals.]\n\n{}",
-                    node.source_ids.first().unwrap_or(&0),
-                    node.source_ids.last().unwrap_or(&0),
-                    id_list,
-                    node.text
-                )
-            });
-            engine.active.push(ContextEntry::Summary {
-                node_id: node.id,
-                message: summary_message,
-            });
-        }
-
-        // Add raw messages that aren't covered by any summary.
-        // Iterate over the full store so that messages with IDs lower than
-        // last_summary_end but not included in any summary (e.g. user messages
-        // when only assistant messages were summarized) are not orphaned.
-        for msg_id in 0..engine.store.len() {
-            if !summarized_ids.contains(&msg_id) {
-                let message = engine.store[msg_id].clone();
-                engine.active.push(ContextEntry::Raw { msg_id, message });
-            }
-        }
-
-        debug!(
-            "LCM rebuild: {} store entries, {} summary nodes, {} active entries (cleared at idx {:?})",
-            engine.store.len(),
-            engine.dag.len(),
-            engine.active.len(),
-            clear_idx
-        );
-
-        engine
-    }
-
-    /// Ingest a new message into the immutable store and active context.
-    ///
-    /// Returns the assigned MessageId.
-    pub fn ingest(&mut self, message: Value) -> MessageId {
-        let msg_id = self.store.len();
-        self.store.push(message.clone());
+        self.store.insert(msg_id, message.clone());
         self.active.push(ContextEntry::Raw { msg_id, message });
-        msg_id
+        Some(msg_id)
     }
 
     /// Get the active context as a message array for the LLM.
@@ -458,9 +324,13 @@ impl LcmEngine {
         let available = budget.available_budget(tool_def_tokens);
         let target = (available as f64 * self.config.tau_soft * 0.8) as usize;
 
+        // Tier-aware protection: keep more recent turns verbatim on large windows,
+        // fewer on tiny ones. A fixed 4 was wrong for both 4K and 200K tiers.
+        let protect_count = protect_count_for_budget(available);
+
         // Find the oldest contiguous block of raw messages to compact.
         // Skip the system message (index 0) and any existing summaries.
-        let (block_start, block_end) = match self.find_oldest_raw_block_impl() {
+        let (block_start, block_end) = match self.find_oldest_raw_block_impl(protect_count) {
             Some(range) => range,
             None => {
                 debug!("LCM: no raw block to compact");
@@ -566,6 +436,7 @@ impl LcmEngine {
             .join(",");
         let summary_message = json!({
             "role": "user",
+            "_lcm_summary": true,
             "content": format!(
                 "[Summary of messages {}-{} (IDs: {}). Use lcm_expand to retrieve originals.]\n\n{}",
                 source_ids.first().unwrap_or(&0),
@@ -595,33 +466,27 @@ impl LcmEngine {
         })
     }
 
-    /// Find the oldest contiguous block of raw messages after the last summary.
+    /// Find the oldest contiguous block of raw messages, keeping the most recent
+    /// `protect_count` raw entries uncompacted.
     ///
-    /// If no summary exists, starts from the beginning (after system prompt).
-    /// This ensures we don't re-compact messages that have already been summarized.
-    fn find_oldest_raw_block_impl(&self) -> Option<(usize, usize)> {
-        let mut last_summary_idx: Option<usize> = None;
-
-        // Find the position of the last summary in active context
-        for (i, entry) in self.active.iter().enumerate() {
-            if matches!(entry, ContextEntry::Summary { .. }) {
-                last_summary_idx = Some(i);
-            }
-        }
-
-        // Start searching for raw messages after the last summary
-        let search_start = last_summary_idx.map(|idx| idx + 1).unwrap_or(0);
-
+    /// Scans from the beginning and returns the FIRST run of real raw messages,
+    /// stopping at the first summary. Scanning from the start (rather than only
+    /// after the last summary) means a raw block sitting *before* a summary is
+    /// compacted oldest-first instead of being orphaned forever. Raws are never
+    /// inside a summary (summaries reference the store), so this never
+    /// re-compacts already-summarized content.
+    fn find_oldest_raw_block_impl(&self, protect_count: usize) -> Option<(usize, usize)> {
         let mut start = None;
         let mut end = 0;
 
-        for i in search_start..self.active.len() {
-            let entry = &self.active[i];
-            match entry {
-                ContextEntry::Raw { msg_id: _, message } => {
-                    // Skip system message.
+        for i in 0..self.active.len() {
+            match &self.active[i] {
+                ContextEntry::Raw { message, .. } => {
+                    // Skip the system message and synthetic tail entries (e.g.
+                    // auto-expanded originals) — neither is a real message to
+                    // re-summarize, and compacting the latter would ping-pong.
                     let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    if role == "system" {
+                    if role == "system" || crate::agent::markers::is_synthetic(message) {
                         continue;
                     }
                     if start.is_none() {
@@ -630,8 +495,6 @@ impl LcmEngine {
                     end = i + 1;
                 }
                 ContextEntry::Summary { .. } => {
-                    // Shouldn't happen since we start after the last summary,
-                    // but handle it just in case.
                     if start.is_some() {
                         break;
                     }
@@ -639,24 +502,18 @@ impl LcmEngine {
             }
         }
 
-        // Don't compact the most recent messages (keep at least the last 4 raw entries).
+        let s = start?;
         let raw_count = self
             .active
             .iter()
             .filter(|e| matches!(e, ContextEntry::Raw { .. }))
             .count();
-
-        if let Some(s) = start {
-            // Keep at least 4 recent raw messages uncompacted.
-            let protect_count = 4.min(raw_count);
-            let max_end = self.active.len().saturating_sub(protect_count);
-            let clamped_end = end.min(max_end);
-            if clamped_end > s + 1 {
-                // Need at least 2 messages to justify compaction.
-                Some((s, clamped_end))
-            } else {
-                None
-            }
+        let protect = protect_count.min(raw_count);
+        let max_end = self.active.len().saturating_sub(protect);
+        let clamped_end = end.min(max_end);
+        if clamped_end > s + 1 {
+            // Need at least 2 messages to justify compaction.
+            Some((s, clamped_end))
         } else {
             None
         }
@@ -673,7 +530,7 @@ impl LcmEngine {
     pub fn expand(&self, msg_ids: &[MessageId]) -> Vec<(MessageId, &Value)> {
         msg_ids
             .iter()
-            .filter_map(|&id| self.store.get(id).map(|msg| (id, msg)))
+            .filter_map(|&id| self.store.get(&id).map(|msg| (id, msg)))
             .collect()
     }
 
@@ -701,6 +558,11 @@ impl LcmEngine {
         self.store.len()
     }
 
+    /// All message IDs currently in the immutable store, ascending.
+    pub fn store_ids(&self) -> Vec<MessageId> {
+        self.store.keys().copied().collect()
+    }
+
     /// Get the active context entry count.
     pub fn active_len(&self) -> usize {
         self.active.len()
@@ -718,18 +580,22 @@ impl LcmEngine {
 
     /// Find the oldest contiguous block of raw messages (for testing).
     pub fn find_oldest_raw_block(&self) -> Option<(usize, usize)> {
-        self.find_oldest_raw_block_impl()
+        self.find_oldest_raw_block_impl(DEFAULT_PROTECT_COUNT)
     }
 
     /// Auto-expand summaries that are relevant to the latest user message.
     ///
-    /// Uses keyword overlap (cheap, no LLM needed) between the latest user
-    /// message and summary source messages. If overlap exceeds threshold,
-    /// temporarily replaces the summary entry with original messages for
-    /// this turn only.
+    /// Returns synthetic messages the caller should APPEND to the wire history
+    /// (after any frozen cache prefix). The summary itself is left in place, so
+    /// the cached prefix stays byte-stable — this works even on warm sessions,
+    /// unlike the old in-place splice which rewrote the prefix and was therefore
+    /// disabled whenever the cache was warm. Each summary is expanded at most
+    /// once (tracked in `auto_expanded`) so the pass never spams the tail.
     ///
-    /// Returns true if any summaries were expanded.
-    pub fn auto_expand(&mut self, budget: &TokenBudget, tool_def_tokens: usize) -> bool {
+    /// Relevance uses semantic embeddings when available, else keyword overlap.
+    ///
+    /// Returns the synthetic messages to append (empty if nothing was expanded).
+    pub fn auto_expand(&mut self, budget: &TokenBudget, tool_def_tokens: usize) -> Vec<Value> {
         // Find the latest user message content.
         let user_text = self.active.iter().rev().find_map(|entry| {
             let msg = entry.message();
@@ -744,105 +610,140 @@ impl LcmEngine {
 
         let user_text = match user_text {
             Some(t) if !t.is_empty() => t,
-            _ => return false,
+            _ => return Vec::new(),
         };
 
         let user_keywords = extract_keywords(&user_text);
         if user_keywords.is_empty() {
-            return false;
+            return Vec::new();
         }
+        // Embed the user message once; None when the semantic feature is off or
+        // the model is unavailable, in which case we fall back to keyword overlap.
+        let user_embedding = crate::agent::embedder::embed_one(&user_text).ok();
 
-        // Check budget: only expand if we're below τ_hard.
+        // Budget: never let expansion push the context past τ_hard. Because we
+        // APPEND originals (the summary stays in place, keeping the frozen prefix
+        // byte-stable and the prompt cache warm), the cost is the full expansion,
+        // not summary→original net.
         let available = budget.available_budget(tool_def_tokens);
         let hard_limit = (available as f64 * self.config.tau_hard) as usize;
-        let current_tokens = self.active_tokens();
-        let headroom = hard_limit.saturating_sub(current_tokens);
+        let mut headroom = hard_limit.saturating_sub(self.active_tokens());
         if headroom < 100 {
-            debug!(
-                "LCM auto_expand: no headroom ({} tokens available), skipping",
-                headroom
-            );
-            return false;
+            debug!("LCM auto_expand: no headroom, skipping");
+            return Vec::new();
         }
 
-        // Find summary entries with high keyword overlap.
-        let mut expansions: Vec<(usize, Vec<ContextEntry>)> = Vec::new();
-
-        for (idx, entry) in self.active.iter().enumerate() {
-            if let ContextEntry::Summary { node_id, .. } = entry {
-                let source_ids = self.dag.all_source_ids(*node_id);
-                // Compute keyword overlap with source messages.
-                let mut source_keywords = std::collections::HashSet::new();
-                for &sid in &source_ids {
-                    if let Some(msg) = self.store.get(sid) {
-                        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                            for kw in extract_keywords(content) {
-                                source_keywords.insert(kw);
-                            }
-                        }
-                    }
+        // Collect relevant, not-yet-expanded summary nodes (immutable borrow),
+        // then record them afterwards to satisfy the borrow checker.
+        let mut to_append: Vec<(usize, Value)> = Vec::new();
+        let candidates: Vec<usize> = self
+            .active
+            .iter()
+            .filter_map(|e| match e {
+                ContextEntry::Summary { node_id, .. } if !self.auto_expanded.contains(node_id) => {
+                    Some(*node_id)
                 }
+                _ => None,
+            })
+            .collect();
 
-                if source_keywords.is_empty() {
-                    continue;
-                }
+        for node_id in candidates {
+            let source_ids = self.dag.all_source_ids(node_id);
+            let source_messages: Vec<Value> = source_ids
+                .iter()
+                .filter_map(|&id| self.store.get(&id).cloned())
+                .collect();
+            if source_messages.is_empty() {
+                continue;
+            }
+            let source_text = source_messages
+                .iter()
+                .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ");
 
-                let overlap: usize = user_keywords
-                    .iter()
-                    .filter(|kw| source_keywords.contains(*kw))
-                    .count();
-                let relevance = overlap as f64 / user_keywords.len() as f64;
+            let relevance =
+                self.relevance(&user_text, &user_keywords, user_embedding.as_deref(), &source_text);
+            if relevance < 0.3 {
+                continue;
+            }
 
-                if relevance >= 0.3 {
-                    // Check if expansion fits in headroom.
-                    let source_messages: Vec<Value> = source_ids
-                        .iter()
-                        .filter_map(|&id| self.store.get(id).cloned())
-                        .collect();
-                    let expansion_tokens = TokenBudget::estimate_tokens(&source_messages);
-                    let summary_tokens = entry
-                        .message()
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .map(|s| TokenBudget::estimate_str_tokens(s))
-                        .unwrap_or(0);
-                    let net_cost = expansion_tokens.saturating_sub(summary_tokens);
+            let expansion_tokens = TokenBudget::estimate_tokens(&source_messages);
+            if expansion_tokens > headroom {
+                debug!(
+                    "LCM auto_expand: node {} relevant but needs {} tokens, {} headroom",
+                    node_id, expansion_tokens, headroom
+                );
+                continue;
+            }
 
-                    if net_cost <= headroom {
-                        debug!(
-                            "LCM auto_expand: expanding summary node {} (relevance={:.2}, +{} tokens)",
-                            node_id, relevance, net_cost
-                        );
-                        let entries: Vec<ContextEntry> = source_ids
-                            .iter()
-                            .filter_map(|&id| {
-                                self.store.get(id).map(|msg| ContextEntry::Raw {
-                                    msg_id: id,
-                                    message: msg.clone(),
-                                })
-                            })
-                            .collect();
-                        expansions.push((idx, entries));
-                    } else {
-                        debug!(
-                            "LCM auto_expand: skipping node {} (needs {} tokens, {} available)",
-                            node_id, net_cost, headroom
-                        );
-                    }
-                }
+            debug!(
+                "LCM auto_expand: appending originals for node {} (relevance={:.2}, +{} tokens)",
+                node_id, relevance, expansion_tokens
+            );
+            let first = source_ids.first().copied().unwrap_or(0);
+            let last = source_ids.last().copied().unwrap_or(0);
+            let body = source_ids
+                .iter()
+                .zip(source_messages.iter())
+                .map(|(id, m)| {
+                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                    let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    format!("[msg {id}] {role}: {content}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let msg = json!({
+                "role": "user",
+                "content": format!(
+                    "[Auto-expanded originals for the summary of messages {first}-{last}:]\n\n{body}"
+                ),
+                // Synthetic: dropped from the wire's turn tags, and skipped by
+                // find_oldest_raw_block so it is never itself re-compacted.
+                "_synthetic": true,
+            });
+            headroom = headroom.saturating_sub(expansion_tokens);
+            to_append.push((node_id, msg));
+        }
+
+        // Record idempotency and return the messages for the caller to append to
+        // the wire history. We deliberately do NOT push these into `self.active`:
+        // active persists across turns while ctx.messages is rebuilt from history
+        // each turn, so pushing here would leak synthetic entries and inflate the
+        // engine's token accounting over time. The expansion is a per-turn nudge.
+        let mut appended = Vec::with_capacity(to_append.len());
+        for (node_id, msg) in to_append {
+            self.auto_expanded.insert(node_id);
+            appended.push(msg);
+        }
+        appended
+    }
+
+    /// Relevance of a summary's source text to the user message. Uses semantic
+    /// cosine similarity when embeddings are available, else keyword overlap.
+    fn relevance(
+        &self,
+        _user_text: &str,
+        user_keywords: &std::collections::HashSet<String>,
+        user_embedding: Option<&[f32]>,
+        source_text: &str,
+    ) -> f64 {
+        // ponytail: re-embeds each summary per turn. Cache on SummaryNode if the
+        // summary count ever grows enough for ~5ms/embed to matter.
+        if let Some(u) = user_embedding {
+            if let Ok(s) = crate::agent::embedder::embed_one(source_text) {
+                return crate::agent::embedder::cosine_similarity(u, &s) as f64;
             }
         }
-
-        if expansions.is_empty() {
-            return false;
+        let source_keywords = extract_keywords(source_text);
+        if source_keywords.is_empty() {
+            return 0.0;
         }
-
-        // Apply expansions in reverse order to preserve indices.
-        for (idx, entries) in expansions.into_iter().rev() {
-            self.active.splice(idx..=idx, entries);
-        }
-
-        true
+        let overlap = user_keywords
+            .iter()
+            .filter(|kw| source_keywords.contains(*kw))
+            .count();
+        overlap as f64 / user_keywords.len() as f64
     }
 
     /// Rebuild the LCM engine from persisted summary nodes (from SQLite DB).
@@ -850,27 +751,59 @@ impl LcmEngine {
     /// This is the preferred way to restore the DAG after a restart — it uses
     /// the summary_nodes table instead of scanning Turn::Summary entries from
     /// the message stream.
+    ///
+    /// The store is keyed by each row's stable `_db_id` (SQLite rowid), so
+    /// persisted `source_ids` resolve to exactly the same originals they were
+    /// created against, no matter how the live context was windowed.
+    ///
+    /// Legacy nodes (id_kind != "db_id", the 7th tuple element) were persisted
+    /// with POSITIONAL source ids from the pre-rowid scheme. Resolving those
+    /// against rowids would silently return the wrong originals, so they are
+    /// skipped with a warning: their summary text stays in session history,
+    /// but the node never enters the DAG — honest degradation beats wrong
+    /// expansion.
     pub fn rebuild_from_db_nodes(
         raw_messages: &[Value],
-        nodes: &[(usize, Vec<usize>, Vec<usize>, String, usize, u8)],
+        nodes: &[(usize, Vec<usize>, Vec<usize>, String, usize, u8, String)],
         config: LcmConfig,
     ) -> Self {
         let mut engine = Self::new(config);
 
-        // Ingest all raw messages into the store.
+        // Ingest raw messages keyed by rowid. Persisted `role: "summary"` rows
+        // reference store entries and never occupy store slots themselves;
+        // synthetic scaffolds are not originals. Rows without a `_db_id`
+        // cannot be addressed losslessly and are skipped (get_all_messages
+        // always supplies the rowid, so this is defensive only).
         for msg in raw_messages {
-            engine.store.push(msg.clone());
+            let role = msg.get("role").and_then(|r| r.as_str());
+            if role == Some("summary") || crate::agent::markers::is_synthetic(msg) {
+                continue;
+            }
+            let Some(db_id) = msg.get("_db_id").and_then(|v| v.as_u64()) else {
+                warn!("LCM rebuild: skipping message without _db_id");
+                continue;
+            };
+            engine.store.insert(db_id as usize, msg.clone());
         }
 
         // Track which message IDs are covered by summaries.
         let mut summarized_ids: std::collections::HashSet<MessageId> =
             std::collections::HashSet::new();
 
-        // Reconstruct DAG nodes.
-        for &(ref _id, ref source_ids, ref _child_ids, ref text, _tokens, level) in nodes {
+        // Reconstruct DAG nodes, skipping legacy positional-id nodes.
+        for (id, source_ids, _child_ids, text, _tokens, level, id_kind) in nodes {
+            if id_kind != "db_id" {
+                warn!(
+                    node_id = id,
+                    id_kind = %id_kind,
+                    "LCM rebuild: skipping legacy summary node with positional \
+                     source_ids (would misresolve against db-id-keyed store)"
+                );
+                continue;
+            }
             engine
                 .dag
-                .create_node(source_ids.clone(), text.clone(), level);
+                .create_node(source_ids.clone(), text.clone(), *level);
             for &sid in source_ids {
                 summarized_ids.insert(sid);
             }
@@ -886,6 +819,7 @@ impl LcmEngine {
                 .join(",");
             let summary_message = json!({
                 "role": "user",
+                "_lcm_summary": true,
                 "content": format!(
                     "[Summary of messages {}-{} (IDs: {}). Use lcm_expand to retrieve originals.]\n\n{}",
                     node.source_ids.first().unwrap_or(&0),
@@ -900,11 +834,15 @@ impl LcmEngine {
             });
         }
 
-        for msg_id in 0..engine.store.len() {
-            if !summarized_ids.contains(&msg_id) {
-                let message = engine.store[msg_id].clone();
-                engine.active.push(ContextEntry::Raw { msg_id, message });
-            }
+        // BTreeMap iteration is ascending by id — session order is preserved.
+        let unsummarized: Vec<(MessageId, Value)> = engine
+            .store
+            .iter()
+            .filter(|(id, _)| !summarized_ids.contains(id))
+            .map(|(&id, m)| (id, m.clone()))
+            .collect();
+        for (msg_id, message) in unsummarized {
+            engine.active.push(ContextEntry::Raw { msg_id, message });
         }
 
         debug!(
@@ -1104,9 +1042,10 @@ pub fn contains_refusal_pattern(text: &str) -> bool {
         "violates my",
         "i'm not comfortable",
         "i am not comfortable",
-        "ethically",
-        "unethical",
-        "harmful",
+        // NB: bare topic words like "harmful"/"ethical"/"unethical" were removed —
+        // they flag legitimate summaries of conversations *about* harm or ethics
+        // (e.g. "summary of the discussion on harmful algae blooms") as refusals.
+        // Only first-person refusal phrasing belongs here.
     ];
 
     for indicator in &refusal_indicators {
@@ -1171,8 +1110,10 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
     }
 
     fn description(&self) -> &str {
-        "Retrieve original messages from a summarized conversation block. \
-         Use when you need full details from a [Summary of messages X-Y] block."
+        "Retrieve the exact original messages behind a compressed \
+         [Summary of messages X-Y (IDs: …)] block. Pass the IDs from that block \
+         as an integer array, e.g. lcm_expand({\"message_ids\": [5, 6, 7, 8]}). \
+         Expansion is lossless — the originals are always available."
     }
 
     fn parameters(&self) -> Value {
@@ -1180,8 +1121,9 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
             "type": "object",
             "properties": {
                 "message_ids": {
-                    "type": "string",
-                    "description": "Comma-separated message IDs to retrieve (e.g. '5,6,7,8')"
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Message IDs from a [Summary … (IDs: …)] block. Example: [5, 6, 7, 8]"
                 }
             },
             "required": ["message_ids"]
@@ -1189,23 +1131,64 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let ids_str = params
-            .get("message_ids")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let msg_ids: Vec<usize> = ids_str
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
+        // Lenient by design: small models emit arrays, bare strings, ranges, or
+        // stray prose. Accept all of them rather than silently returning nothing.
+        let msg_ids = match params.get("message_ids") {
+            Some(v) => parse_message_ids(v),
+            None => Vec::new(),
+        };
 
         if msg_ids.is_empty() {
-            return "Error: no valid message IDs provided. Use comma-separated numbers (e.g. '5,6,7,8').".to_string();
+            return "Error: no valid message IDs provided. Pass the IDs from the \
+                    [Summary … (IDs: …)] block as an array, e.g. [5, 6, 7, 8]."
+                .to_string();
         }
 
         let engine = self.engine.lock().await;
         engine.format_expanded(&msg_ids)
     }
+}
+
+/// Extract message IDs from whatever shape the model produced: an integer array,
+/// a comma/space-separated string, a `"5-8"` range, or numbers embedded in prose.
+fn parse_message_ids(v: &Value) -> Vec<usize> {
+    match v {
+        Value::Array(arr) => arr
+            .iter()
+            .flat_map(|e| match e {
+                Value::Number(n) => n.as_u64().map(|x| x as usize).into_iter().collect(),
+                Value::String(s) => parse_id_runs(s),
+                _ => Vec::new(),
+            })
+            .collect(),
+        Value::String(s) => parse_id_runs(s),
+        Value::Number(n) => n.as_u64().map(|x| x as usize).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Parse integer IDs and `a-b` ranges out of a free-form string.
+fn parse_id_runs(s: &str) -> Vec<usize> {
+    let mut ids = Vec::new();
+    // Tokens are runs of digits and '-'; everything else (commas, brackets,
+    // spaces, prose) is a separator.
+    for tok in s.split(|c: char| !c.is_ascii_digit() && c != '-') {
+        let tok = tok.trim_matches('-');
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = tok.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                // Cap runaway ranges so a typo can't allocate millions of IDs.
+                if a <= b && b - a < 10_000 {
+                    ids.extend(a..=b);
+                }
+            }
+        } else if let Ok(n) = tok.parse::<usize>() {
+            ids.push(n);
+        }
+    }
+    ids
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,6 +1277,17 @@ mod tests {
         }
     }
 
+    /// Test message tagged with an explicit `_db_id`, mirroring what
+    /// get_history supplies for persisted messages.
+    fn msg(id: usize, role: &str, content: &str) -> Value {
+        json!({"role": role, "content": content, "_db_id": id})
+    }
+
+    /// Ingest a `_db_id`-tagged message, asserting it was accepted.
+    fn ingest(engine: &mut LcmEngine, id: usize, role: &str, content: &str) {
+        assert_eq!(engine.ingest(msg(id, role, content)), Some(id));
+    }
+
     #[test]
     fn test_summary_dag_create_and_retrieve() {
         let mut dag = SummaryDag::new();
@@ -1316,36 +1310,57 @@ mod tests {
     #[test]
     fn test_lcm_engine_ingest() {
         let engine = &mut LcmEngine::new(LcmConfig::default());
-        let id0 = engine.ingest(json!({"role": "system", "content": "You are helpful."}));
-        let id1 = engine.ingest(json!({"role": "user", "content": "Hello"}));
-        assert_eq!(id0, 0);
-        assert_eq!(id1, 1);
+        let id0 = engine.ingest(msg(1, "system", "You are helpful."));
+        let id1 = engine.ingest(msg(2, "user", "Hello"));
+        assert_eq!(id0, Some(1));
+        assert_eq!(id1, Some(2));
         assert_eq!(engine.store_len(), 2);
         assert_eq!(engine.active_len(), 2);
+        assert_eq!(engine.store_ids(), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_ingest_skips_unpersisted_messages() {
+        let engine = &mut LcmEngine::new(LcmConfig::default());
+
+        // No `_db_id` → not persisted yet → not ingested.
+        assert_eq!(
+            engine.ingest(json!({"role": "user", "content": "not persisted"})),
+            None
+        );
+        assert_eq!(engine.store_len(), 0);
+        assert_eq!(engine.active_len(), 0);
+
+        // Same message re-offered WITH a `_db_id` ingests exactly once.
+        let m = msg(7, "user", "now persisted");
+        assert_eq!(engine.ingest(m.clone()), Some(7));
+        assert_eq!(engine.ingest(m), Some(7), "upsert must be idempotent");
+        assert_eq!(engine.store_len(), 1);
+        assert_eq!(engine.active_len(), 1, "no duplicate active entry");
     }
 
     #[test]
     fn test_lcm_engine_expand() {
         let engine = &mut LcmEngine::new(LcmConfig::default());
-        engine.ingest(json!({"role": "user", "content": "Hello"}));
-        engine.ingest(json!({"role": "assistant", "content": "Hi there!"}));
-        engine.ingest(json!({"role": "user", "content": "How are you?"}));
+        ingest(engine, 1, "user", "Hello");
+        ingest(engine, 2, "assistant", "Hi there!");
+        ingest(engine, 3, "user", "How are you?");
 
-        let expanded = engine.expand(&[0, 2]);
+        let expanded = engine.expand(&[1, 3]);
         assert_eq!(expanded.len(), 2);
-        assert_eq!(expanded[0].0, 0);
-        assert_eq!(expanded[1].0, 2);
+        assert_eq!(expanded[0].0, 1);
+        assert_eq!(expanded[1].0, 3);
     }
 
     #[test]
     fn test_lcm_engine_format_expanded() {
         let engine = &mut LcmEngine::new(LcmConfig::default());
-        engine.ingest(json!({"role": "user", "content": "Hello"}));
-        engine.ingest(json!({"role": "assistant", "content": "Hi!"}));
+        ingest(engine, 1, "user", "Hello");
+        ingest(engine, 2, "assistant", "Hi!");
 
-        let output = engine.format_expanded(&[0, 1]);
-        assert!(output.contains("[msg 0] user: Hello"));
-        assert!(output.contains("[msg 1] assistant: Hi!"));
+        let output = engine.format_expanded(&[1, 2]);
+        assert!(output.contains("[msg 1] user: Hello"));
+        assert!(output.contains("[msg 2] assistant: Hi!"));
     }
 
     #[test]
@@ -1356,8 +1371,8 @@ mod tests {
             tau_hard: 0.85,
             deterministic_target: 512,
         });
-        engine.ingest(json!({"role": "system", "content": "S"}));
-        engine.ingest(json!({"role": "user", "content": "Hi"}));
+        ingest(engine, 1, "system", "S");
+        ingest(engine, 2, "user", "Hi");
 
         let budget = TokenBudget::new(100_000, 8192);
         assert_eq!(
@@ -1383,13 +1398,13 @@ mod tests {
 
         // Simulate a realistic ~8K-token system prompt (32K chars ≈ 8K tokens)
         let big_system = "x".repeat(32_000);
-        engine.ingest(json!({"role": "system", "content": big_system}));
+        ingest(&mut engine, 1, "system", &big_system);
 
         // Add 2 short conversation turns (~200 tokens total)
-        engine.ingest(json!({"role": "user", "content": "Hello, how are you?"}));
-        engine.ingest(json!({"role": "assistant", "content": "I'm fine, thanks for asking! How can I help you today?"}));
-        engine.ingest(json!({"role": "user", "content": "What is the weather like?"}));
-        engine.ingest(json!({"role": "assistant", "content": "I don't have access to weather data, but I can help with other things."}));
+        ingest(&mut engine, 2, "user", "Hello, how are you?");
+        ingest(&mut engine, 3, "assistant", "I'm fine, thanks for asking! How can I help you today?");
+        ingest(&mut engine, 4, "user", "What is the weather like?");
+        ingest(&mut engine, 5, "assistant", "I don't have access to weather data, but I can help with other things.");
 
         // 32K context, 2K reserve → 30K available, tau_soft=0.5 → soft=15K
         let budget = TokenBudget::new(32_768, 2048);
@@ -1416,13 +1431,13 @@ mod tests {
         });
 
         // Small system prompt
-        engine.ingest(json!({"role": "system", "content": "You are helpful."}));
+        ingest(&mut engine, 1, "system", "You are helpful.");
 
         // Fill conversation with enough tokens to exceed tau_soft on a small window
         // 4K context, 512 reserve → 3.5K available, tau_soft=0.5 → soft=1.75K tokens
         // Add ~2K tokens of conversation (8K chars / 4)
         let big_msg = "y".repeat(8_000);
-        engine.ingest(json!({"role": "user", "content": big_msg}));
+        ingest(&mut engine, 2, "user", &big_msg);
 
         let budget = TokenBudget::new(4096, 512);
         assert_eq!(
@@ -1445,14 +1460,20 @@ mod tests {
             deterministic_target: 64,
         });
 
-        engine.ingest(json!({"role": "system", "content": "System"}));
+        ingest(&mut engine, 1, "system", "System");
         // Add 200 messages — way more than any sane compaction block
         for i in 0..100 {
-            engine.ingest(
-                json!({"role": "user", "content": format!("Question {} about topic {}", i, i * 7)}),
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!("Question {} about topic {}", i, i * 7),
             );
-            engine.ingest(
-                json!({"role": "assistant", "content": format!("Answer {} with details about {}", i, i * 3)}),
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Answer {} with details about {}", i, i * 3),
             );
         }
 
@@ -1484,7 +1505,7 @@ mod tests {
     fn test_conversation_tokens_zero_for_system_only() {
         let mut engine = LcmEngine::new(LcmConfig::default());
         let big_system = "z".repeat(40_000); // ~10K tokens
-        engine.ingest(json!({"role": "system", "content": big_system}));
+        ingest(&mut engine, 1, "system", &big_system);
 
         assert_eq!(engine.conversation_tokens(), 0);
     }
@@ -1516,11 +1537,11 @@ mod tests {
     fn test_find_oldest_raw_block() {
         let engine = &mut LcmEngine::new(LcmConfig::default());
         // System message (protected).
-        engine.ingest(json!({"role": "system", "content": "System"}));
+        ingest(engine, 1, "system", "System");
         // 10 user/assistant messages.
         for i in 0..10 {
-            engine.ingest(json!({"role": "user", "content": format!("Msg {}", i)}));
-            engine.ingest(json!({"role": "assistant", "content": format!("Reply {}", i)}));
+            ingest(engine, 2 + 2 * i, "user", &format!("Msg {}", i));
+            ingest(engine, 3 + 2 * i, "assistant", &format!("Reply {}", i));
         }
 
         let block = engine.find_oldest_raw_block();
@@ -1546,28 +1567,32 @@ mod tests {
         });
 
         // System prompt.
-        engine.ingest(json!({"role": "system", "content": "You are a helpful assistant."}));
+        ingest(&mut engine, 1, "system", "You are a helpful assistant.");
 
         // 10 turns of verbose conversation to fill the context.
         for i in 0..10 {
-            engine.ingest(json!({
-                "role": "user",
-                "content": format!(
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!(
                     "Tell me about Rust ownership, borrowing, and lifetimes in detail. Turn {}. \
                      I need a comprehensive explanation with examples and edge cases.",
                     i
-                )
-            }));
-            engine.ingest(json!({
-                "role": "assistant",
-                "content": format!(
+                ),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!(
                     "Rust ownership is a memory safety feature. Each value has exactly one owner. \
                      When the owner goes out of scope, the value is dropped. Borrowing allows \
                      temporary references. Lifetimes annotate how long references are valid. \
                      This is turn {} of our conversation about memory management in Rust.",
                     i
-                )
-            }));
+                ),
+            );
         }
 
         let pre_compact_active = engine.active_len();
@@ -1666,16 +1691,20 @@ mod tests {
             deterministic_target: 64,
         });
 
-        engine.ingest(json!({"role": "system", "content": "System prompt."}));
+        ingest(&mut engine, 1, "system", "System prompt.");
         for i in 0..10 {
-            engine.ingest(json!({
-                "role": "user",
-                "content": format!("Question {} about lifetimes and borrowing rules.", i)
-            }));
-            engine.ingest(json!({
-                "role": "assistant",
-                "content": format!("Answer {} explains ownership semantics in detail.", i)
-            }));
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!("Question {} about lifetimes and borrowing rules.", i),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Answer {} explains ownership semantics in detail.", i),
+            );
         }
 
         let budget = TokenBudget::new(4096, 2048);
@@ -1721,22 +1750,33 @@ mod tests {
         // Ingest messages.
         {
             let mut e = engine.lock().await;
-            e.ingest(json!({"role": "user", "content": "What is Rust?"}));
-            e.ingest(
-                json!({"role": "assistant", "content": "Rust is a systems programming language."}),
-            );
-            e.ingest(json!({"role": "user", "content": "Tell me about ownership."}));
+            ingest(&mut e, 1, "user", "What is Rust?");
+            ingest(&mut e, 2, "assistant", "Rust is a systems programming language.");
+            ingest(&mut e, 3, "user", "Tell me about ownership.");
         }
 
         let tool = LcmExpandTool::new(engine.clone());
 
         // Valid IDs.
         let mut params = HashMap::new();
-        params.insert("message_ids".to_string(), json!("0,1,2"));
+        params.insert("message_ids".to_string(), json!("1,2,3"));
         let output = tool.execute(params).await;
-        assert!(output.contains("[msg 0] user: What is Rust?"));
-        assert!(output.contains("[msg 1] assistant: Rust is a systems programming language."));
-        assert!(output.contains("[msg 2] user: Tell me about ownership."));
+        assert!(output.contains("[msg 1] user: What is Rust?"));
+        assert!(output.contains("[msg 2] assistant: Rust is a systems programming language."));
+        assert!(output.contains("[msg 3] user: Tell me about ownership."));
+
+        // Integer array (the shape small models actually emit) works too.
+        let mut params = HashMap::new();
+        params.insert("message_ids".to_string(), json!([1, 2, 3]));
+        let output = tool.execute(params).await;
+        assert!(output.contains("[msg 1] user: What is Rust?"));
+        assert!(output.contains("[msg 3] user: Tell me about ownership."));
+
+        // A range string expands inclusively.
+        let mut params = HashMap::new();
+        params.insert("message_ids".to_string(), json!("1-3"));
+        let output = tool.execute(params).await;
+        assert!(output.contains("[msg 2]"));
 
         // Invalid IDs.
         let mut params = HashMap::new();
@@ -1764,17 +1804,21 @@ mod tests {
             deterministic_target: 64,
         });
 
-        engine.ingest(json!({"role": "system", "content": "System."}));
+        ingest(&mut engine, 1, "system", "System.");
         // 20 turns — enough for two compaction rounds.
         for i in 0..20 {
-            engine.ingest(json!({
-                "role": "user",
-                "content": format!("Detailed question {} about async Rust with tokio examples.", i)
-            }));
-            engine.ingest(json!({
-                "role": "assistant",
-                "content": format!("Detailed answer {} covering spawn, select, and channels.", i)
-            }));
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!("Detailed question {} about async Rust with tokio examples.", i),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Detailed answer {} covering spawn, select, and channels.", i),
+            );
         }
 
         let total_messages = engine.store_len();
@@ -1940,8 +1984,10 @@ mod tests {
                 deterministic_target: 128,
             });
 
-            for msg in &conversation {
-                engine.ingest(msg.clone());
+            for (i, m) in conversation.iter().enumerate() {
+                let mut tagged = m.clone();
+                tagged["_db_id"] = json!(i + 1);
+                let _ = engine.ingest(tagged);
             }
 
             let compactor = ContextCompactor::new(provider.clone(), model_name.to_string(), 4096);
@@ -2067,65 +2113,36 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Bug 8: rebuild_from_turns orphans non-contiguous messages
-    //
-    // When a summary covers only non-contiguous source_ids (e.g. [1, 3, 5]),
-    // last_summary_end is set to 5 so start_raw becomes 6.  Messages at IDs
-    // 0, 2, 4 — which are not covered by any summary but sit before
-    // last_summary_end — were silently dropped from the active context.
+    // Non-contiguous summary coverage: rebuild must not orphan messages whose
+    // ids sit between summarized ids (e.g. users when only assistants were
+    // summarized).
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_rebuild_non_contiguous_source_ids() {
-        use crate::agent::protocol::CloudProtocol;
+        // 8 messages, db ids 1..=8; summary covers only assistants 2, 4, 6.
+        let raw_messages: Vec<Value> = (1..=8)
+            .map(|i| {
+                if i % 2 == 1 {
+                    msg(i, "user", &format!("user{i}"))
+                } else {
+                    msg(i, "assistant", &format!("asst{i}"))
+                }
+            })
+            .collect();
+        let nodes = vec![(
+            0usize,
+            vec![2usize, 4, 6],
+            vec![],
+            "Summary of assistant messages.".to_string(),
+            10usize,
+            1u8,
+            "db_id".to_string(),
+        )];
 
-        // Build 8 turns: user0, asst1, user2, asst3, user4, asst5, user6, asst7
-        let turns = vec![
-            Turn::User {
-                content: "user0".into(),
-                media: vec![],
-            },
-            Turn::Assistant {
-                text: Some("asst1".into()),
-                tool_calls: vec![],
-            },
-            Turn::User {
-                content: "user2".into(),
-                media: vec![],
-            },
-            Turn::Assistant {
-                text: Some("asst3".into()),
-                tool_calls: vec![],
-            },
-            Turn::User {
-                content: "user4".into(),
-                media: vec![],
-            },
-            Turn::Assistant {
-                text: Some("asst5".into()),
-                tool_calls: vec![],
-            },
-            Turn::User {
-                content: "user6".into(),
-                media: vec![],
-            },
-            Turn::Assistant {
-                text: Some("asst7".into()),
-                tool_calls: vec![],
-            },
-            // Summary covers only the assistant messages (non-contiguous IDs 1, 3, 5)
-            Turn::Summary {
-                text: "Summary of assistant messages.".into(),
-                source_ids: vec![1, 3, 5],
-                level: 1,
-            },
-        ];
-
-        let protocol = CloudProtocol;
         let engine =
-            LcmEngine::rebuild_from_turns(&turns, LcmConfig::default(), &protocol, "system prompt");
+            LcmEngine::rebuild_from_db_nodes(&raw_messages, &nodes, LcmConfig::default());
 
-        // Collect the msg_ids of all Raw entries in the active context.
         let raw_ids: Vec<usize> = engine
             .active
             .iter()
@@ -2138,63 +2155,15 @@ mod tests {
             })
             .collect();
 
-        // IDs 0, 2, 4 are user messages not covered by any summary.
-        // They must appear in active — not orphaned.
-        assert!(
-            raw_ids.contains(&0),
-            "msg_id 0 (user0) must be in active context, got: {:?}",
-            raw_ids
-        );
-        assert!(
-            raw_ids.contains(&2),
-            "msg_id 2 (user2) must be in active context, got: {:?}",
-            raw_ids
-        );
-        assert!(
-            raw_ids.contains(&4),
-            "msg_id 4 (user4) must be in active context, got: {:?}",
-            raw_ids
-        );
+        // Unsummarized ids (1, 3, 5, 7, 8) must all be active — not orphaned.
+        assert_eq!(raw_ids, vec![1, 3, 5, 7, 8], "unsummarized raws must stay active");
 
-        // IDs 6, 7 (after the last summarized ID) must also be in active.
-        assert!(
-            raw_ids.contains(&6),
-            "msg_id 6 (user6) must be in active context, got: {:?}",
-            raw_ids
-        );
-        assert!(
-            raw_ids.contains(&7),
-            "msg_id 7 (asst7) must be in active context, got: {:?}",
-            raw_ids
-        );
-
-        // Summarized IDs (1, 3, 5) must NOT be in active as raw messages.
-        assert!(
-            !raw_ids.contains(&1),
-            "msg_id 1 is summarized — must not appear as Raw, got: {:?}",
-            raw_ids
-        );
-        assert!(
-            !raw_ids.contains(&3),
-            "msg_id 3 is summarized — must not appear as Raw, got: {:?}",
-            raw_ids
-        );
-        assert!(
-            !raw_ids.contains(&5),
-            "msg_id 5 is summarized — must not appear as Raw, got: {:?}",
-            raw_ids
-        );
-
-        // There must be exactly one Summary entry in active.
         let summary_count = engine
             .active
             .iter()
             .filter(|e| matches!(e, ContextEntry::Summary { .. }))
             .count();
-        assert_eq!(
-            summary_count, 1,
-            "Expected exactly 1 Summary entry in active"
-        );
+        assert_eq!(summary_count, 1, "Expected exactly 1 Summary entry in active");
     }
 
     // -----------------------------------------------------------------------
@@ -2211,27 +2180,25 @@ mod tests {
         });
 
         // Ingest messages about Rust ownership.
-        engine.ingest(json!({"role": "system", "content": "You are helpful."}));
-        engine.ingest(
-            json!({"role": "user", "content": "Explain Rust ownership and borrowing rules."}),
-        );
-        engine.ingest(json!({"role": "assistant", "content": "Rust ownership means each value has one owner. Borrowing allows references."}));
-        engine.ingest(json!({"role": "user", "content": "How do lifetimes work in Rust?"}));
-        engine.ingest(json!({"role": "assistant", "content": "Lifetimes track how long references are valid."}));
+        ingest(&mut engine, 1, "system", "You are helpful.");
+        ingest(&mut engine, 2, "user", "Explain Rust ownership and borrowing rules.");
+        ingest(&mut engine, 3, "assistant", "Rust ownership means each value has one owner. Borrowing allows references.");
+        ingest(&mut engine, 4, "user", "How do lifetimes work in Rust?");
+        ingest(&mut engine, 5, "assistant", "Lifetimes track how long references are valid.");
 
-        // Manually create a summary covering messages 1-4.
+        // Manually create a summary covering messages 2-5.
         let node = engine.dag.create_node(
-            vec![1, 2, 3, 4],
+            vec![2, 3, 4, 5],
             "Discussion about Rust ownership, borrowing, and lifetimes.".to_string(),
             1,
         );
         let node_id = node.id;
         let summary_msg = json!({
             "role": "user",
-            "content": "[Summary of messages 1-4 (IDs: 1,2,3,4). Use lcm_expand to retrieve originals.]\n\nDiscussion about Rust ownership, borrowing, and lifetimes."
+            "content": "[Summary of messages 2-5 (IDs: 2,3,4,5). Use lcm_expand to retrieve originals.]\n\nDiscussion about Rust ownership, borrowing, and lifetimes."
         });
 
-        // Replace raw entries 1-4 with the summary in active context.
+        // Replace raw entries 2-5 with the summary in active context.
         engine.active = vec![
             engine.active[0].clone(), // system
             ContextEntry::Summary {
@@ -2241,32 +2208,36 @@ mod tests {
         ];
 
         // Now add a new user message about ownership (should trigger expansion).
-        engine.ingest(json!({"role": "user", "content": "Tell me more about Rust ownership rules and borrow checker."}));
+        ingest(&mut engine, 6, "user", "Tell me more about Rust ownership rules and borrow checker.");
 
         let budget = TokenBudget::new(100_000, 8192);
-        let expanded = engine.auto_expand(&budget, 100);
-        assert!(expanded, "Auto-expand should trigger for relevant query");
+        let appended = engine.auto_expand(&budget, 100);
+        assert_eq!(
+            appended.len(),
+            1,
+            "Auto-expand should append one expansion message for the relevant query"
+        );
 
-        // After expansion, the summary should be replaced with raw messages.
+        // The summary STAYS in place (cache-safe): expansion is appended, not spliced.
         let has_summary = engine
             .active
             .iter()
             .any(|e| matches!(e, ContextEntry::Summary { .. }));
-        assert!(
-            !has_summary,
-            "Summary should be replaced by raw messages after auto-expand"
-        );
+        assert!(has_summary, "Summary must remain — expansion is append-only");
 
-        // Should have system + 4 expanded raw + 1 new user = 6 entries.
-        let raw_count = engine
-            .active
-            .iter()
-            .filter(|e| matches!(e, ContextEntry::Raw { .. }))
-            .count();
+        // The appended message carries the original content, tagged synthetic.
+        let content = appended[0]["content"].as_str().unwrap_or("");
+        assert!(content.contains("Auto-expanded"), "should be labelled");
         assert!(
-            raw_count >= 5,
-            "Should have at least 5 raw entries after expansion, got {}",
-            raw_count
+            content.contains("each value has one owner"),
+            "should contain the original message text, got: {content}"
+        );
+        assert_eq!(appended[0]["_synthetic"], json!(true));
+
+        // Idempotent: a second pass does not re-append the same node.
+        assert!(
+            engine.auto_expand(&budget, 100).is_empty(),
+            "already-expanded summary must not be appended twice"
         );
     }
 
@@ -2284,20 +2255,24 @@ mod tests {
         });
 
         // Fill with enough messages to be near the hard limit.
-        engine.ingest(json!({"role": "system", "content": "S"}));
+        ingest(&mut engine, 1, "system", "S");
         for i in 0..20 {
-            engine.ingest(json!({
-                "role": "user",
-                "content": format!("Long question {} about Rust ownership and memory management details with many words.", i)
-            }));
-            engine.ingest(json!({
-                "role": "assistant",
-                "content": format!("Long answer {} about ownership, borrowing, lifetimes, and the borrow checker.", i)
-            }));
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!("Long question {} about Rust ownership and memory management details with many words.", i),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Long answer {} about ownership, borrowing, lifetimes, and the borrow checker.", i),
+            );
         }
 
-        // Create a summary covering messages 1-10.
-        let source_ids: Vec<usize> = (1..=10).collect();
+        // Create a summary covering messages 2-11.
+        let source_ids: Vec<usize> = (2..=11).collect();
         let node = engine.dag.create_node(
             source_ids.clone(),
             "Summary of first 10 messages.".to_string(),
@@ -2306,10 +2281,10 @@ mod tests {
         let node_id = node.id;
         let summary_msg = json!({
             "role": "user",
-            "content": "[Summary of messages 1-10 (IDs: 1..10).]\n\nSummary of first 10 messages."
+            "content": "[Summary of messages 2-11 (IDs: 2..11).]\n\nSummary of first 10 messages."
         });
 
-        // Replace messages 1-10 in active with summary.
+        // Replace messages 2-11 in active with summary.
         let mut new_active = vec![engine.active[0].clone()];
         new_active.push(ContextEntry::Summary {
             node_id,
@@ -2322,9 +2297,8 @@ mod tests {
 
         // Use a tiny budget where there's no headroom.
         let budget = TokenBudget::new(256, 128); // Very small
-        let expanded = engine.auto_expand(&budget, 50);
         assert!(
-            !expanded,
+            engine.auto_expand(&budget, 50).is_empty(),
             "Should NOT expand when budget headroom is insufficient"
         );
     }
@@ -2342,14 +2316,12 @@ mod tests {
             deterministic_target: 64,
         });
 
-        engine.ingest(json!({"role": "system", "content": "S"}));
-        engine.ingest(json!({"role": "user", "content": "Explain Rust ownership and borrowing."}));
-        engine.ingest(
-            json!({"role": "assistant", "content": "Ownership means each value has one owner."}),
-        );
+        ingest(&mut engine, 1, "system", "S");
+        ingest(&mut engine, 2, "user", "Explain Rust ownership and borrowing.");
+        ingest(&mut engine, 3, "assistant", "Ownership means each value has one owner.");
 
         let node = engine.dag.create_node(
-            vec![1, 2],
+            vec![2, 3],
             "Discussion about Rust ownership.".to_string(),
             1,
         );
@@ -2368,13 +2340,13 @@ mod tests {
         ];
 
         // Ask about something completely unrelated.
-        engine.ingest(
-            json!({"role": "user", "content": "What is the weather forecast for Tokyo tomorrow?"}),
-        );
+        ingest(&mut engine, 4, "user", "What is the weather forecast for Tokyo tomorrow?");
 
         let budget = TokenBudget::new(100_000, 8192);
-        let expanded = engine.auto_expand(&budget, 100);
-        assert!(!expanded, "Should NOT expand for an irrelevant query");
+        assert!(
+            engine.auto_expand(&budget, 100).is_empty(),
+            "Should NOT expand for an irrelevant query"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2383,24 +2355,25 @@ mod tests {
 
     #[test]
     fn test_rebuild_from_db_nodes() {
-        // Simulate raw messages.
+        // Simulate raw messages with stable db ids 1..=6.
         let raw_messages = vec![
-            json!({"role": "system", "content": "System prompt."}),
-            json!({"role": "user", "content": "Hello"}),
-            json!({"role": "assistant", "content": "Hi there!"}),
-            json!({"role": "user", "content": "How are you?"}),
-            json!({"role": "assistant", "content": "I'm good, thanks!"}),
-            json!({"role": "user", "content": "Tell me a joke."}),
+            msg(1, "system", "System prompt."),
+            msg(2, "user", "Hello"),
+            msg(3, "assistant", "Hi there!"),
+            msg(4, "user", "How are you?"),
+            msg(5, "assistant", "I'm good, thanks!"),
+            msg(6, "user", "Tell me a joke."),
         ];
 
-        // Simulate a DB node covering messages 1-4.
+        // Simulate a DB node covering db ids 2-5.
         let db_nodes = vec![(
             0usize,                           // node_id
-            vec![1usize, 2, 3, 4],            // source_ids
+            vec![2usize, 3, 4, 5],            // source_ids
             vec![],                           // child_ids
             "Greeting exchange.".to_string(), // text
             10usize,                          // tokens
             1u8,                              // level
+            "db_id".to_string(),              // id_kind
         )];
 
         let config = LcmConfig {
@@ -2418,10 +2391,10 @@ mod tests {
         // DAG should have 1 node.
         assert_eq!(engine.dag().len(), 1);
         let node = engine.dag().get(0).unwrap();
-        assert_eq!(node.source_ids, vec![1, 2, 3, 4]);
+        assert_eq!(node.source_ids, vec![2, 3, 4, 5]);
         assert_eq!(node.level, 1);
 
-        // Active context: 1 summary + 2 raw (system + msg 5).
+        // Active context: 1 summary + 2 raw (system + msg 6).
         let summary_count = engine
             .active_entries()
             .iter()
@@ -2434,11 +2407,262 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, ContextEntry::Raw { .. }))
             .count();
-        assert_eq!(raw_count, 2, "system + msg 5 should be raw");
+        assert_eq!(raw_count, 2, "system + msg 6 should be raw");
 
         // Expand still works.
-        let expanded = engine.expand(&[1, 2, 3, 4]);
+        let expanded = engine.expand(&[2, 3, 4, 5]);
         assert_eq!(expanded.len(), 4);
+    }
+
+    /// THE id-drift repro. Live sessions ingest a FILTERED WINDOW of history
+    /// (get_history caps counts/tokens and drops synthetics), while restart
+    /// rebuilds from the FULL history. Under the old positional scheme a
+    /// summary created against the window (positions 0..) misresolved after
+    /// restart — expand() silently returned the wrong originals. With
+    /// db-id-keyed MessageIds the same ids resolve identically in both worlds.
+    #[test]
+    fn test_windowed_resume_ids_stable() {
+        // Full history: db ids 1..=10.
+        let full: Vec<Value> = (1..=10)
+            .map(|i| {
+                let role = if i % 2 == 1 { "user" } else { "assistant" };
+                msg(i, role, &format!("MSG_{i}"))
+            })
+            .collect();
+
+        // Live session: the engine only ever saw a window (ids 6..=10)...
+        let mut live = LcmEngine::new(LcmConfig::default());
+        for m in &full[5..] {
+            let _ = live.ingest(m.clone());
+        }
+        // ...and compacted ids 6,7 into a summary persisted with those ids.
+        live.dag
+            .create_node(vec![6, 7], "Summary of 6-7.".to_string(), 1);
+        // Even before restart, the live engine resolves by db id, not window
+        // position (positionally, "6" would have been out of range or wrong).
+        let live_expanded = live.expand(&[6, 7]);
+        assert_eq!(live_expanded.len(), 2);
+        assert_eq!(live_expanded[0].1["content"], "MSG_6");
+        assert_eq!(live_expanded[1].1["content"], "MSG_7");
+
+        // Restart: rebuild from the FULL history + the persisted node.
+        let nodes = vec![(
+            0usize,
+            vec![6usize, 7],
+            vec![],
+            "Summary of 6-7.".to_string(),
+            5usize,
+            1u8,
+            "db_id".to_string(),
+        )];
+        let engine = LcmEngine::rebuild_from_db_nodes(&full, &nodes, LcmConfig::default());
+
+        // Lossless guarantee: expand(6,7) returns EXACTLY messages 6 and 7.
+        // (Old positional code returned the messages at positions 6,7 of the
+        // full history — MSG_7 and MSG_8 — silent corruption.)
+        let expanded = engine.expand(&[6, 7]);
+        assert_eq!(expanded.len(), 2);
+        assert_eq!(expanded[0].1["content"], "MSG_6");
+        assert_eq!(expanded[1].1["content"], "MSG_7");
+
+        // The summarized ids are not active as raws; everything else is.
+        let raw_ids: Vec<usize> = engine
+            .active
+            .iter()
+            .filter_map(|e| match e {
+                ContextEntry::Raw { msg_id, .. } => Some(*msg_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raw_ids, vec![1, 2, 3, 4, 5, 8, 9, 10]);
+    }
+
+    /// Legacy summary_nodes rows (id_kind absent/legacy) carry POSITIONAL
+    /// source_ids. They must be skipped on rebuild — never resolved against
+    /// db ids — leaving all raws active.
+    #[test]
+    fn test_legacy_ordinal_nodes_are_skipped_not_misresolved() {
+        let full: Vec<Value> = (1..=6)
+            .map(|i| {
+                let role = if i % 2 == 1 { "user" } else { "assistant" };
+                msg(i, role, &format!("MSG_{i}"))
+            })
+            .collect();
+        let nodes = vec![(
+            0usize,
+            vec![1usize, 2], // positional ids from the pre-rowid scheme
+            vec![],
+            "Legacy summary.".to_string(),
+            5usize,
+            1u8,
+            "legacy".to_string(),
+        )];
+
+        let engine = LcmEngine::rebuild_from_db_nodes(&full, &nodes, LcmConfig::default());
+
+        assert_eq!(
+            engine.dag_ref().len(),
+            0,
+            "legacy node must not enter the DAG"
+        );
+        let raw_count = engine
+            .active_entries()
+            .iter()
+            .filter(|e| matches!(e, ContextEntry::Raw { .. }))
+            .count();
+        assert_eq!(raw_count, 6, "all raws must remain active");
+    }
+
+    /// CRIT-1 seam: after a compaction the loop used to call
+    /// `reset_from_messages()`, clearing the store and corrupting `lcm_expand`.
+    /// The old e2e tests missed this because they called `compact()` directly.
+    /// The store is now append-only; originals survive compaction + resync.
+    #[tokio::test]
+    async fn test_store_sacred_across_compaction_and_resync() {
+        let config = LcmConfig {
+            enabled: true,
+            tau_soft: 0.5,
+            tau_hard: 0.85,
+            deterministic_target: 512,
+        };
+        let mut engine = LcmEngine::new(config);
+
+        ingest(&mut engine, 1, "system", "System prompt.");
+        for i in 0..8 {
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!(
+                    "MARKER_USER_{i} tell me about rust ownership borrowing lifetimes \
+                     in detail with worked examples and edge cases please"
+                ),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!(
+                    "MARKER_ASSISTANT_{i} rust ownership is a memory safety feature; \
+                     each value has exactly one owner and is dropped at scope end"
+                ),
+            );
+        }
+        let store_before = engine.store_len();
+
+        let budget = TokenBudget::new(4096, 2048);
+        let compactor = ContextCompactor::new(
+            Arc::new(SummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            4096,
+        );
+        let summary = engine
+            .compact(&compactor, &budget, 100)
+            .await
+            .expect("should compact");
+        let source_ids = match &summary {
+            Turn::Summary { source_ids, .. } => source_ids.clone(),
+            _ => panic!("expected Turn::Summary"),
+        };
+
+        // Simulate the loop's post-swap resync: ctx.messages = active_context(),
+        // engine is NOT reset. The active window shrinks...
+        assert!(
+            engine.active_context().len() < store_before,
+            "active context should shrink after compaction"
+        );
+        // ...but the store keeps every original.
+        assert_eq!(
+            engine.store_len(),
+            store_before,
+            "store must never be cleared"
+        );
+        for &id in &source_ids {
+            let got = engine.expand(&[id]);
+            assert_eq!(got.len(), 1, "original id {id} must still resolve");
+            let content = got[0].1.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            assert!(
+                content.contains("MARKER"),
+                "expand({id}) returned corrupted/shifted content: {content}"
+            );
+        }
+
+        // A new persisted message on the next turn keeps its own db id; the
+        // store is never renumbered.
+        let next_id = store_before + 1; // ids 1..=17 used above
+        let new_id = engine.ingest(msg(next_id, "user", "next turn"));
+        assert_eq!(new_id, Some(next_id));
+        assert_eq!(engine.store_len(), store_before + 1);
+        assert_eq!(engine.expand(&[next_id])[0].1["content"], "next turn");
+    }
+
+    /// CRIT-2 seam: a persisted `role:"summary"` row must never occupy a
+    /// store slot on restart. Under db-id keying its rowid is simply absent
+    /// from the store, and every other id resolves to exactly its own row.
+    #[test]
+    fn test_rebuild_skips_summary_rows_preserving_ids() {
+        let raw_messages = vec![
+            msg(1, "system", "System prompt."),
+            msg(2, "user", "FIRST question"),
+            msg(3, "assistant", "FIRST answer"),
+            // Poison row: a legacy summary persisted into messages (rowid 4).
+            json!({"role": "summary", "text": "a summary", "source_ids": [2, 3], "level": 1, "_db_id": 4}),
+            msg(5, "user", "SECOND question"),
+            msg(6, "assistant", "SECOND answer"),
+        ];
+        let db_nodes = vec![(
+            0usize,
+            vec![2usize, 3],
+            vec![],
+            "a summary".to_string(),
+            10usize,
+            1u8,
+            "db_id".to_string(),
+        )];
+
+        let engine = LcmEngine::rebuild_from_db_nodes(&raw_messages, &db_nodes, LcmConfig::default());
+
+        assert_eq!(
+            engine.store_len(),
+            5,
+            "the summary row must be skipped, not stored"
+        );
+        assert!(
+            engine.expand(&[4]).is_empty(),
+            "the summary row's own id must not resolve to anything"
+        );
+        let first = engine.expand(&[2, 3]);
+        assert_eq!(first[0].1["content"], "FIRST question");
+        assert_eq!(first[1].1["content"], "FIRST answer");
+        let after = engine.expand(&[5]);
+        assert_eq!(
+            after[0].1["content"], "SECOND question",
+            "ids must resolve to their own rows, never shifted"
+        );
+    }
+
+    #[test]
+    fn test_parse_message_ids_lenient() {
+        // Integer array — the canonical shape.
+        assert_eq!(parse_message_ids(&json!([5, 6, 7, 8])), vec![5, 6, 7, 8]);
+        // Comma string, with spaces.
+        assert_eq!(parse_message_ids(&json!("5, 6, 7, 8")), vec![5, 6, 7, 8]);
+        // Bracketed string (model echoed the block literally).
+        assert_eq!(parse_message_ids(&json!("[5,6,7,8]")), vec![5, 6, 7, 8]);
+        // Inclusive range.
+        assert_eq!(parse_message_ids(&json!("5-8")), vec![5, 6, 7, 8]);
+        // Mixed singles and a range.
+        assert_eq!(parse_message_ids(&json!("1, 5-7")), vec![1, 5, 6, 7]);
+        // Numbers embedded in prose.
+        assert_eq!(parse_message_ids(&json!("messages 5 and 6")), vec![5, 6]);
+        // Bare number.
+        assert_eq!(parse_message_ids(&json!(5)), vec![5]);
+        // Array of strings.
+        assert_eq!(parse_message_ids(&json!(["5", "6"])), vec![5, 6]);
+        // Nothing parseable.
+        assert!(parse_message_ids(&json!("none")).is_empty());
+        // Runaway range is rejected, not expanded to millions.
+        assert!(parse_message_ids(&json!("0-999999")).is_empty());
     }
 
     // -----------------------------------------------------------------------

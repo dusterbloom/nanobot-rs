@@ -1056,7 +1056,8 @@ async fn test_real_lcm_e2e_compact_and_expand() {
     );
 
     // Invariant 6: lossless expand — all store IDs are retrievable.
-    let all_ids: Vec<usize> = (0..engine.store_len()).collect();
+    // IDs are db rowids (sparse), not positions — enumerate via store_ids().
+    let all_ids: Vec<usize> = engine.store_ids();
     let expanded = engine.expand(&all_ids);
     assert_eq!(
         expanded.len(),

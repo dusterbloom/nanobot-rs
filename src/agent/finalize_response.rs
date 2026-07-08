@@ -222,6 +222,10 @@ impl AgentLoopShared {
             vec![]
         };
         if !new_messages.is_empty() {
+            // Deliberately no `_db_id` tagging here: ctx is dropped right
+            // after finalize, so tagging the rowids back would be dead work.
+            // The LCM engine skips messages without `_db_id`; next turn's
+            // get_history reload supplies the rowids and ingests them then.
             ctx.core
                 .sessions
                 .add_messages(&ctx.session_id, &new_messages)

@@ -184,7 +184,7 @@ mod tests {
         // Seed the DB with a known message.
         let db = SessionDb::new(&tmp.path().join("sessions.db"));
         let session = db.create_session("cli:default").await;
-        db.add_message(
+        let _ = db.add_message(
             &session.id,
             &json!({"role": "user", "content": "How do I configure Rustfmt?"}),
         )
@@ -208,12 +208,12 @@ mod tests {
         // Insert into two different channels.
         let cli = db.create_session("cli:default").await;
         let tg = db.create_session("telegram:42").await;
-        db.add_message(
+        let _ = db.add_message(
             &cli.id,
             &json!({"role": "user", "content": "CLI benchmark result"}),
         )
         .await;
-        db.add_message(
+        let _ = db.add_message(
             &tg.id,
             &json!({"role": "user", "content": "Telegram benchmark result"}),
         )
@@ -243,7 +243,7 @@ mod tests {
 
         // Insert 5 matching messages.
         for i in 0..5 {
-            db.add_message(
+            let _ = db.add_message(
                 &session.id,
                 &json!({"role": "user", "content": format!("Tokio async message {}", i)}),
             )

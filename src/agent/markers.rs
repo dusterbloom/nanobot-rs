@@ -20,3 +20,8 @@ pub fn scaffold_user(content: impl Into<String>) -> serde_json::Value {
         "_cache_replay": true,
     })
 }
+
+/// True if a message is a synthetic scaffold (injected nudge, not real input).
+pub fn is_synthetic(msg: &serde_json::Value) -> bool {
+    msg.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false)
+}

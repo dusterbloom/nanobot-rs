@@ -193,6 +193,12 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
             if let Some(turn) = m.get("_turn") {
                 msg["_turn"] = turn.clone();
             }
+            // Preserve _db_id (stable SQLite rowid — the LCM engine's
+            // MessageId). Internal-only, like _turn: the protocol render
+            // drops it before the wire call.
+            if let Some(db_id) = m.get("_db_id") {
+                msg["_db_id"] = db_id.clone();
+            }
             msg
         })
         .collect();
@@ -240,7 +246,19 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     let dropped_turns = if min_drop == 0 {
         0
     } else {
-        ((min_drop + batch - 1) / batch * batch).min(turn_starts.len())
+        let quantized = ((min_drop + batch - 1) / batch * batch).min(turn_starts.len());
+        if quantized == turn_starts.len() && min_drop < turn_starts.len() {
+            // Quantizing up would wipe ALL history even though the newest
+            // turn(s) fit the budget — a max_turns-derived batch (e.g. 30) in a
+            // token window holding only ~4 fat turns rounds every 1-turn drop
+            // up to "drop everything". Quantization is a cache nicety, never a
+            // license to drop more than the ceiling demands: fall back to the
+            // exact minimum. (The boundary slides per reload in this regime,
+            // but this is precisely where LCM compaction takes over anyway.)
+            min_drop
+        } else {
+            quantized
+        }
     };
     let keep_from = turn_starts
         .get(dropped_turns)
@@ -341,6 +359,42 @@ mod tests {
     fn test_empty_input_returns_empty() {
         let result = filter_history(&[], 100, 0);
         assert!(result.is_empty());
+    }
+
+    /// Stage-6 batch scale regression: with fat turns (~1000 tokens each) and a
+    /// token ceiling that only fits one, the drop quantizer must keep the
+    /// newest turn — the old `max_turns/2` batch (30) ceil-quantized a 4-turn
+    /// drop up to 30, `.min(len)` clamped it to "all", and the entire history
+    /// was silently wiped on every reload.
+    #[test]
+    fn test_token_budget_trim_keeps_newest_turn_with_fat_turns() {
+        let fat = "x".repeat(4000); // ~1000 tokens
+        let mut messages = Vec::new();
+        for i in 0..5 {
+            messages.push(user(&format!("TURN_{i} question")));
+            messages.push(assistant(&fat));
+        }
+        // max_messages=14 → token ceiling 14*150 = 2100; max_turns=60 → the
+        // old batch would be 30.
+        let result = filter_history(&messages, 14, 60);
+
+        assert!(
+            !result.is_empty(),
+            "history must never be wiped entirely by the token-budget trim"
+        );
+        let kept_tokens: usize = result.iter().map(estimate_msg_tokens).sum();
+        assert!(
+            kept_tokens <= 14 * 150,
+            "kept suffix must respect the ceiling, got {kept_tokens}"
+        );
+        assert!(
+            result.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("TURN_4"))
+            }),
+            "the newest turn must survive the trim"
+        );
     }
 
     #[test]

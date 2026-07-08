@@ -427,6 +427,38 @@ impl TokenBudget {
             return msgs;
         }
 
+        // Pin LCM summary blocks (`_lcm_summary`) before trimming. Summaries
+        // are already-compressed history sitting at the head — exactly where
+        // every stage below cuts first. Dropping one costs the most context
+        // per token saved, orphans its lcm_expand pointers, and can leave the
+        // wire opening on an assistant turn (chat templates 500 on that).
+        // Pins rejoin the output right after the leading system message.
+        let is_pin = |m: &Value| {
+            m.get("_lcm_summary")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+        if msgs.iter().any(is_pin) {
+            let (pinned, rest): (Vec<Value>, Vec<Value>) = msgs.into_iter().partition(is_pin);
+            let pinned_tokens = Self::estimate_tokens(&pinned);
+            let sub = TokenBudget::new(
+                self.max_context.saturating_sub(pinned_tokens),
+                self.reserve_response,
+            );
+            let mut trimmed =
+                sub.trim_to_fit_with_age(&rest, tool_def_tokens, current_turn, max_age_turns);
+            let insert_at = usize::from(
+                trimmed
+                    .first()
+                    .map(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+                    .unwrap_or(false),
+            );
+            for (i, p) in pinned.into_iter().enumerate() {
+                trimmed.insert(insert_at + i, p);
+            }
+            return trimmed;
+        }
+
         // Stage 1: Age-based eviction — drop messages older than max_age_turns.
         evict_by_age(&mut msgs, current_turn, max_age_turns);
 
@@ -538,6 +570,51 @@ mod tests {
             "name": "read_file",
             "content": content
         })
+    }
+
+    /// Trim must PIN `_lcm_summary` blocks: they are already-compressed
+    /// history at the head — exactly where trim cuts first. Dropping one
+    /// orphans its lcm_expand pointers and can leave the wire opening on an
+    /// assistant turn (chat templates 500 on that). Live repro: post-restart
+    /// LCM context lost its summary to trim and the model went amnesiac.
+    #[test]
+    fn test_trim_pins_lcm_summary_blocks() {
+        let budget = TokenBudget::new(2000, 500); // available ≈ 1500 tokens
+        let fat = "word ".repeat(1200); // ~1200+ tokens per assistant reply
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys prompt"}),
+            json!({
+                "role": "user",
+                "_lcm_summary": true,
+                "content": "[Summary of messages 1-9 (IDs: 1,2,3). Use lcm_expand to retrieve originals.]\n\nEarlier discussion."
+            }),
+        ];
+        for i in 0..5 {
+            messages.push(json!({"role": "user", "content": format!("q{i}")}));
+            messages.push(json!({"role": "assistant", "content": fat.clone()}));
+        }
+        assert!(
+            TokenBudget::estimate_tokens(&messages) > 1500,
+            "test setup must be over budget or trim is a no-op"
+        );
+
+        let trimmed = budget.trim_to_fit_with_age(&messages, 0, 0, 0);
+
+        // The summary survived the trim...
+        let pins: Vec<usize> = trimmed
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.get("_lcm_summary").and_then(|v| v.as_bool()) == Some(true))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(pins, vec![1], "summary must survive, right after system");
+        assert_eq!(trimmed[0]["role"], "system");
+        // ...and the result still fits the budget.
+        assert!(
+            TokenBudget::estimate_tokens(&trimmed) <= 1500,
+            "pinned trim must still respect the budget, got {}",
+            TokenBudget::estimate_tokens(&trimmed)
+        );
     }
 
     #[test]

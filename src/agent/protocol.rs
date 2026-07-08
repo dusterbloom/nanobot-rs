@@ -19,11 +19,10 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use super::turn::{ToolCall, Turn};
-use crate::agent::model_capabilities::{lookup, ModelSizeClass};
+use crate::agent::model_capabilities::{lookup_default, ModelSizeClass};
 
 // Matches the outer `[I called: ...]` or `[Called: ...]` or `[called ...]` or
 // `[Calling tool: ...]` bracket. Captures the inner content.
@@ -222,7 +221,7 @@ impl LocalProtocol {
             return Self { replay_mode: mode };
         }
 
-        let caps = lookup(model, &HashMap::new());
+        let caps = lookup_default(model);
         if !caps.tool_calling || caps.size_class == ModelSizeClass::Small {
             Self::textual()
         } else {

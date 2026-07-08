@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS summary_nodes (
     text          TEXT NOT NULL,
     tokens        INTEGER NOT NULL,
     level         INTEGER NOT NULL,
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    id_kind       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_summary_nodes_session ON summary_nodes(session_id);
 
@@ -183,6 +184,11 @@ impl SessionDb {
         // Create schema.
         conn.execute_batch(SCHEMA)
             .unwrap_or_else(|e| panic!("Failed to initialise session DB schema: {}", e));
+
+        // Migration: summary_nodes.id_kind (added when LCM MessageId became
+        // the messages rowid). The error on already-migrated DBs (duplicate
+        // column) is expected and ignored.
+        let _ = conn.execute("ALTER TABLE summary_nodes ADD COLUMN id_kind TEXT", []);
 
         Self {
             conn: Mutex::new(conn),
@@ -369,9 +375,12 @@ impl SessionDb {
     /// Extracts `role`, `content`, `tool_calls`, `tool_call_id`, `name`,
     /// `_turn`, `_synthetic`, and `timestamp` from the value. All other
     /// fields are stored in the `metadata` column as JSON.
-    pub async fn add_message(&self, session_id: &str, msg: &Value) {
+    ///
+    /// Returns the inserted rowid (the message's stable `_db_id`), or `None`
+    /// if the insert failed.
+    pub async fn add_message(&self, session_id: &str, msg: &Value) -> Option<i64> {
         let conn = self.conn.lock().await;
-        insert_message_locked(&conn, session_id, msg);
+        insert_message_locked(&conn, session_id, msg)
     }
 
     /// Add a batch of raw JSON messages in a single transaction.
@@ -387,7 +396,7 @@ impl SessionDb {
         }
 
         for msg in msgs {
-            insert_message_locked(&conn, session_id, msg);
+            let _ = insert_message_locked(&conn, session_id, msg);
         }
 
         if let Err(e) = conn.execute_batch("COMMIT") {
@@ -406,7 +415,7 @@ impl SessionDb {
             "role": "clear",
             "timestamp": Utc::now().to_rfc3339(),
         });
-        self.add_message(session_id, &clear_marker).await;
+        let _ = self.add_message(session_id, &clear_marker).await;
     }
 
     /// Save or replace the latest TUI/workspace snapshot for a session key.
@@ -485,7 +494,7 @@ impl SessionDb {
     pub async fn get_all_messages(&self, session_id: &str) -> Vec<Value> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
-            "SELECT role, content, tool_calls, tool_call_id, tool_name, \
+            "SELECT id, role, content, tool_calls, tool_call_id, tool_name, \
                     turn_tag, synthetic, timestamp, metadata \
              FROM messages WHERE session_id = ?1 ORDER BY id ASC",
         ) {
@@ -497,16 +506,18 @@ impl SessionDb {
         };
 
         let rows = stmt.query_map(params![session_id], |row| {
-            let role: String = row.get(0)?;
-            let content: Option<String> = row.get(1)?;
-            let tool_calls_json: Option<String> = row.get(2)?;
-            let tool_call_id: Option<String> = row.get(3)?;
-            let tool_name: Option<String> = row.get(4)?;
-            let turn_tag: Option<i64> = row.get(5)?;
-            let synthetic: i64 = row.get(6)?;
-            let timestamp: String = row.get(7)?;
-            let metadata_json: String = row.get(8)?;
+            let id: i64 = row.get(0)?;
+            let role: String = row.get(1)?;
+            let content: Option<String> = row.get(2)?;
+            let tool_calls_json: Option<String> = row.get(3)?;
+            let tool_call_id: Option<String> = row.get(4)?;
+            let tool_name: Option<String> = row.get(5)?;
+            let turn_tag: Option<i64> = row.get(6)?;
+            let synthetic: i64 = row.get(7)?;
+            let timestamp: String = row.get(8)?;
+            let metadata_json: String = row.get(9)?;
             Ok((
+                id,
                 role,
                 content,
                 tool_calls_json,
@@ -530,6 +541,7 @@ impl SessionDb {
         rows.flatten()
             .map(
                 |(
+                    id,
                     role,
                     content,
                     tool_calls_json,
@@ -541,6 +553,7 @@ impl SessionDb {
                     metadata_json,
                 )| {
                     reconstruct_message(
+                        id,
                         role,
                         content,
                         tool_calls_json,
@@ -642,10 +655,13 @@ impl SessionDb {
         let source_json = serde_json::to_string(source_ids).unwrap_or_else(|_| "[]".to_string());
         let child_json = serde_json::to_string(child_ids).unwrap_or_else(|_| "[]".to_string());
         let now = Utc::now().to_rfc3339();
+        // id_kind = 'db_id': source_ids are messages rowids. Rows without this
+        // marker predate the rowid scheme (positional ids) and are skipped on
+        // rebuild — see `load_summary_nodes`.
         if let Err(e) = conn.execute(
             "INSERT OR REPLACE INTO summary_nodes \
-             (id, session_id, source_ids, child_ids, text, tokens, level, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'db_id')",
             params![
                 node_id as i64,
                 session_id,
@@ -666,14 +682,19 @@ impl SessionDb {
 
     /// Load all summary nodes for a session, ordered by ID.
     ///
-    /// Returns a vec of (node_id, source_ids, child_ids, text, tokens, level).
+    /// Returns a vec of (node_id, source_ids, child_ids, text, tokens, level,
+    /// id_kind). `id_kind` is `"db_id"` for nodes whose source_ids are stable
+    /// messages rowids; anything else (NULL rows predate the rowid scheme and
+    /// load as `"legacy"`) carries POSITIONAL source_ids that must NOT be
+    /// resolved against rowids — `rebuild_from_db_nodes` skips such nodes with
+    /// a warning instead of misresolving them.
     pub async fn load_summary_nodes(
         &self,
         session_id: &str,
-    ) -> Vec<(usize, Vec<usize>, Vec<usize>, String, usize, u8)> {
+    ) -> Vec<(usize, Vec<usize>, Vec<usize>, String, usize, u8, String)> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
-            "SELECT id, source_ids, child_ids, text, tokens, level \
+            "SELECT id, source_ids, child_ids, text, tokens, level, id_kind \
              FROM summary_nodes WHERE session_id = ?1 ORDER BY id ASC",
         ) {
             Ok(s) => s,
@@ -690,13 +711,14 @@ impl SessionDb {
             let text: String = row.get(3)?;
             let tokens: i64 = row.get(4)?;
             let level: i64 = row.get(5)?;
-            Ok((id, source_str, child_str, text, tokens, level))
+            let id_kind: Option<String> = row.get(6)?;
+            Ok((id, source_str, child_str, text, tokens, level, id_kind))
         });
 
         match rows {
             Ok(r) => r
                 .flatten()
-                .map(|(id, source_str, child_str, text, tokens, level)| {
+                .map(|(id, source_str, child_str, text, tokens, level, id_kind)| {
                     let source_ids: Vec<usize> =
                         serde_json::from_str(&source_str).unwrap_or_default();
                     let child_ids: Vec<usize> =
@@ -708,6 +730,7 @@ impl SessionDb {
                         text,
                         tokens as usize,
                         level as u8,
+                        id_kind.unwrap_or_else(|| "legacy".to_string()),
                     )
                 })
                 .collect(),
@@ -831,7 +854,9 @@ fn parse_json_vec(json: String) -> Vec<String> {
 ///
 /// Called from both `add_message()` (which locks externally) and the batch
 /// path in `add_messages()` (which holds the lock for the whole batch).
-fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) {
+///
+/// Returns the inserted rowid, or `None` on failure.
+fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) -> Option<i64> {
     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
 
     let content = msg.get("content").and_then(|v| v.as_str());
@@ -864,6 +889,8 @@ fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) {
         .unwrap_or_else(|| Utc::now().to_rfc3339());
 
     // Collect any remaining fields into `metadata` so nothing is lost.
+    // `_db_id` is excluded: it is the rowid assigned by THIS insert — a stale
+    // copy from a reloaded message must never be persisted as metadata.
     let reserved = [
         "role",
         "content",
@@ -872,6 +899,7 @@ fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) {
         "name",
         "_turn",
         "_synthetic",
+        "_db_id",
         "timestamp",
     ];
     let metadata: serde_json::Map<String, Value> = msg
@@ -907,8 +935,9 @@ fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) {
             "Failed to insert message into session {}: {}",
             session_id, e
         );
-        return;
+        return None;
     }
+    let row_id = conn.last_insert_rowid();
 
     // Update the session's `updated_at` and increment `message_count`.
     let now_str = Utc::now().to_rfc3339();
@@ -921,12 +950,14 @@ fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) {
             session_id, e
         );
     }
+    Some(row_id)
 }
 
 /// Reconstruct a `serde_json::Value` from the columns stored in the `messages`
 /// table. This is the inverse of the field extraction done in
 /// `insert_message_locked()`.
 fn reconstruct_message(
+    id: i64,
     role: String,
     content: Option<String>,
     tool_calls_json: Option<String>,
@@ -937,10 +968,14 @@ fn reconstruct_message(
     timestamp: String,
     metadata_json: String,
 ) -> Value {
+    // `_db_id` is the stable rowid — the LCM engine's MessageId. It is an
+    // internal-only field: filter_history preserves it, the protocol render
+    // drops it before the wire call.
     let mut msg = json!({
         "role": role,
         "content": content.unwrap_or_default(),
         "timestamp": timestamp,
+        "_db_id": id,
     });
 
     if let Some(tc_str) = tool_calls_json {
@@ -1105,9 +1140,9 @@ mod tests {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:test").await;
 
-        db.add_message(&meta.id, &json!({"role": "user", "content": "hello"}))
+        let _ = db.add_message(&meta.id, &json!({"role": "user", "content": "hello"}))
             .await;
-        db.add_message(
+        let _ = db.add_message(
             &meta.id,
             &json!({"role": "assistant", "content": "hi there"}),
         )
@@ -1189,7 +1224,7 @@ mod tests {
         let (db, _dir) = make_db();
         let meta = db.create_session("test:turn_tag").await;
 
-        db.add_message(
+        let _ = db.add_message(
             &meta.id,
             &json!({"role": "user", "content": "hello", "_turn": 7}),
         )
@@ -1204,7 +1239,7 @@ mod tests {
         let (db, _dir) = make_db();
         let meta = db.create_session("test:synthetic").await;
 
-        db.add_message(
+        let _ = db.add_message(
             &meta.id,
             &json!({"role": "user", "content": "injected", "_synthetic": true}),
         )
@@ -1318,7 +1353,7 @@ mod tests {
         let second = db.create_session("cli:default").await;
 
         // Add a message to the second session to bump its updated_at.
-        db.add_message(&second.id, &json!({"role": "user", "content": "bump"}))
+        let _ = db.add_message(&second.id, &json!({"role": "user", "content": "bump"}))
             .await;
 
         let latest = db
@@ -1345,7 +1380,7 @@ mod tests {
         let (db, _dir) = make_db();
 
         let original = db.create_session("cli:default").await;
-        db.add_message(
+        let _ = db.add_message(
             &original.id,
             &json!({"role": "user", "content": "message from yesterday"}),
         )
@@ -1373,9 +1408,9 @@ mod tests {
         let meta = db.create_session("cli:count").await;
         assert_eq!(meta.message_count, 0);
 
-        db.add_message(&meta.id, &json!({"role": "user", "content": "one"}))
+        let _ = db.add_message(&meta.id, &json!({"role": "user", "content": "one"}))
             .await;
-        db.add_message(&meta.id, &json!({"role": "assistant", "content": "two"}))
+        let _ = db.add_message(&meta.id, &json!({"role": "assistant", "content": "two"}))
             .await;
 
         let loaded = db.get_session(&meta.id).await.expect("session exists");
@@ -1403,7 +1438,7 @@ mod tests {
     async fn test_fts_search_no_match() {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:fts2").await;
-        db.add_message(&meta.id, &json!({"role": "user", "content": "Hello world"}))
+        let _ = db.add_message(&meta.id, &json!({"role": "user", "content": "Hello world"}))
             .await;
         let results = db.search_messages("xyznonexistent", 10, None).await;
         assert!(results.is_empty());
@@ -1414,12 +1449,12 @@ mod tests {
         let (db, _dir) = make_db();
         let cli = db.create_session("cli:default").await;
         let tg = db.create_session("telegram:42").await;
-        db.add_message(
+        let _ = db.add_message(
             &cli.id,
             &json!({"role": "user", "content": "CLI Rust question"}),
         )
         .await;
-        db.add_message(
+        let _ = db.add_message(
             &tg.id,
             &json!({"role": "user", "content": "Telegram Rust question"}),
         )
@@ -1433,7 +1468,7 @@ mod tests {
     async fn test_fts_rebuild() {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:rebuild").await;
-        db.add_message(
+        let _ = db.add_message(
             &meta.id,
             &json!({"role": "user", "content": "Rebuild test message"}),
         )
@@ -1571,20 +1606,37 @@ mod tests {
         let nodes = db.load_summary_nodes(&meta.id).await;
         assert_eq!(nodes.len(), 2);
 
-        let (id0, src0, child0, text0, tokens0, level0) = &nodes[0];
+        let (id0, src0, child0, text0, tokens0, level0, kind0) = &nodes[0];
         assert_eq!(*id0, 0);
         assert_eq!(*src0, vec![1, 2, 3, 4]);
         assert!(child0.is_empty());
         assert_eq!(text0, "Summary of greeting exchange.");
         assert_eq!(*tokens0, 15);
         assert_eq!(*level0, 1);
+        assert_eq!(kind0, "db_id", "save_summary_node must tag id_kind");
 
-        let (id1, src1, _child1, text1, tokens1, level1) = &nodes[1];
+        let (id1, src1, _child1, text1, tokens1, level1, _kind1) = &nodes[1];
         assert_eq!(*id1, 1);
         assert_eq!(*src1, vec![5, 6, 7]);
         assert_eq!(text1, "Summary of technical discussion.");
         assert_eq!(*tokens1, 12);
         assert_eq!(*level1, 2);
+
+        // A pre-migration row (no id_kind) must load as "legacy" — never as
+        // db-id-addressable.
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO summary_nodes \
+                 (id, session_id, source_ids, child_ids, text, tokens, level, created_at) \
+                 VALUES (99, ?1, '[0,1]', '[]', 'old positional node', 4, 1, '2025-01-01T00:00:00Z')",
+                rusqlite::params![meta.id],
+            )
+            .unwrap();
+        }
+        let nodes = db.load_summary_nodes(&meta.id).await;
+        let legacy = nodes.iter().find(|n| n.0 == 99).unwrap();
+        assert_eq!(legacy.6, "legacy");
     }
 
     // -----------------------------------------------------------------------
@@ -1650,7 +1702,7 @@ mod tests {
         .await;
 
         let current = db.create_session("cli:oneshot-current").await;
-        db.add_message(&current.id, &json!({"role": "user", "content": "hello"}))
+        let _ = db.add_message(&current.id, &json!({"role": "user", "content": "hello"}))
             .await;
 
         let tails = db.latest_session_tails(&current.id, 3).await;

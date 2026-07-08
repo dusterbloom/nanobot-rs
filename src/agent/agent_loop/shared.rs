@@ -202,11 +202,6 @@ pub(crate) struct TurnContext {
     // --- Budget/compaction ---
     pub(crate) compaction: CompactionHandle,
     pub(crate) content_gate: crate::agent::context_gate::ContentGate,
-    /// Bug 5 fix: after a compaction swap, ctx.messages shrinks but the LCM
-    /// engine's store_len still reflects the pre-compaction count. This field
-    /// overrides the skip offset used in step_pre_call's ingestion loop so
-    /// that messages are re-ingested from the correct position after a swap.
-    pub(crate) lcm_synced_to: Option<usize>,
 
     // --- Observability ---
     pub(crate) counters: Arc<RuntimeCounters>,
@@ -472,10 +467,17 @@ impl AgentLoopShared {
         // finalize_response does not double-persist it.
         if ctx.new_start < ctx.messages.len() {
             let user_msg = ctx.messages[ctx.new_start].clone();
-            ctx.core
+            let row_id = ctx
+                .core
                 .sessions
                 .add_message(&ctx.session_id, &user_msg)
                 .await;
+            // Tag the in-memory message with its rowid so the LCM engine can
+            // ingest this user message in the same turn (ingest skips
+            // messages without a `_db_id`).
+            if let Some(row_id) = row_id {
+                ctx.messages[ctx.new_start]["_db_id"] = json!(row_id);
+            }
             ctx.new_start += 1;
         }
 
@@ -1302,10 +1304,9 @@ impl AgentLoopShared {
         // perspective of persistence (the session file was rebuilt).
         ctx.new_start = ctx.messages.len();
         ctx.flow.iterations_since_compaction = 0;
-        // Bug 5 fix: after compaction ctx.messages shrinks but the LCM engine's
-        // store_len reflects the old count. Override the skip offset so
-        // step_pre_call ingests from index 0 instead of skipping past the end.
-        ctx.lcm_synced_to = Some(0);
+        // No ingest bookkeeping needed after the swap: the engine's store is
+        // keyed by `_db_id` and ingest is an idempotent upsert, so re-offering
+        // already-stored messages is a no-op.
         true
     }
 
@@ -1339,21 +1340,24 @@ impl AgentLoopShared {
                 engines.get(&ctx.session_key).cloned().unwrap()
             };
 
-            // Feed messages into the LCM engine's store.
+            // Feed messages into the LCM engine's append-only store.
+            //
+            // Ingest is an idempotent upsert keyed by `_db_id` (the SQLite
+            // rowid): messages already in the store are skipped, and messages
+            // not yet persisted this turn carry no `_db_id` and are skipped
+            // too — they are always inside the protect window and get
+            // ingested next turn, once get_history supplies their rowid.
+            // Synthetic scaffolds and summary placeholders are not originals
+            // and never enter the store.
             {
                 let mut engine = lcm_engine.lock().await;
-                if ctx.lcm_synced_to == Some(0) {
-                    // Post-compaction: ctx.messages was rebuilt from the engine's
-                    // active_context(). Re-ingesting via ingest() would APPEND
-                    // duplicates. Reset the engine from the compacted messages.
-                    engine.reset_from_messages(&ctx.messages);
-                    ctx.lcm_synced_to = None;
-                } else {
-                    // Normal path: append only new messages (idempotent by index).
-                    let store_len = engine.store_len();
-                    for msg in ctx.messages.iter().skip(store_len) {
-                        engine.ingest(msg.clone());
+                for msg in &ctx.messages {
+                    if crate::agent::markers::is_synthetic(msg)
+                        || msg.get("role").and_then(|r| r.as_str()) == Some("summary")
+                    {
+                        continue;
                     }
+                    let _ = engine.ingest(msg.clone());
                 }
             }
 
@@ -1388,6 +1392,7 @@ impl AgentLoopShared {
                     let soft = (available as f64 * engine.tau_soft()) as usize;
                     (action, conv, available, hard, soft)
                 };
+
 
                 match action {
                     CompactionAction::Async | CompactionAction::Blocking => {
@@ -1451,19 +1456,15 @@ impl AgentLoopShared {
                                             }
                                         });
 
-                                    // Persist Turn::Summary to session JSONL for lossless restart.
+                                    // Persist the summary for lossless restart.
+                                    //
+                                    // Summaries live ONLY in the summary_nodes table
+                                    // (below), never in the messages table. Writing a
+                                    // `role: "summary"` row into messages would give it
+                                    // a positional index in get_all_messages() and shift
+                                    // every later message's MessageId, invalidating the
+                                    // DAG's persisted source_ids on restart (CRIT-2).
                                     if let Some(ref turn) = summary_turn {
-                                        if let Some(summary_json) = turn.summary_to_json() {
-                                            debug!(
-                                                session = %bg_session_key,
-                                                "LCM: persisting summary turn to session"
-                                            );
-                                            bg_core
-                                                .sessions
-                                                .add_message(&bg_session_id, &summary_json)
-                                                .await;
-                                        }
-
                                         // Persist summary node to SQLite for DAG restoration.
                                         if let crate::agent::turn::Turn::Summary {
                                             text: ref s_text,
@@ -1528,31 +1529,22 @@ impl AgentLoopShared {
                 }
             }
 
-            // Auto-expand relevant summaries before the LLM call.
-            // This is the key innovation: the system decides when to expand,
-            // not the model. Uses keyword overlap (no LLM needed).
+            // Auto-expand relevant summaries before the LLM call. The system,
+            // not the model, decides when to surface older detail. Expansions are
+            // APPENDED to the tail (after any frozen cache prefix), so this runs
+            // even on warm sessions without invalidating the prompt cache.
             {
-                let frozen_prefix = ctx
-                    .counters
-                    .prompt_cache_watermark
-                    .lock()
-                    .get(&ctx.session_key)
-                    .copied()
-                    .unwrap_or(0);
                 let mut engine = lcm_engine.lock().await;
-                if !engine.dag().is_empty() && frozen_prefix == 0 {
-                    let expanded = engine.auto_expand(&ctx.core.token_budget, tool_def_tokens);
-                    if expanded {
-                        // Replace ctx.messages with the auto-expanded context.
-                        ctx.messages = engine.active_context();
-                        debug!("LCM auto_expand: replaced context with expanded messages");
+                if !engine.dag().is_empty() {
+                    let appended = engine.auto_expand(&ctx.core.token_budget, tool_def_tokens);
+                    if !appended.is_empty() {
+                        debug!(
+                            session = %ctx.session_key,
+                            count = appended.len(),
+                            "LCM auto_expand: appended expanded originals to tail"
+                        );
+                        ctx.messages.extend(appended);
                     }
-                } else if !engine.dag().is_empty() {
-                    debug!(
-                        session = %ctx.session_key,
-                        frozen_prefix,
-                        "LCM auto_expand skipped: prompt cache warm"
-                    );
                 }
             }
         } else {

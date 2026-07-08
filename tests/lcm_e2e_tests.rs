@@ -8,12 +8,22 @@
 use async_trait::async_trait;
 use nanobot::agent::compaction::ContextCompactor;
 use nanobot::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
-use nanobot::agent::protocol::LocalProtocol;
 use nanobot::agent::token_budget::TokenBudget;
 use nanobot::agent::turn::Turn;
 use nanobot::providers::base::{LLMProvider, LLMResponse};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// Test message tagged with an explicit `_db_id`, mirroring what
+/// get_history supplies for persisted messages.
+fn msg(id: usize, role: &str, content: &str) -> Value {
+    json!({"role": role, "content": content, "_db_id": id})
+}
+
+/// Ingest a `_db_id`-tagged message, asserting it was accepted.
+fn ingest(engine: &mut LcmEngine, id: usize, role: &str, content: &str) {
+    assert_eq!(engine.ingest(msg(id, role, content)), Some(id));
+}
 
 // ─────────────────────────────────────────────────────────────
 // Mock LLM for testing
@@ -61,9 +71,9 @@ fn test_clear_resets_lcm_engine() {
 
     let mut engine = LcmEngine::new(config.clone());
 
-    engine.ingest(json!({"role": "system", "content": "System"}));
-    engine.ingest(json!({"role": "user", "content": "First message"}));
-    engine.ingest(json!({"role": "assistant", "content": "First response"}));
+    ingest(&mut engine, 1, "system", "System");
+    ingest(&mut engine, 2, "user", "First message");
+    ingest(&mut engine, 3, "assistant", "First response");
 
     assert_eq!(engine.store_len(), 3);
     assert_eq!(engine.active_len(), 3);
@@ -75,84 +85,6 @@ fn test_clear_resets_lcm_engine() {
     assert!(fresh_engine.dag_ref().is_empty());
 }
 
-#[test]
-fn test_rebuild_from_turns_after_clear_is_empty() {
-    let config = LcmConfig::default();
-    let protocol = LocalProtocol::default();
-
-    let turns: Vec<Turn> = vec![];
-    let engine = LcmEngine::rebuild_from_turns(&turns, config, &protocol, "");
-
-    assert_eq!(engine.store_len(), 0);
-    assert_eq!(engine.active_len(), 0);
-    assert!(engine.dag_ref().is_empty());
-}
-
-#[test]
-fn test_rebuild_respects_clear_marker() {
-    let config = LcmConfig::default();
-    let protocol = LocalProtocol::default();
-
-    // Turns BEFORE clear marker
-    let turns_before_clear = vec![
-        Turn::User {
-            content: "Old question 1".into(),
-            media: vec![],
-        },
-        Turn::Assistant {
-            text: Some("Old answer 1".into()),
-            tool_calls: vec![],
-        },
-        Turn::User {
-            content: "Old question 2".into(),
-            media: vec![],
-        },
-        Turn::Assistant {
-            text: Some("Old answer 2".into()),
-            tool_calls: vec![],
-        },
-        Turn::Summary {
-            text: "Summary of old conversation".into(),
-            source_ids: vec![0, 1, 2, 3],
-            level: 1,
-        },
-    ];
-
-    // Turns AFTER clear marker (what should be processed)
-    let turns_after_clear = vec![
-        Turn::Clear,
-        Turn::User {
-            content: "New question".into(),
-            media: vec![],
-        },
-        Turn::Assistant {
-            text: Some("New answer".into()),
-            tool_calls: vec![],
-        },
-    ];
-
-    // Combine: old turns, clear marker, new turns
-    let all_turns: Vec<Turn> = [turns_before_clear, turns_after_clear].concat();
-
-    let engine = LcmEngine::rebuild_from_turns(&all_turns, config, &protocol, "");
-
-    // Should only have 2 messages (new question + new answer)
-    assert_eq!(
-        engine.store_len(),
-        2,
-        "Should only have messages after clear marker"
-    );
-    assert_eq!(
-        engine.active_len(),
-        2,
-        "Active context should only have post-clear messages"
-    );
-    assert!(
-        engine.dag_ref().is_empty(),
-        "Old summaries should be discarded after clear"
-    );
-}
-
 // ─────────────────────────────────────────────────────────────
 // Test 2: Compaction window - should summarize AFTER last summary
 // ─────────────────────────────────────────────────────────────
@@ -161,10 +93,10 @@ fn test_rebuild_respects_clear_marker() {
 fn test_find_oldest_raw_block_returns_first_block() {
     let mut engine = LcmEngine::new(LcmConfig::default());
 
-    engine.ingest(json!({"role": "system", "content": "System"}));
+    ingest(&mut engine, 1, "system", "System");
     for i in 0..10 {
-        engine.ingest(json!({"role": "user", "content": format!("User {}", i)}));
-        engine.ingest(json!({"role": "assistant", "content": format!("Assistant {}", i)}));
+        ingest(&mut engine, 2 + 2 * i, "user", &format!("User {}", i));
+        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Assistant {}", i));
     }
 
     let block = engine.find_oldest_raw_block();
@@ -187,26 +119,30 @@ async fn test_compaction_creates_summary_node() {
         deterministic_target: 64,
     });
 
-    engine.ingest(json!({"role": "system", "content": "System"}));
+    ingest(&mut engine, 1, "system", "System");
     for i in 0..10 {
-        engine.ingest(json!({
-            "role": "user",
-            "content": format!(
+        ingest(
+            &mut engine,
+            2 + 2 * i,
+            "user",
+            &format!(
                 "Tell me about Rust ownership, borrowing, and lifetimes in detail. Turn {}. \
                  I need a comprehensive explanation with examples and edge cases.",
                 i
-            )
-        }));
-        engine.ingest(json!({
-            "role": "assistant",
-            "content": format!(
+            ),
+        );
+        ingest(
+            &mut engine,
+            3 + 2 * i,
+            "assistant",
+            &format!(
                 "Rust ownership is a memory safety feature. Each value has exactly one owner. \
                  When the owner goes out of scope, the value is dropped. Borrowing allows \
                  temporary references. Lifetimes annotate how long references are valid. \
                  This is turn {} of our conversation about memory management in Rust.",
                 i
-            )
-        }));
+            ),
+        );
     }
 
     let budget = TokenBudget::new(4096, 2048);
@@ -234,10 +170,10 @@ async fn test_second_compaction_summarizes_after_first_summary() {
         deterministic_target: 64,
     });
 
-    engine.ingest(json!({"role": "system", "content": "System"}));
+    ingest(&mut engine, 1, "system", "System");
     for i in 0..20 {
-        engine.ingest(json!({"role": "user", "content": format!("Message {}", i)}));
-        engine.ingest(json!({"role": "assistant", "content": format!("Response {}", i)}));
+        ingest(&mut engine, 2 + 2 * i, "user", &format!("Message {}", i));
+        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Response {}", i));
     }
 
     let budget = TokenBudget::new(4096, 2048);
@@ -352,6 +288,13 @@ fn test_filter_refusal_from_summary() {
         !contains_refusal_pattern(clean_summary),
         "Should NOT detect refusal in clean summary"
     );
+
+    // Legitimate summaries that merely discuss harm/ethics must not be flagged.
+    let topical = "User asked about harmful algae blooms and the ethical review process.";
+    assert!(
+        !contains_refusal_pattern(topical),
+        "Topic words about harm/ethics are not refusals"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -367,12 +310,12 @@ async fn test_lossless_retrieval_after_multiple_compactions() {
         deterministic_target: 64,
     });
 
-    engine.ingest(json!({"role": "system", "content": "System"}));
+    ingest(&mut engine, 1, "system", "System");
 
     let total_messages = 30;
     for i in 0..total_messages {
-        engine.ingest(json!({"role": "user", "content": format!("Original message {}", i)}));
-        engine.ingest(json!({"role": "assistant", "content": format!("Original response {}", i)}));
+        ingest(&mut engine, 2 + 2 * i, "user", &format!("Original message {}", i));
+        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Original response {}", i));
     }
 
     let store_size = engine.store_len();
@@ -431,8 +374,8 @@ fn test_check_thresholds_below_soft() {
         deterministic_target: 512,
     });
 
-    engine.ingest(json!({"role": "system", "content": "System"}));
-    engine.ingest(json!({"role": "user", "content": "Hello"}));
+    ingest(&mut engine, 1, "system", "System");
+    ingest(&mut engine, 2, "user", "Hello");
 
     let budget = TokenBudget::new(100_000, 8192);
     assert_eq!(
@@ -450,11 +393,9 @@ fn test_check_thresholds_above_soft() {
         deterministic_target: 512,
     });
 
-    engine.ingest(json!({"role": "system", "content": "System"}));
+    ingest(&mut engine, 1, "system", "System");
     for i in 0..20 {
-        engine.ingest(
-            json!({"role": "user", "content": format!("A long message with content {}", i)}),
-        );
+        ingest(&mut engine, 2 + i, "user", &format!("A long message with content {}", i));
     }
 
     let budget = TokenBudget::new(1024, 512);
@@ -466,51 +407,37 @@ fn test_check_thresholds_above_soft() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Test 6: Rebuild from persisted turns
+// Test 6: Rebuild from persisted DB nodes (restart path)
 // ─────────────────────────────────────────────────────────────
 
 #[test]
-fn test_rebuild_from_turns_preserves_summaries() {
-    let config = LcmConfig::default();
-    let protocol = LocalProtocol::default();
-
-    let turns = vec![
-        Turn::User {
-            content: "First question".into(),
-            media: vec![],
-        },
-        Turn::Assistant {
-            text: Some("First answer".into()),
-            tool_calls: vec![],
-        },
-        Turn::Summary {
-            text: "Summary of first exchange".into(),
-            source_ids: vec![0, 1],
-            level: 1,
-        },
-        Turn::User {
-            content: "Second question".into(),
-            media: vec![],
-        },
-        Turn::Assistant {
-            text: Some("Second answer".into()),
-            tool_calls: vec![],
-        },
+fn test_rebuild_from_db_nodes_preserves_summaries() {
+    // Raw history with stable db ids 1..=4; a node covers ids 1-2.
+    let raw_messages = vec![
+        msg(1, "user", "First question"),
+        msg(2, "assistant", "First answer"),
+        msg(3, "user", "Second question"),
+        msg(4, "assistant", "Second answer"),
     ];
+    let nodes = vec![(
+        0usize,
+        vec![1usize, 2],
+        vec![],
+        "Summary of first exchange".to_string(),
+        10usize,
+        1u8,
+        "db_id".to_string(),
+    )];
 
-    let engine = LcmEngine::rebuild_from_turns(&turns, config, &protocol, "");
+    let engine = LcmEngine::rebuild_from_db_nodes(&raw_messages, &nodes, LcmConfig::default());
 
     // Store should have all raw messages (not summaries)
-    assert_eq!(
-        engine.store_len(),
-        4,
-        "Store should have 4 raw messages (2 user + 2 assistant)"
-    );
+    assert_eq!(engine.store_len(), 4, "Store should have all 4 raw messages");
 
     // DAG should have the summary
     assert_eq!(engine.dag_ref().len(), 1, "DAG should have 1 summary node");
 
-    // Active context should have summary + recent raw messages
+    // Active context should have summary + the unsummarized raw messages
     let active = engine.active_entries();
     let summary_count = active
         .iter()
@@ -520,4 +447,9 @@ fn test_rebuild_from_turns_preserves_summaries() {
         summary_count, 1,
         "Active context should have 1 summary entry"
     );
+
+    // Lossless: the summarized originals resolve by their db ids.
+    let expanded = engine.expand(&[1, 2]);
+    assert_eq!(expanded.len(), 2);
+    assert_eq!(expanded[0].1["content"], "First question");
 }

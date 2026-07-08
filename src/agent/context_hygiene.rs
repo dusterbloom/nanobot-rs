@@ -327,6 +327,33 @@ fn get_tool_result_ids_set(message: &Value) -> HashSet<String> {
 mod tests {
     use super::*;
 
+    /// Live-shape repro: a plain alternating user/assistant history (with
+    /// `_db_id` tags as supplied by get_history) must pass hygiene intact —
+    /// bisecting a wire bug where 28 ctx messages reached the provider as 3.
+    #[test]
+    fn test_hygiene_preserves_plain_alternating_history() {
+        let mut messages = vec![json!({"role": "system", "content": "sys"})];
+        messages.push(json!({"role": "developer", "content": "protocol"}));
+        for i in 0..12 {
+            messages.push(json!({"role": "user", "content": format!("q{i}"), "_db_id": 2*i+1}));
+            messages.push(json!({"role": "assistant", "content": format!("a{i}"), "_db_id": 2*i+2}));
+        }
+        messages.push(json!({"role": "user", "content": "current question"}));
+        let before = messages.len(); // 27
+
+        hygiene_pipeline(&mut messages, 20);
+
+        assert_eq!(
+            messages.len(),
+            before,
+            "hygiene must not delete plain user/assistant turns; survivors: {:?}",
+            messages
+                .iter()
+                .map(|m| m.get("role").and_then(|r| r.as_str()).unwrap_or("?"))
+                .collect::<Vec<_>>()
+        );
+    }
+
     fn assistant_with_tool_call(id: &str) -> Value {
         json!({
             "role": "assistant",

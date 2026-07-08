@@ -23,6 +23,17 @@ use crate::agent::token_budget::TokenBudget;
 use crate::agent::tool_guard::ToolGuard;
 use crate::bus::events::InboundMessage;
 
+/// System-prompt guidance teaching the LCM expand workflow, with a worked call.
+/// Shared by the local and cloud advertisement paths so the wording (and the
+/// worked example small models copy) stays in one place.
+const LCM_EXPAND_GUIDE: &str =
+    "Your conversation history is managed by LCM. When earlier turns are \
+     compressed, you will see a block marked [Summary of messages X-Y (IDs: …)]. \
+     To read the exact originals, call lcm_expand with those IDs — for example \
+     lcm_expand({\"message_ids\": [5, 6, 7, 8]}). Expansion is lossless and safe: \
+     the full originals are always retrievable, so nothing is ever permanently \
+     lost by summarizing. The system may also auto-expand relevant summaries for you.";
+
 /// Query the memory ladder for the local prompt path, capped to the local
 /// working-memory budget (the same `(working_memory_budget * multiplier).min(200)`
 /// formula the always-on prefix path has always used).
@@ -186,46 +197,18 @@ impl AgentLoopShared {
         let mut blocks = Vec::new();
 
         // LCM context awareness for local models.
+        //
+        // Advertised unconditionally (not gated on has_summaries) so the block
+        // lives in the stable system-prompt prefix from turn 1. Adding it later,
+        // once a summary appears, would rewrite the prefix and bust the prompt
+        // cache — the exact failure the old cache_warm gate tried to avoid, at
+        // the cost of leaving small models staring at an unexplained [Summary…]
+        // block. A fixed ~50-token block in the cold prefix is the cheaper trade.
         if self.lcm_enabled.load(Ordering::Relaxed) {
-            let cache_warm = self
-                .core_handle
-                .counters
-                .prompt_cache_watermark
-                .lock()
-                .get(session_key)
-                .copied()
-                .unwrap_or(0)
-                > 0;
-            let already_advertised = self
-                .core_handle
-                .counters
-                .lcm_prompt_advertised
-                .lock()
-                .contains(session_key);
-            let has_summaries = {
-                let engines = self.lcm_engines.lock().await;
-                engines
-                    .get(session_key)
-                    .map(|e| e.try_lock().map_or(true, |eng| !eng.dag().is_empty()))
-                    .unwrap_or(false)
-            };
-            if has_summaries && (!cache_warm || already_advertised) {
-                self.core_handle
-                    .counters
-                    .lcm_prompt_advertised
-                    .lock()
-                    .insert(session_key.to_string());
-                blocks.push(crate::agent::context::PromptBlock::new(
-                    "Context Management",
-                    "Blocks marked [Summary of messages X-Y] are compressed earlier messages. \
-                     Call lcm_expand with message IDs to retrieve originals.",
-                ));
-            } else if has_summaries {
-                tracing::debug!(
-                    session = %session_key,
-                    "lcm_context_block_deferred_for_prompt_cache"
-                );
-            }
+            blocks.push(crate::agent::context::PromptBlock::new(
+                "Context Management",
+                LCM_EXPAND_GUIDE,
+            ));
         }
 
         // Only durable, cross-session memory ("Memory Briefing") goes in the
@@ -291,60 +274,18 @@ impl AgentLoopShared {
     ) -> Vec<SectionEntry> {
         let mut sections = Vec::new();
 
-        // LCM context awareness: tell the model about summarized context.
+        // LCM context awareness: advertised unconditionally so it stays in the
+        // stable cached prefix from turn 1 (see build_local_runtime_blocks).
         if self.lcm_enabled.load(Ordering::Relaxed) {
-            let cache_warm = self
-                .core_handle
-                .counters
-                .prompt_cache_watermark
-                .lock()
-                .get(session_key)
-                .copied()
-                .unwrap_or(0)
-                > 0;
-            let already_advertised = self
-                .core_handle
-                .counters
-                .lcm_prompt_advertised
-                .lock()
-                .contains(session_key);
-            let has_summaries = {
-                let engines = self.lcm_engines.lock().await;
-                engines
-                    .get(session_key)
-                    .map(|e| {
-                        // Try lock to avoid blocking; if locked, assume summaries exist.
-                        e.try_lock().map_or(true, |eng| !eng.dag().is_empty())
-                    })
-                    .unwrap_or(false)
-            };
-            if has_summaries && (!cache_warm || already_advertised) {
-                self.core_handle
-                    .counters
-                    .lcm_prompt_advertised
-                    .lock()
-                    .insert(session_key.to_string());
-                sections.push(SectionEntry {
-                    section: PromptSection::ToolUse,
-                    block: PromptBlock::new(
-                        "Context Management",
-                        "Your conversation history is managed by LCM. Blocks marked \
-                         [Summary of messages X-Y] are compressed versions of earlier messages. \
-                         If you need the full original text, call lcm_expand with the message \
-                         IDs shown. The system may auto-expand relevant summaries for you.",
-                    ),
-                    allocated_tokens: 0,
-                    actual_tokens: 0,
-                    source: SectionSource::Runtime("lcm-context".to_string()),
-                    included: true,
-                    shrinkable: false,
-                });
-            } else if has_summaries {
-                tracing::debug!(
-                    session = %session_key,
-                    "lcm_context_section_deferred_for_prompt_cache"
-                );
-            }
+            sections.push(SectionEntry {
+                section: PromptSection::ToolUse,
+                block: PromptBlock::new("Context Management", LCM_EXPAND_GUIDE),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Runtime("lcm-context".to_string()),
+                included: true,
+                shrinkable: false,
+            });
         }
 
         // 1. Memory layers via MemoryLadder (replaces direct working memory + bulletin cache).
@@ -507,6 +448,11 @@ impl AgentLoopShared {
         // Register lcm_expand tool when LCM is enabled.
         // Eagerly create the engine here (with DB-persisted DAG if available)
         // so the tool is available from the very first turn.
+        //
+        // The engine persists across turns (cached in self.lcm_engines) and
+        // its store is append-only, keyed by each message's stable `_db_id`
+        // (SQLite rowid). Ingest is an idempotent upsert, so no per-turn
+        // cursor is needed: re-offering already-stored messages is a no-op.
         if self.lcm_enabled.load(Ordering::Relaxed) {
             let lcm_engine = {
                 let mut engines = self.lcm_engines.lock().await;
@@ -531,29 +477,12 @@ impl AgentLoopShared {
                         );
                         LcmEngine::rebuild_from_db_nodes(&all_msgs, &db_nodes, config)
                     } else {
-                        // Check for legacy Turn::Summary entries in messages.
-                        let all_msgs = core.sessions.get_all_messages(&session_meta_tmp.id).await;
-                        let turns: Vec<crate::agent::turn::Turn> = all_msgs
-                            .iter()
-                            .filter_map(|v| crate::agent::turn::turn_from_legacy(v))
-                            .collect();
-                        let has_summaries = turns.iter().any(|t| t.is_summary());
-
-                        if has_summaries {
-                            tracing::debug!(
-                                session = %session_key,
-                                "LCM: rebuilding engine from legacy Turn::Summary entries"
-                            );
-                            LcmEngine::rebuild_from_turns(
-                                &turns,
-                                config,
-                                &crate::agent::protocol::CloudProtocol
-                                    as &dyn crate::agent::protocol::ConversationProtocol,
-                                "",
-                            )
-                        } else {
-                            LcmEngine::new(config)
-                        }
+                        // No persisted DAG. Legacy `role:"summary"` rows in the
+                        // messages table carry positional source_ids that
+                        // cannot be resolved against the db-id-keyed store, so
+                        // they are deliberately NOT loaded into the DAG (their
+                        // text remains in session history).
+                        LcmEngine::new(config)
                     };
 
                     engines.insert(
@@ -577,19 +506,59 @@ impl AgentLoopShared {
         let session_id = session_meta.id.clone();
 
         // Get session history. Track count so we know where new messages start.
+        // With LCM enabled the trim ceiling must stay above LCM's soft
+        // compaction threshold, or compaction never fires (see history_limit_lcm).
+        let max_messages = if self.lcm_enabled.load(Ordering::Relaxed) {
+            crate::agent::agent_core::history_limit_lcm(core.token_budget.max_context())
+        } else {
+            history_limit(core.token_budget.max_context())
+        };
         let history = core
             .sessions
-            .get_history(
-                &session_id,
-                history_limit(core.token_budget.max_context()),
-                core.max_history_turns,
-            )
+            .get_history(&session_id, max_messages, core.max_history_turns)
             .await;
-        // Track where new (unsaved) messages start. Updated after compaction
-        // swaps to avoid re-persisting already-saved messages. Mutable because
-        // the per-turn local tail block (inserted before the user message) bumps
-        // it so the ephemeral tail is never written to session history.
-        let mut new_start = 1 + history.len();
+        // LCM history adoption: when the engine holds a summary DAG, the
+        // engine's active context IS the conversation history — summary
+        // blocks + unsummarized raws. Feeding raw history to the prompt here
+        // would (a) hide every summary from the model after a restart (the
+        // in-process compaction swap is the only other path that surfaces
+        // them, and it dies with the process) and (b) overflow the token
+        // budget with the very messages compaction already condensed, so the
+        // trim would gut recent turns instead. Ingest first (idempotent by
+        // `_db_id`) so a live session's rows are in the store, then adopt.
+        let history = if self.lcm_enabled.load(Ordering::Relaxed) {
+            let engine_arc = self.lcm_engines.lock().await.get(&session_key).cloned();
+            match engine_arc {
+                Some(engine_arc) => {
+                    let mut engine = engine_arc.lock().await;
+                    for msg in &history {
+                        engine.ingest(msg.clone());
+                    }
+                    if engine.dag().is_empty() {
+                        history
+                    } else {
+                        engine
+                            .active_context()
+                            .into_iter()
+                            .filter(|m| {
+                                m.get("role").and_then(|r| r.as_str()) != Some("system")
+                            })
+                            .collect()
+                    }
+                }
+                None => history,
+            }
+        } else {
+            history
+        };
+
+        // `new_start` (where new/unsaved messages begin) is computed AFTER
+        // build_messages below — the assembled array may carry a variable
+        // prompt prefix (system only, or system + developer). The old
+        // `1 + history.len()` hardcoded a 1-slot prefix; with a developer
+        // message present every index was off by one: eager-persist wrote the
+        // previous assistant (duplicates), overshot, and the real user message
+        // was never persisted.
 
         // Extract media paths.
         let media_paths: Vec<String> = msg
@@ -632,6 +601,11 @@ impl AgentLoopShared {
             is_voice_message,
             detected_language.as_deref(),
         );
+        // The just-pushed user message is the last element; everything before
+        // it (any prompt prefix + history) is already persisted or ephemeral.
+        // Mutable because the per-turn local tail block (inserted before the
+        // user message) bumps it so the tail is never written to history.
+        let mut new_start = messages.len() - 1;
 
         // Append-only local prompt (default): keep per-turn-volatile runtime
         // blocks (Working Memory, Background Tasks, Tool Patterns, LCM hints)
@@ -794,7 +768,6 @@ impl AgentLoopShared {
                 in_flight: compaction_in_flight,
             },
             content_gate,
-            lcm_synced_to: None,
             counters: self.core_handle.counters.clone(),
             flow: FlowControl {
                 boundary: crate::agent::agent_loop::ResponseBoundary::Off,

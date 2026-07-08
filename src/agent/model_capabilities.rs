@@ -4,6 +4,17 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Config `modelCapabilities` overrides, set once at config load so that
+/// [`lookup_default`] call sites (provider, protocol, compaction, router…)
+/// honor them without threading the config through every layer.
+static GLOBAL_OVERRIDES: OnceLock<HashMap<String, ModelCapabilitiesOverride>> = OnceLock::new();
+
+/// Install config overrides process-wide. First call wins; later calls no-op.
+pub fn set_global_overrides(overrides: HashMap<String, ModelCapabilitiesOverride>) {
+    let _ = GLOBAL_OVERRIDES.set(overrides);
+}
 
 /// Broad size class for model-dependent tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,9 +107,16 @@ pub fn lookup(
     caps
 }
 
-/// Convenience: look up capabilities without user overrides.
+/// Convenience: look up capabilities using the process-wide config overrides
+/// (empty until [`set_global_overrides`] runs at config load).
 pub fn lookup_default(model: &str) -> ModelCapabilities {
-    lookup(model, &HashMap::new())
+    static EMPTY: OnceLock<HashMap<String, ModelCapabilitiesOverride>> = OnceLock::new();
+    lookup(
+        model,
+        GLOBAL_OVERRIDES
+            .get()
+            .unwrap_or_else(|| EMPTY.get_or_init(HashMap::new)),
+    )
 }
 
 /// Models whose local servers can split template reasoning into
