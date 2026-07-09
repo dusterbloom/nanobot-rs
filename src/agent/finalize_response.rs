@@ -9,7 +9,6 @@ use chrono::Utc;
 use serde_json::json;
 use tracing::{debug, instrument, warn};
 
-use crate::agent::agent_core::provenance_warning_role;
 use crate::agent::agent_loop::{AgentLoopShared, TurnContext};
 use crate::agent::token_budget::TokenBudget;
 use crate::bus::events::OutboundMessage;
@@ -96,8 +95,7 @@ impl AgentLoopShared {
                         crate::agent::provenance::redact_fabrications(&ctx.final_content, &claims);
                     ctx.final_content = redacted;
                     if redaction_count > 0 {
-                        // migrated from swappable().is_local — phase 09-03
-                        let warning_role = provenance_warning_role(ctx.core.mode().is_local());
+                        let warning_role = ctx.core.mode().grounding_role();
                         let warning_content = format!(
                             "NOTICE: {} claim(s) in the previous response could not be \
                              verified against tool outputs and were removed.",
@@ -137,8 +135,7 @@ impl AgentLoopShared {
                 }
 
                 // Inject system reminder for the next turn.
-                // migrated from swappable().is_local — phase 09-03
-                let warning_role = provenance_warning_role(ctx.core.mode().is_local());
+                let warning_role = ctx.core.mode().grounding_role();
                 ctx.messages.push(json!({
                     "role": warning_role,
                     "content": detection.system_warning

@@ -159,12 +159,6 @@ fn build_test_core(
 }
 
 #[test]
-fn test_provenance_warning_role_local_safe() {
-    assert_eq!(provenance_warning_role(true), "user");
-    assert_eq!(provenance_warning_role(false), "system");
-}
-
-#[test]
 fn test_extract_json_object_from_markdown_fence() {
     let raw =
         "```json\n{\"action\":\"tool\",\"target\":\"exec\",\"args\":{},\"confidence\":0.9}\n```";

@@ -35,7 +35,7 @@ pub use crate::agent::agent_core::SharedCoreHandle;
 // Re-export for test use (agent_loop_tests.rs uses `use super::*`).
 #[cfg(test)]
 pub(crate) use crate::agent::agent_core::{
-    build_swappable_core, provenance_warning_role, AgentHandle, SwappableCore, SwappableCoreConfig,
+    build_swappable_core, AgentHandle, SwappableCore, SwappableCoreConfig,
 };
 
 // ---------------------------------------------------------------------------

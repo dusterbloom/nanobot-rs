@@ -381,16 +381,6 @@ impl AgentHandle {
 // Backward-compatibility alias during migration.
 pub type SharedCoreHandle = AgentHandle;
 
-/// Local chat templates often reject mid-conversation `system` messages.
-/// In local mode, provenance reminders must be emitted as `user` role.
-pub(crate) fn provenance_warning_role(is_local: bool) -> &'static str {
-    if is_local {
-        "user"
-    } else {
-        "system"
-    }
-}
-
 // ---------------------------------------------------------------------------
 // SwappableCore construction
 // ---------------------------------------------------------------------------
