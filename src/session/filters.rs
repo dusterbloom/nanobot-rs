@@ -7,6 +7,14 @@ use serde_json::Value;
 use tracing::warn;
 
 /// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
+///
+/// ponytail: deliberately NOT the tiktoken counter (PERF-02 evaluated
+/// 2026-07-09 and aborted). This is a coarse DB-load pre-filter; the
+/// accurate tiktoken trim (`trim_to_fit_with_age_preserving_prefix`,
+/// shared.rs) runs downstream every turn and corrects any error here.
+/// Swapping estimators shifts every long session's drop boundary once at
+/// upgrade — a full re-prefill (~45s on a 35B) per session for no
+/// correctness win. Revisit only if a real overflow traces back to here.
 fn estimate_msg_tokens(m: &Value) -> usize {
     let content_len = m
         .get("content")
