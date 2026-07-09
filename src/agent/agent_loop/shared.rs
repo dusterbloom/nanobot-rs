@@ -103,6 +103,34 @@ fn proactive_grounding_preserves_prefix_cache(is_local: bool, local_tail_opt_in:
     !is_local || local_tail_opt_in
 }
 
+/// Decide whether to inject a heartbeat `[grounding]` message this iteration.
+///
+/// Pure policy: combines the existing cadence/pressure rule (`should_ground`)
+/// with the prefix-cache preservation rule (`proactive_grounding_preserves_prefix_cache`).
+/// Local models without the `NANOBOT_LOCAL_TAIL` opt-in skip heartbeat grounding
+/// because every synthetic user turn diverges the warm prefix cache.
+fn should_inject_heartbeat_grounding(
+    iteration: u32,
+    interval: u32,
+    pressure: f32,
+    is_local: bool,
+    local_tail_opt_in: bool,
+) -> bool {
+    system_state::should_ground(iteration, interval, pressure)
+        && proactive_grounding_preserves_prefix_cache(is_local, local_tail_opt_in)
+}
+
+/// Decide whether to accept the prefix-cache re-prefill cost and install a
+/// pending compaction result rather than deferring it.
+///
+/// Below `tau_hard` the cache-warm deferral is honoured. At or above
+/// `tau_hard` compaction is forced through: the one-time re-prefill of a
+/// compacted context is strictly cheaper than the unbounded growth that
+/// starves compaction until the model hits max tokens and fails.
+fn should_allow_checkpoint(pressure: f32, tau_hard: f64) -> bool {
+    (pressure as f64) >= tau_hard
+}
+
 // ---------------------------------------------------------------------------
 // Per-instance state (different per agent)
 // ---------------------------------------------------------------------------
@@ -859,10 +887,12 @@ impl AgentLoopShared {
         // --- Heartbeat: inject grounding message ---
         if self.proprioception_config.enabled {
             let state = self.system_state.load_full();
-            if system_state::should_ground(
+            if should_inject_heartbeat_grounding(
                 iteration,
                 self.proprioception_config.grounding_interval,
                 state.context_pressure,
+                ctx.core.mode().is_local(),
+                std::env::var("NANOBOT_LOCAL_TAIL").is_ok(),
             ) {
                 let grounding = system_state::format_grounding(&state);
                 ctx.messages
@@ -875,8 +905,12 @@ impl AgentLoopShared {
         // Install finished compaction only at cold/checkpoint boundaries. LCM may
         // summarize in the background, but replacing already-sent prompt bytes
         // while the local prefix cache is warm causes the long re-prefill stalls
-        // this cache watermark is meant to prevent.
-        self.install_pending_compaction(ctx, false).await;
+        // this cache watermark is meant to prevent — UNLESS pressure has crossed
+        // `tau_hard`, where deferring any longer guarantees hitting max tokens.
+        let state = self.system_state.load_full();
+        let allow_checkpoint =
+            should_allow_checkpoint(state.context_pressure, self.lcm_config.tau_hard);
+        self.install_pending_compaction(ctx, allow_checkpoint).await;
 
         StepResult::Next(IterationPhase::PreCall)
     }
@@ -2785,5 +2819,62 @@ mod forced_recovery_tests {
             true,
             false
         ));
+    }
+}
+
+#[cfg(test)]
+mod cache_pressure_tests {
+    use super::{should_allow_checkpoint, should_inject_heartbeat_grounding};
+
+    // -- should_inject_heartbeat_grounding --------------------------------
+
+    #[test]
+    fn heartbeat_grounding_skipped_on_local_without_tail_opt_in() {
+        // Local model without NANOBOT_LOCAL_TAIL: heartbeat grounding is a
+        // synthetic user turn that diverges the prefix cache. Must skip.
+        assert!(!should_inject_heartbeat_grounding(8, 8, 0.5, true, false));
+    }
+
+    #[test]
+    fn heartbeat_grounding_allowed_on_local_with_tail_opt_in() {
+        assert!(should_inject_heartbeat_grounding(8, 8, 0.5, true, true));
+    }
+
+    #[test]
+    fn heartbeat_grounding_allowed_on_cloud_regardless_of_tail() {
+        assert!(should_inject_heartbeat_grounding(8, 8, 0.5, false, false));
+        assert!(should_inject_heartbeat_grounding(8, 8, 0.5, false, true));
+    }
+
+    #[test]
+    fn heartbeat_grounding_respects_cadence() {
+        assert!(!should_inject_heartbeat_grounding(4, 8, 0.5, false, false));
+    }
+
+    #[test]
+    fn heartbeat_grounding_respects_pressure_ceiling() {
+        // Above 0.85 pressure, should_ground already returns false.
+        assert!(!should_inject_heartbeat_grounding(8, 8, 0.9, false, false));
+    }
+
+    // -- should_allow_checkpoint ------------------------------------------
+
+    #[test]
+    fn checkpoint_deferred_below_tau_hard() {
+        assert!(!should_allow_checkpoint(0.50, 0.85));
+        assert!(!should_allow_checkpoint(0.84, 0.85));
+    }
+
+    #[test]
+    fn checkpoint_forced_at_tau_hard_boundary() {
+        // Exactly tau_hard: accept the re-prefill to break the grow-forever
+        // deadlock where warm-cache deferral starves compaction entirely.
+        assert!(should_allow_checkpoint(0.85, 0.85));
+    }
+
+    #[test]
+    fn checkpoint_forced_above_tau_hard() {
+        assert!(should_allow_checkpoint(0.90, 0.85));
+        assert!(should_allow_checkpoint(1.00, 0.85));
     }
 }
