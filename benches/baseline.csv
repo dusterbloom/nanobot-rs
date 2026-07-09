@@ -1,1 +1,5 @@
 commit_sha,task_id,model,cold_start_ms,context_ms,ttfb_ms,total_ms,tokens_in,tokens_out,tool_calls,turn_rounds,success
+6254235,turn_01,ornith-35b@higgs:8000,2286,44,44859,47162,3452,11,0,1,true
+6254235,turn_05,ornith-35b@higgs:8000,273,30,614,888,3612,11,0,1,true
+6254235,turn_10,ornith-35b@higgs:8000,281,32,1409,1692,3846,30,0,1,true
+6254235,turn_20,ornith-35b@higgs:8000,109,31,1562,1673,4555,36,0,1,true
