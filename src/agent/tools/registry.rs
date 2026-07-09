@@ -525,9 +525,9 @@ impl ToolRegistry {
     ) -> ToolExecutionResult {
         // Proxy intercept: "tool" is the meta-tool, not a registered tool.
         if name == "tool" {
-            return self.execute_proxy(params).await;
+            return self.execute_proxy(params, None).await;
         }
-        self.execute_inner(name, params).await
+        self.execute_inner(name, params, None).await
     }
 
     /// Run the pre-tool-use hook if configured. Returns `Some(result)` to
@@ -578,54 +578,10 @@ impl ToolRegistry {
         .await;
     }
 
-    /// Core execute logic (no proxy intercept). Called by both `execute()`
-    /// and `execute_proxy()` dispatch mode.
-    async fn execute_inner(
-        &self,
-        name: &str,
-        params: HashMap<String, serde_json::Value>,
-    ) -> ToolExecutionResult {
-        let (name, params) = match Self::normalize_tool_request(name, params) {
-            Ok(v) => v,
-            Err(e) => return ToolExecutionResult::failure(e),
-        };
-
-        let tool = match self.tools.get(&name) {
-            Some(t) => t,
-            None => {
-                return ToolExecutionResult::failure(format!("Tool '{}' not found", name));
-            }
-        };
-
-        if tool.permission() > self.max_permission {
-            return ToolExecutionResult::failure(format!(
-                "Permission denied: tool '{}' requires {:?} but max allowed is {:?}",
-                name,
-                tool.permission(),
-                self.max_permission
-            ));
-        }
-
-        if let Some(blocked) = self.run_pre_hook(&name, &params).await {
-            return blocked;
-        }
-
-        let fut = std::panic::AssertUnwindSafe(tool.execute_with_result(params.clone()));
-        let result = match futures_util::FutureExt::catch_unwind(fut).await {
-            Ok(result) => result,
-            Err(_) => {
-                ToolExecutionResult::failure(format!("Tool '{}' panicked during execution", name))
-            }
-        };
-
-        self.run_post_hook(&name, &params, &result).await;
-        result
-    }
-
     /// Execute a tool by name with a [`ToolExecutionContext`] for progress
     /// reporting and cancellation support.
     ///
-    /// Same as [`execute`] but passes the context through to the tool.
+    /// Same as [`Self::execute`] but passes the context through to the tool.
     pub async fn execute_with_context(
         &self,
         name: &str,
@@ -634,17 +590,19 @@ impl ToolRegistry {
     ) -> ToolExecutionResult {
         // Proxy intercept: "tool" is the meta-tool, not a registered tool.
         if name == "tool" {
-            return self.execute_proxy_with_context(params, ctx).await;
+            return self.execute_proxy(params, Some(ctx)).await;
         }
-        self.execute_inner_with_context(name, params, ctx).await
+        self.execute_inner(name, params, Some(ctx)).await
     }
 
-    /// Core execute-with-context logic (no proxy intercept).
-    async fn execute_inner_with_context(
+    /// Core execute logic (no proxy intercept). Called by both `execute()`
+    /// variants and `execute_proxy()` dispatch mode. `ctx` enables progress
+    /// reporting and cancellation when the caller has one.
+    async fn execute_inner(
         &self,
         name: &str,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: Option<&ToolExecutionContext>,
     ) -> ToolExecutionResult {
         let (name, params) = match Self::normalize_tool_request(name, params) {
             Ok(v) => v,
@@ -671,9 +629,19 @@ impl ToolRegistry {
             return blocked;
         }
 
-        let fut =
-            std::panic::AssertUnwindSafe(tool.execute_with_result_and_context(params.clone(), ctx));
-        let result = match futures_util::FutureExt::catch_unwind(fut).await {
+        let unwound = match ctx {
+            Some(ctx) => {
+                let fut = std::panic::AssertUnwindSafe(
+                    tool.execute_with_result_and_context(params.clone(), ctx),
+                );
+                futures_util::FutureExt::catch_unwind(fut).await
+            }
+            None => {
+                let fut = std::panic::AssertUnwindSafe(tool.execute_with_result(params.clone()));
+                futures_util::FutureExt::catch_unwind(fut).await
+            }
+        };
+        let result = match unwound {
             Ok(result) => result,
             Err(_) => {
                 ToolExecutionResult::failure(format!("Tool '{}' panicked during execution", name))
@@ -959,9 +927,11 @@ impl ToolRegistry {
     }
 
     /// Handle a proxy call: inspect (no args) or dispatch (with args).
-    pub async fn execute_proxy(
+    /// `ctx` is passed through to the dispatched tool when present.
+    async fn execute_proxy(
         &self,
         params: HashMap<String, serde_json::Value>,
+        ctx: Option<&ToolExecutionContext>,
     ) -> ToolExecutionResult {
         let tool_name = match params.get("name").and_then(|v| v.as_str()) {
             Some(n) => n.to_string(),
@@ -1011,65 +981,7 @@ impl ToolRegistry {
                         );
                     }
                 };
-                self.execute_inner(&tool_name, inner_params).await
-            }
-        }
-    }
-
-    /// Handle a proxy call with execution context passthrough.
-    pub async fn execute_proxy_with_context(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
-    ) -> ToolExecutionResult {
-        let tool_name = match params.get("name").and_then(|v| v.as_str()) {
-            Some(n) => n.to_string(),
-            None => {
-                let names = self.available_tool_names();
-                return ToolExecutionResult::failure(format!(
-                    "Missing 'name'. Available tools: {}",
-                    names.join(", ")
-                ));
-            }
-        };
-
-        match params.get("args") {
-            None | Some(serde_json::Value::Null) => {
-                // Inspect mode (same as non-context version)
-                match self.tools.get(&tool_name) {
-                    Some(tool) if tool.is_available() => {
-                        let schema = serde_json::json!({
-                            "name": tool.name(),
-                            "description": tool.description(),
-                            "parameters": tool.parameters(),
-                        });
-                        ToolExecutionResult::success(
-                            serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".into()),
-                        )
-                    }
-                    _ => {
-                        let names = self.available_tool_names();
-                        ToolExecutionResult::failure(format!(
-                            "Tool '{}' not found. Available: {}",
-                            tool_name,
-                            names.join(", ")
-                        ))
-                    }
-                }
-            }
-            Some(args_val) => {
-                let inner_params: HashMap<String, serde_json::Value> = match args_val {
-                    serde_json::Value::Object(map) => {
-                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                    }
-                    _ => {
-                        return ToolExecutionResult::failure(
-                            "'args' must be a JSON object".to_string(),
-                        );
-                    }
-                };
-                self.execute_inner_with_context(&tool_name, inner_params, ctx)
-                    .await
+                self.execute_inner(&tool_name, inner_params, ctx).await
             }
         }
     }
