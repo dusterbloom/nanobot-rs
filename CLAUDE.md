@@ -117,16 +117,19 @@ Local models (via LM Studio) have stricter message protocol than cloud APIs:
 - Assistant message prefill is **NOT** supported
 - Tool result messages (`role: "tool"`) cannot be the last message
 
-After adding tool results to any message array, always append a user continuation before calling the LLM:
+These invariants are enforced **structurally at render time** by the
+`ConversationProtocol` trait (`src/agent/protocol.rs`): `LocalProtocol::render`
+repairs role alternation and appends a `Continue.` user turn when the wire
+would otherwise end on assistant/tool. Never hand-append continuation messages
+in loop code — build the message array and pass it through
+`render_to_wire(protocol, …)` like `subagent.rs`, `pipeline.rs`, and
+`prepare_context.rs` do.
 
-```rust
-messages.push(json!({
-    "role": "user",
-    "content": "Based on the tool results above, continue with the task."
-}));
-```
-
-**Affected code paths:** `tool_runner.rs`, `subagent.rs`, `agent_loop.rs` (inline path, conditional on `is_local`). Any new code path that builds message arrays with tool results must follow this pattern.
+**KV prefix-cache contract:** the rendered wire prompt for turn N must be a
+byte-prefix of turn N+1's (per-turn content goes in TAIL blocks, never
+`messages[0]`). One mutated byte forces the local server to re-prefill
+everything past it (~45s cold vs ~0.6s reuse measured on a 35B). Pinned by
+`test_local_wire_prompt_prefix_stable_across_turns` in `agent_loop/tests.rs`.
 
 ### Local Model Function Calling
 
@@ -160,7 +163,7 @@ Keys match as case-insensitive substrings against the model name. Override `size
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **nanobot-rs** (9236 symbols, 24301 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **nanobot-rs** (9269 symbols, 24358 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
