@@ -2466,6 +2466,144 @@ fn build_local_inline_harness_with_model(
     (agent_loop, workspace)
 }
 
+/// Records the full wire `messages` array of every `chat()` call and replays
+/// a scripted response sequence (last response repeats when exhausted).
+struct WireRecordingProvider {
+    name: String,
+    responses: std::sync::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
+    calls: std::sync::Mutex<Vec<Vec<Value>>>,
+}
+
+impl WireRecordingProvider {
+    fn new(name: &str, responses: Vec<crate::providers::base::LLMResponse>) -> Self {
+        Self {
+            name: name.to_string(),
+            responses: std::sync::Mutex::new(responses.into()),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn text_response(content: &str) -> crate::providers::base::LLMResponse {
+        crate::providers::base::LLMResponse {
+            content: Some(content.to_string()),
+            tool_calls: vec![],
+            finish_reason: "stop".to_string(),
+            usage: std::collections::HashMap::new(),
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<Value>> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for WireRecordingProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let mut queue = self.responses.lock().unwrap();
+        Ok(if queue.len() > 1 {
+            queue.pop_front().unwrap()
+        } else {
+            queue.front().cloned().unwrap_or_else(|| Self::text_response("done"))
+        })
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Assert every wire message of `first` reappears byte-identical, in order,
+/// at the head of `second` — the KV prefix-cache contract. One mutated byte
+/// forces the local server to re-prefill everything past it (~45s cold on a
+/// 35B), so this property IS the local-model perf story.
+fn assert_wire_prefix(first: &[Value], second: &[Value]) {
+    assert!(
+        second.len() > first.len(),
+        "later call must extend the earlier one (got {} then {})",
+        first.len(),
+        second.len()
+    );
+    for (i, msg) in first.iter().enumerate() {
+        assert_eq!(
+            serde_json::to_string(msg).unwrap(),
+            serde_json::to_string(&second[i]).unwrap(),
+            "wire message {i} mutated between calls — prompt prefix diverged, KV cache busted"
+        );
+    }
+}
+
+/// KV prefix contract across turns: turn N's wire prompt must be a
+/// byte-prefix of turn N+1's. Per-turn content belongs in TAIL blocks,
+/// never in messages[0]. Guards the 1.9s-full-prefill → 0.07s-reuse asset.
+#[tokio::test]
+async fn test_local_wire_prompt_prefix_stable_across_turns() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![WireRecordingProvider::text_response("first reply")],
+    ));
+    let (agent_loop, _ws) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("prefix-stability-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("first message", &session_key, "test", "offline")
+        .await;
+    agent_loop
+        .process_direct("second message", &session_key, "test", "offline")
+        .await;
+
+    let calls = provider.calls();
+    assert!(calls.len() >= 2, "expected two LLM calls, got {}", calls.len());
+    assert_wire_prefix(&calls[0], &calls[calls.len() - 1]);
+}
+
+/// Same contract within a turn: executing a tool must only APPEND to the
+/// wire prompt (assistant carrier + tool result + continuation), never
+/// rewrite what the server already prefilled.
+#[tokio::test]
+async fn test_local_wire_prompt_tool_result_appends_only() {
+    let mut args = std::collections::HashMap::new();
+    args.insert("path".to_string(), json!("."));
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_prefix".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments: args,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+            WireRecordingProvider::text_response("listed."),
+        ],
+    ));
+    let (agent_loop, _ws) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("prefix-tool-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("please list files", &session_key, "test", "offline")
+        .await;
+
+    let calls = provider.calls();
+    assert!(calls.len() >= 2, "expected two LLM calls, got {}", calls.len());
+    assert_wire_prefix(&calls[0], &calls[1]);
+}
+
 static NANOBOT_LOCAL_TAIL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct EnvVarGuard {
