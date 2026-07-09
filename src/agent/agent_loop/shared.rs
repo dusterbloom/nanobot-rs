@@ -1536,7 +1536,14 @@ impl AgentLoopShared {
             {
                 let mut engine = lcm_engine.lock().await;
                 if !engine.dag().is_empty() {
+                    let expand_t0 = std::time::Instant::now();
                     let appended = engine.auto_expand(&ctx.core.token_budget, tool_def_tokens);
+                    tracing::info!(
+                        target: "turn_timing",
+                        auto_expand_ms = expand_t0.elapsed().as_millis() as u64,
+                        summaries = engine.dag().len(),
+                        "auto_expand_timing"
+                    );
                     if !appended.is_empty() {
                         debug!(
                             session = %ctx.session_key,
@@ -1767,6 +1774,7 @@ impl AgentLoopShared {
         // re-prefill everything past the divergence point (~60s for a 14k
         // local context). Make every such miss a one-line diagnosis.
         use crate::agent::prompt_fingerprint::{self, PromptDelta};
+        let diag_t0 = std::time::Instant::now();
         let prompt_fp = prompt_fingerprint::fingerprint(&messages_for_llm);
         let prompt_msg_count = messages_for_llm.len();
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
@@ -1876,6 +1884,12 @@ impl AgentLoopShared {
             }
             tool_store.insert(ctx.session_key.to_string(), new_tool_hash);
         }
+        tracing::info!(
+            target: "turn_timing",
+            prefix_diag_ms = diag_t0.elapsed().as_millis() as u64,
+            msg_count = prompt_msg_count,
+            "prefix_diag_timing"
+        );
 
         if ctx.core.mode().is_local() && ctx.core.provider.get_api_base().is_some() {
             let provider_session_id = stable_higgs_session_id(

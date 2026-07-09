@@ -398,6 +398,17 @@ impl AgentLoopShared {
     ) -> TurnContext {
         let streaming = text_delta_tx.is_some();
 
+        // Per-turn overhead baseline (Phase 1, plan cozy-squishing-galaxy):
+        // one `turn_timing` line per turn; grep `prepare_context_timing`.
+        let prep_t0 = std::time::Instant::now();
+        let mut prep_last = prep_t0;
+        let mut lap_ms = move || {
+            let now = std::time::Instant::now();
+            let ms = now.duration_since(prep_last).as_millis() as u64;
+            prep_last = now;
+            ms
+        };
+
         // Snapshot core — instant Arc clone under brief read lock.
         let core = self.core_handle.swappable();
         let counters = &self.core_handle.counters;
@@ -444,6 +455,7 @@ impl AgentLoopShared {
         // stored in TurnContext for plan-guided execution and backtracking.
         let (mut tools, reasoning_engine) =
             self.build_tools(&core, &msg.channel, &msg.chat_id).await;
+        let tools_ms = lap_ms();
 
         // Register lcm_expand tool when LCM is enabled.
         // Eagerly create the engine here (with DB-persisted DAG if available)
@@ -495,6 +507,7 @@ impl AgentLoopShared {
             use crate::agent::lcm::LcmExpandTool;
             tools.register(Box::new(LcmExpandTool::new(lcm_engine)));
         }
+        let lcm_setup_ms = lap_ms();
 
         // Resolve or create session for this key.
         // If the session has been idle longer than session_complete_after_secs,
@@ -517,6 +530,7 @@ impl AgentLoopShared {
             .sessions
             .get_history(&session_id, max_messages, core.max_history_turns)
             .await;
+        let history_ms = lap_ms();
         // LCM history adoption: when the engine holds a summary DAG, the
         // engine's active context IS the conversation history — summary
         // blocks + unsummarized raws. Feeding raw history to the prompt here
@@ -551,6 +565,7 @@ impl AgentLoopShared {
         } else {
             history
         };
+        let lcm_ingest_ms = lap_ms();
 
         // `new_start` (where new/unsaved messages begin) is computed AFTER
         // build_messages below — the assembled array may carry a variable
@@ -601,6 +616,7 @@ impl AgentLoopShared {
             is_voice_message,
             detected_language.as_deref(),
         );
+        let build_msgs_ms = lap_ms();
         // The just-pushed user message is the last element; everything before
         // it (any prompt prefix + history) is already persisted or ephemeral.
         // Mutable because the per-turn local tail block (inserted before the
@@ -665,6 +681,7 @@ impl AgentLoopShared {
         // `hi`). Keep the marker stable within an epoch so later turns remain
         // append-only, but make each new epoch a cold prompt prefix.
         apply_session_prompt_epoch(&mut messages, counters.session_prompt_epoch(&session_key));
+        let sections_ms = lap_ms();
 
         // Optional per-turn query-aware TAIL block (local only): relevant skills
         // + memory placed AFTER history, immediately before the user message.
@@ -711,6 +728,22 @@ impl AgentLoopShared {
         // Pre-consume the tokens already used by system prompt + history.
         let initial_tokens = TokenBudget::estimate_tokens(&messages);
         content_gate.budget.consume(initial_tokens);
+        let estimate_ms = lap_ms();
+        tracing::info!(
+            target: "turn_timing",
+            tools_ms,
+            lcm_setup_ms,
+            history_ms,
+            lcm_ingest_ms,
+            build_msgs_ms,
+            sections_ms,
+            estimate_ms,
+            total_ms = prep_t0.elapsed().as_millis() as u64,
+            history_len = history.len(),
+            msg_count = messages.len(),
+            session = %session_key,
+            "prepare_context_timing"
+        );
 
         let tool_guard = ToolGuard::new(core.tool_delegation_config.max_same_tool_call_per_turn);
 
