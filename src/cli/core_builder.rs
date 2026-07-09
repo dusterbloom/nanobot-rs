@@ -328,10 +328,31 @@ pub(super) fn make_local_providers(
     };
 
     // Compaction provider (separate port only).
+    //
+    // IMPORTANT: build the URL directly from the port. We must NOT use
+    // `local_base_url(config, p)` here — that helper honours
+    // `local_api_base`, which after Higgs auto-start points at the MAIN
+    // higgs port, silently routing compaction traffic to the wrong server
+    // (the bug this fixed). The compaction port always targets a localhost
+    // sidecar, so we construct the URL explicitly.
+    // The sidecar's model name must ride with its provider: `None` here makes
+    // OpenAICompatProvider fall back to a cloud placeholder default, and
+    // `resolve_memory_provider` would then pair the sidecar with the MAIN
+    // model name — asking a 1.7B sidecar to runtime-load the 35B, the exact
+    // contention the sidecar exists to prevent. Mirror the spawn fallback:
+    // configured compaction model, else the main semantic model id.
+    let compaction_model = config
+        .agents
+        .defaults
+        .higgs_compaction_model
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| semantic_model_id.clone());
     let compaction: Option<Arc<dyn LLMProvider>> =
         compaction_port.map(|p| -> Arc<dyn LLMProvider> {
+            let base = format!("http://127.0.0.1:{p}/v1");
             factory::create_openai_compat(
-                factory::ProviderSpec::local_with_key(&local_base_url(config, p), None, api_key)
+                factory::ProviderSpec::local_with_key(&base, Some(&compaction_model), api_key)
                     .with_jit_gate_opt(jit_gate.clone())
                     .with_timeout_config(&config.timeouts)
                     .with_retry(config.retry.clone()),

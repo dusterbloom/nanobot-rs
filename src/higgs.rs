@@ -48,21 +48,46 @@ pub(crate) fn find_binary() -> Option<PathBuf> {
     None
 }
 
-/// PID file path: `~/.nanobot/higgs.pid`.
+/// PID file path for a named role: `~/.nanobot/higgs.pid` (main) or
+/// `~/.nanobot/higgs-{role}.pid` (e.g. compaction sidecar).
+fn pid_path_for(role: &str) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let name = if role == "higgs" {
+        "higgs.pid".to_string()
+    } else {
+        format!("higgs-{role}.pid")
+    };
+    home.join(".nanobot").join(name)
+}
+
+/// Log file path for a named role.
+fn log_path_for(role: &str) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let name = if role == "higgs" {
+        "higgs.log".to_string()
+    } else {
+        format!("higgs-{role}.log")
+    };
+    home.join(".nanobot").join(name)
+}
+
+/// Backward-compat wrappers for the main ("higgs") instance.
+#[allow(dead_code)]
 fn pid_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".nanobot").join("higgs.pid")
+    pid_path_for("higgs")
 }
 
-/// Log file path: `~/.nanobot/higgs.log`.
-fn log_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".nanobot").join("higgs.log")
-}
-
-/// Read the stored PID, if any.
+/// Read the stored PID for the main instance, if any.
+#[allow(dead_code)]
 fn read_pid() -> Option<u32> {
     fs::read_to_string(pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Read the stored PID for a named role, if any.
+fn read_pid_for(role: &str) -> Option<u32> {
+    fs::read_to_string(pid_path_for(role))
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
@@ -94,22 +119,37 @@ pub(crate) async fn server_start(
     model_dir: &str,
     local_model: &str,
 ) -> Result<StartResult, String> {
+    server_start_role(bin, port, model_dir, local_model, "higgs").await
+}
+
+/// Start a Higgs instance for a named role. `role == "higgs"` is the main
+/// instance (writes `~/.nanobot/higgs.pid`); any other tag (e.g.
+/// `"compaction"`) gets its own PID/log files so a sidecar can coexist with
+/// the main server without colliding on the singleton PID file.
+pub(crate) async fn server_start_role(
+    bin: &Path,
+    port: u16,
+    model_dir: &str,
+    local_model: &str,
+    role: &str,
+) -> Result<StartResult, String> {
     // Already running and healthy?
-    if let Some(pid) = read_pid() {
+    if let Some(pid) = read_pid_for(role) {
         if pid_is_alive(pid) && wait_for_ready(port, 3).await {
             if is_serving_expected_model(port, model_dir, local_model).await {
-                tracing::info!(pid, port, "higgs already running");
+                tracing::info!(pid, port, role, "higgs already running");
                 return Ok(StartResult::Ready);
             }
             tracing::info!(
                 pid,
                 port,
+                role,
                 "higgs running but serving wrong model, restarting"
             );
-            server_stop()?;
+            server_stop_role(role)?;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         } else {
-            let _ = fs::remove_file(pid_path());
+            let _ = fs::remove_file(pid_path_for(role));
         }
     }
 
@@ -131,20 +171,24 @@ pub(crate) async fn server_start(
         return Ok(StartResult::Ready);
     }
 
-    if let Some(existing_pid) = find_existing_higgs_process() {
-        return Err(format!(
-            "another Higgs process is already running (pid {existing_pid}).\n\
-             Stop it first, or point localApiBase at its port to reuse it.\n\
-             To force nanobot to start its own instance: kill {existing_pid}"
-        ));
+    // Only the main instance owns the singleton pgrep guard; a sidecar
+    // (e.g. compaction) is expected to coexist with a main `higgs serve`.
+    if role == "higgs" {
+        if let Some(existing_pid) = find_existing_higgs_process() {
+            return Err(format!(
+                "another Higgs process is already running (pid {existing_pid}).\n\
+                 Stop it first, or point localApiBase at its port to reuse it.\n\
+                 To force nanobot to start its own instance: kill {existing_pid}"
+            ));
+        }
     }
 
-    if let Some(parent) = pid_path().parent() {
+    if let Some(parent) = pid_path_for(role).parent() {
         let _ = fs::create_dir_all(parent);
     }
 
     let log_file =
-        fs::File::create(log_path()).map_err(|e| format!("failed to create higgs log: {e}"))?;
+        fs::File::create(log_path_for(role)).map_err(|e| format!("failed to create higgs log: {e}"))?;
     let log_err = log_file
         .try_clone()
         .map_err(|e| format!("failed to clone log handle: {e}"))?;
@@ -180,7 +224,7 @@ pub(crate) async fn server_start(
 
     let child_pid = child.id();
 
-    fs::write(pid_path(), child_pid.to_string())
+    fs::write(pid_path_for(role), child_pid.to_string())
         .map_err(|e| format!("failed to write higgs PID file: {e}"))?;
 
     // Reaper thread: wait for higgs to exit and log how it died.
@@ -236,21 +280,26 @@ pub(crate) async fn server_start(
         return Err(format!(
             "higgs (pid {child_pid}) exited before becoming healthy on port {port}\n\
              check log: {}",
-            log_path().display()
+            log_path_for(role).display()
         ));
     }
 
     Ok(StartResult::Ready)
 }
 
-/// Stop a running Higgs instance.
+/// Stop a running Higgs instance (main role).
 pub(crate) fn server_stop() -> Result<(), String> {
-    let Some(pid) = read_pid() else {
+    server_stop_role("higgs")
+}
+
+/// Stop a running Higgs instance for a named role.
+pub(crate) fn server_stop_role(role: &str) -> Result<(), String> {
+    let Some(pid) = read_pid_for(role) else {
         return Ok(());
     };
 
     if !pid_is_alive(pid) {
-        let _ = fs::remove_file(pid_path());
+        let _ = fs::remove_file(pid_path_for(role));
         return Ok(());
     }
 
@@ -260,15 +309,15 @@ pub(crate) fn server_stop() -> Result<(), String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while pid_is_alive(pid) {
         if std::time::Instant::now() >= deadline {
-            tracing::warn!(pid, "higgs still running after SIGTERM, sending SIGKILL");
+            tracing::warn!(pid, role, "higgs still running after SIGTERM, sending SIGKILL");
             platform::send_signal(pid, libc::SIGKILL);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let _ = fs::remove_file(pid_path());
-    tracing::info!(pid, "higgs stopped");
+    let _ = fs::remove_file(pid_path_for(role));
+    tracing::info!(pid, role, "higgs stopped");
     Ok(())
 }
 
@@ -310,6 +359,31 @@ async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
     }
 
     false
+}
+
+/// Resolve the compaction sidecar's `(model_dir, model)` from config,
+/// mirroring the main-instance fallbacks: configured compaction dir, else the
+/// main model dir; configured compaction model, else the main local model.
+/// Single source of truth for the spawn path and `/restart`.
+pub(crate) fn compaction_sidecar_config(
+    config: &crate::config::schema::Config,
+) -> (Option<String>, String) {
+    let dir = config
+        .agents
+        .defaults
+        .higgs_compaction_model_dir
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| resolve_model_dir(config).ok());
+    let model = config
+        .agents
+        .defaults
+        .higgs_compaction_model
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| config.agents.defaults.local_model.clone());
+    (dir, model)
 }
 
 /// Resolve the model directory for Higgs from config.
@@ -899,9 +973,20 @@ pub(crate) async fn server_restart(
     model_dir: &str,
     local_model: &str,
 ) -> Result<StartResult, String> {
-    server_stop()?;
+    server_restart_role(bin, port, model_dir, local_model, "higgs").await
+}
+
+/// Restart a Higgs instance for a named role (stop then start).
+pub(crate) async fn server_restart_role(
+    bin: &Path,
+    port: u16,
+    model_dir: &str,
+    local_model: &str,
+    role: &str,
+) -> Result<StartResult, String> {
+    server_stop_role(role)?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    server_start(bin, port, model_dir, local_model).await
+    server_start_role(bin, port, model_dir, local_model, role).await
 }
 
 /// Check if the running Higgs is serving a model that matches `expected_dir`.

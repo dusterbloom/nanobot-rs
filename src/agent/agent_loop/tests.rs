@@ -730,6 +730,13 @@ fn test_delegation_with_compaction_and_delegation_providers() {
         "compaction",
         "Memory should use compaction provider"
     );
+    // The model name must ride with the provider it's paired to: sending the
+    // MAIN model name to a dedicated compaction sidecar would make the sidecar
+    // runtime-load the big model — the contention the sidecar prevents.
+    assert_eq!(
+        core.memory_model, "compaction",
+        "memory_model must be the compaction provider's own model, not the main model"
+    );
     assert_eq!(
         core.tool_runner_provider
             .as_ref()

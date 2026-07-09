@@ -284,6 +284,20 @@ pub struct AgentDefaults {
     /// Port for the managed Higgs server (default: 8091).
     #[serde(default = "default_higgs_port")]
     pub higgs_port: u16,
+    /// Port for the compaction Higgs server (default: 8092).
+    /// When set, a second Higgs instance is spawned on this port for compaction,
+    /// avoiding GPU contention with the main model. Requires the higgs backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub higgs_compaction_port: Option<u16>,
+    /// Model directory for the compaction Higgs instance (e.g. a small Bonsai
+    /// Qwen3-1.7B). When unset, falls back to the main `mlxModelDir`/
+    /// `localModel`. Use a lighter model to avoid GPU memory contention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub higgs_compaction_model_dir: Option<String>,
+    /// Model name hint for the compaction Higgs instance (mirrors `localModel`
+    /// for the main instance). When unset, falls back to `localModel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub higgs_compaction_model: Option<String>,
     /// Path to MLX model directory (containing .safetensors + tokenizer.json).
     /// Default: ~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -490,6 +504,9 @@ impl Default for AgentDefaults {
             local_autostart: LocalAutostart::default(),
             lms_port: default_lms_port(),
             higgs_port: default_higgs_port(),
+            higgs_compaction_port: None,
+            higgs_compaction_model_dir: None,
+            higgs_compaction_model: None,
             local_backend: default_local_backend(),
             mlx_model_dir: None,
             draft_model: None,

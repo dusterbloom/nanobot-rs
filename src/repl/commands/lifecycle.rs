@@ -145,6 +145,45 @@ impl ReplContext {
                 tui::GREEN,
                 tui::RESET
             );
+
+            // Also cycle the compaction sidecar if one is configured, so
+            // `/restart` brings both servers back in a known-good state.
+            if let Some(cport) = self.config.agents.defaults.higgs_compaction_port {
+                let (cmodel_dir, cmodel) = crate::higgs::compaction_sidecar_config(&self.config);
+                if let Some(dir) = cmodel_dir {
+                    if let Some(bin) = crate::higgs::find_binary() {
+                        print!("  Restarting compaction Higgs (:{cport})... ");
+                        io::stdout().flush().ok();
+                        match crate::higgs::server_restart_role(
+                            &bin, cport, &dir, &cmodel, "compaction",
+                        )
+                        .await
+                        {
+                            Ok(crate::higgs::StartResult::Ready) => {
+                                println!("{}OK{}", tui::GREEN, tui::RESET);
+                            }
+                            Ok(crate::higgs::StartResult::Loading { pid, port: _ }) => {
+                                println!(
+                                    "{}LOADING{} (pid {pid} still warming up)",
+                                    tui::YELLOW, tui::RESET,
+                                );
+                            }
+                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                        }
+                    } else {
+                        println!(
+                            "  {}Higgs binary not found, cannot restart compaction sidecar.{}",
+                            tui::YELLOW, tui::RESET,
+                        );
+                    }
+                } else {
+                    println!(
+                        "  {}Skipped compaction restart:{} no model dir configured",
+                        tui::YELLOW, tui::RESET,
+                    );
+                }
+            }
+
             return;
         }
 

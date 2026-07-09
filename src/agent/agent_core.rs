@@ -707,6 +707,10 @@ fn resolve_memory_provider(
             } else if let Some(sp) = specialist_provider {
                 // Trio specialist is ideal for summarisation tasks.
                 sp.get_default_model().to_string()
+            } else if let Some(ref cp) = compaction_provider {
+                // Dedicated compaction sidecar: the model name must match the
+                // provider it rides with, never the main model's name.
+                cp.get_default_model().to_string()
             } else {
                 model.to_string()
             };

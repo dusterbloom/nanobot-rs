@@ -1626,6 +1626,68 @@ pub(crate) fn cmd_agent(
             }
         }
 
+        // Dedicated compaction Higgs sidecar (non-contention): when
+        // `higgsCompactionPort` is set, spawn a second Higgs instance on that
+        // port so compaction/memory jobs run on a separate server (ideally a
+        // lighter model) instead of contending with the main model for GPU time.
+        //
+        // Deliberately NOT gated on `use_higgs`: that flag means "discovery
+        // found nothing and autostart wants to spawn a MAIN server" — false
+        // whenever a main endpoint is already running or the backend is LM
+        // Studio, which is exactly when the sidecar is most useful. The
+        // sidecar is self-contained (own port/PID/model) and orthogonal to
+        // how the main endpoint was provisioned.
+        if is_local {
+            if let Some(compaction_port) = config.agents.defaults.higgs_compaction_port {
+                let (cmodel_dir, cmodel) = crate::higgs::compaction_sidecar_config(&config);
+                match cmodel_dir {
+                    Some(dir) => {
+                        if let Some(bin) = crate::higgs::find_binary() {
+                            match crate::higgs::server_start_role(
+                                &bin,
+                                compaction_port,
+                                &dir,
+                                &cmodel,
+                                "compaction",
+                            )
+                            .await
+                            {
+                                Ok(crate::higgs::StartResult::Ready) => {
+                                    info!(port = compaction_port, model = %cmodel, "higgs_compaction_ready");
+                                }
+                                Ok(crate::higgs::StartResult::Loading { pid, port }) => {
+                                    eprintln!(
+                                        "Warning: compaction Higgs (pid {pid}) still loading model on port {port} — requests will retry until ready"
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Warning: failed to start compaction Higgs on port {compaction_port}: {e}\n\
+                                         Compaction will fall back to the main model."
+                                    );
+                                    // Disable the compaction port so the provider
+                                    // builder doesn't point at a dead endpoint.
+                                    config.agents.defaults.higgs_compaction_port = None;
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "Warning: Higgs binary not found, cannot start compaction sidecar; compaction will use the main model"
+                            );
+                            config.agents.defaults.higgs_compaction_port = None;
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "Warning: higgsCompactionPort set but no model dir configured\n\
+                             (set higgsCompactionModelDir or mlxModelDir); compaction will use the main model"
+                        );
+                        config.agents.defaults.higgs_compaction_port = None;
+                    }
+                }
+            }
+        }
+
         // In local mode with single-message (-m), just start main server.
         // Trio is for interactive sessions - single messages use inline tools.
         // When localApiBase is set, skip all local server spawning — use remote server.
@@ -2007,7 +2069,7 @@ pub(crate) fn cmd_agent(
             &config,
             &srv.local_port,
             Some(&local_model_name),
-            None,
+            config.agents.defaults.higgs_compaction_port.map(|p| p.to_string()).as_deref(),
             None,
             None,
             is_local,
@@ -2280,6 +2342,46 @@ pub(crate) fn cmd_agent(
                 )
             });
 
+            // Keepalive for the dedicated compaction Higgs sidecar (same
+            // interval as the main keepalive). Runs only when the compaction
+            // port is set and points at our own localhost sidecar.
+            let compaction_keepalive_stop = Arc::new(AtomicBool::new(false));
+            let compaction_keepalive_handle: Option<tokio::task::JoinHandle<()>> =
+                if let Some(cport) = ctx.config.agents.defaults.higgs_compaction_port {
+                    let base = format!("http://127.0.0.1:{cport}/v1");
+                    // The sidecar is always a Higgs instance regardless of the
+                    // MAIN backend tag — pass "higgs" so the keepalive isn't
+                    // dead-gated when the main backend is LM Studio.
+                    higgs_keepalive_secs(
+                        "higgs",
+                        &base,
+                        std::env::var("NANOBOT_HIGGS_KEEPALIVE_SECS").ok().as_deref(),
+                    )
+                    .map(|secs| {
+                        let model = ctx
+                            .config
+                            .agents
+                            .defaults
+                            .higgs_compaction_model
+                            .clone()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| local_model_name.clone());
+                        info!(interval_s = secs, port = cport, model = %model, "higgs_compaction_keepalive_enabled");
+                        spawn_higgs_keepalive(
+                            base,
+                            ctx.config.agents.defaults.local_api_key.clone(),
+                            model,
+                            secs,
+                            // Compaction is idle most of the time; the shared
+                            // inference_active flag is fine as a proxy.
+                            Arc::clone(&ctx.core_handle.counters.inference_active),
+                            Arc::clone(&compaction_keepalive_stop),
+                        )
+                    })
+                } else {
+                    None
+                };
+
             log_startup_phase("interactive_ready", startup_t0, &mut startup_last);
 
             // First bar render pushes content up to make room; all subsequent
@@ -2551,6 +2653,10 @@ pub(crate) fn cmd_agent(
             heartbeat.stop().await;
             if let Some(h) = keepalive_handle {
                 keepalive_stop.store(true, Ordering::Relaxed);
+                h.abort();
+            }
+            if let Some(h) = compaction_keepalive_handle {
+                compaction_keepalive_stop.store(true, Ordering::Relaxed);
                 h.abort();
             }
             let _ = ctx.rl.as_mut().unwrap().save_history(&history_path);
