@@ -705,10 +705,75 @@ fn extract_reasoning_delta(delta: &serde_json::Value) -> Option<&str> {
         })
 }
 
+/// The two request shapes built by [`OpenAICompatProvider::build_chat_request`].
+#[derive(Clone, Copy)]
+enum RequestKind {
+    /// Non-streaming (`stream:false`); honors the caller's [`ToolChoice`].
+    Blocking { tool_choice: ToolChoice },
+    /// SSE streaming (`stream:true` + usage + local prefill progress);
+    /// `tool_choice` is always `"auto"` on this path.
+    Streaming,
+}
+
+/// Map a non-success chat/completions response to a [`crate::errors::ProviderError`].
+///
+/// Shared by `chat_impl` and `chat_stream` so streaming and non-streaming can
+/// never disagree on error classification. Also emits the local-400 role
+/// diagnostic (chat-template failures) and the generic API-error warning.
+fn map_status_to_provider_error(
+    status_code: u16,
+    response_text: String,
+    api_base: &str,
+    body: &serde_json::Value,
+    model_str: &str,
+) -> crate::errors::ProviderError {
+    use crate::errors::ProviderError;
+    let body_snippet: String = response_text.chars().take(500).collect();
+    if status_code == 400 && is_local_api_base(api_base) {
+        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+            let roles: Vec<&str> = msgs
+                .iter()
+                .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+                .collect();
+            tracing::error!(
+                model = %model_str,
+                status = status_code,
+                body = %body_snippet,
+                roles = ?roles,
+                message_count = msgs.len(),
+                "local_llm_400_message_roles"
+            );
+        }
+    }
+    warn!(
+        model = %model_str,
+        api_base = %api_base,
+        status = status_code,
+        body = %body_snippet,
+        "llm_api_error"
+    );
+    match status_code {
+        429 => ProviderError::RateLimited {
+            status: status_code,
+            retry_after_ms: parse_retry_after_ms(&response_text),
+        },
+        401 | 403 => ProviderError::AuthError {
+            status: status_code,
+            message: response_text,
+        },
+        500..=599 => ProviderError::ServerError {
+            status: status_code,
+            message: response_text,
+        },
+        _ => ProviderError::HttpError(format!("HTTP {}: {}", status_code, response_text)),
+    }
+}
+
 impl OpenAICompatProvider {
-    #[instrument(skip(self, messages, tools), fields(api_base = %self.api_base))]
+    /// Build the `chat/completions` request body shared by `chat_impl` and
+    /// `chat_stream`. Returns `(resolved_model, body)`.
     #[allow(clippy::too_many_arguments)]
-    async fn chat_impl(
+    fn build_chat_request(
         &self,
         messages: &[serde_json::Value],
         tools: Option<&[serde_json::Value]>,
@@ -717,8 +782,8 @@ impl OpenAICompatProvider {
         temperature: f64,
         thinking_budget: Option<u32>,
         top_p: Option<f64>,
-        tool_choice: ToolChoice,
-    ) -> Result<LLMResponse> {
+        kind: RequestKind,
+    ) -> (String, serde_json::Value) {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
         // Strip "local:" prefix (internal routing tag, not part of actual model name)
@@ -729,11 +794,14 @@ impl OpenAICompatProvider {
             resolve_request_and_policy_model(&self.api_base, &self.default_model, stripped);
 
         debug!(
-            "chat: api_base={} raw_model={} stripped={} model={} policy_model={}",
-            self.api_base, raw_model, stripped, model, policy_model
+            "chat request: api_base={} raw_model={} stripped={} model={} policy_model={} streaming={}",
+            self.api_base,
+            raw_model,
+            stripped,
+            model,
+            policy_model,
+            matches!(kind, RequestKind::Streaming)
         );
-
-        let url = format!("{}/chat/completions", self.api_base);
 
         let (request_messages, higgs_session_id) = request_messages_and_higgs_session_id(messages);
         let request_messages = fold_developer_role_for_local(request_messages, &self.api_base);
@@ -745,7 +813,6 @@ impl OpenAICompatProvider {
             (request_messages, tools.map(|t| t.to_vec()))
         };
 
-        // Build request body.
         // Log message roles for debugging chat template errors from local servers.
         if is_local_api_base(&self.api_base) {
             let roles: Vec<&str> = cached_msgs
@@ -759,17 +826,34 @@ impl OpenAICompatProvider {
                 "local_llm_request_roles"
             );
         }
+
         let mut body = serde_json::json!({
             "model": model,
             "messages": cached_msgs,
             "max_tokens": max_tokens,
             "temperature": temperature,
+        });
+        match kind {
             // Explicit non-streaming: the OpenAI spec defaults `stream` to
             // false, but Apple FM's `fm serve` defaults to SSE when the field
-            // is absent, which this (non-streaming) path can't parse. Declaring
+            // is absent, which the non-streaming path can't parse. Declaring
             // it is a no-op for compliant servers and required for Apple FM.
-            "stream": false,
-        });
+            RequestKind::Blocking { .. } => {
+                body["stream"] = serde_json::json!(false);
+            }
+            RequestKind::Streaming => {
+                body["stream"] = serde_json::json!(true);
+                body["stream_options"] = serde_json::json!({ "include_usage": true });
+                if is_local_api_base(&self.api_base) {
+                    // Ask llama.cpp/higgs servers to stream prefill progress
+                    // (`prompt_progress` chunks) so the REPL can show a real %.
+                    // Local-only: cloud APIs may reject unknown fields, and their
+                    // prefill is not the bottleneck. Servers without support
+                    // (LM Studio) ignore the field.
+                    body["return_progress"] = serde_json::json!(true);
+                }
+            }
+        }
         if let Some(tp) = top_p {
             body["top_p"] = serde_json::json!(tp);
         }
@@ -782,21 +866,25 @@ impl OpenAICompatProvider {
 
         // Forced tool calls ("required") only engage for local backends with
         // constrained tool calls enabled; elsewhere this is "auto" (unchanged).
-        let tc_value = tool_choice_value(tool_choice, &self.api_base, self.constrained_tool_calls);
-        let mut request_has_tools = false;
+        // The streaming path never forces tools.
+        let tc_value = match kind {
+            RequestKind::Blocking { tool_choice } => {
+                tool_choice_value(tool_choice, &self.api_base, self.constrained_tool_calls)
+            }
+            RequestKind::Streaming => serde_json::json!("auto"),
+        };
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.clone());
                 body["tool_choice"] = tc_value.clone();
-                request_has_tools = true;
             }
         } else if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.to_vec());
-                body["tool_choice"] = tc_value.clone();
-                request_has_tools = true;
+                body["tool_choice"] = tc_value;
             }
         }
+        let request_has_tools = body.get("tools").is_some();
         apply_local_tool_call_controls(&mut body, &self.api_base, request_has_tools);
         // Local models can enter a sampling loop where a token sequence echoes
         // until max_tokens; repeat_penalty breaks it. No-op for cloud APIs.
@@ -804,6 +892,35 @@ impl OpenAICompatProvider {
         // Strict-validation servers (Apple FM) reject object schemas that omit a
         // `required` key; normalize every outgoing tool schema (no-op elsewhere).
         normalize_tool_schemas(&mut body);
+
+        (model.to_string(), body)
+    }
+
+    #[instrument(skip(self, messages, tools), fields(api_base = %self.api_base))]
+    #[allow(clippy::too_many_arguments)]
+    async fn chat_impl(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+        thinking_budget: Option<u32>,
+        top_p: Option<f64>,
+        tool_choice: ToolChoice,
+    ) -> Result<LLMResponse> {
+        let (model, body) = self.build_chat_request(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            thinking_budget,
+            top_p,
+            RequestKind::Blocking { tool_choice },
+        );
+        let url = format!("{}/chat/completions", self.api_base);
+
         // JIT gate: serialise access to JIT-loading servers.
         // Measure JIT wait separately from the actual API call.
         let jit_wait_start = std::time::Instant::now();
@@ -829,7 +946,7 @@ impl OpenAICompatProvider {
         let retry_url = url.clone();
         let api_key = self.api_key.clone();
         let api_base = self.api_base.clone();
-        let model_owned = model.to_string();
+        let model_owned = model.clone();
 
         use crate::errors::ProviderError;
         let result: Result<LLMResponse, ProviderError> = (|| {
@@ -859,54 +976,13 @@ impl OpenAICompatProvider {
                     .map_err(|e| ProviderError::ResponseReadError(e.to_string()))?;
 
                 if !status.is_success() {
-                    let status_code = status.as_u16();
-                    let body_snippet: String = response_text.chars().take(500).collect();
-                    // On 400 errors from local servers, log the message roles
-                    // to help diagnose chat template issues.
-                    if status_code == 400 && is_local_api_base(&api_base) {
-                        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
-                            let roles: Vec<&str> = msgs
-                                .iter()
-                                .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
-                                .collect();
-                            tracing::error!(
-                                model = %model_str,
-                                status = status_code,
-                                body = %body_snippet,
-                                roles = ?roles,
-                                message_count = msgs.len(),
-                                "local_llm_400_message_roles"
-                            );
-                        }
-                    }
-                    warn!(
-                        model = %model_str,
-                        api_base = %api_base,
-                        status = status_code,
-                        body = %body_snippet,
-                        "llm_api_error"
-                    );
-                    return Err(match status_code {
-                        429 => {
-                            let retry_ms = parse_retry_after_ms(&response_text);
-                            ProviderError::RateLimited {
-                                status: status_code,
-                                retry_after_ms: retry_ms,
-                            }
-                        }
-                        401 | 403 => ProviderError::AuthError {
-                            status: status_code,
-                            message: response_text,
-                        },
-                        500..=599 => ProviderError::ServerError {
-                            status: status_code,
-                            message: response_text,
-                        },
-                        _ => ProviderError::HttpError(format!(
-                            "HTTP {}: {}",
-                            status_code, response_text
-                        )),
-                    });
+                    return Err(map_status_to_provider_error(
+                        status.as_u16(),
+                        response_text,
+                        &api_base,
+                        &body,
+                        &model_str,
+                    ));
                 }
 
                 let data: serde_json::Value = serde_json::from_str(&response_text)
@@ -1017,89 +1093,18 @@ impl LLMProvider for OpenAICompatProvider {
         thinking_budget: Option<u32>,
         top_p: Option<f64>,
     ) -> Result<StreamHandle> {
-        let normalized = model.map(|m| normalize_model_name(m));
-        let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
-        let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
-        let (model, policy_model) =
-            resolve_request_and_policy_model(&self.api_base, &self.default_model, stripped);
-
-        debug!(
-            "chat_stream: api_base={} raw_model={} stripped={} model={} policy_model={}",
-            self.api_base, raw_model, stripped, model, policy_model
+        let (model, body) = self.build_chat_request(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            thinking_budget,
+            top_p,
+            RequestKind::Streaming,
         );
-
         let url = format!("{}/chat/completions", self.api_base);
 
-        let (request_messages, higgs_session_id) = request_messages_and_higgs_session_id(messages);
-        let request_messages = fold_developer_role_for_local(request_messages, &self.api_base);
-
-        // Inject cache_control breakpoints for Anthropic prompt caching.
-        let (cached_msgs, cached_tools) = if self.supports_cache_control(model) {
-            inject_cache_control(&request_messages, tools)
-        } else {
-            (request_messages, tools.map(|t| t.to_vec()))
-        };
-
-        // Log message roles for debugging chat template errors from local servers.
-        if is_local_api_base(&self.api_base) {
-            let roles: Vec<&str> = cached_msgs
-                .iter()
-                .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
-                .collect();
-            tracing::debug!(
-                model = model,
-                message_count = cached_msgs.len(),
-                roles = ?roles,
-                "local_llm_stream_request_roles"
-            );
-        }
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": cached_msgs,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": true,
-            "stream_options": { "include_usage": true },
-        });
-        if let Some(tp) = top_p {
-            body["top_p"] = serde_json::json!(tp);
-        }
-        if self.higgs_session_cache {
-            if let Some(session_id) = higgs_session_id {
-                body["session_id"] = serde_json::json!(session_id);
-            }
-        }
-        if is_local_api_base(&self.api_base) {
-            // Ask llama.cpp/higgs servers to stream prefill progress
-            // (`prompt_progress` chunks) so the REPL can show a real %.
-            // Local-only: cloud APIs may reject unknown fields, and their
-            // prefill is not the bottleneck. Servers without support
-            // (LM Studio) ignore the field.
-            body["return_progress"] = serde_json::json!(true);
-        }
-        apply_local_reasoning_controls(&mut body, &self.api_base, policy_model, thinking_budget);
-
-        let mut request_has_tools = false;
-        if let Some(ref tool_defs) = cached_tools {
-            if !tool_defs.is_empty() {
-                body["tools"] = serde_json::Value::Array(tool_defs.clone());
-                body["tool_choice"] = serde_json::json!("auto");
-                request_has_tools = true;
-            }
-        } else if let Some(tool_defs) = tools {
-            if !tool_defs.is_empty() {
-                body["tools"] = serde_json::Value::Array(tool_defs.to_vec());
-                body["tool_choice"] = serde_json::json!("auto");
-                request_has_tools = true;
-            }
-        }
-        apply_local_tool_call_controls(&mut body, &self.api_base, request_has_tools);
-        // Local models can enter a sampling loop where a token sequence echoes
-        // until max_tokens; repeat_penalty breaks it. No-op for cloud APIs.
-        apply_repetition_controls(&mut body, &self.api_base);
-        // Strict-validation servers (Apple FM) reject object schemas that omit a
-        // `required` key; normalize every outgoing tool schema (no-op elsewhere).
-        normalize_tool_schemas(&mut body);
         // JIT gate: serialise access to JIT-loading servers.
         // For streaming, the permit is moved into the spawned task so it's held
         // for the entire stream duration, preventing model switches mid-stream.
@@ -1127,7 +1132,7 @@ impl LLMProvider for OpenAICompatProvider {
         let stream_url = url.clone();
         let api_key = self.api_key.clone();
         let api_base = self.api_base.clone();
-        let model_owned = model.to_string();
+        let model_owned = model.clone();
 
         let response: Result<reqwest::Response, ProviderError> = (|| {
             let client = client.clone();
@@ -1154,48 +1159,13 @@ impl LLMProvider for OpenAICompatProvider {
                 let status = response.status();
                 if !status.is_success() {
                     let error_text = response.text().await.unwrap_or_default();
-                    let status_code = status.as_u16();
-                    // On 400 from local server, log roles to diagnose template errors.
-                    if status_code == 400 && is_local_api_base(&api_base) {
-                        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
-                            let roles: Vec<&str> = msgs
-                                .iter()
-                                .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
-                                .collect();
-                            tracing::error!(
-                                model = %model_str,
-                                status = status_code,
-                                error = %error_text,
-                                roles = ?roles,
-                                message_count = msgs.len(),
-                                "local_llm_stream_400_message_roles"
-                            );
-                        }
-                    }
-                    warn!(
-                        model = %model_str,
-                        api_base = %api_base,
-                        status = status_code,
-                        "llm_stream_api_error"
-                    );
-                    return Err(match status_code {
-                        429 => ProviderError::RateLimited {
-                            status: status_code,
-                            retry_after_ms: parse_retry_after_ms(&error_text),
-                        },
-                        401 | 403 => ProviderError::AuthError {
-                            status: status_code,
-                            message: error_text,
-                        },
-                        500..=599 => ProviderError::ServerError {
-                            status: status_code,
-                            message: error_text,
-                        },
-                        _ => ProviderError::HttpError(format!(
-                            "HTTP {}: {}",
-                            status_code, error_text
-                        )),
-                    });
+                    return Err(map_status_to_provider_error(
+                        status.as_u16(),
+                        error_text,
+                        &api_base,
+                        &body,
+                        &model_str,
+                    ));
                 }
 
                 Ok(response)
@@ -1779,6 +1749,62 @@ async fn parse_sse_stream(
 mod tests {
     use super::super::base::LLMProvider;
     use super::*;
+
+    /// chat and chat_stream must build identical request bodies apart from
+    /// the streaming-only fields — the whole point of build_chat_request.
+    #[test]
+    fn test_blocking_and_streaming_request_bodies_agree() {
+        let provider = OpenAICompatProvider::new(
+            "local",
+            Some("http://127.0.0.1:1234/v1"),
+            Some("qwen3-8b"),
+        );
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "prefix"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "t", "description": "d",
+                         "parameters": {"type": "object", "properties": {}}}
+        })];
+
+        let (model_b, mut blocking) = provider.build_chat_request(
+            &messages,
+            Some(&tools),
+            Some("qwen3-8b"),
+            256,
+            0.7,
+            None,
+            Some(0.9),
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+        let (model_s, mut streaming) = provider.build_chat_request(
+            &messages,
+            Some(&tools),
+            Some("qwen3-8b"),
+            256,
+            0.7,
+            None,
+            Some(0.9),
+            RequestKind::Streaming,
+        );
+
+        assert_eq!(model_b, model_s);
+        assert_eq!(blocking["stream"], serde_json::json!(false));
+        assert_eq!(streaming["stream"], serde_json::json!(true));
+
+        // Strip the fields that legitimately differ; the rest must be identical.
+        for body in [&mut blocking, &mut streaming] {
+            let obj = body.as_object_mut().unwrap();
+            obj.remove("stream");
+            obj.remove("stream_options");
+            obj.remove("return_progress");
+        }
+        assert_eq!(blocking, streaming);
+    }
 
     #[test]
     fn test_request_messages_extracts_higgs_session_marker() {
