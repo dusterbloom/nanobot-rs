@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{require_str, PermissionLevel, Tool};
 
 /// Type alias for the spawn callback.
 ///
@@ -316,10 +316,7 @@ impl Tool for SpawnTool {
                 }
             }
             "check" => {
-                let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
-                    Some(id) => id.to_string(),
-                    None => return "Error: 'task_id' parameter is required for check".to_string(),
-                };
+                let task_id = require_str!(params, "task_id", " for check").to_string();
                 let cb_guard = self.check_callback.lock().await;
                 match cb_guard.as_ref() {
                     Some(cb) => {
@@ -331,10 +328,7 @@ impl Tool for SpawnTool {
                 }
             }
             "cancel" => {
-                let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
-                    Some(id) => id.to_string(),
-                    None => return "Error: 'task_id' parameter is required for cancel".to_string(),
-                };
+                let task_id = require_str!(params, "task_id", " for cancel").to_string();
                 let cb_guard = self.cancel_callback.lock().await;
                 match cb_guard.as_ref() {
                     Some(cb) => {
@@ -346,10 +340,7 @@ impl Tool for SpawnTool {
                 }
             }
             "wait" => {
-                let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
-                    Some(id) => id.to_string(),
-                    None => return "Error: 'task_id' parameter is required for wait".to_string(),
-                };
+                let task_id = require_str!(params, "task_id", " for wait").to_string();
                 let timeout = params
                     .get("timeout")
                     .and_then(|v| v.as_u64())
@@ -385,10 +376,7 @@ impl Tool for SpawnTool {
                 }
             }
             "loop" => {
-                let task = match params.get("task").and_then(|v| v.as_str()) {
-                    Some(t) => t.to_string(),
-                    None => return "Error: 'task' parameter is required for loop".to_string(),
-                };
+                let task = require_str!(params, "task", " for loop").to_string();
                 let max_rounds = params
                     .get("max_rounds")
                     .and_then(|v| v.as_u64())
@@ -431,10 +419,7 @@ impl Tool for SpawnTool {
                 }
             }
             "spawn" | _ => {
-                let task = match params.get("task").and_then(|v| v.as_str()) {
-                    Some(t) => t.to_string(),
-                    None => return "Error: 'task' parameter is required".to_string(),
-                };
+                let task = require_str!(params, "task").to_string();
 
                 let label = params
                     .get("label")

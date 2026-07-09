@@ -9,7 +9,7 @@ use reqwest::Client;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::base::{PermissionLevel, Tool, ToolExecutionContext};
+use super::base::{require_str, PermissionLevel, Tool, ToolExecutionContext};
 use crate::agent::audit::ToolEvent;
 
 /// Shared user-agent string.
@@ -228,10 +228,7 @@ impl Tool for WebSearchTool {
     }
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let query = match params.get("query").and_then(|v| v.as_str()) {
-            Some(q) => q,
-            None => return "Error: 'query' parameter is required".to_string(),
-        };
+        let query = require_str!(params, "query");
 
         let count = params
             .get("count")

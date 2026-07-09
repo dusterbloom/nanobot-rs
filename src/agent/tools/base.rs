@@ -8,6 +8,29 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::audit::ToolEvent;
 
+/// Extract a required string parameter or early-return the canonical error.
+///
+/// `require_str!(params, "key")`          → `Error: 'key' parameter is required`
+/// `require_str!(params, "key", " for X")`→ `Error: 'key' parameter is required for X`
+/// `require_str!(params, "key", ".")`     → `Error: 'key' parameter is required.`
+///
+/// The suffix is appended verbatim so every pre-existing error string
+/// (tests assert exact substrings) is preserved byte-for-byte.
+macro_rules! require_str {
+    ($params:expr, $key:literal) => {
+        require_str!($params, $key, "")
+    };
+    ($params:expr, $key:literal, $suffix:literal) => {
+        match $params.get($key).and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => {
+                return concat!("Error: '", $key, "' parameter is required", $suffix).to_string()
+            }
+        }
+    };
+}
+pub(crate) use require_str;
+
 /// Permission level required to execute a tool.
 ///
 /// Ordered from least to most privileged. A registry's `max_permission`

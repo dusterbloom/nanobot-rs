@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{require_str, PermissionLevel, Tool};
 use crate::bus::events::OutboundMessage;
 
 /// Type alias for the send callback.
@@ -86,10 +86,7 @@ impl Tool for MessageTool {
     }
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let content = match params.get("content").and_then(|v| v.as_str()) {
-            Some(c) => c.to_string(),
-            None => return "Error: 'content' parameter is required".to_string(),
-        };
+        let content = require_str!(params, "content").to_string();
 
         let default_channel = self.default_channel.lock().await.clone();
         let default_chat_id = self.default_chat_id.lock().await.clone();

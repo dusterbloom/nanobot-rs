@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::Tool;
+use super::base::{require_str, Tool};
 use crate::agent::skills::SkillsLoader;
 
 /// Tool that reads a skill's full content by name.
@@ -51,10 +51,7 @@ impl Tool for ReadSkillTool {
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let name = match params.get("name").and_then(|v| v.as_str()) {
-            Some(n) => n,
-            None => return "Error: 'name' parameter is required".to_string(),
-        };
+        let name = require_str!(params, "name");
 
         let loader = SkillsLoader::new(&self.workspace, None);
 

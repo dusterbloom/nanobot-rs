@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::agent::tools::base::require_str;
+
 /// Names of async worker tools.
 pub const WORKER_TOOLS: &[&str] = &["verify", "python_eval", "diff_apply", "fmt_convert"];
 
@@ -110,10 +112,7 @@ pub async fn execute_worker_tool(
 
 /// Run a command and check output against expectations.
 async fn execute_verify(args: &HashMap<String, Value>) -> String {
-    let command = match args.get("command").and_then(|v| v.as_str()) {
-        Some(c) => c,
-        None => return "Error: 'command' parameter is required.".to_string(),
-    };
+    let command = require_str!(args, "command", ".");
 
     // Safety: apply the same deny patterns as ExecTool.
     if let Some(reason) = check_deny_patterns(command) {
@@ -192,10 +191,7 @@ async fn execute_verify(args: &HashMap<String, Value>) -> String {
 
 /// Execute Python code in a sandboxed environment.
 async fn execute_python_eval(args: &HashMap<String, Value>) -> String {
-    let code = match args.get("code").and_then(|v| v.as_str()) {
-        Some(c) => c,
-        None => return "Error: 'code' parameter is required.".to_string(),
-    };
+    let code = require_str!(args, "code", ".");
 
     let output = tokio::time::timeout(
         Duration::from_secs(5),
@@ -236,14 +232,8 @@ async fn execute_diff_apply(
     args: &HashMap<String, Value>,
     workspace: Option<&std::path::Path>,
 ) -> String {
-    let path = match args.get("path").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return "Error: 'path' parameter is required.".to_string(),
-    };
-    let diff = match args.get("diff").and_then(|v| v.as_str()) {
-        Some(d) => d,
-        None => return "Error: 'diff' parameter is required.".to_string(),
-    };
+    let path = require_str!(args, "path", ".");
+    let diff = require_str!(args, "diff", ".");
 
     // Security: if workspace is set, ensure path is within it.
     if let Some(ws) = workspace {
@@ -310,18 +300,9 @@ async fn execute_diff_apply(
 
 /// Convert data between formats.
 async fn execute_fmt_convert(args: &HashMap<String, Value>) -> String {
-    let input = match args.get("input").and_then(|v| v.as_str()) {
-        Some(i) => i,
-        None => return "Error: 'input' parameter is required.".to_string(),
-    };
-    let from = match args.get("from").and_then(|v| v.as_str()) {
-        Some(f) => f,
-        None => return "Error: 'from' parameter is required.".to_string(),
-    };
-    let to = match args.get("to").and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => return "Error: 'to' parameter is required.".to_string(),
-    };
+    let input = require_str!(args, "input", ".");
+    let from = require_str!(args, "from", ".");
+    let to = require_str!(args, "to", ".");
 
     if from == to {
         return input.to_string();

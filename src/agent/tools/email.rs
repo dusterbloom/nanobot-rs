@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{require_str, PermissionLevel, Tool};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::email::{poll_inbox, poll_inbox_api, send_email};
 use crate::config::schema::EmailConfig;
@@ -143,18 +143,9 @@ impl Tool for SendEmailTool {
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let to = match params.get("to").and_then(|v| v.as_str()) {
-            Some(t) => t,
-            None => return "Error: 'to' parameter is required".to_string(),
-        };
-        let subject = match params.get("subject").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return "Error: 'subject' parameter is required".to_string(),
-        };
-        let body = match params.get("body").and_then(|v| v.as_str()) {
-            Some(b) => b,
-            None => return "Error: 'body' parameter is required".to_string(),
-        };
+        let to = require_str!(params, "to");
+        let subject = require_str!(params, "subject");
+        let body = require_str!(params, "body");
         let reply_to = params.get("reply_to_message_id").and_then(|v| v.as_str());
 
         let mut msg = OutboundMessage::new("email", format!("email:{}", to), body);

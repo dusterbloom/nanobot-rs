@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{require_str, PermissionLevel, Tool};
 use crate::cron::executor::initial_next_run;
 use crate::cron::service::CronService;
 use crate::cron::types::CronSchedule;
@@ -185,10 +185,7 @@ impl Tool for CronScheduleTool {
     }
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let action = match params.get("action").and_then(|v| v.as_str()) {
-            Some(a) => a,
-            None => return "Error: 'action' parameter is required".to_string(),
-        };
+        let action = require_str!(params, "action");
 
         match action {
             "add" => {

@@ -17,7 +17,7 @@ static RE_POSIX_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/[^\s"']+
 static RE_WIN_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap());
 
-use super::base::{PermissionLevel, Tool, ToolExecutionContext};
+use super::base::{require_str, PermissionLevel, Tool, ToolExecutionContext};
 use crate::agent::audit::ToolEvent;
 
 /// Default deny patterns for dangerous shell commands.
@@ -352,10 +352,7 @@ impl Tool for ExecTool {
     }
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let command = match params.get("command").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => return "Error: 'command' parameter is required".to_string(),
-        };
+        let command = require_str!(params, "command");
 
         let cwd = self.resolve_cwd(&params);
 
@@ -432,10 +429,7 @@ impl Tool for ExecTool {
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let command = match params.get("command").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => return "Error: 'command' parameter is required".to_string(),
-        };
+        let command = require_str!(params, "command");
 
         let cwd = self.resolve_cwd(&params);
 
