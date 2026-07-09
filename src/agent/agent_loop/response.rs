@@ -762,6 +762,22 @@ impl AgentLoopShared {
     // Token telemetry
     // -----------------------------------------------------------------------
 
+    /// Classify a completed LLM call for metrics. A call that yields no
+    /// content AND no tool calls is not "ok" — it is the signature of a dead
+    /// stream (observed: 600s zero-token Higgs stall recorded as ok), and
+    /// hiding it makes provider health invisible in metrics.jsonl.
+    fn response_status(response: &LLMResponse) -> &'static str {
+        let no_content = response
+            .content
+            .as_deref()
+            .map_or(true, |c| c.trim().is_empty());
+        if no_content && response.tool_calls.is_empty() {
+            "empty_response"
+        } else {
+            "ok"
+        }
+    }
+
     fn emit_token_telemetry(&self, ctx: &TurnContext, response: &LLMResponse) {
         let counters = &self.core_handle.counters;
         let estimated_prompt = TokenBudget::estimate_tokens(&ctx.messages);
@@ -824,7 +840,7 @@ impl AgentLoopShared {
             completion_tokens: actual_completion.max(0) as u64,
             cache_read_tokens,
             cache_creation_tokens,
-            status: "ok".into(),
+            status: Self::response_status(response).into(),
             error_detail: None,
             anti_drift_score: None,
             anti_drift_signals: None,
@@ -861,6 +877,30 @@ fn prepare_rescue_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_response_status_flags_dead_streams() {
+        let resp = |content: Option<&str>, tool_calls: Vec<crate::providers::base::ToolCallRequest>| {
+            LLMResponse {
+                content: content.map(str::to_string),
+                tool_calls,
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            }
+        };
+        let tc = crate::providers::base::ToolCallRequest {
+            id: "tc1".into(),
+            name: "list_dir".into(),
+            arguments: std::collections::HashMap::new(),
+        };
+
+        // The 600s zero-token stall signature: nothing at all.
+        assert_eq!(AgentLoopShared::response_status(&resp(None, vec![])), "empty_response");
+        assert_eq!(AgentLoopShared::response_status(&resp(Some("  \n"), vec![])), "empty_response");
+        // Legitimate outcomes stay ok.
+        assert_eq!(AgentLoopShared::response_status(&resp(Some("hi"), vec![])), "ok");
+        assert_eq!(AgentLoopShared::response_status(&resp(None, vec![tc])), "ok");
+    }
 
     #[test]
     fn test_is_degenerate_continuation() {
