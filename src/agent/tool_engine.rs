@@ -22,8 +22,11 @@ use std::sync::Arc;
 use super::agent_loop::{ResponseBoundary, TurnContext};
 
 const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
-const INLINE_TOOL_RESULT_HOT_PROMPT_MAX_CHARS: usize = 2_400;
-const INLINE_TOOL_RESULT_HOT_PROMPT_MIN_CHARS: usize = 800;
+/// Hard cap on a tool result's in-context (preview) size. The full body is
+/// stashed in the tool_result_store for lossless `recall_tool_result`, so the
+/// preview can be small — bounding the per-result context cost.
+const INLINE_TOOL_RESULT_HOT_PROMPT_MAX_CHARS: usize = 1_200;
+const INLINE_TOOL_RESULT_HOT_PROMPT_MIN_CHARS: usize = 600;
 
 /// Per-tool token threshold above which a raw tool result is replaced by a
 /// summary. Enumerative tools (`exec`, `list_dir`, `web_search`, `read_file`)
@@ -76,6 +79,54 @@ fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> String {
     summary.chars().take(260).collect()
 }
 
+/// Digest a tool result for in-context storage with lossless retrieval.
+///
+/// Small results (≤ `cap`) pass through verbatim. Large results are reduced to
+/// a head+tail preview and the FULL body is stashed in `store` keyed by
+/// `tool_call_id`; the preview tells the model how to call
+/// `recall_tool_result` to recover the middle. This bounds each result's
+/// in-context cost to ~`cap` chars (so N tool calls cost ~N×cap, not N×full)
+/// while keeping any result one tool call away — no re-run needed.
+fn digest_tool_result(
+    tool_name: &str,
+    args: &std::collections::HashMap<String, Value>,
+    data: &str,
+    cap: usize,
+    tool_call_id: &str,
+    store: &parking_lot::Mutex<std::collections::HashMap<String, String>>,
+) -> String {
+    let total_chars = data.chars().count();
+    if total_chars <= cap {
+        return data.to_string();
+    }
+    store
+        .lock()
+        .insert(tool_call_id.to_string(), data.to_string());
+    let source = tool_arg_summary(args);
+    let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
+    let header = format!(
+        "[truncated: {tool_name}({source}) returned {total_chars} chars (~{estimated_tokens} tokens); \
+         head+tail shown — call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output]\n"
+    );
+    let footer = "\n[...]\n";
+    let fixed_chars = header.chars().count() + footer.chars().count();
+    let preview_budget = cap.saturating_sub(fixed_chars).max(200);
+    let head_chars = preview_budget * 2 / 3;
+    let tail_chars = preview_budget.saturating_sub(head_chars);
+    let head: String = data.chars().take(head_chars).collect();
+    let tail_rev: Vec<char> = data.chars().rev().take(tail_chars).collect();
+    let tail: String = tail_rev.into_iter().rev().collect();
+    let mut out = format!("{header}{head}{footer}{tail}");
+    if out.chars().count() > cap {
+        out = out.chars().take(cap).collect();
+    }
+    out
+}
+
+/// Head+tail preview builder retained as the reference for the truncation
+/// tests; production ingestion uses [`digest_tool_result`] (which adds
+/// lossless retrieval).
+#[allow(dead_code)]
 fn compact_inline_tool_result(
     tool_name: &str,
     args: &std::collections::HashMap<String, Value>,
@@ -431,7 +482,14 @@ pub(crate) async fn execute_tools_delegated(
         } else {
             ctx.content_gate.admit_simple(full_data).into_text()
         };
-        let injected = compact_inline_tool_result(&tc.name, &tc.arguments, &injected_raw, cap);
+        let injected = digest_tool_result(
+            &tc.name,
+            &tc.arguments,
+            &injected_raw,
+            cap,
+            &tc.id,
+            &ctx.counters.tool_result_store,
+        );
 
         if ctx.core.provenance_config.enabled {
             ContextBuilder::add_tool_result_immutable(
@@ -722,9 +780,23 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
             )
             .await
             .into_text();
-        compact_inline_tool_result(&r.tool_name, &r.arguments, &summarized, cap)
+        digest_tool_result(
+            &r.tool_name,
+            &r.arguments,
+            &summarized,
+            cap,
+            &r.tool_id,
+            &ctx.counters.tool_result_store,
+        )
     } else {
-        let prompt_data = compact_inline_tool_result(&r.tool_name, &r.arguments, &result_data, cap);
+        let prompt_data = digest_tool_result(
+            &r.tool_name,
+            &r.arguments,
+            &result_data,
+            cap,
+            &r.tool_id,
+            &ctx.counters.tool_result_store,
+        );
         ctx.content_gate.admit_simple(&prompt_data).into_text()
     };
 
@@ -1037,6 +1109,38 @@ mod tests {
         assert!(compacted.contains("re-request with a narrower range/query"));
         assert!(compacted.contains("\n[...]\n"));
         assert!(!compacted.contains("MIDDLE_SHOULD_BE_OMITTED"));
+    }
+
+    #[test]
+    fn digest_tool_result_passes_small_data_raw_and_stores_nothing() {
+        let store = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let args = HashMap::new();
+        let out = digest_tool_result("exec", &args, "short output", 1200, "call_1", &store);
+        assert_eq!(out, "short output");
+        assert!(store.lock().is_empty(), "small result must not be stored");
+    }
+
+    #[test]
+    fn digest_tool_result_stashes_full_and_points_to_recall() {
+        let store = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let mut args = HashMap::new();
+        args.insert("path".to_string(), serde_json::json!("src/lib.rs"));
+        let data = format!(
+            "{}MIDDLE_SECRET{}",
+            "head line\n".repeat(200),
+            "tail line\n".repeat(200)
+        );
+
+        let out = digest_tool_result("read_file", &args, &data, 1200, "call_42", &store);
+
+        // Preview is bounded and omits the middle.
+        assert!(out.chars().count() <= 1200);
+        assert!(!out.contains("MIDDLE_SECRET"));
+        // Points the model at the recall tool with the right id.
+        assert!(out.contains("recall_tool_result"));
+        assert!(out.contains("call_42"));
+        // Full body is stashed for lossless retrieval.
+        assert_eq!(store.lock().get("call_42").map(|s| s.len()), Some(data.len()));
     }
 
     #[test]

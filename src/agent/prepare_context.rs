@@ -507,6 +507,19 @@ impl AgentLoopShared {
             use crate::agent::lcm::LcmExpandTool;
             tools.register(Box::new(LcmExpandTool::new(lcm_engine)));
         }
+
+        // Register recall_tool_result: large tool results are digested to a
+        // head+tail preview at ingestion with the full body stashed in the
+        // per-agent tool_result_store. This tool recovers the full output
+        // losslessly on demand (no tool re-run). Registered whenever local
+        // mode is active (digestion is local-only via inline_hot_prompt cap).
+        if core.mode().is_local() {
+            tools.register(Box::new(
+                crate::agent::tools::recall_tool_result::RecallToolResultTool::new(
+                    counters.tool_result_store.clone(),
+                ),
+            ));
+        }
         let lcm_setup_ms = lap_ms();
 
         // Resolve or create session for this key.

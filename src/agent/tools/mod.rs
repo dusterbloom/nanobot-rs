@@ -13,6 +13,7 @@ pub mod message;
 pub mod read_skill;
 pub mod reasoning_tools;
 pub mod recall;
+pub mod recall_tool_result;
 pub mod registry;
 pub mod remember;
 pub mod search_context;

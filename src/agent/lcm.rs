@@ -533,10 +533,15 @@ impl LcmEngine {
                     continue;
                 }
                 let t = TokenBudget::estimate_message_tokens(message);
-                if seen_any && acc + t > protect_tokens {
+                // Tool results are losslessly retrievable via recall_tool_result,
+                // so weight them 2× in the protect budget: reasoning (user /
+                // assistant) is protected in preference to raw tool output, and
+                // oversized tool results get compacted (summarized) sooner.
+                let weighted = if role == "tool" { t.saturating_mul(2) } else { t };
+                if seen_any && acc + weighted > protect_tokens {
                     break; // protect window full; this older message is compacted
                 }
-                acc += t;
+                acc += weighted;
                 boundary = i;
                 seen_any = true;
             }
@@ -1602,6 +1607,25 @@ mod tests {
         }
         // Protect budget larger than all raws → nothing to compact.
         assert!(engine.find_oldest_raw_block_with_tokens(1024).is_none());
+    }
+
+    #[test]
+    fn test_protect_prefers_reasoning_over_tool_results() {
+        // Tool results are weighted 2× in the protect budget (they're
+        // retrievable via recall_tool_result), so a tool result that would
+        // otherwise fit gets compacted in favour of keeping reasoning raw.
+        let engine = &mut LcmEngine::new(LcmConfig::default());
+        let body = "the quick brown fox jumps over the lazy dog while the model prefills ";
+        ingest(engine, 1, "system", "System");
+        ingest(engine, 2, "assistant", &body.repeat(4)); // older reasoning (~50 tok)
+        ingest(engine, 3, "tool", &body.repeat(4)); // ~50 tok, weighted ~100 → overflows
+        ingest(engine, 4, "assistant", "ok"); // tiny, newest
+        // protect=50: newest assistant fits (~5); tool (weighted ~100) overflows → compacted.
+        let (start, end) = engine.find_oldest_raw_block_with_tokens(50).unwrap();
+        assert_eq!(start, 1);
+        // tool at active index 2 is in the compact block (end > 2) while the
+        // newest assistant at index 3 is protected (end <= 3) → end == 3.
+        assert_eq!(end, 3, "tool result compacted, newest reasoning protected");
     }
 
     #[test]
