@@ -144,12 +144,19 @@ pub(crate) fn select_endpoint(
 }
 
 /// Pure startup decision: discovery result + autostart policy → action.
+///
+/// `backend_is_higgs`: `localBackend: "higgs"` selects a MANAGED engine, so it
+/// is itself the spawn opt-in — when the selected engine is unreachable and
+/// nothing else was discovered, start it rather than fail every inference
+/// with "no server". `localAutostart` still governs the other backends.
 pub(crate) fn decide_startup(
     discovered: Option<AdoptedLocal>,
     autostart: LocalAutostart,
+    backend_is_higgs: bool,
 ) -> StartupAction {
     let Some(pair) = discovered else {
         return match autostart {
+            LocalAutostart::Off if backend_is_higgs => StartupAction::SpawnHiggs,
             LocalAutostart::Off => StartupAction::NoServerNote,
             LocalAutostart::Higgs => StartupAction::SpawnHiggs,
             LocalAutostart::Lmstudio => StartupAction::SpawnLmStudio,
@@ -165,7 +172,23 @@ pub(crate) async fn discover_endpoints(config: &Config) -> Vec<DiscoveredEndpoin
     let probes = candidate_endpoints(config).into_iter().map(|(base, source)| {
         let key = api_key.clone();
         async move {
-            let models = probe_models(&base, &key).await?;
+            let (models, served_by) = probe_models(&base, &key).await?;
+            // Classify by what actually answered, not which config key
+            // produced the URL: a manually-started Higgs adopted through
+            // `localApiBase` (source=Configured) must still be recognized as
+            // Higgs, or the adopt path never corrects `localBackend` and a
+            // stale "lmstudio" label keeps being re-persisted to config.json.
+            // Cluster peers are left as-is: the backend tag governs LOCAL
+            // server management and must not follow a remote peer's engine.
+            let is_localhost = base.contains("127.0.0.1") || base.contains("localhost");
+            let source = if served_by == ServedBy::Higgs
+                && is_localhost
+                && source != EndpointSource::ClusterPeer
+            {
+                EndpointSource::Higgs
+            } else {
+                source
+            };
             Some(DiscoveredEndpoint {
                 base_url: base,
                 source,
@@ -180,9 +203,18 @@ pub(crate) async fn discover_endpoints(config: &Config) -> Vec<DiscoveredEndpoin
         .collect()
 }
 
+/// What kind of server answered a probe, detected from the payload itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ServedBy {
+    /// Payload carries Higgs's `runtime_model_load` marker.
+    Higgs,
+    /// Any other OpenAI-compat server (LM Studio, llama-server, vLLM, ...).
+    Generic,
+}
+
 /// `GET {base}/models` with a hard [`PROBE_TIMEOUT_MS`] budget.
-/// `Some(ids)` = healthy endpoint (ids may be empty); `None` = dead/not OpenAI.
-async fn probe_models(base_url: &str, api_key: &str) -> Option<Vec<String>> {
+/// `Some((ids, kind))` = healthy endpoint (ids may be empty); `None` = dead/not OpenAI.
+async fn probe_models(base_url: &str, api_key: &str) -> Option<(Vec<String>, ServedBy)> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(PROBE_TIMEOUT_MS))
@@ -198,13 +230,18 @@ async fn probe_models(base_url: &str, api_key: &str) -> Option<Vec<String>> {
         return None;
     }
     let json = resp.json::<serde_json::Value>().await.ok()?;
+    let served_by = if json.get("runtime_model_load").is_some() {
+        ServedBy::Higgs
+    } else {
+        ServedBy::Generic
+    };
     let ids = json
         .get("data")?
         .as_array()?
         .iter()
         .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
         .collect();
-    Some(ids)
+    Some((ids, served_by))
 }
 
 #[cfg(test)]
@@ -314,19 +351,29 @@ mod tests {
     // -- decision fn: no server found must produce the note, never a spawn --
     #[test]
     fn test_decide_no_server_and_autostart_off_is_note_not_spawn() {
-        let action = decide_startup(None, LocalAutostart::Off);
+        let action = decide_startup(None, LocalAutostart::Off, false);
         assert_eq!(action, StartupAction::NoServerNote);
     }
 
     #[test]
     fn test_decide_no_server_spawns_only_with_explicit_autostart() {
         assert_eq!(
-            decide_startup(None, LocalAutostart::Higgs),
+            decide_startup(None, LocalAutostart::Higgs, false),
             StartupAction::SpawnHiggs
         );
         assert_eq!(
-            decide_startup(None, LocalAutostart::Lmstudio),
+            decide_startup(None, LocalAutostart::Lmstudio, false),
             StartupAction::SpawnLmStudio
+        );
+    }
+
+    // localBackend:"higgs" selects a MANAGED engine — that alone is the spawn
+    // opt-in. Selected-but-unreachable must start it, not fail every inference.
+    #[test]
+    fn test_decide_higgs_backend_spawns_even_with_autostart_off() {
+        assert_eq!(
+            decide_startup(None, LocalAutostart::Off, true),
+            StartupAction::SpawnHiggs
         );
     }
 
@@ -342,10 +389,12 @@ mod tests {
             LocalAutostart::Higgs,
             LocalAutostart::Lmstudio,
         ] {
-            assert_eq!(
-                decide_startup(Some(pair.clone()), autostart),
-                StartupAction::UseDiscovered(pair.clone())
-            );
+            for backend_is_higgs in [false, true] {
+                assert_eq!(
+                    decide_startup(Some(pair.clone()), autostart, backend_is_higgs),
+                    StartupAction::UseDiscovered(pair.clone())
+                );
+            }
         }
     }
 

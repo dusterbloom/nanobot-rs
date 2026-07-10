@@ -1468,6 +1468,7 @@ pub(crate) fn cmd_agent(
             Some(crate::local_discovery::decide_startup(
                 selected,
                 config.agents.defaults.local_autostart,
+                crate::config::schema::is_higgs_backend(&config.agents.defaults.local_backend),
             ))
         } else {
             None
