@@ -313,9 +313,17 @@ impl RuntimeCounters {
         const MIN_CEILING: usize = 4096;
 
         let expected_warm_ms = (prompt_tokens as f64 / WARM_RATE_TPS * 1000.0) as u64;
-        // Slow, pressured miss → the context at this size thrashed. Back off.
+        // Only treat a slow turn as "context too big" when the context is a
+        // meaningful fraction of the current ceiling. A slow turn at LOW context
+        // is a cold model (weights evicted, e.g. right after compaction or a
+        // sidecar spawn) — shrinking the ceiling further won't help and causes
+        // erratic over-tightening. Require prompt ≥ 50% of the ceiling.
+        let cur_ceiling = self.effective_context_ceiling.load(Ordering::Relaxed);
+        let big_context_threshold = (cur_ceiling as f64 * 0.5) as u64;
+        // Slow, pressured miss at a large context → thrashing; back off.
         if ttft_ms > MISS_BUDGET_MS
             && (ttft_ms as f64) > SLOW_MISS_FACTOR * expected_warm_ms.max(1) as f64
+            && prompt_tokens >= big_context_threshold
         {
             let new_ceiling = (((prompt_tokens as f64) * 0.8) as usize).max(MIN_CEILING);
             let prev = self
@@ -1058,6 +1066,21 @@ mod tests {
             c.effective_context_ceiling.load(Ordering::Relaxed),
             16_000,
             "should back off to 0.8 × the size that stalled"
+        );
+    }
+
+    #[test]
+    fn ceiling_slow_low_context_does_not_tighten() {
+        // A slow turn at LOW context is a cold model (e.g. right after
+        // compaction or a sidecar spawn evicted the weights), NOT an oversize
+        // context. Must NOT tighten — doing so caused erratic over-tightening
+        // on post-compaction re-prefills.
+        let c = ceiling_counters(); // default ceiling 32768
+        c.observe_context_ceiling(3_316, 55_000); // 3.3k prompt, 55s ttft
+        assert_eq!(
+            c.effective_context_ceiling.load(Ordering::Relaxed),
+            32768,
+            "cold-model stall must not tighten the ceiling"
         );
     }
 

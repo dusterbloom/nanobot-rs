@@ -346,14 +346,39 @@ impl LcmEngine {
             }
         };
 
-        // Collect the messages and their IDs.
-        let mut source_ids = Vec::new();
+        // Collect messages and source ids from the block. The block may contain
+        // prior Summary entries (so each compaction MERGES them with old raws
+        // into one summary, bounding summary mass). Their text is folded into
+        // the summarization input and their underlying source ids are unioned so
+        // the merged summary still points at every original (lcm_expand stays
+        // lossless).
+        let mut source_ids: Vec<MessageId> = Vec::new();
         let mut block_messages = Vec::new();
+        let mut raw_count = 0usize;
         for entry in &self.active[block_start..block_end] {
-            if let ContextEntry::Raw { msg_id, message } = entry {
-                source_ids.push(*msg_id);
-                block_messages.push(message.clone());
+            match entry {
+                ContextEntry::Raw { msg_id, message } => {
+                    source_ids.push(*msg_id);
+                    block_messages.push(message.clone());
+                    raw_count += 1;
+                }
+                ContextEntry::Summary { node_id, message } => {
+                    block_messages.push(message.clone());
+                    for sid in self.dag.all_source_ids(*node_id) {
+                        if !source_ids.contains(&sid) {
+                            source_ids.push(sid);
+                        }
+                    }
+                }
             }
+        }
+
+        // Need at least one RAW (new content) to merge — re-summarizing a lone
+        // summary with no new raws is wasted work.
+        if raw_count == 0 {
+            debug!("LCM: compact block had no raws (only summaries); nothing new to merge");
+            self.async_compaction_pending = false;
+            return None;
         }
 
         if block_messages.is_empty() {
@@ -473,56 +498,33 @@ impl LcmEngine {
         })
     }
 
-    /// Find the oldest contiguous block of raw messages to compact, keeping the
-    /// most recent ~`protect_tokens` worth of raw messages verbatim.
+    /// Find the block to compact: everything from the first compactible entry
+    /// (a Raw non-system message OR a prior Summary) up to the recent-protect
+    /// boundary.
     ///
-    /// Scans from the beginning and returns the FIRST run of real raw messages,
-    /// stopping at the first summary. Scanning from the start (rather than only
-    /// after the last summary) means a raw block sitting *before* a summary is
-    /// compacted oldest-first instead of being orphaned forever. Raws are never
-    /// inside a summary (summaries reference the store), so this never
-    /// re-compacts already-summarized content.
+    /// Including prior Summary nodes in the block is what bounds summary mass:
+    /// each compaction MERGES old summaries + old raws into one new summary, so
+    /// the active context holds at most ONE summary node instead of accumulating
+    /// one per compaction (which grew the post-compaction floor without bound).
     ///
     /// Protection is TOKEN-based (not message-count): walk back from the end
-    /// accumulating tokens of real raw messages; the boundary where we cross
-    /// `protect_tokens` is the earliest index still considered "recent". So a
-    /// single huge tool result can't blow past the protect target the way a
-    /// fixed message count could.
+    /// accumulating tokens of real raw messages (2× for tool results, which are
+    /// retrievable via recall_tool_result); the boundary where we cross
+    /// `protect_tokens` is the oldest still-protected index. Summaries are never
+    /// "recent turns" to protect — they stay compactible.
     fn find_oldest_raw_block_impl(&self, protect_tokens: usize) -> Option<(usize, usize)> {
-        let mut start = None;
-        let mut end = 0;
-
-        for i in 0..self.active.len() {
-            match &self.active[i] {
-                ContextEntry::Raw { message, .. } => {
-                    // Skip the system message and synthetic tail entries (e.g.
-                    // auto-expanded originals) — neither is a real message to
-                    // re-summarize, and compacting the latter would ping-pong.
-                    let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    if role == "system" || crate::agent::markers::is_synthetic(message) {
-                        continue;
-                    }
-                    if start.is_none() {
-                        start = Some(i);
-                    }
-                    end = i + 1;
-                }
-                ContextEntry::Summary { .. } => {
-                    if start.is_some() {
-                        break;
-                    }
-                }
+        // Block start = first compactible entry (Raw non-system/non-synthetic,
+        // or a prior Summary).
+        let start = (0..self.active.len()).find(|&i| match &self.active[i] {
+            ContextEntry::Raw { message, .. } => {
+                let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                role != "system" && !crate::agent::markers::is_synthetic(message)
             }
-        }
+            ContextEntry::Summary { .. } => true,
+        })?;
 
-        let s = start?;
-        // Walk back from the end, protecting the most recent raw messages until
-        // the protect-token budget would overflow. The newest message is always
-        // protected (it's the current turn); older messages are protected only
-        // while they fit, so a huge tool result can't monopolize the window the
-        // way a fixed message count could. `boundary` = index of the oldest
-        // protected message; the compact block is [s, boundary). If everything
-        // fits in the budget, boundary collapses to `s` → None (nothing to compact).
+        // Protect the most recent RAW messages (token-based, 2× tool weighting).
+        // `boundary` = oldest protected raw index; the compact block is [start, boundary).
         let mut acc: usize = 0;
         let mut boundary: usize = 0;
         let mut seen_any = false;
@@ -533,10 +535,6 @@ impl LcmEngine {
                     continue;
                 }
                 let t = TokenBudget::estimate_message_tokens(message);
-                // Tool results are losslessly retrievable via recall_tool_result,
-                // so weight them 2× in the protect budget: reasoning (user /
-                // assistant) is protected in preference to raw tool output, and
-                // oversized tool results get compacted (summarized) sooner.
                 let weighted = if role == "tool" { t.saturating_mul(2) } else { t };
                 if seen_any && acc + weighted > protect_tokens {
                     break; // protect window full; this older message is compacted
@@ -546,12 +544,8 @@ impl LcmEngine {
                 seen_any = true;
             }
         }
-        let clamped_end = end.min(boundary);
-        if clamped_end > s {
-            // At least 1 message in the block. A single huge message (e.g. a
-            // giant tool result) is worth compacting; the downstream
-            // MIN_COMPACTION_TOKENS guard filters blocks too small to bother.
-            Some((s, clamped_end))
+        if boundary > start {
+            Some((start, boundary))
         } else {
             None
         }
@@ -1949,6 +1943,69 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_compaction_merges_summaries_no_accumulation() {
+        // Each compaction must MERGE prior summaries + old raws into ONE
+        // summary, so summary mass stays bounded at one node. Without the
+        // merge, summaries accumulated one-per-compaction and the post-
+        // compaction floor grew without bound.
+        let mut engine = LcmEngine::new(LcmConfig {
+            enabled: true,
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+        let compactor = ContextCompactor::new(
+            Arc::new(SummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            4096,
+        );
+        let budget = TokenBudget::new(4096, 1024);
+        let body = "the quick brown fox jumps over the lazy dog while the model prefills tokens ";
+
+        let count_summaries = |e: &LcmEngine| {
+            e.active_entries()
+                .iter()
+                .filter(|en| matches!(en, ContextEntry::Summary { .. }))
+                .count()
+        };
+
+        // Round 1.
+        ingest(&mut engine, 1, "system", "System");
+        for i in 0..12 {
+            ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
+            ingest(&mut engine, 3 + 2 * i, "assistant", &format!("reply {i}: {body}"));
+        }
+        let r1 = engine.compact(&compactor, &budget, 0).await;
+        assert!(r1.is_some(), "first compaction fires");
+        assert_eq!(count_summaries(&engine), 1, "one summary after round 1");
+
+        // Round 2: add more turns and compact again.
+        for i in 0..12 {
+            ingest(&mut engine, 100 + 2 * i, "user", &format!("more {i}: {body}"));
+            ingest(&mut engine, 101 + 2 * i, "assistant", &format!("more reply {i}: {body}"));
+        }
+        let r2 = engine.compact(&compactor, &budget, 0).await;
+        assert!(r2.is_some(), "second compaction fires");
+        assert_eq!(
+            count_summaries(&engine),
+            1,
+            "summaries must merge (bounded at 1), not accumulate"
+        );
+
+        // Round 3: once more.
+        for i in 0..12 {
+            ingest(&mut engine, 200 + 2 * i, "user", &format!("extra {i}: {body}"));
+            ingest(&mut engine, 201 + 2 * i, "assistant", &format!("extra reply {i}: {body}"));
+        }
+        let _ = engine.compact(&compactor, &budget, 0).await;
+        assert_eq!(
+            count_summaries(&engine),
+            1,
+            "still one summary after round 3 — merge holds across compactions"
+        );
     }
 
     // -----------------------------------------------------------------------
