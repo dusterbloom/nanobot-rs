@@ -1007,7 +1007,7 @@ impl SubagentManager {
 
         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut tool_defs = if is_local {
-            tools.get_slim_definitions()
+            tools.get_lean_definitions()
         } else {
             tools.get_definitions()
         };
@@ -1026,7 +1026,7 @@ impl SubagentManager {
 
             // Refresh tool definitions for local models as used_tools may have expanded.
             if is_local && iteration > 0 {
-                tool_defs = tools.get_slim_definitions();
+                tool_defs = tools.get_lean_definitions();
             }
             let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
                 None

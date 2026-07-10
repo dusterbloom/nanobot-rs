@@ -881,10 +881,14 @@ pub enum LocalToolMode {
     /// Single proxy schema (~90 tokens) with inspect/execute modes.
     /// Requires a model smart enough to use indirect `tool(name, args)` calls.
     Proxy,
+    /// Core tools as slim schemas + proxy meta-tool for the rest (~1/2 the
+    /// tokens of Slim; long-tail tools reachable via `tool(name, args)`
+    /// inspect/dispatch). Default.
+    #[default]
+    Lean,
     /// Individual tool schemas with condensed descriptions and stripped parameter
     /// descriptions (~120 tokens for 12 tools). Keeps real tool names so models
-    /// call them directly. Default.
-    #[default]
+    /// call them directly.
     Slim,
     /// All schemas sent individually with condensed descriptions but full
     /// parameter detail (~350 tokens).

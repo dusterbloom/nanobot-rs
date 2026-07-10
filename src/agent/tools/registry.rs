@@ -663,6 +663,12 @@ impl ToolRegistry {
         "spawn",
     ];
 
+    /// Extra tools included (when registered) in the lean local surface,
+    /// on top of `CORE_TOOLS`. Everything else is reachable via the proxy
+    /// meta-tool appended by `get_lean_definitions`.
+    const LEAN_EXTRA_TOOLS: &'static [&'static str] =
+        &["read_skill", "web_search", "web_fetch", "message"];
+
     /// Keyword-to-tool mapping for context-triggered tool selection (cloud path).
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
         (
@@ -846,6 +852,31 @@ impl ToolRegistry {
                 }
             }
         }
+        defs
+    }
+
+    /// Lean local surface: core tools as slim schemas + the proxy meta-tool.
+    ///
+    /// Roughly half the tokens of the full slim surface. Long-tail tools stay
+    /// registered and executable — only their DEFINITIONS are omitted; the
+    /// model reaches them via `tool(name)` inspect / `tool(name, args)`
+    /// dispatch. The set is static per session (fixed name lists), so the
+    /// prompt-head tool block stays prefix-cache stable.
+    pub fn get_lean_definitions(&self) -> Vec<serde_json::Value> {
+        let mut defs: Vec<serde_json::Value> = self
+            .get_slim_definitions()
+            .into_iter()
+            .filter(|d| {
+                let name = d
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Self::CORE_TOOLS.contains(&name) || Self::LEAN_EXTRA_TOOLS.contains(&name)
+            })
+            .collect();
+        Self::sort_definitions(&mut defs);
+        // Proxy meta-tool goes LAST so the core schemas stay a stable prefix.
+        defs.extend(self.get_proxy_definition());
         defs
     }
 
@@ -1089,6 +1120,73 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+
+    /// Wire-cost budget for the local tool surface. The tool block is
+    /// rendered into the prompt HEAD by the chat template, so its size is
+    /// paid on every cold prefill and its hash must stay stable for the
+    /// prefix cache. Run with --nocapture to see the actual numbers.
+    #[test]
+    fn test_local_tool_surface_token_budget() {
+        use crate::agent::token_budget::TokenBudget;
+        let ws = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        let count = reg.get_local_definitions().len();
+        let full = TokenBudget::estimate_tool_def_tokens(&reg.get_definitions());
+        let local = TokenBudget::estimate_tool_def_tokens(&reg.get_local_definitions());
+        let slim = TokenBudget::estimate_tool_def_tokens(&reg.get_slim_definitions());
+        let lean = TokenBudget::estimate_tool_def_tokens(&reg.get_lean_definitions());
+        let proxy = TokenBudget::estimate_tool_def_tokens(&reg.get_proxy_definition());
+        println!(
+            "tool surface: count={count} full={full} local={local} slim={slim} lean={lean} proxy={proxy}"
+        );
+        assert!(
+            lean <= 1400,
+            "lean tool defs (the local default) ballooned to {lean} tokens (budget 1400) — \
+             every token here is cold-prefill cost on the local path"
+        );
+        assert!(
+            slim <= 2500,
+            "slim tool defs ballooned to {slim} tokens (budget 2500) across {count} tools"
+        );
+    }
+
+    /// Lean surface contract: core tools present as slim schemas, proxy
+    /// meta-tool appended last, long-tail tools NOT present as top-level
+    /// definitions, and the output byte-identical across calls (the tool
+    /// block is hashed for prefix-cache stability).
+    #[test]
+    fn test_lean_definitions_surface() {
+        let ws = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        let lean = reg.get_lean_definitions();
+        let names: Vec<&str> = lean
+            .iter()
+            .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(names.contains(&"read_file"), "core tool missing: {names:?}");
+        assert_eq!(
+            names.last(),
+            Some(&"tool"),
+            "proxy meta-tool must be the last definition: {names:?}"
+        );
+        // Long-tail tools are reachable only via the proxy, never top-level.
+        let allowed: Vec<&str> = ToolRegistry::CORE_TOOLS
+            .iter()
+            .chain(ToolRegistry::LEAN_EXTRA_TOOLS)
+            .copied()
+            .chain(std::iter::once("tool"))
+            .collect();
+        for n in &names {
+            assert!(allowed.contains(n), "unexpected top-level lean def: {n}");
+        }
+        assert!(!names.contains(&"browser") && !names.contains(&"send_email"));
+
+        // Determinism: byte-identical across two calls on the same registry.
+        let a = serde_json::to_vec(&lean).unwrap();
+        let b = serde_json::to_vec(&reg.get_lean_definitions()).unwrap();
+        assert_eq!(a, b, "lean definitions must be byte-identical across calls");
+    }
 
     /// A simple mock tool for registry tests.
     struct MockTool {

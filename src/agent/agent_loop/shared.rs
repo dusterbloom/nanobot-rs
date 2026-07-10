@@ -1153,6 +1153,7 @@ impl AgentLoopShared {
         let mut tool_defs = match ctx.core.mode() {
             RuntimeMode::Local { .. } => match ctx.core.local_tool_mode {
                 crate::config::schema::LocalToolMode::Proxy => ctx.tools.get_proxy_definition(),
+                crate::config::schema::LocalToolMode::Lean => ctx.tools.get_lean_definitions(),
                 crate::config::schema::LocalToolMode::Slim => ctx.tools.get_slim_definitions(),
                 crate::config::schema::LocalToolMode::Full => ctx.tools.get_local_definitions(),
             },
@@ -2618,18 +2619,21 @@ mod tests {
         use crate::config::schema::LocalToolMode;
         let mode = LocalToolMode::default();
         match mode {
-            LocalToolMode::Proxy | LocalToolMode::Slim | LocalToolMode::Full => {
+            LocalToolMode::Proxy
+            | LocalToolMode::Lean
+            | LocalToolMode::Slim
+            | LocalToolMode::Full => {
                 // Exhaustive match ensures any new variant trips the compiler,
                 // forcing Wave 1 to update the RuntimeMode::Local { tool_mode }
                 // constructor mapping.
             }
         }
-        // Sanity: default is Slim (individual tool schemas, condensed descs).
+        // Sanity: default is Lean (core slim schemas + proxy meta-tool).
         // Wave 1 `RuntimeMode::Local { tool_mode }` constructor must carry this
         // same default through unchanged.
         assert!(
-            matches!(LocalToolMode::default(), LocalToolMode::Slim),
-            "LocalToolMode::default() must stay Slim — Wave 1 RuntimeMode::Local tool_mode default pins on this"
+            matches!(LocalToolMode::default(), LocalToolMode::Lean),
+            "LocalToolMode::default() must stay Lean — Wave 1 RuntimeMode::Local tool_mode default pins on this"
         );
     }
 
