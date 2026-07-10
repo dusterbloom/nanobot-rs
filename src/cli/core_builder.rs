@@ -680,6 +680,7 @@ pub(crate) fn create_agent_loop(
         lcm_config,
         health_registry,
     );
+    agent_loop.set_compaction_sidecar(crate::higgs::CompactionSidecarSpec::from_config(config));
 
     agent_loop
 }

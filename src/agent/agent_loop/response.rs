@@ -848,6 +848,18 @@ impl AgentLoopShared {
             tool_calls_executed: 0,
             validation_result: None,
         });
+
+        // Phase D: feed this turn's TTFT + prompt size to the runtime
+        // context-ceiling detector. Local-only — cloud latency has different
+        // causes (network, provider queueing) and must not tighten a local
+        // compaction ceiling.
+        if ctx.core.model.starts_with("local:") {
+            if let Some(ttft_ms) = ctx.flow.ttft_ms {
+                self.core_handle
+                    .counters
+                    .observe_context_ceiling(actual_prompt.max(0) as u64, ttft_ms);
+            }
+        }
     }
 }
 

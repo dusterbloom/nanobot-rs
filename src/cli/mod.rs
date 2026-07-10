@@ -710,6 +710,7 @@ pub(crate) async fn run_gateway_async(
         lcm_config,
         Some(health_registry.clone()),
     );
+    agent_loop.set_compaction_sidecar(crate::higgs::CompactionSidecarSpec::from_config(&config));
 
     // Apply optional setup (e.g. MLX provider wiring).
     if let Some(f) = setup_fn {

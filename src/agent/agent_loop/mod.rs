@@ -216,6 +216,7 @@ impl AgentLoop {
             lcm_enabled: AtomicBool::new(lcm_config.is_enabled()),
             lcm_config,
             lcm_compactor,
+            compaction_sidecar: parking_lot::Mutex::new(None),
             health_registry,
             #[cfg(feature = "cluster")]
             cluster_router: None,
@@ -231,6 +232,13 @@ impl AgentLoop {
             max_concurrent_chats,
             reflection_spawned: AtomicBool::new(false),
         }
+    }
+
+    /// Install the compaction sidecar lifecycle spec (on-demand Bonsai). Set
+    /// once after construction from the call site that owns `Config`, so
+    /// `AgentLoop::new`'s signature stays stable for the many test builders.
+    pub fn set_compaction_sidecar(&self, spec: Option<crate::higgs::CompactionSidecarSpec>) {
+        *self.shared.compaction_sidecar.lock() = spec.map(Arc::new);
     }
 
     /// Set the cluster router for distributed inference routing.

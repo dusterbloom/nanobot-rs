@@ -187,15 +187,18 @@ impl From<&LcmSchemaConfig> for LcmConfig {
     }
 }
 
-/// Recent raw entries kept uncompacted by default (test helper / fallback).
-const DEFAULT_PROTECT_COUNT: usize = 4;
+/// Default recent-raw token budget for the test helper / fallback (≈1k tokens,
+/// matching the production protect target so post-compaction lands ~1–2k).
+const DEFAULT_PROTECT_TOKENS: usize = 1024;
 
-/// Tier-aware count of recent raw entries to keep verbatim, scaled to the
-/// available context budget: ~2 on a 4K window, ~8 on 32K, capped at 16 on very
-/// large windows. A fixed 4 protected too much on tiny tiers and too little on
-/// large ones.
-fn protect_count_for_budget(available_tokens: usize) -> usize {
-    (available_tokens / 4096).clamp(2, 16)
+/// Token budget for the recent raw messages kept verbatim (not summarized),
+/// scaled to the available context. ~5% of the budget, clamped to [512, 2048]:
+/// on a ~22k effective budget this keeps ~1k tokens of recent turns raw (the
+/// rest summarized), so post-compaction active context lands ~1–2k and a
+/// cache-miss re-prefill is a few seconds, not minutes. Token-based (not
+/// message-count) so a single huge tool result can't blow past the target.
+fn protect_tokens_for_budget(available_tokens: usize) -> usize {
+    (available_tokens / 20).clamp(512, 2048)
 }
 
 /// The LCM engine: manages the active context with lossless compaction.
@@ -324,13 +327,17 @@ impl LcmEngine {
         let available = budget.available_budget(tool_def_tokens);
         let target = (available as f64 * self.config.tau_soft * 0.8) as usize;
 
-        // Tier-aware protection: keep more recent turns verbatim on large windows,
-        // fewer on tiny ones. A fixed 4 was wrong for both 4K and 200K tiers.
-        let protect_count = protect_count_for_budget(available);
+        // Token-budgeted protection: keep ~1k tokens of the most recent raw
+        // turns verbatim (the rest summarized), so post-compaction active
+        // context lands ~1–2k regardless of individual message size. Cap at
+        // half the conversation so we always compact a meaningful portion
+        // (matters when messages are small relative to the protect target).
+        let protect_tokens = protect_tokens_for_budget(available)
+            .min(self.conversation_tokens().max(1) / 2);
 
         // Find the oldest contiguous block of raw messages to compact.
         // Skip the system message (index 0) and any existing summaries.
-        let (block_start, block_end) = match self.find_oldest_raw_block_impl(protect_count) {
+        let (block_start, block_end) = match self.find_oldest_raw_block_impl(protect_tokens) {
             Some(range) => range,
             None => {
                 debug!("LCM: no raw block to compact");
@@ -466,8 +473,8 @@ impl LcmEngine {
         })
     }
 
-    /// Find the oldest contiguous block of raw messages, keeping the most recent
-    /// `protect_count` raw entries uncompacted.
+    /// Find the oldest contiguous block of raw messages to compact, keeping the
+    /// most recent ~`protect_tokens` worth of raw messages verbatim.
     ///
     /// Scans from the beginning and returns the FIRST run of real raw messages,
     /// stopping at the first summary. Scanning from the start (rather than only
@@ -475,7 +482,13 @@ impl LcmEngine {
     /// compacted oldest-first instead of being orphaned forever. Raws are never
     /// inside a summary (summaries reference the store), so this never
     /// re-compacts already-summarized content.
-    fn find_oldest_raw_block_impl(&self, protect_count: usize) -> Option<(usize, usize)> {
+    ///
+    /// Protection is TOKEN-based (not message-count): walk back from the end
+    /// accumulating tokens of real raw messages; the boundary where we cross
+    /// `protect_tokens` is the earliest index still considered "recent". So a
+    /// single huge tool result can't blow past the protect target the way a
+    /// fixed message count could.
+    fn find_oldest_raw_block_impl(&self, protect_tokens: usize) -> Option<(usize, usize)> {
         let mut start = None;
         let mut end = 0;
 
@@ -503,16 +516,36 @@ impl LcmEngine {
         }
 
         let s = start?;
-        let raw_count = self
-            .active
-            .iter()
-            .filter(|e| matches!(e, ContextEntry::Raw { .. }))
-            .count();
-        let protect = protect_count.min(raw_count);
-        let max_end = self.active.len().saturating_sub(protect);
-        let clamped_end = end.min(max_end);
-        if clamped_end > s + 1 {
-            // Need at least 2 messages to justify compaction.
+        // Walk back from the end, protecting the most recent raw messages until
+        // the protect-token budget would overflow. The newest message is always
+        // protected (it's the current turn); older messages are protected only
+        // while they fit, so a huge tool result can't monopolize the window the
+        // way a fixed message count could. `boundary` = index of the oldest
+        // protected message; the compact block is [s, boundary). If everything
+        // fits in the budget, boundary collapses to `s` → None (nothing to compact).
+        let mut acc: usize = 0;
+        let mut boundary: usize = 0;
+        let mut seen_any = false;
+        for i in (0..self.active.len()).rev() {
+            if let ContextEntry::Raw { message, .. } = &self.active[i] {
+                let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role == "system" || crate::agent::markers::is_synthetic(message) {
+                    continue;
+                }
+                let t = TokenBudget::estimate_message_tokens(message);
+                if seen_any && acc + t > protect_tokens {
+                    break; // protect window full; this older message is compacted
+                }
+                acc += t;
+                boundary = i;
+                seen_any = true;
+            }
+        }
+        let clamped_end = end.min(boundary);
+        if clamped_end > s {
+            // At least 1 message in the block. A single huge message (e.g. a
+            // giant tool result) is worth compacting; the downstream
+            // MIN_COMPACTION_TOKENS guard filters blocks too small to bother.
             Some((s, clamped_end))
         } else {
             None
@@ -578,9 +611,19 @@ impl LcmEngine {
         &self.active
     }
 
-    /// Find the oldest contiguous block of raw messages (for testing).
+    /// Find the oldest contiguous block of raw messages (for testing), using the
+    /// default ~1k-token protect budget.
     pub fn find_oldest_raw_block(&self) -> Option<(usize, usize)> {
-        self.find_oldest_raw_block_impl(DEFAULT_PROTECT_COUNT)
+        self.find_oldest_raw_block_impl(DEFAULT_PROTECT_TOKENS)
+    }
+
+    /// Find the oldest contiguous block of raw messages with an explicit
+    /// protect-token budget (for testing the token-based boundary).
+    pub fn find_oldest_raw_block_with_tokens(
+        &self,
+        protect_tokens: usize,
+    ) -> Option<(usize, usize)> {
+        self.find_oldest_raw_block_impl(protect_tokens)
     }
 
     /// Auto-expand summaries that are relevant to the latest user message.
@@ -1534,22 +1577,47 @@ mod tests {
     }
 
     #[test]
-    fn test_find_oldest_raw_block() {
+    fn test_find_oldest_raw_block_token_based_protects_recent() {
         let engine = &mut LcmEngine::new(LcmConfig::default());
-        // System message (protected).
         ingest(engine, 1, "system", "System");
-        // 10 user/assistant messages.
+        // 10 messages, each ~100 tokens (400 chars). Total raw ≈ 2000 tokens.
+        let body = "x".repeat(400);
         for i in 0..10 {
-            ingest(engine, 2 + 2 * i, "user", &format!("Msg {}", i));
-            ingest(engine, 3 + 2 * i, "assistant", &format!("Reply {}", i));
+            ingest(engine, 2 + 2 * i, "user", &format!("Msg {i}: {body}"));
+            ingest(engine, 3 + 2 * i, "assistant", &format!("Reply {i}: {body}"));
         }
+        // Protect ~400 tokens (≈ the 4 most recent messages); compact the older run.
+        let (start, end) = engine.find_oldest_raw_block_with_tokens(400).unwrap();
+        assert_eq!(start, 1, "block starts after the system message");
+        assert!(end <= engine.active.len() - 4, "recent tail is protected");
+        assert!(end > start + 1, "a non-trivial block is compacted");
+    }
 
-        let block = engine.find_oldest_raw_block();
-        assert!(block.is_some());
-        let (start, end) = block.unwrap();
-        assert_eq!(start, 1); // After system message.
-                              // End should leave at least 4 raw messages protected.
-        assert!(end <= engine.active.len() - 4);
+    #[test]
+    fn test_find_oldest_raw_block_none_when_all_fit_in_protect_budget() {
+        let engine = &mut LcmEngine::new(LcmConfig::default());
+        ingest(engine, 1, "system", "System");
+        for i in 0..5 {
+            ingest(engine, 2 + i, "user", &format!("Msg {i}")); // tiny (~3 tokens)
+        }
+        // Protect budget larger than all raws → nothing to compact.
+        assert!(engine.find_oldest_raw_block_with_tokens(1024).is_none());
+    }
+
+    #[test]
+    fn test_find_oldest_raw_block_huge_old_message_is_compacted() {
+        // The point of token-based protect: one giant OLD tool result must not
+        // be protected as "a single message". The recent small replies are
+        // protected by the token budget; the giant is the compact block.
+        let engine = &mut LcmEngine::new(LcmConfig::default());
+        ingest(engine, 1, "system", "System");
+        ingest(engine, 2, "user", &"x".repeat(8000)); // ~2k-token giant, oldest
+        for i in 0..4 {
+            ingest(engine, 3 + i, "assistant", &format!("reply {i}")); // ~3 tokens each
+        }
+        let (start, end) = engine.find_oldest_raw_block_with_tokens(100).unwrap();
+        assert_eq!(start, 1, "the giant at index 1 starts the compact block");
+        assert_eq!(end, 2, "only the giant is compacted; the 4 recent replies are protected");
     }
 
     // -----------------------------------------------------------------------
@@ -1697,13 +1765,13 @@ mod tests {
                 &mut engine,
                 2 + 2 * i,
                 "user",
-                &format!("Question {} about lifetimes and borrowing rules.", i),
+                &format!("Question {i} about lifetimes and borrowing rules in Rust, with examples of move semantics and shared references across scopes. "),
             );
             ingest(
                 &mut engine,
                 3 + 2 * i,
                 "assistant",
-                &format!("Answer {} explains ownership semantics in detail.", i),
+                &format!("Answer {i} explains ownership semantics in detail, covering how values are dropped, how borrows prevent aliasing, and where lifetimes annotations are required. "),
             );
         }
 

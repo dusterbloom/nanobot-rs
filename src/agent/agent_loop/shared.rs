@@ -169,6 +169,14 @@ pub(crate) struct AgentLoopShared {
     pub(crate) lcm_enabled: AtomicBool,
     /// Dedicated LCM compactor (when `lcm.compaction_endpoint` is configured).
     pub(crate) lcm_compactor: Option<Arc<ContextCompactor>>,
+    /// Compaction sidecar lifecycle spec (set after construction via
+    /// `AgentLoop::set_compaction_sidecar`). When on-demand, the LCM compaction
+    /// task spawns the sidecar (`ensure_up`) before summarizing and stops it
+    /// (`release`) after, so it never resident-competes with the main model
+    /// between compactions. Mutex because it's set once at startup and read
+    /// rarely (once per compaction).
+    pub(crate) compaction_sidecar:
+        parking_lot::Mutex<Option<Arc<crate::higgs::CompactionSidecarSpec>>>,
     /// Health probe registry — used to gate LCM compaction when endpoint is degraded.
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     /// Cluster router for distributed inference (feature-gated).
@@ -1418,10 +1426,21 @@ impl AgentLoopShared {
                 && !has_pending_compaction
                 && !ctx.compaction.in_flight.load(Ordering::Relaxed)
             {
+                // Phase D: cap the threshold budget to the runtime-adaptive
+                // effective ceiling. A slow cache-miss tightens this ceiling,
+                // so LCM's soft/hard thresholds (fractions of `available`)
+                // shrink and the next compaction fires earlier — keeping the
+                // worst-case re-prefill tolerable under the current pressure.
+                let eff = ctx
+                    .counters
+                    .effective_context_ceiling
+                    .load(Ordering::Relaxed)
+                    .min(ctx.core.token_budget.max_context());
+                let budget = ctx.core.token_budget.with_max_context(eff);
                 let (action, conv_tokens, available, hard_limit, soft_limit) = {
                     let engine = lcm_engine.lock().await;
-                    let action = engine.check_thresholds(&ctx.core.token_budget, tool_def_tokens);
-                    let available = ctx.core.token_budget.available_budget(tool_def_tokens);
+                    let action = engine.check_thresholds(&budget, tool_def_tokens);
+                    let available = budget.available_budget(tool_def_tokens);
                     let conv = engine.conversation_tokens();
                     let hard = (available as f64 * engine.tau_hard()) as usize;
                     let soft = (available as f64 * engine.tau_soft()) as usize;
@@ -1448,10 +1467,16 @@ impl AgentLoopShared {
                         let in_flight = ctx.compaction.in_flight.clone();
                         let bg_messages = ctx.messages.clone();
                         let bg_core = ctx.core.clone();
+                        let bg_eff_budget = eff; // carry Phase-D ceiling into the spawned compaction
                         let bg_session_key = ctx.session_key.clone();
                         let bg_session_id = ctx.session_id.clone();
                         let bg_lcm = lcm_engine.clone();
                         let bg_lcm_compactor = self.lcm_compactor.clone();
+                        // On-demand Bonsai: capture the sidecar spec so the
+                        // spawned compaction can spawn it before summarizing
+                        // and stop it after (freeing unified memory between
+                        // compactions). None when always-on or no sidecar.
+                        let bg_sidecar = self.compaction_sidecar.lock().clone();
                         let watermark = ctx.messages.len();
                         let bg_turn_count = ctx.turn_count;
                         in_flight.store(true, Ordering::SeqCst);
@@ -1467,6 +1492,19 @@ impl AgentLoopShared {
                         }
 
                         tokio::spawn(async move {
+                            // On-demand Bonsai: bring the sidecar up for this
+                            // compaction pass. Failure is non-fatal — the
+                            // compactor call will simply fail and disable itself
+                            // for the run (existing behaviour); we still attempt
+                            // the release so a half-started sidecar is cleaned up.
+                            if let Some(spec) = bg_sidecar.as_ref() {
+                                if let Err(e) = spec.ensure_up().await {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "compaction_sidecar_ensure_up_failed"
+                                    );
+                                }
+                            }
                             let timeout_result =
                                 tokio::time::timeout(Duration::from_secs(90), async {
                                     // Use dedicated LCM compactor if configured,
@@ -1475,7 +1513,9 @@ impl AgentLoopShared {
                                         bg_lcm_compactor.as_deref().unwrap_or(&bg_core.compactor);
                                     let summary_turn = {
                                         let mut engine = bg_lcm.lock().await;
-                                        engine.compact(compactor, &bg_core.token_budget, 0).await
+                                        let bg_budget =
+                                            bg_core.token_budget.with_max_context(bg_eff_budget);
+                                        engine.compact(compactor, &bg_budget, 0).await
                                     };
 
                                     // Extract text from Turn::Summary for working memory and result.
@@ -1556,6 +1596,12 @@ impl AgentLoopShared {
                                 .await;
                             if timeout_result.is_err() {
                                 warn!("LCM compaction timed out after 90s, resetting in_flight");
+                            }
+                            // On-demand Bonsai: release the sidecar now that the
+                            // compaction pass is done (success or timeout), so it
+                            // stops competing with the main model for memory.
+                            if let Some(spec) = bg_sidecar.as_ref() {
+                                spec.release();
                             }
                             in_flight.store(false, Ordering::SeqCst);
                         });

@@ -5,7 +5,7 @@
 //! compaction utilities.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -226,6 +226,17 @@ pub struct RuntimeCounters {
     pub lcm_tokens_after: AtomicU64,
     /// Epoch ms of the most recently installed compaction (0 = never).
     pub lcm_last_compaction_ms: AtomicU64,
+    /// Runtime-adaptive context ceiling (Phase D). Starts at the resolved
+    /// context budget; tightened when a slow cache-miss turn signals the model
+    /// is thrashing at the current size under memory pressure; loosened slowly
+    /// on sustained fast turns. LCM compaction thresholds scale to this, so a
+    /// slow miss makes the next compaction fire earlier.
+    pub effective_context_ceiling: AtomicUsize,
+    /// Upper bound `effective_context_ceiling` loosens back toward (= the
+    /// resolved context budget at startup).
+    pub default_context_ceiling: AtomicUsize,
+    /// Consecutive fast-turn counter driving the loosen logic.
+    pub consecutive_fast_turns: AtomicUsize,
 }
 
 impl RuntimeCounters {
@@ -263,6 +274,72 @@ impl RuntimeCounters {
             lcm_tokens_before: AtomicU64::new(0),
             lcm_tokens_after: AtomicU64::new(0),
             lcm_last_compaction_ms: AtomicU64::new(0),
+            effective_context_ceiling: AtomicUsize::new(max_context_tokens),
+            default_context_ceiling: AtomicUsize::new(max_context_tokens),
+            consecutive_fast_turns: AtomicUsize::new(0),
+        }
+    }
+
+    /// Phase D runtime context-ceiling detector.
+    ///
+    /// Called after every local inference with the turn's prompt-token count and
+    /// time-to-first-token. A prefix-cache *hit* is near-instant regardless of
+    /// context size; a warm *miss* costs `prompt_tokens / WARM_RATE`; a
+    /// pressured miss (weights evicted by the prefill working set) is far
+    /// slower — that is the "waiting minutes" stall. When we observe one, the
+    /// context at this size is too big under current pressure, so we tighten
+    /// the effective ceiling: LCM then compacts earlier, the next turn's
+    /// worst-case miss is smaller, and the model stops thrashing. Sustained
+    /// fast turns loosen it back toward the default — so a better-quantized
+    /// model or freed memory naturally raises the ceiling again.
+    pub fn observe_context_ceiling(&self, prompt_tokens: u64, ttft_ms: u64) {
+        const MISS_BUDGET_MS: u64 = 30_000;
+        const WARM_RATE_TPS: f64 = 3000.0;
+        const SLOW_MISS_FACTOR: f64 = 2.5;
+        const FAST_TTFT_MS: u64 = 5_000;
+        const FAST_RUNS_TO_LOOSEN: usize = 8;
+        const LOOSEN_FRAC: f64 = 1.15;
+        const MIN_CEILING: usize = 4096;
+
+        let expected_warm_ms = (prompt_tokens as f64 / WARM_RATE_TPS * 1000.0) as u64;
+        // Slow, pressured miss → the context at this size thrashed. Back off.
+        if ttft_ms > MISS_BUDGET_MS
+            && (ttft_ms as f64) > SLOW_MISS_FACTOR * expected_warm_ms.max(1) as f64
+        {
+            let new_ceiling = (((prompt_tokens as f64) * 0.8) as usize).max(MIN_CEILING);
+            let prev = self
+                .effective_context_ceiling
+                .fetch_min(new_ceiling, Ordering::Relaxed);
+            if new_ceiling < prev {
+                self.consecutive_fast_turns.store(0, Ordering::Relaxed);
+                tracing::info!(
+                    ttft_ms,
+                    prompt_tokens,
+                    from = prev,
+                    to = new_ceiling,
+                    "context_ceiling_tightened_slow_miss"
+                );
+            }
+            return;
+        }
+        // Fast turn → the model is comfortable; accumulate toward a loosen.
+        if ttft_ms < FAST_TTFT_MS {
+            let n = self.consecutive_fast_turns.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= FAST_RUNS_TO_LOOSEN {
+                self.consecutive_fast_turns.store(0, Ordering::Relaxed);
+                let cur = self.effective_context_ceiling.load(Ordering::Relaxed);
+                let default = self.default_context_ceiling.load(Ordering::Relaxed);
+                let raised = ((cur as f64) * LOOSEN_FRAC).min(default as f64) as usize;
+                if raised > cur {
+                    self.effective_context_ceiling
+                        .store(raised, Ordering::Relaxed);
+                    tracing::debug!(
+                        from = cur, to = raised, default, "context_ceiling_loosened_sustained_fast"
+                    );
+                }
+            }
+        } else {
+            self.consecutive_fast_turns.store(0, Ordering::Relaxed);
         }
     }
 
@@ -703,7 +780,24 @@ fn resolve_memory_provider(
     match mode {
         RuntimeMode::Local { .. } => {
             let mem_model = if !memory_config.model.is_empty() {
-                memory_config.model.clone()
+                // If the memory provider targets a localhost sidecar AND we have
+                // a managed Higgs compaction sidecar, prefer "active" (Higgs'
+                // transport indirection) over the literal config name. The
+                // sidecar serves exactly one model, so "active" always resolves
+                // to whatever it loaded — a stale/mismatched `memory.model`
+                // (e.g. "bonsai-1.7b-mlx" vs the loaded "Bonsai-1.7B-mlx-1bit")
+                // can't 404. This works for both always-on and on-demand spawn
+                // (where the sidecar isn't up at build time to be queried).
+                let targets_sidecar = memory_config
+                    .provider
+                    .as_ref()
+                    .and_then(|p| p.api_base.as_deref())
+                    .is_some_and(|b| b.contains("127.0.0.1") || b.contains("localhost"));
+                if targets_sidecar && compaction_provider.is_some() {
+                    "active".to_string()
+                } else {
+                    memory_config.model.clone()
+                }
             } else if let Some(sp) = specialist_provider {
                 // Trio specialist is ideal for summarisation tasks.
                 sp.get_default_model().to_string()
@@ -936,5 +1030,62 @@ mod tests {
 
         assert_eq!(counters.reset_session_prompt_state(session), 2);
         assert_eq!(counters.session_prompt_epoch(session), 2);
+    }
+
+    // -- Phase D: runtime context-ceiling detection -----------------------
+
+    fn ceiling_counters() -> RuntimeCounters {
+        RuntimeCounters::new_with_config(32768, &CircuitBreakerConfig::default())
+    }
+
+    #[test]
+    fn ceiling_slow_pressured_miss_tightens() {
+        let c = ceiling_counters();
+        // 20k prompt, 120s TTFT — a pressured miss (warm would be ~6.7s).
+        c.observe_context_ceiling(20_000, 120_000);
+        assert_eq!(
+            c.effective_context_ceiling.load(Ordering::Relaxed),
+            16_000,
+            "should back off to 0.8 × the size that stalled"
+        );
+    }
+
+    #[test]
+    fn ceiling_cache_hit_does_not_tighten() {
+        let c = ceiling_counters();
+        // 20k prompt but 3s TTFT — a prefix-cache hit. No tightening.
+        c.observe_context_ceiling(20_000, 3_000);
+        assert_eq!(c.effective_context_ceiling.load(Ordering::Relaxed), 32768);
+    }
+
+    #[test]
+    fn ceiling_warm_miss_under_budget_kept() {
+        // 30k prompt, 12s TTFT — a warm miss (expected ~10s), under the 30s
+        // budget. Not a pressured stall, so the ceiling must not drop.
+        let c = ceiling_counters();
+        c.observe_context_ceiling(30_000, 12_000);
+        assert_eq!(c.effective_context_ceiling.load(Ordering::Relaxed), 32768);
+    }
+
+    #[test]
+    fn ceiling_sustained_fast_loosens_back_up() {
+        let c = ceiling_counters();
+        c.observe_context_ceiling(20_000, 120_000); // tighten to 16k
+        let tightened = c.effective_context_ceiling.load(Ordering::Relaxed);
+        assert_eq!(tightened, 16_000);
+        for _ in 0..8 {
+            c.observe_context_ceiling(1_000, 1_000); // fast turns
+        }
+        let after = c.effective_context_ceiling.load(Ordering::Relaxed);
+        assert!(after > tightened, "expected loosen after sustained fast, got {after}");
+        assert!(after <= 32768, "never exceeds the default");
+    }
+
+    #[test]
+    fn ceiling_never_drops_below_floor() {
+        let c = ceiling_counters();
+        // Tiny prompt but very slow — still floor at 4k, not 800.
+        c.observe_context_ceiling(1_000, 120_000);
+        assert!(c.effective_context_ceiling.load(Ordering::Relaxed) >= 4096);
     }
 }

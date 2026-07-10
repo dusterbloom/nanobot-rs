@@ -268,6 +268,19 @@ impl TokenBudget {
         }
     }
 
+    /// Return a copy of this budget with `max_context` overridden. Used to cap
+    /// LCM's threshold budget to the runtime-adaptive effective ceiling without
+    /// mutating the shared budget (Phase D). `used_tokens` is reset since this
+    /// is only used for threshold math, not admission tracking.
+    pub fn with_max_context(&self, max_context: usize) -> Self {
+        Self {
+            max_context,
+            reserve_response: self.reserve_response,
+            used_tokens: 0,
+            output_reserve: self.output_reserve,
+        }
+    }
+
     /// Create a budget with a fractional output reserve (used by ContentGate).
     ///
     /// `output_reserve` is the fraction reserved for generation (0.0–1.0).
@@ -327,7 +340,7 @@ impl TokenBudget {
     }
 
     /// Estimate token count for a single message Value.
-    fn estimate_message_tokens(msg: &Value) -> usize {
+    pub fn estimate_message_tokens(msg: &Value) -> usize {
         let mut tokens = 4; // per-message overhead (role, delimiters)
 
         if let Some(content) = msg.get("content") {

@@ -361,6 +361,64 @@ async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
     false
 }
 
+/// Lifecycle spec for the compaction Higgs sidecar.
+///
+/// In always-on mode the sidecar is started once at REPL startup and kept
+/// resident. In on-demand mode (the default) it is spawned just before a
+/// compaction pass and stopped right after, so the lightweight compaction
+/// model never competes with the main model for unified memory between
+/// compactions. `ensure_up` is idempotent (a running sidecar is a no-op), and
+/// `release` is a no-op in always-on mode.
+#[derive(Debug, Clone)]
+pub(crate) struct CompactionSidecarSpec {
+    pub bin: PathBuf,
+    pub port: u16,
+    pub dir: String,
+    pub model: String,
+    pub on_demand: bool,
+}
+
+impl CompactionSidecarSpec {
+    /// Build from config. Returns `None` when there is no compaction sidecar
+    /// (no port), no spawnable model directory, or no `higgs` binary on disk —
+    /// in all those cases compaction falls back to the main model.
+    pub(crate) fn from_config(config: &crate::config::schema::Config) -> Option<Self> {
+        let port = config.agents.defaults.higgs_compaction_port?;
+        let bin = find_binary()?;
+        let (dir, model) = compaction_sidecar_config(config);
+        let dir = dir?;
+        let on_demand = config.agents.defaults.higgs_compaction_on_demand.unwrap_or(true);
+        Some(Self {
+            bin,
+            port,
+            dir,
+            model,
+            on_demand,
+        })
+    }
+
+    /// Ensure the sidecar is reachable before a compaction/memory call.
+    /// Idempotent: a running sidecar (always-on, or a prior on-demand spawn)
+    /// returns `Ready` immediately.
+    pub(crate) async fn ensure_up(&self) -> Result<(), String> {
+        if !self.on_demand {
+            return Ok(());
+        }
+        match server_start_role(&self.bin, self.port, &self.dir, &self.model, "compaction").await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Release the sidecar after a compaction/memory call (on-demand only).
+    pub(crate) fn release(&self) {
+        if !self.on_demand {
+            return;
+        }
+        let _ = server_stop_role("compaction");
+    }
+}
+
 /// Resolve the compaction sidecar's `(model_dir, model)` from config,
 /// mirroring the main-instance fallbacks: configured compaction dir, else the
 /// main model dir; configured compaction model, else the main local model.

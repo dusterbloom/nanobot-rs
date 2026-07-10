@@ -607,6 +607,19 @@ fn spawn_higgs_keepalive(
     })
 }
 
+/// Resolve the model id a Higgs keepalive should ping.
+///
+/// Adopts the id the server *actually serves* (via `GET /v1/models`) so a stale
+/// config hint can't make every warm-keep ping 404 — e.g. `lmsMainModel:
+/// "qwen36-35b"` against a Higgs that loaded `Qwen3.6-35B-A3B-4bit`, or
+/// `higgsCompactionModel: "bonsai-1.7b"` against `Bonsai-1.7B-mlx-1bit`. Falls
+/// back to `hint` when the server can't be queried (still loading, or not
+/// OpenAI-compatible) so we never send an empty model field.
+async fn resolve_keepalive_model(api_base: &str, api_key: &str, hint: &str) -> String {
+    let served = crate::higgs::list_served_models_at(api_base, api_key).await;
+    crate::higgs::adopt_served_model(hint, &served).unwrap_or_else(|| hint.to_string())
+}
+
 /// Parse a `/ctx` argument into a byte count.
 ///
 /// Accepts:
@@ -1640,6 +1653,22 @@ pub(crate) fn cmd_agent(
         // how the main endpoint was provisioned.
         if is_local {
             if let Some(compaction_port) = config.agents.defaults.higgs_compaction_port {
+                let on_demand = config
+                    .agents
+                    .defaults
+                    .higgs_compaction_on_demand
+                    .unwrap_or(true);
+                if on_demand {
+                    // On-demand Bonsai: don't start the sidecar now — it is
+                    // spawned per-compaction (CompactionSidecarSpec::ensure_up)
+                    // and stopped right after, so it never resident-competes
+                    // with the main model between compactions. The port stays
+                    // set so the compaction provider + spec target it.
+                    info!(
+                        port = compaction_port,
+                        "higgs_compaction_on_demand_enabled_sidecar_not_started"
+                    );
+                } else {
                 let (cmodel_dir, cmodel) = crate::higgs::compaction_sidecar_config(&config);
                 match cmodel_dir {
                     Some(dir) => {
@@ -1686,6 +1715,7 @@ pub(crate) fn cmd_agent(
                         config.agents.defaults.higgs_compaction_port = None;
                     }
                 }
+                } // end always-on (!on_demand) branch
             }
         }
 
@@ -2321,66 +2351,97 @@ pub(crate) fn cmd_agent(
             // reload on the next turn (the watchdog only checks liveness; it
             // doesn't touch the weights). Gated to our own localhost Higgs.
             let keepalive_stop = Arc::new(AtomicBool::new(false));
-            let keepalive_handle = higgs_keepalive_secs(
+            let keepalive_handle = match higgs_keepalive_secs(
                 &ctx.config.agents.defaults.local_backend,
                 &ctx.config.agents.defaults.local_api_base,
                 std::env::var("NANOBOT_HIGGS_KEEPALIVE_SECS").ok().as_deref(),
-            )
-            .map(|secs| {
-                let model = if !ctx.config.agents.defaults.lms_main_model.is_empty() {
-                    ctx.config.agents.defaults.lms_main_model.clone()
-                } else {
-                    local_model_name.clone()
-                };
-                info!(interval_s = secs, model = %model, "higgs_keepalive_enabled");
-                spawn_higgs_keepalive(
-                    ctx.config.agents.defaults.local_api_base.clone(),
-                    ctx.config.agents.defaults.local_api_key.clone(),
-                    model,
-                    secs,
-                    Arc::clone(&ctx.core_handle.counters.inference_active),
-                    Arc::clone(&keepalive_stop),
-                )
-            });
+            ) {
+                Some(secs) => {
+                    // Adopt the id Higgs actually serves (via /v1/models) rather
+                    // than the raw config hint, so the ping can't 404 on a name
+                    // the server never loaded (e.g. lmsMainModel "qwen36-35b" vs
+                    // the loaded "Qwen3.6-35B-A3B-4bit"). Discovery may have
+                    // missed it when /v1/models was slow/wedged at startup.
+                    let model = resolve_keepalive_model(
+                        &ctx.config.agents.defaults.local_api_base,
+                        &ctx.config.agents.defaults.local_api_key,
+                        &local_model_name,
+                    )
+                    .await;
+                    info!(interval_s = secs, model = %model, "higgs_keepalive_enabled");
+                    Some(spawn_higgs_keepalive(
+                        ctx.config.agents.defaults.local_api_base.clone(),
+                        ctx.config.agents.defaults.local_api_key.clone(),
+                        model,
+                        secs,
+                        Arc::clone(&ctx.core_handle.counters.inference_active),
+                        Arc::clone(&keepalive_stop),
+                    ))
+                }
+                None => None,
+            };
 
             // Keepalive for the dedicated compaction Higgs sidecar (same
             // interval as the main keepalive). Runs only when the compaction
-            // port is set and points at our own localhost sidecar.
+            // port is set, points at our own localhost sidecar, AND the sidecar
+            // is always-on — an on-demand sidecar is down between compactions,
+            // so pinging it would just spam connection-refused warnings.
+            let compaction_on_demand = ctx
+                .config
+                .agents
+                .defaults
+                .higgs_compaction_on_demand
+                .unwrap_or(true);
             let compaction_keepalive_stop = Arc::new(AtomicBool::new(false));
             let compaction_keepalive_handle: Option<tokio::task::JoinHandle<()>> =
-                if let Some(cport) = ctx.config.agents.defaults.higgs_compaction_port {
+                if !compaction_on_demand {
+                    if let Some(cport) = ctx.config.agents.defaults.higgs_compaction_port {
                     let base = format!("http://127.0.0.1:{cport}/v1");
                     // The sidecar is always a Higgs instance regardless of the
                     // MAIN backend tag — pass "higgs" so the keepalive isn't
                     // dead-gated when the main backend is LM Studio.
-                    higgs_keepalive_secs(
+                    match higgs_keepalive_secs(
                         "higgs",
                         &base,
                         std::env::var("NANOBOT_HIGGS_KEEPALIVE_SECS").ok().as_deref(),
-                    )
-                    .map(|secs| {
-                        let model = ctx
-                            .config
-                            .agents
-                            .defaults
-                            .higgs_compaction_model
-                            .clone()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| local_model_name.clone());
-                        info!(interval_s = secs, port = cport, model = %model, "higgs_compaction_keepalive_enabled");
-                        spawn_higgs_keepalive(
-                            base,
-                            ctx.config.agents.defaults.local_api_key.clone(),
-                            model,
-                            secs,
-                            // Compaction is idle most of the time; the shared
-                            // inference_active flag is fine as a proxy.
-                            Arc::clone(&ctx.core_handle.counters.inference_active),
-                            Arc::clone(&compaction_keepalive_stop),
-                        )
-                    })
+                    ) {
+                        Some(secs) => {
+                            let hint = ctx
+                                .config
+                                .agents
+                                .defaults
+                                .higgs_compaction_model
+                                .clone()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| local_model_name.clone());
+                            // Adopt the sidecar's actual served id (e.g.
+                            // "Bonsai-1.7B-mlx-1bit") so the ping can't 404 on
+                            // the stale higgsCompactionModel hint ("bonsai-1.7b").
+                            let model = resolve_keepalive_model(
+                                &base,
+                                &ctx.config.agents.defaults.local_api_key,
+                                &hint,
+                            )
+                            .await;
+                            info!(interval_s = secs, port = cport, model = %model, "higgs_compaction_keepalive_enabled");
+                            Some(spawn_higgs_keepalive(
+                                base,
+                                ctx.config.agents.defaults.local_api_key.clone(),
+                                model,
+                                secs,
+                                // Compaction is idle most of the time; the shared
+                                // inference_active flag is fine as a proxy.
+                                Arc::clone(&ctx.core_handle.counters.inference_active),
+                                Arc::clone(&compaction_keepalive_stop),
+                            ))
+                        }
+                        None => None,
+                    }
                 } else {
                     None
+                }
+                } else {
+                    None // on-demand sidecar: no keepalive (down between compactions)
                 };
 
             log_startup_phase("interactive_ready", startup_t0, &mut startup_last);
@@ -2728,15 +2789,30 @@ pub(crate) fn cmd_agent(
                     );
                     if reflector.should_reflect() {
                         info!("Exit: reflecting on accumulated working memory (background)...");
+                        // On-demand Bonsai: the sidecar is down between
+                        // compactions, so bring it up for exit reflection and
+                        // stop it after (frees memory before the process exits).
+                        let exit_sidecar =
+                            crate::higgs::CompactionSidecarSpec::from_config(&ctx.config);
                         let reflection_handle = tokio::spawn(async move {
-                            match reflector.reflect().await {
+                            if let Some(spec) = exit_sidecar.as_ref() {
+                                if let Err(e) = spec.ensure_up().await {
+                                    warn!(error = %e, "exit_reflection_sidecar_ensure_up_failed");
+                                }
+                            }
+                            let res = reflector.reflect().await;
+                            if let Some(spec) = exit_sidecar.as_ref() {
+                                spec.release();
+                            }
+                            match res {
                                 Ok(()) => info!("Exit reflection complete — MEMORY.md updated"),
                                 Err(e) => warn!("Exit reflection failed: {}", e),
                             }
                         });
-                        // Wait up to 5s for reflection to complete; don't block exit indefinitely
+                        // Wait up to 20s for reflection (sidecar spawn ~1s + the
+                        // summarization call); don't block exit indefinitely.
                         let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
+                            std::time::Duration::from_secs(20),
                             reflection_handle,
                         ).await;
                     }

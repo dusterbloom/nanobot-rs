@@ -298,6 +298,12 @@ pub struct AgentDefaults {
     /// for the main instance). When unset, falls back to `localModel`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub higgs_compaction_model: Option<String>,
+    /// When true (default), the compaction Higgs sidecar is spawned on demand
+    /// for each compaction pass and stopped afterward — so it does not compete
+    /// with the main model for unified memory between compactions. When false,
+    /// the sidecar stays resident (the original always-on behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub higgs_compaction_on_demand: Option<bool>,
     /// Path to MLX model directory (containing .safetensors + tokenizer.json).
     /// Default: ~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -507,6 +513,7 @@ impl Default for AgentDefaults {
             higgs_compaction_port: None,
             higgs_compaction_model_dir: None,
             higgs_compaction_model: None,
+            higgs_compaction_on_demand: None,
             local_backend: default_local_backend(),
             mlx_model_dir: None,
             draft_model: None,
