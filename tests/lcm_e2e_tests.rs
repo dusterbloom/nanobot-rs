@@ -92,11 +92,16 @@ fn test_clear_resets_lcm_engine() {
 #[test]
 fn test_find_oldest_raw_block_returns_first_block() {
     let mut engine = LcmEngine::new(LcmConfig::default());
+    // Realistic-sized messages: token-based protect (default ~1k tokens) only
+    // yields a compact block once the conversation exceeds the protect budget,
+    // so use ~60-token messages (not 3-token ones).
+    let body = "the quick brown fox jumps over the lazy dog while the model prefills tokens "
+        .repeat(5);
 
     ingest(&mut engine, 1, "system", "System");
     for i in 0..10 {
-        ingest(&mut engine, 2 + 2 * i, "user", &format!("User {}", i));
-        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Assistant {}", i));
+        ingest(&mut engine, 2 + 2 * i, "user", &format!("User {}: {}", i, body));
+        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Assistant {}: {}", i, body));
     }
 
     let block = engine.find_oldest_raw_block();
@@ -106,7 +111,7 @@ fn test_find_oldest_raw_block_returns_first_block() {
     assert!(start >= 1, "Block should start after system message");
     assert!(
         end <= engine.active_len() - 4,
-        "Block should leave 4 recent messages"
+        "Block should leave the recent messages protected"
     );
 }
 
@@ -171,9 +176,13 @@ async fn test_second_compaction_summarizes_after_first_summary() {
     });
 
     ingest(&mut engine, 1, "system", "System");
+    // Realistic-sized messages so the conversation exceeds the protect budget
+    // and the block clears the MIN_COMPACTION_TOKENS floor.
+    let body = "the quick brown fox jumps over the lazy dog while the model prefills tokens "
+        .repeat(5);
     for i in 0..20 {
-        ingest(&mut engine, 2 + 2 * i, "user", &format!("Message {}", i));
-        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Response {}", i));
+        ingest(&mut engine, 2 + 2 * i, "user", &format!("Message {}: {}", i, body));
+        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Response {}: {}", i, body));
     }
 
     let budget = TokenBudget::new(4096, 2048);
@@ -200,13 +209,23 @@ async fn test_second_compaction_summarizes_after_first_summary() {
             _ => panic!("Expected Summary"),
         };
 
-        // Second compaction should NOT overlap with first
+        // With summary-merge, a second compaction MERGES the first summary
+        // (folds it + any newly-unprotected raws into one) so summary mass
+        // stays bounded. The merged node therefore covers a SUPERSET of the
+        // first summary's sources — overlap is correct and expected, not a
+        // re-summarization bug (originals stay lossless in the store).
         for id in &first_source_ids {
             assert!(
-                !second_source_ids.contains(id),
-                "Second compaction should not include messages from first summary"
+                second_source_ids.contains(id),
+                "Merged summary should cover the first summary's sources: {} missing",
+                id
             );
         }
+        assert!(
+            engine.dag_ref().len() <= 2,
+            "summary mass should stay bounded (<=2 nodes after merge), got {}",
+            engine.dag_ref().len()
+        );
     }
 }
 

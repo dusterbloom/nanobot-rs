@@ -1551,6 +1551,15 @@ impl AgentLoopShared {
                                             // The node ID is dag.len() - 1 (just created).
                                             let node_id =
                                                 engine.dag().len().saturating_sub(1);
+                                            // child_summaries = the prior summary nodes this
+                                            // compaction MERGED (retired). Persisted as child_ids
+                                            // so rebuild_from_db_nodes skips them — the merge is
+                                            // durable across restart instead of re-accumulating.
+                                            let child_ids: Vec<usize> = engine
+                                                .dag()
+                                                .get(node_id)
+                                                .map(|n| n.child_summaries.clone())
+                                                .unwrap_or_default();
                                             let tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(s_text);
                                             bg_core
                                                 .sessions
@@ -1558,7 +1567,7 @@ impl AgentLoopShared {
                                                     &bg_session_id,
                                                     node_id,
                                                     source_ids,
-                                                    &[],
+                                                    &child_ids,
                                                     s_text,
                                                     tokens,
                                                     *s_level,

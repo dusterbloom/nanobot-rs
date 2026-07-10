@@ -75,6 +75,7 @@ impl SummaryDag {
     pub fn create_node(
         &mut self,
         source_ids: Vec<MessageId>,
+        child_summaries: Vec<usize>,
         text: String,
         level: u8,
     ) -> &SummaryNode {
@@ -84,7 +85,7 @@ impl SummaryDag {
         self.nodes.push(SummaryNode {
             id,
             source_ids,
-            child_summaries: Vec::new(),
+            child_summaries,
             text,
             tokens,
             level,
@@ -354,6 +355,7 @@ impl LcmEngine {
         // lossless).
         let mut source_ids: Vec<MessageId> = Vec::new();
         let mut block_messages = Vec::new();
+        let mut merged_node_ids: Vec<usize> = Vec::new();
         let mut raw_count = 0usize;
         for entry in &self.active[block_start..block_end] {
             match entry {
@@ -369,6 +371,10 @@ impl LcmEngine {
                             source_ids.push(sid);
                         }
                     }
+                    // Track the subsumed node so it can be retired in the DAG
+                    // and DB (rebuild_from_db_nodes skips children), keeping the
+                    // merge durable across restarts instead of re-accumulating.
+                    merged_node_ids.push(*node_id);
                 }
             }
         }
@@ -453,10 +459,15 @@ impl LcmEngine {
             (1.0 - summary_tokens as f64 / block_tokens as f64) * 100.0
         );
 
-        // Create summary node in DAG.
-        let node = self
-            .dag
-            .create_node(source_ids.clone(), summary_text.clone(), level);
+        // Create summary node in DAG, recording the subsumed children so the
+        // merge is durable (rebuild_from_db_nodes skips child nodes; the
+        // persistence site stores them as child_ids).
+        let node = self.dag.create_node(
+            source_ids.clone(),
+            merged_node_ids.clone(),
+            summary_text.clone(),
+            level,
+        );
         let node_id = node.id;
 
         // Build the summary message with lossless pointers.
@@ -832,8 +843,18 @@ impl LcmEngine {
         let mut summarized_ids: std::collections::HashSet<MessageId> =
             std::collections::HashSet::new();
 
-        // Reconstruct DAG nodes, skipping legacy positional-id nodes.
-        for (id, source_ids, _child_ids, text, _tokens, level, id_kind) in nodes {
+        // Nodes that have been merged into a newer summary (they appear in some
+        // other node's child_ids) are retired — re-activating them on rebuild
+        // would duplicate their content and re-accumulate summary mass. Collect
+        // the subsumed set first, then skip them when reconstructing the DAG.
+        let subsumed: std::collections::HashSet<usize> = nodes
+            .iter()
+            .flat_map(|(_, _, child_ids, _, _, _, _)| child_ids.iter().copied())
+            .collect();
+
+        // Reconstruct DAG nodes, skipping legacy positional-id nodes and
+        // subsumed (merged) nodes.
+        for (id, source_ids, child_ids, text, _tokens, level, id_kind) in nodes {
             if id_kind != "db_id" {
                 warn!(
                     node_id = id,
@@ -843,9 +864,13 @@ impl LcmEngine {
                 );
                 continue;
             }
+            if subsumed.contains(id) {
+                debug!(node_id = id, "LCM rebuild: skipping subsumed (merged) summary node");
+                continue;
+            }
             engine
                 .dag
-                .create_node(source_ids.clone(), text.clone(), *level);
+                .create_node(source_ids.clone(), child_ids.clone(), text.clone(), *level);
             for &sid in source_ids {
                 summarized_ids.insert(sid);
             }
@@ -1333,7 +1358,7 @@ mod tests {
     #[test]
     fn test_summary_dag_create_and_retrieve() {
         let mut dag = SummaryDag::new();
-        dag.create_node(vec![0, 1, 2], "Summary of first 3 messages.".to_string(), 1);
+        dag.create_node(vec![0, 1, 2], vec![], "Summary of first 3 messages.".to_string(), 1);
         assert_eq!(dag.len(), 1);
         let node = dag.get(0).unwrap();
         assert_eq!(node.source_ids, vec![0, 1, 2]);
@@ -1343,8 +1368,8 @@ mod tests {
     #[test]
     fn test_summary_dag_all_source_ids() {
         let mut dag = SummaryDag::new();
-        dag.create_node(vec![0, 1, 2], "First batch.".to_string(), 1);
-        dag.create_node(vec![3, 4, 5], "Second batch.".to_string(), 1);
+        dag.create_node(vec![0, 1, 2], vec![], "First batch.".to_string(), 1);
+        dag.create_node(vec![3, 4, 5], vec![], "Second batch.".to_string(), 1);
         let ids = dag.all_source_ids(0);
         assert_eq!(ids, vec![0, 1, 2]);
     }
@@ -2338,6 +2363,7 @@ mod tests {
         // Manually create a summary covering messages 2-5.
         let node = engine.dag.create_node(
             vec![2, 3, 4, 5],
+            vec![],
             "Discussion about Rust ownership, borrowing, and lifetimes.".to_string(),
             1,
         );
@@ -2424,6 +2450,7 @@ mod tests {
         let source_ids: Vec<usize> = (2..=11).collect();
         let node = engine.dag.create_node(
             source_ids.clone(),
+            vec![],
             "Summary of first 10 messages.".to_string(),
             1,
         );
@@ -2471,6 +2498,7 @@ mod tests {
 
         let node = engine.dag.create_node(
             vec![2, 3],
+            vec![],
             "Discussion about Rust ownership.".to_string(),
             1,
         );
@@ -2586,7 +2614,7 @@ mod tests {
         }
         // ...and compacted ids 6,7 into a summary persisted with those ids.
         live.dag
-            .create_node(vec![6, 7], "Summary of 6-7.".to_string(), 1);
+            .create_node(vec![6, 7], vec![], "Summary of 6-7.".to_string(), 1);
         // Even before restart, the live engine resolves by db id, not window
         // position (positionally, "6" would have been out of range or wrong).
         let live_expanded = live.expand(&[6, 7]);
@@ -2624,6 +2652,38 @@ mod tests {
             })
             .collect();
         assert_eq!(raw_ids, vec![1, 2, 3, 4, 5, 8, 9, 10]);
+    }
+
+    /// A merged summary records the nodes it subsumed as child_ids. On rebuild,
+    /// those subsumed nodes must be SKIPPED — otherwise they re-activate
+    /// alongside the merged node (duplicate content + renewed accumulation).
+    #[test]
+    fn rebuild_skips_subsumed_summary_nodes() {
+        // Node 0 = an old summary (subsumed). Node 1 = the merged summary whose
+        // child_ids = [0]. No raw messages needed for this DAG-only check.
+        let nodes: Vec<(usize, Vec<usize>, Vec<usize>, String, usize, u8, String)> = vec![
+            (0, vec![1, 2, 3], vec![], "old summary".to_string(), 10, 1, "db_id".to_string()),
+            (
+                1,
+                vec![1, 2, 3, 4, 5],
+                vec![0],
+                "merged summary".to_string(),
+                15,
+                1,
+                "db_id".to_string(),
+            ),
+        ];
+        let engine = LcmEngine::rebuild_from_db_nodes(&[], &nodes, LcmConfig::default());
+
+        // Only the merged node survives (the subsumed old node is skipped).
+        assert_eq!(
+            engine.dag_ref().len(),
+            1,
+            "subsumed node must be skipped on rebuild"
+        );
+        let only = engine.dag_ref().get(0).expect("one node rebuilt");
+        assert_eq!(only.text, "merged summary");
+        assert_eq!(only.child_summaries, vec![0]);
     }
 
     /// Legacy summary_nodes rows (id_kind absent/legacy) carry POSITIONAL

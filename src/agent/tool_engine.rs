@@ -95,6 +95,13 @@ fn digest_tool_result(
     tool_call_id: &str,
     store: &parking_lot::Mutex<std::collections::HashMap<String, String>>,
 ) -> String {
+    // A recalled output IS the verbatim body the model explicitly asked for —
+    // never re-digest it (would re-truncate into another preview and loop the
+    // model back to recall_tool_result forever). It enters context raw. If the
+    // body is very large that's a deliberate spend the model chose.
+    if tool_name == "recall_tool_result" {
+        return data.to_string();
+    }
     let total_chars = data.chars().count();
     if total_chars <= cap {
         return data.to_string();
