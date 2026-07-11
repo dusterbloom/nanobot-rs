@@ -79,6 +79,41 @@ fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> String {
     summary.chars().take(260).collect()
 }
 
+/// Build a head+tail preview of `data` (≤ `cap` chars) with a `recall_tool_result`
+/// pointer to `tool_call_id`. Assumes the full body is ALREADY stashed (by the
+/// caller) when `data` was truncated — this only shapes the in-context preview.
+fn build_tool_result_preview(
+    tool_name: &str,
+    args: &std::collections::HashMap<String, Value>,
+    data: &str,
+    cap: usize,
+    tool_call_id: &str,
+) -> String {
+    let total_chars = data.chars().count();
+    if total_chars <= cap {
+        return data.to_string();
+    }
+    let source = tool_arg_summary(args);
+    let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
+    let header = format!(
+        "[truncated: {tool_name}({source}) returned {total_chars} chars (~{estimated_tokens} tokens); \
+         head+tail shown — call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output]\n"
+    );
+    let footer = "\n[...]\n";
+    let fixed_chars = header.chars().count() + footer.chars().count();
+    let preview_budget = cap.saturating_sub(fixed_chars).max(200);
+    let head_chars = preview_budget * 2 / 3;
+    let tail_chars = preview_budget.saturating_sub(head_chars);
+    let head: String = data.chars().take(head_chars).collect();
+    let tail_rev: Vec<char> = data.chars().rev().take(tail_chars).collect();
+    let tail: String = tail_rev.into_iter().rev().collect();
+    let mut out = format!("{header}{head}{footer}{tail}");
+    if out.chars().count() > cap {
+        out = out.chars().take(cap).collect();
+    }
+    out
+}
+
 /// Digest a tool result for in-context storage with lossless retrieval.
 ///
 /// Small results (≤ `cap`) pass through verbatim. Large results are reduced to
@@ -109,25 +144,7 @@ fn digest_tool_result(
     store
         .lock()
         .insert(tool_call_id.to_string(), data.to_string());
-    let source = tool_arg_summary(args);
-    let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
-    let header = format!(
-        "[truncated: {tool_name}({source}) returned {total_chars} chars (~{estimated_tokens} tokens); \
-         head+tail shown — call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output]\n"
-    );
-    let footer = "\n[...]\n";
-    let fixed_chars = header.chars().count() + footer.chars().count();
-    let preview_budget = cap.saturating_sub(fixed_chars).max(200);
-    let head_chars = preview_budget * 2 / 3;
-    let tail_chars = preview_budget.saturating_sub(head_chars);
-    let head: String = data.chars().take(head_chars).collect();
-    let tail_rev: Vec<char> = data.chars().rev().take(tail_chars).collect();
-    let tail: String = tail_rev.into_iter().rev().collect();
-    let mut out = format!("{header}{head}{footer}{tail}");
-    if out.chars().count() > cap {
-        out = out.chars().take(cap).collect();
-    }
-    out
+    build_tool_result_preview(tool_name, args, data, cap, tool_call_id)
 }
 
 /// Head+tail preview builder retained as the reference for the truncation
@@ -489,14 +506,25 @@ pub(crate) async fn execute_tools_delegated(
         } else {
             ctx.content_gate.admit_simple(full_data).into_text()
         };
-        let injected = digest_tool_result(
-            &tc.name,
-            &tc.arguments,
-            &injected_raw,
-            cap,
-            &tc.id,
-            &ctx.counters.tool_result_store,
-        );
+        // Stash the RAW delegated output (pre-runner-summary / pre-gate) for
+        // lossless recall — digesting `injected_raw` directly would store the
+        // summary instead of the original. Then preview injected_raw and add a
+        // recall pointer when the raw was stashed.
+        let stashed_raw = full_data.chars().count() > cap;
+        if stashed_raw {
+            ctx.counters
+                .tool_result_store
+                .lock()
+                .insert(tc.id.clone(), full_data.to_string());
+        }
+        let mut injected =
+            build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id);
+        if stashed_raw && !injected.contains("recall_tool_result") {
+            injected.push_str(&format!(
+                "\n[full original output retrievable via recall_tool_result({{\"tool_call_id\": \"{}\"}})]",
+                tc.id
+            ));
+        }
 
         if ctx.core.provenance_config.enabled {
             ContextBuilder::add_tool_result_immutable(
@@ -775,9 +803,30 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
     // Gate tool result through context budget.
     let threshold = summary_threshold_tokens(&r.tool_name);
     let cap = inline_hot_prompt_result_cap(ctx);
-    let data = if ctx.core.specialist_provider.is_some()
+    // A recalled output is the verbatim body the model explicitly requested —
+    // never re-summarize or re-truncate it (would loop back to another preview).
+    // Handle it before the specialist/digest branches. Still charge its tokens
+    // to the content budget so subsequent admits this batch see true usage.
+    let data = if r.tool_name == "recall_tool_result" {
+        ctx.content_gate
+            .budget
+            .consume(crate::agent::token_budget::TokenBudget::estimate_str_tokens(
+                &result_data,
+            ));
+        result_data
+    } else if ctx.core.specialist_provider.is_some()
         && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > threshold
     {
+        // Specialist path: stash the RAW (pre-specialist) output for lossless
+        // recall — without this, recall would return the specialist's summary
+        // instead of the original. Then summarize and preview the summary.
+        let stashed_raw = result_data.chars().count() > cap;
+        if stashed_raw {
+            ctx.counters
+                .tool_result_store
+                .lock()
+                .insert(r.tool_id.clone(), result_data.clone());
+        }
         let summarized = ctx
             .content_gate
             .admit_with_specialist(
@@ -787,14 +836,18 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
             )
             .await
             .into_text();
-        digest_tool_result(
-            &r.tool_name,
-            &r.arguments,
-            &summarized,
-            cap,
-            &r.tool_id,
-            &ctx.counters.tool_result_store,
-        )
+        let mut preview =
+            build_tool_result_preview(&r.tool_name, &r.arguments, &summarized, cap, &r.tool_id);
+        // If the summary fit under cap, build_tool_result_preview returned it
+        // unchanged with no recall pointer — but the raw IS stashed, so tell
+        // the model it can still recover the original.
+        if stashed_raw && !preview.contains("recall_tool_result") {
+            preview.push_str(&format!(
+                "\n[full original output retrievable via recall_tool_result({{\"tool_call_id\": \"{}\"}})]",
+                r.tool_id
+            ));
+        }
+        preview
     } else {
         let prompt_data = digest_tool_result(
             &r.tool_name,

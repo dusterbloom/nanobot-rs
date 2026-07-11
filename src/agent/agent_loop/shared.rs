@@ -1493,24 +1493,46 @@ impl AgentLoopShared {
 
                         tokio::spawn(async move {
                             // On-demand Bonsai: bring the sidecar up for this
-                            // compaction pass. Failure is non-fatal — the
-                            // compactor call will simply fail and disable itself
-                            // for the run (existing behaviour); we still attempt
-                            // the release so a half-started sidecar is cleaned up.
-                            if let Some(spec) = bg_sidecar.as_ref() {
-                                if let Err(e) = spec.ensure_up().await {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "compaction_sidecar_ensure_up_failed"
-                                    );
-                                }
-                            }
+                            // compaction pass. If it fails, fall back to
+                            // summarizing on the MAIN model (slower but works)
+                            // instead of burning the 90s timeout retrying a
+                            // dead sidecar endpoint.
+                            let sidecar_up = match bg_sidecar.as_ref() {
+                                Some(spec) => match spec.ensure_up().await {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "compaction_sidecar_ensure_up_failed_main_model_fallback"
+                                        );
+                                        false
+                                    }
+                                },
+                                None => true,
+                            };
+                            // Main-model fallback compactor (only built when the
+                            // sidecar is down; otherwise we use the configured one).
+                            // Size the fallback compactor to the MAIN model's
+                            // context (not a tiny hardcoded 4096), so a large-
+                            // context model doesn't explode into many tiny
+                            // sequential summarize+merge calls.
+                            let fallback_compactor = if !sidecar_up {
+                                Some(crate::agent::compaction::ContextCompactor::new(
+                                    bg_core.provider.clone(),
+                                    bg_core.model.clone(),
+                                    bg_core.token_budget.max_context(),
+                                ))
+                            } else {
+                                None
+                            };
                             let timeout_result =
                                 tokio::time::timeout(Duration::from_secs(90), async {
-                                    // Use dedicated LCM compactor if configured,
-                                    // otherwise fall back to the core memory compactor.
-                                    let compactor: &ContextCompactor =
-                                        bg_lcm_compactor.as_deref().unwrap_or(&bg_core.compactor);
+                                    let compactor: &ContextCompactor = match fallback_compactor.as_ref() {
+                                        Some(fb) => fb,
+                                        None => bg_lcm_compactor
+                                            .as_deref()
+                                            .unwrap_or(&bg_core.compactor),
+                                    };
                                     let summary_turn = {
                                         let mut engine = bg_lcm.lock().await;
                                         let bg_budget =
@@ -1610,7 +1632,7 @@ impl AgentLoopShared {
                             // compaction pass is done (success or timeout), so it
                             // stops competing with the main model for memory.
                             if let Some(spec) = bg_sidecar.as_ref() {
-                                spec.release();
+                                spec.release().await;
                             }
                             in_flight.store(false, Ordering::SeqCst);
                         });

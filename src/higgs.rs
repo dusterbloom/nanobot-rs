@@ -367,9 +367,14 @@ async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
 /// resident. In on-demand mode (the default) it is spawned just before a
 /// compaction pass and stopped right after, so the lightweight compaction
 /// model never competes with the main model for unified memory between
-/// compactions. `ensure_up` is idempotent (a running sidecar is a no-op), and
-/// `release` is a no-op in always-on mode.
-#[derive(Debug, Clone)]
+/// compactions.
+///
+/// On-demand uses a reference-counted LEASE so concurrent gateway sessions
+/// compacting at the same time can't stop the sidecar out from under each
+/// other: `ensure_up` takes a lease, `release` drops one, and the sidecar is
+/// only stopped when the last lease is dropped. `ensure_up` is idempotent (a
+/// running sidecar is a no-op), and `release`/`ensure_up` are no-ops in
+/// always-on mode. Always held behind an `Arc` (one per AgentLoop).
 pub(crate) struct CompactionSidecarSpec {
     pub bin: PathBuf,
     pub port: u16,
@@ -378,12 +383,58 @@ pub(crate) struct CompactionSidecarSpec {
     pub on_demand: bool,
 }
 
+/// Process-global outstanding leases on the compaction sidecar. Global (not
+/// per-`CompactionSidecarSpec`) because cron reflection, REPL `/learn`, exit
+/// reflection, and the LCM compaction task each construct their own spec from
+/// config — independent per-spec counters couldn't coordinate and one could
+/// `release()` the sidecar while another is mid-summarize. There is only one
+/// compaction sidecar (role `"compaction"`) per process, so one shared counter
+/// is correct. The sidecar is stopped only when the LAST lease drops.
+static COMPACTION_SIDE_LEASES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Serializes sidecar lifecycle transitions (start, stop). Without it, a
+/// release could CAS the lease count 1→0 and stop the sidecar in the window
+/// between a concurrent ensure_up's health check and its lease increment.
+/// Held briefly when the sidecar is already up; only the (rare) cold spawn
+/// holds it for the load duration.
+static COMPACTION_LIFECYCLE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+impl std::fmt::Debug for CompactionSidecarSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompactionSidecarSpec")
+            .field("port", &self.port)
+            .field("model", &self.model)
+            .field("on_demand", &self.on_demand)
+            .field(
+                "active_leases",
+                &COMPACTION_SIDE_LEASES.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
 impl CompactionSidecarSpec {
     /// Build from config. Returns `None` when there is no compaction sidecar
     /// (no port), no spawnable model directory, or no `higgs` binary on disk —
     /// in all those cases compaction falls back to the main model.
     pub(crate) fn from_config(config: &crate::config::schema::Config) -> Option<Self> {
         let port = config.agents.defaults.higgs_compaction_port?;
+        // Don't build a sidecar spec (and later spawn it) when the memory
+        // provider targets a non-localhost endpoint — the sidecar wouldn't be
+        // used, and cron/`/learn`/exit-reflection would waste up to 60s
+        // spawning a model the Reflector never calls. If a memory provider is
+        // configured, it must point at localhost for the sidecar to apply.
+        let memory_targets_remote = config
+            .memory
+            .provider
+            .as_ref()
+            .and_then(|p| p.api_base.as_deref())
+            .is_some_and(|b| !b.contains("127.0.0.1") && !b.contains("localhost"));
+        if memory_targets_remote {
+            return None;
+        }
         let bin = find_binary()?;
         let (dir, model) = compaction_sidecar_config(config);
         let dir = dir?;
@@ -397,25 +448,50 @@ impl CompactionSidecarSpec {
         })
     }
 
-    /// Ensure the sidecar is reachable before a compaction/memory call.
-    /// Idempotent: a running sidecar (always-on, or a prior on-demand spawn)
-    /// returns `Ready` immediately.
+    /// Ensure the sidecar is reachable before a compaction/memory call, and
+    /// take a lease on the global counter. Idempotent: a running sidecar
+    /// (always-on, or a prior on-demand spawn) returns `Ready` immediately. On
+    /// failure NO lease is taken (so a matching `release()` is a no-op).
     pub(crate) async fn ensure_up(&self) -> Result<(), String> {
         if !self.on_demand {
             return Ok(());
         }
+        // Serialize start vs stop so a concurrent release can't kill the
+        // sidecar between this health check and the lease increment.
+        let _guard = COMPACTION_LIFECYCLE.lock().await;
         match server_start_role(&self.bin, self.port, &self.dir, &self.model, "compaction").await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                COMPACTION_SIDE_LEASES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
 
-    /// Release the sidecar after a compaction/memory call (on-demand only).
-    pub(crate) fn release(&self) {
+    /// Drop a lease taken by `ensure_up`. The sidecar is stopped only when the
+    /// LAST lease drops. Safe against an unheld release (e.g. a caller whose
+    /// `ensure_up` failed): the CAS loop refuses to decrement past zero. The
+    /// lifecycle lock serializes the stop against concurrent starts.
+    pub(crate) async fn release(&self) {
         if !self.on_demand {
             return;
         }
-        let _ = server_stop_role("compaction");
+        let _guard = COMPACTION_LIFECYCLE.lock().await;
+        loop {
+            let cur = COMPACTION_SIDE_LEASES.load(std::sync::atomic::Ordering::SeqCst);
+            if cur == 0 {
+                return; // no lease held — nothing to release (ensure_up failed)
+            }
+            if COMPACTION_SIDE_LEASES
+                .compare_exchange(cur, cur - 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .is_ok()
+            {
+                if cur == 1 {
+                    let _ = server_stop_role("compaction");
+                }
+                return;
+            }
+        }
     }
 }
 

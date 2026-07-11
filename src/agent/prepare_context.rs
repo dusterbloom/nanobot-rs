@@ -511,15 +511,15 @@ impl AgentLoopShared {
         // Register recall_tool_result: large tool results are digested to a
         // head+tail preview at ingestion with the full body stashed in the
         // per-agent tool_result_store. This tool recovers the full output
-        // losslessly on demand (no tool re-run). Registered whenever local
-        // mode is active (digestion is local-only via inline_hot_prompt cap).
-        if core.mode().is_local() {
-            tools.register(Box::new(
-                crate::agent::tools::recall_tool_result::RecallToolResultTool::new(
-                    counters.tool_result_store.clone(),
-                ),
-            ));
-        }
+        // losslessly on demand (no tool re-run). Registered for ALL modes —
+        // digestion runs for both local and cloud tool execution, so a cloud
+        // turn would otherwise see a recall hint for a tool missing from its
+        // schema, making the truncated middle unrecoverable.
+        tools.register(Box::new(
+            crate::agent::tools::recall_tool_result::RecallToolResultTool::new(
+                counters.tool_result_store.clone(),
+            ),
+        ));
         let lcm_setup_ms = lap_ms();
 
         // Resolve or create session for this key.

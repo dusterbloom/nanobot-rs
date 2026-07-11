@@ -681,7 +681,7 @@ pub(crate) async fn run_gateway_async(
         cron_arc.clone(),
         crate::cron::executor::ExecutorHooks {
             inbound_tx: Some(inbound_tx.clone()),
-            reflect: Some(build_cron_reflect_hook(core_handle.clone())),
+            reflect: Some(build_cron_reflect_hook(core_handle.clone(), config.clone())),
         },
     );
 
@@ -851,9 +851,15 @@ pub(crate) async fn run_gateway_async(
 /// Build the cron executor's `reflect` hook from the live core handle, so
 /// `/model` and `/local` swaps are honored at fire time. Memory disabled →
 /// silent skip. Threshold 0: distill whatever accumulated since the last run.
-fn build_cron_reflect_hook(core_handle: SharedCoreHandle) -> crate::cron::executor::ReflectFn {
+fn build_cron_reflect_hook(
+    core_handle: SharedCoreHandle,
+    config: crate::config::schema::Config,
+) -> crate::cron::executor::ReflectFn {
     Arc::new(move || {
         let core = core_handle.swappable();
+        // Build the sidecar spec in the sync closure body (borrows config here,
+        // where the borrow can't escape), then move it into the async block.
+        let sidecar = crate::higgs::CompactionSidecarSpec::from_config(&config);
         Box::pin(async move {
             if !core.memory_enabled {
                 tracing::debug!("Cron reflect: memory disabled — skipped");
@@ -865,7 +871,18 @@ fn build_cron_reflect_hook(core_handle: SharedCoreHandle) -> crate::cron::execut
                 &core.workspace,
                 0,
             );
-            match reflector.reflect().await {
+            // On-demand Bonsai: bring the sidecar up for this memory op and
+            // release it after (no-op when always-on or no sidecar).
+            if let Some(spec) = sidecar.as_ref() {
+                if let Err(e) = spec.ensure_up().await {
+                    tracing::warn!("Cron reflect: sidecar unavailable: {}", e);
+                }
+            }
+            let result = reflector.reflect().await;
+            if let Some(spec) = sidecar.as_ref() {
+                spec.release().await;
+            }
+            match result {
                 Ok(()) => tracing::info!("Cron reflect: memory distillation complete"),
                 Err(e) => tracing::warn!("Cron reflect failed: {}", e),
             }

@@ -2802,7 +2802,7 @@ pub(crate) fn cmd_agent(
                             }
                             let res = reflector.reflect().await;
                             if let Some(spec) = exit_sidecar.as_ref() {
-                                spec.release();
+                                spec.release().await;
                             }
                             match res {
                                 Ok(()) => info!("Exit reflection complete — MEMORY.md updated"),

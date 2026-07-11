@@ -203,7 +203,20 @@ impl ReplContext {
             return;
         }
         println!("\n  Reflecting on accumulated sessions...");
-        match reflector.reflect().await {
+        // On-demand Bonsai: the compaction sidecar is down between compactions,
+        // so bring it up for this memory op and release it after. (No-op when
+        // always-on or no sidecar.)
+        let sidecar = crate::higgs::CompactionSidecarSpec::from_config(&self.config);
+        if let Some(spec) = sidecar.as_ref() {
+            if let Err(e) = spec.ensure_up().await {
+                println!("  (compaction sidecar unavailable: {})", e);
+            }
+        }
+        let result = reflector.reflect().await;
+        if let Some(spec) = sidecar.as_ref() {
+            spec.release().await;
+        }
+        match result {
             Ok(()) => println!("  Learned. MEMORY.md updated.\n"),
             Err(e) => println!("  Reflection failed: {}\n", e),
         }
