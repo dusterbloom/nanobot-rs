@@ -307,25 +307,29 @@ pub(super) fn make_local_providers(
         detected_context_tokens,
         config.agents.defaults.local_max_context_tokens,
     );
-    // When the server can't report its own context window (no /props — e.g.
-    // higgs/MLX), the value above is the model's architectural max, unrelated
-    // to how much unified memory this machine has. Bound it by a memory-derived
-    // ceiling so history compacts before the engine gets OOM-killed. Servers
-    // that DO report n_ctx (llama-server) are trusted and left untouched.
-    let max_context_tokens = if detected_context_tokens.is_none() && !is_apple_fm_model(&model_id) {
+    // ALWAYS bound the context by both the memory-derived ceiling AND the
+    // user's localMaxContextTokens config cap — regardless of whether the
+    // server reports its own n_ctx. A server reporting 262k native context
+    // (e.g. higgs serving a 256k model) must NOT bypass the 32k practical
+    // cap on a 32GB machine, or compaction never fires and the model
+    // thrashes on memory pressure.
+    let max_context_tokens = if !is_apple_fm_model(&model_id) {
         let ceiling = memory_context_ceiling(config, &model_id);
         if ceiling < max_context_tokens {
             tracing::info!(
                 configured = max_context_tokens,
                 memory_ceiling = ceiling,
                 model = %model_id,
-                "Local endpoint has no /props; clamping context to memory-safe ceiling"
+                "Clamping context to memory-safe ceiling"
             );
         }
         max_context_tokens.min(ceiling)
     } else {
         max_context_tokens
     };
+    // Always respect the user's explicit localMaxContextTokens cap.
+    let max_context_tokens =
+        max_context_tokens.min(config.agents.defaults.local_max_context_tokens);
 
     // Compaction provider (separate port only).
     //
