@@ -2674,6 +2674,56 @@ async fn test_local_wire_prompt_tool_result_appends_only() {
     assert_wire_prefix(&calls[0], &calls[1]);
 }
 
+#[tokio::test]
+async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
+    let duplicate_call = |id: usize| {
+        let mut arguments = std::collections::HashMap::new();
+        arguments.insert("path".to_string(), json!("."));
+        crate::providers::base::LLMResponse {
+            content: Some("Let me check the remaining modified files:".to_string()),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: format!("tc_duplicate_{id}"),
+                name: "list_dir".to_string(),
+                arguments,
+            }],
+            finish_reason: "tool_calls".to_string(),
+            usage: std::collections::HashMap::new(),
+        }
+    };
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-qwen-test",
+        vec![
+            duplicate_call(1),
+            duplicate_call(2),
+            duplicate_call(3),
+            duplicate_call(4),
+            WireRecordingProvider::text_response("breaker failed"),
+        ],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("cached-duplicate-breaker-{}", uuid::Uuid::new_v4());
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent_loop.process_direct("inspect the workspace", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("cached duplicate loop must terminate");
+
+    assert_eq!(
+        response,
+        "The same tool request repeated after its result was already available, so the loop was stopped to prevent further duplicate work."
+    );
+    assert_eq!(
+        provider.call_count(),
+        4,
+        "two allowed reads followed by two blocked duplicate rounds must force finalization"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 static NANOBOT_LOCAL_TAIL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct EnvVarGuard {

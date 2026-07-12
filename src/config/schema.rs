@@ -270,7 +270,8 @@ pub struct AgentDefaults {
     /// may still start servers regardless of this setting.
     #[serde(default)]
     pub local_autostart: LocalAutostart,
-    /// Port for the LM Studio server when managed by lms CLI (default: 1234).
+    /// Default local inference port (8000; explicit LM Studio endpoints remain
+    /// supported).
     #[serde(default = "default_lms_port")]
     pub lms_port: u16,
     /// Local backend tag: "lmstudio" (default) or "higgs".
@@ -408,7 +409,7 @@ fn default_max_continuations() -> u32 {
 }
 
 fn default_lms_port() -> u16 {
-    1234
+    8000
 }
 
 fn default_higgs_port() -> u16 {
@@ -2757,6 +2758,12 @@ mod tests {
         let json = r#"{}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.agents.defaults.local_api_base.is_empty());
+    }
+
+    #[test]
+    fn test_default_local_port_is_8000() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.agents.defaults.lms_port, 8000);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Local CLI smoke test for `nanobot agent -l`.
 //!
 //! This test is ignored by default because it requires a running local
-//! OpenAI-compatible endpoint (for example LM Studio on 127.0.0.1:1234).
+//! OpenAI-compatible endpoint on the default local port, 127.0.0.1:8000.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -168,7 +168,7 @@ fn agent_local_single_turn_smoke() {
     let home = temp_home.path();
 
     let local_api_base = std::env::var("NANOBOT_TEST_LOCAL_API_BASE")
-        .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string());
     let local_model = std::env::var("NANOBOT_TEST_LOCAL_MODEL")
         .unwrap_or_else(|_| "qwen/qwen3-4b-thinking-2507".to_string());
 
@@ -217,7 +217,7 @@ fn agent_local_tool_call_smoke() {
     let home = temp_home.path();
 
     let local_api_base = std::env::var("NANOBOT_TEST_LOCAL_API_BASE")
-        .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string());
     let local_model = std::env::var("NANOBOT_TEST_LOCAL_MODEL")
         .unwrap_or_else(|_| "qwen/qwen3-4b-thinking-2507".to_string());
     write_isolated_config(home, &local_api_base, &local_model);

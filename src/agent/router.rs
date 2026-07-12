@@ -1582,15 +1582,11 @@ pub(crate) async fn route_tool_calls(
     if allowed_calls.is_empty() {
         // All tool calls were blocked.
         if total_blocked > 0 && total_blocked == original_count {
-            if !blocked_with_result.is_empty() && blocked_no_result == 0 {
-                // All blocked calls had cached results — replay succeeded.
-                ctx.flow.consecutive_all_blocked = 0;
-                return RouteResult::Continue;
-            }
             ctx.flow.consecutive_all_blocked += 1;
-            // Every call was blocked and none had a cached result — no tool ran,
-            // so this round made no progress and must not consume a real
-            // iteration (bounded by the circuit breaker below).
+            // A cached duplicate produces only a compact protocol receipt; it
+            // does not execute a tool or add evidence. Count every all-blocked
+            // round as zero progress so cached receipts cannot livelock the
+            // agent loop while also bypassing its iteration budget.
             ctx.flow.round_executed_no_tools = true;
             // Circuit breaker: after 2 consecutive all-blocked rounds, force a
             // text response. The LLM is stuck in a loop requesting the same tools.
@@ -1600,10 +1596,14 @@ pub(crate) async fn route_tool_calls(
                     "tool_loop_circuit_breaker: model stuck requesting blocked tools, forcing response"
                 );
                 return RouteResult::Break(
-                    "I've been trying to use the same tools repeatedly. Let me answer with what I have so far."
+                    "The same tool request repeated after its result was already available, so the loop was stopped to prevent further duplicate work."
                         .to_string(),
                 );
             }
+            // Text accompanying a tool call is normally a progress preamble
+            // ("let me check ..."), not a final answer. Give the model one
+            // receipt-informed retry instead of exposing that preamble.
+            return RouteResult::Continue;
         }
         if let Some(text) = response_content.filter(|s| !s.trim().is_empty()) {
             return RouteResult::Break(text.to_string());
