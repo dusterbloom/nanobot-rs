@@ -1359,12 +1359,6 @@ impl AgentLoopShared {
     /// summary persistence, and auto-expand). Otherwise falls back to core
     /// compaction (gradient/audience-aware/simple).
     async fn manage_compaction(&self, ctx: &mut TurnContext, tool_def_tokens: usize) {
-        tracing::warn!(
-            "MANAGE_COMPACTION_ENTER lcm_enabled={} msg_count={} session={}",
-            self.lcm_enabled.load(Ordering::Relaxed),
-            ctx.messages.len(),
-            ctx.session_key
-        );
         if self.lcm_enabled.load(Ordering::Relaxed) {
             // LCM path: get or create per-session engine, check thresholds.
             //
@@ -1452,11 +1446,6 @@ impl AgentLoopShared {
                     let soft = (available as f64 * engine.tau_soft()) as usize;
                     (action, conv, available, hard, soft)
                 };
-
-                tracing::warn!(
-                    "LCM_THRESHOLD_CHECK action={:?} conv_tokens={} available={} soft={} hard={} eff_ceiling={}",
-                    action, conv_tokens, available, soft_limit, hard_limit, eff
-                );
 
 
                 match action {
