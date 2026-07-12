@@ -6,7 +6,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::Tool;
+use super::base::{Tool, ToolConcurrency};
 use super::filesystem::{resolve_read_path, sha256_hex};
 
 const SNIPPET_LINES: usize = 12;
@@ -23,6 +23,10 @@ impl Tool for FilePreviewTool {
 
     fn description(&self) -> &str {
         "Preview a file before reading it: metadata, line count, hash, small head/tail snippets, simple outline, and suggested read_file ranges."
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
     }
 
     fn parameters(&self) -> Value {

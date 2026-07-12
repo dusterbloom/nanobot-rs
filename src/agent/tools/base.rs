@@ -51,6 +51,15 @@ pub enum PermissionLevel {
     System,
 }
 
+/// Whether a tool may overlap with adjacent calls from the same assistant
+/// response. Defaulting to sequential keeps new and stateful tools safe until
+/// their implementations are explicitly audited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolConcurrency {
+    Sequential,
+    ParallelSafe,
+}
+
 /// Structured outcome for a tool invocation.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionResult {
@@ -179,6 +188,11 @@ pub trait Tool: Send + Sync {
     /// executing. Default is `ReadOnly` (least privileged).
     fn permission(&self) -> PermissionLevel {
         PermissionLevel::ReadOnly
+    }
+
+    /// Execution policy for adjacent tool calls in one assistant response.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Sequential
     }
 
     /// Whether this tool is currently available for use.

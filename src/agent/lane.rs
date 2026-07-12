@@ -272,6 +272,7 @@ mod tests {
         // Read tier
         assert_contains(&tools, "read_file");
         assert_contains(&tools, "list_dir");
+        assert_contains(&tools, "recall_tool_result");
         // Http tier
         assert_contains(&tools, "web_search");
         assert_contains(&tools, "web_fetch");
@@ -294,6 +295,7 @@ mod tests {
         assert!(tools.is_some());
         // Everything from Small tier
         assert_contains(&tools, "read_file");
+        assert_contains(&tools, "recall_tool_result");
         assert_contains(&tools, "web_search");
         assert_contains(&tools, "read_skill");
         // Plus the balanced additions

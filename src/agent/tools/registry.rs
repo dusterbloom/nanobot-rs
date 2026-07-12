@@ -7,12 +7,14 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolExecutionResult};
+use super::base::{
+    PermissionLevel, Tool, ToolConcurrency, ToolExecutionContext, ToolExecutionResult,
+};
 use super::{
-    ApplyPatchTool, BatchTool, BrowserTool, CodeExecutionTool, EditFileTool, ExecTool,
-    FileInfoTool, FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool, ReadSkillTool,
-    RecallTool, RememberTool, SearchContextTool, SearchFilesTool, SessionSearchTool,
-    SystemInfoTool, ToolStatusTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileTool,
+    ApplyPatchTool, BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, FileInfoTool,
+    FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool,
+    RememberTool, SearchContextTool, SearchFilesTool, SessionSearchTool, SystemInfoTool,
+    ToolStatusTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
 use crate::config::schema::CodeExecutionConfig;
@@ -316,12 +318,6 @@ impl ToolRegistry {
         if should_include("file_info") {
             self.register(Box::new(FileInfoTool));
         }
-        if should_include("batch") {
-            self.register(Box::new(BatchTool::new(
-                config.workspace.clone(),
-                config.db_path.clone(),
-            )));
-        }
         if should_include("workspace_diff") {
             self.register(Box::new(WorkspaceDiffTool));
         }
@@ -414,6 +410,17 @@ impl ToolRegistry {
     /// Get a reference to a tool by name.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
+    }
+
+    /// Return the implementation-declared execution policy. Hooks may mutate
+    /// external state, so their presence conservatively serializes every tool.
+    pub fn concurrency(&self, name: &str) -> ToolConcurrency {
+        if self.hooks.is_some() {
+            return ToolConcurrency::Sequential;
+        }
+        self.get(name)
+            .map(Tool::concurrency)
+            .unwrap_or(ToolConcurrency::Sequential)
     }
 
     /// Check if a tool is registered.
@@ -1045,7 +1052,6 @@ impl ToolRegistry {
                 "search_files",
                 "search_context",
                 "file_info",
-                "batch",
                 "workspace_diff",
                 "exec",
             ]),
@@ -1058,7 +1064,6 @@ impl ToolRegistry {
                 "search_files",
                 "search_context",
                 "file_info",
-                "batch",
                 "workspace_diff",
             ]),
             TaskPhase::WebResearch => Some(&["web_search", "web_fetch", "browser", "read_file"]),
@@ -1872,13 +1877,12 @@ mod tests {
             "search_files",
             "search_context",
             "file_info",
-            "batch",
             "workspace_diff",
             "exec",
         ] {
             assert!(tools.contains(&t), "FileEditing phase missing {t}");
         }
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -1893,12 +1897,11 @@ mod tests {
             "search_files",
             "search_context",
             "file_info",
-            "batch",
             "workspace_diff",
         ] {
             assert!(tools.contains(&t), "CodeExecution phase missing {t}");
         }
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 9);
     }
 
     #[test]
@@ -1908,6 +1911,16 @@ mod tests {
         assert!(tools.contains(&"web_fetch"));
         assert!(tools.contains(&"browser"));
         assert_eq!(tools.len(), 4);
+    }
+
+    #[test]
+    fn test_standard_registry_omits_redundant_batch_tool() {
+        let registry =
+            ToolRegistry::with_standard_tools(&ToolConfig::new(std::path::Path::new(".")));
+        assert!(
+            !registry.has("batch"),
+            "native multi-tool responses are the single batching path"
+        );
     }
 
     #[test]

@@ -20,13 +20,12 @@ use crate::providers::base::{LLMResponse, ToolCallRequest};
 use std::sync::Arc;
 
 use super::agent_loop::{ResponseBoundary, TurnContext};
+use crate::agent::tools::base::ToolConcurrency;
 
 const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
-/// Hard cap on a tool result's in-context (preview) size. The full body is
-/// stashed in the tool_result_store for lossless `recall_tool_result`, so the
-/// preview can be small — bounding the per-result context cost.
-const INLINE_TOOL_RESULT_HOT_PROMPT_MAX_CHARS: usize = 1_200;
-const INLINE_TOOL_RESULT_HOT_PROMPT_MIN_CHARS: usize = 600;
+/// Bound native multi-tool fan-out. Four concurrent reads/fetches keep local
+/// resource use predictable while still collapsing the dominant serial waits.
+const MAX_PARALLEL_TOOL_CALLS: usize = 4;
 
 /// Per-tool token threshold above which a raw tool result is replaced by a
 /// summary. Enumerative tools (`exec`, `list_dir`, `web_search`, `read_file`)
@@ -36,17 +35,22 @@ const INLINE_TOOL_RESULT_HOT_PROMPT_MIN_CHARS: usize = 600;
 fn summary_threshold_tokens(tool_name: &str) -> usize {
     match tool_name {
         "exec" | "list_dir" | "find_files" | "search_files" | "search_context" | "file_info"
-        | "file_preview" | "batch" | "workspace_diff" | "system_info" | "tool_status"
-        | "web_search" | "read_file" => 4000,
+        | "file_preview" | "workspace_diff" | "system_info" | "tool_status" | "web_search"
+        | "read_file" => 4000,
         _ => LARGE_TOOL_RESULT_TOKEN_THRESHOLD,
     }
 }
 
+fn effective_tool_result_cap(configured_max_chars: usize) -> usize {
+    // This setting is the user-visible contract. A second hidden 1,200-char
+    // ceiling made ordinary ranged reads lossy even when the configured limit
+    // was 10,000. Older results are compacted later by the context-budget hot
+    // path, which already preserves the four freshest tool messages.
+    configured_max_chars.max(1)
+}
+
 fn inline_hot_prompt_result_cap(ctx: &TurnContext) -> usize {
-    ctx.core
-        .max_tool_result_chars
-        .min(INLINE_TOOL_RESULT_HOT_PROMPT_MAX_CHARS)
-        .max(INLINE_TOOL_RESULT_HOT_PROMPT_MIN_CHARS)
+    effective_tool_result_cap(ctx.core.max_tool_result_chars)
 }
 
 fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> String {
@@ -651,29 +655,6 @@ fn is_routed_call(tool_call_id: &str, routed_tool_calls: &[ToolCallRequest]) -> 
     routed_tool_calls.iter().any(|tc| tc.id == tool_call_id)
 }
 
-/// Returns `true` if a tool is safe to execute in parallel with other
-/// parallel-safe tools. These are read-only operations that do not mutate
-/// any shared state and can safely race each other.
-fn is_parallel_safe(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "read_file"
-            | "file_preview"
-            | "list_dir"
-            | "find_files"
-            | "search_files"
-            | "search_context"
-            | "file_info"
-            | "batch"
-            | "workspace_diff"
-            | "system_info"
-            | "tool_status"
-            | "web_fetch"
-            | "web_search"
-            | "read_skill"
-    )
-}
-
 /// Collects everything produced by a single tool execution, ready for
 /// sequential post-processing by `inject_tool_result`.
 struct SingleToolResult {
@@ -731,6 +712,23 @@ async fn execute_single_tool(
 
         let start = std::time::Instant::now();
 
+        // A later bounded chunk may start after a sibling observes turn
+        // cancellation. Return a protocol result without entering the tool.
+        if cancellation_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return SingleToolResult {
+                tool_name: tc.name.clone(),
+                tool_id: tc.id.clone(),
+                arguments: tc.arguments.clone(),
+                result: crate::agent::tools::base::ToolExecutionResult::failure(
+                    "tool call cancelled".to_string(),
+                ),
+                duration_ms: 0,
+            };
+        }
+
         // Spawn heartbeat that emits Progress ticks until the tool finishes.
         let heartbeat = if let Some(ref tx) = tool_event_tx {
             let hb_tx = tx.clone();
@@ -755,21 +753,34 @@ async fn execute_single_tool(
             None
         };
 
-        let result = if let Some(ref tx) = tool_event_tx {
-            use crate::agent::tools::base::ToolExecutionContext;
-            let exec_ctx = ToolExecutionContext {
-                event_tx: tx.clone(),
-                cancellation_token: cancellation_token
-                    .as_ref()
-                    .map(|t| t.child_token())
-                    .unwrap_or_else(tokio_util::sync::CancellationToken::new),
-                tool_call_id: tc.id.clone(),
-            };
-            tools
-                .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
-                .await
+        let execution = async {
+            if let Some(ref tx) = tool_event_tx {
+                use crate::agent::tools::base::ToolExecutionContext;
+                let exec_ctx = ToolExecutionContext {
+                    event_tx: tx.clone(),
+                    cancellation_token: cancellation_token
+                        .as_ref()
+                        .map(|t| t.child_token())
+                        .unwrap_or_else(tokio_util::sync::CancellationToken::new),
+                    tool_call_id: tc.id.clone(),
+                };
+                tools
+                    .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
+                    .await
+            } else {
+                tools.execute(&tc.name, tc.arguments.clone()).await
+            }
+        };
+        let result = if let Some(token) = cancellation_token {
+            tokio::select! {
+                biased;
+                result = execution => result,
+                _ = token.cancelled() => crate::agent::tools::base::ToolExecutionResult::failure(
+                    "tool call cancelled".to_string()
+                ),
+            }
         } else {
-            tools.execute(&tc.name, tc.arguments.clone()).await
+            execution.await
         };
 
         // Stop heartbeat.
@@ -797,6 +808,65 @@ async fn execute_single_tool(
     }
     .instrument(tool_span)
     .await
+}
+
+/// Execute calls in provider order. Adjacent `ParallelSafe` runs overlap with
+/// bounded fan-out; every sequential tool is an ordering barrier. Each bounded
+/// `join_all` preserves carrier order even when calls complete out of order.
+async fn execute_tool_calls_ordered(
+    calls: &[&ToolCallRequest],
+    tools: &crate::agent::tools::registry::ToolRegistry,
+    tool_event_tx: &Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
+    cancellation_token: &Option<tokio_util::sync::CancellationToken>,
+    tool_heartbeat_secs: u64,
+    taints: Vec<Option<String>>,
+) -> Vec<SingleToolResult> {
+    let mut results = Vec::with_capacity(calls.len());
+    let mut start = 0;
+
+    while start < calls.len() {
+        if tools.concurrency(&calls[start].name) == ToolConcurrency::ParallelSafe {
+            let mut end = start + 1;
+            while end < calls.len()
+                && tools.concurrency(&calls[end].name) == ToolConcurrency::ParallelSafe
+            {
+                end += 1;
+            }
+            for chunk_start in (start..end).step_by(MAX_PARALLEL_TOOL_CALLS) {
+                let chunk_end = (chunk_start + MAX_PARALLEL_TOOL_CALLS).min(end);
+                let futures = calls[chunk_start..chunk_end]
+                    .iter()
+                    .zip(taints[chunk_start..chunk_end].iter().cloned())
+                    .map(|(tc, taint)| {
+                        execute_single_tool(
+                            tc,
+                            tools,
+                            tool_event_tx,
+                            cancellation_token,
+                            tool_heartbeat_secs,
+                            taint,
+                        )
+                    });
+                results.extend(futures_util::future::join_all(futures).await);
+            }
+            start = end;
+        } else {
+            results.push(
+                execute_single_tool(
+                    calls[start],
+                    tools,
+                    tool_event_tx,
+                    cancellation_token,
+                    tool_heartbeat_secs,
+                    taints[start].clone(),
+                )
+                .await,
+            );
+            start += 1;
+        }
+    }
+
+    results
 }
 
 /// Post-process one completed tool result: gate content, inject into messages,
@@ -991,10 +1061,10 @@ fn inject_boundary_rejection(ctx: &mut TurnContext, tc: &ToolCallRequest) {
 
 /// Execute tool calls via the inline (direct) path.
 ///
-/// Parallel-safe tools (`read_file`, `list_dir`, `web_fetch`, `web_search`,
-/// `read_skill`) are executed concurrently via `join_all`. All other tools are
-/// executed sequentially. Post-processing always runs sequentially so that
-/// `ctx` mutations are safe.
+/// Adjacent implementation-declared `ParallelSafe` tools execute concurrently
+/// with bounded fan-out. Sequential tools are ordering barriers. Results are
+/// always post-processed in provider order so `ctx` mutations stay safe and
+/// assistant/tool message pairing remains deterministic.
 pub(crate) async fn execute_tools_inline(
     ctx: &mut TurnContext,
     routed_tool_calls: &[ToolCallRequest],
@@ -1030,13 +1100,8 @@ pub(crate) async fn execute_tools_inline(
     }
     ctx.persist_pending_protocol_messages().await;
 
-    // Partition into parallel-safe and sequential tool calls.
-    let (parallel, sequential): (Vec<_>, Vec<_>) = allowed
-        .into_iter()
-        .partition(|tc| is_parallel_safe(&tc.name));
-
     // Build taint warnings up-front (immutable borrow of ctx.taint_state).
-    let parallel_taints: Vec<Option<String>> = parallel
+    let taints: Vec<Option<String>> = allowed
         .iter()
         .map(|tc| {
             if ctx.taint_state.check_sensitive(&tc.name).is_some() {
@@ -1047,56 +1112,24 @@ pub(crate) async fn execute_tools_inline(
         })
         .collect();
 
-    // Execute the parallel-safe batch concurrently.
-    let parallel_results: Vec<SingleToolResult> = if !parallel.is_empty() {
-        let futs = parallel
-            .iter()
-            .zip(parallel_taints.into_iter())
-            .map(|(tc, taint)| {
-                execute_single_tool(
-                    tc,
-                    &ctx.tools,
-                    &ctx.tool_event_tx,
-                    &ctx.cancellation_token,
-                    ctx.core.tool_heartbeat_secs,
-                    taint,
-                )
-            });
-        futures_util::future::join_all(futs).await
-    } else {
-        vec![]
-    };
-
-    // Post-process parallel results sequentially (ctx mutation is safe here).
-    for r in &parallel_results {
-        inject_tool_result(ctx, r).await;
-    }
-
-    // Execute sequential tools one at a time.
-    for tc in &sequential {
-        let taint = if ctx.taint_state.check_sensitive(&tc.name).is_some() {
-            Some(ctx.taint_state.taint_summary())
-        } else {
-            None
-        };
-        let r = execute_single_tool(
-            tc,
-            &ctx.tools,
-            &ctx.tool_event_tx,
-            &ctx.cancellation_token,
-            ctx.core.tool_heartbeat_secs,
-            taint,
-        )
-        .await;
-        inject_tool_result(ctx, &r).await;
+    let ordered_results = execute_tool_calls_ordered(
+        &allowed,
+        &ctx.tools,
+        &ctx.tool_event_tx,
+        &ctx.cancellation_token,
+        ctx.core.tool_heartbeat_secs,
+        taints,
+    )
+    .await;
+    for result in &ordered_results {
+        inject_tool_result(ctx, result).await;
     }
 
     // Behavioral response-boundary arming. `parallel`/`sequential` hold only the
     // EXECUTED (non-blocked) calls, so a boundary-rejected call cannot re-arm.
-    let executed: Vec<&str> = parallel
+    let executed: Vec<&str> = ordered_results
         .iter()
-        .chain(sequential.iter())
-        .map(|tc| tc.name.as_str())
+        .map(|result| result.tool_name.as_str())
         .collect();
 
     // No tool actually ran this round — every call was boundary-rejected. The
@@ -1114,6 +1147,115 @@ pub(crate) async fn execute_tools_inline(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use crate::agent::tools::base::Tool;
+    use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
+
+    struct ProbeState {
+        started: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        log: Mutex<Vec<String>>,
+        changed: tokio::sync::Notify,
+    }
+
+    impl ProbeState {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                started: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                log: Mutex::new(Vec::new()),
+                changed: tokio::sync::Notify::new(),
+            })
+        }
+
+        async fn wait_for_started(&self, expected: usize) {
+            while self.started.load(Ordering::SeqCst) < expected {
+                self.changed.notified().await;
+            }
+        }
+    }
+
+    struct ProbeTool {
+        name: String,
+        concurrency: ToolConcurrency,
+        state: Arc<ProbeState>,
+        gate: Option<tokio_util::sync::CancellationToken>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ProbeTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "test probe"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn concurrency(&self) -> ToolConcurrency {
+            self.concurrency
+        }
+
+        async fn execute(&self, _params: HashMap<String, Value>) -> String {
+            self.state.started.fetch_add(1, Ordering::SeqCst);
+            let active = self.state.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.peak.fetch_max(active, Ordering::SeqCst);
+            self.state.log.lock().unwrap().push(self.name.clone());
+            self.state.changed.notify_waiters();
+            if let Some(gate) = &self.gate {
+                gate.cancelled().await;
+            }
+            self.state.active.fetch_sub(1, Ordering::SeqCst);
+            if self.fail {
+                "Error: probe failure".to_string()
+            } else {
+                format!("{} complete", self.name)
+            }
+        }
+    }
+
+    fn register_probe(
+        registry: &mut ToolRegistry,
+        name: &str,
+        concurrency: ToolConcurrency,
+        state: &Arc<ProbeState>,
+        gate: Option<tokio_util::sync::CancellationToken>,
+        fail: bool,
+    ) {
+        registry.register(Box::new(ProbeTool {
+            name: name.to_string(),
+            concurrency,
+            state: Arc::clone(state),
+            gate,
+            fail,
+        }));
+    }
+
+    async fn run_probe_calls(
+        registry: &ToolRegistry,
+        calls: &[ToolCallRequest],
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Vec<SingleToolResult> {
+        let refs: Vec<&ToolCallRequest> = calls.iter().collect();
+        execute_tool_calls_ordered(
+            &refs,
+            registry,
+            &None,
+            &cancellation,
+            60,
+            vec![None; calls.len()],
+        )
+        .await
+    }
 
     fn make_tc(name: &str, id: &str) -> ToolCallRequest {
         ToolCallRequest {
@@ -1198,6 +1340,12 @@ mod tests {
     }
 
     #[test]
+    fn configured_tool_result_cap_is_the_hot_prompt_cap() {
+        assert_eq!(effective_tool_result_cap(10_000), 10_000);
+        assert_eq!(effective_tool_result_cap(2_000), 2_000);
+    }
+
+    #[test]
     fn digest_tool_result_stashes_full_and_points_to_recall() {
         let store = parking_lot::Mutex::new(std::collections::HashMap::new());
         let mut args = HashMap::new();
@@ -1233,30 +1381,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_parallel_safe_classification() {
-        // Parallel-safe tools
-        assert!(is_parallel_safe("read_file"));
-        assert!(is_parallel_safe("file_preview"));
-        assert!(is_parallel_safe("list_dir"));
-        assert!(is_parallel_safe("find_files"));
-        assert!(is_parallel_safe("search_files"));
-        assert!(is_parallel_safe("search_context"));
-        assert!(is_parallel_safe("file_info"));
-        assert!(is_parallel_safe("batch"));
-        assert!(is_parallel_safe("workspace_diff"));
-        assert!(is_parallel_safe("system_info"));
-        assert!(is_parallel_safe("tool_status"));
-        assert!(is_parallel_safe("web_fetch"));
-        assert!(is_parallel_safe("web_search"));
-        assert!(is_parallel_safe("read_skill"));
-        // Must serialize
-        assert!(!is_parallel_safe("exec"));
-        assert!(!is_parallel_safe("write_file"));
-        assert!(!is_parallel_safe("edit_file"));
-        assert!(!is_parallel_safe("apply_patch"));
-        assert!(!is_parallel_safe("spawn"));
-        // Unknown defaults to serial
-        assert!(!is_parallel_safe("unknown_tool"));
+    fn test_tool_concurrency_is_declared_by_implementation() {
+        let registry =
+            ToolRegistry::with_standard_tools(&ToolConfig::new(std::path::Path::new(".")));
+        for name in [
+            "read_file",
+            "file_preview",
+            "list_dir",
+            "file_info",
+            "web_fetch",
+            "web_search",
+            "read_skill",
+        ] {
+            assert_eq!(registry.concurrency(name), ToolConcurrency::ParallelSafe);
+        }
+        for name in ["exec", "write_file", "find_files", "unknown_tool"] {
+            assert_eq!(registry.concurrency(name), ToolConcurrency::Sequential);
+        }
     }
 
     #[test]
@@ -1346,44 +1487,232 @@ mod tests {
         assert!(!boundary_blocks_side_effects(false, Some("hi")));
     }
 
-    #[test]
-    fn test_mixed_tools_partition_correctly() {
-        let calls = vec![
-            make_tc("read_file", "1"),
-            make_tc("exec", "2"),
-            make_tc("list_dir", "3"),
-            make_tc("write_file", "4"),
-            make_tc("find_files", "5"),
-        ];
-        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
-        assert_eq!(par.len(), 3);
-        assert_eq!(seq.len(), 2);
-        assert_eq!(par[0].name, "read_file");
-        assert_eq!(par[1].name, "list_dir");
-        assert_eq!(par[2].name, "find_files");
-        assert_eq!(seq[0].name, "exec");
-        assert_eq!(seq[1].name, "write_file");
+    #[tokio::test]
+    async fn parallel_safe_calls_overlap_and_preserve_order() {
+        let state = ProbeState::new();
+        let gate = tokio_util::sync::CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        register_probe(
+            &mut registry,
+            "safe_a",
+            ToolConcurrency::ParallelSafe,
+            &state,
+            Some(gate.clone()),
+            false,
+        );
+        register_probe(
+            &mut registry,
+            "safe_b",
+            ToolConcurrency::ParallelSafe,
+            &state,
+            Some(gate.clone()),
+            false,
+        );
+        let calls = vec![make_tc("safe_a", "a"), make_tc("safe_b", "b")];
+        let execution = run_probe_calls(&registry, &calls, None);
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(1), state.wait_for_started(2))
+                .await
+                .expect("parallel calls did not overlap");
+            assert_eq!(state.peak.load(Ordering::SeqCst), 2);
+            gate.cancel();
+        };
+        let (results, ()) = tokio::join!(execution, release);
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.tool_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
     }
 
-    #[test]
-    fn test_all_parallel_safe_no_sequential() {
+    #[tokio::test]
+    async fn sequential_tool_is_an_ordering_barrier() {
+        let state = ProbeState::new();
+        let gate = tokio_util::sync::CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        for name in ["safe_a", "safe_b"] {
+            register_probe(
+                &mut registry,
+                name,
+                ToolConcurrency::ParallelSafe,
+                &state,
+                Some(gate.clone()),
+                false,
+            );
+        }
+        register_probe(
+            &mut registry,
+            "serial",
+            ToolConcurrency::Sequential,
+            &state,
+            None,
+            false,
+        );
+        register_probe(
+            &mut registry,
+            "safe_c",
+            ToolConcurrency::ParallelSafe,
+            &state,
+            None,
+            false,
+        );
         let calls = vec![
-            make_tc("read_file", "1"),
-            make_tc("list_dir", "2"),
-            make_tc("web_search", "3"),
-            make_tc("file_info", "4"),
+            make_tc("safe_a", "a"),
+            make_tc("safe_b", "b"),
+            make_tc("serial", "s"),
+            make_tc("safe_c", "c"),
         ];
-        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
-        assert_eq!(par.len(), 4);
-        assert!(seq.is_empty());
+        let execution = run_probe_calls(&registry, &calls, None);
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(1), state.wait_for_started(2))
+                .await
+                .expect("first safe run did not start");
+            let log = state.log.lock().unwrap().clone();
+            assert!(!log.iter().any(|name| name == "serial" || name == "safe_c"));
+            gate.cancel();
+        };
+        let (results, ()) = tokio::join!(execution, release);
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.tool_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "s", "c"]
+        );
     }
 
-    #[test]
-    fn test_all_sequential_no_parallel() {
-        let calls = vec![make_tc("exec", "1"), make_tc("write_file", "2")];
-        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
-        assert!(par.is_empty());
-        assert_eq!(seq.len(), 2);
+    #[tokio::test]
+    async fn parallel_failure_is_all_settled_before_serial_barrier() {
+        let state = ProbeState::new();
+        let gate = tokio_util::sync::CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        register_probe(
+            &mut registry,
+            "fail",
+            ToolConcurrency::ParallelSafe,
+            &state,
+            None,
+            true,
+        );
+        register_probe(
+            &mut registry,
+            "keep",
+            ToolConcurrency::ParallelSafe,
+            &state,
+            Some(gate.clone()),
+            false,
+        );
+        register_probe(
+            &mut registry,
+            "serial",
+            ToolConcurrency::Sequential,
+            &state,
+            None,
+            false,
+        );
+        let calls = vec![
+            make_tc("fail", "f"),
+            make_tc("keep", "k"),
+            make_tc("serial", "s"),
+        ];
+        let execution = run_probe_calls(&registry, &calls, None);
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(1), state.wait_for_started(2))
+                .await
+                .expect("safe siblings did not both start");
+            assert!(!state
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|name| name == "serial"));
+            gate.cancel();
+        };
+        let (results, ()) = tokio::join!(execution, release);
+        assert!(!results[0].result.ok);
+        assert!(results[1].result.ok);
+        assert!(results[2].result.ok);
+    }
+
+    #[tokio::test]
+    async fn parallelism_never_exceeds_cap() {
+        let state = ProbeState::new();
+        let gate = tokio_util::sync::CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        let mut calls = Vec::new();
+        for index in 0..MAX_PARALLEL_TOOL_CALLS + 2 {
+            let name = format!("safe_{index}");
+            register_probe(
+                &mut registry,
+                &name,
+                ToolConcurrency::ParallelSafe,
+                &state,
+                Some(gate.clone()),
+                false,
+            );
+            calls.push(make_tc(&name, &index.to_string()));
+        }
+        let execution = run_probe_calls(&registry, &calls, None);
+        let release = async {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state.wait_for_started(MAX_PARALLEL_TOOL_CALLS),
+            )
+            .await
+            .expect("initial bounded batch did not start");
+            tokio::task::yield_now().await;
+            assert_eq!(
+                state.started.load(Ordering::SeqCst),
+                MAX_PARALLEL_TOOL_CALLS
+            );
+            gate.cancel();
+        };
+        let (results, ()) = tokio::join!(execution, release);
+        assert_eq!(results.len(), MAX_PARALLEL_TOOL_CALLS + 2);
+        assert_eq!(state.peak.load(Ordering::SeqCst), MAX_PARALLEL_TOOL_CALLS);
+    }
+
+    #[tokio::test]
+    async fn cancellation_skips_queued_underlying_calls_but_returns_every_receipt() {
+        let state = ProbeState::new();
+        let gate = tokio_util::sync::CancellationToken::new();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        let mut calls = Vec::new();
+        for index in 0..MAX_PARALLEL_TOOL_CALLS + 2 {
+            let name = format!("safe_{index}");
+            register_probe(
+                &mut registry,
+                &name,
+                ToolConcurrency::ParallelSafe,
+                &state,
+                Some(gate.clone()),
+                false,
+            );
+            calls.push(make_tc(&name, &index.to_string()));
+        }
+        let execution = run_probe_calls(&registry, &calls, Some(cancellation.clone()));
+        let cancel = async {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state.wait_for_started(MAX_PARALLEL_TOOL_CALLS),
+            )
+            .await
+            .expect("initial bounded batch did not start");
+            cancellation.cancel();
+        };
+        let (results, ()) = tokio::join!(execution, cancel);
+        assert_eq!(results.len(), MAX_PARALLEL_TOOL_CALLS + 2);
+        assert_eq!(
+            state.started.load(Ordering::SeqCst),
+            MAX_PARALLEL_TOOL_CALLS
+        );
+        assert!(results.iter().all(|result| !result.result.ok));
+        assert!(results
+            .iter()
+            .all(|result| result.result.data.contains("cancelled")));
     }
 
     #[test]
@@ -1411,20 +1740,5 @@ mod tests {
         assert!(is_routed_call("id_a", &routed));
         assert!(is_routed_call("id_b", &routed));
         assert!(!is_routed_call("id_c", &routed));
-    }
-
-    #[test]
-    fn test_single_tool_partitions_correctly() {
-        // Single parallel-safe tool
-        let calls = vec![make_tc("read_file", "1")];
-        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
-        assert_eq!(par.len(), 1);
-        assert!(seq.is_empty());
-
-        // Single serial tool
-        let calls = vec![make_tc("exec", "1")];
-        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
-        assert!(par.is_empty());
-        assert_eq!(seq.len(), 1);
     }
 }

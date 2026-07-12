@@ -433,39 +433,28 @@ fn apply_local_reasoning_controls(
     }
 }
 
-/// Keep local OpenAI-compatible tool calls single-call and parser-friendly.
-///
-/// Local servers/models are much more likely than cloud APIs to emit malformed
-/// or duplicate parallel tool calls. For the local path, force serial tool
-/// calls whenever tools are exposed.
-fn apply_local_tool_call_controls(
-    body: &mut serde_json::Value,
-    api_base: &str,
-    request_has_tools: bool,
-) {
-    if request_has_tools && is_local_api_base(api_base) {
-        body["parallel_tool_calls"] = serde_json::json!(false);
-    }
-}
-
 /// Suppress degenerate repetition loops on local servers.
 ///
-/// Local models (especially smaller GGUF/Q4 ones) can enter a sampling
-/// failure mode where a token sequence — e.g. an exec command containing a
-/// near-duplicate path pair — echoes until `max_tokens` is exhausted. The
-/// OpenAI-compatible request body carries no repetition-control parameter,
-/// so once the pattern is seeded nothing breaks it. llama.cpp / higgs / LM
-/// Studio OpenAI-compat layers all accept `repeat_penalty` (>1.0 suppresses
-/// repeats; 1.1 is the widely used default, same as Ollama). Applied to
-/// local servers only — cloud APIs manage their own anti-repetition and
-/// would reject llama.cpp-native fields.
-fn apply_repetition_controls(body: &mut serde_json::Value, api_base: &str) {
+/// Qwen 3.x recommends an additive presence penalty of 1.5. Higgs implements
+/// the OpenAI/vLLM names `presence_penalty` and `repetition_penalty`; its
+/// request parser ignores llama.cpp's `repeat_penalty`, which made the old
+/// local safeguard a no-op on our production path. Non-Qwen local backends
+/// retain the backend-specific 1.1 control for compatibility.
+fn apply_repetition_controls(
+    body: &mut serde_json::Value,
+    api_base: &str,
+    policy_model: &str,
+) {
     if !is_local_api_base(api_base) {
         return;
     }
-    // 1.1 is the llama.cpp default and matches Ollama's hardcoded value; it
-    // suppresses repeats without distorting coherent output.
-    body["repeat_penalty"] = serde_json::json!(1.1);
+    if policy_model.to_ascii_lowercase().contains("qwen3") {
+        body["presence_penalty"] = serde_json::json!(1.5);
+        body["repetition_penalty"] = serde_json::json!(1.0);
+    } else {
+        // 1.1 is the llama.cpp default and matches Ollama's default behavior.
+        body["repeat_penalty"] = serde_json::json!(1.1);
+    }
 }
 
 /// Ensure every object schema carries a `required` key (recursively).
@@ -884,11 +873,9 @@ impl OpenAICompatProvider {
                 body["tool_choice"] = tc_value;
             }
         }
-        let request_has_tools = body.get("tools").is_some();
-        apply_local_tool_call_controls(&mut body, &self.api_base, request_has_tools);
         // Local models can enter a sampling loop where a token sequence echoes
-        // until max_tokens; repeat_penalty breaks it. No-op for cloud APIs.
-        apply_repetition_controls(&mut body, &self.api_base);
+        // until max_tokens; use the model/backend's actual sampling fields.
+        apply_repetition_controls(&mut body, &self.api_base, policy_model);
         // Strict-validation servers (Apple FM) reject object schemas that omit a
         // `required` key; normalize every outgoing tool schema (no-op elsewhere).
         normalize_tool_schemas(&mut body);
@@ -1810,6 +1797,8 @@ mod tests {
         assert_eq!(model_b, model_s);
         assert_eq!(blocking["stream"], serde_json::json!(false));
         assert_eq!(streaming["stream"], serde_json::json!(true));
+        assert!(blocking.get("parallel_tool_calls").is_none());
+        assert!(streaming.get("parallel_tool_calls").is_none());
 
         // Strip the fields that legitimately differ; the rest must be identical.
         for body in [&mut blocking, &mut streaming] {
@@ -2754,27 +2743,25 @@ mod tests {
 
 
     #[test]
-    fn test_local_tool_call_controls_disable_parallel_calls() {
-        let mut body = serde_json::json!({"model": "qwen36-35b", "messages": []});
-        apply_local_tool_call_controls(&mut body, "http://localhost:1234", true);
-        assert_eq!(body["parallel_tool_calls"], false);
-
-        let mut remote_body = serde_json::json!({"model": "gpt-4o", "messages": []});
-        apply_local_tool_call_controls(&mut remote_body, "https://api.openai.com/v1", true);
-        assert!(remote_body.get("parallel_tool_calls").is_none());
-
-        let mut no_tools_body = serde_json::json!({"model": "qwen36-35b", "messages": []});
-        apply_local_tool_call_controls(&mut no_tools_body, "http://localhost:1234", false);
-        assert!(no_tools_body.get("parallel_tool_calls").is_none());
+    fn test_qwen_repetition_controls_use_openai_fields_for_higgs() {
+        let mut body = serde_json::json!({"model": "active", "messages": []});
+        apply_repetition_controls(
+            &mut body,
+            "http://localhost:8000",
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+        );
+        assert_eq!(body["presence_penalty"], 1.5);
+        assert_eq!(body["repetition_penalty"], 1.0);
+        assert!(body.get("repeat_penalty").is_none());
+        assert!(body.get("frequency_penalty").is_none());
     }
 
     #[test]
-    fn test_repetition_controls_added_for_local_server() {
-        // Local llama.cpp/higgs/LM Studio server must receive repeat_penalty
-        // to break degenerate sampling loops.
-        let mut body = serde_json::json!({"model": "qwen36-35b", "messages": []});
-        apply_repetition_controls(&mut body, "http://localhost:1234");
+    fn test_non_qwen_local_repetition_controls_keep_backend_field() {
+        let mut body = serde_json::json!({"model": "llama", "messages": []});
+        apply_repetition_controls(&mut body, "http://localhost:1234", "llama-3.2-3b");
         assert_eq!(body["repeat_penalty"], 1.1);
+        assert!(body.get("presence_penalty").is_none());
     }
 
     #[test]
@@ -2782,8 +2769,10 @@ mod tests {
         // Cloud APIs manage their own anti-repetition and would reject
         // llama.cpp-native fields, so they must not be sent.
         let mut body = serde_json::json!({"model": "gpt-4o", "messages": []});
-        apply_repetition_controls(&mut body, "https://api.openai.com/v1");
+        apply_repetition_controls(&mut body, "https://api.openai.com/v1", "gpt-4o");
         assert!(body.get("repeat_penalty").is_none());
+        assert!(body.get("presence_penalty").is_none());
+        assert!(body.get("repetition_penalty").is_none());
     }
 
 

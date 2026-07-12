@@ -21,7 +21,10 @@ impl Capability {
     /// Tool names this capability grants access to.
     pub fn tool_names(&self) -> &[&str] {
         match self {
-            Capability::Read => &["read_file", "list_dir"],
+            // Result recall is part of the read contract: the agent loop may
+            // replace an oversized result with a pointer to this tool. Cloud
+            // capability gating must not leave that pointer uncallable.
+            Capability::Read => &["read_file", "list_dir", "recall_tool_result"],
             Capability::Write => &["write_file", "edit_file"],
             Capability::Execute => &["exec"],
             Capability::Http => &["web_search", "web_fetch", "browser"],
@@ -57,7 +60,8 @@ mod tests {
         let tools = resolve_capabilities(&[Capability::Read]);
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"list_dir".to_string()));
-        assert_eq!(tools.len(), 2);
+        assert!(tools.contains(&"recall_tool_result".to_string()));
+        assert_eq!(tools.len(), 3);
     }
 
     #[test]

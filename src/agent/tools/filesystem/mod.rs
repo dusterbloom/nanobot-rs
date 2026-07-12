@@ -18,7 +18,7 @@ use regex::RegexBuilder;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{PermissionLevel, Tool, ToolConcurrency};
 
 /// Extract a required string parameter, returning an error string on missing.
 fn require_param<'a>(
@@ -69,6 +69,10 @@ impl Tool for ReadFileTool {
 
     fn description(&self) -> &str {
         "Read a file: returns the first 1000 lines by default (numbered) and the file's total line count. Use max_lines to raise the initial window up to 5000 lines, or lines=\"START:END\" (1-indexed, inclusive) for an exact range; use lines=\"1:\" only when you truly need the entire file."
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -326,6 +330,10 @@ impl Tool for ListDirTool {
 
     fn description(&self) -> &str {
         "List the contents of a directory."
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -964,6 +972,10 @@ impl Tool for FileInfoTool {
 
     fn description(&self) -> &str {
         "Return metadata for a file or directory: type, size, permissions, timestamps, and SHA-256 for files. Use expected_sha256 with edit_file to catch concurrent edits."
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
     }
 
     fn parameters(&self) -> serde_json::Value {

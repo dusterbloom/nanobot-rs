@@ -2,7 +2,6 @@
 
 pub mod apply_patch;
 pub mod base;
-pub mod batch;
 pub mod browser;
 pub mod code_execution;
 pub mod cron_tool;
@@ -27,7 +26,6 @@ pub mod web;
 
 pub use apply_patch::ApplyPatchTool;
 pub use base::Tool;
-pub use batch::BatchTool;
 pub use browser::BrowserTool;
 pub use code_execution::CodeExecutionTool;
 pub use cron_tool::CronScheduleTool;

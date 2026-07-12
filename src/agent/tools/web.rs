@@ -9,7 +9,7 @@ use reqwest::Client;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::base::{require_str, PermissionLevel, Tool, ToolExecutionContext};
+use super::base::{require_str, PermissionLevel, Tool, ToolConcurrency, ToolExecutionContext};
 use crate::agent::audit::ToolEvent;
 
 /// Shared user-agent string.
@@ -196,6 +196,10 @@ impl Tool for WebSearchTool {
 
     fn permission(&self) -> PermissionLevel {
         PermissionLevel::Network
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -597,6 +601,10 @@ impl Tool for WebFetchTool {
 
     fn permission(&self) -> PermissionLevel {
         PermissionLevel::Network
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
     }
 
     fn parameters(&self) -> serde_json::Value {

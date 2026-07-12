@@ -289,3 +289,95 @@ fn agent_local_tool_call_smoke() {
         "found ClaimedButNotExecuted in isolated logs"
     );
 }
+
+#[test]
+#[ignore = "requires running local OpenAI-compatible endpoint (e.g. Higgs)"]
+fn agent_local_bounded_tool_result_stays_verbatim() {
+    let bin = resolve_nanobot_bin();
+    let temp_home = tempfile::tempdir().expect("failed to create temp home");
+    let home = temp_home.path();
+
+    let local_api_base = std::env::var("NANOBOT_TEST_LOCAL_API_BASE")
+        .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string());
+    let local_model = std::env::var("NANOBOT_TEST_LOCAL_MODEL")
+        .unwrap_or_else(|_| "qwen36-35b-a3b".to_string());
+    write_isolated_config(home, &local_api_base, &local_model);
+
+    let session = format!("cli:bounded_tool_{}", uuid::Uuid::new_v4());
+    let prompt = "Use exec exactly once to run `seq 1 400`. After the result arrives, reply only with LAST=400.";
+    let output = run_local_agent_with_transient_retry(&bin, home, &session, &prompt, 3);
+    assert!(
+        output.status.success(),
+        "bounded tool agent command failed: status={:?} stderr={} stdout={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let turns = read_session_messages(&expected_sessions_db(home), &session);
+    let tool_content = turns
+        .iter()
+        .find(|message| {
+            message.get("role") == Some(&Value::String("tool".to_string()))
+                && message.get("name") == Some(&Value::String("exec".to_string()))
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected persisted exec tool result; turns={turns:?}"));
+    assert!(tool_content.contains("\n250\n"), "middle was lost: {tool_content}");
+    assert!(
+        !tool_content.contains("[truncated:") && !tool_content.contains("# Content Summary"),
+        "configured-bounded result was eagerly compressed: {tool_content}"
+    );
+}
+
+#[test]
+#[ignore = "requires running local OpenAI-compatible endpoint (e.g. Higgs)"]
+fn agent_local_parallel_tool_call_smoke() {
+    let bin = resolve_nanobot_bin();
+    let temp_home = tempfile::tempdir().expect("failed to create temp home");
+    let home = temp_home.path();
+
+    let local_api_base = std::env::var("NANOBOT_TEST_LOCAL_API_BASE")
+        .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string());
+    let local_model = std::env::var("NANOBOT_TEST_LOCAL_MODEL")
+        .unwrap_or_else(|_| "qwen36-35b-a3b".to_string());
+    write_isolated_config(home, &local_api_base, &local_model);
+
+    let workspace = home.join(".nanobot").join("workspace");
+    let first = workspace.join("parallel_a.txt");
+    let second = workspace.join("parallel_b.txt");
+    fs::write(&first, "PARALLEL_A_SENTINEL").expect("failed to write first input");
+    fs::write(&second, "PARALLEL_B_SENTINEL").expect("failed to write second input");
+
+    let session = format!("cli:parallel_tool_{}", uuid::Uuid::new_v4());
+    let prompt = format!(
+        "In your next assistant response, issue exactly two read_file tool calls together: one for {} and one for {}. Do not use a batch tool and do not read them in separate rounds. After both results arrive, reply with both sentinel lines.",
+        first.display(),
+        second.display()
+    );
+    let output = run_local_agent_with_transient_retry(&bin, home, &session, &prompt, 3);
+    assert!(
+        output.status.success(),
+        "parallel agent command failed: status={:?} stderr={} stdout={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let turns = read_session_messages(&expected_sessions_db(home), &session);
+    let parallel_carrier = turns.iter().find(|message| {
+        message.get("role") == Some(&Value::String("assistant".to_string()))
+            && message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| calls.len() == 2)
+    });
+    assert!(
+        parallel_carrier.is_some(),
+        "expected one assistant carrier with exactly two tool calls; got {turns:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PARALLEL_A_SENTINEL"), "stdout={stdout}");
+    assert!(stdout.contains("PARALLEL_B_SENTINEL"), "stdout={stdout}");
+}

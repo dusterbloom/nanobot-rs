@@ -369,14 +369,15 @@ Do stuff."#;
         let tools = profile
             .tools
             .expect("capabilities should produce a tools list");
-        // read -> [list_dir, read_file], http -> [browser, web_fetch, web_search], skills -> [read_skill]
+        // Read also carries the recovery tool required by digested results.
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"list_dir".to_string()));
+        assert!(tools.contains(&"recall_tool_result".to_string()));
         assert!(tools.contains(&"web_search".to_string()));
         assert!(tools.contains(&"web_fetch".to_string()));
         assert!(tools.contains(&"browser".to_string()));
         assert!(tools.contains(&"read_skill".to_string()));
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         // Verify sorted
         for i in 1..tools.len() {
             assert!(tools[i] >= tools[i - 1], "tools should be sorted");

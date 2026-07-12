@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{require_str, Tool};
+use super::base::{require_str, Tool, ToolConcurrency};
 use crate::agent::skills::SkillsLoader;
 
 /// Tool that reads a skill's full content by name.
@@ -35,6 +35,10 @@ impl Tool for ReadSkillTool {
     fn description(&self) -> &str {
         "Read a skill's full instructions by name. Use this when the skills \
          summary in the system prompt mentions a skill you want to use."
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
     }
 
     fn parameters(&self) -> Value {
