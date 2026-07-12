@@ -74,6 +74,22 @@ pub fn hash_tools(tools: &[Value]) -> u64 {
     h.finish()
 }
 
+/// Hash the exact prompt-bearing parts of a provider request. This combines
+/// rendered messages (including transport metadata) and the tool schema block,
+/// so an identical value means the model would receive no new evidence.
+pub fn hash_provider_request(messages: &[Value], tools: &[Value]) -> u64 {
+    let mut h = DefaultHasher::new();
+    messages.len().hash(&mut h);
+    for message in messages {
+        message.to_string().hash(&mut h);
+    }
+    tools.len().hash(&mut h);
+    for tool in tools {
+        tool.to_string().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Classify the new fingerprint against the session's previous one.
 pub fn compare(prev: Option<&PromptFingerprint>, new: &PromptFingerprint) -> PromptDelta {
     let Some(prev) = prev else {

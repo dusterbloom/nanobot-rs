@@ -664,6 +664,10 @@ pub(crate) fn create_agent_loop(
         tracing::info!("Auto-enabling LCM for local mode");
         lcm_config.enabled = Some(true);
     }
+    let compaction_sidecar = crate::higgs::CompactionSidecarSpec::from_config(config);
+    if let Some(spec) = compaction_sidecar.as_ref() {
+        spec.bind_lcm_endpoint_model(&mut lcm_config);
+    }
 
     let agent_loop = AgentLoop::new(
         core_handle,
@@ -679,7 +683,7 @@ pub(crate) fn create_agent_loop(
         lcm_config,
         health_registry,
     );
-    agent_loop.set_compaction_sidecar(crate::higgs::CompactionSidecarSpec::from_config(config));
+    agent_loop.set_compaction_sidecar(compaction_sidecar);
 
     agent_loop
 }

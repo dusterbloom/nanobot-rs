@@ -30,7 +30,8 @@ impl AgentLoopShared {
         session = %ctx.session_key,
         model = %ctx.core.model,
         iterations = ctx.iterations_used,
-        tools_called = ctx.used_tools.len(),
+        tool_calls_executed = ctx.turn_tool_entries.len(),
+        unique_tools_used = ctx.used_tools.len(),
         has_content = !ctx.final_content.is_empty(),
     ))]
     pub(crate) async fn finalize_response(&self, mut ctx: TurnContext) -> Option<OutboundMessage> {
@@ -209,25 +210,10 @@ impl AgentLoopShared {
             ctx.messages.truncate(end);
         }
 
-        let new_messages: Vec<serde_json::Value> = if ctx.new_start < ctx.messages.len() {
-            ctx.messages[ctx.new_start..].to_vec()
-        } else if !ctx.final_content.is_empty() {
-            // User message already eagerly persisted (Bug 3 fix, line 274).
-            // Only persist assistant response if present.
-            vec![json!({"role": "assistant", "content": ctx.final_content.clone()})]
-        } else {
-            vec![]
-        };
-        if !new_messages.is_empty() {
-            // Deliberately no `_db_id` tagging here: ctx is dropped right
-            // after finalize, so tagging the rowids back would be dead work.
-            // The LCM engine skips messages without `_db_id`; next turn's
-            // get_history reload supplies the rowids and ingests them then.
-            ctx.core
-                .sessions
-                .add_messages(&ctx.session_id, &new_messages)
-                .await;
-        }
+        // Final text is the only normal message that has not already been
+        // checkpointed in the active tool path. This also retries any earlier
+        // SQLite failure without double-inserting successful rows.
+        ctx.persist_pending_protocol_messages().await;
 
         // Auto-complete stale working memory sessions (runs on every message, cheap).
         if ctx.core.memory_enabled {

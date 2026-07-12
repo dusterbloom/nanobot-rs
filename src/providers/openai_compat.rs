@@ -1413,11 +1413,7 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
     // Extract usage.
     let mut usage = HashMap::new();
     if let Some(usage_obj) = data.get("usage").and_then(|v| v.as_object()) {
-        for (key, value) in usage_obj {
-            if let Some(n) = value.as_i64() {
-                usage.insert(key.clone(), n);
-            }
-        }
+        extract_usage_numbers(usage_obj, &mut usage);
     }
 
     Ok(LLMResponse {
@@ -1426,6 +1422,29 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
         finish_reason,
         usage,
     })
+}
+
+/// Normalize the two common OpenAI usage shapes into the flat map shared by
+/// all nanobot providers. `prompt_tokens_details.cached_tokens` is emitted by
+/// OpenAI-compatible local servers, while Anthropic-style providers already
+/// use the flat `cache_read_input_tokens` name.
+fn extract_usage_numbers(
+    usage_obj: &serde_json::Map<String, serde_json::Value>,
+    usage: &mut HashMap<String, i64>,
+) {
+    for (key, value) in usage_obj {
+        if let Some(n) = value.as_i64() {
+            usage.insert(key.clone(), n);
+        }
+    }
+    let cached_tokens = usage_obj
+        .get("prompt_tokens_details")
+        .or_else(|| usage_obj.get("input_tokens_details"))
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(serde_json::Value::as_i64);
+    if let Some(cached_tokens) = cached_tokens {
+        usage.insert("cache_read_input_tokens".to_string(), cached_tokens);
+    }
 }
 
 /// Parse an SSE byte stream from an OpenAI-compatible streaming response.
@@ -1654,11 +1673,7 @@ async fn parse_sse_stream(
 
             // Extract usage if present (some providers include it in the last chunk)
             if let Some(usage_obj) = chunk.get("usage").and_then(|v| v.as_object()) {
-                for (key, value) in usage_obj {
-                    if let Some(n) = value.as_i64() {
-                        usage.insert(key.clone(), n);
-                    }
-                }
+                extract_usage_numbers(usage_obj, &mut usage);
             }
         }
     }
@@ -2116,6 +2131,24 @@ mod tests {
         assert_eq!(resp.usage.get("prompt_tokens"), Some(&50));
         assert_eq!(resp.usage.get("completion_tokens"), Some(&30));
         assert_eq!(resp.usage.get("total_tokens"), Some(&80));
+    }
+
+    #[test]
+    fn test_parse_response_flattens_openai_cached_prompt_tokens() {
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {"content": "cached"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 4,
+                "prompt_tokens_details": {"cached_tokens": 96}
+            }
+        });
+
+        let response = parse_response(&data).expect("parse should succeed");
+        assert_eq!(response.usage.get("cache_read_input_tokens"), Some(&96));
     }
 
     #[test]

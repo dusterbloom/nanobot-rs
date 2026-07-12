@@ -416,6 +416,30 @@ impl std::fmt::Debug for CompactionSidecarSpec {
 }
 
 impl CompactionSidecarSpec {
+    /// Bind an LCM endpoint that targets this managed sidecar to the literal
+    /// model id the sidecar loaded. Higgs' chat endpoint does not guarantee
+    /// the transport alias `active`; using the known id avoids a late 404 and
+    /// silent deterministic-compaction fallback.
+    pub(crate) fn bind_lcm_endpoint_model(
+        &self,
+        lcm: &mut crate::config::schema::LcmSchemaConfig,
+    ) {
+        let Some(endpoint) = lcm.compaction_endpoint.as_mut() else {
+            return;
+        };
+        let Ok(url) = url::Url::parse(&endpoint.url) else {
+            return;
+        };
+        let targets_this_sidecar = url.port_or_known_default() == Some(self.port)
+            && url.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            });
+        if targets_this_sidecar {
+            endpoint.model.clone_from(&self.model);
+        }
+    }
+
     /// Build from config. Returns `None` when there is no compaction sidecar
     /// (no port), no spawnable model directory, or no `higgs` binary on disk —
     /// in all those cases compaction falls back to the main model.
@@ -1311,6 +1335,31 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_sidecar_binds_lcm_to_loaded_model_id() {
+        let spec = CompactionSidecarSpec {
+            bin: PathBuf::from("/tmp/higgs"),
+            port: 8001,
+            dir: "/models/Bonsai".to_string(),
+            model: "Bonsai-1.7B-mlx-1bit".to_string(),
+            on_demand: true,
+        };
+        let mut lcm = crate::config::schema::LcmSchemaConfig {
+            compaction_endpoint: Some(crate::config::schema::ModelEndpoint {
+                url: "http://127.0.0.1:8001/v1".to_string(),
+                model: "active".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        spec.bind_lcm_endpoint_model(&mut lcm);
+
+        assert_eq!(
+            lcm.compaction_endpoint.as_ref().unwrap().model,
+            "Bonsai-1.7B-mlx-1bit"
+        );
+    }
 
     #[test]
     fn test_pid_path_under_nanobot_dir() {

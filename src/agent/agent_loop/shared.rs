@@ -273,6 +273,45 @@ impl TurnContext {
                 .store(saved, Ordering::Relaxed);
         }
     }
+
+    /// Persist every newly appended real protocol message and tag it with its
+    /// SQLite row id. Tool-call carriers are flushed before execution and tool
+    /// results immediately after injection, so a crash cannot leave a side
+    /// effect without the conversation bytes that caused and described it.
+    /// The row ids also make same-turn messages visible to the LCM ingester.
+    pub(crate) async fn persist_pending_protocol_messages(&mut self) {
+        // Do not rely solely on `new_start`: token trimming can remove old
+        // history and shift every index during the turn. Persist by durable-id
+        // presence instead; DB-loaded history already carries `_db_id`.
+        for index in 0..self.messages.len() {
+            let role = self.messages[index]
+                .get("role")
+                .and_then(|value| value.as_str());
+            if self.messages[index].get("_db_id").is_some()
+                || crate::agent::markers::is_synthetic(&self.messages[index])
+                || matches!(role, Some("system" | "developer" | "summary"))
+            {
+                continue;
+            }
+
+            let message = self.messages[index].clone();
+            let Some(row_id) = self
+                .core
+                .sessions
+                .add_message(&self.session_id, &message)
+                .await
+            else {
+                warn!(
+                    session = %self.session_key,
+                    role = message.get("role").and_then(|value| value.as_str()).unwrap_or("unknown"),
+                    "active_turn_message_persist_failed"
+                );
+                break;
+            };
+            self.messages[index]["_db_id"] = json!(row_id);
+        }
+        self.new_start = self.messages.len();
+    }
 }
 
 /// Response-boundary lifecycle. After a side-effect tool (exec/write_file)
@@ -349,6 +388,14 @@ pub(crate) struct FlowControl {
     pub(crate) retries: RetryState,
     /// Saved thinking budget to restore after a thinking-off retry iteration.
     pub(crate) restore_thinking_budget: Option<u32>,
+    /// Exact provider-request identity across tool rounds. If a completed tool
+    /// round produces the same request bytes, calling the model would only
+    /// repeat stale work; force a context checkpoint first.
+    pub(crate) provider_request: ProviderRequestState,
+    pub(crate) tool_rounds_completed: u32,
+    /// Metrics for a provider response that requested tools. Emission is
+    /// deferred until routing/execution knows the truthful executed count.
+    pub(crate) pending_request_metrics: Option<crate::agent::metrics::RequestMetrics>,
 }
 
 impl FlowControl {
@@ -358,6 +405,38 @@ impl FlowControl {
     pub(crate) fn mark_first_token(&mut self) {
         if self.ttft_ms.is_none() {
             self.ttft_ms = self.llm_call_start.map(|t| t.elapsed().as_millis() as u64);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderRequestAdmission {
+    Proceed,
+    ForceCheckpoint,
+}
+
+#[derive(Default)]
+pub(crate) struct ProviderRequestState {
+    last_hash: Option<u64>,
+    last_tool_round: u32,
+}
+
+impl ProviderRequestState {
+    fn admit(&mut self, request_hash: u64, tool_round: u32) -> ProviderRequestAdmission {
+        if self.last_hash == Some(request_hash) && tool_round > self.last_tool_round {
+            return ProviderRequestAdmission::ForceCheckpoint;
+        }
+        self.last_hash = Some(request_hash);
+        self.last_tool_round = tool_round;
+        ProviderRequestAdmission::Proceed
+    }
+}
+
+impl TurnContext {
+    pub(crate) fn emit_pending_request_metrics(&mut self, tool_calls_executed: u32) {
+        if let Some(mut metrics) = self.flow.pending_request_metrics.take() {
+            metrics.tool_calls_executed = tool_calls_executed;
+            crate::agent::metrics::emit(&metrics);
         }
     }
 }
@@ -477,17 +556,6 @@ impl AgentLoopShared {
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
         priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     ) -> Option<OutboundMessage> {
-        let request_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let core = self.core_handle.swappable();
-        info!(
-            request_id = %request_id,
-            role = "main",
-            model = %core.model,
-            channel = %msg.channel,
-            "request_start"
-        );
-        drop(core);
-
         let mut ctx = self
             .prepare_context(
                 msg,
@@ -498,24 +566,19 @@ impl AgentLoopShared {
             )
             .await;
 
-        // Bug 3 fix: eagerly persist the user message before the LLM call so
-        // it is not lost if the agent crashes mid-turn. Bump new_start so
-        // finalize_response does not double-persist it.
-        if ctx.new_start < ctx.messages.len() {
-            let user_msg = ctx.messages[ctx.new_start].clone();
-            let row_id = ctx
-                .core
-                .sessions
-                .add_message(&ctx.session_id, &user_msg)
-                .await;
-            // Tag the in-memory message with its rowid so the LCM engine can
-            // ingest this user message in the same turn (ingest skips
-            // messages without a `_db_id`).
-            if let Some(row_id) = row_id {
-                ctx.messages[ctx.new_start]["_db_id"] = json!(row_id);
-            }
-            ctx.new_start += 1;
-        }
+        // `prepare_context` owns request-id creation. Reuse that exact id for
+        // the outer lifecycle log, provider metrics, and downstream spans so a
+        // single turn never appears as two unrelated requests.
+        info!(
+            request_id = %ctx.request_id,
+            role = "main",
+            model = %ctx.core.model,
+            channel = %msg.channel,
+            "request_start"
+        );
+
+        // Make the inbound user turn durable before the first provider call.
+        ctx.persist_pending_protocol_messages().await;
 
         self.run_agent_loop(&mut ctx).await;
         self.finalize_response(ctx).await
@@ -991,7 +1054,7 @@ impl AgentLoopShared {
             .get(&ctx.session_key)
             .copied()
             .unwrap_or(0);
-        let (trimmed_messages, prefix_preserved) = ctx
+        let (trimmed_messages, trim_disposition) = ctx
             .core
             .token_budget
             .trim_to_fit_with_age_preserving_prefix(
@@ -1001,6 +1064,10 @@ impl AgentLoopShared {
                 ctx.core.max_message_age_turns,
                 frozen_prefix,
             );
+        let prefix_preserved = matches!(
+            trim_disposition,
+            crate::agent::token_budget::PrefixTrimDisposition::Preserved
+        );
         if !prefix_preserved && frozen_prefix > 0 {
             clear_prompt_cache_state(ctx);
             send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::Trim);
@@ -1097,10 +1164,14 @@ impl AgentLoopShared {
                 .copied()
                 .unwrap_or(0);
             // tool_def_tokens=0 is conservative (trims more aggressively).
-            let (trimmed_messages, prefix_preserved) = ctx
+            let (trimmed_messages, trim_disposition) = ctx
                 .core
                 .token_budget
                 .trim_to_fit_with_age_preserving_prefix(&ctx.messages, 0, 0, 0, frozen_prefix);
+            let prefix_preserved = matches!(
+                trim_disposition,
+                crate::agent::token_budget::PrefixTrimDisposition::Preserved
+            );
             if !prefix_preserved && frozen_prefix > 0 {
                 clear_prompt_cache_state(ctx);
                 send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::EmergencyTrim);
@@ -1867,11 +1938,6 @@ impl AgentLoopShared {
                 None
             }
         };
-        // Signal watchdog: LLM inference is active — skip health checks.
-        counters.mark_inference_started();
-        ctx.flow.llm_call_start = Some(std::time::Instant::now());
-        ctx.flow.ttft_ms = None; // reset per call; set on this call's first token
-
         // Use the protocol-rendered wire format for the provider call.
         // `ctx.rendered_messages` was computed by `render_via_protocol()` in step_pre_call.
         let mut messages_for_llm = if ctx.rendered_messages.is_empty() {
@@ -2010,6 +2076,38 @@ impl AgentLoopShared {
             );
             attach_higgs_session_marker(&mut messages_for_llm, provider_session_id);
         }
+
+        let request_hash = crate::agent::prompt_fingerprint::hash_provider_request(
+            &messages_for_llm,
+            tool_defs_opt.unwrap_or(&[]),
+        );
+        if ctx
+            .flow
+            .provider_request
+            .admit(request_hash, ctx.flow.tool_rounds_completed)
+            == ProviderRequestAdmission::ForceCheckpoint
+        {
+            clear_prompt_cache_state(ctx);
+            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::LcmCheckpoint);
+            ctx.messages
+                .push(crate::agent::markers::scaffold_user(
+                    "[system] Context checkpoint: the latest tool round did not change the provider request. Re-read the newest tool result and continue from it."
+                ));
+            ctx.rendered_messages.clear();
+            warn!(
+                session = %ctx.session_key,
+                request_hash,
+                tool_round = ctx.flow.tool_rounds_completed,
+                "provider_request_stalled_after_tool_progress"
+            );
+            return StepResult::Done(IterationOutcome::Continue);
+        }
+
+        // Signal watchdog only after request admission: a rejected no-progress
+        // call never marks inference active or starts latency telemetry.
+        counters.mark_inference_started();
+        ctx.flow.llm_call_start = Some(std::time::Instant::now());
+        ctx.flow.ttft_ms = None;
 
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas to the REPL/voice renderer as
@@ -2281,9 +2379,13 @@ impl AgentLoopShared {
         .await
         {
             crate::agent::router::RouteResult::Continue => {
+                ctx.emit_pending_request_metrics(0);
+                ctx.flow.tool_rounds_completed =
+                    ctx.flow.tool_rounds_completed.saturating_add(1);
                 return StepResult::Done(IterationOutcome::Continue);
             }
             crate::agent::router::RouteResult::Break(msg) => {
+                ctx.emit_pending_request_metrics(0);
                 return StepResult::Done(IterationOutcome::Finished(msg));
             }
             crate::agent::router::RouteResult::Execute(calls) => calls,
@@ -2417,6 +2519,9 @@ impl AgentLoopShared {
             .await
             {
                 // Delegation handled execution — continue the main loop.
+                ctx.emit_pending_request_metrics(routed_tool_calls.len() as u32);
+                ctx.flow.tool_rounds_completed =
+                    ctx.flow.tool_rounds_completed.saturating_add(1);
                 return StepResult::Done(IterationOutcome::Continue);
             }
         }
@@ -2438,7 +2543,11 @@ impl AgentLoopShared {
         }
 
         // Inline path (default, unchanged): execute tools directly.
+        let tool_entries_before = ctx.turn_tool_entries.len();
         crate::agent::tool_engine::execute_tools_inline(ctx, &routed_tool_calls, &response).await;
+        let executed = ctx.turn_tool_entries.len().saturating_sub(tool_entries_before) as u32;
+        ctx.emit_pending_request_metrics(executed);
+        ctx.flow.tool_rounds_completed = ctx.flow.tool_rounds_completed.saturating_add(1);
 
         // Local models via --jinja require strict user/assistant alternation.
         // Tool results are folded into user messages by
@@ -2905,7 +3014,27 @@ mod forced_recovery_tests {
 
 #[cfg(test)]
 mod cache_pressure_tests {
-    use super::{should_allow_checkpoint, should_inject_heartbeat_grounding};
+    use super::{
+        should_allow_checkpoint, should_inject_heartbeat_grounding, ProviderRequestAdmission,
+        ProviderRequestState,
+    };
+
+    #[test]
+    fn identical_provider_request_after_tool_progress_forces_checkpoint() {
+        let mut state = ProviderRequestState::default();
+        assert_eq!(state.admit(42, 0), ProviderRequestAdmission::Proceed);
+        assert_eq!(
+            state.admit(42, 0),
+            ProviderRequestAdmission::Proceed,
+            "an ordinary retry with no intervening tool round remains valid"
+        );
+        assert_eq!(
+            state.admit(42, 1),
+            ProviderRequestAdmission::ForceCheckpoint,
+            "new tool progress must change the exact provider request"
+        );
+        assert_eq!(state.admit(43, 1), ProviderRequestAdmission::Proceed);
+    }
 
     // -- should_inject_heartbeat_grounding --------------------------------
 

@@ -1036,7 +1036,10 @@ impl ContextBuilder {
             return;
         }
         let pos = messages.len() - 1;
-        messages.insert(pos, json!({"role": "user", "content": tail}));
+        messages.insert(
+            pos,
+            json!({"role": "user", "content": tail, "_synthetic": true}),
+        );
     }
 
     /// Add a tool result to the message list and return the updated list.
@@ -1690,6 +1693,7 @@ mod tests {
         let n = messages.len();
         assert_eq!(messages[n - 2]["content"], "RELEVANT TAIL");
         assert_eq!(messages[n - 2]["role"], "user");
+        assert_eq!(messages[n - 2]["_synthetic"], true);
         assert_eq!(messages[n - 1]["content"], "current question");
         assert_eq!(messages.last().unwrap()["role"], "user");
     }

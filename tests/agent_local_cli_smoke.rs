@@ -9,11 +9,9 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use chrono::Local;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use nanobot::config::schema::Config;
-use nanobot::utils::helpers::safe_filename;
 
 fn resolve_nanobot_bin() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_nanobot") {
@@ -57,24 +55,43 @@ fn write_isolated_config(home: &Path, local_api_base: &str, local_model: &str) {
     fs::write(cfg_path, cfg_json).expect("failed to write config");
 }
 
-fn expected_session_path(home: &Path, session_key: &str) -> PathBuf {
-    let safe = safe_filename(&session_key.replace(':', "_"));
-    let date = Local::now().format("%Y-%m-%d");
-    home.join(".nanobot")
-        .join("sessions")
-        .join(format!("{}_{}.jsonl", safe, date))
+fn expected_sessions_db(home: &Path) -> PathBuf {
+    home.join(".nanobot").join("sessions.db")
 }
 
-fn read_session_jsonl(path: &Path) -> Vec<Value> {
-    let data = fs::read_to_string(path).expect("failed to read session file");
-    data.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return None;
+fn read_session_messages(path: &Path, session_key: &str) -> Vec<Value> {
+    let connection = rusqlite::Connection::open(path).expect("failed to open sessions.db");
+    let mut statement = connection
+        .prepare(
+            "SELECT m.role, m.content, m.tool_calls, m.tool_call_id, m.tool_name
+             FROM messages m
+             JOIN sessions s ON s.id = m.session_id
+             WHERE s.session_key = ?1
+             ORDER BY m.id",
+        )
+        .expect("failed to prepare session query");
+    statement
+        .query_map([session_key], |row| {
+            let role: String = row.get(0)?;
+            let content: Option<String> = row.get(1)?;
+            let tool_calls: Option<String> = row.get(2)?;
+            let tool_call_id: Option<String> = row.get(3)?;
+            let tool_name: Option<String> = row.get(4)?;
+            let mut message = json!({"role": role, "content": content});
+            if let Some(tool_calls) = tool_calls {
+                message["tool_calls"] =
+                    serde_json::from_str(&tool_calls).unwrap_or(Value::Null);
             }
-            serde_json::from_str::<Value>(trimmed).ok()
+            if let Some(tool_call_id) = tool_call_id {
+                message["tool_call_id"] = Value::String(tool_call_id);
+            }
+            if let Some(tool_name) = tool_name {
+                message["name"] = Value::String(tool_name);
+            }
+            Ok(message)
         })
+        .expect("failed to query session messages")
+        .map(|row| row.expect("failed to decode session row"))
         .collect()
 }
 
@@ -170,14 +187,14 @@ fn agent_local_single_turn_smoke() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    let session_path = expected_session_path(home, &session);
+    let session_path = expected_sessions_db(home);
     assert!(
         session_path.exists(),
-        "session file not created: {}",
+        "sessions.db not created: {}",
         session_path.display()
     );
 
-    let session_turns = read_session_jsonl(&session_path);
+    let session_turns = read_session_messages(&session_path, &session);
     assert!(session_turns
         .iter()
         .any(|m| m.get("role") == Some(&Value::String("user".to_string()))));
@@ -226,13 +243,13 @@ fn agent_local_tool_call_smoke() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    let session_path = expected_session_path(home, &session);
+    let session_path = expected_sessions_db(home);
     assert!(
         session_path.exists(),
-        "session file not created: {}",
+        "sessions.db not created: {}",
         session_path.display()
     );
-    let session_turns = read_session_jsonl(&session_path);
+    let session_turns = read_session_messages(&session_path, &session);
 
     let has_assistant_tool_call = session_turns.iter().any(|m| {
         m.get("role") == Some(&Value::String("assistant".to_string()))
@@ -248,12 +265,12 @@ fn agent_local_tool_call_smoke() {
 
     assert!(
         has_assistant_tool_call,
-        "expected assistant tool_calls in session JSONL; got {:?}",
+        "expected assistant tool_calls in sessions.db; got {:?}",
         session_turns
     );
     assert!(
         has_tool_result,
-        "expected tool result turn in session JSONL; got {:?}",
+        "expected tool result turn in sessions.db; got {:?}",
         session_turns
     );
 

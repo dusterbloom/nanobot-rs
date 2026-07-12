@@ -2107,6 +2107,69 @@ struct ResponseSequenceProvider {
     call_count: std::sync::atomic::AtomicU32,
 }
 
+/// Pauses the second provider call so tests can inspect durable session state
+/// after a tool round but before finalization.
+struct ToolRoundBarrierProvider {
+    call_count: std::sync::atomic::AtomicU32,
+    second_call_started: tokio::sync::Notify,
+    release_second_call: tokio::sync::Notify,
+}
+
+impl ToolRoundBarrierProvider {
+    fn new() -> Self {
+        Self {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+            second_call_started: tokio::sync::Notify::new(),
+            release_second_call: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for ToolRoundBarrierProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        let call = self
+            .call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call == 0 {
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("path".to_string(), json!("."));
+            return Ok(crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_durable".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: std::collections::HashMap::new(),
+            });
+        }
+
+        self.second_call_started.notify_one();
+        self.release_second_call.notified().await;
+        Ok(crate::providers::base::LLMResponse {
+            content: Some("done".to_string()),
+            tool_calls: vec![],
+            finish_reason: "stop".to_string(),
+            usage: std::collections::HashMap::new(),
+        })
+    }
+
+    fn get_default_model(&self) -> &str {
+        "local-barrier"
+    }
+}
+
 impl ResponseSequenceProvider {
     fn new(name: &str, responses: Vec<crate::providers::base::LLMResponse>) -> Self {
         Self {
@@ -2697,6 +2760,52 @@ async fn test_tool_call_carrier_persists_before_tool_result() {
         "tool result must point at the immediately preceding assistant call"
     );
 
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_tool_round_is_durable_before_next_provider_call_completes() {
+    let provider = Arc::new(ToolRoundBarrierProvider::new());
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let core = agent_loop.shared.core_handle.swappable();
+    let session_key = format!("test-tool-durable-{}", uuid::Uuid::new_v4());
+    let task_loop = Arc::new(agent_loop);
+    let task = {
+        let task_loop = task_loop.clone();
+        let session_key = session_key.clone();
+        tokio::spawn(async move {
+            task_loop
+                .process_direct("please list files", &session_key, "test", "offline")
+                .await
+        })
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.second_call_started.notified(),
+    )
+    .await
+    .expect("second provider call should start after the tool round");
+
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("session should exist while the turn is active");
+    let durable = core.sessions.get_all_messages(&meta.id).await;
+    let roles: Vec<&str> = durable
+        .iter()
+        .map(|message| message.get("role").and_then(Value::as_str).unwrap_or(""))
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["user", "assistant", "tool"],
+        "the active tool protocol must be crash-durable before the next inference"
+    );
+
+    provider.release_second_call.notify_one();
+    assert_eq!(task.await.expect("turn task should join"), "done");
     let _ = std::fs::remove_dir_all(&workspace);
 }
 

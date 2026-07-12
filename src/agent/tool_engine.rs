@@ -400,6 +400,20 @@ pub(crate) async fn execute_tools_delegated(
     }
 
     let delegation_start = std::time::Instant::now();
+
+    // Journal the provider's tool-call carrier before the runner can perform
+    // any side effect. This is the durable intent record for delegated tools.
+    let tc_json: Vec<Value> = routed_tool_calls
+        .iter()
+        .map(|tc| tc.to_openai_json())
+        .collect();
+    ContextBuilder::add_assistant_message(
+        &mut ctx.messages,
+        response.content.as_deref(),
+        Some(&tc_json),
+    );
+    ctx.persist_pending_protocol_messages().await;
+
     let run_result =
         tool_runner::run_tool_loop(&runner_config, routed_tool_calls, &ctx.tools, &task_desc).await;
     let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
@@ -451,17 +465,6 @@ pub(crate) async fn execute_tools_delegated(
         "Tool runner completed: {} results in {} iterations",
         run_result.tool_results.len(),
         run_result.iterations_used
-    );
-
-    // Build the assistant message with original tool_calls.
-    let tc_json: Vec<Value> = routed_tool_calls
-        .iter()
-        .map(|tc| tc.to_openai_json())
-        .collect();
-    ContextBuilder::add_assistant_message(
-        &mut ctx.messages,
-        response.content.as_deref(),
-        Some(&tc_json),
     );
 
     // Add tool results from the runner to the main context.
@@ -540,6 +543,7 @@ pub(crate) async fn execute_tools_delegated(
             .tool_guard
             .record_result(&tc.name, &tc.arguments, injected.clone());
         ctx.used_tools.insert(tc.name.clone());
+        ctx.persist_pending_protocol_messages().await;
     }
 
     // Inject the runner's summary so the main LLM knows what
@@ -570,6 +574,7 @@ pub(crate) async fn execute_tools_delegated(
                 "role": "user",
                 "content": format!("{} {}", prefix, summary_text)
             }));
+            ctx.persist_pending_protocol_messages().await;
         }
     }
 
@@ -609,6 +614,14 @@ pub(crate) async fn execute_tools_delegated(
         }
 
         ctx.used_tools.insert(tool_name.clone());
+        ctx.turn_tool_entries
+            .push(crate::agent::audit::TurnToolEntry {
+                name: tool_name.clone(),
+                id: tool_call_id.clone(),
+                ok,
+                duration_ms: per_tool_ms,
+                result_chars: data.len(),
+            });
 
         // Taint tracking: mark context tainted when a web tool ran via delegation.
         // We don't have the original arguments here, so pass None for detail.
@@ -870,6 +883,7 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
     } else {
         ContextBuilder::add_tool_result(&mut ctx.messages, &r.tool_id, &r.tool_name, &data);
     }
+    ctx.persist_pending_protocol_messages().await;
     ctx.flow
         .tool_guard
         .record_result(&r.tool_name, &r.arguments, data.clone());
@@ -996,6 +1010,8 @@ pub(crate) async fn execute_tools_inline(
         response.content.as_deref(),
         Some(&tc_json),
     );
+    // Durable intent precedes execution, including side-effect tools.
+    ctx.persist_pending_protocol_messages().await;
 
     // Response boundary enforcement: when this call was nudged to respond,
     // side-effect tools are rejected with an error result instead of having
@@ -1012,6 +1028,7 @@ pub(crate) async fn execute_tools_inline(
     for tc in &blocked {
         inject_boundary_rejection(ctx, tc);
     }
+    ctx.persist_pending_protocol_messages().await;
 
     // Partition into parallel-safe and sequential tool calls.
     let (parallel, sequential): (Vec<_>, Vec<_>) = allowed

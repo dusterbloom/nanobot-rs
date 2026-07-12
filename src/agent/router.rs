@@ -1576,6 +1576,7 @@ pub(crate) async fn route_tool_calls(
             );
             ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &receipt);
         }
+        ctx.persist_pending_protocol_messages().await;
     }
 
     if allowed_calls.is_empty() {

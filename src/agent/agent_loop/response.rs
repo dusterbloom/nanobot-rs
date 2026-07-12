@@ -349,7 +349,8 @@ impl AgentLoopShared {
         );
 
         // --- Token telemetry (always, regardless of kind) ---
-        self.emit_token_telemetry(ctx, &response);
+        let defers_metrics = matches!(&kind, ResponseKind::ToolCalls { .. });
+        self.emit_token_telemetry(ctx, &response, defers_metrics);
         // Forward the completion-token count to the REPL footer. Sent per LLM
         // call so the renderer can accumulate the turn total and report tok/s.
         let completion_tokens = response
@@ -778,7 +779,12 @@ impl AgentLoopShared {
         }
     }
 
-    fn emit_token_telemetry(&self, ctx: &TurnContext, response: &LLMResponse) {
+    fn emit_token_telemetry(
+        &self,
+        ctx: &mut TurnContext,
+        response: &LLMResponse,
+        defer_until_tool_execution: bool,
+    ) {
         let counters = &self.core_handle.counters;
         let estimated_prompt = TokenBudget::estimate_tokens(&ctx.messages);
         let actual_prompt = response.usage.get("prompt_tokens").copied().unwrap_or(-1);
@@ -825,7 +831,7 @@ impl AgentLoopShared {
             .last_estimated_prompt_tokens
             .store(estimated_prompt as u64, Ordering::Relaxed);
 
-        crate::agent::metrics::emit(&crate::agent::metrics::RequestMetrics {
+        let metrics = crate::agent::metrics::RequestMetrics {
             timestamp: chrono::Local::now().to_rfc3339(),
             request_id: ctx.request_id.clone(),
             role: "main".into(),
@@ -847,7 +853,13 @@ impl AgentLoopShared {
             tool_calls_requested: response.tool_calls.len() as u32,
             tool_calls_executed: 0,
             validation_result: None,
-        });
+        };
+        if defer_until_tool_execution {
+            debug_assert!(ctx.flow.pending_request_metrics.is_none());
+            ctx.flow.pending_request_metrics = Some(metrics);
+        } else {
+            crate::agent::metrics::emit(&metrics);
+        }
 
         // Phase D: feed this turn's TTFT + prompt size to the runtime
         // context-ceiling detector. Local-only — cloud latency has different

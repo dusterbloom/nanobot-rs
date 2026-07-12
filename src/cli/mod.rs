@@ -695,6 +695,10 @@ pub(crate) async fn run_gateway_async(
         tracing::info!("Auto-enabling LCM for local mode");
         lcm_config.enabled = Some(true);
     }
+    let compaction_sidecar = crate::higgs::CompactionSidecarSpec::from_config(&config);
+    if let Some(spec) = compaction_sidecar.as_ref() {
+        spec.bind_lcm_endpoint_model(&mut lcm_config);
+    }
 
     let mut agent_loop = AgentLoop::new(
         core_handle,
@@ -710,7 +714,7 @@ pub(crate) async fn run_gateway_async(
         lcm_config,
         Some(health_registry.clone()),
     );
-    agent_loop.set_compaction_sidecar(crate::higgs::CompactionSidecarSpec::from_config(&config));
+    agent_loop.set_compaction_sidecar(compaction_sidecar);
 
     // Apply optional setup (e.g. MLX provider wiring).
     if let Some(f) = setup_fn {
