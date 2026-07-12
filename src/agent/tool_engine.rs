@@ -53,6 +53,31 @@ fn inline_hot_prompt_result_cap(ctx: &TurnContext) -> usize {
     effective_tool_result_cap(ctx.core.max_tool_result_chars)
 }
 
+/// Stash a result before any lossy prompt shaping. The live map keeps recall
+/// fast within the process; SQLite makes the same call id recoverable after a
+/// restart or explicit session resume. Small results need neither copy.
+async fn stash_oversized_tool_result(
+    ctx: &TurnContext,
+    tool_call_id: &str,
+    tool_name: &str,
+    data: &str,
+    cap: usize,
+) -> bool {
+    if tool_name == "recall_tool_result" || data.chars().count() <= cap {
+        return false;
+    }
+    ctx.counters
+        .tool_result_store
+        .lock()
+        .insert(tool_call_id.to_string(), data.to_string());
+    let _ = ctx
+        .core
+        .sessions
+        .store_tool_result(&ctx.session_id, tool_call_id, tool_name, data)
+        .await;
+    true
+}
+
 fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> String {
     let mut parts = Vec::new();
     for key in [
@@ -517,13 +542,8 @@ pub(crate) async fn execute_tools_delegated(
         // lossless recall — digesting `injected_raw` directly would store the
         // summary instead of the original. Then preview injected_raw and add a
         // recall pointer when the raw was stashed.
-        let stashed_raw = full_data.chars().count() > cap;
-        if stashed_raw {
-            ctx.counters
-                .tool_result_store
-                .lock()
-                .insert(tc.id.clone(), full_data.to_string());
-        }
+        let stashed_raw =
+            stash_oversized_tool_result(ctx, &tc.id, &tc.name, full_data, cap).await;
         let mut injected =
             build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id);
         if stashed_raw && !injected.contains("recall_tool_result") {
@@ -903,13 +923,14 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
         // Specialist path: stash the RAW (pre-specialist) output for lossless
         // recall — without this, recall would return the specialist's summary
         // instead of the original. Then summarize and preview the summary.
-        let stashed_raw = result_data.chars().count() > cap;
-        if stashed_raw {
-            ctx.counters
-                .tool_result_store
-                .lock()
-                .insert(r.tool_id.clone(), result_data.clone());
-        }
+        let stashed_raw = stash_oversized_tool_result(
+            ctx,
+            &r.tool_id,
+            &r.tool_name,
+            &result_data,
+            cap,
+        )
+        .await;
         let summarized = ctx
             .content_gate
             .admit_with_specialist(
@@ -932,6 +953,14 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
         }
         preview
     } else {
+        let _ = stash_oversized_tool_result(
+            ctx,
+            &r.tool_id,
+            &r.tool_name,
+            &result_data,
+            cap,
+        )
+        .await;
         let prompt_data = digest_tool_result(
             &r.tool_name,
             &r.arguments,

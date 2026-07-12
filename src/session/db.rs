@@ -13,7 +13,7 @@
 //! - `filter_history()` from the `filters` module applies the same
 //!   windowing/clear-marker/orphan-skip logic that the JSONL manager used.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session   ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+
+CREATE TABLE IF NOT EXISTS tool_results (
+    session_id    TEXT NOT NULL REFERENCES sessions(id),
+    tool_call_id  TEXT NOT NULL,
+    tool_name     TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (session_id, tool_call_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_results_session ON tool_results(session_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
@@ -166,6 +176,7 @@ pub struct SessionSnapshot {
 /// `SessionManager`.
 pub struct SessionDb {
     conn: Mutex<Connection>,
+    path: PathBuf,
 }
 
 impl SessionDb {
@@ -192,7 +203,14 @@ impl SessionDb {
 
         Self {
             conn: Mutex::new(conn),
+            path: db_path.to_path_buf(),
         }
+    }
+
+    /// Filesystem location backing this handle. Used by restart-safe tools
+    /// that open a short-lived read handle without sharing the live mutex.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     // -----------------------------------------------------------------------
@@ -403,6 +421,55 @@ impl SessionDb {
             warn!("Failed to commit batch insert: {}", e);
             let _ = conn.execute_batch("ROLLBACK");
         }
+    }
+
+    /// Durably store the complete pre-compaction output for an oversized tool
+    /// result. Repeated writes for the same protocol call are idempotent.
+    pub async fn store_tool_result(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        content: &str,
+    ) -> bool {
+        let conn = self.conn.lock().await;
+        match conn.execute(
+            "INSERT INTO tool_results (session_id, tool_call_id, tool_name, content, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(session_id, tool_call_id) DO UPDATE SET \
+             tool_name = excluded.tool_name, content = excluded.content",
+            params![
+                session_id,
+                tool_call_id,
+                tool_name,
+                content,
+                Utc::now().to_rfc3339()
+            ],
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    "Failed to persist tool result session={} call={}: {}",
+                    session_id, tool_call_id, error
+                );
+                false
+            }
+        }
+    }
+
+    /// Load a complete tool output previously stored by [`store_tool_result`].
+    pub async fn load_tool_result(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+    ) -> Option<String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT content FROM tool_results WHERE session_id = ?1 AND tool_call_id = ?2",
+            params![session_id, tool_call_id],
+            |row| row.get(0),
+        )
+        .ok()
     }
 
     /// Append a `role: "clear"` marker to `session_id`.
@@ -1171,6 +1238,28 @@ mod tests {
 
         let all = db.get_all_messages(&meta.id).await;
         assert_eq!(all.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_results_survive_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let session_id = {
+            let db = SessionDb::new(&db_path);
+            let session = db.create_session("cli:durable-tool-result").await;
+            assert!(
+                db.store_tool_result(&session.id, "call_42", "read_file", "full exact body")
+                    .await
+            );
+            session.id
+        };
+
+        let reopened = SessionDb::new(&db_path);
+        assert_eq!(
+            reopened.load_tool_result(&session_id, "call_42").await,
+            Some("full exact body".to_string())
+        );
+        assert_eq!(reopened.path(), db_path.as_path());
     }
 
     #[tokio::test]

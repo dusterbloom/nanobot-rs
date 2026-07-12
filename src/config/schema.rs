@@ -920,7 +920,7 @@ pub struct ToolsConfig {
     /// Code execution (Python RPC) tool settings.
     #[serde(default)]
     pub code_execution: CodeExecutionConfig,
-    /// How tool schemas are presented to local models (default: proxy).
+    /// How tool schemas are presented to local models (default: lean).
     #[serde(default)]
     pub local_tool_mode: LocalToolMode,
 }

@@ -522,18 +522,6 @@ impl AgentLoopShared {
             tools.register(Box::new(LcmExpandTool::new(lcm_engine)));
         }
 
-        // Register recall_tool_result: large tool results are digested to a
-        // head+tail preview at ingestion with the full body stashed in the
-        // per-agent tool_result_store. This tool recovers the full output
-        // losslessly on demand (no tool re-run). Registered for ALL modes —
-        // digestion runs for both local and cloud tool execution, so a cloud
-        // turn would otherwise see a recall hint for a tool missing from its
-        // schema, making the truncated middle unrecoverable.
-        tools.register(Box::new(
-            crate::agent::tools::recall_tool_result::RecallToolResultTool::new(
-                counters.tool_result_store.clone(),
-            ),
-        ));
         let lcm_setup_ms = lap_ms();
 
         // Resolve or create session for this key.
@@ -544,6 +532,17 @@ impl AgentLoopShared {
             .get_or_resume_with_idle(&session_key, core.session_complete_after_secs)
             .await;
         let session_id = session_meta.id.clone();
+
+        // Large results enter the prompt as bounded previews. Keep the direct
+        // recovery tool in every mode and bind it to this concrete session so
+        // a restarted process can load the exact original bytes from SQLite.
+        tools.register(Box::new(
+            crate::agent::tools::recall_tool_result::RecallToolResultTool::with_db(
+                counters.tool_result_store.clone(),
+                core.sessions.path().to_path_buf(),
+                session_id.clone(),
+            ),
+        ));
 
         // Get session history. Track count so we know where new messages start.
         // With LCM enabled the trim ceiling must stay above LCM's soft

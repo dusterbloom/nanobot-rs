@@ -237,12 +237,9 @@ pub struct RuntimeCounters {
     pub default_context_ceiling: AtomicUsize,
     /// Consecutive fast-turn counter driving the loosen logic.
     pub consecutive_fast_turns: AtomicUsize,
-    /// Per-agent store of full tool-result outputs that were digested at
-    /// ingestion (head+tail preview kept in-context, full body here). Keyed by
-    /// `tool_call_id`. The `recall_tool_result` tool reads this so the agent
-    /// can recover a truncated result's middle losslessly, without re-running
-    /// the tool. In-memory only (per session); entries are cheap and the agent
-    /// can always re-run a tool for fresh data in a new session.
+    /// Hot cache for full tool outputs stashed before in-context digesting.
+    /// SQLite is the durable source for restart-safe recall; this map avoids a
+    /// database read while the producing process is still alive.
     pub tool_result_store:
         Arc<parking_lot::Mutex<std::collections::HashMap<String, String>>>,
 }

@@ -673,8 +673,13 @@ impl ToolRegistry {
     /// Extra tools included (when registered) in the lean local surface,
     /// on top of `CORE_TOOLS`. Everything else is reachable via the proxy
     /// meta-tool appended by `get_lean_definitions`.
-    const LEAN_EXTRA_TOOLS: &'static [&'static str] =
-        &["read_skill", "web_search", "web_fetch", "message"];
+    const LEAN_EXTRA_TOOLS: &'static [&'static str] = &[
+        "read_skill",
+        "web_search",
+        "web_fetch",
+        "message",
+        "recall_tool_result",
+    ];
 
     /// Keyword-to-tool mapping for context-triggered tool selection (cloud path).
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
@@ -1126,6 +1131,16 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
+    fn register_test_result_recall(registry: &mut ToolRegistry, db_path: std::path::PathBuf) {
+        registry.register(Box::new(
+            crate::agent::tools::recall_tool_result::RecallToolResultTool::with_db(
+                Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                db_path,
+                "test-session".to_string(),
+            ),
+        ));
+    }
+
     /// Wire-cost budget for the local tool surface. The tool block is
     /// rendered into the prompt HEAD by the chat template, so its size is
     /// paid on every cold prefill and its hash must stay stable for the
@@ -1134,7 +1149,8 @@ mod tests {
     fn test_local_tool_surface_token_budget() {
         use crate::agent::token_budget::TokenBudget;
         let ws = tempfile::tempdir().unwrap();
-        let reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
         let count = reg.get_local_definitions().len();
         let full = TokenBudget::estimate_tool_def_tokens(&reg.get_definitions());
         let local = TokenBudget::estimate_tool_def_tokens(&reg.get_local_definitions());
@@ -1162,7 +1178,8 @@ mod tests {
     #[test]
     fn test_lean_definitions_surface() {
         let ws = tempfile::tempdir().unwrap();
-        let reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
         let lean = reg.get_lean_definitions();
         let names: Vec<&str> = lean
             .iter()
@@ -1170,6 +1187,10 @@ mod tests {
             .collect();
 
         assert!(names.contains(&"read_file"), "core tool missing: {names:?}");
+        assert!(
+            names.contains(&"recall_tool_result"),
+            "preview recovery tool missing: {names:?}"
+        );
         assert_eq!(
             names.last(),
             Some(&"tool"),

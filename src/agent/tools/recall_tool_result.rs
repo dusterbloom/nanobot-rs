@@ -2,11 +2,13 @@
 //!
 //! Large tool results are reduced to a head+tail preview at ingestion
 //! (`digest_tool_result` in `tool_engine.rs`) and the full body is stashed in
-//! the per-agent `tool_result_store` keyed by `tool_call_id`. This tool lets
-//! the model recover the full output (the truncated middle) on demand — one
-//! tool call, no re-execution of the original tool.
+//! the per-agent `tool_result_store` and SQLite keyed by session +
+//! `tool_call_id`. This tool lets the model recover the full output (the
+//! truncated middle) on demand — one tool call, no re-execution, including
+//! after a process restart.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,11 +20,19 @@ use crate::agent::tools::base::Tool;
 /// `tool_call_id` (the id shown in a `[truncated: ...]` preview block).
 pub struct RecallToolResultTool {
     store: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    durable: (PathBuf, String),
 }
 
 impl RecallToolResultTool {
-    pub fn new(store: Arc<parking_lot::Mutex<HashMap<String, String>>>) -> Self {
-        Self { store }
+    pub fn with_db(
+        store: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+        db_path: PathBuf,
+        session_id: String,
+    ) -> Self {
+        Self {
+            store,
+            durable: (db_path, session_id),
+        }
     }
 }
 
@@ -62,14 +72,50 @@ impl Tool for RecallToolResultTool {
                     .to_string();
             }
         };
-        match self.store.lock().get(id) {
-            Some(full) => full.clone(),
-            None => format!(
-                "No stored output for tool_call_id='{id}'. It may be from a \
-                 previous session (full outputs are in-memory only) or already \
-                 small enough that it was never truncated. Re-run the original \
-                 tool if you need fresh data."
-            ),
+        if let Some(full) = self.store.lock().get(id).cloned() {
+            return full;
         }
+        let (db_path, session_id) = &self.durable;
+        let db = crate::session::db::SessionDb::new(db_path);
+        if let Some(full) = db.load_tool_result(session_id, id).await {
+            self.store.lock().insert(id.to_string(), full.clone());
+            return full;
+        }
+        format!(
+            "No stored output for tool_call_id='{id}' in this session. It may \
+             have been small enough that it was never stashed, or it may have \
+             been removed. Re-run the original tool if you need fresh data."
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recalls_from_sqlite_after_live_cache_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let db = crate::session::db::SessionDb::new(&db_path);
+        let session = db.create_session("cli:restart-recall").await;
+        assert!(
+            db.store_tool_result(&session.id, "call_restart", "exec", "durable body")
+                .await
+        );
+
+        let tool = RecallToolResultTool::with_db(
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            db_path,
+            session.id,
+        );
+        let result = tool
+            .execute(HashMap::from([(
+                "tool_call_id".to_string(),
+                Value::String("call_restart".to_string()),
+            )]))
+            .await;
+
+        assert_eq!(result, "durable body");
     }
 }
