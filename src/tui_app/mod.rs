@@ -1,10 +1,10 @@
-//! Full-screen ratatui UI for `nanobot agent`, opt-in via `NANOBOT_TUI=1`.
+//! Full-screen ratatui UI for `nanobot agent` — the default on real terminals.
 //!
-//! This is the in-progress replacement for the classic pinned-bar REPL. It runs
-//! the same agent streaming surface (`process_direct_streaming`) but renders
-//! into a re-renderable transcript that reflows on resize and supports a real
-//! multi-line input box (`ratatui-textarea`). The classic renderer remains the
-//! default until this reaches parity.
+//! It runs the same agent streaming surface (`process_direct_streaming`) as the
+//! classic pinned-bar REPL but renders into a re-renderable transcript that
+//! reflows on resize and supports a real multi-line input box
+//! (`ratatui-textarea`). `NANOBOT_TUI=0` opts back into the classic REPL;
+//! `NANOBOT_TUI=1` forces the TUI even when the tty probe fails.
 //!
 //! Architecture: one async task owns the terminal and the [`App`] state. A
 //! dedicated OS thread reads crossterm events (blocking) and forwards them over
@@ -95,11 +95,23 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Whether the full-screen ratatui UI is requested (`NANOBOT_TUI=1`/`true`).
+/// Whether the full-screen ratatui UI should run. Default ON when both stdin
+/// and stdout are real terminals; `NANOBOT_TUI=0`/`false` opts back into the
+/// classic REPL, `NANOBOT_TUI=1`/`true` forces the TUI regardless of the probe.
 pub(crate) fn enabled() -> bool {
-    std::env::var("NANOBOT_TUI")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    use std::io::IsTerminal;
+    enabled_from(
+        std::env::var("NANOBOT_TUI").ok().as_deref(),
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+    )
+}
+
+fn enabled_from(var: Option<&str>, is_tty: bool) -> bool {
+    match var {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        _ => is_tty,
+    }
 }
 
 /// Run the full-screen UI for one interactive session. Restores the terminal
@@ -940,6 +952,21 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn tui_defaults_on_for_ttys_and_env_overrides_both_ways() {
+        // Unset env: the tty probe decides.
+        assert!(enabled_from(None, true));
+        assert!(!enabled_from(None, false));
+        // Explicit opt-out wins over a tty; opt-in wins over no tty.
+        assert!(!enabled_from(Some("0"), true));
+        assert!(!enabled_from(Some("false"), true));
+        assert!(enabled_from(Some("1"), false));
+        assert!(enabled_from(Some("TRUE"), false));
+        // Unrecognized values fall back to the probe.
+        assert!(enabled_from(Some("yes"), true));
+        assert!(!enabled_from(Some("yes"), false));
+    }
 
     /// The delta-flush rule `run_turn` used to enforce inline and now gets
     /// structurally from [`TurnStream`]; kept here so the render-order pin

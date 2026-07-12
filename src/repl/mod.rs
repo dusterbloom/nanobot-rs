@@ -2450,14 +2450,31 @@ pub(crate) fn cmd_agent(
             // renders refresh in place so we never get a duplicate bar.
             let mut bar_needs_push = true;
 
+            // Which interactive surface runs. The TUI is the default on real
+            // terminals (NANOBOT_TUI=0 opts out); it gets one attempt, and a
+            // failed start (e.g. a terminal that never answers the
+            // cursor-position query) falls back to the classic REPL below
+            // instead of exiting.
+            enum Ui {
+                Tui,
+                Classic,
+            }
+            let mut ui = if crate::tui_app::enabled() {
+                Ui::Tui
+            } else {
+                Ui::Classic
+            };
+
             loop {
-                // Full-screen ratatui UI (opt-in via NANOBOT_TUI). Runs one
-                // interactive session, then breaks to the shared cleanup below.
-                if crate::tui_app::enabled() {
-                    if let Err(e) = crate::tui_app::run(&mut ctx).await {
-                        eprintln!("nanobot: TUI error: {e}");
+                if let Ui::Tui = ui {
+                    ui = Ui::Classic; // one attempt; fall back on error
+                    match crate::tui_app::run(&mut ctx).await {
+                        // Clean exit: the whole session ran in the TUI.
+                        Ok(()) => break,
+                        Err(e) => eprintln!(
+                            "nanobot: TUI unavailable ({e}); falling back to classic REPL"
+                        ),
                     }
-                    break;
                 }
 
                 // Drain any pending display messages from background channels.
