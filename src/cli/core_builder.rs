@@ -533,11 +533,9 @@ pub(crate) fn build_core_handle(
             specialist_port,
         );
         let model = format!("local:{}", lp.semantic_model_id);
-        // Size context per-model on the local path too (not just cloud): a
-        // capable long-context model (e.g. Qwen3.6, 256K native) gets its real
-        // budget, while smaller local models (Bonsai 32K/64K) keep the
-        // conservative server-probed/default value and are never overshot.
-        let ctx = model_context_size(&lp.semantic_model_id, lp.max_context_tokens);
+        // Use lp.max_context_tokens directly — model_context_size would override
+        // the memory-safe cap with .max(131072) for Qwen3.6, breaking compaction.
+        let ctx = lp.max_context_tokens;
         (
             lp.main,
             model,
@@ -599,11 +597,8 @@ pub(crate) fn rebuild_core(
             specialist_port,
         );
         let model = format!("local:{}", lp.semantic_model_id);
-        // Size context per-model on the local path too (not just cloud): a
-        // capable long-context model (e.g. Qwen3.6, 256K native) gets its real
-        // budget, while smaller local models (Bonsai 32K/64K) keep the
-        // conservative server-probed/default value and are never overshot.
-        let ctx = model_context_size(&lp.semantic_model_id, lp.max_context_tokens);
+        // Use lp.max_context_tokens directly (same fix as build_core_handle).
+        let ctx = lp.max_context_tokens;
         (
             lp.main,
             model,
