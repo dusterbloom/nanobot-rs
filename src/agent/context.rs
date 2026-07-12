@@ -224,7 +224,7 @@ impl ContextBuilder {
             long_term_memory_budget: 200,
             skills_budget: 300,
             profiles_budget: 200,
-            system_prompt_cap: 800, // ~20% of typical 4K local model
+            system_prompt_cap: 500,
             provenance_enabled: false,
             lazy_skills: false,
             skill_disclosure: "compact".to_string(),
@@ -241,17 +241,18 @@ impl ContextBuilder {
             self.long_term_memory_budget = 80;
             self.skills_budget = 100;
             self.profiles_budget = 80;
-            self.system_prompt_cap = 800;
+            self.system_prompt_cap = 500;
             return;
         }
 
-        // Local models: scale down but with tighter clamps.
-        self.bootstrap_budget = (max_context_tokens / 50).clamp(300, 2_000); // 2%
-        self.long_term_memory_budget = (max_context_tokens / 100).clamp(100, 1_000); // 1%
-        self.skills_budget = (max_context_tokens / 50).clamp(200, 1_500); // 2%
-        self.profiles_budget = (max_context_tokens / 100).clamp(100, 800); // 1%
-                                                                           // Hard cap: 30% of context for system prompt, leaving 70% for conversation.
-        self.system_prompt_cap = (max_context_tokens * 3 / 10).clamp(500, 4_000);
+        // Pi-style local context has a fixed semantic cost instead of growing
+        // with the model window. More context belongs to the conversation and
+        // on-demand retrieval, not to an increasingly large permanent prompt.
+        self.bootstrap_budget = (max_context_tokens / 100).clamp(160, 250);
+        self.long_term_memory_budget = 80;
+        self.skills_budget = 100;
+        self.profiles_budget = 80;
+        self.system_prompt_cap = 500;
     }
 
     /// Scale prompt component budgets proportionally to the model's context window.
@@ -452,11 +453,16 @@ impl ContextBuilder {
             });
         }
 
-        let context_window = if self.system_prompt_cap > 0 {
-            (self.system_prompt_cap as f64 / 0.3).round() as usize
+        // The permanent local prefix has a semantic budget, not a model-window
+        // percentage. Keep the guarantee even for callers that toggle
+        // `local_prompt_mode` on a default builder without calling
+        // `set_lite_mode` first.
+        let prompt_cap = if self.system_prompt_cap > 0 {
+            self.system_prompt_cap.min(500)
         } else {
-            16_000 // default local context
+            500
         };
+        let context_window = (prompt_cap as f64 / 0.3).round() as usize;
 
         let ctx = AssemblyContext {
             context_window,
@@ -510,11 +516,12 @@ impl ContextBuilder {
             });
         }
 
-        let context_window = if self.system_prompt_cap > 0 {
-            (self.system_prompt_cap as f64 / 0.3).round() as usize
+        let prompt_cap = if self.system_prompt_cap > 0 {
+            self.system_prompt_cap.min(500)
         } else {
-            16_000
+            500
         };
+        let context_window = (prompt_cap as f64 / 0.3).round() as usize;
 
         let ctx = AssemblyContext {
             context_window,
@@ -597,22 +604,6 @@ impl ContextBuilder {
                 shrinkable: section.shrinkable(),
             });
         }
-
-        // DATE ONLY (not wall-clock time) so the system prefix stays byte-stable
-        // across turns within a day → Higgs's radix prefix cache can reuse the
-        // prefix instead of re-prefilling it. A minute-resolution timestamp here
-        // (near token 15) would change every turn and poison the whole
-        // prefix-cache chain for the entire downstream prompt.
-        let today = Self::session_date_stamp();
-        sections.push(SectionEntry {
-            section: PromptSection::MemoryBriefing, // highest section → rendered last
-            block: PromptBlock::new("Session", &format!("Today's date: {today}")),
-            allocated_tokens: 0,
-            actual_tokens: 0,
-            source: SectionSource::Static("session date"),
-            included: true,
-            shrinkable: false,
-        });
 
         sections
     }
@@ -1129,31 +1120,22 @@ impl ContextBuilder {
             } else {
                 format!("Model: {}", self.model_name)
             };
-            let claim_hint = if self.model_name.starts_with("local:")
-                || self.model_name.starts_with("mlx:")
-            {
-                "\n- Claim to be Claude, GPT, or another cloud model — this is a local session."
-            } else {
-                ""
-            };
             (
-                format!("You are nanobot, a local tool-using assistant.\n{model_line}"),
-                String::new(),
-                "\n- `exec`, `list_dir`, `read_file`, `write_file` take project-directory \
-                 paths; the workspace is only for `recall`, `remember`, `read_skill`.\n\
-                 - One tool call at a time; after tool results, answer directly.\n\
-                 - For large files, `read_file` a range: lines=\"START:END\"."
-                    .to_string(),
                 format!(
-                    "\n\n## Values\n\
-                     Accuracy over speed; honesty over confidence; small reversible steps.\n\n\
-                     ## When unsure\n\
-                     Ask a short clarifying question. Investigate read-only before changing \
-                     anything. Say plainly what you couldn't verify.\n\n\
-                     ## Never\n\
-                     - Claim an action happened without a matching tool call.\n\
-                     - Modify or delete files the user didn't ask about.{claim_hint}"
+                    "You are nanobot, a tool-using assistant.\n\
+                     {model_line}\n\
+                     Project: {cwd}\n\
+                     Workspace: {workspace_path} (nanobot state, not the user's project).\n\n\
+                     Act on the user's request. Use tools when evidence or changes are needed; \
+                     never invent results or claim work you did not perform. Keep changes scoped \
+                     and verify them. Project paths are relative to the project. Use `recall` to \
+                     load memory only when relevant; use `read_skill __list__` to discover skills \
+                     and `read_skill <name>` to load one. Answer directly and concisely unless \
+                     asked for detail."
                 ),
+                String::new(),
+                String::new(),
+                String::new(),
             )
         } else {
             let home_dir = dirs::home_dir()
@@ -1214,6 +1196,10 @@ impl ContextBuilder {
             )
         };
 
+        if local {
+            return intro;
+        }
+
         format!(
             r#"# nanobot
 
@@ -1247,7 +1233,7 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
         &self,
         skill_names: Option<&[String]>,
         channel: Option<&str>,
-        chat_id: Option<&str>,
+        _chat_id: Option<&str>,
         is_voice_message: bool,
         detected_language: Option<&str>,
     ) -> Vec<PromptBlock> {
@@ -1264,18 +1250,10 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
         // into the prompt so the agent knows its identity and user preferences.
         // Previously this only listed file names as "available via read_file"
         // which meant local agents started with zero context.
-        let bootstrap = self._load_bootstrap_files_within_budget(self.bootstrap_budget);
+        let bootstrap = self._load_bootstrap_files_within_budget(self.bootstrap_budget.min(200));
         if !bootstrap.is_empty() {
             blocks.push(PromptBlock::new("Workspace Context", bootstrap));
         }
-
-        blocks.push(PromptBlock::new(
-            "On-Demand Context",
-            concat!(
-                "Use `recall` to load memory only when needed. ",
-                "Use `read_skill __list__` to discover skills and `read_skill <name>` to load one."
-            ),
-        ));
 
         let skill_index = self.skills.build_name_index(12);
         if !skill_index.is_empty() {
@@ -1291,10 +1269,13 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
             }
         }
 
-        let session_meta =
-            _session_metadata_suffix(channel, chat_id, is_voice_message, detected_language);
-        if !session_meta.trim().is_empty() {
-            blocks.push(PromptBlock::new(String::new(), session_meta));
+        // Transport identifiers are harness state, not model context. Voice is
+        // the exception because it changes the required response format.
+        if channel == Some("voice") || is_voice_message {
+            blocks.push(PromptBlock::new(
+                String::new(),
+                _voice_mode_instructions(detected_language),
+            ));
         }
 
         blocks
@@ -2236,7 +2217,7 @@ mod tests {
         let mut cb = ContextBuilder::new_lite(tmp.path());
         cb.set_lite_mode(4_096);
 
-        assert_eq!(cb.system_prompt_cap, 800);
+        assert_eq!(cb.system_prompt_cap, 500);
         assert_eq!(cb.bootstrap_budget, 160);
         assert_eq!(cb.long_term_memory_budget, 80);
         assert_eq!(cb.skills_budget, 100);
@@ -2361,16 +2342,16 @@ mod tests {
         let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
         let system_content = system_msg["content"].as_str().unwrap();
         assert!(system_content.contains("Model: mlx:Qwen3-8B-MLX-4bit"));
-        assert!(system_content.contains("local tool-using assistant"));
+        assert!(system_content.contains("tool-using assistant"));
         assert!(!system_content.contains("User prefers Rust"));
         assert!(system_content.contains("read_skill __list__"));
     }
 
     #[test]
     fn test_local_builtin_skeleton_stays_within_token_budget() {
-        // Empty workspace: no bootstrap files, no memory, no skills — what's
-        // left is the BUILT-IN template skeleton (identity, directories,
-        // rules, values, when-unsure/never, on-demand hints, date stamp).
+        // Pi-style local context starts with a tiny stable harness contract.
+        // Product policy and runtime facts belong in code, tools, or dynamic
+        // context rather than permanent prose.
         let tmp = TempDir::new().unwrap();
         let mut cb = ContextBuilder::new(tmp.path());
         cb.model_name = "local:Qwen3-35B.gguf".to_string();
@@ -2378,16 +2359,40 @@ mod tests {
 
         let prompt = cb.build_local_system_prompt(None, None, None, false, None, &[]);
         let tokens = TokenBudget::estimate_str_tokens(&prompt);
-        // Pre-rework skeleton measured 341 tokens; post-rework 378 (adds the
-        // Values / When-unsure / Never structure a 35B model asked for).
-        println!("local built-in skeleton: {tokens} tokens (was 341 pre-rework)");
-
-        // Post-rework size + ~20% headroom. If this fails, built-in prose
-        // grew — trim before raising the budget.
+        println!("Pi-style local built-in skeleton: {tokens} tokens");
         assert!(
-            tokens <= 455,
-            "built-in local skeleton ({tokens} tokens) exceeds budget of 455"
+            tokens <= 180,
+            "built-in local skeleton ({tokens} tokens) exceeds budget of 180"
         );
+        assert!(!prompt.contains("## Values"));
+        assert!(!prompt.contains("## When unsure"));
+        assert!(!prompt.contains("## Never"));
+        assert!(!prompt.contains("Today's date"));
+    }
+
+    #[test]
+    fn test_local_prompt_omits_transport_metadata_but_keeps_voice_constraints() {
+        let tmp = TempDir::new().unwrap();
+        let mut cb = ContextBuilder::new_lite(tmp.path());
+        cb.model_name = "local:Qwen3-35B.gguf".to_string();
+
+        let text =
+            cb.build_local_system_prompt(None, Some("telegram"), Some("12345"), false, None, &[]);
+        assert!(!text.contains("Current Session"));
+        assert!(!text.contains("Channel: telegram"));
+        assert!(!text.contains("Chat ID: 12345"));
+
+        let voice = cb.build_local_system_prompt(
+            None,
+            Some("voice"),
+            Some("direct"),
+            true,
+            Some("it"),
+            &[],
+        );
+        assert!(voice.contains("Voice Mode"));
+        assert!(voice.contains("Italian"));
+        assert!(!voice.contains("Chat ID: direct"));
     }
 
     #[test]
@@ -2428,12 +2433,11 @@ mod tests {
         let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
         let system_content = system_msg["content"].as_str().unwrap();
 
-        // Local prompt now loads bootstrap file content (within budget)
-        // so the agent knows its identity. It should still stay under the
-        // system_prompt_cap and include at least some bootstrap content.
+        // Local prompt loads project instructions and a compact skill index,
+        // but the whole stable prefix remains bounded.
         assert!(
-            total_tokens < 1250,
-            "local prompt with bootstrap content should stay within budget, got {} tokens",
+            total_tokens < 550,
+            "local prompt with bootstrap content should stay near 500 tokens, got {} tokens",
             total_tokens
         );
         // Bootstrap content should now be included (at least partially).

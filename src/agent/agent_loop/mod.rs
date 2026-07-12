@@ -582,6 +582,9 @@ impl AgentLoop {
         &self,
         session_key: &str,
     ) -> Vec<crate::agent::context::PromptBlock> {
+        if !crate::agent::prepare_context::local_always_on_memory_enabled() {
+            return Vec::new();
+        }
         let core = self.shared.core_handle.swappable();
         self.shared
             .build_local_runtime_blocks(&core, session_key)

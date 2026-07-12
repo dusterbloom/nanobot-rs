@@ -134,6 +134,13 @@ fn local_tail_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether volatile memory/status blocks are intentionally part of the local
+/// stable prefix. Shared by real turn preparation and `/context` so inspection
+/// cannot report a prompt different from the one sent to the provider.
+pub(crate) fn local_always_on_memory_enabled() -> bool {
+    std::env::var("NANOBOT_LOCAL_ALWAYS_ON_MEMORY").is_ok()
+}
+
 /// Append the previous-session continuity note to the system message.
 ///
 /// Callers must pass the SAME note on every turn of a session (it is cached
@@ -177,6 +184,13 @@ impl AgentLoopShared {
         prior_history_len: usize,
     ) -> Option<String> {
         use crate::agent::continuity::{classify_session_start, continuity_note};
+
+        // Local sessions follow a Pi-style progressive context contract: prior
+        // sessions stay durable and searchable, but an unrelated tail is never
+        // resident in every fresh prompt. Cloud behavior remains unchanged.
+        if core.context.local_prompt_mode {
+            return None;
+        }
 
         let mut notes = self.continuity_notes.lock().await;
         if let Some(cached) = notes.get(session_key) {
@@ -645,7 +659,7 @@ impl AgentLoopShared {
         // from the append-only history; older/cross-session facts via `recall`.
         // Opt back into always-on injection with NANOBOT_LOCAL_ALWAYS_ON_MEMORY=1.
         let local_runtime_blocks = if core.context.local_prompt_mode
-            && std::env::var("NANOBOT_LOCAL_ALWAYS_ON_MEMORY").is_ok()
+            && local_always_on_memory_enabled()
         {
             self.build_local_runtime_blocks(&core, &session_key).await
         } else {
@@ -707,7 +721,7 @@ impl AgentLoopShared {
         // per-turn retrieved context. `new_start` is bumped so the tail remains
         // ephemeral when enabled.
         if core.context.local_prompt_mode
-            && std::env::var("NANOBOT_LOCAL_ALWAYS_ON_MEMORY").is_err()
+            && !local_always_on_memory_enabled()
             && local_tail_enabled()
         {
             let query = turn_query(&msg.content);

@@ -2638,6 +2638,43 @@ async fn test_local_wire_prompt_prefix_stable_across_turns() {
     assert_wire_prefix(&calls[0], &calls[calls.len() - 1]);
 }
 
+/// Persisted sessions remain discoverable through recall/resume, but a fresh
+/// local turn must not carry an unrelated previous-session hint in its stable
+/// prompt prefix.
+#[tokio::test]
+async fn test_local_fresh_session_does_not_inject_previous_session() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![
+            WireRecordingProvider::text_response("first reply"),
+            WireRecordingProvider::text_response("second reply"),
+        ],
+    ));
+    let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+
+    agent_loop
+        .process_direct("first message", "pi-style-prior", "test", "offline")
+        .await;
+    agent_loop
+        .process_direct(
+            "unrelated fresh message",
+            "pi-style-fresh",
+            "test",
+            "offline",
+        )
+        .await;
+
+    let calls = provider.calls();
+    assert!(
+        calls.len() >= 2,
+        "expected two LLM calls, got {}",
+        calls.len()
+    );
+    let system = calls[1][0]["content"].as_str().unwrap_or("");
+    assert!(!system.contains("Previous Session"));
+    assert!(!system.contains("pi-style-prior"));
+}
+
 /// Same contract within a turn: executing a tool must only APPEND to the
 /// wire prompt (assistant carrier + tool result + continuation), never
 /// rewrite what the server already prefilled.
@@ -4296,10 +4333,8 @@ mod runtime_mode_parity_tests {
             sessions_db_path: None,
         });
         assert!(core.context.local_prompt_mode);
-        // set_lite_mode clamps system_prompt_cap to (ctx * 3/10).clamp(500, 4000).
-        // 16384 * 3/10 = 4915 → clamped to 4000.
-        let expected = (16_384usize * 3 / 10).clamp(500, 4_000);
-        assert_eq!(core.context.system_prompt_cap, expected);
+        // Local prompt cost is fixed rather than scaling with the model window.
+        assert_eq!(core.context.system_prompt_cap, 500);
     }
 
     /// Task 2 / Branch 3: cloud memory provider/model follows the pre-Wave-2 path.

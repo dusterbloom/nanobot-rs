@@ -284,7 +284,11 @@ fn build_report(
         .iter()
         .map(|s| PromptBlockReport {
             kind: s.section.kind(),
-            title: s.block.report_title(),
+            title: if s.section == PromptSection::Identity {
+                "Identity".to_string()
+            } else {
+                s.block.report_title()
+            },
             tokens: s.actual_tokens,
             included: s.included,
             allocated_tokens: s.allocated_tokens,
@@ -550,6 +554,13 @@ mod tests {
         assert!(result.system_content.contains("Check stuff"));
         assert!(result.system_content.contains("---"));
         assert!(result.developer_content.is_empty());
+    }
+
+    #[test]
+    fn test_identity_report_label_does_not_fall_back_to_session_metadata() {
+        let sections = vec![make_entry(PromptSection::Identity, "", "I am nanobot")];
+        let result = LocalAssembler.assemble(&make_ctx(2_000, 0.3, sections));
+        assert_eq!(result.report.blocks[0].title, "Identity");
     }
 
     #[test]
