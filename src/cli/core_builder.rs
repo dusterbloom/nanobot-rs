@@ -349,8 +349,13 @@ pub(super) fn make_local_providers(
     let compaction: Option<Arc<dyn LLMProvider>> =
         compaction_port.map(|p| -> Arc<dyn LLMProvider> {
             let base = format!("http://127.0.0.1:{p}/v1");
+            // higgs-nightly serves the sidecar under the spawn dir's basename
+            // and 404s on the legacy "active" alias, so address it by the real
+            // served id (e.g. "Bonsai-1.7B-mlx-1bit"). Falls back to "active"
+            // only when no compaction model dir is configured (legacy path).
+            let served = crate::higgs::compaction_sidecar_served_model(config);
             factory::create_openai_compat(
-                factory::ProviderSpec::local_with_key(&base, Some("active"), api_key)
+                factory::ProviderSpec::local_with_key(&base, served.as_deref().or(Some("active")), api_key)
                     .with_jit_gate_opt(jit_gate.clone())
                     .with_timeout_config(&config.timeouts)
                     .with_retry(config.retry.clone()),
@@ -446,6 +451,28 @@ pub(super) fn make_local_providers(
     }
 }
 
+/// When the memory provider targets the localhost compaction sidecar, override
+/// `memory.model` with the id higgs-nightly actually serves (the spawn dir's
+/// basename). higgs-nightly 404s on the legacy "active" alias AND on stale short
+/// names from config (e.g. `bonsai-1.7b-mlx` vs served `Bonsai-1.7B-mlx-1bit`).
+/// Non-sidecar memory providers (cloud, remote) are left unchanged.
+fn normalize_memory_model_for_sidecar(
+    mut memory: crate::config::schema::MemoryConfig,
+    config: &Config,
+) -> crate::config::schema::MemoryConfig {
+    let targets_sidecar = memory
+        .provider
+        .as_ref()
+        .and_then(|p| p.api_base.as_deref())
+        .is_some_and(|b| b.contains("127.0.0.1") || b.contains("localhost"));
+    if targets_sidecar {
+        if let Some(served) = crate::higgs::compaction_sidecar_served_model(config) {
+            memory.model = served;
+        }
+    }
+    memory
+}
+
 /// Build a `SwappableCoreConfig` from shared config + per-call overrides.
 ///
 /// Centralises the 25-field struct construction that was previously copy-pasted
@@ -492,7 +519,7 @@ fn core_config_from(
         search_max_results: config.tools.web.search.max_results,
         exec_timeout: config.tools.exec_.timeout,
         restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
-        memory_config: config.memory.clone(),
+        memory_config: normalize_memory_model_for_sidecar(config.memory.clone(), config),
         is_local,
         local_tool_mode: config.tools.local_tool_mode.clone(),
         lane,

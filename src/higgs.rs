@@ -544,6 +544,26 @@ pub(crate) fn compaction_sidecar_config(
     (dir, model)
 }
 
+/// The model id higgs-nightly will SERVE the compaction sidecar under.
+///
+/// The sidecar spawns with `higgs serve --model <dir>` and no `--name`, so
+/// higgs registers it under the directory's basename (e.g. dir
+/// `.../prism-ml/Bonsai-1.7B-mlx-1bit` → served id `Bonsai-1.7B-mlx-1bit`).
+/// nanobot must address the sidecar by THIS name: higgs-nightly rejects the
+/// legacy `"active"` alias AND any stale short name from `memory.model`
+/// (e.g. `bonsai-1.7b-mlx`) with a 404 "model not found among loaded local
+/// models". Returns `None` only when no compaction model dir is configured.
+pub(crate) fn compaction_sidecar_served_model(
+    config: &crate::config::schema::Config,
+) -> Option<String> {
+    let (dir, _) = compaction_sidecar_config(config);
+    dir.and_then(|d| {
+        std::path::Path::new(&d)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+    })
+}
+
 /// Resolve the model directory for Higgs from config.
 ///
 /// Priority: `mlxModelDir` → error.

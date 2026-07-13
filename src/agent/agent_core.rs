@@ -818,24 +818,12 @@ fn resolve_memory_provider(
     match mode {
         RuntimeMode::Local { .. } => {
             let mem_model = if !memory_config.model.is_empty() {
-                // If the memory provider targets a localhost sidecar AND we have
-                // a managed Higgs compaction sidecar, prefer "active" (Higgs'
-                // transport indirection) over the literal config name. The
-                // sidecar serves exactly one model, so "active" always resolves
-                // to whatever it loaded — a stale/mismatched `memory.model`
-                // (e.g. "bonsai-1.7b-mlx" vs the loaded "Bonsai-1.7B-mlx-1bit")
-                // can't 404. This works for both always-on and on-demand spawn
-                // (where the sidecar isn't up at build time to be queried).
-                let targets_sidecar = memory_config
-                    .provider
-                    .as_ref()
-                    .and_then(|p| p.api_base.as_deref())
-                    .is_some_and(|b| b.contains("127.0.0.1") || b.contains("localhost"));
-                if targets_sidecar && compaction_provider.is_some() {
-                    "active".to_string()
-                } else {
-                    memory_config.model.clone()
-                }
+                // `memory.model` is the real id the sidecar serves — normalized
+                // to the spawn dir's basename by `normalize_memory_model_for_
+                // sidecar` when it targets localhost. The legacy `"active"`
+                // transport alias was removed: higgs-nightly serves each model
+                // under its real id and 404s on "active".
+                memory_config.model.clone()
             } else if let Some(sp) = specialist_provider {
                 // Trio specialist is ideal for summarisation tasks.
                 sp.get_default_model().to_string()
