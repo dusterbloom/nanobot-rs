@@ -328,7 +328,13 @@ pub fn run() {
     // Always suppress noisy crates regardless of RUST_LOG setting.
     // When RUST_LOG is set (e.g. "debug"), append mandatory filters so html5ever
     // and other spammy crates don't flood the log file.
-    let noisy_crate_filters = ",html5ever=error,ort=off,hyper=warn,reqwest=warn,rustyline=warn";
+    //
+    // `mdns_sd=off`: the cluster-discovery mDNS daemon logs every DNS packet
+    // (`read_others`, `read_header`, `query question: DnsQuestion`, `received N
+    // bytes from IP`) at DEBUG — these are never actionable for nanobot and
+    // single-handedly produced a 5 GB daily log under RUST_LOG=debug.
+    let noisy_crate_filters =
+        ",html5ever=error,ort=off,hyper=warn,reqwest=warn,rustyline=warn,mdns_sd=off";
     let env_filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
         Ok(_) => {
             // RUST_LOG is set — append our mandatory suppressions

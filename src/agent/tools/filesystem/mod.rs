@@ -68,7 +68,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file: returns the first 1000 lines by default (numbered) and the file's total line count. Use max_lines to raise the initial window up to 5000 lines, or lines=\"START:END\" (1-indexed, inclusive) for an exact range; use lines=\"1:\" only when you truly need the entire file."
+        "Read a file: returns the first chunk of numbered lines that fits the read budget (~7000 chars), plus the total line count and the exact next range to read. Output is always complete, contiguous lines — never a mid-cut — so page forward using the suggested next range (or lines=\"START:END\" for an exact 1-indexed inclusive range). Use lines=\"1:\" only on small files."
     }
 
     fn concurrency(&self) -> ToolConcurrency {
@@ -1463,6 +1463,32 @@ fn extract_line_range(content: &str, range: &str, path: &str) -> String {
 fn render_range(content: &str, start: usize, end: usize, path: &str, total: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let end = end.min(total);
+
+    // Bound the window to COMPLETE lines within the read char-budget. A file is
+    // randomly accessible, so the model is best served by a contiguous, whole
+    // window plus the exact next range to read — never a head+tail cut that
+    // destroys the middle and forces a `recall_tool_result` round-trip.
+    // `read_file` was the #1 truncated tool (343 events/week) purely because the
+    // old 1000-line default overflowed the 10k-char tool-result cap and got
+    // head+tail previewed. Always render at least one line. The header reserve
+    // covers the "# path (lines…)" line, the VERBATIM wrapper, and the
+    // next-chunk marker so the total stays under the cap.
+    const READ_RESULT_CHAR_BUDGET: usize = 7_000;
+    let budget = READ_RESULT_CHAR_BUDGET
+        .saturating_sub(path.len().saturating_add(160));
+    let mut eff_end = start;
+    let mut cost: usize = 0;
+    for i in start..=end {
+        // Rendered width: "{:>4}: " (6) + line content + "\n" (1).
+        let line_cost = 7 + lines[i - 1].chars().count();
+        if i > start && cost + line_cost > budget {
+            break;
+        }
+        cost += line_cost;
+        eff_end = i;
+    }
+    let end = eff_end;
+
     let selected: Vec<String> = lines[start - 1..end]
         .iter()
         .enumerate()
@@ -1659,8 +1685,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_default_is_bounded_with_paging_hint() {
-        // ds4-style: a bare read returns the first DEFAULT_READ_LINES, NOT the
-        // whole file, and tells the model the total + exact next range to read.
+        // Budget-aware: a bare read returns the largest chunk of complete lines
+        // that fits the read char-budget, NOT a fixed 1000 lines. The old 1000-
+        // line default overflowed the 10k-char tool-result cap and got head+tail
+        // truncated — the #1 source of read_file truncation. Now the window is
+        // whole, under budget, and points at the next range.
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("big.txt");
         let content = (1..=1200)
@@ -1674,24 +1703,36 @@ mod tests {
             .execute(make_params(&[("path", file_path.to_str().unwrap())]))
             .await;
 
+        assert!(result.contains("of 1200)"), "header: {}", &result[..80]);
         assert!(
-            result.contains("(lines 1-1000 of 1200)"),
-            "header: {}",
-            &result[..80]
-        );
-        assert!(result.contains("1000: line 1000"));
-        assert!(
-            !result.contains("1001: line 1001"),
-            "must not dump past the default"
+            !result.contains("[truncated:"),
+            "read_file must never head+tail-truncate"
         );
         assert!(
-            result.contains("read the next chunk with lines=\"1001:1200\""),
-            "must tell the model the exact next range"
+            result.contains("more lines — read the next chunk"),
+            "must tell the model the next range: {result}"
+        );
+        // Budget-bounded: never reaches line 1000 (each line renders ~13 chars,
+        // budget allows ~500). The first line is always present.
+        assert!(result.contains("   1: line 1"));
+        assert!(
+            !result.contains("1000: line 1000"),
+            "must not dump past the char budget"
+        );
+        assert!(
+            result.chars().count() <= 7_600,
+            "output must stay under budget+slack, got {}",
+            result.chars().count()
         );
     }
 
     #[tokio::test]
-    async fn test_read_file_max_lines_expands_bare_window() {
+    async fn test_read_file_max_lines_caps_window() {
+        // max_lines is an upper bound honored when it sits below the char-budget
+        // line count. (It can no longer EXPAND past the budget — a multi-thousand-
+        // line dump was exactly what overflowed the cap and got head+tail cut.)
+        // Here max_lines=40 binds: 40 short lines fit the budget easily, so the
+        // window is exactly 40.
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("window.txt");
         let content = (1..=1500)
@@ -1702,20 +1743,25 @@ mod tests {
 
         let tool = ReadFileTool;
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
-        params.insert("max_lines".to_string(), serde_json::json!(1200));
+        params.insert("max_lines".to_string(), serde_json::json!(40));
         let result = tool.execute(params).await;
 
-        assert!(result.contains("(lines 1-1200 of 1500)"), "{result}");
-        assert!(result.contains("1200: line 1200"), "{result}");
-        assert!(!result.contains("1201: line 1201"), "{result}");
+        assert!(result.contains("(lines 1-40 of 1500)"), "{result}");
+        assert!(result.contains("  40: line 40"), "{result}");
+        assert!(!result.contains(" 41: line 41"), "{result}");
+        assert!(
+            result.contains("more lines — read the next chunk"),
+            "must point at the next range"
+        );
     }
 
     #[tokio::test]
     async fn test_read_file_whole_via_open_range() {
-        // The model can still read the entire file when it needs to: lines="1:".
+        // The model can still read the entire file when it fits the budget:
+        // lines="1:" on a small file returns every line with no continuation.
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("whole.txt");
-        let content = (1..=700)
+        let content = (1..=200)
             .map(|i| format!("L{i}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -1726,11 +1772,11 @@ mod tests {
         params.insert("lines".to_string(), serde_json::json!("1:"));
         let result = tool.execute(params).await;
 
-        assert!(result.contains("(lines 1-700 of 700)"));
-        assert!(result.contains(" 700: L700"));
+        assert!(result.contains("(lines 1-200 of 200)"));
+        assert!(result.contains(" 200: L200"));
         assert!(
             !result.contains("more lines"),
-            "full read has no continuation"
+            "full read of a small file has no continuation"
         );
     }
 
@@ -1867,6 +1913,45 @@ mod tests {
     fn test_extract_line_range_out_of_bounds() {
         let result = extract_line_range("one\ntwo", "5:10", "test.txt");
         assert!(result.contains("exceeds file length"));
+    }
+
+    #[test]
+    fn render_range_bounds_to_char_budget_no_truncation() {
+        // A realistic large source file: 5000 lines × ~40 chars. The old behavior
+        // rendered the whole requested range and let the downstream cap head+tail-
+        // truncate it. Now render_range itself bounds to complete lines within the
+        // read budget, so the output is whole, contiguous, and never mid-cut.
+        let content: String = (1..=5000)
+            .map(|i| format!("    let x_{i} = some_call(arg_one, arg_two);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = render_range(&content, 1, 1000, "src/big_module.rs", 5000);
+
+        assert!(
+            !out.contains("[truncated:"),
+            "read_file must never head+tail-truncate: {}",
+            &out[..80.min(out.len())]
+        );
+        assert!(
+            out.chars().count() <= 7_600,
+            "output must stay under budget+slack, got {}",
+            out.chars().count()
+        );
+        assert!(
+            out.contains("of 5000)"),
+            "header reports the true total"
+        );
+        assert!(
+            out.contains("more lines — read the next chunk"),
+            "must point at the next range"
+        );
+        assert!(out.contains("   1:"), "range starts at line 1");
+        // Contiguous + whole: the first line is rendered complete (numbered
+        // prefix + full statement), not a fragment from a head+tail cut.
+        assert!(
+            out.contains("let x_1 = some_call(arg_one, arg_two);"),
+            "first line must be whole, not mid-cut"
+        );
     }
 
     // -----------------------------------------------------------------------

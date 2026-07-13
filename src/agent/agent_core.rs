@@ -300,7 +300,23 @@ impl RuntimeCounters {
     /// worst-case miss is smaller, and the model stops thrashing. Sustained
     /// fast turns loosen it back toward the default — so a better-quantized
     /// model or freed memory naturally raises the ceiling again.
-    pub fn observe_context_ceiling(&self, prompt_tokens: u64, ttft_ms: u64) {
+    ///
+    /// `prefix_diverged` MUST be true on any turn whose prompt was not an
+    /// append-only extension of the previous call (a compaction summary was
+    /// installed, a tool result was re-digested, etc.). Such a turn forces the
+    /// server to re-prefill past the divergence point, so its TTFT is a one-off
+    /// re-prefill cost — NOT evidence that the current context size is
+    /// unsustainable. Tightening here is a positive-feedback death spiral:
+    /// tighten → LCM compacts earlier → the compaction rewrites the prefix →
+    /// the next turn diverges and re-prefills → read as "slow" → tighten again.
+    /// Observed in the wild as 19456→13908→12384 across two turns. So on a
+    /// diverged turn we observe neutrally: no tighten, no fast-turn credit.
+    pub fn observe_context_ceiling(
+        &self,
+        prompt_tokens: u64,
+        ttft_ms: u64,
+        prefix_diverged: bool,
+    ) {
         const MISS_BUDGET_MS: u64 = 30_000;
         const WARM_RATE_TPS: f64 = 3000.0;
         const SLOW_MISS_FACTOR: f64 = 2.5;
@@ -309,6 +325,12 @@ impl RuntimeCounters {
         const LOOSEN_FRAC: f64 = 1.15;
         const MIN_CEILING: usize = 4096;
 
+        // A diverged-prefix turn's TTFT is a re-prefill cost, not pressure.
+        // Do not act on it either direction: tightening here causes the
+        // compaction→diverge→re-prefill→tighten spiral described above.
+        if prefix_diverged {
+            return;
+        }
         let expected_warm_ms = (prompt_tokens as f64 / WARM_RATE_TPS * 1000.0) as u64;
         // Only treat a slow turn as "context too big" when the context is a
         // meaningful fraction of the current ceiling. A slow turn at LOW context
@@ -1058,7 +1080,8 @@ mod tests {
     fn ceiling_slow_pressured_miss_tightens() {
         let c = ceiling_counters();
         // 20k prompt, 120s TTFT — a pressured miss (warm would be ~6.7s).
-        c.observe_context_ceiling(20_000, 120_000);
+        // Stable prefix (diverged=false): this is genuine pressure.
+        c.observe_context_ceiling(20_000, 120_000, false);
         assert_eq!(
             c.effective_context_ceiling.load(Ordering::Relaxed),
             16_000,
@@ -1073,7 +1096,7 @@ mod tests {
         // context. Must NOT tighten — doing so caused erratic over-tightening
         // on post-compaction re-prefills.
         let c = ceiling_counters(); // default ceiling 32768
-        c.observe_context_ceiling(3_316, 55_000); // 3.3k prompt, 55s ttft
+        c.observe_context_ceiling(3_316, 55_000, false); // 3.3k prompt, 55s ttft
         assert_eq!(
             c.effective_context_ceiling.load(Ordering::Relaxed),
             32768,
@@ -1085,7 +1108,7 @@ mod tests {
     fn ceiling_cache_hit_does_not_tighten() {
         let c = ceiling_counters();
         // 20k prompt but 3s TTFT — a prefix-cache hit. No tightening.
-        c.observe_context_ceiling(20_000, 3_000);
+        c.observe_context_ceiling(20_000, 3_000, false);
         assert_eq!(c.effective_context_ceiling.load(Ordering::Relaxed), 32768);
     }
 
@@ -1094,18 +1117,18 @@ mod tests {
         // 30k prompt, 12s TTFT — a warm miss (expected ~10s), under the 30s
         // budget. Not a pressured stall, so the ceiling must not drop.
         let c = ceiling_counters();
-        c.observe_context_ceiling(30_000, 12_000);
+        c.observe_context_ceiling(30_000, 12_000, false);
         assert_eq!(c.effective_context_ceiling.load(Ordering::Relaxed), 32768);
     }
 
     #[test]
     fn ceiling_sustained_fast_loosens_back_up() {
         let c = ceiling_counters();
-        c.observe_context_ceiling(20_000, 120_000); // tighten to 16k
+        c.observe_context_ceiling(20_000, 120_000, false); // tighten to 16k
         let tightened = c.effective_context_ceiling.load(Ordering::Relaxed);
         assert_eq!(tightened, 16_000);
         for _ in 0..8 {
-            c.observe_context_ceiling(1_000, 1_000); // fast turns
+            c.observe_context_ceiling(1_000, 1_000, false); // fast turns
         }
         let after = c.effective_context_ceiling.load(Ordering::Relaxed);
         assert!(after > tightened, "expected loosen after sustained fast, got {after}");
@@ -1116,7 +1139,30 @@ mod tests {
     fn ceiling_never_drops_below_floor() {
         let c = ceiling_counters();
         // Tiny prompt but very slow — still floor at 4k, not 800.
-        c.observe_context_ceiling(1_000, 120_000);
+        c.observe_context_ceiling(1_000, 120_000, false);
         assert!(c.effective_context_ceiling.load(Ordering::Relaxed) >= 4096);
+    }
+
+    #[test]
+    fn ceiling_diverged_prefix_does_not_tighten() {
+        // Regression for the slow-miss watchdog death spiral: a slow, big-context
+        // turn whose TTFT is a re-prefill (compaction just installed / history
+        // edited) must NOT tighten the ceiling. Tightening here fed the spiral:
+        // tighten → LCM compacts → prefix rewrites → next turn re-prefills →
+        // slow again → tighten again (observed 19456→13908→12384). The re-prefill
+        // cost is one-off, not evidence the context size is unsustainable.
+        let c = ceiling_counters(); // default ceiling 32768
+        c.observe_context_ceiling(20_000, 120_000, true);
+        assert_eq!(
+            c.effective_context_ceiling.load(Ordering::Relaxed),
+            32768,
+            "a re-prefill (diverged prefix) must not tighten — that is the spiral"
+        );
+        // And it must not count as a fast turn toward loosening either —
+        // a diverged turn is observed neutrally.
+        // (No observable counter for fast-turn credit; the tighten assertion
+        // above is the contract. A follow-up diverged turn stays neutral too.)
+        c.observe_context_ceiling(20_000, 120_000, true);
+        assert_eq!(c.effective_context_ceiling.load(Ordering::Relaxed), 32768);
     }
 }

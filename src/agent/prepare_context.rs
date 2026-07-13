@@ -843,6 +843,7 @@ impl AgentLoopShared {
                 provider_request: Default::default(),
                 tool_rounds_completed: 0,
                 pending_request_metrics: None,
+                prefix_diverged_this_turn: false,
             },
             health_registry: self.health_registry.clone(),
             taint_state: TaintState::new(),

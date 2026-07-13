@@ -816,6 +816,20 @@ impl AgentLoopShared {
             cache_read_tokens.unwrap_or(0),
             cache_creation_tokens.unwrap_or(0),
         );
+        // Definitive cache-served diagnostic for local servers. higgs/llama.cpp
+        // may report prompt-cache hits under a non-OpenAI key (e.g. a native
+        // timings field or prompt_cache_hit_tokens) that
+        // extract_usage_numbers doesn't fold into cache_read_input_tokens.
+        // Dumping the raw usage map answers "is the prefix cache being served
+        // at all" without guessing from a zero cache_read. Cross-reference with
+        // the request-side `higgs_session_cache_request` log.
+        if ctx.core.model.starts_with("local:") {
+            debug!(
+                model = %ctx.core.model,
+                usage = ?response.usage,
+                "local_llm_raw_usage"
+            );
+        }
         if actual_prompt > 0 {
             counters
                 .last_actual_prompt_tokens
@@ -864,12 +878,18 @@ impl AgentLoopShared {
         // Phase D: feed this turn's TTFT + prompt size to the runtime
         // context-ceiling detector. Local-only — cloud latency has different
         // causes (network, provider queueing) and must not tighten a local
-        // compaction ceiling.
+        // compaction ceiling. `prefix_diverged_this_turn` suppresses tightening
+        // when this turn's TTFT was a one-off re-prefill (compaction, history
+        // edit) rather than sustained pressure — see observe_context_ceiling.
         if ctx.core.model.starts_with("local:") {
             if let Some(ttft_ms) = ctx.flow.ttft_ms {
                 self.core_handle
                     .counters
-                    .observe_context_ceiling(actual_prompt.max(0) as u64, ttft_ms);
+                    .observe_context_ceiling(
+                        actual_prompt.max(0) as u64,
+                        ttft_ms,
+                        ctx.flow.prefix_diverged_this_turn,
+                    );
             }
         }
     }

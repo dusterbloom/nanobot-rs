@@ -572,8 +572,22 @@ impl ReplContext {
                     .map_err(|e| format!("failed to switch Higgs to {selected_id}: {e}"))?;
                     report.note(format!("Higgs loaded {loaded_name}"));
 
-                    self.config.agents.defaults.local_model = selected_id.clone();
-                    self.config.agents.defaults.lms_main_model = "active".to_string();
+                    // Address higgs by the name it actually registered the model
+                    // under (`loaded_name`), NOT the candidate's display `id`.
+                    // For HF-style candidates these differ (id is "org/name" while
+                    // higgs serves the basename), and a mismatch makes every chat
+                    // request fail with "model not found" until `/restart` re-adopts
+                    // the served name. `loaded_name` is higgs's own response id.
+                    //
+                    // Both local_model AND lms_main_model must be the real name:
+                    // the provider's default_model (built from lms_main_model) is
+                    // what `resolve_request_and_policy_model` puts on the wire. The
+                    // old "active" sentinel meant "use higgs's loaded model" on the
+                    // legacy server, but higgs-nightly serves each model under its
+                    // real id and rejects the literal name "active" with 404.
+                    self.config.agents.defaults.local_model = loaded_name.clone();
+                    self.config.agents.defaults.lms_main_model = loaded_name.clone();
+                    report.model_id = loaded_name.clone();
                     self.config.agents.defaults.mlx_model_dir = Some(model_path.clone());
                     self.current_model_path = PathBuf::from(model_path.as_str());
                 } else {

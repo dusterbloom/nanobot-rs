@@ -359,12 +359,11 @@ fn model_prefers_hidden_reasoning(model: &str) -> bool {
 
 fn resolve_request_and_policy_model<'a>(
     api_base: &str,
-    default_model: &'a str,
     stripped_model: &'a str,
 ) -> (&'a str, &'a str) {
     let provider_model = if api_base.contains("openrouter") || api_base.starts_with("http://") {
         // OpenRouter: keep org/model for routing.
-        // Local HTTP servers (LMS, vLLM): keep full identifier (e.g. "nvidia/nemotron-3-nano").
+        // Local HTTP servers (LMS, vLLM, higgs): keep the full identifier.
         stripped_model
     } else {
         // Cloud HTTPS APIs (Anthropic, OpenAI, etc.): strip org prefix
@@ -372,13 +371,13 @@ fn resolve_request_and_policy_model<'a>(
         stripped_model.split('/').last().unwrap_or(stripped_model)
     };
 
-    if is_local_api_base(api_base) && default_model == "active" && stripped_model != "active" {
-        // Higgs uses "active" as the served transport model while nanobot keeps
-        // the loaded model's real identity for capabilities and reasoning policy.
-        ("active", stripped_model)
-    } else {
-        (provider_model, provider_model)
-    }
+    // higgs-nightly serves each model under its real id and 404s on any other
+    // name, so the wire (request) model and the policy model are the SAME real
+    // id. The legacy `"active"` transport alias (one virtual name for whatever
+    // was loaded) is gone: ctx.core.model always carries the real served id,
+    // populated by startup discovery/`/v1/models` adoption or by `/model`
+    // switch (which sets local_model to higgs's response id).
+    (provider_model, provider_model)
 }
 
 /// Apply local reasoning controls when talking to localhost.
@@ -780,7 +779,7 @@ impl OpenAICompatProvider {
         // becomes "claude-opus-4-5" when hitting api.anthropic.com directly).
         let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
         let (model, policy_model) =
-            resolve_request_and_policy_model(&self.api_base, &self.default_model, stripped);
+            resolve_request_and_policy_model(&self.api_base, stripped);
 
         debug!(
             "chat request: api_base={} raw_model={} stripped={} model={} policy_model={} streaming={}",
@@ -851,6 +850,22 @@ impl OpenAICompatProvider {
                 body["session_id"] = serde_json::json!(session_id);
             }
         }
+        // Definitive cache-engagement diagnostic. Both `higgs_session_cache`
+        // (the provider flag, set when localBackend=higgs) AND `session_id`
+        // (the marker extracted from the message array at line ~795) must be
+        // present for body["session_id"] to be sent. If this logs
+        // session_id_set=false on a higgs backend, the prefix cache is never
+        // engaged — that is the root cause of per-turn re-prefill bursts.
+        // Cross-reference with the response-side `local_llm_raw_usage` log:
+        // session_id_set=true + cache_read=0 ⇒ the server received the id but
+        // is not serving a cached prefix.
+        debug!(
+            api_base = %self.api_base,
+            higgs_session_cache = self.higgs_session_cache,
+            session_id_set = body.get("session_id").is_some(),
+            session_id_value = ?higgs_session_id,
+            "higgs_session_cache_request"
+        );
         apply_local_reasoning_controls(&mut body, &self.api_base, policy_model, thinking_budget);
 
         // Forced tool calls ("required") only engage for local backends with
@@ -3242,16 +3257,20 @@ mod tests {
 
     #[test]
     fn active_local_transport_keeps_semantic_policy_model() {
+        // higgs-nightly serves models under their real id and rejects the legacy
+        // "active" alias, so the wire model must be the real id (not "active").
+        // `default_model == "active"` (an unresolved sentinel) no longer affects
+        // the wire — ctx.core.model's id is sent directly.
         let (request, policy) =
-            resolve_request_and_policy_model(LOCAL, "active", "usermma/VibeThinker-3B-mlx-8Bit");
+            resolve_request_and_policy_model(LOCAL, "usermma/VibeThinker-3B-mlx-8Bit");
 
-        assert_eq!(request, "active");
+        assert_eq!(request, "usermma/VibeThinker-3B-mlx-8Bit");
         assert_eq!(policy, "usermma/VibeThinker-3B-mlx-8Bit");
     }
 
     #[test]
     fn non_active_local_transport_uses_same_request_and_policy_model() {
-        let (request, policy) = resolve_request_and_policy_model(LOCAL, "qwen3-8b", "qwen3-8b");
+        let (request, policy) = resolve_request_and_policy_model(LOCAL, "qwen3-8b");
 
         assert_eq!(request, "qwen3-8b");
         assert_eq!(policy, "qwen3-8b");

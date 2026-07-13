@@ -841,15 +841,6 @@ fn models_url_from_base(api_base: &str) -> String {
     }
 }
 
-fn switch_url_from_base(api_base: &str) -> String {
-    let base = api_base.trim_end_matches('/');
-    if base.ends_with("/v1") {
-        format!("{base}/models/switch")
-    } else {
-        format!("{base}/v1/models/switch")
-    }
-}
-
 fn health_url_from_base(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     let base = base.strip_suffix("/v1").unwrap_or(base);
@@ -1051,13 +1042,18 @@ pub(crate) async fn list_available_served_models_at(api_base: &str, api_key: &st
     filter_available_model_ids(served, &unavailable)
 }
 
-/// Probe whether this endpoint implements Higgs' runtime switch API.
+/// Probe whether this endpoint supports higgs' runtime model load/unload API.
 ///
-/// A real switch-capable Higgs answers GET /v1/models/switch with 405 and
-/// Allow: POST. Plain OpenAI-compatible resident endpoints commonly return
-/// 404; those must not receive filesystem switch candidates.
+/// higgs-nightly advertises this via `GET /v1/models`, whose response carries a
+/// `runtime_model_load: bool` flag mirroring the server's
+/// `local.allow_runtime_model_load` config. When true, `POST /v1/models`
+/// (load) and `DELETE /v1/models/{name}` (unload) are enabled. (The older
+/// `/v1/models/switch` route was removed; it 405s with `allow: DELETE` now
+/// because `/switch` is parsed as a model name.) Plain OpenAI-compatible
+/// resident endpoints don't set the flag, so they must not receive filesystem
+/// switch candidates.
 pub(crate) async fn supports_runtime_model_switch_at(api_base: &str, api_key: &str) -> bool {
-    let url = switch_url_from_base(api_base);
+    let url = models_url_from_base(api_base);
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
     if !api_key.is_empty() {
@@ -1066,21 +1062,26 @@ pub(crate) async fn supports_runtime_model_switch_at(api_base: &str, api_key: &s
     let Ok(resp) = req.timeout(std::time::Duration::from_secs(3)).send().await else {
         return false;
     };
-    if resp.status() != reqwest::StatusCode::METHOD_NOT_ALLOWED {
+    if !resp.status().is_success() {
         return false;
     }
-    resp.headers()
-        .get(reqwest::header::ALLOW)
-        .and_then(|value| value.to_str().ok())
-        .map(|allow| {
-            allow
-                .split(',')
-                .any(|method| method.trim().eq_ignore_ascii_case("POST"))
-        })
-        .unwrap_or(true)
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return false;
+    };
+    json.get("runtime_model_load")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
-/// Switch Higgs to one runtime model using the free-then-load endpoint.
+/// Switch higgs to one runtime model using the load/unload API.
+///
+/// higgs-nightly replaced the atomic `/v1/models/switch` with explicit
+/// `POST /v1/models` (load) and `DELETE /v1/models/{name}` (unload). A switch
+/// is therefore unload-the-old-then-load-the-new. We unload FIRST because two
+/// multi-GB models cannot resident together on a memory-bound Mac (a 35B+35B
+/// pair OOMs the GPU); unloading first frees the memory before the new weights
+/// arrive. The brief gap with no model loaded is harmless — nanobot is not
+/// inferring during the switch.
 pub(crate) async fn switch_runtime_model(
     api_base: &str,
     api_key: &str,
@@ -1088,37 +1089,68 @@ pub(crate) async fn switch_runtime_model(
     name: &str,
     timeout_secs: u64,
 ) -> Result<String, String> {
-    let url = switch_url_from_base(api_base);
+    let client = reqwest::Client::new();
+    let auth = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
+        if !api_key.is_empty() {
+            req.header("Authorization", format!("Bearer {api_key}"))
+        } else {
+            req
+        }
+    };
+
+    // 1. Unload every currently-loaded model that isn't the one we're loading.
+    //    This frees GPU memory so the new weights don't OOM. Best-effort: a
+    //    failed unload is logged in the result note path, not fatal (the load
+    //    may still succeed if there's headroom).
+    let loaded = list_available_served_models_at(api_base, api_key).await;
+    let unload_url = models_url_from_base(api_base);
+    for id in &loaded {
+        if name.eq_ignore_ascii_case(id) {
+            continue;
+        }
+        let _ = auth(client.delete(format!("{unload_url}/{}", url_encode_model_id(id))))
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await;
+    }
+
+    // 2. Load the requested model. Body mirrors a higgs [[models]] entry.
     let mut body = serde_json::json!({ "path": path });
     if !name.is_empty() {
         body["name"] = serde_json::json!(name);
     }
-
-    let client = reqwest::Client::new();
-    let mut req = client.post(&url).json(&body);
-    if !api_key.is_empty() {
-        req = req.header("Authorization", format!("Bearer {api_key}"));
-    }
-    let resp = req
+    let resp = auth(client.post(unload_url).json(&body))
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await
-        .map_err(|e| format!("Higgs switch request failed: {e}"))?;
+        .map_err(|e| format!("Higgs load request failed: {e}"))?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!(
-            "Higgs switch failed (HTTP {status}): {}",
-            text.trim()
-        ));
+        return Err(format!("Higgs load failed (HTTP {status}): {}", text.trim()));
     }
 
-    let loaded = serde_json::from_str::<serde_json::Value>(&text)
+    let loaded_name = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|json| json.get("id").and_then(|id| id.as_str()).map(String::from))
         .unwrap_or_else(|| name.to_string());
-    Ok(loaded)
+    Ok(loaded_name)
+}
+
+/// Percent-encode a model id for use in a DELETE path segment. higgs ids are
+/// normally filesystem-safe (alphanumeric + dashes), but this guards against
+/// any `/` or space sneaking in.
+fn url_encode_model_id(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u8)
+            }
+        })
+        .collect()
 }
 
 /// Restart Higgs with a (potentially different) model.
@@ -1615,8 +1647,8 @@ mod tests {
             "http://127.0.0.1:8091/v1/models"
         );
         assert_eq!(
-            switch_url_from_base("http://127.0.0.1:8091"),
-            "http://127.0.0.1:8091/v1/models/switch"
+            models_url_from_base("http://127.0.0.1:8091"),
+            "http://127.0.0.1:8091/v1/models"
         );
     }
 

@@ -396,6 +396,14 @@ pub(crate) struct FlowControl {
     /// Metrics for a provider response that requested tools. Emission is
     /// deferred until routing/execution knows the truthful executed count.
     pub(crate) pending_request_metrics: Option<crate::agent::metrics::RequestMetrics>,
+    /// True when THIS call's prompt was not an append-only extension of the
+    /// previous one (`PromptDelta::Diverged`) — i.e. the server must re-prefill
+    /// past the divergence point. Set in `step_call_llm` from the prompt
+    /// fingerprint diff. Read by `observe_context_ceiling`: a diverged turn's
+    /// TTFT reflects a one-off re-prefill cost, not sustained context pressure,
+    /// so tightening on it is a positive-feedback death spiral (tighten → LCM
+    /// compacts → prefix rewrites → next turn diverges → tighten again).
+    pub(crate) prefix_diverged_this_turn: bool,
 }
 
 impl FlowControl {
@@ -1958,6 +1966,11 @@ impl AgentLoopShared {
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
         let prompt_total_estimate =
             TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens);
+        // Whether this turn's prompt diverged from the previous call's prefix.
+        // Captured here (inside the diagnostic block's scope is awkward because
+        // it holds the fingerprint lock) and copied to ctx.flow after the block
+        // so observe_context_ceiling can suppress tightening on re-prefill turns.
+        let mut prompt_diverged = false;
         {
             let store = counters.prompt_fingerprints.lock();
             let prompt_delta = prompt_fingerprint::compare(store.get(&ctx.session_key), &prompt_fp);
@@ -1981,6 +1994,7 @@ impl AgentLoopShared {
                     prev_msgs,
                     new_msgs,
                 } => {
+                    prompt_diverged = true;
                     // WARN (not info): the default subscriber filter is `warn`,
                     // and a prefix divergence costs ~60s/turn on local — this must
                     // be visible in the log without RUST_LOG=info. Self-suppresses
@@ -2039,6 +2053,7 @@ impl AgentLoopShared {
                 }
             }
         }
+        ctx.flow.prefix_diverged_this_turn = prompt_diverged;
 
         // Tool-block divergence diagnostic. The message fingerprint above is
         // blind to tool schemas by design, yet chat templates render the tool
