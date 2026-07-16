@@ -1,5 +1,12 @@
 # CONTEXT.md Protocol — Implementation Plan
 
+> **Historical proposal:** This document records the former Markdown
+> working-memory design; it is not the production storage contract. Production uses
+> `~/.nanobot/sessions.db` for raw messages, LCM nodes, tool results, snapshots,
+> and session-scoped working memory. `MEMORY.md` contains only curated cross-
+> session facts. The `SESSION_*.md` and proposed `CONTEXT.md` examples below are
+> retained to explain the problem this design was exploring.
+
 ## Problems (Verified by Research)
 
 ### 1. Duplication Map (token waste per turn)
@@ -52,7 +59,7 @@ provided them. I should prompt them to specify the file locations...
 - **Format:** Strict template (below) — any SLM can fill it
 - **Rule:** Overwritten each compaction. One file, not accumulated sections.
 
-### Layer 3: Session JSONL (Raw history)
+### Layer 3: SQLite session history (Raw history)
 - **What:** Every message, tool call, result — verbatim
 - **Updated by:** Nanobot core (automatic)
 - **Rule:** Never summarized in-place

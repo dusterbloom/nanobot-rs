@@ -119,7 +119,11 @@ mod tests {
 
     #[test]
     fn test_format_line_contains_key_age_and_exchange() {
-        let tail = make_tail("fix the login bug", "Fixed it by adding a guard.", Duration::hours(2));
+        let tail = make_tail(
+            "fix the login bug",
+            "Fixed it by adding a guard.",
+            Duration::hours(2),
+        );
         let line = format_continuity_line(&tail, Utc::now());
         assert!(line.contains("cli:oneshot-123"), "line: {line}");
         assert!(line.contains("2h ago"), "line: {line}");

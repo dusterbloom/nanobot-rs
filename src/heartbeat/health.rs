@@ -195,63 +195,6 @@ impl HealthRegistry {
     }
 }
 
-// --- LcmCompactionProbe ---
-
-pub struct LcmCompactionProbe {
-    pub(crate) endpoint_url: String,
-    client: reqwest::Client,
-}
-
-impl LcmCompactionProbe {
-    pub fn new(endpoint_url: &str) -> Self {
-        // Strip /v1 suffix and trailing slashes
-        let base = endpoint_url
-            .trim_end_matches('/')
-            .trim_end_matches("/v1")
-            .trim_end_matches('/');
-        Self {
-            endpoint_url: base.to_string(),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default(),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl HealthProbe for LcmCompactionProbe {
-    fn name(&self) -> &str {
-        "lcm_compaction"
-    }
-
-    fn interval_secs(&self) -> u64 {
-        60
-    }
-
-    async fn check(&self) -> ProbeResult {
-        let url = format!("{}/health", self.endpoint_url);
-        let start = Instant::now();
-        match self.client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => ProbeResult {
-                healthy: true,
-                latency_ms: start.elapsed().as_millis() as u64,
-            },
-            Ok(_) => ProbeResult {
-                healthy: false,
-                latency_ms: start.elapsed().as_millis() as u64,
-            },
-            Err(e) => {
-                warn!("LCM compaction health check failed: {}", e);
-                ProbeResult {
-                    healthy: false,
-                    latency_ms: start.elapsed().as_millis() as u64,
-                }
-            }
-        }
-    }
-}
-
 // --- TrioEndpointProbe ---
 
 /// Health probe for trio router/specialist endpoints.
@@ -385,11 +328,6 @@ impl HealthProbe for SearXNGProbe {
 
 pub fn build_registry(config: &crate::config::schema::Config) -> HealthRegistry {
     let mut reg = HealthRegistry::new_with_threshold(config.monitoring.degraded_threshold);
-    if config.lcm.is_enabled() {
-        if let Some(ref ep) = config.lcm.compaction_endpoint {
-            reg.register(Box::new(LcmCompactionProbe::new(&ep.url)));
-        }
-    }
     if config.trio.enabled {
         if let Some(ref ep) = config.trio.router_endpoint {
             reg.register(Box::new(TrioEndpointProbe::new(
@@ -616,32 +554,6 @@ mod tests {
         assert_eq!(first_check, second_check);
     }
 
-    // --- LcmCompactionProbe tests ---
-
-    #[test]
-    fn test_lcm_probe_name() {
-        let probe = LcmCompactionProbe::new("http://localhost:1234/v1");
-        assert_eq!(probe.name(), "lcm_compaction");
-    }
-
-    #[test]
-    fn test_lcm_probe_interval() {
-        let probe = LcmCompactionProbe::new("http://localhost:1234/v1");
-        assert_eq!(probe.interval_secs(), 60);
-    }
-
-    #[test]
-    fn test_lcm_probe_strips_v1() {
-        let probe = LcmCompactionProbe::new("http://localhost:1234/v1");
-        assert_eq!(probe.endpoint_url, "http://localhost:1234");
-    }
-
-    #[test]
-    fn test_lcm_probe_strips_trailing_slash() {
-        let probe = LcmCompactionProbe::new("http://localhost:1234/v1/");
-        assert_eq!(probe.endpoint_url, "http://localhost:1234");
-    }
-
     // --- build_registry tests ---
 
     #[test]
@@ -653,37 +565,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_registry_lcm_disabled() {
+    fn test_build_registry_does_not_probe_on_demand_compactor() {
         let mut config = crate::config::schema::Config::default();
         config.tools.web.search.searxng_url = String::new();
-        config.lcm.enabled = Some(false);
-        config.lcm.compaction_endpoint = Some(crate::config::schema::ModelEndpoint {
-            url: "http://localhost:1234/v1".to_string(),
-            model: "qwen3-0.6b".to_string(),
-        });
-        let reg = build_registry(&config);
-        assert_eq!(reg.probe_count(), 0);
-    }
-
-    #[test]
-    fn test_build_registry_with_lcm_endpoint() {
-        let mut config = crate::config::schema::Config::default();
-        config.tools.web.search.searxng_url = String::new();
-        config.lcm.enabled = Some(true);
-        config.lcm.compaction_endpoint = Some(crate::config::schema::ModelEndpoint {
-            url: "http://localhost:1234/v1".to_string(),
-            model: "qwen3-0.6b".to_string(),
-        });
-        let reg = build_registry(&config);
-        assert_eq!(reg.probe_count(), 1);
-    }
-
-    #[test]
-    fn test_build_registry_lcm_no_endpoint() {
-        let mut config = crate::config::schema::Config::default();
-        config.tools.web.search.searxng_url = String::new();
-        config.lcm.enabled = Some(true);
-        // No compaction_endpoint set
+        config.lcm.compaction_port = Some(8092);
+        config.lcm.compaction_model_dir = Some("/models/bonsai".to_string());
         let reg = build_registry(&config);
         assert_eq!(reg.probe_count(), 0);
     }

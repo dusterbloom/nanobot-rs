@@ -483,7 +483,7 @@ fn sessions_native_arg(rest: &str) -> SessionsRoute<'_> {
     let arg = trimmed[command.len()..].trim();
     let first = arg.split_whitespace().next().unwrap_or("");
     match first {
-        "export" | "purge" | "archive" | "index" => SessionsRoute::Classic,
+        "export" | "purge" | "archive" => SessionsRoute::Classic,
         "list" => SessionsRoute::Native(""),
         _ => SessionsRoute::Native(arg),
     }
@@ -563,7 +563,12 @@ async fn load_current_session_state(app: &mut App, ctx: &mut ReplContext) {
     let meta = core.sessions.get_or_resume(&ctx.session_id).await;
     let history = core.sessions.get_history(&meta.id, 80, 20).await;
     app.load_transcript_from_history(&history);
-    if let Some(snapshot) = core.sessions.load_snapshot(&ctx.session_id).await {
+    if let Some(snapshot) = core
+        .sessions
+        .load_snapshot(&ctx.session_id)
+        .await
+        .filter(|snapshot| snapshot.session_id == meta.id)
+    {
         let snapshot_model = snapshot.model.clone();
         app.apply_snapshot(&snapshot);
         restore_snapshot_model(app, ctx, &snapshot_model).await;
@@ -680,12 +685,24 @@ async fn preview_session(ctx: &ReplContext, pick: &SessionPick) -> String {
 
 async fn resume_session(app: &mut App, ctx: &mut ReplContext, pick: SessionPick) {
     save_current_snapshot(app, ctx).await;
-    ctx.session_id = pick.session_key.clone();
+    let core = ctx.core_handle.swappable();
+    let resumed = match core.sessions.resume_session(&pick.session_id).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => {
+            app.push_note(format!("session {} no longer exists", pick.session_id));
+            return;
+        }
+        Err(error) => {
+            app.push_note(format!("failed to resume {}: {error}", pick.session_id));
+            return;
+        }
+    };
+    ctx.session_id = resumed.session_key.clone();
     ctx.core_handle
         .counters
         .reset_session_prompt_state(&ctx.session_id);
     load_current_session_state(app, ctx).await;
-    app.push_note(format!("resumed {}", pick.session_key));
+    app.push_note(format!("resumed {}", resumed.id));
 }
 
 async fn refresh_background_jobs(app: &mut App, agent: &AgentLoop) {
@@ -1052,6 +1069,26 @@ mod tests {
         );
         assert_eq!(model_command_direct_arg("model"), None);
         assert_eq!(model_command_direct_arg("m"), None);
+    }
+
+    #[test]
+    fn sessions_router_does_not_restore_removed_index_subcommand() {
+        assert!(matches!(
+            sessions_native_arg("sessions export cli:test"),
+            SessionsRoute::Classic
+        ));
+        assert!(matches!(
+            sessions_native_arg("sessions purge 7d"),
+            SessionsRoute::Classic
+        ));
+        assert!(matches!(
+            sessions_native_arg("sessions archive"),
+            SessionsRoute::Classic
+        ));
+        assert!(matches!(
+            sessions_native_arg("sessions index"),
+            SessionsRoute::Native("index")
+        ));
     }
 
     #[test]

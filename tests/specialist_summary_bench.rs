@@ -127,7 +127,7 @@ fn long_fixtures() -> Vec<Fixture> {
         }
         s.push_str("failures:\n");
         s.push_str("---- protocol::tests::local_assistant_preserves_tool_calls_for_lm_studio stdout ----\n");
-        s.push_str("assertion failed: expected assistant tool_calls in session JSONL\n");
+        s.push_str("assertion failed: expected assistant tool_calls in SQLite session history\n");
         s.push_str(
             "---- lcm::tests::test_second_compaction_summarizes_after_first_summary stdout ----\n",
         );

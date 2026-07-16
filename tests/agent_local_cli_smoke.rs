@@ -79,8 +79,7 @@ fn read_session_messages(path: &Path, session_key: &str) -> Vec<Value> {
             let tool_name: Option<String> = row.get(4)?;
             let mut message = json!({"role": role, "content": content});
             if let Some(tool_calls) = tool_calls {
-                message["tool_calls"] =
-                    serde_json::from_str(&tool_calls).unwrap_or(Value::Null);
+                message["tool_calls"] = serde_json::from_str(&tool_calls).unwrap_or(Value::Null);
             }
             if let Some(tool_call_id) = tool_call_id {
                 message["tool_call_id"] = Value::String(tool_call_id);
@@ -299,8 +298,8 @@ fn agent_local_parallel_tool_call_smoke() {
 
     let local_api_base = std::env::var("NANOBOT_TEST_LOCAL_API_BASE")
         .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string());
-    let local_model = std::env::var("NANOBOT_TEST_LOCAL_MODEL")
-        .unwrap_or_else(|_| "qwen36-35b-a3b".to_string());
+    let local_model =
+        std::env::var("NANOBOT_TEST_LOCAL_MODEL").unwrap_or_else(|_| "qwen36-35b-a3b".to_string());
     write_isolated_config(home, &local_api_base, &local_model);
 
     let workspace = home.join(".nanobot").join("workspace");

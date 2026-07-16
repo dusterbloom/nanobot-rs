@@ -59,7 +59,32 @@ const DEFAULT_READ_LINES: usize = 1000;
 const MAX_READ_LINES: usize = 5000;
 
 /// Tool to read file contents.
-pub struct ReadFileTool;
+///
+/// `char_budget` bounds the rendered line window so it stays UNDER the
+/// tool-result cap (`max_tool_result_chars`). This is essential: if the window
+/// exceeded the cap, `digest_tool_result` would head+tail-truncate it and
+/// insert a `"[...]"` gap — read_file is randomly accessible, so a complete
+/// window plus a next-range pointer always beats a hole. Production constructs
+/// with `new(max_tool_result_chars)`; `Default` keeps the historical 7000 for
+/// tests.
+pub struct ReadFileTool {
+    char_budget: usize,
+}
+
+impl ReadFileTool {
+    pub fn new(char_budget: usize) -> Self {
+        // Floor so an absurdly small cap still renders at least a few lines.
+        Self {
+            char_budget: char_budget.max(512),
+        }
+    }
+}
+
+impl Default for ReadFileTool {
+    fn default() -> Self {
+        Self::new(7_000)
+    }
+}
 
 #[async_trait]
 impl Tool for ReadFileTool {
@@ -138,11 +163,11 @@ impl Tool for ReadFileTool {
         // ds4-style, so the model never dumps a whole file unless it asks
         // (lines="1:"). Both paths share the deterministic renderer below.
         if let Some(lines_param) = params.get("lines").and_then(|v| v.as_str()) {
-            return extract_line_range(&content, lines_param, path);
+            return extract_line_range(&content, lines_param, path, self.char_budget);
         }
         let max_lines =
             bounded_usize_param(&params, "max_lines", DEFAULT_READ_LINES, MAX_READ_LINES);
-        render_range(&content, 1, max_lines.min(total), path, total)
+        render_range(&content, 1, max_lines.min(total), path, total, self.char_budget)
     }
 }
 
@@ -1402,7 +1427,7 @@ fn truncate_chars_with_notice(s: &str, max_chars: usize) -> String {
 /// Extract a line range from content.
 ///
 /// `range` format: "start:end" (1-indexed, inclusive) or "start:" (to end).
-fn extract_line_range(content: &str, range: &str, path: &str) -> String {
+fn extract_line_range(content: &str, range: &str, path: &str, char_budget: usize) -> String {
     let parts: Vec<&str> = range.splitn(2, ':').collect();
     if parts.len() != 2 {
         return format!(
@@ -1448,7 +1473,7 @@ fn extract_line_range(content: &str, range: &str, path: &str) -> String {
         return format!("Error: Start line {} is after end line {}.", start, end);
     }
 
-    render_range(content, start, end, path, total)
+    render_range(content, start, end, path, total, char_budget)
 }
 
 /// Render a 1-indexed inclusive line range with line numbers, a header
@@ -1460,7 +1485,20 @@ fn extract_line_range(content: &str, range: &str, path: &str) -> String {
 /// Output is a pure function of `(content, start, end, path)`: no timestamps,
 /// ids, or mtimes, so two reads of the same file+range are byte-identical and
 /// the inference server's prefix cache stays warm.
-fn render_range(content: &str, start: usize, end: usize, path: &str, total: usize) -> String {
+///
+/// `char_budget` is the per-read ceiling (sourced from `max_tool_result_chars`
+/// in production). The window is bounded to complete lines that fit within it
+/// (minus a header/marker reserve) so the result stays UNDER the tool-result
+/// cap — otherwise `digest_tool_result` head+tail-truncates it and inserts a
+/// `"[...]"` gap, which defeats the point of a randomly-accessible file.
+fn render_range(
+    content: &str,
+    start: usize,
+    end: usize,
+    path: &str,
+    total: usize,
+    char_budget: usize,
+) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let end = end.min(total);
 
@@ -1468,14 +1506,10 @@ fn render_range(content: &str, start: usize, end: usize, path: &str, total: usiz
     // randomly accessible, so the model is best served by a contiguous, whole
     // window plus the exact next range to read — never a head+tail cut that
     // destroys the middle and forces a `recall_tool_result` round-trip.
-    // `read_file` was the #1 truncated tool (343 events/week) purely because the
-    // old 1000-line default overflowed the 10k-char tool-result cap and got
-    // head+tail previewed. Always render at least one line. The header reserve
-    // covers the "# path (lines…)" line, the VERBATIM wrapper, and the
-    // next-chunk marker so the total stays under the cap.
-    const READ_RESULT_CHAR_BUDGET: usize = 7_000;
-    let budget = READ_RESULT_CHAR_BUDGET
-        .saturating_sub(path.len().saturating_add(160));
+    // Always render at least one line. The reserve covers the "# path (lines…)"
+    // header, the VERBATIM wrapper, and the next-chunk marker so the total
+    // stays under the cap and `digest_tool_result` never fires its `"[...]"`.
+    let budget = char_budget.saturating_sub(path.len().saturating_add(160));
     let mut eff_end = start;
     let mut cost: usize = 0;
     for i in start..=end {
@@ -1673,7 +1707,7 @@ mod tests {
         let file_path = dir.path().join("hello.txt");
         std::fs::write(&file_path, "hello world").unwrap();
 
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let params = make_params(&[("path", file_path.to_str().unwrap())]);
         let result = tool.execute(params).await;
         // Bounded-default format: numbered line + header reporting the total.
@@ -1698,7 +1732,7 @@ mod tests {
             .join("\n");
         std::fs::write(&file_path, &content).unwrap();
 
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let result = tool
             .execute(make_params(&[("path", file_path.to_str().unwrap())]))
             .await;
@@ -1741,7 +1775,7 @@ mod tests {
             .join("\n");
         std::fs::write(&file_path, &content).unwrap();
 
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("max_lines".to_string(), serde_json::json!(40));
         let result = tool.execute(params).await;
@@ -1767,7 +1801,7 @@ mod tests {
             .join("\n");
         std::fs::write(&file_path, &content).unwrap();
 
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("lines".to_string(), serde_json::json!("1:"));
         let result = tool.execute(params).await;
@@ -1792,7 +1826,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&file_path, &content).unwrap();
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let p = file_path.to_str().unwrap();
 
         let bare1 = tool.execute(make_params(&[("path", p)])).await;
@@ -1814,7 +1848,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_missing() {
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let params = make_params(&[("path", "/tmp/nonexistent_nanobot_test_file_xyz.txt")]);
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error: File not found"));
@@ -1822,7 +1856,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_missing_param() {
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let params = HashMap::new();
         let result = tool.execute(params).await;
         assert!(result.contains("'path' parameter is required"));
@@ -1831,7 +1865,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_not_a_file() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let params = make_params(&[("path", dir.path().to_str().unwrap())]);
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error: Not a file"));
@@ -1839,13 +1873,13 @@ mod tests {
 
     #[test]
     fn test_read_file_name() {
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         assert_eq!(tool.name(), "read_file");
     }
 
     #[test]
     fn test_read_file_parameters_schema() {
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["path"].is_object());
@@ -1862,7 +1896,7 @@ mod tests {
             .join("\n");
         std::fs::write(&file_path, &content).unwrap();
 
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("lines".to_string(), serde_json::json!("5:10"));
         let result = tool.execute(params).await;
@@ -1884,7 +1918,7 @@ mod tests {
             .join("\n");
         std::fs::write(&file_path, &content).unwrap();
 
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("lines".to_string(), serde_json::json!("3:"));
         let result = tool.execute(params).await;
@@ -1897,7 +1931,7 @@ mod tests {
     #[test]
     fn test_extract_line_range_basic() {
         let content = "alpha\nbeta\ngamma\ndelta\nepsilon";
-        let result = extract_line_range(content, "2:4", "test.txt");
+        let result = extract_line_range(content, "2:4", "test.txt", 7_000);
         assert!(result.contains("lines 2-4 of 5"));
         assert!(result.contains("beta"));
         assert!(result.contains("delta"));
@@ -1905,13 +1939,13 @@ mod tests {
 
     #[test]
     fn test_extract_line_range_invalid_format() {
-        let result = extract_line_range("content", "bad", "test.txt");
+        let result = extract_line_range("content", "bad", "test.txt", 7_000);
         assert!(result.contains("Error"));
     }
 
     #[test]
     fn test_extract_line_range_out_of_bounds() {
-        let result = extract_line_range("one\ntwo", "5:10", "test.txt");
+        let result = extract_line_range("one\ntwo", "5:10", "test.txt", 7_000);
         assert!(result.contains("exceeds file length"));
     }
 
@@ -1925,7 +1959,7 @@ mod tests {
             .map(|i| format!("    let x_{i} = some_call(arg_one, arg_two);"))
             .collect::<Vec<_>>()
             .join("\n");
-        let out = render_range(&content, 1, 1000, "src/big_module.rs", 5000);
+        let out = render_range(&content, 1, 1000, "src/big_module.rs", 5000, 7_000);
 
         assert!(
             !out.contains("[truncated:"),
@@ -1937,10 +1971,7 @@ mod tests {
             "output must stay under budget+slack, got {}",
             out.chars().count()
         );
-        assert!(
-            out.contains("of 5000)"),
-            "header reports the true total"
-        );
+        assert!(out.contains("of 5000)"), "header reports the true total");
         assert!(
             out.contains("more lines — read the next chunk"),
             "must point at the next range"
@@ -1952,6 +1983,36 @@ mod tests {
             out.contains("let x_1 = some_call(arg_one, arg_two);"),
             "first line must be whole, not mid-cut"
         );
+    }
+
+    #[test]
+    fn render_range_under_small_cap_never_emits_ellipsis_gap() {
+        // Regression: a small `max_tool_result_chars` (e.g. 2500) must bound the
+        // window so the result stays UNDER that cap. Previously render_range
+        // hardcoded 7000, so a 2500-cap config would let read_file return ~7000
+        // chars → digest_tool_result head+tail-truncated it → a "[...]" gap. With
+        // the cap threaded in, the window fits and no "[...]" can appear.
+        let content: String = (1..=5000)
+            .map(|i| format!("    let x_{i} = some_call(arg_one, arg_two);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = render_range(&content, 1, 1000, "src/big.rs", 5000, 2_500);
+
+        assert!(
+            !out.contains("[...]"),
+            "small-cap read must not produce a '[...]' head+tail gap: {}",
+            &out[..80.min(out.len())]
+        );
+        assert!(
+            out.chars().count() <= 2_500,
+            "output must stay under the 2500 cap, got {}",
+            out.chars().count()
+        );
+        assert!(
+            out.contains("more lines — read the next chunk"),
+            "must still point at the next range"
+        );
+        assert!(out.contains("   1:"), "range starts at line 1");
     }
 
     // -----------------------------------------------------------------------
@@ -2335,7 +2396,7 @@ mod tests {
         // Write binary content with null bytes.
         std::fs::write(&bin_path, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
 
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let mut params = HashMap::new();
         params.insert(
             "path".to_string(),
@@ -2356,7 +2417,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_not_found_has_hint() {
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let params = make_params(&[("path", "/tmp/nanobot_hint_test_nonexistent_xyz.txt")]);
         let result = tool.execute(params).await;
         assert!(
@@ -2374,7 +2435,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_not_a_file_has_hint() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::default();
         let params = make_params(&[("path", dir.path().to_str().unwrap())]);
         let result = tool.execute(params).await;
         assert!(

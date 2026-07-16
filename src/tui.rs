@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! TUI-related functions: ANSI constants, status bars, banners, and voice helpers.
 
 use parking_lot::Mutex;
@@ -7,8 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 #[cfg(feature = "voice")]
 use std::sync::Arc;
 use std::sync::OnceLock;
-
-use unicode_width::UnicodeWidthStr;
 
 use crate::agent::agent_loop::SharedCoreHandle;
 use crate::config::loader::load_config;
@@ -213,28 +210,6 @@ pub fn loading_animation(message: &str) {
 // ============================================================================
 // Terminal Utilities
 // ============================================================================
-
-/// Count terminal rows that `text` occupies when printed raw, accounting for line wrapping.
-///
-/// Each `\n`-delimited line takes `ceil(len / width)` rows (minimum 1).
-/// Adds `extra` for surrounding blank lines / println calls.
-pub(crate) fn terminal_rows(text: &str, extra: usize) -> usize {
-    // Guard against a 0-width terminal (e.g. a pty with no winsize, or a
-    // resize-to-zero): `(len + width - 1) / width` would divide by zero/panic.
-    let width = terminal_width().max(1);
-    let rows: usize = text
-        .split('\n')
-        .map(|line| {
-            let len = line.width();
-            if len == 0 {
-                1
-            } else {
-                (len + width - 1) / width
-            }
-        })
-        .sum();
-    rows + extra
-}
 
 /// Format a number with thousands separators (e.g. 12430 -> "12,430").
 pub(crate) fn format_thousands(n: usize) -> String {
@@ -927,53 +902,6 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- terminal_rows (unicode-width) ---
-
-    #[test]
-    fn test_terminal_rows_ascii() {
-        // "hello" is 5 display chars — fits in one row on an 80-col terminal.
-        let rows = terminal_rows("hello", 0);
-        assert_eq!(rows, 1);
-    }
-
-    #[test]
-    fn test_terminal_rows_empty() {
-        let rows = terminal_rows("", 0);
-        assert_eq!(rows, 1); // empty line still occupies 1 row
-    }
-
-    #[test]
-    fn test_terminal_rows_multiline() {
-        let rows = terminal_rows("line1\nline2\nline3", 0);
-        assert_eq!(rows, 3);
-    }
-
-    #[test]
-    fn test_terminal_rows_extra() {
-        let rows = terminal_rows("hello", 2);
-        assert_eq!(rows, 3); // 1 row + 2 extra
-    }
-
-    #[test]
-    fn test_terminal_rows_cjk_double_width() {
-        // CJK characters are 2 columns wide. 3 chars = 6 display columns.
-        // This should still fit in 1 row on an 80-col terminal.
-        let rows = terminal_rows("你好世", 0);
-        assert_eq!(rows, 1);
-    }
-
-    #[test]
-    fn test_terminal_rows_emoji() {
-        // Emoji vary — but the key test is that we DON'T use byte length.
-        // "🧠" is 4 bytes but typically 2 display columns.
-        let text = "🧠";
-        let rows = terminal_rows(text, 0);
-        // Should be 1 row regardless (display width <= 80)
-        assert_eq!(rows, 1);
-        // Verify we're not using byte length: byte len is 4, but width is 2.
-        assert_ne!(text.len(), text.width());
-    }
 
     #[cfg(feature = "voice")]
     #[test]

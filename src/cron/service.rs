@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Cron service for managing scheduled jobs.
 //!
 //! Interior mutability (`Mutex<CronStore>` + `AtomicBool`) so the service can

@@ -25,11 +25,8 @@ Useful narrower checks (one per protected contract):
 
 ```sh
 cargo test --test protocol_invariants
-cargo test --test tool_call_quality
-cargo test --test context_byte_stability
-cargo test --test session_resume
-cargo test --test channel_smoke
-cargo test --test provider_parsers
+cargo test --test protocol_tests
+cargo test --test lcm_e2e_tests
 ```
 
 What they cover:
@@ -37,50 +34,37 @@ What they cover:
 - `protocol_invariants`: message-array protocol — tool-call/tool-result
   pairing, "last message must be user" for local models, no orphan tool_calls.
   This is the best quick check for prompt-rendering changes.
-- `tool_call_quality`: tool-call parser regressions across families
-  (Hermes/Qwen/Llama/DeepSeek/native). Compares each recorded model response
-  against a golden parsed `ToolCall` in `tests/fixtures/tool_calls/`.
-- `context_byte_stability`: prompt-builder drift. Hashes the output of
-  `ContextBuilder` for a fixed `TurnContext` and compares to a checked-in
-  SHA-256. Any change must update the hash with a commit message explaining why.
-- `session_resume`: JSONL session save/load round-trip. Catches `session/`,
-  `working_memory/`, `session_indexer/` regressions.
-- `channel_smoke`: channel-adapter outbound formatting. No network — mocks the
-  transport and asserts the rendered message bytes.
-- `provider_parsers`: OpenAI/Anthropic-compatible response parsing for each
-  supported provider, from recorded SSE transcripts in
-  `tests/fixtures/provider_responses/`.
-
-Override fixture paths when needed:
-
-```sh
-NANOBOT_FIXTURE_DIR=/path/to/alternate cargo test --test tool_call_quality
-```
+- `protocol_tests`: provider and parser protocol regressions, including native
+  and fallback tool-call shapes.
+- `lcm_e2e_tests`: lossless-context compaction, summary selection, and reset
+  behavior.
 
 ## Speed Regression Tests
 
-Use `nanobot-bench` for end-to-end speed regressions. It reports instantaneous
-per-task timings, not whole-run averages.
+Build the release binary, then use the real local turn harness. It records wall
+time, `turn_timing` context-build spans, and the new rows written to
+`~/.nanobot/metrics.jsonl`.
 
 ```sh
-cargo run --release --bin nanobot-bench -- \
-  --tasks t01,t02,t05 \
-  --csv /tmp/nanobot-speed.csv
+cargo build --release
+OUT=/tmp/nanobot-before scripts/turn_bench.sh 20 bench:before
+# check out the candidate build, rebuild, then:
+OUT=/tmp/nanobot-after scripts/turn_bench.sh 20 bench:after
 ```
 
 Use the same machine, provider, model, power state, and background load when
-comparing two commits. For loop or context-builder work, run at least one
-before/after CSV and compare both `context_ms` and `total_ms`.
+comparing two commits. For loop or context-builder work, compare the emitted
+context timing, TTFT, elapsed time, token counts, and failures.
 
-To compare two CSVs:
+Historical baselines remain in `benches/baseline.csv`. If a run has been
+normalized to the same CSV schema, compare it with:
 
 ```sh
 python3 scripts/bench_diff.py benches/baseline.csv /tmp/nanobot-speed.csv
 ```
 
-The headline metric is `total_ms` summed across the run. A PR that regresses
-it by **more than 5%** without explanation in the PR description should not
-merge.
+Do not claim a speedup from the historical baseline alone: include matched
+before/after measurements from the same environment in the PR notes.
 
 ## Reporting Bugs
 

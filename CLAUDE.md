@@ -87,7 +87,7 @@ The `AgentLoop` (`src/agent/agent_loop.rs`) is the core: it receives messages vi
 - **`config/`** - JSON config schema (`schema.rs`) + loader. Config lives at `~/.nanobot/config.json`
 - **`channels/`** - Chat channel adapters (Telegram polling, WhatsApp WebSocket bridge, Feishu WebSocket)
 - **`bus/`** - `InboundMessage`/`OutboundMessage` event types, message queue
-- **`session/`** - JSONL-based session persistence in `~/.nanobot/sessions/`
+- **`session/`** - SQLite session persistence in `~/.nanobot/sessions.db`
 - **`cron/`** - Scheduled job system with interval and cron expression support
 - **`heartbeat/`** - Periodic heartbeat service
 
@@ -103,7 +103,7 @@ Tools implement the `Tool` trait (`agent/tools/base.rs`): `name()`, `description
 
 ### Context & Memory
 
-`ContextBuilder` assembles the system prompt from: identity text, bootstrap files (`AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `IDENTITY.md` in workspace), memory (`MEMORY.md` only — daily notes and learnings are excluded from the system prompt), and skills. The workspace defaults to `~/.nanobot/workspace/`.
+`ContextBuilder` assembles the system prompt from: identity text, bootstrap files (`AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `IDENTITY.md` in workspace), memory (`MEMORY.md` only — daily notes and learnings are excluded from the system prompt), and skills. The workspace defaults to `~/.nanobot/workspace/`. Raw sessions, LCM nodes, tool results, and session working state live in `~/.nanobot/sessions.db`; `MEMORY.md` contains curated cross-session facts rather than transcript history.
 
 ### Skills
 
@@ -135,14 +135,9 @@ everything past it (~45s cold vs ~0.6s reuse measured on a 35B). Pinned by
 
 For local models to use native function calling (tool_calls JSON), LM Studio must have `--jinja` enabled. This requires llama.cpp b8148 or newer. Without `--jinja`, models receive the `tools` parameter but can't generate proper `tool_calls` responses.
 
-**Protocol modes:**
-- `NativeToolCalls` — Model generates `tool_calls` JSON (requires LM Studio `--jinja`)
-- `TextualReplay` — Tool calls rendered as `[I called: tool_name({...})]` in text; nanobot parses them back
-
-Protocol is auto-selected by model capabilities. Override via:
-```bash
-NANOBOT_LOCAL_PROTOCOL_MODE=native nanobot agent -m "message"
-```
+Local inference has one production tool surface: the Lean definitions. The wire
+representation is selected from model/server capabilities; there is no
+user-facing tool-surface or protocol-mode switch.
 
 **Model capability overrides** (`~/.nanobot/config.json`):
 ```json

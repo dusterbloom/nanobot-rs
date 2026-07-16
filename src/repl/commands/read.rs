@@ -173,20 +173,15 @@ impl ReplContext {
             tui::RESET
         );
 
-        let obs_count = {
-            let obs = crate::agent::observer::ObservationStore::new(&core.workspace);
-            obs.count()
-        };
         println!(
-            "  {}MEMORY{}    {} ({} observations)",
+            "  {}MEMORY{}    {} (SQLite working memory → MEMORY.md)",
             tui::BOLD,
             tui::RESET,
             if core.memory_enabled {
                 "enabled"
             } else {
                 "disabled"
-            },
-            obs_count
+            }
         );
 
         let agent_count = self.agent_loop.subagent_manager().get_running_count().await;
@@ -658,14 +653,23 @@ impl ReplContext {
     }
 
     /// /memory — show working memory for current session.
-    pub(super) fn cmd_memory(&self) {
+    pub(super) async fn cmd_memory(&self) {
         let core = self.core_handle.swappable();
         if !core.memory_enabled {
             println!("\n  Memory system is disabled.\n");
         } else {
-            let wm = core
+            let session = core.sessions.get_or_resume(&self.session_id).await;
+            let wm = match core
                 .working_memory
-                .get_context(&self.session_id, usize::MAX);
+                .get_context(&session.id, usize::MAX)
+                .await
+            {
+                Ok(wm) => wm,
+                Err(error) => {
+                    println!("\n  Could not read working memory: {error}\n");
+                    return;
+                }
+            };
             if wm.is_empty() {
                 println!("\n  No working memory for this session.\n");
             } else {
@@ -695,13 +699,14 @@ impl ReplContext {
     /// means the same thing in both surfaces.
     pub(crate) async fn clear_session_state(&self) {
         let core = self.core_handle.swappable();
-        if core.memory_enabled {
-            core.working_memory.clear(&self.session_id);
-        }
         let session_meta = core.sessions.get_or_resume(&self.session_id).await;
+        if core.memory_enabled {
+            if let Err(error) = core.working_memory.clear(&session_meta.id).await {
+                tracing::warn!(%error, session_id = %session_meta.id, "failed to clear working memory");
+            }
+        }
         core.sessions.clear_history(&session_meta.id).await;
-        self.agent_loop.clear_lcm_engine(&self.session_id).await;
-        self.agent_loop.clear_bulletin_cache();
+        self.agent_loop.clear_lcm_engine(&session_meta.id).await;
 
         let counters = &self.core_handle.counters;
         counters.reset_session_prompt_state(&self.session_id);

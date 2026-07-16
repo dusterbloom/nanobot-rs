@@ -15,9 +15,10 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::agent::anti_drift;
 use crate::agent::audit::{AuditLog, ToolEvent};
-use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_hygiene;
-use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
+use crate::agent::lcm::{
+    CompactionAction, CompactionFailureMode, LcmCompactionState, LcmConfig, LcmEngine,
+};
 use crate::agent::policy;
 use crate::agent::prefix_guard;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
@@ -99,25 +100,33 @@ fn attach_higgs_session_marker(messages: &mut [Value], session_id: u64) {
     }
 }
 
-fn proactive_grounding_preserves_prefix_cache(is_local: bool, local_tail_opt_in: bool) -> bool {
-    !is_local || local_tail_opt_in
+fn proactive_grounding_preserves_prefix_cache(is_local: bool) -> bool {
+    !is_local
 }
 
 /// Decide whether to inject a heartbeat `[grounding]` message this iteration.
 ///
 /// Pure policy: combines the existing cadence/pressure rule (`should_ground`)
 /// with the prefix-cache preservation rule (`proactive_grounding_preserves_prefix_cache`).
-/// Local models without the `NANOBOT_LOCAL_TAIL` opt-in skip heartbeat grounding
-/// because every synthetic user turn diverges the warm prefix cache.
+/// Local models skip heartbeat grounding because every synthetic user turn
+/// diverges the warm prefix cache.
 fn should_inject_heartbeat_grounding(
     iteration: u32,
     interval: u32,
     pressure: f32,
     is_local: bool,
-    local_tail_opt_in: bool,
 ) -> bool {
     system_state::should_ground(iteration, interval, pressure)
-        && proactive_grounding_preserves_prefix_cache(is_local, local_tail_opt_in)
+        && proactive_grounding_preserves_prefix_cache(is_local)
+}
+
+fn conversation_token_count(messages: &[Value]) -> usize {
+    let conversation: Vec<Value> = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+        .cloned()
+        .collect();
+    TokenBudget::estimate_tokens(&conversation)
 }
 
 /// Decide whether to accept the prefix-cache re-prefill cost and install a
@@ -143,8 +152,6 @@ pub(crate) struct AgentLoopShared {
     pub(crate) cron_service: Option<Arc<CronService>>,
     pub(crate) email_config: Option<EmailConfig>,
     pub(crate) repl_display_tx: Option<UnboundedSender<String>>,
-    /// Cached memory bulletin for system prompt injection (zero-cost reads).
-    pub(crate) bulletin_cache: Arc<arc_swap::ArcSwap<String>>,
     /// Shared system state for ensemble proprioception.
     pub(crate) system_state: Arc<arc_swap::ArcSwap<SystemState>>,
     /// Proprioception config (feature toggles).
@@ -164,20 +171,8 @@ pub(crate) struct AgentLoopShared {
     pub(crate) lcm_engines: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<LcmEngine>>>>>,
     /// LCM configuration.
     pub(crate) lcm_config: LcmSchemaConfig,
-    /// Runtime toggle for LCM (initialised from `lcm_config.is_enabled()`).
-    /// Allows `/lcm` to flip without rebuilding the agent loop.
-    pub(crate) lcm_enabled: AtomicBool,
-    /// Dedicated LCM compactor (when `lcm.compaction_endpoint` is configured).
-    pub(crate) lcm_compactor: Option<Arc<ContextCompactor>>,
-    /// Compaction sidecar lifecycle spec (set after construction via
-    /// `AgentLoop::set_compaction_sidecar`). When on-demand, the LCM compaction
-    /// task spawns the sidecar (`ensure_up`) before summarizing and stops it
-    /// (`release`) after, so it never resident-competes with the main model
-    /// between compactions. Mutex because it's set once at startup and read
-    /// rarely (once per compaction).
-    pub(crate) compaction_sidecar:
-        parking_lot::Mutex<Option<Arc<crate::higgs::CompactionSidecarSpec>>>,
-    /// Health probe registry — used to gate LCM compaction when endpoint is degraded.
+    /// Health probes for foreground/router/specialist providers. The managed
+    /// LCM sidecar uses its own lease health and retry backoff.
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     /// Cluster router for distributed inference (feature-gated).
     #[cfg(feature = "cluster")]
@@ -396,14 +391,6 @@ pub(crate) struct FlowControl {
     /// Metrics for a provider response that requested tools. Emission is
     /// deferred until routing/execution knows the truthful executed count.
     pub(crate) pending_request_metrics: Option<crate::agent::metrics::RequestMetrics>,
-    /// True when THIS call's prompt was not an append-only extension of the
-    /// previous one (`PromptDelta::Diverged`) — i.e. the server must re-prefill
-    /// past the divergence point. Set in `step_call_llm` from the prompt
-    /// fingerprint diff. Read by `observe_context_ceiling`: a diverged turn's
-    /// TTFT reflects a one-off re-prefill cost, not sustained context pressure,
-    /// so tightening on it is a positive-feedback death spiral (tighten → LCM
-    /// compacts → prefix rewrites → next turn diverges → tighten again).
-    pub(crate) prefix_diverged_this_turn: bool,
 }
 
 impl FlowControl {
@@ -453,6 +440,277 @@ impl TurnContext {
 pub(crate) struct CompactionHandle {
     pub(crate) slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>>,
     pub(crate) in_flight: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+enum CompactionSidecarAttempt {
+    Acquire,
+    Skip,
+}
+
+/// Cancellation-safe ownership of one tentative LCM mutation. Unless SQLite
+/// commit explicitly succeeds, dropping the future restores the prior DAG and
+/// active window before releasing the per-session engine lock.
+struct LcmCompactionMutation<'a> {
+    engine: &'a mut LcmEngine,
+    rollback: Option<LcmCompactionState>,
+}
+
+impl<'a> LcmCompactionMutation<'a> {
+    fn new(engine: &'a mut LcmEngine) -> Self {
+        Self {
+            rollback: Some(engine.compaction_state()),
+            engine,
+        }
+    }
+
+    fn engine(&self) -> &LcmEngine {
+        self.engine
+    }
+
+    fn engine_mut(&mut self) -> &mut LcmEngine {
+        self.engine
+    }
+
+    fn commit(&mut self) {
+        self.rollback = None;
+    }
+}
+
+impl Drop for LcmCompactionMutation<'_> {
+    fn drop(&mut self) {
+        if let Some(state) = self.rollback.take() {
+            self.engine.restore_compaction_state(state);
+        }
+    }
+}
+
+const COMPACTION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(75);
+const COMPACTION_RUN_TIMEOUT: Duration = Duration::from_secs(150);
+const COMPACTION_SOFT_DRAIN_TIMEOUT: Duration = Duration::from_secs(155);
+
+/// Execute one LCM compaction and persist its lossless summary metadata.
+/// The caller decides whether to await this future (hard pressure) or spawn it
+/// (soft pressure); keeping the operation itself shared prevents the two paths
+/// from drifting.
+async fn execute_lcm_compaction(
+    core: Arc<SwappableCore>,
+    session_id: String,
+    lcm: Arc<tokio::sync::Mutex<LcmEngine>>,
+    messages: Vec<Value>,
+    session_turn: u64,
+    failure_mode: CompactionFailureMode,
+    sidecar_attempt: CompactionSidecarAttempt,
+) -> Option<PendingCompaction> {
+    let (lease, resolved_compactor) = match sidecar_attempt {
+        CompactionSidecarAttempt::Acquire => match core.compaction_manager.as_ref() {
+            Some(manager) => {
+                match tokio::time::timeout(COMPACTION_ACQUIRE_TIMEOUT, manager.acquire()).await {
+                    Ok(Ok(lease)) => {
+                        let compactor = core.compactor.for_model(lease.served_model().to_string());
+                        (Some(lease), Some(compactor))
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %error,
+                            ?failure_mode,
+                            "compaction_sidecar_acquire_failed"
+                        );
+                        (None, None)
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_secs = COMPACTION_ACQUIRE_TIMEOUT.as_secs(),
+                            ?failure_mode,
+                            "compaction_sidecar_acquire_timed_out"
+                        );
+                        (None, None)
+                    }
+                }
+            }
+            None => (None, None),
+        },
+        CompactionSidecarAttempt::Skip => (None, None),
+    };
+
+    // Keep the engine locked through SQLite commit. A failed checkpoint rolls
+    // back the DAG/active window before any other task can observe or extend
+    // the non-durable state.
+    let mut engine = lcm.lock().await;
+    let mut mutation = LcmCompactionMutation::new(&mut engine);
+    let summary_turn = mutation
+        .engine_mut()
+        .compact(
+            resolved_compactor.as_ref(),
+            &core.token_budget,
+            0,
+            failure_mode,
+        )
+        .await;
+    let compacted_conversation = mutation.engine().active_context();
+    let summary_node = summary_turn.as_ref().and_then(|turn| {
+        let crate::agent::turn::Turn::Summary {
+            text,
+            source_ids,
+            level,
+        } = turn
+        else {
+            return None;
+        };
+        let node = mutation.engine().dag().newest()?;
+        let node_id = node.id;
+        let child_ids = node.child_summaries.clone();
+        Some((
+            node_id,
+            source_ids.clone(),
+            child_ids,
+            text.clone(),
+            TokenBudget::estimate_str_tokens(text),
+            *level,
+        ))
+    });
+
+    // LCM stores only durable conversation rows. Reattach the complete
+    // non-durable prompt prefix (system + optional developer) and any
+    // same-snapshot ephemeral tail so installing the checkpoint cannot erase
+    // instructions or scaffolding that the engine intentionally did not ingest.
+    let prompt_prefix_len = messages
+        .iter()
+        .take_while(|message| {
+            matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            )
+        })
+        .count();
+    let ephemeral_tail = messages[prompt_prefix_len..]
+        .iter()
+        .filter(|message| {
+            message.get("_db_id").is_none()
+                && !message
+                    .get("_lcm_summary")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .cloned();
+    let mut compacted_messages =
+        Vec::with_capacity(prompt_prefix_len + compacted_conversation.len() + messages.len());
+    compacted_messages.extend_from_slice(&messages[..prompt_prefix_len]);
+    compacted_messages.extend(compacted_conversation);
+    compacted_messages.extend(ephemeral_tail);
+
+    // A failed/no-op soft compaction must preserve the active array byte for
+    // byte. Length alone is invalid here because the LCM context deliberately
+    // omits system/developer messages.
+    let reduced =
+        TokenBudget::estimate_tokens(&compacted_messages) < TokenBudget::estimate_tokens(&messages);
+    let pending = (summary_turn.is_some() && reduced).then(|| PendingCompaction {
+        result: crate::agent::compaction::CompactionResult {
+            messages: compacted_messages,
+        },
+        snapshot: messages,
+    });
+
+    // Summary nodes, rather than synthetic message rows, persist the DAG. The
+    // summary and working-memory snapshot commit together before this function
+    // returns the in-memory checkpoint: foreground inference must never install
+    // an LCM state that cannot be reconstructed after restart.
+    let compacted = summary_turn.is_some();
+    let checkpoint_persisted =
+        if let (Some((node_id, source_ids, child_ids, text, tokens, level)), true) =
+            (summary_node, pending.is_some())
+        {
+            let working_memory = core.memory_enabled.then_some((text.as_str(), session_turn));
+            match core
+                .sessions
+                .save_compaction_checkpoint(
+                    &session_id,
+                    node_id,
+                    &source_ids,
+                    &child_ids,
+                    &text,
+                    tokens,
+                    level,
+                    working_memory,
+                )
+                .await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(%error, %session_id, node_id, "lcm checkpoint persistence failed");
+                    false
+                }
+            }
+        } else {
+            !compacted
+        };
+    if checkpoint_persisted {
+        mutation.commit();
+    }
+    drop(mutation);
+    drop(engine);
+    // Drop is the cancellation-safe release path; it schedules last-lease
+    // shutdown without delaying foreground checkpoint installation.
+    drop(lease);
+    if checkpoint_persisted {
+        pending
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod lcm_checkpoint_tests {
+    use super::LcmCompactionMutation;
+    use crate::agent::lcm::{CompactionFailureMode, LcmConfig, LcmEngine};
+    use crate::agent::token_budget::TokenBudget;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn failed_checkpoint_persistence_restores_tentative_engine_state() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.05,
+            tau_hard: 0.8,
+            deterministic_target: 64,
+        });
+        for id in 1..=12 {
+            let role = if id % 2 == 0 { "assistant" } else { "user" };
+            engine.ingest(json!({
+                "role": role,
+                "content": format!("checkpoint-{id} {}", "x".repeat(400)),
+                "_db_id": id,
+            }));
+        }
+        engine.request_async_compaction();
+        let active_before = engine.active_context();
+        let dag_before = engine.dag().len();
+        let store_before = engine.store_len();
+
+        {
+            let mut mutation = LcmCompactionMutation::new(&mut engine);
+            let compacted = mutation
+                .engine_mut()
+                .compact(
+                    None,
+                    &TokenBudget::new(4096, 512),
+                    0,
+                    CompactionFailureMode::Deterministic,
+                )
+                .await;
+            assert!(compacted.is_some());
+            assert_ne!(mutation.engine().active_context(), active_before);
+            // Simulate SQLite failure/cancellation by dropping without commit.
+        }
+
+        assert_eq!(engine.active_context(), active_before);
+        assert_eq!(engine.dag().len(), dag_before);
+        assert_eq!(engine.store_len(), store_before);
+        assert_eq!(
+            engine.check_thresholds(&TokenBudget::new(4096, 512), 0),
+            crate::agent::lcm::CompactionAction::Async,
+            "rollback must clear the in-flight marker so compaction can retry"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -971,7 +1229,6 @@ impl AgentLoopShared {
                 self.proprioception_config.grounding_interval,
                 state.context_pressure,
                 ctx.core.mode().is_local(),
-                std::env::var("NANOBOT_LOCAL_TAIL").is_ok(),
             ) {
                 let grounding = system_state::format_grounding(&state);
                 ctx.messages
@@ -1101,12 +1358,9 @@ impl AgentLoopShared {
         // useful, but cache-hostile: LocalProtocol merges consecutive user
         // turns, while synthetic turns are stripped from the next replay, so
         // turn N+1 diverges at turn N's user message. Keep the local fast path
-        // append-only unless the existing local-tail opt-in explicitly chooses
-        // per-turn retrieval over prefix-cache reuse.
-        let local_retrieval_opt_in = proactive_grounding_preserves_prefix_cache(
-            ctx.core.mode().is_local(),
-            std::env::var("NANOBOT_LOCAL_TAIL").is_ok(),
-        );
+        // append-only. Cloud models retain proactive retrieval.
+        let local_retrieval_opt_in =
+            proactive_grounding_preserves_prefix_cache(ctx.core.mode().is_local());
         if self.proprioception_config.proactive_retrieval
             && local_retrieval_opt_in
             && iteration == 0
@@ -1234,29 +1488,10 @@ impl AgentLoopShared {
     /// Returns `(active_defs, saved_defs)` where `saved_defs` preserves the
     /// pre-trio-stripping state for router passthrough fallback.
     fn select_tool_definitions(&self, ctx: &mut TurnContext) -> (Vec<Value>, Vec<Value>) {
-        // Filter tool definitions to relevant tools.
-        // Local models get a minimal set to conserve context tokens.
-        let current_phase = self.system_state.load_full().task_phase;
-        let mut tool_defs = match ctx.core.mode() {
-            RuntimeMode::Local { .. } => match ctx.core.local_tool_mode {
-                crate::config::schema::LocalToolMode::Proxy => ctx.tools.get_proxy_definition(),
-                crate::config::schema::LocalToolMode::Lean => ctx.tools.get_lean_definitions(),
-                crate::config::schema::LocalToolMode::Slim => ctx.tools.get_slim_definitions(),
-                crate::config::schema::LocalToolMode::Full => ctx.tools.get_local_definitions(),
-            },
-            RuntimeMode::Cloud => {
-                if self.proprioception_config.enabled
-                    && self.proprioception_config.dynamic_tool_scoping
-                {
-                    ctx.tools
-                        .get_scoped_definitions(&current_phase, &ctx.messages, &ctx.used_tools)
-                } else {
-                    // Cloud models have 100K+ context — give them all registered
-                    // tools instead of keyword-gated subsets that hide capabilities.
-                    ctx.tools.get_definitions()
-                }
-            }
-        };
+        // One production catalog for every runtime mode. Long-tail tools stay
+        // executable through the proxy meta-tool, while the stable Lean schema
+        // keeps provider behavior and prompt-prefix caching identical.
+        let mut tool_defs = ctx.tools.get_lean_definitions();
         // Tool-averse models (no tool-calling training, e.g. VibeThinker):
         // the native `tools` parameter confuses or errors their chat
         // templates, and nothing else would teach them the textual syntax the
@@ -1377,6 +1612,16 @@ impl AgentLoopShared {
             return false;
         };
 
+        if !pending.matches_snapshot_prefix(&ctx.messages) {
+            warn!(
+                session = %ctx.session_key,
+                snapshot_messages = pending.watermark(),
+                live_messages = ctx.messages.len(),
+                "stale_lcm_checkpoint_discarded"
+            );
+            return false;
+        }
+
         let frozen_prefix = ctx
             .counters
             .prompt_cache_watermark
@@ -1384,13 +1629,13 @@ impl AgentLoopShared {
             .get(&ctx.session_key)
             .copied()
             .unwrap_or(0);
-        let rewrites_prompt = pending.result.messages.len() < pending.watermark;
+        let rewrites_prompt = pending.result.messages != pending.snapshot;
         if rewrites_prompt && frozen_prefix > 0 && !allow_checkpoint {
             debug!(
                 session = %ctx.session_key,
                 frozen_prefix,
                 compacted_messages = pending.result.messages.len(),
-                watermark = pending.watermark,
+                watermark = pending.watermark(),
                 "lcm_compaction_deferred_for_prompt_cache"
             );
             *guard = Some(pending);
@@ -1403,27 +1648,28 @@ impl AgentLoopShared {
                 session = %ctx.session_key,
                 frozen_prefix,
                 compacted_messages = pending.result.messages.len(),
-                watermark = pending.watermark,
+                watermark = pending.watermark(),
                 "prompt_cache_watermark_invalidated_by_lcm_checkpoint"
             );
         }
 
         debug!(
             "Compaction swap: {} msgs -> {} compacted + {} new",
-            pending.watermark,
+            pending.watermark(),
             pending.result.messages.len(),
-            ctx.messages.len().saturating_sub(pending.watermark)
+            ctx.messages.len().saturating_sub(pending.watermark())
         );
         // Record stats for `/lcm stats`: tokens of the replaced prefix vs its
         // compacted form (estimates, same estimator as budget accounting).
-        let prefix_end = pending.watermark.min(ctx.messages.len());
         ctx.counters.record_compaction(
-            TokenBudget::estimate_tokens(&ctx.messages[..prefix_end]) as u64,
+            TokenBudget::estimate_tokens(&pending.snapshot) as u64,
             TokenBudget::estimate_tokens(&pending.result.messages) as u64,
         );
-        apply_compaction_result(&mut ctx.messages, pending);
-        // After compaction, all messages in the array are "new" from the
-        // perspective of persistence (the session file was rebuilt).
+        if !apply_compaction_result(&mut ctx.messages, pending) {
+            return false;
+        }
+        // Compaction rewrites only the in-memory active window. Raw protocol
+        // messages remain durable in SQLite and are identified by `_db_id`.
         ctx.new_start = ctx.messages.len();
         ctx.flow.iterations_since_compaction = 0;
         // No ingest bookkeeping needed after the swap: the engine's store is
@@ -1434,11 +1680,10 @@ impl AgentLoopShared {
 
     /// Spawn background compaction when threshold exceeded.
     ///
-    /// When LCM is enabled, uses the LCM engine's control loop (with DAG,
-    /// summary persistence, and auto-expand). Otherwise falls back to core
-    /// compaction (gradient/audience-aware/simple).
+    /// Uses the LCM engine's control loop with its persisted DAG and
+    /// deterministic hard-pressure fallback.
     async fn manage_compaction(&self, ctx: &mut TurnContext, tool_def_tokens: usize) {
-        if self.lcm_enabled.load(Ordering::Relaxed) {
+        {
             // LCM path: get or create per-session engine, check thresholds.
             //
             // The engine starts EMPTY and ingests only the filtered messages
@@ -1451,15 +1696,15 @@ impl AgentLoopShared {
             // engine only needs the current context window.
             let lcm_engine = {
                 let mut engines = self.lcm_engines.lock().await;
-                if !engines.contains_key(&ctx.session_key) {
+                if !engines.contains_key(&ctx.session_id) {
                     let config = LcmConfig::from(&self.lcm_config);
                     let engine = LcmEngine::new(config);
                     engines.insert(
-                        ctx.session_key.clone(),
+                        ctx.session_id.clone(),
                         Arc::new(tokio::sync::Mutex::new(engine)),
                     );
                 }
-                engines.get(&ctx.session_key).cloned().unwrap()
+                engines.get(&ctx.session_id).cloned().unwrap()
             };
 
             // Feed messages into the LCM engine's append-only store.
@@ -1483,241 +1728,151 @@ impl AgentLoopShared {
                 }
             }
 
-            // Check thresholds and spawn compaction if needed.
-            // Pre-flight: skip LCM compaction if endpoint is degraded.
-            let lcm_healthy = self
-                .health_registry
-                .as_ref()
-                .map_or(true, |reg| reg.is_healthy("lcm_compaction"));
-            if !lcm_healthy {
-                debug!("LCM compaction skipped: endpoint degraded");
-            }
-            let has_pending_compaction = ctx
-                .compaction
-                .slot
-                .try_lock()
-                .map(|guard| guard.is_some())
-                .unwrap_or(true);
-            if has_pending_compaction {
-                debug!("LCM compaction skipped: pending checkpoint not installed yet");
-            }
-            if lcm_healthy
-                && !has_pending_compaction
-                && !ctx.compaction.in_flight.load(Ordering::Relaxed)
-            {
-                // Phase D: cap the threshold budget to the runtime-adaptive
-                // effective ceiling. A slow cache-miss tightens this ceiling,
-                // so LCM's soft/hard thresholds (fractions of `available`)
-                // shrink and the next compaction fires earlier — keeping the
-                // worst-case re-prefill tolerable under the current pressure.
-                let eff = ctx
-                    .counters
-                    .effective_context_ceiling
-                    .load(Ordering::Relaxed)
-                    .min(ctx.core.token_budget.max_context());
-                let budget = ctx.core.token_budget.with_max_context(eff);
-                let (action, conv_tokens, available, hard_limit, soft_limit) = {
-                    let engine = lcm_engine.lock().await;
-                    let action = engine.check_thresholds(&budget, tool_def_tokens);
-                    let available = budget.available_budget(tool_def_tokens);
-                    let conv = engine.conversation_tokens();
-                    let hard = (available as f64 * engine.tau_hard()) as usize;
-                    let soft = (available as f64 * engine.tau_soft()) as usize;
-                    (action, conv, available, hard, soft)
-                };
+            let budget_core = ctx.core.clone();
+            let budget = &budget_core.token_budget;
+            let (mut action, conv_tokens, available, hard_limit, soft_limit) = {
+                let engine = lcm_engine.lock().await;
+                let available = budget.available_budget(tool_def_tokens);
+                (
+                    engine.check_thresholds(budget, tool_def_tokens),
+                    engine.conversation_tokens(),
+                    available,
+                    (available as f64 * engine.tau_hard()) as usize,
+                    (available as f64 * engine.tau_soft()) as usize,
+                )
+            };
 
-
-                match action {
-                    CompactionAction::Async | CompactionAction::Blocking => {
-                        tracing::info!(
-                            compaction_type = if action == CompactionAction::Async {
-                                "lcm_async"
-                            } else {
-                                "lcm_blocking"
-                            },
-                            msg_count = ctx.messages.len(),
-                            conv_tokens = conv_tokens,
-                            available = available,
-                            hard_limit = hard_limit,
-                            soft_limit = soft_limit,
-                            "lcm_compaction_triggered"
-                        );
-                        let slot = ctx.compaction.slot.clone();
-                        let in_flight = ctx.compaction.in_flight.clone();
-                        let bg_messages = ctx.messages.clone();
-                        let bg_core = ctx.core.clone();
-                        let bg_eff_budget = eff; // carry Phase-D ceiling into the spawned compaction
-                        let bg_session_key = ctx.session_key.clone();
-                        let bg_session_id = ctx.session_id.clone();
-                        let bg_lcm = lcm_engine.clone();
-                        let bg_lcm_compactor = self.lcm_compactor.clone();
-                        // On-demand Bonsai: capture the sidecar spec so the
-                        // spawned compaction can spawn it before summarizing
-                        // and stop it after (freeing unified memory between
-                        // compactions). None when always-on or no sidecar.
-                        let bg_sidecar = self.compaction_sidecar.lock().clone();
-                        let watermark = ctx.messages.len();
-                        let bg_turn_count = ctx.turn_count;
-                        in_flight.store(true, Ordering::SeqCst);
-
-                        // Lazily start auxiliary server before compaction uses its endpoint.
-                        // If aux fails, clear the dedicated compactor so we fall back to
-                        // the main provider's compactor (bg_core.compactor).
-
-                        if action == CompactionAction::Async {
-                            // Mark async pending so we don't re-trigger.
-                            let mut engine = lcm_engine.lock().await;
-                            engine.request_async_compaction();
-                        }
-
-                        tokio::spawn(async move {
-                            // On-demand Bonsai: bring the sidecar up for this
-                            // compaction pass. If it fails, fall back to
-                            // summarizing on the MAIN model (slower but works)
-                            // instead of burning the 90s timeout retrying a
-                            // dead sidecar endpoint.
-                            let sidecar_up = match bg_sidecar.as_ref() {
-                                Some(spec) => match spec.ensure_up().await {
-                                    Ok(()) => true,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "compaction_sidecar_ensure_up_failed_main_model_fallback"
-                                        );
-                                        false
-                                    }
-                                },
-                                None => true,
-                            };
-                            // Main-model fallback compactor (only built when the
-                            // sidecar is down; otherwise we use the configured one).
-                            // Size the fallback compactor to the MAIN model's
-                            // context (not a tiny hardcoded 4096), so a large-
-                            // context model doesn't explode into many tiny
-                            // sequential summarize+merge calls.
-                            let fallback_compactor = if !sidecar_up {
-                                Some(crate::agent::compaction::ContextCompactor::new(
-                                    bg_core.provider.clone(),
-                                    bg_core.model.clone(),
-                                    bg_core.token_budget.max_context(),
-                                ))
-                            } else {
-                                None
-                            };
-                            let timeout_result =
-                                tokio::time::timeout(Duration::from_secs(90), async {
-                                    let compactor: &ContextCompactor = match fallback_compactor.as_ref() {
-                                        Some(fb) => fb,
-                                        None => bg_lcm_compactor
-                                            .as_deref()
-                                            .unwrap_or(&bg_core.compactor),
-                                    };
-                                    let summary_turn = {
-                                        let mut engine = bg_lcm.lock().await;
-                                        let bg_budget =
-                                            bg_core.token_budget.with_max_context(bg_eff_budget);
-                                        engine.compact(compactor, &bg_budget, 0).await
-                                    };
-
-                                    // Extract text from Turn::Summary for working memory and result.
-                                    let observation: Option<String> =
-                                        summary_turn.as_ref().and_then(|t| {
-                                            if let crate::agent::turn::Turn::Summary {
-                                                text, ..
-                                            } = t
-                                            {
-                                                Some(text.clone())
-                                            } else {
-                                                None
-                                            }
-                                        });
-
-                                    // Persist the summary for lossless restart.
-                                    //
-                                    // Summaries live ONLY in the summary_nodes table
-                                    // (below), never in the messages table. Writing a
-                                    // `role: "summary"` row into messages would give it
-                                    // a positional index in get_all_messages() and shift
-                                    // every later message's MessageId, invalidating the
-                                    // DAG's persisted source_ids on restart (CRIT-2).
-                                    if let Some(ref turn) = summary_turn {
-                                        // Persist summary node to SQLite for DAG restoration.
-                                        if let crate::agent::turn::Turn::Summary {
-                                            text: ref s_text,
-                                            ref source_ids,
-                                            level: s_level,
-                                        } = turn
-                                        {
-                                            let engine = bg_lcm.lock().await;
-                                            // The node ID is dag.len() - 1 (just created).
-                                            let node_id =
-                                                engine.dag().len().saturating_sub(1);
-                                            // child_summaries = the prior summary nodes this
-                                            // compaction MERGED (retired). Persisted as child_ids
-                                            // so rebuild_from_db_nodes skips them — the merge is
-                                            // durable across restart instead of re-accumulating.
-                                            let child_ids: Vec<usize> = engine
-                                                .dag()
-                                                .get(node_id)
-                                                .map(|n| n.child_summaries.clone())
-                                                .unwrap_or_default();
-                                            let tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(s_text);
-                                            bg_core
-                                                .sessions
-                                                .save_summary_node(
-                                                    &bg_session_id,
-                                                    node_id,
-                                                    source_ids,
-                                                    &child_ids,
-                                                    s_text,
-                                                    tokens,
-                                                    *s_level,
-                                                )
-                                                .await;
-                                        }
-                                    }
-
-                                    // Update working memory with compaction observation.
-                                    if bg_core.memory_enabled {
-                                        if let Some(ref summary_text) = observation {
-                                            bg_core.working_memory.update_from_compaction(
-                                                &bg_session_key,
-                                                summary_text,
-                                                bg_turn_count,
-                                            );
-                                        }
-                                    }
-
-                                    // Build CompactionResult from LCM's active context.
-                                    let compacted_messages = {
-                                        let engine = bg_lcm.lock().await;
-                                        engine.active_context()
-                                    };
-
-                                    if compacted_messages.len() < bg_messages.len() {
-                                        let result = crate::agent::compaction::CompactionResult {
-                                            messages: compacted_messages,
-                                            observation,
-                                        };
-                                        *slot.lock().await =
-                                            Some(PendingCompaction { result, watermark });
-                                    }
-                                })
-                                .await;
-                            if timeout_result.is_err() {
-                                warn!("LCM compaction timed out after 90s, resetting in_flight");
-                            }
-                            // On-demand Bonsai: release the sidecar now that the
-                            // compaction pass is done (success or timeout), so it
-                            // stops competing with the main model for memory.
-                            if let Some(spec) = bg_sidecar.as_ref() {
-                                spec.release().await;
-                            }
-                            in_flight.store(false, Ordering::SeqCst);
-                        });
+            // A soft job may finish after the raw foreground context has
+            // crossed the hard threshold. At that point foreground inference
+            // waits for it and installs its checkpoint before doing anything
+            // else. The background job has its own 90-second timeout.
+            let mut raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
+            if raw_hard && ctx.compaction.in_flight.load(Ordering::Acquire) {
+                let wait_for_soft_job = async {
+                    while ctx.compaction.in_flight.load(Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    CompactionAction::None => {}
+                };
+                if tokio::time::timeout(COMPACTION_SOFT_DRAIN_TIMEOUT, wait_for_soft_job)
+                    .await
+                    .is_err()
+                {
+                    warn!("LCM soft compaction did not clear after its timeout");
+                    ctx.compaction.in_flight.store(false, Ordering::Release);
                 }
+            }
+            if raw_hard {
+                self.install_pending_compaction(ctx, true).await;
+                raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
+                action = {
+                    let engine = lcm_engine.lock().await;
+                    engine.check_thresholds(budget, tool_def_tokens)
+                };
+            }
+
+            let has_pending = ctx.compaction.slot.lock().await.is_some();
+            let in_flight = ctx.compaction.in_flight.load(Ordering::Acquire);
+            let must_block = raw_hard || action == CompactionAction::Blocking;
+
+            if must_block && !in_flight {
+                tracing::info!(
+                    compaction_type = "lcm_blocking",
+                    msg_count = ctx.messages.len(),
+                    conv_tokens,
+                    available,
+                    hard_limit,
+                    soft_limit,
+                    "lcm_compaction_triggered"
+                );
+                ctx.compaction.in_flight.store(true, Ordering::Release);
+                let core = ctx.core.clone();
+                let session_id = ctx.session_id.clone();
+                let messages = ctx.messages.clone();
+                // SQLite message_count is a durable, concrete-session sequence.
+                // The process-global learning counter remains telemetry only and
+                // must not order one session's working-memory checkpoints.
+                let session_turn = core
+                    .sessions
+                    .get_session(&session_id)
+                    .await
+                    .map_or(0, |session| session.message_count as u64);
+                let first_attempt = execute_lcm_compaction(
+                    core.clone(),
+                    session_id.clone(),
+                    lcm_engine.clone(),
+                    messages.clone(),
+                    session_turn,
+                    CompactionFailureMode::Deterministic,
+                    CompactionSidecarAttempt::Acquire,
+                );
+                let pending = match tokio::time::timeout(COMPACTION_RUN_TIMEOUT, first_attempt)
+                    .await
+                {
+                    Ok(pending) => pending,
+                    Err(_) => {
+                        warn!("LCM blocking compaction timed out; applying deterministic fallback");
+                        execute_lcm_compaction(
+                            core,
+                            session_id,
+                            lcm_engine.clone(),
+                            messages,
+                            session_turn,
+                            CompactionFailureMode::Deterministic,
+                            CompactionSidecarAttempt::Skip,
+                        )
+                        .await
+                    }
+                };
+                if let Some(pending) = pending {
+                    *ctx.compaction.slot.lock().await = Some(pending);
+                }
+                ctx.compaction.in_flight.store(false, Ordering::Release);
+                self.install_pending_compaction(ctx, true).await;
+            } else if action == CompactionAction::Async && !has_pending && !in_flight {
+                tracing::info!(
+                    compaction_type = "lcm_async",
+                    msg_count = ctx.messages.len(),
+                    conv_tokens,
+                    available,
+                    hard_limit,
+                    soft_limit,
+                    "lcm_compaction_triggered"
+                );
+                {
+                    let mut engine = lcm_engine.lock().await;
+                    engine.request_async_compaction();
+                }
+                let slot = ctx.compaction.slot.clone();
+                let in_flight = ctx.compaction.in_flight.clone();
+                let session_turn = ctx
+                    .core
+                    .sessions
+                    .get_session(&ctx.session_id)
+                    .await
+                    .map_or(0, |session| session.message_count as u64);
+                let task = execute_lcm_compaction(
+                    ctx.core.clone(),
+                    ctx.session_id.clone(),
+                    lcm_engine.clone(),
+                    ctx.messages.clone(),
+                    session_turn,
+                    CompactionFailureMode::PreserveContext,
+                    CompactionSidecarAttempt::Acquire,
+                );
+                in_flight.store(true, Ordering::Release);
+                tokio::spawn(async move {
+                    match tokio::time::timeout(COMPACTION_RUN_TIMEOUT, task).await {
+                        Ok(Some(pending)) => *slot.lock().await = Some(pending),
+                        Ok(None) => {}
+                        Err(_) => warn!(
+                            timeout_secs = COMPACTION_RUN_TIMEOUT.as_secs(),
+                            "LCM soft compaction timed out"
+                        ),
+                    }
+                    in_flight.store(false, Ordering::Release);
+                });
+            } else if has_pending {
+                debug!("LCM compaction deferred: checkpoint is waiting for a safe install");
             }
 
             // Auto-expand relevant summaries before the LLM call. The system,
@@ -1744,83 +1899,6 @@ impl AgentLoopShared {
                         ctx.messages.extend(appended);
                     }
                 }
-            }
-        } else {
-            let has_pending_compaction = ctx
-                .compaction
-                .slot
-                .try_lock()
-                .map(|guard| guard.is_some())
-                .unwrap_or(true);
-            if has_pending_compaction {
-                debug!("Core compaction skipped: pending checkpoint not installed yet");
-            } else if !ctx.compaction.in_flight.load(Ordering::Relaxed)
-                && ctx.core.compactor.needs_compaction(
-                    &ctx.messages,
-                    &ctx.core.token_budget,
-                    tool_def_tokens,
-                )
-            {
-                tracing::info!(
-                    compaction_type = "core_async",
-                    msg_count = ctx.messages.len(),
-                    "core_compaction_triggered"
-                );
-                let slot = ctx.compaction.slot.clone();
-                let in_flight = ctx.compaction.in_flight.clone();
-                let bg_messages = ctx.messages.clone();
-                let bg_core = ctx.core.clone();
-                let bg_session_key = ctx.session_key.clone();
-                let watermark = ctx.messages.len();
-                let bg_turn_count = ctx.turn_count;
-                in_flight.store(true, Ordering::SeqCst);
-
-                let bg_proprio = self.proprioception_config.clone();
-                tokio::spawn(async move {
-                    let timeout_result = tokio::time::timeout(Duration::from_secs(90), async {
-                        let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
-                            bg_core
-                                .compactor
-                                .compact_gradient(
-                                    &bg_messages,
-                                    &bg_core.token_budget,
-                                    0,
-                                    bg_proprio.raw_window,
-                                    bg_proprio.light_window,
-                                )
-                                .await
-                        } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
-                            let reader =
-                                crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
-                            bg_core
-                                .compactor
-                                .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
-                                .await
-                        } else {
-                            bg_core
-                                .compactor
-                                .compact(&bg_messages, &bg_core.token_budget, 0)
-                                .await
-                        };
-                        if bg_core.memory_enabled {
-                            if let Some(ref summary) = result.observation {
-                                bg_core.working_memory.update_from_compaction(
-                                    &bg_session_key,
-                                    summary,
-                                    bg_turn_count,
-                                );
-                            }
-                        }
-                        if result.messages.len() < bg_messages.len() {
-                            *slot.lock().await = Some(PendingCompaction { result, watermark });
-                        }
-                    })
-                    .await;
-                    if timeout_result.is_err() {
-                        warn!("Core compaction timed out after 90s, resetting in_flight");
-                    }
-                    in_flight.store(false, Ordering::SeqCst);
-                });
             }
         }
     }
@@ -1966,11 +2044,6 @@ impl AgentLoopShared {
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
         let prompt_total_estimate =
             TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens);
-        // Whether this turn's prompt diverged from the previous call's prefix.
-        // Captured here (inside the diagnostic block's scope is awkward because
-        // it holds the fingerprint lock) and copied to ctx.flow after the block
-        // so observe_context_ceiling can suppress tightening on re-prefill turns.
-        let mut prompt_diverged = false;
         {
             let store = counters.prompt_fingerprints.lock();
             let prompt_delta = prompt_fingerprint::compare(store.get(&ctx.session_key), &prompt_fp);
@@ -1994,7 +2067,6 @@ impl AgentLoopShared {
                     prev_msgs,
                     new_msgs,
                 } => {
-                    prompt_diverged = true;
                     // WARN (not info): the default subscriber filter is `warn`,
                     // and a prefix divergence costs ~60s/turn on local — this must
                     // be visible in the log without RUST_LOG=info. Self-suppresses
@@ -2049,12 +2121,11 @@ impl AgentLoopShared {
             if let Some(ref delta_tx) = ctx.text_delta_tx {
                 let _ = delta_tx.send(cache_marker);
                 if prefill_estimate > 0 {
-                    let _ = delta_tx.send(ControlMarker::PrefillEstimate(prefill_estimate as u64).encode());
+                    let _ = delta_tx
+                        .send(ControlMarker::PrefillEstimate(prefill_estimate as u64).encode());
                 }
             }
         }
-        ctx.flow.prefix_diverged_this_turn = prompt_diverged;
-
         // Tool-block divergence diagnostic. The message fingerprint above is
         // blind to tool schemas by design, yet chat templates render the tool
         // block at the prompt head — so a tool block that changes between turns
@@ -2395,8 +2466,7 @@ impl AgentLoopShared {
         {
             crate::agent::router::RouteResult::Continue => {
                 ctx.emit_pending_request_metrics(0);
-                ctx.flow.tool_rounds_completed =
-                    ctx.flow.tool_rounds_completed.saturating_add(1);
+                ctx.flow.tool_rounds_completed = ctx.flow.tool_rounds_completed.saturating_add(1);
                 return StepResult::Done(IterationOutcome::Continue);
             }
             crate::agent::router::RouteResult::Break(msg) => {
@@ -2535,8 +2605,7 @@ impl AgentLoopShared {
             {
                 // Delegation handled execution — continue the main loop.
                 ctx.emit_pending_request_metrics(routed_tool_calls.len() as u32);
-                ctx.flow.tool_rounds_completed =
-                    ctx.flow.tool_rounds_completed.saturating_add(1);
+                ctx.flow.tool_rounds_completed = ctx.flow.tool_rounds_completed.saturating_add(1);
                 return StepResult::Done(IterationOutcome::Continue);
             }
         }
@@ -2560,7 +2629,10 @@ impl AgentLoopShared {
         // Inline path (default, unchanged): execute tools directly.
         let tool_entries_before = ctx.turn_tool_entries.len();
         crate::agent::tool_engine::execute_tools_inline(ctx, &routed_tool_calls, &response).await;
-        let executed = ctx.turn_tool_entries.len().saturating_sub(tool_entries_before) as u32;
+        let executed = ctx
+            .turn_tool_entries
+            .len()
+            .saturating_sub(tool_entries_before) as u32;
         ctx.emit_pending_request_metrics(executed);
         ctx.flow.tool_rounds_completed = ctx.flow.tool_rounds_completed.saturating_add(1);
 
@@ -2608,7 +2680,7 @@ impl AgentLoopShared {
 //   :743   — pre-call tracing (`is_local && strict_no_tools_main`)        → `is_trio_mode_active`
 //   :820   — grounding role ternary                                       → `grounding_role`
 //   :866-868 (same as :820; documented row in RESEARCH)                    → `grounding_role`
-//   :900   — `select_tool_definitions` local branch                       → covered via TODO + pins through `local_tool_mode`
+//   :900   — `select_tool_definitions`                                    → Lean production surface
 //   :920   — trio-strip outer gate (`is_local && strict_no_tools_main`)   → `is_trio_mode_active`
 //   :942-951 — `should_strip_tools_for_trio` free fn                      → pinned in `agent_heuristics::tests`
 //   :983   — ToolGate cloud gate (`!is_local`)                            → `tool_gate_enabled_for_turn`
@@ -2695,16 +2767,12 @@ mod tests {
     #[test]
     fn test_local_proactive_grounding_keeps_cache_fast_path() {
         assert!(
-            proactive_grounding_preserves_prefix_cache(false, false),
+            proactive_grounding_preserves_prefix_cache(false),
             "cloud grounding is not governed by the local prefix-cache tradeoff"
         );
         assert!(
-            !proactive_grounding_preserves_prefix_cache(true, false),
+            !proactive_grounding_preserves_prefix_cache(true),
             "local default skips synthetic per-turn grounding to avoid msg-N cache resets"
-        );
-        assert!(
-            proactive_grounding_preserves_prefix_cache(true, true),
-            "NANOBOT_LOCAL_TAIL remains the explicit local relevance-over-cache opt-in"
         );
     }
 
@@ -2804,37 +2872,6 @@ mod tests {
         assert!(
             !thinking_cap_applied(false, ModelSizeClass::Large),
             "cloud large → no cap"
-        );
-    }
-
-    #[test]
-    fn test_is_local_tool_def_mode_dispatch_local() {
-        // Pins agent_shared.rs:900 — when `is_local=true`, tool-def selection
-        // dispatches on `local_tool_mode` (Proxy | Slim | Full). When
-        // `is_local=false`, the cloud path takes over (tested by absence: the
-        // local dispatch simply doesn't run).
-        //
-        // We pin the *shape* of the LocalToolMode enum here so that any
-        // addition/removal of a variant during Wave 1 forces a compile error
-        // in this test — exhaustive-match is a Nyquist filter.
-        use crate::config::schema::LocalToolMode;
-        let mode = LocalToolMode::default();
-        match mode {
-            LocalToolMode::Proxy
-            | LocalToolMode::Lean
-            | LocalToolMode::Slim
-            | LocalToolMode::Full => {
-                // Exhaustive match ensures any new variant trips the compiler,
-                // forcing Wave 1 to update the RuntimeMode::Local { tool_mode }
-                // constructor mapping.
-            }
-        }
-        // Sanity: default is Lean (core slim schemas + proxy meta-tool).
-        // Wave 1 `RuntimeMode::Local { tool_mode }` constructor must carry this
-        // same default through unchanged.
-        assert!(
-            matches!(LocalToolMode::default(), LocalToolMode::Lean),
-            "LocalToolMode::default() must stay Lean — Wave 1 RuntimeMode::Local tool_mode default pins on this"
         );
     }
 
@@ -3054,32 +3091,24 @@ mod cache_pressure_tests {
     // -- should_inject_heartbeat_grounding --------------------------------
 
     #[test]
-    fn heartbeat_grounding_skipped_on_local_without_tail_opt_in() {
-        // Local model without NANOBOT_LOCAL_TAIL: heartbeat grounding is a
-        // synthetic user turn that diverges the prefix cache. Must skip.
-        assert!(!should_inject_heartbeat_grounding(8, 8, 0.5, true, false));
+    fn heartbeat_grounding_skipped_on_local() {
+        assert!(!should_inject_heartbeat_grounding(8, 8, 0.5, true));
     }
 
     #[test]
-    fn heartbeat_grounding_allowed_on_local_with_tail_opt_in() {
-        assert!(should_inject_heartbeat_grounding(8, 8, 0.5, true, true));
-    }
-
-    #[test]
-    fn heartbeat_grounding_allowed_on_cloud_regardless_of_tail() {
-        assert!(should_inject_heartbeat_grounding(8, 8, 0.5, false, false));
-        assert!(should_inject_heartbeat_grounding(8, 8, 0.5, false, true));
+    fn heartbeat_grounding_allowed_on_cloud() {
+        assert!(should_inject_heartbeat_grounding(8, 8, 0.5, false));
     }
 
     #[test]
     fn heartbeat_grounding_respects_cadence() {
-        assert!(!should_inject_heartbeat_grounding(4, 8, 0.5, false, false));
+        assert!(!should_inject_heartbeat_grounding(4, 8, 0.5, false));
     }
 
     #[test]
     fn heartbeat_grounding_respects_pressure_ceiling() {
         // Above 0.85 pressure, should_ground already returns false.
-        assert!(!should_inject_heartbeat_grounding(8, 8, 0.9, false, false));
+        assert!(!should_inject_heartbeat_grounding(8, 8, 0.9, false));
     }
 
     // -- should_allow_checkpoint ------------------------------------------

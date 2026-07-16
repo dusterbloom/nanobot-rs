@@ -50,15 +50,7 @@ const WARN_COLOR: Color = Color::Rgb(0xC8, 0xA1, 0x3A);
 const ERR_COLOR: Color = Color::Rgb(0xE0, 0x66, 0x66);
 
 /// Number of rotatable color schemes (Ctrl+P cycles through them).
-/// Hue-wheel schemes: index 0 is monochrome, 1..32 rotate the wheel.
-const HUE_THEMES: u8 = 32;
-/// The "paper" editorial scheme: warm print greys plus a centered text
-/// measure (see [`App::text_column`]) — after the wheel, before the wrap.
-pub(crate) const PAPER_THEME: u8 = HUE_THEMES;
-/// Total schemes cycled by Ctrl+P.
-const THEME_COUNT: u8 = HUE_THEMES + 1;
-/// Paper-theme text measure (box width; the input's inner text runs ~4 less).
-const PAPER_MEASURE: u16 = 76;
+const THEME_COUNT: u8 = 32;
 
 /// Commands offered by the `/` autocomplete popup (name, one-line help).
 const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -84,7 +76,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/long", "toggle long-output mode"),
     ("/ctx", "context management"),
     ("/lane", "switch policy lane"),
-    ("/lcm", "lossless context management"),
+    ("/lcm", "lossless context statistics (/lcm stats)"),
     ("/trio", "trio routing status"),
     ("/provenance", "tool provenance log"),
     ("/cluster", "cluster peers"),
@@ -125,19 +117,9 @@ impl Palette {
                 accent2: Color::Rgb(0x8E, 0x8E, 0x8E),
             };
         }
-        // Paper: warm print greys with a terracotta rubrication accent. The
-        // layout half of this scheme (centered measure) lives in `text_column`.
-        if i == PAPER_THEME {
-            return Palette {
-                accent: Color::Rgb(0xB8, 0x5C, 0x42),
-                shine: Color::Rgb(0xF2, 0xEC, 0xDF),
-                glow: Color::Rgb(0xCB, 0xC2, 0xAF),
-                accent2: Color::Rgb(0x8C, 0x82, 0x6D),
-            };
-        }
         // Walk the hue wheel for the accent; accent2 is the +160° companion that
         // rotates in lockstep so the pairing always holds.
-        let hue = (187.0 + i as f32 * (360.0 / HUE_THEMES as f32)) % 360.0;
+        let hue = (187.0 + i as f32 * (360.0 / THEME_COUNT as f32)) % 360.0;
         Palette {
             accent: hsl_to_rgb(hue, 0.66, 0.46),
             shine: hsl_to_rgb(hue, 0.90, 0.95),
@@ -1958,32 +1940,9 @@ impl App {
 
     // --- drawing ------------------------------------------------------------
 
-    /// Print-style measure for the paper theme: cap the text column at
-    /// [`PAPER_MEASURE`] cells. Other themes (and narrow terminals) use the
-    /// full width.
-    fn text_width(&self, full: u16) -> u16 {
-        if self.theme_index == PAPER_THEME {
-            full.min(PAPER_MEASURE)
-        } else {
-            full
-        }
-    }
-
-    /// The rect the transcript and input render into: full-width normally,
-    /// a centered [`PAPER_MEASURE`]-cell column on the paper theme. Header
-    /// and footer stay full-width, like running heads in print.
-    fn text_column(&self, r: Rect) -> Rect {
-        let w = self.text_width(r.width);
-        Rect {
-            x: r.x + (r.width - w) / 2,
-            width: w,
-            ..r
-        }
-    }
-
     pub(crate) fn draw(&mut self, f: &mut Frame, footer: &Footer) {
         let area = f.area();
-        let input_h = self.input_height(self.text_width(area.width));
+        let input_h = self.input_height(area.width);
         let chunks = Layout::vertical([
             Constraint::Length(2), // header: status + rule
             Constraint::Min(1),    // transcript
@@ -1998,7 +1957,7 @@ impl App {
             header,
         );
 
-        let transcript = self.text_column(chunks[1]);
+        let transcript = chunks[1];
         if self.transcript.is_empty() {
             render_intro(f, transcript);
         } else {
@@ -2029,8 +1988,7 @@ impl App {
         // Re-apply each frame so the cursor tracks the active palette (Ctrl+P)
         // and the blink phase (toggled by the idle loop).
         self.input.set_cursor_style(cursor_style(self.cursor_on));
-        let input_area = self.text_column(chunks[2]);
-        f.render_widget(&self.input, input_area);
+        f.render_widget(&self.input, chunks[2]);
         f.render_widget(
             Paragraph::new(footer_line(
                 footer,
@@ -2043,7 +2001,7 @@ impl App {
         );
 
         if self.slash_active() {
-            render_slash_popup(f, input_area, &self.slash_matches(), self.slash_sel);
+            render_slash_popup(f, chunks[2], &self.slash_matches(), self.slash_sel);
         }
         if self.show_help {
             render_help(f, area);
@@ -3664,50 +3622,6 @@ mod tests {
     }
 
     #[test]
-    fn paper_theme_is_warm_and_wraps_into_the_cycle() {
-        // Paper is its own scheme, not a wheel stop …
-        assert_ne!(
-            Palette::from_index(PAPER_THEME).accent,
-            Palette::from_index(0).accent
-        );
-        // … and Ctrl+P past it returns to the monochrome default.
-        assert_eq!(
-            Palette::from_index(THEME_COUNT).accent,
-            Palette::from_index(0).accent
-        );
-    }
-
-    #[test]
-    fn paper_theme_centers_the_text_column() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let mut app = App::new();
-        app.set_theme_index(PAPER_THEME);
-        app.begin_turn("hello world");
-        app.on_delta("hi there");
-        app.finish_turn(String::new());
-
-        let mut term = Terminal::new(TestBackend::new(120, 16)).unwrap();
-        term.draw(|f| app.draw(f, &test_footer())).unwrap();
-        let text = buffer_text(term.backend().buffer());
-
-        let line = text
-            .lines()
-            .find(|l| l.contains("hello world"))
-            .expect("user turn rendered");
-        let col = line.find("hello").unwrap();
-        // 120-col terminal, 76-cell measure → a ≥22-cell gutter on each side.
-        assert!(
-            col >= 22,
-            "paper theme should center the text column, got col {col}:\n{text}"
-        );
-
-        // Restore the render-global palette for sibling tests.
-        app.set_theme_index(0);
-    }
-
-    #[test]
     fn palette_rotation_changes_the_accent() {
         // Distinct schemes must actually look different — the point of rotation.
         assert_ne!(Palette::from_index(0).accent, Palette::from_index(8).accent);
@@ -4864,11 +4778,35 @@ mod tests {
         // ponytail: list duplicated from dispatch() by hand; a data-driven
         // command registry would make this parity structural.
         const REQUIRED: &[&str] = &[
-            "/model", "/local", "/think", "/nothink", "/status", "/context",
-            "/memory", "/sessions", "/clear", "/skill", "/learn", "/agents",
-            "/audit", "/verify", "/replay", "/kill", "/stop", "/long", "/ctx",
-            "/provenance", "/lane", "/lcm", "/trio", "/email", "/whatsapp",
-            "/telegram", "/cluster", "/restart", "/help",
+            "/model",
+            "/local",
+            "/think",
+            "/nothink",
+            "/status",
+            "/context",
+            "/memory",
+            "/sessions",
+            "/clear",
+            "/skill",
+            "/learn",
+            "/agents",
+            "/audit",
+            "/verify",
+            "/replay",
+            "/kill",
+            "/stop",
+            "/long",
+            "/ctx",
+            "/provenance",
+            "/lane",
+            "/lcm",
+            "/trio",
+            "/email",
+            "/whatsapp",
+            "/telegram",
+            "/cluster",
+            "/restart",
+            "/help",
         ];
         let names: Vec<&str> = SLASH_COMMANDS.iter().map(|(n, _)| *n).collect();
         for cmd in REQUIRED {

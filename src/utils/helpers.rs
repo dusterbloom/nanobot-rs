@@ -70,11 +70,6 @@ pub fn get_workspace_path(workspace: Option<&str>) -> PathBuf {
     ensure_dir(path)
 }
 
-/// Get the sessions storage directory.
-pub fn get_sessions_path() -> PathBuf {
-    ensure_dir(get_data_path().join("sessions"))
-}
-
 /// Get the memory directory within the workspace.
 pub fn get_memory_path(workspace: Option<&Path>) -> PathBuf {
     let ws = match workspace {

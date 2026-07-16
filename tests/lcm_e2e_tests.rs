@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use nanobot::agent::compaction::ContextCompactor;
-use nanobot::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
+use nanobot::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
 use nanobot::agent::token_budget::TokenBudget;
 use nanobot::agent::turn::Turn;
 use nanobot::providers::base::{LLMProvider, LLMResponse};
@@ -63,7 +63,6 @@ impl LLMProvider for MockSummarizer {
 #[test]
 fn test_clear_resets_lcm_engine() {
     let config = LcmConfig {
-        enabled: true,
         tau_soft: 0.5,
         tau_hard: 0.85,
         deterministic_target: 512,
@@ -82,43 +81,16 @@ fn test_clear_resets_lcm_engine() {
     let fresh_engine = LcmEngine::new(config);
     assert_eq!(fresh_engine.store_len(), 0);
     assert_eq!(fresh_engine.active_len(), 0);
-    assert!(fresh_engine.dag_ref().is_empty());
+    assert!(fresh_engine.dag().is_empty());
 }
 
 // ─────────────────────────────────────────────────────────────
 // Test 2: Compaction window - should summarize AFTER last summary
 // ─────────────────────────────────────────────────────────────
 
-#[test]
-fn test_find_oldest_raw_block_returns_first_block() {
-    let mut engine = LcmEngine::new(LcmConfig::default());
-    // Realistic-sized messages: token-based protect (default ~1k tokens) only
-    // yields a compact block once the conversation exceeds the protect budget,
-    // so use ~60-token messages (not 3-token ones).
-    let body = "the quick brown fox jumps over the lazy dog while the model prefills tokens "
-        .repeat(5);
-
-    ingest(&mut engine, 1, "system", "System");
-    for i in 0..10 {
-        ingest(&mut engine, 2 + 2 * i, "user", &format!("User {}: {}", i, body));
-        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Assistant {}: {}", i, body));
-    }
-
-    let block = engine.find_oldest_raw_block();
-    assert!(block.is_some());
-
-    let (start, end) = block.unwrap();
-    assert!(start >= 1, "Block should start after system message");
-    assert!(
-        end <= engine.active_len() - 4,
-        "Block should leave the recent messages protected"
-    );
-}
-
 #[tokio::test]
 async fn test_compaction_creates_summary_node() {
     let mut engine = LcmEngine::new(LcmConfig {
-        enabled: true,
         tau_soft: 0.3,
         tau_hard: 0.6,
         deterministic_target: 64,
@@ -157,19 +129,25 @@ async fn test_compaction_creates_summary_node() {
         4096,
     );
 
-    let result = engine.compact(&compactor, &budget, 100).await;
+    let result = engine
+        .compact(
+            Some(&compactor),
+            &budget,
+            100,
+            CompactionFailureMode::Deterministic,
+        )
+        .await;
     assert!(result.is_some());
 
     let summary_turn = result.unwrap();
     assert!(matches!(summary_turn, Turn::Summary { .. }));
 
-    assert_eq!(engine.dag_ref().len(), 1);
+    assert_eq!(engine.dag().len(), 1);
 }
 
 #[tokio::test]
 async fn test_second_compaction_summarizes_after_first_summary() {
     let mut engine = LcmEngine::new(LcmConfig {
-        enabled: true,
         tau_soft: 0.2,
         tau_hard: 0.5,
         deterministic_target: 64,
@@ -178,11 +156,21 @@ async fn test_second_compaction_summarizes_after_first_summary() {
     ingest(&mut engine, 1, "system", "System");
     // Realistic-sized messages so the conversation exceeds the protect budget
     // and the block clears the MIN_COMPACTION_TOKENS floor.
-    let body = "the quick brown fox jumps over the lazy dog while the model prefills tokens "
-        .repeat(5);
+    let body =
+        "the quick brown fox jumps over the lazy dog while the model prefills tokens ".repeat(5);
     for i in 0..20 {
-        ingest(&mut engine, 2 + 2 * i, "user", &format!("Message {}: {}", i, body));
-        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Response {}: {}", i, body));
+        ingest(
+            &mut engine,
+            2 + 2 * i,
+            "user",
+            &format!("Message {}: {}", i, body),
+        );
+        ingest(
+            &mut engine,
+            3 + 2 * i,
+            "assistant",
+            &format!("Response {}: {}", i, body),
+        );
     }
 
     let budget = TokenBudget::new(4096, 2048);
@@ -192,7 +180,14 @@ async fn test_second_compaction_summarizes_after_first_summary() {
         4096,
     );
 
-    let r1 = engine.compact(&compactor, &budget, 100).await;
+    let r1 = engine
+        .compact(
+            Some(&compactor),
+            &budget,
+            100,
+            CompactionFailureMode::Deterministic,
+        )
+        .await;
     assert!(r1.is_some(), "First compaction should succeed");
 
     let first_summary = r1.unwrap();
@@ -201,7 +196,14 @@ async fn test_second_compaction_summarizes_after_first_summary() {
         _ => panic!("Expected Summary"),
     };
 
-    let r2 = engine.compact(&compactor, &budget, 100).await;
+    let r2 = engine
+        .compact(
+            Some(&compactor),
+            &budget,
+            100,
+            CompactionFailureMode::Deterministic,
+        )
+        .await;
     if r2.is_some() {
         let second_summary = r2.unwrap();
         let second_source_ids = match &second_summary {
@@ -222,9 +224,9 @@ async fn test_second_compaction_summarizes_after_first_summary() {
             );
         }
         assert!(
-            engine.dag_ref().len() <= 2,
+            engine.dag().len() <= 2,
             "summary mass should stay bounded (<=2 nodes after merge), got {}",
-            engine.dag_ref().len()
+            engine.dag().len()
         );
     }
 }
@@ -323,7 +325,6 @@ fn test_filter_refusal_from_summary() {
 #[tokio::test]
 async fn test_lossless_retrieval_after_multiple_compactions() {
     let mut engine = LcmEngine::new(LcmConfig {
-        enabled: true,
         tau_soft: 0.2,
         tau_hard: 0.5,
         deterministic_target: 64,
@@ -333,8 +334,18 @@ async fn test_lossless_retrieval_after_multiple_compactions() {
 
     let total_messages = 30;
     for i in 0..total_messages {
-        ingest(&mut engine, 2 + 2 * i, "user", &format!("Original message {}", i));
-        ingest(&mut engine, 3 + 2 * i, "assistant", &format!("Original response {}", i));
+        ingest(
+            &mut engine,
+            2 + 2 * i,
+            "user",
+            &format!("Original message {}", i),
+        );
+        ingest(
+            &mut engine,
+            3 + 2 * i,
+            "assistant",
+            &format!("Original response {}", i),
+        );
     }
 
     let store_size = engine.store_len();
@@ -348,7 +359,14 @@ async fn test_lossless_retrieval_after_multiple_compactions() {
 
     // Multiple compaction rounds
     for _ in 0..3 {
-        let _ = engine.compact(&compactor, &budget, 100).await;
+        let _ = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                100,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
     }
 
     // Store should be unchanged
@@ -359,8 +377,8 @@ async fn test_lossless_retrieval_after_multiple_compactions() {
     );
 
     // All summary nodes should have retrievable sources
-    for i in 0..engine.dag_ref().len() {
-        let node = engine.dag_ref().get(i).unwrap();
+    for i in 0..engine.dag().len() {
+        let node = engine.dag().get(i).unwrap();
         let expanded = engine.expand(&node.source_ids);
         assert_eq!(
             expanded.len(),
@@ -387,7 +405,6 @@ async fn test_lossless_retrieval_after_multiple_compactions() {
 #[test]
 fn test_check_thresholds_below_soft() {
     let mut engine = LcmEngine::new(LcmConfig {
-        enabled: true,
         tau_soft: 0.5,
         tau_hard: 0.85,
         deterministic_target: 512,
@@ -406,7 +423,6 @@ fn test_check_thresholds_below_soft() {
 #[test]
 fn test_check_thresholds_above_soft() {
     let mut engine = LcmEngine::new(LcmConfig {
-        enabled: true,
         tau_soft: 0.3,
         tau_hard: 0.8,
         deterministic_target: 512,
@@ -414,7 +430,12 @@ fn test_check_thresholds_above_soft() {
 
     ingest(&mut engine, 1, "system", "System");
     for i in 0..20 {
-        ingest(&mut engine, 2 + i, "user", &format!("A long message with content {}", i));
+        ingest(
+            &mut engine,
+            2 + i,
+            "user",
+            &format!("A long message with content {}", i),
+        );
     }
 
     let budget = TokenBudget::new(1024, 512);
@@ -451,10 +472,14 @@ fn test_rebuild_from_db_nodes_preserves_summaries() {
     let engine = LcmEngine::rebuild_from_db_nodes(&raw_messages, &nodes, LcmConfig::default());
 
     // Store should have all raw messages (not summaries)
-    assert_eq!(engine.store_len(), 4, "Store should have all 4 raw messages");
+    assert_eq!(
+        engine.store_len(),
+        4,
+        "Store should have all 4 raw messages"
+    );
 
     // DAG should have the summary
-    assert_eq!(engine.dag_ref().len(), 1, "DAG should have 1 summary node");
+    assert_eq!(engine.dag().len(), 1, "DAG should have 1 summary node");
 
     // Active context should have summary + the unsummarized raw messages
     let active = engine.active_entries();

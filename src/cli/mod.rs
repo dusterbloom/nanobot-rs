@@ -162,6 +162,16 @@ mod tests {
         // Verify content of one file
         let agents_content = std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
         assert!(agents_content.contains("Agent Instructions"));
+        assert!(agents_content.contains("sessions.db"));
+        assert!(agents_content.contains("LCM"));
+
+        let tools_content = std::fs::read_to_string(workspace.join("TOOLS.md")).unwrap();
+        assert!(tools_content.contains("independent tools in parallel"));
+
+        let memory_content =
+            std::fs::read_to_string(workspace.join("memory").join("MEMORY.md")).unwrap();
+        assert!(memory_content.contains("curated cross-session facts"));
+        assert!(memory_content.contains("sessions.db"));
     }
 
     // -- inference engine detection tests --
@@ -286,7 +296,6 @@ mod tests {
             Some("Qwen3-8B-Q4_K_M.gguf"),
             None,
             None,
-            None,
             true,
         );
         let core = handle.swappable();
@@ -309,13 +318,45 @@ mod tests {
     }
 
     #[test]
+    fn managed_compaction_sidecar_overrides_legacy_memory_provider() {
+        let mut cfg = Config::default();
+        cfg.lcm.compaction_port = Some(28009);
+        cfg.lcm.compaction_model_dir = Some("/models/managed-compactor".to_string());
+        cfg.memory.model = "legacy-memory-model".to_string();
+        cfg.memory.provider = Some(crate::config::schema::ProviderConfig {
+            api_key: "legacy-key".to_string(),
+            api_base: Some("https://legacy-memory.example/v1".to_string()),
+        });
+
+        let handle = build_core_handle(
+            &cfg,
+            "18080",
+            Some("Qwen3-8B-Q4_K_M.gguf"),
+            None,
+            None,
+            true,
+        );
+        let core = handle.swappable();
+
+        assert!(core.compaction_manager.is_some());
+        assert_eq!(
+            core.memory_provider.get_api_base(),
+            Some("http://127.0.0.1:28009/v1")
+        );
+        assert_eq!(
+            core.memory_provider.get_default_model(),
+            "managed-compactor"
+        );
+    }
+
+    #[test]
     fn test_higgs_active_uses_real_model_identity_for_core() {
         let mut cfg = Config::default();
         cfg.agents.defaults.local_backend = "higgs".to_string();
         cfg.agents.defaults.local_model = "usermma/VibeThinker-3B-mlx-8Bit".to_string();
         cfg.agents.defaults.lms_main_model = "active".to_string();
 
-        let handle = build_core_handle(&cfg, "18080", Some("active"), None, None, None, true);
+        let handle = build_core_handle(&cfg, "18080", Some("active"), None, None, true);
         let core = handle.swappable();
 
         assert_eq!(
@@ -340,7 +381,7 @@ mod tests {
         cfg.agents.defaults.local_model = "usermma/VibeThinker-3B-mlx-8Bit".to_string();
         cfg.agents.defaults.lms_main_model = "active".to_string();
 
-        let handle = build_core_handle(&cfg, "18080", None, None, None, None, true);
+        let handle = build_core_handle(&cfg, "18080", None, None, None, true);
         let core = handle.swappable();
 
         assert_eq!(
@@ -535,11 +576,11 @@ pub(crate) fn cmd_onboard() {
 
 pub(crate) fn create_workspace_templates(workspace: &Path) {
     let templates: Vec<(&str, &str)> = vec![
-        ("AGENTS.md", "# Agent Instructions\n\nYou are a helpful AI assistant. Be concise, accurate, and friendly.\n\n## Guidelines\n\n- Always explain what you're doing before taking actions\n- Ask for clarification when the request is ambiguous\n- Use tools to help accomplish tasks\n- Remember important information in your memory files\n"),
+        ("AGENTS.md", "# Agent Instructions\n\nYou are a helpful AI assistant. Be concise, accurate, and friendly.\n\n## Guidelines\n\n- Always explain what you're doing before taking actions\n- Ask for clarification when the request is ambiguous\n- Use tools to help accomplish tasks\n- Raw session history lives in ~/.nanobot/sessions.db, and LCM maintains session-scoped working summaries there\n- Store only curated cross-session facts in workspace/memory/MEMORY.md\n"),
         ("SOUL.md", "# Soul\n\nI am nanobot, a lightweight AI assistant.\n\n## Personality\n\n- Helpful and friendly\n- Concise and to the point\n- Curious and eager to learn\n\n## Values\n\n- Accuracy over speed\n- User privacy and safety\n- Transparency in actions\n"),
         ("USER.md", "# User\n\nInformation about the user goes here.\n\n## Preferences\n\n- Communication style: (casual/formal)\n- Timezone: (your timezone)\n- Language: (your preferred language)\n"),
-        ("TOOLS.md", "# Tool Usage\n\nGuidelines for using tools effectively.\n\n## Principles\n\n- Use one tool at a time and verify results before proceeding\n- Prefer read operations before write operations\n- Always confirm destructive actions with the user\n- Check tool output for errors before continuing\n"),
-        ("IDENTITY.md", "# Identity\n\nYou are nanobot, a personal AI assistant.\n\n## Core Traits\n\n- You run locally on the user's hardware\n- You have access to the filesystem, shell, and web\n- You maintain memory across sessions via memory files\n- You can spawn subagents for parallel work\n"),
+        ("TOOLS.md", "# Tool Usage\n\nGuidelines for using tools effectively.\n\n## Principles\n\n- Run independent tools in parallel; keep dependent tool calls ordered\n- Prefer read operations before write operations\n- Always confirm destructive actions with the user\n- Check tool output for errors before continuing\n"),
+        ("IDENTITY.md", "# Identity\n\nYou are nanobot, a personal AI assistant.\n\n## Core Traits\n\n- You run locally on the user's hardware\n- You have access to the filesystem, shell, and web\n- SQLite stores raw session history, while LCM maintains session-scoped working summaries\n- workspace/memory/MEMORY.md contains curated cross-session facts only\n- You can spawn subagents for parallel work\n"),
     ];
 
     for (filename, content) in &templates {
@@ -556,7 +597,7 @@ pub(crate) fn create_workspace_templates(workspace: &Path) {
     if !memory_file.exists() {
         std::fs::write(
             &memory_file,
-            "# Long-term Memory\n\nThis file stores important information that should persist across sessions.\n",
+            "# Curated Cross-session Memory\n\nStore only durable, curated cross-session facts here. Raw messages and LCM working summaries live in ~/.nanobot/sessions.db; do not copy session transcripts into this file.\n",
         )
         .ok();
         println!("  Created memory/MEMORY.md");
@@ -600,7 +641,7 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
 
     let core_handle = {
         let is_local = !config.agents.defaults.local_api_base.is_empty();
-        build_core_handle(&config, "8080", None, None, None, None, is_local)
+        build_core_handle(&config, "8080", None, None, None, is_local)
     };
 
     // Build setup closure that wires MLX provider into the agent loop.
@@ -614,9 +655,7 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
 /// crw-server). Detached on purpose: SearXNG setup can poll Docker Desktop for
 /// up to ~65s, and web tools self-heal mid-session (`trigger_searxng_heal`) if
 /// these come up later — first paint must never wait on them.
-pub(crate) fn spawn_web_service_autostart(
-    config: &Config,
-) -> Option<tokio::task::JoinHandle<()>> {
+pub(crate) fn spawn_web_service_autostart(config: &Config) -> Option<tokio::task::JoinHandle<()>> {
     let search_url = (config.tools.web.search.provider == "searxng"
         && config.tools.web.search.auto_start)
         .then(|| config.tools.web.search.searxng_url.clone());
@@ -681,25 +720,14 @@ pub(crate) async fn run_gateway_async(
         cron_arc.clone(),
         crate::cron::executor::ExecutorHooks {
             inbound_tx: Some(inbound_tx.clone()),
-            reflect: Some(build_cron_reflect_hook(core_handle.clone(), config.clone())),
+            reflect: Some(build_cron_reflect_hook(core_handle.clone())),
         },
     );
 
     let health_registry = Arc::new(crate::heartbeat::health::build_registry(&config));
 
-    let mut lcm_config = config.lcm.clone();
-    // Inject the local API key so the LCM compactor can authenticate with oMLX.
-    lcm_config.api_key = config.agents.defaults.local_api_key.clone();
-    // migrated from swappable().is_local — phase 09-03
-    if core_handle.swappable().mode().is_local() && !lcm_config.is_enabled() {
-        tracing::info!("Auto-enabling LCM for local mode");
-        lcm_config.enabled = Some(true);
-    }
-    let compaction_sidecar = crate::higgs::CompactionSidecarSpec::from_config(&config);
-    if let Some(spec) = compaction_sidecar.as_ref() {
-        spec.bind_lcm_endpoint_model(&mut lcm_config);
-    }
-
+    let lcm_config = config.lcm.clone();
+    let shutdown_core_handle = core_handle.clone();
     let mut agent_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
@@ -714,8 +742,6 @@ pub(crate) async fn run_gateway_async(
         lcm_config,
         Some(health_registry.clone()),
     );
-    agent_loop.set_compaction_sidecar(compaction_sidecar);
-
     // Apply optional setup (e.g. MLX provider wiring).
     if let Some(f) = setup_fn {
         f(&mut agent_loop);
@@ -846,6 +872,12 @@ pub(crate) async fn run_gateway_async(
     heartbeat.stop().await;
     channel_manager.stop_all().await;
 
+    // Join owned sidecar cleanup before the runtime exits. The manager tracks
+    // process ownership, so an externally started Higgs server is never stopped.
+    if let Some(manager) = shutdown_core_handle.swappable().compaction_manager.clone() {
+        manager.shutdown_owned().await;
+    }
+
     // Safety net: kill any managed child processes whose Drop may not
     // have fired (e.g. Arc still held elsewhere).
     crate::agent::pid_file::cleanup_stale_pids();
@@ -855,37 +887,38 @@ pub(crate) async fn run_gateway_async(
 /// Build the cron executor's `reflect` hook from the live core handle, so
 /// `/model` and `/local` swaps are honored at fire time. Memory disabled →
 /// silent skip. Threshold 0: distill whatever accumulated since the last run.
-fn build_cron_reflect_hook(
-    core_handle: SharedCoreHandle,
-    config: crate::config::schema::Config,
-) -> crate::cron::executor::ReflectFn {
+fn build_cron_reflect_hook(core_handle: SharedCoreHandle) -> crate::cron::executor::ReflectFn {
     Arc::new(move || {
         let core = core_handle.swappable();
-        // Build the sidecar spec in the sync closure body (borrows config here,
-        // where the borrow can't escape), then move it into the async block.
-        let sidecar = crate::higgs::CompactionSidecarSpec::from_config(&config);
         Box::pin(async move {
             if !core.memory_enabled {
                 tracing::debug!("Cron reflect: memory disabled — skipped");
                 return;
             }
+            if !crate::agent::reflector::Reflector::should_reflect_sessions(&core.sessions, 0).await
+            {
+                return;
+            }
+            let Some(manager) = core.compaction_manager.as_ref() else {
+                tracing::warn!("Cron reflect skipped: no managed compaction sidecar");
+                return;
+            };
+            let lease = match manager.acquire().await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    tracing::warn!(%error, "Cron reflect: compaction sidecar unavailable");
+                    return;
+                }
+            };
             let reflector = crate::agent::reflector::Reflector::new(
                 core.memory_provider.clone(),
-                core.memory_model.clone(),
+                lease.served_model().to_string(),
                 &core.workspace,
                 0,
+                core.sessions.clone(),
             );
-            // On-demand Bonsai: bring the sidecar up for this memory op and
-            // release it after (no-op when always-on or no sidecar).
-            if let Some(spec) = sidecar.as_ref() {
-                if let Err(e) = spec.ensure_up().await {
-                    tracing::warn!("Cron reflect: sidecar unavailable: {}", e);
-                }
-            }
             let result = reflector.reflect().await;
-            if let Some(spec) = sidecar.as_ref() {
-                spec.release().await;
-            }
+            lease.release().await;
             match result {
                 Ok(()) => tracing::info!("Cron reflect: memory distillation complete"),
                 Err(e) => tracing::warn!("Cron reflect failed: {}", e),
@@ -909,7 +942,7 @@ pub(crate) fn cmd_whatsapp() {
     println!("  Scan the QR code when it appears");
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None, None));
 }
@@ -970,7 +1003,7 @@ pub(crate) fn cmd_telegram(token_arg: Option<String>) {
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None, None));
 }
@@ -1088,7 +1121,7 @@ pub(crate) fn cmd_email(
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None, None));
 }

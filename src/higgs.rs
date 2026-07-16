@@ -1,16 +1,14 @@
 //! Higgs inference server sidecar management.
 //!
-//! Higgs is a pure-Rust MLX inference server for Apple Silicon. When
-//! `localBackend == "higgs"`, nanobot auto-starts Higgs as a detached
-//! background daemon and manages its lifecycle via PID file.
-//!
-//! Clean nanobot exits stop the managed Higgs PID. If nanobot dies before
-//! cleanup, subsequent `nanobot agent -l` invocations detect the running
-//! instance and reuse or replace it through the PID file.
+//! Higgs is a pure-Rust MLX inference server for Apple Silicon. Endpoint
+//! discovery may reuse an existing Higgs process, while autonomous spawning is
+//! allowed only by `localAutostart: "higgs"`. The foreground model and the
+//! leased LCM compaction sidecar have independent ports and PID files.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, Weak};
 
 /// Find the `higgs` binary on the system.
 ///
@@ -187,8 +185,8 @@ pub(crate) async fn server_start_role(
         let _ = fs::create_dir_all(parent);
     }
 
-    let log_file =
-        fs::File::create(log_path_for(role)).map_err(|e| format!("failed to create higgs log: {e}"))?;
+    let log_file = fs::File::create(log_path_for(role))
+        .map_err(|e| format!("failed to create higgs log: {e}"))?;
     let log_err = log_file
         .try_clone()
         .map_err(|e| format!("failed to clone log handle: {e}"))?;
@@ -309,7 +307,11 @@ pub(crate) fn server_stop_role(role: &str) -> Result<(), String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while pid_is_alive(pid) {
         if std::time::Instant::now() >= deadline {
-            tracing::warn!(pid, role, "higgs still running after SIGTERM, sending SIGKILL");
+            tracing::warn!(
+                pid,
+                role,
+                "higgs still running after SIGTERM, sending SIGKILL"
+            );
             platform::send_signal(pid, libc::SIGKILL);
             break;
         }
@@ -348,9 +350,15 @@ fn find_existing_higgs_process() -> Option<u32> {
 async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
     let url = format!("http://127.0.0.1:{port}/health");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
 
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = reqwest::get(&url).await {
+        if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
                 return true;
             }
@@ -361,207 +369,458 @@ async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
     false
 }
 
-/// Lifecycle spec for the compaction Higgs sidecar.
-///
-/// In always-on mode the sidecar is started once at REPL startup and kept
-/// resident. In on-demand mode (the default) it is spawned just before a
-/// compaction pass and stopped right after, so the lightweight compaction
-/// model never competes with the main model for unified memory between
-/// compactions.
-///
-/// On-demand uses a reference-counted LEASE so concurrent gateway sessions
-/// compacting at the same time can't stop the sidecar out from under each
-/// other: `ensure_up` takes a lease, `release` drops one, and the sidecar is
-/// only stopped when the last lease is dropped. `ensure_up` is idempotent (a
-/// running sidecar is a no-op), and `release`/`ensure_up` are no-ops in
-/// always-on mode. Always held behind an `Arc` (one per AgentLoop).
-pub(crate) struct CompactionSidecarSpec {
-    pub bin: PathBuf,
-    pub port: u16,
-    pub dir: String,
-    pub model: String,
-    pub on_demand: bool,
+const COMPACTION_MODEL_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const COMPACTION_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(5);
+const COMPACTION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CompactionSidecarSpec {
+    port: u16,
+    dir: String,
+    context_size: usize,
+    allow_spawn: bool,
 }
 
-/// Process-global outstanding leases on the compaction sidecar. Global (not
-/// per-`CompactionSidecarSpec`) because cron reflection, REPL `/learn`, exit
-/// reflection, and the LCM compaction task each construct their own spec from
-/// config — independent per-spec counters couldn't coordinate and one could
-/// `release()` the sidecar while another is mid-summarize. There is only one
-/// compaction sidecar (role `"compaction"`) per process, so one shared counter
-/// is correct. The sidecar is stopped only when the LAST lease drops.
-static COMPACTION_SIDE_LEASES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+#[derive(Debug)]
+struct CompactionSidecarState {
+    active_leases: usize,
+    active_spec: Option<CompactionSidecarSpec>,
+    served_model: Option<String>,
+    owns_process: bool,
+    consecutive_failures: u32,
+    retry_after: Option<std::time::Instant>,
+}
 
-/// Serializes sidecar lifecycle transitions (start, stop). Without it, a
-/// release could CAS the lease count 1→0 and stop the sidecar in the window
-/// between a concurrent ensure_up's health check and its lease increment.
-/// Held briefly when the sidecar is already up; only the (rare) cold spawn
-/// holds it for the load duration.
-static COMPACTION_LIFECYCLE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+fn compaction_sidecar_state() -> Arc<tokio::sync::Mutex<CompactionSidecarState>> {
+    Arc::new(tokio::sync::Mutex::new(CompactionSidecarState {
+        active_leases: 0,
+        active_spec: None,
+        served_model: None,
+        owns_process: false,
+        consecutive_failures: 0,
+        retry_after: None,
+    }))
+}
 
-impl std::fmt::Debug for CompactionSidecarSpec {
+fn compaction_manager_registry(
+) -> &'static std::sync::Mutex<HashMap<CompactionSidecarSpec, Weak<CompactionSidecarManager>>> {
+    static REGISTRY: OnceLock<
+        std::sync::Mutex<HashMap<CompactionSidecarSpec, Weak<CompactionSidecarManager>>>,
+    > = OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The single owner of the on-demand compaction Higgs process.
+///
+/// One `Arc` is stored in the swappable agent core and shared by LCM, cron
+/// reflection, `/learn`, and exit reflection. A caller can only release the
+/// process by owning a [`CompactionLease`] returned from a successful acquire;
+/// failed acquisitions therefore cannot steal another caller's lease.
+pub(crate) struct CompactionSidecarManager {
+    bin: PathBuf,
+    spec: CompactionSidecarSpec,
+    model_hint: String,
+    role: String,
+    state: Arc<tokio::sync::Mutex<CompactionSidecarState>>,
+    stop_role: fn(&str) -> Result<(), String>,
+}
+
+/// Cancellation guard for the interval between deciding to acquire and
+/// returning a lease. A caller timeout can otherwise drop `acquire()` after
+/// Higgs has spawned but before lease ownership exists, leaving the model
+/// resident forever and bypassing health backoff.
+struct CompactionAcquisitionGuard {
+    state: Arc<tokio::sync::Mutex<CompactionSidecarState>>,
+    role: String,
+    stop_role: fn(&str) -> Result<(), String>,
+    armed: bool,
+    stop_process: bool,
+}
+
+impl CompactionAcquisitionGuard {
+    fn new(manager: &CompactionSidecarManager) -> Self {
+        Self {
+            state: manager.state.clone(),
+            role: manager.role.clone(),
+            stop_role: manager.stop_role,
+            armed: false,
+            stop_process: false,
+        }
+    }
+
+    fn arm(&mut self, stop_process: bool) {
+        self.armed = true;
+        self.stop_process = stop_process;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CompactionAcquisitionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let state = self.state.clone();
+        let cleaned_immediately = if let Ok(mut state) = state.try_lock() {
+            if state.active_leases == 0 {
+                state.active_spec = None;
+                state.served_model = None;
+                state.owns_process = false;
+                let _ = record_compaction_failure(
+                    &mut state,
+                    "compaction sidecar acquisition was cancelled".to_string(),
+                );
+            }
+            true
+        } else {
+            false
+        };
+        if !cleaned_immediately {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let deferred_state = state.clone();
+                runtime.spawn(async move {
+                    let mut state = deferred_state.lock().await;
+                    if state.active_leases == 0 {
+                        state.active_spec = None;
+                        state.served_model = None;
+                        state.owns_process = false;
+                        let _ = record_compaction_failure(
+                            &mut state,
+                            "compaction sidecar acquisition was cancelled".to_string(),
+                        );
+                    }
+                });
+            }
+        }
+
+        if self.stop_process {
+            // Cancellation is exceptional and process cleanup must finish
+            // before the caller's timeout can let the runtime exit. The stop
+            // path already has a bounded SIGTERM/SIGKILL deadline.
+            if let Err(error) = (self.stop_role)(&self.role) {
+                tracing::warn!(%error, "cancelled_compaction_sidecar_stop_failed");
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for CompactionSidecarManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompactionSidecarSpec")
-            .field("port", &self.port)
-            .field("model", &self.model)
-            .field("on_demand", &self.on_demand)
-            .field(
-                "active_leases",
-                &COMPACTION_SIDE_LEASES.load(std::sync::atomic::Ordering::Relaxed),
-            )
+        f.debug_struct("CompactionSidecarManager")
+            .field("port", &self.spec.port)
+            .field("model_hint", &self.model_hint)
+            .field("context_size", &self.spec.context_size)
             .finish()
     }
 }
 
-impl CompactionSidecarSpec {
-    /// Bind an LCM endpoint that targets this managed sidecar to the literal
-    /// model id the sidecar loaded. Higgs' chat endpoint does not guarantee
-    /// the transport alias `active`; using the known id avoids a late 404 and
-    /// silent deterministic-compaction fallback.
-    pub(crate) fn bind_lcm_endpoint_model(
-        &self,
-        lcm: &mut crate::config::schema::LcmSchemaConfig,
-    ) {
-        let Some(endpoint) = lcm.compaction_endpoint.as_mut() else {
-            return;
-        };
-        let Ok(url) = url::Url::parse(&endpoint.url) else {
-            return;
-        };
-        let targets_this_sidecar = url.port_or_known_default() == Some(self.port)
-            && url.host_str().is_some_and(|host| {
-                host.eq_ignore_ascii_case("localhost")
-                    || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
-            });
-        if targets_this_sidecar {
-            endpoint.model.clone_from(&self.model);
-        }
-    }
+impl CompactionSidecarManager {
+    /// Build the canonical managed sidecar. `lcm.*` wins over the two legacy
+    /// `agents.defaults.higgsCompaction*` aliases retained for one release.
+    pub(crate) fn from_config(config: &crate::config::schema::Config) -> Option<Arc<Self>> {
+        let port = config
+            .lcm
+            .compaction_port
+            .or(config.agents.defaults.higgs_compaction_port)?;
+        let dir = config
+            .lcm
+            .compaction_model_dir
+            .as_deref()
+            .filter(|dir| !dir.trim().is_empty())
+            .or_else(|| {
+                config
+                    .agents
+                    .defaults
+                    .higgs_compaction_model_dir
+                    .as_deref()
+                    .filter(|dir| !dir.trim().is_empty())
+            })?
+            .to_string();
+        let model_hint = Path::new(&dir)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())?
+            .to_string();
 
-    /// Build from config. Returns `None` when there is no compaction sidecar
-    /// (no port), no spawnable model directory, or no `higgs` binary on disk —
-    /// in all those cases compaction falls back to the main model.
-    pub(crate) fn from_config(config: &crate::config::schema::Config) -> Option<Self> {
-        let port = config.agents.defaults.higgs_compaction_port?;
-        // Don't build a sidecar spec (and later spawn it) when the memory
-        // provider targets a non-localhost endpoint — the sidecar wouldn't be
-        // used, and cron/`/learn`/exit-reflection would waste up to 60s
-        // spawning a model the Reflector never calls. If a memory provider is
-        // configured, it must point at localhost for the sidecar to apply.
-        let memory_targets_remote = config
-            .memory
-            .provider
-            .as_ref()
-            .and_then(|p| p.api_base.as_deref())
-            .is_some_and(|b| !b.contains("127.0.0.1") && !b.contains("localhost"));
-        if memory_targets_remote {
-            return None;
-        }
-        let bin = find_binary()?;
-        let (dir, model) = compaction_sidecar_config(config);
-        let dir = dir?;
-        let on_demand = config.agents.defaults.higgs_compaction_on_demand.unwrap_or(true);
-        Some(Self {
-            bin,
+        let spec = CompactionSidecarSpec {
             port,
             dir,
-            model,
-            on_demand,
+            context_size: config.lcm.compaction_context_size,
+            allow_spawn: config.agents.defaults.local_autostart
+                == crate::config::schema::LocalAutostart::Higgs,
+        };
+        let mut registry = compaction_manager_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.retain(|_, manager| manager.strong_count() > 0);
+        if let Some(manager) = registry.get(&spec).and_then(Weak::upgrade) {
+            return Some(manager);
+        }
+
+        let manager = Arc::new(Self {
+            // A healthy externally-managed sidecar is reusable even when the
+            // binary is absent. If spawning is required, Command reports the
+            // missing executable as an acquisition error.
+            bin: find_binary().unwrap_or_else(|| PathBuf::from("higgs")),
+            spec: spec.clone(),
+            model_hint,
+            role: "compaction".to_string(),
+            state: compaction_sidecar_state(),
+            stop_role: server_stop_role,
+        });
+        registry.insert(spec, Arc::downgrade(&manager));
+        Some(manager)
+    }
+
+    pub(crate) fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.spec.port)
+    }
+
+    /// Configured directory basename used only to select the desired model.
+    /// Requests use the literal id returned by Higgs on the acquired lease.
+    pub(crate) fn model_hint(&self) -> &str {
+        &self.model_hint
+    }
+
+    pub(crate) fn context_size(&self) -> usize {
+        self.spec.context_size
+    }
+
+    /// Start or join the sidecar and return the only capability that can
+    /// release this acquisition.
+    pub(crate) async fn acquire(self: &Arc<Self>) -> Result<CompactionLease, String> {
+        let mut acquisition = CompactionAcquisitionGuard::new(self);
+        let mut state = self.state.lock().await;
+        if state.active_leases > 0 {
+            if state.active_spec.as_ref() != Some(&self.spec) {
+                return Err(
+                    "another compaction sidecar configuration is still leased; retry after it releases"
+                        .to_string(),
+                );
+            }
+            let served_model = state.served_model.clone().ok_or_else(|| {
+                "compaction sidecar lease state is missing its served model id".to_string()
+            })?;
+            state.active_leases += 1;
+            return Ok(CompactionLease {
+                manager: Some(Arc::clone(self)),
+                served_model,
+            });
+        }
+
+        let now = std::time::Instant::now();
+        if state
+            .retry_after
+            .is_some_and(|retry_after| retry_after > now)
+        {
+            let wait = state
+                .retry_after
+                .expect("checked above")
+                .saturating_duration_since(now)
+                .as_secs_f32();
+            return Err(format!(
+                "compaction sidecar health backoff active; retry in {wait:.1}s"
+            ));
+        }
+        acquisition.arm(self.spec.allow_spawn);
+
+        if self.spec.allow_spawn {
+            if let Err(error) = server_start_role(
+                &self.bin,
+                self.spec.port,
+                &self.spec.dir,
+                &self.model_hint,
+                &self.role,
+            )
+            .await
+            {
+                let error = record_compaction_failure(&mut state, error);
+                acquisition.disarm();
+                return Err(error);
+            }
+        } else if !wait_for_ready(self.spec.port, 1).await {
+            let error = record_compaction_failure(
+                &mut state,
+                "compaction sidecar is unavailable and localAutostart is not higgs".to_string(),
+            );
+            acquisition.disarm();
+            return Err(error);
+        }
+
+        let owns_process =
+            self.spec.allow_spawn && read_pid_for(&self.role).is_some_and(pid_is_alive);
+        let served_model = match wait_for_served_model(
+            self.spec.port,
+            &self.model_hint,
+            COMPACTION_MODEL_RESOLVE_TIMEOUT,
+            owns_process,
+        )
+        .await
+        {
+            Ok(Some(model)) => model,
+            Ok(None) => {
+                if owns_process {
+                    let _ = (self.stop_role)(&self.role);
+                }
+                let error = record_compaction_failure(
+                    &mut state,
+                    "Higgs became healthy but did not report a served model id".to_string(),
+                );
+                acquisition.disarm();
+                return Err(error);
+            }
+            Err(served) => {
+                let error = record_compaction_failure(
+                    &mut state,
+                    format!(
+                        "compaction port {} serves [{}], not configured model {}",
+                        self.spec.port,
+                        served.join(", "),
+                        self.model_hint
+                    ),
+                );
+                acquisition.disarm();
+                return Err(error);
+            }
+        };
+
+        state.active_spec = Some(self.spec.clone());
+        state.served_model = Some(served_model.clone());
+        state.owns_process = owns_process;
+        state.consecutive_failures = 0;
+        state.retry_after = None;
+        state.active_leases += 1;
+        acquisition.disarm();
+        Ok(CompactionLease {
+            manager: Some(Arc::clone(self)),
+            served_model,
         })
     }
 
-    /// Ensure the sidecar is reachable before a compaction/memory call, and
-    /// take a lease on the global counter. Idempotent: a running sidecar
-    /// (always-on, or a prior on-demand spawn) returns `Ready` immediately. On
-    /// failure NO lease is taken (so a matching `release()` is a no-op).
-    pub(crate) async fn ensure_up(&self) -> Result<(), String> {
-        if !self.on_demand {
-            return Ok(());
-        }
-        // Serialize start vs stop so a concurrent release can't kill the
-        // sidecar between this health check and the lease increment.
-        let _guard = COMPACTION_LIFECYCLE.lock().await;
-        match server_start_role(&self.bin, self.port, &self.dir, &self.model, "compaction").await {
-            Ok(_) => {
-                COMPACTION_SIDE_LEASES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Drop a lease taken by `ensure_up`. The sidecar is stopped only when the
-    /// LAST lease drops. Safe against an unheld release (e.g. a caller whose
-    /// `ensure_up` failed): the CAS loop refuses to decrement past zero. The
-    /// lifecycle lock serializes the stop against concurrent starts.
-    pub(crate) async fn release(&self) {
-        if !self.on_demand {
+    async fn release_one(&self) {
+        let mut state = self.state.lock().await;
+        if state.active_leases == 0 {
             return;
         }
-        let _guard = COMPACTION_LIFECYCLE.lock().await;
-        loop {
-            let cur = COMPACTION_SIDE_LEASES.load(std::sync::atomic::Ordering::SeqCst);
-            if cur == 0 {
-                return; // no lease held — nothing to release (ensure_up failed)
-            }
-            if COMPACTION_SIDE_LEASES
-                .compare_exchange(cur, cur - 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
-                .is_ok()
-            {
-                if cur == 1 {
-                    let _ = server_stop_role("compaction");
+        debug_assert!(state.active_leases > 0, "compaction lease underflow");
+        state.active_leases -= 1;
+        if state.active_leases == 0 {
+            if state.owns_process {
+                if let Err(error) = (self.stop_role)(&self.role) {
+                    tracing::warn!(%error, "compaction_sidecar_stop_failed");
                 }
-                return;
             }
+            state.active_spec = None;
+            state.served_model = None;
+            state.owns_process = false;
+        }
+    }
+
+    /// Stop a sidecar owned by this manager and invalidate every outstanding
+    /// lease. Exit uses this after its reflection deadline so process cleanup
+    /// completes before the Tokio runtime is dropped. External sidecars are
+    /// never stopped.
+    pub(crate) async fn shutdown_owned(&self) {
+        let mut state = self.state.lock().await;
+        if state.owns_process {
+            if let Err(error) = (self.stop_role)(&self.role) {
+                tracing::warn!(%error, "compaction_sidecar_forced_stop_failed");
+            }
+        }
+        state.active_leases = 0;
+        state.active_spec = None;
+        state.served_model = None;
+        state.owns_process = false;
+    }
+}
+
+fn record_compaction_failure(state: &mut CompactionSidecarState, error: String) -> String {
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    let exponent = state.consecutive_failures.saturating_sub(1).min(4);
+    let delay = COMPACTION_RETRY_BASE
+        .saturating_mul(1_u32 << exponent)
+        .min(COMPACTION_RETRY_MAX);
+    state.retry_after = Some(std::time::Instant::now() + delay);
+    format!(
+        "{error}; retrying after {}s health backoff",
+        delay.as_secs()
+    )
+}
+
+async fn wait_for_served_model(
+    port: u16,
+    preferred: &str,
+    timeout: std::time::Duration,
+    may_adopt_unmatched: bool,
+) -> Result<Option<String>, Vec<String>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let served = list_served_models(port).await;
+        if let Some(model) = served
+            .iter()
+            .find(|id| model_id_matches(id, preferred))
+            .cloned()
+        {
+            return Ok(Some(model));
+        }
+        if let Some(model) = served.first() {
+            if may_adopt_unmatched {
+                // We own the PID and therefore know which directory was
+                // loaded; use Higgs's literal transport id even when it does
+                // not resemble the directory basename.
+                return Ok(Some(model.clone()));
+            }
+            // A healthy external process on the compaction port may belong to
+            // the foreground model. Never compact with an arbitrary first id.
+            return Err(served);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// A successful sidecar acquisition. Explicit release is deterministic; Drop
+/// is the cancellation/timeout safety net and schedules the same release.
+#[derive(Debug)]
+pub(crate) struct CompactionLease {
+    manager: Option<Arc<CompactionSidecarManager>>,
+    served_model: String,
+}
+
+impl CompactionLease {
+    pub(crate) fn served_model(&self) -> &str {
+        &self.served_model
+    }
+
+    pub(crate) async fn release(mut self) {
+        if let Some(manager) = self.manager.take() {
+            manager.release_one().await;
         }
     }
 }
 
-/// Resolve the compaction sidecar's `(model_dir, model)` from config,
-/// mirroring the main-instance fallbacks: configured compaction dir, else the
-/// main model dir; configured compaction model, else the main local model.
-/// Single source of truth for the spawn path and `/restart`.
-pub(crate) fn compaction_sidecar_config(
-    config: &crate::config::schema::Config,
-) -> (Option<String>, String) {
-    let dir = config
-        .agents
-        .defaults
-        .higgs_compaction_model_dir
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| resolve_model_dir(config).ok());
-    let model = config
-        .agents
-        .defaults
-        .higgs_compaction_model
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| config.agents.defaults.local_model.clone());
-    (dir, model)
-}
-
-/// The model id higgs-nightly will SERVE the compaction sidecar under.
-///
-/// The sidecar spawns with `higgs serve --model <dir>` and no `--name`, so
-/// higgs registers it under the directory's basename (e.g. dir
-/// `.../prism-ml/Bonsai-1.7B-mlx-1bit` → served id `Bonsai-1.7B-mlx-1bit`).
-/// nanobot must address the sidecar by THIS name: higgs-nightly rejects the
-/// legacy `"active"` alias AND any stale short name from `memory.model`
-/// (e.g. `bonsai-1.7b-mlx`) with a 404 "model not found among loaded local
-/// models". Returns `None` only when no compaction model dir is configured.
-pub(crate) fn compaction_sidecar_served_model(
-    config: &crate::config::schema::Config,
-) -> Option<String> {
-    let (dir, _) = compaction_sidecar_config(config);
-    dir.and_then(|d| {
-        std::path::Path::new(&d)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-    })
+impl Drop for CompactionLease {
+    fn drop(&mut self) {
+        let Some(manager) = self.manager.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    manager.release_one().await;
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "compaction_lease_dropped_without_runtime");
+            }
+        }
+    }
 }
 
 /// Resolve the model directory for Higgs from config.
@@ -1148,7 +1407,10 @@ pub(crate) async fn switch_runtime_model(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("Higgs load failed (HTTP {status}): {}", text.trim()));
+        return Err(format!(
+            "Higgs load failed (HTTP {status}): {}",
+            text.trim()
+        ));
     }
 
     let loaded_name = serde_json::from_str::<serde_json::Value>(&text)
@@ -1267,7 +1529,13 @@ pub(crate) fn adopt_served_model(configured: &str, served: &[String]) -> Option<
 /// List every model id a running Higgs instance is serving (via /v1/models).
 pub(crate) async fn list_served_models(port: u16) -> Vec<String> {
     let url = format!("http://127.0.0.1:{port}/v1/models");
-    let Ok(resp) = reqwest::get(&url).await else {
+    let client = reqwest::Client::new();
+    let Ok(resp) = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    else {
         return Vec::new();
     };
     let Ok(json) = resp.json::<serde_json::Value>().await else {
@@ -1388,29 +1656,540 @@ mod platform {
 mod tests {
     use super::*;
 
+    static TEST_STOP_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static TEST_EXIT_STOP_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_test_stop(_role: &str) -> Result<(), String> {
+        TEST_STOP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn count_exit_test_stop(_role: &str) -> Result<(), String> {
+        TEST_EXIT_STOP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn isolated_compaction_state() -> Arc<tokio::sync::Mutex<CompactionSidecarState>> {
+        Arc::new(tokio::sync::Mutex::new(CompactionSidecarState {
+            active_leases: 0,
+            active_spec: None,
+            served_model: None,
+            owns_process: false,
+            consecutive_failures: 0,
+            retry_after: None,
+        }))
+    }
+
+    async fn spawn_mock_sidecar(model_id: &str) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let model_id = model_id.to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let model_id = model_id.clone();
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let Ok(size) = stream.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..size]);
+                    let body = if request.starts_with("GET /v1/models ") {
+                        serde_json::json!({"data": [{"id": model_id}]}).to_string()
+                    } else {
+                        "ok".to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (port, task)
+    }
+
     #[test]
-    fn compaction_sidecar_binds_lcm_to_loaded_model_id() {
+    fn compaction_manager_uses_canonical_config_and_model_hint() {
+        let mut config = crate::config::schema::Config::default();
+        config.lcm.compaction_port = Some(8001);
+        config.lcm.compaction_model_dir = Some("/models/Bonsai-1.7B-mlx-1bit".to_string());
+        config.lcm.compaction_context_size = 8192;
+
+        let manager = CompactionSidecarManager::from_config(&config).unwrap();
+        assert_eq!(manager.base_url(), "http://127.0.0.1:8001/v1");
+        assert_eq!(manager.model_hint(), "Bonsai-1.7B-mlx-1bit");
+        assert_eq!(manager.context_size(), 8192);
+    }
+
+    #[test]
+    fn canonical_compaction_config_ignores_legacy_memory_provider() {
+        let mut config = crate::config::schema::Config::default();
+        config.lcm.compaction_port = Some(28007);
+        config.lcm.compaction_model_dir = Some("/models/canonical-compactor".to_string());
+        config.memory.provider = Some(crate::config::schema::ProviderConfig {
+            api_key: "legacy-key".to_string(),
+            api_base: Some("https://legacy-memory.example/v1".to_string()),
+        });
+
+        let manager = CompactionSidecarManager::from_config(&config)
+            .expect("canonical LCM config must construct the managed sidecar");
+        assert_eq!(manager.base_url(), "http://127.0.0.1:28007/v1");
+        assert_eq!(manager.model_hint(), "canonical-compactor");
+    }
+
+    #[test]
+    fn compaction_manager_is_shared_across_core_rebuilds() {
+        let mut config = crate::config::schema::Config::default();
+        config.lcm.compaction_port = Some(28001);
+        config.lcm.compaction_model_dir = Some("/models/shared-manager".to_string());
+
+        let first = CompactionSidecarManager::from_config(&config).unwrap();
+        let rebuilt = CompactionSidecarManager::from_config(&config).unwrap();
+        assert!(Arc::ptr_eq(&first, &rebuilt));
+    }
+
+    #[test]
+    fn compaction_manager_respects_explicit_higgs_autostart() {
+        let mut off = crate::config::schema::Config::default();
+        off.lcm.compaction_port = Some(28002);
+        off.lcm.compaction_model_dir = Some("/models/autostart-off".to_string());
+        let off_manager = CompactionSidecarManager::from_config(&off).unwrap();
+        assert!(!off_manager.spec.allow_spawn);
+
+        let mut higgs = off;
+        higgs.lcm.compaction_port = Some(28003);
+        higgs.lcm.compaction_model_dir = Some("/models/autostart-higgs".to_string());
+        higgs.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Higgs;
+        let higgs_manager = CompactionSidecarManager::from_config(&higgs).unwrap();
+        assert!(higgs_manager.spec.allow_spawn);
+    }
+
+    #[test]
+    fn compaction_manager_never_spawns_for_lmstudio_autostart() {
+        let mut config = crate::config::schema::Config::default();
+        config.lcm.compaction_port = Some(28004);
+        config.lcm.compaction_model_dir = Some("/models/autostart-lmstudio".to_string());
+        config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Lmstudio;
+
+        let manager = CompactionSidecarManager::from_config(&config).unwrap();
+        assert!(!manager.spec.allow_spawn);
+    }
+
+    #[tokio::test]
+    async fn failed_manager_backoff_does_not_block_another_spec() {
+        let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_port = unavailable_listener.local_addr().unwrap().port();
+        drop(unavailable_listener);
+        let (healthy_port, healthy_server) = spawn_mock_sidecar("healthy-sidecar").await;
+
+        let mut unavailable_config = crate::config::schema::Config::default();
+        unavailable_config.lcm.compaction_port = Some(unavailable_port);
+        unavailable_config.lcm.compaction_model_dir = Some("/models/unavailable".to_string());
+        let unavailable = CompactionSidecarManager::from_config(&unavailable_config).unwrap();
+
+        let mut healthy_config = crate::config::schema::Config::default();
+        healthy_config.lcm.compaction_port = Some(healthy_port);
+        healthy_config.lcm.compaction_model_dir = Some("/models/healthy-sidecar".to_string());
+        let healthy = CompactionSidecarManager::from_config(&healthy_config).unwrap();
+
+        assert!(!Arc::ptr_eq(&unavailable.state, &healthy.state));
+        assert!(unavailable.acquire().await.is_err());
+        let lease = healthy
+            .acquire()
+            .await
+            .expect("one manager's backoff must not affect another spec");
+        assert_eq!(lease.served_model(), "healthy-sidecar");
+        lease.release().await;
+        healthy_server.abort();
+    }
+
+    #[tokio::test]
+    async fn external_compaction_port_rejects_the_wrong_served_model() {
+        let (port, server) = spawn_mock_sidecar("foreground-qwen").await;
+        let state = isolated_compaction_state();
+        let manager = Arc::new(CompactionSidecarManager {
+            bin: PathBuf::from("unused"),
+            spec: CompactionSidecarSpec {
+                port,
+                dir: "/models/Bonsai-1.7B-mlx-1bit".to_string(),
+                context_size: 8192,
+                allow_spawn: false,
+            },
+            model_hint: "Bonsai-1.7B-mlx-1bit".to_string(),
+            role: format!("compaction-test-wrong-model-{port}"),
+            state: state.clone(),
+            stop_role: count_test_stop,
+        });
+
+        let error = manager.acquire().await.unwrap_err();
+        assert!(error.contains("foreground-qwen"));
+        assert!(error.contains("Bonsai-1.7B-mlx-1bit"));
+        assert_eq!(state.lock().await.active_leases, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn owned_sidecar_stops_only_after_last_lease() {
+        TEST_STOP_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
         let spec = CompactionSidecarSpec {
-            bin: PathBuf::from("/tmp/higgs"),
-            port: 8001,
-            dir: "/models/Bonsai".to_string(),
-            model: "Bonsai-1.7B-mlx-1bit".to_string(),
-            on_demand: true,
+            port: 28005,
+            dir: "/models/owned".to_string(),
+            context_size: 4096,
+            allow_spawn: true,
         };
-        let mut lcm = crate::config::schema::LcmSchemaConfig {
-            compaction_endpoint: Some(crate::config::schema::ModelEndpoint {
-                url: "http://127.0.0.1:8001/v1".to_string(),
-                model: "active".to_string(),
-            }),
-            ..Default::default()
+        let state = Arc::new(tokio::sync::Mutex::new(CompactionSidecarState {
+            active_leases: 2,
+            active_spec: Some(spec.clone()),
+            served_model: Some("owned-served-id".to_string()),
+            owns_process: true,
+            consecutive_failures: 0,
+            retry_after: None,
+        }));
+        let manager = Arc::new(CompactionSidecarManager {
+            bin: PathBuf::from("unused"),
+            spec,
+            model_hint: "owned".to_string(),
+            role: "compaction-test-owned".to_string(),
+            state: state.clone(),
+            stop_role: count_test_stop,
+        });
+        let first = CompactionLease {
+            manager: Some(manager.clone()),
+            served_model: "owned-served-id".to_string(),
+        };
+        let second = CompactionLease {
+            manager: Some(manager),
+            served_model: "owned-served-id".to_string(),
         };
 
-        spec.bind_lcm_endpoint_model(&mut lcm);
+        first.release().await;
+        assert_eq!(TEST_STOP_CALLS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(state.lock().await.active_leases, 1);
 
+        second.release().await;
+        assert_eq!(TEST_STOP_CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let state = state.lock().await;
+        assert_eq!(state.active_leases, 0);
+        assert!(!state.owns_process);
+        assert!(state.served_model.is_none());
+    }
+
+    #[tokio::test]
+    async fn exit_timeout_deterministically_stops_an_owned_sidecar() {
+        TEST_EXIT_STOP_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let spec = CompactionSidecarSpec {
+            port: 28006,
+            dir: "/models/exit-timeout".to_string(),
+            context_size: 4096,
+            allow_spawn: true,
+        };
+        let state = Arc::new(tokio::sync::Mutex::new(CompactionSidecarState {
+            active_leases: 1,
+            active_spec: Some(spec.clone()),
+            served_model: Some("exit-timeout-served".to_string()),
+            owns_process: true,
+            consecutive_failures: 0,
+            retry_after: None,
+        }));
+        let manager = Arc::new(CompactionSidecarManager {
+            bin: PathBuf::from("unused"),
+            spec,
+            model_hint: "exit-timeout".to_string(),
+            role: "compaction-test-exit-timeout".to_string(),
+            state: state.clone(),
+            stop_role: count_exit_test_stop,
+        });
+        let lease = CompactionLease {
+            manager: Some(manager.clone()),
+            served_model: "exit-timeout-served".to_string(),
+        };
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(1), async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(result.is_err());
+
+        // Mirrors the exit path: cancellation may schedule normal lease
+        // release, and forced shutdown joins whichever path owns the state.
+        manager.shutdown_owned().await;
         assert_eq!(
-            lcm.compaction_endpoint.as_ref().unwrap().model,
-            "Bonsai-1.7B-mlx-1bit"
+            TEST_EXIT_STOP_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
+        let state = state.lock().await;
+        assert_eq!(state.active_leases, 0);
+        assert!(!state.owns_process);
+        assert!(state.served_model.is_none());
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_invalidates_external_lease_without_stopping_server() {
+        TEST_STOP_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let spec = CompactionSidecarSpec {
+            port: 28008,
+            dir: "/models/external".to_string(),
+            context_size: 4096,
+            allow_spawn: false,
+        };
+        let state = Arc::new(tokio::sync::Mutex::new(CompactionSidecarState {
+            active_leases: 1,
+            active_spec: Some(spec.clone()),
+            served_model: Some("external-served-id".to_string()),
+            owns_process: false,
+            consecutive_failures: 0,
+            retry_after: None,
+        }));
+        let manager = Arc::new(CompactionSidecarManager {
+            bin: PathBuf::from("unused"),
+            spec,
+            model_hint: "external".to_string(),
+            role: "compaction-test-external".to_string(),
+            state: state.clone(),
+            stop_role: count_test_stop,
+        });
+        let lease = CompactionLease {
+            manager: Some(manager.clone()),
+            served_model: "external-served-id".to_string(),
+        };
+
+        manager.shutdown_owned().await;
+        assert_eq!(TEST_STOP_CALLS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        lease.release().await;
+        assert_eq!(TEST_STOP_CALLS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let state = state.lock().await;
+        assert_eq!(state.active_leases, 0);
+        assert!(!state.owns_process);
+        assert!(state.served_model.is_none());
+    }
+
+    #[tokio::test]
+    async fn compaction_leases_resolve_model_and_release_only_after_last_user() {
+        let literal_model = "bonsai17bmlx1bit-served";
+        let (port, server) = spawn_mock_sidecar(literal_model).await;
+        let state = isolated_compaction_state();
+        let manager = Arc::new(CompactionSidecarManager {
+            bin: PathBuf::from("missing-higgs-is-not-needed-for-external-server"),
+            spec: CompactionSidecarSpec {
+                port,
+                dir: "/models/Bonsai-1.7B-mlx-1bit-served".to_string(),
+                context_size: 8192,
+                allow_spawn: false,
+            },
+            model_hint: "Bonsai-1.7B-mlx-1bit-served".to_string(),
+            role: format!("compaction-test-{port}"),
+            state: state.clone(),
+            stop_role: server_stop_role,
+        });
+
+        let first = manager.acquire().await.unwrap();
+        let second = manager.acquire().await.unwrap();
+        assert_eq!(first.served_model(), literal_model);
+        assert_eq!(second.served_model(), literal_model);
+        assert_eq!(state.lock().await.active_leases, 2);
+
+        let conflicting = Arc::new(CompactionSidecarManager {
+            bin: PathBuf::from("unused"),
+            spec: CompactionSidecarSpec {
+                port,
+                dir: "/models/different".to_string(),
+                context_size: 8192,
+                allow_spawn: false,
+            },
+            model_hint: "different".to_string(),
+            role: format!("compaction-test-conflict-{port}"),
+            state: state.clone(),
+            stop_role: server_stop_role,
+        });
+        assert!(conflicting.acquire().await.is_err());
+        assert_eq!(state.lock().await.active_leases, 2);
+
+        first.release().await;
+        assert_eq!(state.lock().await.active_leases, 1);
+
+        let cancelled = tokio::spawn(async move {
+            let _lease = second;
+            std::future::pending::<()>().await;
+        });
+        cancelled.abort();
+        let _ = cancelled.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.lock().await.active_leases == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled lease must release before timeout");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_acquisition_enters_backoff_without_a_lease() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let state = isolated_compaction_state();
+        let manager = Arc::new(CompactionSidecarManager {
+            bin: PathBuf::from("definitely-not-a-higgs-binary"),
+            spec: CompactionSidecarSpec {
+                port,
+                dir: "/models/missing".to_string(),
+                context_size: 4096,
+                allow_spawn: false,
+            },
+            model_hint: "missing".to_string(),
+            role: format!("compaction-test-failure-{port}"),
+            state: state.clone(),
+            stop_role: server_stop_role,
+        });
+
+        let first_error = manager.acquire().await.unwrap_err();
+        assert!(first_error.contains("health backoff"));
+        assert_eq!(state.lock().await.active_leases, 0);
+        let second_error = manager.acquire().await.unwrap_err();
+        assert!(second_error.contains("backoff active"));
+        assert_eq!(state.lock().await.active_leases, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_compaction_acquisition_cleans_up_and_enters_backoff() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _stream = stream;
+            std::future::pending::<()>().await;
+        });
+        let state = isolated_compaction_state();
+        let manager = Arc::new(CompactionSidecarManager {
+            bin: PathBuf::from("unused"),
+            spec: CompactionSidecarSpec {
+                port,
+                dir: "/models/hanging".to_string(),
+                context_size: 4096,
+                allow_spawn: false,
+            },
+            model_hint: "hanging".to_string(),
+            role: format!("compaction-test-cancel-{port}"),
+            state: state.clone(),
+            stop_role: server_stop_role,
+        });
+
+        let acquisition = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.acquire().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        acquisition.abort();
+        let _ = acquisition.await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let state = state.lock().await;
+                if state.active_leases == 0 && state.retry_after.is_some() {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled acquisition must record cleanup backoff");
+        assert!(manager
+            .acquire()
+            .await
+            .unwrap_err()
+            .contains("backoff active"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn timed_out_compaction_acquisition_cleans_up_and_enters_backoff() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _stream = stream;
+            std::future::pending::<()>().await;
+        });
+        let state = isolated_compaction_state();
+        let manager = Arc::new(CompactionSidecarManager {
+            bin: PathBuf::from("unused"),
+            spec: CompactionSidecarSpec {
+                port,
+                dir: "/models/timed-out".to_string(),
+                context_size: 4096,
+                allow_spawn: false,
+            },
+            model_hint: "timed-out".to_string(),
+            role: format!("compaction-test-timeout-{port}"),
+            state: state.clone(),
+            stop_role: server_stop_role,
+        });
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), manager.acquire()).await;
+        assert!(result.is_err(), "the hanging acquisition should time out");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let state = state.lock().await;
+                if state.active_leases == 0 && state.retry_after.is_some() {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out acquisition must record cleanup backoff");
+        assert!(manager
+            .acquire()
+            .await
+            .unwrap_err()
+            .contains("backoff active"));
+        server.abort();
+    }
+
+    #[test]
+    fn compaction_manager_accepts_legacy_port_and_dir_aliases() {
+        let mut config = crate::config::schema::Config::default();
+        config.agents.defaults.higgs_compaction_port = Some(8002);
+        config.agents.defaults.higgs_compaction_model_dir =
+            Some("/models/legacy-compactor".to_string());
+
+        let manager = CompactionSidecarManager::from_config(&config).unwrap();
+        assert_eq!(manager.base_url(), "http://127.0.0.1:8002/v1");
+        assert_eq!(manager.model_hint(), "legacy-compactor");
+    }
+
+    #[test]
+    fn canonical_compaction_config_wins_over_legacy_aliases() {
+        let mut config = crate::config::schema::Config::default();
+        config.lcm.compaction_port = Some(8003);
+        config.lcm.compaction_model_dir = Some("/models/canonical".to_string());
+        config.agents.defaults.higgs_compaction_port = Some(8004);
+        config.agents.defaults.higgs_compaction_model_dir = Some("/models/legacy".to_string());
+
+        let manager = CompactionSidecarManager::from_config(&config).unwrap();
+        assert_eq!(manager.base_url(), "http://127.0.0.1:8003/v1");
+        assert_eq!(manager.model_hint(), "canonical");
     }
 
     #[test]
@@ -1477,10 +2256,7 @@ mod tests {
         // Server reported nothing → no adoption, keep configured.
         assert_eq!(adopt_served_model("vibethinker3", &[]), None);
         // Higgs "active" transport already configured and served → keep.
-        assert_eq!(
-            adopt_served_model("active", &["active".to_string()]),
-            None
-        );
+        assert_eq!(adopt_served_model("active", &["active".to_string()]), None);
     }
 
     #[test]

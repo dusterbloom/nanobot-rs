@@ -3,10 +3,7 @@
 //! When completed working sessions accumulate past a token threshold, the
 //! reflector reads current `MEMORY.md` + all completed sessions, calls the
 //! memory model to extract reusable facts, writes the updated memory, and
-//! archives the processed sessions.
-//!
-//! Also checks for legacy observation files and processes those during a
-//! transition period.
+//! marks the processed SQLite rows reflected.
 //!
 //! The reflector runs in a background `tokio::spawn` task and never blocks
 //! user chat.
@@ -19,10 +16,10 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::agent::knowledge_graph::KnowledgeGraph;
-use crate::agent::memory::MemoryStore;
-use crate::agent::observer::ObservationStore;
+use crate::agent::memory::{memory_transaction_lock, MemoryStore};
 use crate::agent::working_memory::{SessionStatus, WorkingMemoryStore};
 use crate::providers::base::LLMProvider;
+use crate::session::db::SessionDb;
 
 /// Prompt sent to the memory model for facts + entity extraction.
 const REFLECTION_PROMPT: &str = "\
@@ -64,8 +61,8 @@ Example:
 Current long-term memory:
 {current_memory}
 
-Recent session summaries:
-{observations}
+Completed SQLite working-memory summaries:
+{session_summaries}
 
 Write updated factual memory (bullet points), then ## Entities section. Be concise.";
 
@@ -75,6 +72,7 @@ pub struct Reflector {
     model: String,
     workspace: PathBuf,
     threshold_tokens: usize,
+    sessions: Arc<SessionDb>,
 }
 
 impl Reflector {
@@ -84,47 +82,62 @@ impl Reflector {
         model: String,
         workspace: &Path,
         threshold: usize,
+        sessions: Arc<SessionDb>,
     ) -> Self {
         Self {
             provider,
             model,
             workspace: workspace.to_path_buf(),
             threshold_tokens: threshold,
+            sessions,
         }
     }
 
-    /// Check whether accumulated sessions/observations exceed the reflection threshold.
-    ///
-    /// Checks both completed working sessions and legacy observation files.
-    pub fn should_reflect(&self) -> bool {
-        let wm = WorkingMemoryStore::new(&self.workspace);
-        let wm_tokens = wm.total_tokens_by_status(SessionStatus::Completed);
-
-        // Also check legacy observations during transition period.
-        let observer = ObservationStore::new(&self.workspace);
-        let obs_tokens = observer.total_tokens();
-
-        let total = wm_tokens + obs_tokens;
-        debug!(
-            "Reflector: {} tokens ({}wm + {}obs, threshold: {})",
-            total, wm_tokens, obs_tokens, self.threshold_tokens
-        );
-        total > self.threshold_tokens
+    /// Check whether completed SQLite working-memory rows exceed the threshold.
+    pub async fn should_reflect(&self) -> bool {
+        Self::should_reflect_sessions(&self.sessions, self.threshold_tokens).await
     }
 
-    /// Perform reflection: read completed sessions + legacy observations +
-    /// current memory, call LLM, update MEMORY.md, archive processed sources.
+    /// Check reflection pressure without constructing a model-bound reflector.
+    /// This keeps the on-demand sidecar unloaded when there is no completed
+    /// working memory to process.
+    pub async fn should_reflect_sessions(sessions: &Arc<SessionDb>, threshold: usize) -> bool {
+        let wm = WorkingMemoryStore::new(sessions.clone());
+        let wm_tokens = match wm.total_tokens_by_status(SessionStatus::Completed).await {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                warn!("Reflector: failed to count completed sessions: {}", error);
+                0
+            }
+        };
+
+        let total = wm_tokens;
+        debug!(
+            "Reflector: {} completed working-memory tokens (threshold: {})",
+            total, threshold
+        );
+        total > threshold
+    }
+
+    /// Distill completed SQLite working-memory rows into `MEMORY.md`.
+    ///
+    /// `MemoryStore::write_long_term` uses temp-file + rename. Only after that
+    /// atomic replacement succeeds do we mark the source rows reflected.
     pub async fn reflect(&self) -> Result<()> {
+        // Reflection is a single read/derive/write/status transaction at the
+        // process level. All triggers share this lock so a slower run cannot
+        // overwrite facts produced by a newer run or reflect the same rows
+        // from the same stale MEMORY.md base.
+        let _memory_guard = memory_transaction_lock().lock().await;
         let memory_store = MemoryStore::new(&self.workspace);
-        let wm = WorkingMemoryStore::new(&self.workspace);
-        let observer = ObservationStore::new(&self.workspace);
+        let wm = WorkingMemoryStore::new(self.sessions.clone());
 
         // Read current state.
         let current_memory = memory_store.read_long_term();
 
         // Gather summaries from completed working sessions.
-        let completed_sessions = wm.list_completed();
-        let mut summaries: Vec<String> = completed_sessions
+        let completed_sessions = wm.list_completed().await?;
+        let summaries: Vec<String> = completed_sessions
             .iter()
             .map(|s| {
                 format!(
@@ -136,33 +149,22 @@ impl Reflector {
             })
             .collect();
 
-        // Also gather legacy observations (transition period).
-        let legacy_obs = observer.load_recent(usize::MAX);
-        for obs in &legacy_obs {
-            summaries.push(format!(
-                "**[{}]** ({})\n{}",
-                obs.timestamp, obs.session_key, obs.content
-            ));
-        }
-
         if summaries.is_empty() {
-            debug!("Reflector: no sessions or observations to process");
+            debug!("Reflector: no completed sessions to process");
             return Ok(());
         }
 
         info!(
-            "Reflector: processing {} sources ({} sessions + {} legacy obs) into MEMORY.md",
-            summaries.len(),
-            completed_sessions.len(),
-            legacy_obs.len()
+            "Reflector: processing {} completed sessions into MEMORY.md",
+            completed_sessions.len()
         );
 
-        let obs_text = summaries.join("\n\n");
+        let summaries_text = summaries.join("\n\n");
 
         // Build the reflection prompt.
         let prompt = REFLECTION_PROMPT
             .replace("{current_memory}", &current_memory)
-            .replace("{observations}", &obs_text);
+            .replace("{session_summaries}", &summaries_text);
 
         let messages = vec![
             json!({"role": "system", "content": "You are a memory management assistant. Extract only permanent facts."}),
@@ -181,8 +183,13 @@ impl Reflector {
         // Split response into facts and entities sections.
         let (facts, entities_section) = split_entities_section(&updated_memory);
 
-        // Write updated memory (atomic — single write call).
+        // Atomic temp-file + rename; do not advance source state first.
         memory_store.write_long_term(&facts);
+        if memory_store.read_long_term() != facts {
+            return Err(anyhow::anyhow!(
+                "atomic MEMORY.md replacement did not persist; completed sessions retained"
+            ));
+        }
         info!("Reflector: MEMORY.md updated");
 
         // Extract entities/relations into knowledge graph.
@@ -206,25 +213,16 @@ impl Reflector {
             }
         }
 
-        // Archive processed working sessions.
-        for session in &completed_sessions {
-            if let Err(e) = wm.archive(&session.session_key) {
-                warn!("Failed to archive session {}: {}", session.session_key, e);
-            }
-        }
-        if !completed_sessions.is_empty() {
-            info!(
-                "Reflector: archived {} working sessions",
-                completed_sessions.len()
-            );
-        }
-
-        // Archive legacy observations.
-        if !legacy_obs.is_empty() {
-            let paths: Vec<PathBuf> = legacy_obs.iter().map(|o| o.path.clone()).collect();
-            observer.archive(&paths)?;
-            info!("Reflector: archived {} legacy observations", paths.len());
-        }
+        // Advance source lifecycle only after the atomic memory replacement.
+        let reflected_ids: Vec<String> = completed_sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect();
+        wm.mark_reflected_all(&reflected_ids).await?;
+        info!(
+            "Reflector: marked {} working sessions reflected",
+            completed_sessions.len()
+        );
 
         Ok(())
     }
@@ -287,6 +285,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::Value;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     /// Mock provider that returns a fixed response.
@@ -350,83 +349,90 @@ mod tests {
         }
     }
 
-    fn setup_workspace_with_sessions(tmp: &TempDir, count: usize, content_size: usize) -> PathBuf {
-        let workspace = tmp.path().to_path_buf();
-        let mem_dir = workspace.join("memory");
-        std::fs::create_dir_all(&mem_dir).unwrap();
-
-        let wm = WorkingMemoryStore::new(&workspace);
-        for i in 0..count {
-            let key = format!("test_session:{}", i);
-            wm.update_from_compaction(&key, &"x".repeat(content_size), 0);
-            wm.complete(&key);
-        }
-        workspace
+    struct CoordinatedProvider {
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
     }
 
-    fn setup_workspace_with_legacy_observations(
+    #[async_trait]
+    impl LLMProvider for CoordinatedProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> Result<LLMResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(LLMResponse {
+                content: Some("- serialized fact".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock"
+        }
+    }
+
+    async fn setup_workspace_with_sessions(
         tmp: &TempDir,
         count: usize,
         content_size: usize,
-    ) -> PathBuf {
+    ) -> (PathBuf, Arc<SessionDb>) {
         let workspace = tmp.path().to_path_buf();
-        let obs_dir = workspace.join("memory").join("observations");
-        std::fs::create_dir_all(&obs_dir).unwrap();
         let mem_dir = workspace.join("memory");
         std::fs::create_dir_all(&mem_dir).unwrap();
 
+        let sessions = Arc::new(SessionDb::new(&workspace.join("sessions.db")));
+        let wm = WorkingMemoryStore::new(sessions.clone());
         for i in 0..count {
-            let content = format!(
-                "---\ntimestamp: 2026-01-{:02}T00:00:00Z\nsession: test_{}\n---\n\n{}",
-                (i % 28) + 1,
-                i,
-                "x".repeat(content_size),
-            );
-            std::fs::write(
-                obs_dir.join(format!("202601{:02}T000000Z_test_{}.md", (i % 28) + 1, i)),
-                content,
-            )
-            .unwrap();
+            let key = format!("test_session:{}", i);
+            let session = sessions.create_session(&key).await;
+            wm.update_from_compaction(&session.id, &"x".repeat(content_size), 0)
+                .await
+                .unwrap();
+            wm.complete(&session.id).await.unwrap();
         }
-
-        workspace
+        (workspace, sessions)
     }
 
-    #[test]
-    fn test_should_reflect_false_when_below_threshold() {
+    #[tokio::test]
+    async fn test_should_reflect_false_when_below_threshold() {
         let tmp = TempDir::new().unwrap();
-        let workspace = setup_workspace_with_sessions(&tmp, 1, 10);
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 1, 10).await;
         let provider = Arc::new(MockProvider::new("memory"));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 100_000);
-        assert!(!reflector.should_reflect());
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 100_000, sessions);
+        assert!(!reflector.should_reflect().await);
     }
 
-    #[test]
-    fn test_should_reflect_true_when_above_threshold() {
+    #[tokio::test]
+    async fn test_should_reflect_true_when_above_threshold() {
         let tmp = TempDir::new().unwrap();
-        let workspace = setup_workspace_with_sessions(&tmp, 10, 1000);
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 10, 1000).await;
         let provider = Arc::new(MockProvider::new("memory"));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 100);
-        assert!(reflector.should_reflect());
-    }
-
-    #[test]
-    fn test_should_reflect_includes_legacy_observations() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = setup_workspace_with_legacy_observations(&tmp, 10, 1000);
-        let provider = Arc::new(MockProvider::new("memory"));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 100);
-        assert!(reflector.should_reflect());
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 100, sessions);
+        assert!(reflector.should_reflect().await);
     }
 
     #[tokio::test]
     async fn test_reflect_updates_memory_md_from_sessions() {
         let tmp = TempDir::new().unwrap();
-        let workspace = setup_workspace_with_sessions(&tmp, 3, 100);
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 3, 100).await;
         let provider = Arc::new(MockProvider::new(
             "- User prefers Rust\n- Dark mode enabled",
         ));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0);
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions);
 
         reflector.reflect().await.unwrap();
 
@@ -436,61 +442,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reflect_archives_completed_sessions() {
+    async fn test_reflect_marks_completed_sessions_reflected() {
         let tmp = TempDir::new().unwrap();
-        let workspace = setup_workspace_with_sessions(&tmp, 3, 100);
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 3, 100).await;
         let provider = Arc::new(MockProvider::new("Updated facts."));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0);
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone());
 
         reflector.reflect().await.unwrap();
 
-        let wm = WorkingMemoryStore::new(&workspace);
-        let remaining = wm.list_completed();
+        let wm = WorkingMemoryStore::new(sessions);
+        let remaining = wm.list_completed().await.unwrap();
         assert!(
             remaining.is_empty(),
-            "completed sessions should be archived after reflection"
+            "completed sessions should be consumed after reflection"
         );
 
-        // Archived directory should have files.
-        let archived_dir = workspace.join("memory").join("sessions").join("archived");
-        assert!(archived_dir.exists());
-        let archived_count = std::fs::read_dir(&archived_dir).unwrap().count();
-        assert_eq!(archived_count, 3);
+        assert_eq!(wm.list_reflected().await.unwrap().len(), 3);
+        assert!(!workspace.join("memory").join("sessions").exists());
     }
 
     #[tokio::test]
-    async fn test_reflect_archives_legacy_observations() {
+    async fn concurrent_reflection_is_serialized_across_triggers() {
         let tmp = TempDir::new().unwrap();
-        let workspace = setup_workspace_with_legacy_observations(&tmp, 2, 100);
-        // Also need to init sessions dir.
-        std::fs::create_dir_all(workspace.join("memory").join("sessions")).unwrap();
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 1, 100).await;
+        let provider = Arc::new(CoordinatedProvider {
+            calls: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let first = Reflector::new(
+            provider.clone(),
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+        );
+        let second = Reflector::new(provider.clone(), "test".into(), &workspace, 0, sessions);
 
-        let provider = Arc::new(MockProvider::new("Updated facts."));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0);
+        let (first_result, second_result) = tokio::join!(first.reflect(), second.reflect());
+        first_result.unwrap();
+        second_result.unwrap();
 
-        reflector.reflect().await.unwrap();
-
-        let observer = ObservationStore::new(&workspace);
-        let remaining = observer.load_recent(100);
-        assert!(
-            remaining.is_empty(),
-            "legacy observations should be archived"
+        assert_eq!(provider.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "the second trigger must re-read SQLite after the first marks rows reflected"
         );
     }
 
     #[tokio::test]
     async fn test_reflect_graceful_on_failure() {
         let tmp = TempDir::new().unwrap();
-        let workspace = setup_workspace_with_sessions(&tmp, 2, 100);
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 2, 100).await;
         let provider = Arc::new(FailingProvider);
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0);
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone());
 
         let result = reflector.reflect().await;
         assert!(result.is_err());
 
-        // Sessions should NOT be archived on failure.
-        let wm = WorkingMemoryStore::new(&workspace);
-        let remaining = wm.list_completed();
+        // Sessions must remain completed when the memory update fails.
+        let wm = WorkingMemoryStore::new(sessions);
+        let remaining = wm.list_completed().await.unwrap();
         assert_eq!(
             remaining.len(),
             2,

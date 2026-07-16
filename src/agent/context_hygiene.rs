@@ -10,7 +10,7 @@
 //! ## Pipeline Order
 //! 1. `dedup_tool_results` - Keep only last result per tool_call_id
 //! 2. `merge_consecutive_same_role` - Merge consecutive same-role messages
-//! 3. `truncate_old_tool_results` - Keep only last N tool results
+//! 3. `drop_old_tool_results` - Keep only last N tool results
 //! 4. `truncate_old_assistant_messages` - Compress old assistant content
 //! 5. `strip_dangling_tool_calls` - Remove tool calls without immediate results
 //! 6. `remove_orphaned_tool_results` - Remove results without matching calls
@@ -21,8 +21,55 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use super::is_synthetic_injection;
+use crate::agent::compaction::tool_output_digest;
 
 const TRUNCATED_ASSISTANT_PLACEHOLDER: &str = "[assistant message truncated]";
+
+/// Policy for shrinking an oversized tool-result body.
+///
+/// Each variant reproduces one pre-existing call site byte-for-byte:
+/// - `ByteCap`: the session-reload cap (`src/session/filters.rs`).
+///   Deterministic in its input, so the same stored tool result always
+///   renders identically — keeping the prompt prefix byte-stable.
+/// - `Digest`: the token-budget pressure digest (`src/agent/token_budget.rs`),
+///   replacing bodies longer than `preview_len` with a compact
+///   `TOOL_OUTPUT_DIGEST` marker.
+#[derive(Clone, Copy, Debug)]
+pub enum ToolBodyPolicy {
+    /// Cap the body to at most this many bytes (backed off to a UTF-8 char
+    /// boundary), appending the `…[tool output truncated]` marker.
+    ByteCap(usize),
+    /// Replace bodies longer than `preview_len` bytes with a digest marker
+    /// (sha256 prefix + original length + single-line preview).
+    Digest { preview_len: usize },
+}
+
+/// Shrink a tool-result body according to `policy`.
+///
+/// Returns `Some(replacement)` when the body was shrunk, `None` when it is
+/// small enough to pass through unchanged. Which messages to shrink (all on
+/// reload, older-than-N, under budget pressure) stays the caller's business —
+/// this unifies only the body-shrinking string logic.
+pub fn shrink_tool_body(content: &str, policy: ToolBodyPolicy) -> Option<String> {
+    match policy {
+        ToolBodyPolicy::ByteCap(max_bytes) => {
+            if content.len() <= max_bytes {
+                return None;
+            }
+            let mut end = max_bytes;
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            Some(format!("{}\n…[tool output truncated]", &content[..end]))
+        }
+        ToolBodyPolicy::Digest { preview_len } => {
+            if content.len() <= preview_len {
+                return None;
+            }
+            Some(tool_output_digest(content, preview_len))
+        }
+    }
+}
 
 pub fn hygiene_pipeline(messages: &mut Vec<Value>, keep_last_messages: usize) {
     if messages.is_empty() {
@@ -33,7 +80,7 @@ pub fn hygiene_pipeline(messages: &mut Vec<Value>, keep_last_messages: usize) {
 
     dedup_tool_results(messages);
     merge_consecutive_same_role(messages);
-    truncate_old_tool_results(messages, keep_last_messages);
+    drop_old_tool_results(messages, keep_last_messages);
     truncate_old_assistant_messages(messages, keep_last_messages);
     strip_dangling_tool_calls(messages);
     remove_orphaned_tool_results(messages);
@@ -121,7 +168,10 @@ fn merge_consecutive_same_role(messages: &mut Vec<Value>) {
     *messages = merged;
 }
 
-pub fn truncate_old_tool_results(messages: &mut Vec<Value>, keep_last_n: usize) {
+/// Drop tool-result messages entirely, keeping only the last `keep_last_n`.
+/// (Formerly `truncate_old_tool_results` — renamed: it removes messages, it
+/// does not shrink bodies. Body shrinking lives in [`shrink_tool_body`].)
+pub fn drop_old_tool_results(messages: &mut Vec<Value>, keep_last_n: usize) {
     if keep_last_n == usize::MAX || messages.len() <= keep_last_n {
         return;
     }
@@ -336,7 +386,8 @@ mod tests {
         messages.push(json!({"role": "developer", "content": "protocol"}));
         for i in 0..12 {
             messages.push(json!({"role": "user", "content": format!("q{i}"), "_db_id": 2*i+1}));
-            messages.push(json!({"role": "assistant", "content": format!("a{i}"), "_db_id": 2*i+2}));
+            messages
+                .push(json!({"role": "assistant", "content": format!("a{i}"), "_db_id": 2*i+2}));
         }
         messages.push(json!({"role": "user", "content": "current question"}));
         let before = messages.len(); // 27
@@ -386,6 +437,31 @@ mod tests {
             "role": "user",
             "content": content
         })
+    }
+
+    /// Branches of the unified body-shrink primitive not pinned elsewhere:
+    /// pass-through (`None`) for both policies, and the UTF-8 char-boundary
+    /// backoff in `ByteCap`. The shrink outputs themselves are pinned by the
+    /// filters.rs and token_budget.rs suites (byte-stability contracts).
+    #[test]
+    fn test_shrink_tool_body_pass_through_and_char_boundary() {
+        // Small bodies pass through unchanged under both policies.
+        assert_eq!(shrink_tool_body("ok", ToolBodyPolicy::ByteCap(8000)), None);
+        assert_eq!(
+            shrink_tool_body("ok", ToolBodyPolicy::Digest { preview_len: 200 }),
+            None
+        );
+
+        // Cap landing inside a multi-byte char must back off to a boundary.
+        let s = format!("{}é tail", "x".repeat(9)); // 'é' spans bytes 9..11
+        let capped = shrink_tool_body(&s, ToolBodyPolicy::ByteCap(10)).unwrap();
+        assert_eq!(capped, "xxxxxxxxx\n…[tool output truncated]");
+
+        // Over-threshold digest emits the digest marker.
+        let long = "y".repeat(300);
+        let digest = shrink_tool_body(&long, ToolBodyPolicy::Digest { preview_len: 200 }).unwrap();
+        assert!(digest.starts_with("TOOL_OUTPUT_DIGEST v1 | sha256:"));
+        assert!(digest.contains("len:300"));
     }
 
     #[test]
@@ -510,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_old_tool_results_keeps_last_n() {
+    fn test_drop_old_tool_results_keeps_last_n() {
         let mut messages = vec![
             assistant_with_tool_call("tc_1"),
             tool_result("tc_1", "old"),
@@ -519,7 +595,7 @@ mod tests {
             assistant_with_tool_call("tc_3"),
             tool_result("tc_3", "newest"),
         ];
-        truncate_old_tool_results(&mut messages, 2);
+        drop_old_tool_results(&mut messages, 2);
 
         let remaining_results: Vec<_> = messages.iter().filter(|m| get_role(m) == "tool").collect();
         assert!(remaining_results.len() <= 2);

@@ -6,6 +6,8 @@
 use serde_json::Value;
 use tracing::warn;
 
+use crate::agent::context_hygiene::{shrink_tool_body, ToolBodyPolicy};
+
 /// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
 ///
 /// ponytail: deliberately NOT the tiktoken counter (PERF-02 evaluated
@@ -214,7 +216,7 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     // Stage 6: Token budget — prevent context bombs from sessions that
     // accumulated large tool results. Walk backward from the end, keeping
     // messages until the cumulative token count exceeds the budget.
-    // Budget is derived from max_messages: since history_limit() already
+    // Budget is derived from max_messages: since the LCM history limit already
     // calculates "30% of context / 150 tokens per message", we use
     // max_messages * 150 as the token ceiling. This gives history at most
     // 30% of the context window in tokens, not just in message count.
@@ -295,14 +297,8 @@ const TOOL_BODY_MAX_BYTES: usize = 8000;
 /// UTF-8 char boundary. Deterministic in its input, so the same stored tool
 /// result always renders identically — keeping the prompt prefix byte-stable.
 fn cap_tool_body(content: &str) -> String {
-    if content.len() <= TOOL_BODY_MAX_BYTES {
-        return content.to_string();
-    }
-    let mut end = TOOL_BODY_MAX_BYTES;
-    while end > 0 && !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n…[tool output truncated]", &content[..end])
+    shrink_tool_body(content, ToolBodyPolicy::ByteCap(TOOL_BODY_MAX_BYTES))
+        .unwrap_or_else(|| content.to_string())
 }
 
 #[cfg(test)]

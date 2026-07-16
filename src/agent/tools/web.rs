@@ -146,7 +146,10 @@ impl WebSearchTool {
             .user_agent(USER_AGENT)
             .default_headers(
                 std::collections::HashMap::from([
-                    ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                    (
+                        "accept",
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    ),
                     ("accept-language", "en-US,en;q=0.9"),
                     ("accept-encoding", "gzip, deflate, br"),
                     ("sec-fetch-dest", "document"),
@@ -155,7 +158,12 @@ impl WebSearchTool {
                     ("x-forwarded-for", "127.0.0.1"),
                 ])
                 .into_iter()
-                .map(|(k, v)| (reqwest::header::HeaderName::from_static(k), reqwest::header::HeaderValue::from_static(v)))
+                .map(|(k, v)| {
+                    (
+                        reqwest::header::HeaderName::from_static(k),
+                        reqwest::header::HeaderValue::from_static(v),
+                    )
+                })
                 .collect(),
             )
             .build()

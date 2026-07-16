@@ -47,10 +47,13 @@ You: What's the weather like?
 
 ### Go local with `/local`
 
-Toggle between cloud and local inference mid-conversation. nanobot connects to LM Studio, loads a model, and switches over.
+Toggle between cloud and local inference mid-conversation. nanobot first adopts
+an already-running compatible endpoint. It starts a server only when
+`agents.defaults.localAutostart` explicitly selects `"higgs"` or
+`"lmstudio"`; the default, `"off"`, never spawns one.
 
 ```
-You: /local
+You: /local  # with localAutostart: "lmstudio"
   Starting LM Studio server on port 1234...
   Loading model...
 
@@ -165,7 +168,38 @@ With the `voice` feature enabled, voice messages sent via Telegram or WhatsApp a
 
 ### Context compaction
 
-Long conversations don't lose context. When history exceeds the token budget, nanobot summarizes older messages via a cheap LLM call instead of silently dropping them. The summary preserves key facts, decisions, and pending actions. Falls back to hard truncation if summarization fails.
+Long conversations don't lose their source history. LCM stores every raw
+message in `~/.nanobot/sessions.db` and replaces older active context with
+hierarchical summaries that point back to those originals. Local compaction
+uses the configured on-demand Higgs model; deterministic compression is the
+hard-limit fallback when that model is unavailable.
+
+The compaction sidecar is loaded only while LCM or reflection is using it. Its
+canonical configuration lives under `lcm`. Autonomous spawning is explicit:
+set `agents.defaults.localAutostart` to `"higgs"`; `"off"` and `"lmstudio"`
+may reuse a healthy sidecar but never start one.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "localAutostart": "higgs"
+    }
+  },
+  "lcm": {
+    "compactionModelDir": "/path/to/small-higgs-model",
+    "compactionPort": 8092,
+    "compactionContextSize": 4096
+  }
+}
+```
+
+For one release, `agents.defaults.higgsCompactionModelDir` and
+`agents.defaults.higgsCompactionPort` are accepted as migration aliases. New
+configuration should not use them. The removed `higgsCompactionModel`,
+`higgsCompactionOnDemand`, and `compactionEndpoint` fields are not part of the
+new schema: Higgs reports the model it actually serves, the sidecar is always
+on demand, and its endpoint comes from the canonical directory/port fields.
 
 ### Concurrent message processing
 
@@ -173,9 +207,14 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 
 ### Memory and skills
 
-- **Memory**: Daily notes + long-term MEMORY.md, loaded into every prompt
+- **Memory**: Curated cross-session facts in
+  `~/.nanobot/workspace/memory/MEMORY.md`. Reflection reads completed session
+  working state from SQLite, atomically updates this file, then marks those rows
+  reflected.
 - **Skills**: Markdown files with YAML frontmatter at `{workspace}/skills/{name}/SKILL.md`. Skills marked `always: true` are always loaded; others appear as summaries the agent can read on demand
-- **Sessions**: JSONL persistence at `~/.nanobot/sessions/`
+- **Sessions**: Raw messages, stable IDs, LCM nodes, tool results, snapshots,
+  and session-scoped working memory live in `~/.nanobot/sessions.db`. JSONL is
+  an explicit import/export format, not a live session store.
 
 ## Interactive commands
 
@@ -192,6 +231,7 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 | `/paste`, `/p` | Paste mode -- multiline input until `---` |
 | `/stop` | Stop all running channels |
 | `/status`, `/s` | Show current mode, model, and channels |
+| `/lcm stats` | Show read-only LCM compaction statistics |
 | `/help`, `/h` | Show help |
 | `Ctrl+C` | Exit |
 
@@ -205,6 +245,9 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 | `nanobot gateway` | Start with channel adapters |
 | `nanobot status` | Configuration status |
 | `nanobot tune --input bench.json` | Pick best local profile from benchmark JSON |
+| `nanobot sessions import-jsonl [path]` | Import legacy session JSONL once |
+| `nanobot sessions export <session> --format jsonl` | Export a SQLite session as JSONL |
+| `nanobot sessions delete <session-id>` | Transactionally delete one session and all owned rows |
 | `nanobot channels status` | Channel status |
 | `nanobot cron list` | List scheduled jobs |
 | `nanobot cron add` | Add a scheduled job |
@@ -236,8 +279,14 @@ Key agent settings in `config.json`:
 | `agents.defaults.maxTokens` | `8192` | Max response tokens |
 | `agents.defaults.maxContextTokens` | `128000` | Context window size |
 | `agents.defaults.maxConcurrentChats` | `4` | Parallel chat limit (gateway) |
+| `agents.defaults.localAutostart` | `off` | Spawn policy when discovery finds no local endpoint: `off`, `higgs`, or `lmstudio` |
+| `agents.defaults.higgsPort` | `8091` | Main managed Higgs endpoint |
+| `agents.defaults.lmsPort` | `1234` | LM Studio endpoint |
 
-For local mode, install [LM Studio](https://lmstudio.ai/) and its CLI (`lms`). Models are managed through LM Studio.
+Local discovery prefers an explicitly configured endpoint, then Higgs, then LM
+Studio. `localBackend` is derived from the endpoint that answers; it is not a
+second spawn switch. For LM Studio autostart, install
+[LM Studio](https://lmstudio.ai/) and its CLI (`lms`).
 
 ### Voice settings (`voice` block in `config.json`)
 

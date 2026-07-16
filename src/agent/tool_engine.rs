@@ -53,11 +53,12 @@ fn inline_hot_prompt_result_cap(ctx: &TurnContext) -> usize {
     effective_tool_result_cap(ctx.core.max_tool_result_chars)
 }
 
-/// Stash a result before any lossy prompt shaping. The live map keeps recall
-/// fast within the process; SQLite makes the same call id recoverable after a
-/// restart or explicit session resume. Small results need neither copy.
+/// Stash a result before any lossy prompt shaping. SQLite is the sole source
+/// of truth, keyed by concrete session id plus tool-call id. Small results do
+/// not need a second copy because their full body remains in message history.
 async fn stash_oversized_tool_result(
-    ctx: &TurnContext,
+    sessions: &crate::session::SessionDb,
+    session_id: &str,
     tool_call_id: &str,
     tool_name: &str,
     data: &str,
@@ -66,16 +67,17 @@ async fn stash_oversized_tool_result(
     if tool_name == "recall_tool_result" || data.chars().count() <= cap {
         return false;
     }
-    ctx.counters
-        .tool_result_store
-        .lock()
-        .insert(tool_call_id.to_string(), data.to_string());
-    let _ = ctx
-        .core
-        .sessions
-        .store_tool_result(&ctx.session_id, tool_call_id, tool_name, data)
-        .await;
-    true
+    sessions
+        .store_tool_result(session_id, tool_call_id, tool_name, data)
+        .await
+}
+
+/// Persistence must succeed before an oversized result can be replaced by a
+/// bounded preview. If SQLite rejects the write, retaining the raw body in the
+/// active context is the only lossless fallback: a recall pointer would point
+/// at data that does not exist.
+fn must_preserve_unstashed_raw(data: &str, cap: usize, stashed: bool) -> bool {
+    data.chars().count() > cap && !stashed
 }
 
 fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> String {
@@ -146,8 +148,8 @@ fn build_tool_result_preview(
 /// Digest a tool result for in-context storage with lossless retrieval.
 ///
 /// Small results (≤ `cap`) pass through verbatim. Large results are reduced to
-/// a head+tail preview and the FULL body is stashed in `store` keyed by
-/// `tool_call_id`; the preview tells the model how to call
+/// a head+tail preview; the caller has already stored the FULL body in SQLite
+/// under `(session_id, tool_call_id)`. The preview tells the model how to call
 /// `recall_tool_result` to recover the middle. This bounds each result's
 /// in-context cost to ~`cap` chars (so N tool calls cost ~N×cap, not N×full)
 /// while keeping any result one tool call away — no re-run needed.
@@ -157,7 +159,6 @@ fn digest_tool_result(
     data: &str,
     cap: usize,
     tool_call_id: &str,
-    store: &parking_lot::Mutex<std::collections::HashMap<String, String>>,
 ) -> String {
     // A recalled output IS the verbatim body the model explicitly asked for —
     // never re-digest it (would re-truncate into another preview and loop the
@@ -170,9 +171,6 @@ fn digest_tool_result(
     if total_chars <= cap {
         return data.to_string();
     }
-    store
-        .lock()
-        .insert(tool_call_id.to_string(), data.to_string());
     build_tool_result_preview(tool_name, args, data, cap, tool_call_id)
 }
 
@@ -542,10 +540,20 @@ pub(crate) async fn execute_tools_delegated(
         // lossless recall — digesting `injected_raw` directly would store the
         // summary instead of the original. Then preview injected_raw and add a
         // recall pointer when the raw was stashed.
-        let stashed_raw =
-            stash_oversized_tool_result(ctx, &tc.id, &tc.name, full_data, cap).await;
-        let mut injected =
-            build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id);
+        let stashed_raw = stash_oversized_tool_result(
+            &ctx.core.sessions,
+            &ctx.session_id,
+            &tc.id,
+            &tc.name,
+            full_data,
+            cap,
+        )
+        .await;
+        let mut injected = if must_preserve_unstashed_raw(full_data, cap, stashed_raw) {
+            full_data.to_string()
+        } else {
+            build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
+        };
         if stashed_raw && !injected.contains("recall_tool_result") {
             injected.push_str(&format!(
                 "\n[full original output retrievable via recall_tool_result({{\"tool_call_id\": \"{}\"}})]",
@@ -913,9 +921,7 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
     let data = if r.tool_name == "recall_tool_result" {
         ctx.content_gate
             .budget
-            .consume(crate::agent::token_budget::TokenBudget::estimate_str_tokens(
-                &result_data,
-            ));
+            .consume(crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data));
         result_data
     } else if ctx.core.specialist_provider.is_some()
         && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > threshold
@@ -924,7 +930,8 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
         // recall — without this, recall would return the specialist's summary
         // instead of the original. Then summarize and preview the summary.
         let stashed_raw = stash_oversized_tool_result(
-            ctx,
+            &ctx.core.sessions,
+            &ctx.session_id,
             &r.tool_id,
             &r.tool_name,
             &result_data,
@@ -940,8 +947,11 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
             )
             .await
             .into_text();
-        let mut preview =
-            build_tool_result_preview(&r.tool_name, &r.arguments, &summarized, cap, &r.tool_id);
+        let mut preview = if must_preserve_unstashed_raw(&result_data, cap, stashed_raw) {
+            result_data.clone()
+        } else {
+            build_tool_result_preview(&r.tool_name, &r.arguments, &summarized, cap, &r.tool_id)
+        };
         // If the summary fit under cap, build_tool_result_preview returned it
         // unchanged with no recall pointer — but the raw IS stashed, so tell
         // the model it can still recover the original.
@@ -953,23 +963,25 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
         }
         preview
     } else {
-        let _ = stash_oversized_tool_result(
-            ctx,
+        let stashed_raw = stash_oversized_tool_result(
+            &ctx.core.sessions,
+            &ctx.session_id,
             &r.tool_id,
             &r.tool_name,
             &result_data,
             cap,
         )
         .await;
-        let prompt_data = digest_tool_result(
-            &r.tool_name,
-            &r.arguments,
-            &result_data,
-            cap,
-            &r.tool_id,
-            &ctx.counters.tool_result_store,
-        );
-        ctx.content_gate.admit_simple(&prompt_data).into_text()
+        if must_preserve_unstashed_raw(&result_data, cap, stashed_raw) {
+            ctx.content_gate.budget.consume(
+                crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data),
+            );
+            result_data
+        } else {
+            let prompt_data =
+                digest_tool_result(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id);
+            ctx.content_gate.admit_simple(&prompt_data).into_text()
+        }
     };
 
     if ctx.core.provenance_config.enabled {
@@ -1360,12 +1372,10 @@ mod tests {
     }
 
     #[test]
-    fn digest_tool_result_passes_small_data_raw_and_stores_nothing() {
-        let store = parking_lot::Mutex::new(std::collections::HashMap::new());
+    fn digest_tool_result_passes_small_data_raw() {
         let args = HashMap::new();
-        let out = digest_tool_result("exec", &args, "short output", 1200, "call_1", &store);
+        let out = digest_tool_result("exec", &args, "short output", 1200, "call_1");
         assert_eq!(out, "short output");
-        assert!(store.lock().is_empty(), "small result must not be stored");
     }
 
     #[test]
@@ -1374,9 +1384,80 @@ mod tests {
         assert_eq!(effective_tool_result_cap(2_000), 2_000);
     }
 
+    #[tokio::test]
+    async fn failed_tool_result_stash_preserves_raw_body_without_recall_pointer() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let data = format!(
+            "{}MIDDLE_SECRET{}",
+            "head\n".repeat(100),
+            "tail\n".repeat(100)
+        );
+        let cap = 120;
+
+        // The missing session makes SQLite reject the foreign-keyed result.
+        let stashed = stash_oversized_tool_result(
+            &sessions,
+            "missing-session",
+            "call_failed",
+            "read_file",
+            &data,
+            cap,
+        )
+        .await;
+        let injected = if must_preserve_unstashed_raw(&data, cap, stashed) {
+            data.clone()
+        } else {
+            digest_tool_result("read_file", &HashMap::new(), &data, cap, "call_failed")
+        };
+
+        assert!(!stashed);
+        assert_eq!(injected, data);
+        assert!(injected.contains("MIDDLE_SECRET"));
+        assert!(!injected.contains("recall_tool_result"));
+    }
+
+    #[tokio::test]
+    async fn successful_tool_result_stash_allows_lossless_recall_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("test:tool-result").await;
+        let data = format!(
+            "{}MIDDLE_SECRET{}",
+            "head\n".repeat(100),
+            "tail\n".repeat(100)
+        );
+        let cap = 120;
+
+        let stashed = stash_oversized_tool_result(
+            &sessions,
+            &session.id,
+            "call_stored",
+            "read_file",
+            &data,
+            cap,
+        )
+        .await;
+        let injected = if must_preserve_unstashed_raw(&data, cap, stashed) {
+            data.clone()
+        } else {
+            digest_tool_result("read_file", &HashMap::new(), &data, cap, "call_stored")
+        };
+
+        assert!(stashed);
+        assert!(injected.contains("recall_tool_result"));
+        assert!(!injected.contains("MIDDLE_SECRET"));
+        assert_eq!(
+            sessions
+                .load_tool_result(&session.id, "call_stored")
+                .await
+                .as_deref(),
+            Some(data.as_str())
+        );
+    }
+
     #[test]
-    fn digest_tool_result_stashes_full_and_points_to_recall() {
-        let store = parking_lot::Mutex::new(std::collections::HashMap::new());
+    fn digest_tool_result_points_to_sqlite_recall() {
         let mut args = HashMap::new();
         args.insert("path".to_string(), serde_json::json!("src/lib.rs"));
         let data = format!(
@@ -1385,7 +1466,7 @@ mod tests {
             "tail line\n".repeat(200)
         );
 
-        let out = digest_tool_result("read_file", &args, &data, 1200, "call_42", &store);
+        let out = digest_tool_result("read_file", &args, &data, 1200, "call_42");
 
         // Preview is bounded and omits the middle.
         assert!(out.chars().count() <= 1200);
@@ -1393,8 +1474,6 @@ mod tests {
         // Points the model at the recall tool with the right id.
         assert!(out.contains("recall_tool_result"));
         assert!(out.contains("call_42"));
-        // Full body is stashed for lossless retrieval.
-        assert_eq!(store.lock().get("call_42").map(|s| s.len()), Some(data.len()));
     }
 
     #[test]

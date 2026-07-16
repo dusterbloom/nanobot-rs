@@ -1005,12 +1005,10 @@ impl SubagentManager {
             })
             .unwrap_or(4096);
 
-        let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut tool_defs = if is_local {
-            tools.get_lean_definitions()
-        } else {
-            tools.get_definitions()
-        };
+        // Subagents use the same Lean production catalog as the main loop in
+        // both cloud and local modes. Long-tail tools remain available through
+        // the proxy definition.
+        let tool_defs = tools.get_lean_definitions();
 
         let mut final_content = String::new();
         let mut taint_state = crate::agent::taint::TaintState::new();
@@ -1024,10 +1022,6 @@ impl SubagentManager {
                 config.max_iterations
             );
 
-            // Refresh tool definitions for local models as used_tools may have expanded.
-            if is_local && iteration > 0 {
-                tool_defs = tools.get_lean_definitions();
-            }
             let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
                 None
             } else {
@@ -1118,11 +1112,8 @@ impl SubagentManager {
             if crate::agent::tool_runner::process_tool_response(&response, &mut messages, &tools)
                 .await
             {
-                // Track invocation count and expand used_tools for local definition refresh.
+                // Track whether the subagent actually used its advertised tools.
                 tools_invoked += response.tool_calls.len() as u32;
-                for tc in &response.tool_calls {
-                    used_tools.insert(tc.name.clone());
-                }
                 // Taint tracking: check sensitive tools before marking new taint sources.
                 for tc in &response.tool_calls {
                     if let Some(_spans) = taint_state.check_sensitive(&tc.name) {
@@ -1443,7 +1434,8 @@ mod tests {
         assert_eq!(s.model, agent_profiles::resolve_model_alias("haiku"));
 
         // No explicit, no profile → default subagent model.
-        let s = resolve_spawn_settings(None, None, Some("default-model"), "parent-model", false, 20);
+        let s =
+            resolve_spawn_settings(None, None, Some("default-model"), "parent-model", false, 20);
         assert_eq!(s.model, "default-model");
 
         // Nothing at all → parent model (last resort).

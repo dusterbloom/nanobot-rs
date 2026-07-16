@@ -23,5 +23,7 @@ pub fn scaffold_user(content: impl Into<String>) -> serde_json::Value {
 
 /// True if a message is a synthetic scaffold (injected nudge, not real input).
 pub fn is_synthetic(msg: &serde_json::Value) -> bool {
-    msg.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false)
+    msg.get("_synthetic")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }

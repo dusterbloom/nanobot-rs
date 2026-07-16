@@ -73,6 +73,18 @@ pub(crate) struct ReplContext {
     pub cluster_state: Option<Arc<crate::cluster::state::ClusterState>>,
 }
 
+/// Whether the configured policy authorizes the watchdog to recreate the
+/// currently selected backend. Commands and background repair share this
+/// `localAutostart` authority; `localBackend` is runtime identity only.
+fn autonomous_restart_allowed(config: &Config) -> bool {
+    let is_higgs = crate::config::schema::is_higgs_backend(&config.agents.defaults.local_backend);
+    matches!(
+        (config.agents.defaults.local_autostart, is_higgs),
+        (crate::config::schema::LocalAutostart::Higgs, true)
+            | (crate::config::schema::LocalAutostart::Lmstudio, false)
+    )
+}
+
 // ============================================================================
 // Unified model picker types
 // ============================================================================
@@ -305,11 +317,14 @@ impl ReplContext {
     /// Aborts any previous watchdog task, collects current server ports, and
     /// spawns a fresh watchdog with auto-repair. Called on REPL init and on `/local` toggle-on.
     /// No-op when using a remote local server — nothing to watch.
-    /// Exception: Higgs is a managed sidecar that uses local_api_base but still
-    /// needs watchdog monitoring.
+    /// A Higgs endpoint is monitored only when `localAutostart: "higgs"`
+    /// authorizes background repair.
     pub fn restart_watchdog(&mut self) {
         if let Some(handle) = self.watchdog_handle.take() {
             handle.abort();
+        }
+        if !autonomous_restart_allowed(&self.config) {
+            return;
         }
         // Remote server: nothing to watch locally — unless it's Higgs (managed sidecar).
         let is_higgs =
@@ -317,11 +332,9 @@ impl ReplContext {
         if !is_higgs && !self.config.agents.defaults.local_api_base.is_empty() {
             return;
         }
-        let port = if is_higgs {
-            self.config.agents.defaults.higgs_port.to_string()
-        } else {
-            self.srv.local_port.clone()
-        };
+        // Discovery is runtime truth. A manually started Higgs may answer on a
+        // port different from the stale `higgsPort` hint.
+        let port = self.srv.local_port.clone();
         let ports = vec![("main".to_string(), port)];
         self.watchdog_handle = Some(crate::server::start_health_watchdog_with_autorepair(
             ports,
@@ -345,9 +358,14 @@ impl ReplContext {
     ///
     /// Returns true if a restart was performed.
     pub async fn handle_restart_requests(&mut self) -> bool {
+        if !autonomous_restart_allowed(&self.config) {
+            while self.restart_rx.try_recv().is_ok() {}
+            return false;
+        }
         // When using a remote local server, there are no local server processes
         // to restart — drain and ignore any stale requests.
-        // Exception: Higgs is managed and CAN be restarted.
+        // A Higgs endpoint can be restarted only under explicit Higgs
+        // autostart authority (checked above).
         let is_higgs =
             crate::config::schema::is_higgs_backend(&self.config.agents.defaults.local_backend);
         if !is_higgs && !self.config.agents.defaults.local_api_base.is_empty() {
@@ -885,7 +903,7 @@ impl ReplContext {
                 self.cmd_context().await;
             }
             "/memory" => {
-                self.cmd_memory();
+                self.cmd_memory().await;
             }
             "/learn" | "/reflect" => {
                 self.cmd_learn().await;
@@ -1073,6 +1091,31 @@ mod tests {
         assert_eq!(normalize_alias("/local"), "/local");
         assert_eq!(normalize_alias("/unknown"), "/unknown");
         assert_eq!(normalize_alias("hello"), "hello");
+    }
+
+    #[test]
+    fn test_watchdog_autorestart_requires_matching_autostart_authority() {
+        let mut config = Config::default();
+        config.agents.defaults.local_backend = "higgs".to_string();
+
+        config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Off;
+        assert!(!autonomous_restart_allowed(&config));
+
+        config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Lmstudio;
+        assert!(!autonomous_restart_allowed(&config));
+
+        config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Higgs;
+        assert!(autonomous_restart_allowed(&config));
+
+        config.agents.defaults.local_backend = "lmstudio".to_string();
+        config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Off;
+        assert!(!autonomous_restart_allowed(&config));
+
+        config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Higgs;
+        assert!(!autonomous_restart_allowed(&config));
+
+        config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Lmstudio;
+        assert!(autonomous_restart_allowed(&config));
     }
 
     fn test_model_entry(id: &str) -> ModelEntry {

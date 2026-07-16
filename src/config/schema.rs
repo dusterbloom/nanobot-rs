@@ -250,7 +250,7 @@ pub struct AgentDefaults {
     pub max_context_tokens: usize,
     #[serde(default = "default_max_concurrent_chats")]
     pub max_concurrent_chats: usize,
-    /// TUI color-scheme index (0..32), cycled with Ctrl+P. Defaults to 0 (teal).
+    /// TUI color-scheme index (0..31), cycled with Ctrl+P. Defaults to 0 (teal).
     #[serde(default)]
     pub theme_index: u8,
     /// Max characters for inline tool results before truncation (default: 30000).
@@ -264,56 +264,37 @@ pub struct AgentDefaults {
     /// the expected model and a compat sink for the adopted id.
     #[serde(default)]
     pub lms_main_model: String,
-    /// Autonomous local-server spawning policy for `-l` mode (default: off).
-    /// Discovery always runs first; this only governs what happens when NO
-    /// healthy endpoint is found. Explicit user actions (/restart, /local)
-    /// may still start servers regardless of this setting.
+    /// Sole local-server spawning policy for `-l`, `/local`, and `/restart`
+    /// (default: off). Discovery always runs first; when no healthy endpoint
+    /// is found, only the explicitly selected backend may be spawned. `off`
+    /// never authorizes a spawn.
     #[serde(default)]
     pub local_autostart: LocalAutostart,
-    /// Default local inference port (8000; explicit LM Studio endpoints remain
+    /// Default LM Studio inference port (1234; explicit endpoints remain
     /// supported).
     #[serde(default = "default_lms_port")]
     pub lms_port: u16,
-    /// Local backend tag: "lmstudio" (default) or "higgs".
-    ///
-    /// LEGACY as a startup selector: discovery-first startup derives this tag
-    /// from the discovered endpoint (or the `localAutostart` spawn decision);
-    /// a stale value can no longer route requests to a dead port. Still read
-    /// by the provider layer (Higgs session cache, JIT-gate policy).
+    /// Derived runtime identity: "lmstudio" (default) or "higgs".
+    /// Discovery or an authorized `localAutostart` spawn sets this tag; it is
+    /// not a second spawn authority. The provider layer reads it for
+    /// backend-specific behavior such as Higgs session caching and JIT policy.
     #[serde(default = "default_local_backend")]
     pub local_backend: String,
     /// Port for the managed Higgs server (default: 8091).
     #[serde(default = "default_higgs_port")]
     pub higgs_port: u16,
-    /// Port for the compaction Higgs server (default: 8092).
-    /// When set, a second Higgs instance is spawned on this port for compaction,
-    /// avoiding GPU contention with the main model. Requires the higgs backend.
+    /// Legacy alias for `lcm.compactionPort` (accepted for one release).
+    /// New configuration must use the canonical LCM field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub higgs_compaction_port: Option<u16>,
-    /// Model directory for the compaction Higgs instance (e.g. a small Bonsai
-    /// Qwen3-1.7B). When unset, falls back to the main `mlxModelDir`/
-    /// `localModel`. Use a lighter model to avoid GPU memory contention.
+    /// Legacy alias for `lcm.compactionModelDir` (accepted for one release).
+    /// New configuration must use the canonical LCM field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub higgs_compaction_model_dir: Option<String>,
-    /// Model name hint for the compaction Higgs instance (mirrors `localModel`
-    /// for the main instance). When unset, falls back to `localModel`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub higgs_compaction_model: Option<String>,
-    /// When true (default), the compaction Higgs sidecar is spawned on demand
-    /// for each compaction pass and stopped afterward — so it does not compete
-    /// with the main model for unified memory between compactions. When false,
-    /// the sidecar stays resident (the original always-on behaviour).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub higgs_compaction_on_demand: Option<bool>,
     /// Path to MLX model directory (containing .safetensors + tokenizer.json).
     /// Default: ~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mlx_model_dir: Option<String>,
-    /// Path to a smaller draft model for speculative decoding (e.g. 0.8B Qwen3.5).
-    /// When set, mlx_lm.server uses `--draft-model` for GPU-based spec decode.
-    /// Expected speedup: 2-3x on 35B models.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub draft_model: Option<String>,
     /// Number of draft tokens per speculative decoding step (default: 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_draft_tokens: Option<u32>,
@@ -409,7 +390,7 @@ fn default_max_continuations() -> u32 {
 }
 
 fn default_lms_port() -> u16 {
-    8000
+    1234
 }
 
 fn default_higgs_port() -> u16 {
@@ -428,16 +409,17 @@ fn default_local_backend() -> String {
     "lmstudio".to_string()
 }
 
-/// Whether the local backend is a managed Higgs server.
-/// Skips LM Studio spawn but auto-starts Higgs as a sidecar.
+/// Whether the derived runtime identity is a managed Higgs server.
+/// This classification does not authorize spawning; `localAutostart` does.
 pub fn is_higgs_backend(backend: &str) -> bool {
     backend == "higgs"
 }
 
-/// Autonomous local-server spawning policy (`agents.defaults.localAutostart`).
+/// Sole local-server spawning policy (`agents.defaults.localAutostart`).
 ///
-/// `Off` is the default: nanobot never spawns an inference server on its own —
-/// startup discovers running endpoints and shows a note when none is found.
+/// `Off` is the default: nanobot never spawns an inference server, including
+/// from explicit `/local` and `/restart` commands. Discovery of an already
+/// running endpoint remains available.
 /// Unknown config values deserialize to `Off` (never silently enable spawning).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -513,11 +495,8 @@ impl Default for AgentDefaults {
             higgs_port: default_higgs_port(),
             higgs_compaction_port: None,
             higgs_compaction_model_dir: None,
-            higgs_compaction_model: None,
-            higgs_compaction_on_demand: None,
             local_backend: default_local_backend(),
             mlx_model_dir: None,
-            draft_model: None,
             num_draft_tokens: None,
             mlx_preset: default_mlx_preset(),
             instructions_path: None,
@@ -882,27 +861,6 @@ impl Default for CodeExecutionConfig {
     }
 }
 
-/// How tool schemas are presented to local models.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LocalToolMode {
-    /// Single proxy schema (~90 tokens) with inspect/execute modes.
-    /// Requires a model smart enough to use indirect `tool(name, args)` calls.
-    Proxy,
-    /// Core tools as slim schemas + proxy meta-tool for the rest (~1/2 the
-    /// tokens of Slim; long-tail tools reachable via `tool(name, args)`
-    /// inspect/dispatch). Default.
-    #[default]
-    Lean,
-    /// Individual tool schemas with condensed descriptions and stripped parameter
-    /// descriptions (~120 tokens for 12 tools). Keeps real tool names so models
-    /// call them directly.
-    Slim,
-    /// All schemas sent individually with condensed descriptions but full
-    /// parameter detail (~350 tokens).
-    Full,
-}
-
 /// Tools configuration.
 ///
 /// Note: the `exec` field from Python is renamed to `exec_` in Rust to avoid
@@ -920,9 +878,6 @@ pub struct ToolsConfig {
     /// Code execution (Python RPC) tool settings.
     #[serde(default)]
     pub code_execution: CodeExecutionConfig,
-    /// How tool schemas are presented to local models (default: lean).
-    #[serde(default)]
-    pub local_tool_mode: LocalToolMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,41 +1114,6 @@ impl Default for TrioConfig {
 // Memory config
 // ---------------------------------------------------------------------------
 
-/// Tuning knobs for context compaction. Nested under memory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CompactionTuning {
-    /// Maximum merge rounds during compaction (default: 6).
-    pub max_merge_rounds: usize,
-}
-
-impl Default for CompactionTuning {
-    fn default() -> Self {
-        Self {
-            max_merge_rounds: 6,
-        }
-    }
-}
-
-/// Tuning knobs for session management. Nested under memory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SessionTuning {
-    /// Rotate session file when it exceeds this size in bytes (default: 1_000_000).
-    pub rotation_size_bytes: usize,
-    /// Number of recent messages to carry into a new session (default: 10).
-    pub rotation_carry_messages: usize,
-}
-
-impl Default for SessionTuning {
-    fn default() -> Self {
-        Self {
-            rotation_size_bytes: 1_000_000,
-            rotation_carry_messages: 10,
-        }
-    }
-}
-
 /// Tuning knobs for context hygiene. Nested under memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1210,19 +1130,18 @@ impl Default for ContextHygieneConfig {
     }
 }
 
-/// Configuration for the observational memory system.
+/// Configuration for SQLite working memory and curated cross-session memory.
 ///
-/// Observations are LLM-generated summaries of conversations, saved after
-/// context compaction. A background reflector periodically condenses
-/// observations into long-term memory (`MEMORY.md`).
+/// LCM updates the concrete session's working-memory row. A background
+/// reflector periodically distills completed rows into `MEMORY.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryConfig {
-    /// Enable/disable observational memory (default: true).
+    /// Enable/disable working memory and reflection (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Model to use for memory operations (observation + reflection).
+    /// Model to use for LCM compaction and reflection.
     /// If empty: Anthropic/OpenRouter defaults to "haiku", other cloud providers
     /// fall back to the main model, local defaults to trio specialist if available.
     /// Override with any model name, e.g. "gemini/gemini-2.5-flash".
@@ -1235,12 +1154,6 @@ pub struct MemoryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderConfig>,
 
-    /// Deprecated: observations are no longer injected into the system prompt.
-    /// Kept for backward compatibility with existing config files.
-    #[deprecated(note = "Observations removed from system prompt; this field has no effect")]
-    #[serde(default = "default_observation_budget")]
-    pub observation_budget: usize,
-
     /// Max tokens for working memory (per-session state) in the system prompt (default: 1500).
     #[serde(default = "default_working_memory_budget")]
     pub working_memory_budget: usize,
@@ -1252,21 +1165,6 @@ pub struct MemoryConfig {
     /// Seconds of inactivity before auto-completing a working memory session (default: 3600).
     #[serde(default = "default_session_complete_after_secs")]
     pub session_complete_after_secs: u64,
-
-    /// Turns of inactivity before clearing the current session's working memory (default: 15).
-    #[serde(default = "default_stale_memory_turn_threshold")]
-    pub stale_memory_turn_threshold: u64,
-
-    /// Compaction threshold as a percentage of available context (default: 66.6%).
-    /// Compaction fires when this OR `compaction_threshold_tokens` is exceeded.
-    #[serde(default = "default_compaction_threshold_percent")]
-    pub compaction_threshold_percent: f64,
-
-    /// Compaction threshold in absolute tokens (default: 100000).
-    /// Compaction fires when this OR `compaction_threshold_percent` is exceeded.
-    /// For large contexts (1M), the percent threshold alone would be too late.
-    #[serde(default = "default_compaction_threshold_tokens")]
-    pub compaction_threshold_tokens: usize,
 
     /// Maximum age (in turns) before messages are preferred for eviction (default: 50).
     /// Messages older than this are dropped first during trim_to_fit.
@@ -1296,20 +1194,6 @@ pub struct MemoryConfig {
     #[serde(default = "default_skill_disclosure")]
     pub skill_disclosure: String,
 
-    /// Context window (tokens) of the compaction/memory model.
-    /// Set when the memory model differs from the main model (e.g. a 2K summarizer).
-    /// Default: 0 (use main model's context size).
-    #[serde(default)]
-    pub compaction_model_context_size: usize,
-
-    /// Tuning knobs for context compaction.
-    #[serde(default)]
-    pub compaction: CompactionTuning,
-
-    /// Tuning knobs for session management.
-    #[serde(default)]
-    pub session: SessionTuning,
-
     /// Tuning knobs for context hygiene.
     #[serde(default)]
     pub hygiene: ContextHygieneConfig,
@@ -1319,28 +1203,12 @@ fn default_true() -> bool {
     true
 }
 
-fn default_observation_budget() -> usize {
-    2000
-}
-
 fn default_working_memory_budget() -> usize {
     600
 }
 
 fn default_session_complete_after_secs() -> u64 {
     3600
-}
-
-fn default_stale_memory_turn_threshold() -> u64 {
-    15
-}
-
-fn default_compaction_threshold_percent() -> f64 {
-    66.6
-}
-
-fn default_compaction_threshold_tokens() -> usize {
-    100_000
 }
 
 fn default_max_message_age_turns() -> usize {
@@ -1372,20 +1240,13 @@ impl Default for MemoryConfig {
             enabled: default_true(),
             model: String::new(),
             provider: None,
-            observation_budget: default_observation_budget(),
             working_memory_budget: default_working_memory_budget(),
             reflection_threshold: default_reflection_threshold(),
             session_complete_after_secs: default_session_complete_after_secs(),
-            stale_memory_turn_threshold: default_stale_memory_turn_threshold(),
-            compaction_threshold_percent: default_compaction_threshold_percent(),
-            compaction_threshold_tokens: default_compaction_threshold_tokens(),
             max_message_age_turns: default_max_message_age_turns(),
             max_history_turns: default_max_history_turns(),
             lazy_skills: true,
             skill_disclosure: default_skill_disclosure(),
-            compaction_model_context_size: 0,
-            compaction: CompactionTuning::default(),
-            session: SessionTuning::default(),
             hygiene: ContextHygieneConfig::default(),
         }
     }
@@ -1792,18 +1653,14 @@ fn default_light_window() -> usize {
 
 /// Configuration for the ensemble proprioception system.
 ///
-/// Controls shared body awareness, tool scoping, audience-aware compaction,
-/// heartbeat grounding, gradient memory, and priority interrupts.
+/// Controls shared body awareness, audience-aware compaction, heartbeat
+/// grounding, gradient memory, and priority interrupts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProprioceptionConfig {
     /// Enable the proprioception system (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
-
-    /// Phase-aware tool scoping for delegation model (default: true).
-    #[serde(default = "default_true")]
-    pub dynamic_tool_scoping: bool,
 
     /// Audience-aware compaction prompts (default: true).
     #[serde(default = "default_true")]
@@ -1838,7 +1695,6 @@ impl Default for ProprioceptionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            dynamic_tool_scoping: true,
             audience_aware_compaction: true,
             grounding_interval: default_grounding_interval(),
             gradient_memory: true,
@@ -1915,17 +1771,12 @@ fn default_lcm_compaction_context_size() -> usize {
 /// Configuration for Lossless Context Management.
 ///
 /// LCM replaces destructive compaction with a dual-state memory:
-/// an immutable store (session JSONL) + active context with hierarchical
+/// immutable SQLite message rows + active context with hierarchical
 /// summaries. Summaries contain pointers back to originals, so the LLM
 /// can `lcm_expand` any summary to recover the full messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LcmSchemaConfig {
-    /// Enable LCM. When `None` (field absent from JSON), auto-resolves to
-    /// `true` if `compaction_endpoint` is configured. Explicit `false`
-    /// always wins.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
     /// Soft threshold as fraction of available context (0.0-1.0).
     /// Triggers async (non-blocking) compaction. Default: 0.5 (50%).
     #[serde(default = "default_lcm_tau_soft")]
@@ -1937,39 +1788,28 @@ pub struct LcmSchemaConfig {
     /// Target tokens for Level 3 deterministic truncation (default: 512).
     #[serde(default = "default_lcm_deterministic_target")]
     pub deterministic_target: usize,
-    /// Dedicated compaction endpoint (url + model). When set, LCM uses this
-    /// model for summarization instead of the default memory/compaction model.
-    /// Example: `{"url": "http://192.168.1.22:1234/v1", "model": "qwen3-0.6b"}`
+    /// Local MLX model directory used to start the on-demand Higgs compaction
+    /// sidecar. Requests use the literal served id resolved from Higgs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction_endpoint: Option<ModelEndpoint>,
+    pub compaction_model_dir: Option<String>,
+    /// Local port for the on-demand Higgs compaction sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_port: Option<u16>,
     /// Context window size of the compaction model in tokens (default: 4096).
-    /// Only used when `compaction_endpoint` is set.
+    /// Used by the compactor attached to the managed sidecar.
     #[serde(default = "default_lcm_compaction_context_size")]
     pub compaction_context_size: usize,
-    /// API key for the compaction endpoint (injected at runtime from
-    /// `agents.defaults.localApiKey`, not serialized in JSON).
-    #[serde(skip)]
-    pub api_key: String,
-}
-
-impl LcmSchemaConfig {
-    /// Whether LCM is active. If `enabled` was not explicitly set in config,
-    /// defaults to `true` when a `compaction_endpoint` is configured.
-    pub fn is_enabled(&self) -> bool {
-        self.enabled.unwrap_or(self.compaction_endpoint.is_some())
-    }
 }
 
 impl Default for LcmSchemaConfig {
     fn default() -> Self {
         Self {
-            enabled: None,
             tau_soft: default_lcm_tau_soft(),
             tau_hard: default_lcm_tau_hard(),
             deterministic_target: default_lcm_deterministic_target(),
-            compaction_endpoint: None,
+            compaction_model_dir: None,
+            compaction_port: None,
             compaction_context_size: default_lcm_compaction_context_size(),
-            api_key: String::new(),
         }
     }
 }
@@ -2761,9 +2601,9 @@ mod tests {
     }
 
     #[test]
-    fn test_default_local_port_is_8000() {
+    fn test_default_lms_port_is_1234() {
         let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
-        assert_eq!(cfg.agents.defaults.lms_port, 8000);
+        assert_eq!(cfg.agents.defaults.lms_port, 1234);
     }
 
     #[test]
@@ -2775,21 +2615,21 @@ mod tests {
 
     #[test]
     fn test_local_autostart_parses_known_values() {
-        let higgs: Config = serde_json::from_str(
-            r#"{"agents": {"defaults": {"localAutostart": "higgs"}}}"#,
-        )
-        .unwrap();
+        let higgs: Config =
+            serde_json::from_str(r#"{"agents": {"defaults": {"localAutostart": "higgs"}}}"#)
+                .unwrap();
         assert_eq!(higgs.agents.defaults.local_autostart, LocalAutostart::Higgs);
 
-        let lms: Config = serde_json::from_str(
-            r#"{"agents": {"defaults": {"localAutostart": "lmstudio"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(lms.agents.defaults.local_autostart, LocalAutostart::Lmstudio);
+        let lms: Config =
+            serde_json::from_str(r#"{"agents": {"defaults": {"localAutostart": "lmstudio"}}}"#)
+                .unwrap();
+        assert_eq!(
+            lms.agents.defaults.local_autostart,
+            LocalAutostart::Lmstudio
+        );
 
         let off: Config =
-            serde_json::from_str(r#"{"agents": {"defaults": {"localAutostart": "off"}}}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"agents": {"defaults": {"localAutostart": "off"}}}"#).unwrap();
         assert_eq!(off.agents.defaults.local_autostart, LocalAutostart::Off);
     }
 
@@ -2797,10 +2637,9 @@ mod tests {
     fn test_local_autostart_unknown_value_falls_back_to_off() {
         // An unknown value must not brick config loading — and must never
         // silently enable spawning. It degrades to Off.
-        let cfg: Config = serde_json::from_str(
-            r#"{"agents": {"defaults": {"localAutostart": "omlx"}}}"#,
-        )
-        .unwrap();
+        let cfg: Config =
+            serde_json::from_str(r#"{"agents": {"defaults": {"localAutostart": "omlx"}}}"#)
+                .unwrap();
         assert_eq!(cfg.agents.defaults.local_autostart, LocalAutostart::Off);
     }
 
@@ -2975,75 +2814,65 @@ mod tests {
     #[test]
     fn test_lcm_config_defaults() {
         let lcm = LcmSchemaConfig::default();
-        assert!(lcm.enabled.is_none());
-        assert!(!lcm.is_enabled()); // no endpoint → disabled
         assert!((lcm.tau_soft - 0.5).abs() < f64::EPSILON);
         assert!((lcm.tau_hard - 0.85).abs() < f64::EPSILON);
         assert_eq!(lcm.deterministic_target, 512);
-        assert!(lcm.compaction_endpoint.is_none());
+        assert!(lcm.compaction_model_dir.is_none());
+        assert!(lcm.compaction_port.is_none());
         assert_eq!(lcm.compaction_context_size, 4096);
     }
 
     #[test]
     fn test_lcm_config_roundtrip() {
         let mut lcm = LcmSchemaConfig::default();
-        lcm.enabled = Some(true);
         lcm.tau_soft = 0.6;
         lcm.tau_hard = 0.9;
         lcm.deterministic_target = 256;
         let json = serde_json::to_string(&lcm).unwrap();
         let lcm2: LcmSchemaConfig = serde_json::from_str(&json).unwrap();
-        assert!(lcm2.is_enabled());
         assert!((lcm2.tau_soft - 0.6).abs() < f64::EPSILON);
         assert!((lcm2.tau_hard - 0.9).abs() < f64::EPSILON);
         assert_eq!(lcm2.deterministic_target, 256);
     }
 
     #[test]
-    fn test_lcm_auto_enabled_with_endpoint() {
-        let json =
-            r#"{"compactionEndpoint": {"url": "http://localhost:1234/v1", "model": "qwen3-0.6b"}}"#;
+    fn test_lcm_managed_compactor_fields() {
+        let json = r#"{"compactionModelDir":"/models/qwen3-0.6b","compactionPort":8092}"#;
         let lcm: LcmSchemaConfig = serde_json::from_str(json).unwrap();
-        assert!(lcm.enabled.is_none(), "enabled was not set in JSON");
-        assert!(lcm.is_enabled(), "auto-enables when endpoint is configured");
+        assert_eq!(lcm.compaction_port, Some(8092));
+        assert_eq!(
+            lcm.compaction_model_dir.as_deref(),
+            Some("/models/qwen3-0.6b")
+        );
     }
 
     #[test]
-    fn test_lcm_explicit_disable_overrides_endpoint() {
-        let json = r#"{"enabled": false, "compactionEndpoint": {"url": "http://localhost:1234/v1", "model": "qwen3-0.6b"}}"#;
+    fn test_legacy_lcm_enabled_field_is_ignored() {
+        let json =
+            r#"{"enabled":false,"compactionModelDir":"/models/qwen3-0.6b","compactionPort":8092}"#;
         let lcm: LcmSchemaConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(lcm.enabled, Some(false));
-        assert!(!lcm.is_enabled(), "explicit false overrides auto-enable");
+        assert_eq!(lcm.compaction_port, Some(8092));
+        assert_eq!(
+            lcm.compaction_model_dir.as_deref(),
+            Some("/models/qwen3-0.6b")
+        );
     }
 
     #[test]
     fn test_lcm_config_from_root_json() {
-        let json = r#"{"lcm": {"enabled": true, "tauSoft": 0.7, "tauHard": 0.9}}"#;
+        let json = r#"{"lcm": {"tauSoft": 0.7, "tauHard": 0.9}}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(cfg.lcm.is_enabled());
         assert!((cfg.lcm.tau_soft - 0.7).abs() < f64::EPSILON);
         assert!((cfg.lcm.tau_hard - 0.9).abs() < f64::EPSILON);
         assert_eq!(cfg.lcm.deterministic_target, 512); // default
     }
 
     #[test]
-    fn test_lcm_absent_defaults_to_disabled() {
+    fn test_lcm_absent_uses_threshold_defaults() {
         let json = r#"{}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(!cfg.lcm.is_enabled());
-    }
-
-    #[test]
-    fn test_compaction_tuning_defaults() {
-        let c = CompactionTuning::default();
-        assert_eq!(c.max_merge_rounds, 6);
-    }
-
-    #[test]
-    fn test_session_tuning_defaults() {
-        let s = SessionTuning::default();
-        assert_eq!(s.rotation_size_bytes, 1_000_000);
-        assert_eq!(s.rotation_carry_messages, 10);
+        assert!((cfg.lcm.tau_soft - 0.5).abs() < f64::EPSILON);
+        assert!((cfg.lcm.tau_hard - 0.85).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -3054,30 +2883,26 @@ mod tests {
 
     #[test]
     fn test_memory_config_nested_tuning() {
-        let json = r#"{"memory": {"compaction": {"maxMergeRounds": 10}, "session": {"rotationSizeBytes": 500000}, "hygiene": {"keepLastMessages": 30}}}"#;
+        let json = r#"{"memory": {"hygiene": {"keepLastMessages": 30}}}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.memory.compaction.max_merge_rounds, 10);
-        assert_eq!(cfg.memory.session.rotation_size_bytes, 500000);
         assert_eq!(cfg.memory.hygiene.keep_last_messages, 30);
     }
 
     #[test]
-    fn test_lcm_compaction_endpoint() {
+    fn test_lcm_managed_compaction_config() {
         let json = r#"{
             "lcm": {
-                "enabled": true,
-                "compactionEndpoint": {
-                    "url": "http://192.168.1.22:1234/v1",
-                    "model": "qwen3-0.6b"
-                },
+                "compactionModelDir": "/models/qwen3-0.6b",
+                "compactionPort": 8092,
                 "compactionContextSize": 2048
             }
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(cfg.lcm.is_enabled());
-        let ep = cfg.lcm.compaction_endpoint.as_ref().unwrap();
-        assert_eq!(ep.url, "http://192.168.1.22:1234/v1");
-        assert_eq!(ep.model, "qwen3-0.6b");
+        assert_eq!(
+            cfg.lcm.compaction_model_dir.as_deref(),
+            Some("/models/qwen3-0.6b")
+        );
+        assert_eq!(cfg.lcm.compaction_port, Some(8092));
         assert_eq!(cfg.lcm.compaction_context_size, 2048);
     }
 
@@ -3100,17 +2925,6 @@ mod tests {
         assert_eq!(cfg.tool_delegation.subagent.max_spawn_depth, 5);
         // Unspecified fields get defaults
         assert_eq!(cfg.tool_delegation.subagent.local_fallback_context, 8192);
-    }
-
-    #[test]
-    fn test_memory_tuning_in_root_config() {
-        let json = r#"{"memory": {"compaction": {"maxMergeRounds": 10}, "session": {"rotationSizeBytes": 500000}}}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.memory.compaction.max_merge_rounds, 10);
-        assert_eq!(cfg.memory.session.rotation_size_bytes, 500000);
-        // Unspecified fields keep defaults
-        assert_eq!(cfg.memory.session.rotation_carry_messages, 10);
-        assert_eq!(cfg.memory.hygiene.keep_last_messages, 20);
     }
 
     #[test]

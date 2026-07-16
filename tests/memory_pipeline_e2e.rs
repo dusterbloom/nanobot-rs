@@ -1,6 +1,6 @@
 //! E2E integration tests for the memory & continual-learning pipeline.
 //!
-//! Tests cover: KnowledgeStore, Embedder, SessionIndexer, Reflector,
+//! Tests cover: KnowledgeStore, Embedder, SQLite working memory, Reflector,
 //! KnowledgeGraph, LoRA Bridge (ExperienceBuffer + D2L/T2L), and RecallTool.
 //!
 //! Tests 1, 2, 5 run without LM Studio (CI-safe).
@@ -19,19 +19,13 @@ use std::thread;
 #[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 use std::time::Duration;
 
-#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
-use chrono::Local;
 #[cfg(feature = "semantic")]
 use tempfile::TempDir;
 
 #[cfg(feature = "semantic")]
 use nanobot::agent::knowledge_store::KnowledgeStore;
-#[cfg(feature = "semantic")]
-use nanobot::agent::session_indexer::index_sessions;
 #[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
 use nanobot::config::schema::Config;
-#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
-use nanobot::utils::helpers::safe_filename;
 
 // =============================================================================
 // Helpers (shared with agent_local_cli_smoke.rs pattern)
@@ -67,7 +61,6 @@ fn write_isolated_config(home: &Path, local_api_base: &str, local_model: &str) {
     fs::create_dir_all(nanobot_dir.join("sessions")).expect("create sessions dir");
     fs::create_dir_all(nanobot_dir.join("logs")).expect("create logs dir");
     fs::create_dir_all(workspace.join("memory")).expect("create memory dir");
-    fs::create_dir_all(workspace.join("memory").join("sessions")).expect("create memory/sessions");
 
     let mut cfg = Config::default();
     cfg.agents.defaults.workspace = workspace.to_string_lossy().to_string();
@@ -78,15 +71,6 @@ fn write_isolated_config(home: &Path, local_api_base: &str, local_model: &str) {
     let cfg_path = nanobot_dir.join("config.json");
     let cfg_json = serde_json::to_string_pretty(&cfg).expect("serialize config");
     fs::write(cfg_path, cfg_json).expect("write config");
-}
-
-#[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
-fn expected_session_path(home: &Path, session_key: &str) -> PathBuf {
-    let safe = safe_filename(&session_key.replace(':', "_"));
-    let date = Local::now().format("%Y-%m-%d");
-    home.join(".nanobot")
-        .join("sessions")
-        .join(format!("{}_{}.jsonl", safe, date))
 }
 
 #[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
@@ -132,19 +116,6 @@ fn run_local_agent_with_retry(
         last = run_local_agent_once(bin, home, session, prompt);
     }
     last
-}
-
-/// Write a realistic JSONL session file with metadata + user/assistant turns.
-#[cfg(feature = "semantic")]
-fn write_session_jsonl(dir: &Path, filename: &str, session_key: &str, turns: &[(&str, &str)]) {
-    let mut lines = vec![format!(
-        r#"{{"_type":"metadata","session_key":"{}","created_at":"2026-02-27T10:00:00Z","updated_at":"2026-02-27T10:30:00Z"}}"#,
-        session_key
-    )];
-    for (role, content) in turns {
-        lines.push(format!(r#"{{"role":"{}","content":"{}"}}"#, role, content));
-    }
-    fs::write(dir.join(filename), lines.join("\n")).expect("write session JSONL");
 }
 
 // =============================================================================
@@ -200,87 +171,7 @@ fn knowledge_store_ingest_and_hybrid_search() {
 }
 
 // =============================================================================
-// Test 2: Session indexer → searchable knowledge (no LM Studio)
-// =============================================================================
-
-#[test]
-#[cfg(feature = "semantic")]
-fn session_indexer_produces_searchable_knowledge() {
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path();
-
-    // Set HOME for this test so open_default() uses our tempdir.
-    // SAFETY: this is a test binary; parallel tests may conflict but #[serial]
-    // is not needed because each test uses unique HOME paths via tempdir.
-    unsafe { std::env::set_var("HOME", home) };
-
-    let nanobot_dir = home.join(".nanobot");
-    let sessions_dir = nanobot_dir.join("sessions");
-    let memory_sessions_dir = nanobot_dir
-        .join("workspace")
-        .join("memory")
-        .join("sessions");
-    fs::create_dir_all(&sessions_dir).unwrap();
-    fs::create_dir_all(&memory_sessions_dir).unwrap();
-
-    // Write a realistic session JSONL about Rust async patterns.
-    write_session_jsonl(
-        &sessions_dir,
-        "cli_async_rust_2026-02-27.jsonl",
-        "cli:async_rust",
-        &[
-            ("user", "How does tokio handle task cancellation in Rust?"),
-            ("assistant", "Tokio uses structured concurrency with select! macro and drop guards. When a task is dropped, its future is cancelled. You can use tokio::select! to race multiple futures and cancel the losers."),
-            ("user", "What about graceful shutdown patterns?"),
-            ("assistant", "For graceful shutdown, use a broadcast channel or tokio::sync::watch. Signal the shutdown, then await all tasks with JoinSet or tokio::join!. The CancellationToken from tokio-util is also excellent for propagating shutdown across task trees."),
-        ],
-    );
-
-    let (indexed, _skipped, errors) = index_sessions(&sessions_dir, &memory_sessions_dir);
-
-    assert_eq!(errors, 0, "no indexing errors expected");
-    assert_eq!(indexed, 1, "should index exactly 1 session");
-
-    // Verify SESSION_*.md was created with YAML frontmatter.
-    let md_files: Vec<_> = fs::read_dir(&memory_sessions_dir)
-        .unwrap()
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .map_or(false, |n| n.starts_with("SESSION_") && n.ends_with(".md"))
-        })
-        .collect();
-    assert_eq!(md_files.len(), 1, "should create exactly 1 SESSION_*.md");
-
-    let md_content = fs::read_to_string(md_files[0].path()).unwrap();
-    assert!(
-        md_content.contains("session_key:"),
-        "SESSION_*.md should have YAML frontmatter"
-    );
-    assert!(
-        md_content.contains("tokio") || md_content.contains("cancellation"),
-        "SESSION_*.md should contain session content"
-    );
-
-    // Verify content is searchable via KnowledgeStore (ingested by index_sessions).
-    let store = KnowledgeStore::open_default().unwrap();
-    let hits = store
-        .hybrid_search("tokio cancellation shutdown", 5)
-        .unwrap();
-    assert!(
-        !hits.is_empty(),
-        "Session content should be searchable in KnowledgeStore after indexing"
-    );
-
-    // Restore HOME (best effort — tempdir cleanup handles the rest).
-    if let Ok(real_home) = std::env::var("USER") {
-        let _ = unsafe { std::env::set_var("HOME", format!("/Users/{}", real_home)) };
-    }
-}
-
-// =============================================================================
-// Test 3: Reflector distills sessions → MEMORY.md + KnowledgeGraph
+// Test 2: Reflector distills sessions → MEMORY.md + KnowledgeGraph
 //         (requires LM Studio)
 // =============================================================================
 
@@ -292,6 +183,7 @@ fn reflector_distills_to_memory_and_graph() {
     use nanobot::agent::reflector::Reflector;
     use nanobot::agent::working_memory::WorkingMemoryStore;
     use nanobot::providers::openai_compat::OpenAICompatProvider;
+    use nanobot::session::db::SessionDb;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -302,24 +194,32 @@ fn reflector_distills_to_memory_and_graph() {
         let workspace = home.join(".nanobot").join("workspace");
         let mem_dir = workspace.join("memory");
         fs::create_dir_all(&mem_dir).unwrap();
-        fs::create_dir_all(mem_dir.join("sessions")).unwrap();
+        let sessions = std::sync::Arc::new(SessionDb::new(
+            &home.join(".nanobot").join("sessions.db"),
+        ));
 
         // Populate workspace with completed working sessions containing
         // distinctive user preferences (short sessions to fit 8K context).
-        let wm = WorkingMemoryStore::new(&workspace);
+        let wm = WorkingMemoryStore::new(sessions.clone());
+        let prefs = sessions.create_session("cli:prefs").await;
         wm.update_from_compaction(
-            "cli:prefs",
+            &prefs.id,
             "User said their favorite programming language is Haskell and they always use the Catppuccin color theme. They prefer functional programming paradigms.",
             0,
-        );
-        wm.complete("cli:prefs");
+        )
+        .await
+        .unwrap();
+        wm.complete(&prefs.id).await.unwrap();
 
+        let tools = sessions.create_session("cli:tools").await;
         wm.update_from_compaction(
-            "cli:tools",
+            &tools.id,
             "User mentioned they use Helix as their primary editor and prefer nix for package management. They run NixOS on their server.",
             0,
-        );
-        wm.complete("cli:tools");
+        )
+        .await
+        .unwrap();
+        wm.complete(&tools.id).await.unwrap();
 
         // Create Reflector with real LLM provider pointed at LM Studio.
         let api_base = std::env::var("NANOBOT_TEST_LOCAL_API_BASE")
@@ -338,10 +238,11 @@ fn reflector_distills_to_memory_and_graph() {
             model,
             &workspace,
             0, // threshold=0 to force reflection
+            sessions,
         );
 
         assert!(
-            reflector.should_reflect(),
+            reflector.should_reflect().await,
             "should_reflect must be true with completed sessions"
         );
 
@@ -363,12 +264,13 @@ fn reflector_distills_to_memory_and_graph() {
         eprintln!("--- MEMORY.md ({} chars) ---", memory_content.len());
         eprintln!("{}", &memory_content[..memory_content.len().min(500)]);
 
-        // Verify sessions were archived.
-        let remaining = wm.list_completed();
+        // Verify completed rows were marked reflected.
+        let remaining = wm.list_completed().await.unwrap();
         assert!(
             remaining.is_empty(),
-            "completed sessions should be archived after reflection"
+            "completed sessions should be consumed after reflection"
         );
+        assert_eq!(wm.list_reflected().await.unwrap().len(), 2);
 
         // Log knowledge graph counts (non-deterministic LLM output).
         let kg = KnowledgeGraph::open_default().unwrap();
@@ -381,14 +283,14 @@ fn reflector_distills_to_memory_and_graph() {
 }
 
 // =============================================================================
-// Test 4: Full pipeline — agent remembers across sessions
+// Test 3: Full pipeline — agent resumes canonical SQLite history
 //         (requires LM Studio + built binary)
 // =============================================================================
 
 #[test]
 #[ignore = "requires running local OpenAI-compatible endpoint (e.g. LM Studio)"]
 #[cfg(all(feature = "semantic", feature = "knowledge-graph"))]
-fn full_pipeline_agent_remembers_across_sessions() {
+fn full_pipeline_agent_resumes_sqlite_session() {
     let bin = resolve_nanobot_bin();
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
@@ -415,49 +317,38 @@ fn full_pipeline_agent_remembers_across_sessions() {
         String::from_utf8_lossy(&output1.stderr)
     );
 
-    // Verify session JSONL was created.
-    let session1_path = expected_session_path(home, &session1);
-    assert!(
-        session1_path.exists(),
-        "Session 1 JSONL not created at {}",
-        session1_path.display()
-    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let db = nanobot::session::db::SessionDb::new(&home.join(".nanobot").join("sessions.db"));
+    let stored = rt
+        .block_on(db.get_latest_session(&session1))
+        .expect("session should be present in SQLite");
+    let messages = rt.block_on(db.get_all_messages(&stored.id));
+    assert!(messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| content.contains("Haskell"))
+    }));
 
-    // Index step: convert JSONL → SESSION_*.md + KnowledgeStore ingestion.
-    // Set HOME so open_default() resolves to our tempdir.
-    unsafe { std::env::set_var("HOME", home) };
-    let sessions_dir = home.join(".nanobot").join("sessions");
-    let memory_sessions_dir = home
-        .join(".nanobot")
-        .join("workspace")
-        .join("memory")
-        .join("sessions");
-    fs::create_dir_all(&memory_sessions_dir).unwrap();
-
-    let (indexed, _, errors) = index_sessions(&sessions_dir, &memory_sessions_dir);
-    assert!(indexed >= 1, "should index at least 1 session");
-    assert_eq!(errors, 0, "no indexing errors expected");
-
-    // Session 2: Ask the agent what it remembers (different session key).
-    let session2 = format!("cli:mem_recall_{}", uuid::Uuid::new_v4());
+    // A second process with the same session key reconstructs raw history from SQLite.
     let output2 = run_local_agent_with_retry(
         &bin,
         home,
-        &session2,
-        "What is my favorite programming language? Check your memory using the recall tool.",
+        &session1,
+        "What favorite programming language did I just tell you?",
         3,
     );
     assert!(
         output2.status.success(),
-        "Session 2 failed: stderr={}",
+        "Resumed session failed: stderr={}",
         String::from_utf8_lossy(&output2.stderr)
     );
 
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
-    eprintln!("--- Session 2 stdout ---\n{}", stdout2);
+    eprintln!("--- Resumed session stdout ---\n{}", stdout2);
     assert!(
         stdout2.to_lowercase().contains("haskell"),
-        "Agent should recall 'Haskell' from memory; stdout={}",
+        "Agent should recover 'Haskell' from SQLite history; stdout={}",
         stdout2
     );
 }

@@ -20,7 +20,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info};
 
-use crate::agent::compaction::ContextCompactor;
 use crate::agent::reflector::Reflector;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::SystemState;
@@ -155,48 +154,7 @@ impl AgentLoop {
 
         let subagents = Arc::new(subagent_mgr);
 
-        // Load persisted bulletin from disk (warm start).
-        let bulletin_cache = {
-            let core = core_handle.swappable();
-            let cache = crate::agent::bulletin::BulletinCache::new();
-            if let Some(persisted) =
-                crate::agent::bulletin::load_persisted_bulletin(&core.workspace)
-            {
-                cache.update(persisted);
-            }
-            cache.handle()
-        };
-
         let system_state = Arc::new(arc_swap::ArcSwap::from_pointee(SystemState::default()));
-
-        // Build dedicated LCM compactor when compaction_endpoint is configured.
-        let lcm_compactor = lcm_config.compaction_endpoint.as_ref().map(|ep| {
-            // Use the local API key so authenticated endpoints (oMLX) work.
-            let api_key = if lcm_config.api_key.is_empty() {
-                "lcm-compactor".to_string()
-            } else {
-                lcm_config.api_key.clone()
-            };
-            let provider: Arc<dyn crate::providers::base::LLMProvider> =
-                crate::providers::factory::create_openai_compat(
-                    crate::providers::factory::ProviderSpec {
-                        api_key,
-                        api_base: Some(ep.url.clone()),
-                        model: Some(ep.model.clone()),
-                        jit_gate: None,
-                        retry: crate::config::schema::RetryConfig::default(),
-                        timeout_secs: 120,
-                        lms_native_probe_secs: 2,
-                        constrained_tool_calls: true,
-                        higgs_session_cache: false,
-                    },
-                );
-            Arc::new(ContextCompactor::new(
-                provider,
-                ep.model.clone(),
-                lcm_config.compaction_context_size,
-            ))
-        });
 
         let shared = Arc::new(AgentLoopShared {
             core_handle,
@@ -205,7 +163,6 @@ impl AgentLoop {
             cron_service,
             email_config,
             repl_display_tx,
-            bulletin_cache,
             system_state,
             proprioception_config,
             aha_rx: Arc::new(Mutex::new(aha_rx)),
@@ -213,10 +170,7 @@ impl AgentLoop {
             session_policies: Arc::new(Mutex::new(HashMap::new())),
             continuity_notes: Arc::new(Mutex::new(HashMap::new())),
             lcm_engines: Arc::new(Mutex::new(HashMap::new())),
-            lcm_enabled: AtomicBool::new(lcm_config.is_enabled()),
             lcm_config,
-            lcm_compactor,
-            compaction_sidecar: parking_lot::Mutex::new(None),
             health_registry,
             #[cfg(feature = "cluster")]
             cluster_router: None,
@@ -234,13 +188,6 @@ impl AgentLoop {
         }
     }
 
-    /// Install the compaction sidecar lifecycle spec (on-demand Bonsai). Set
-    /// once after construction from the call site that owns `Config`, so
-    /// `AgentLoop::new`'s signature stays stable for the many test builders.
-    pub fn set_compaction_sidecar(&self, spec: Option<crate::higgs::CompactionSidecarSpec>) {
-        *self.shared.compaction_sidecar.lock() = spec.map(Arc::new);
-    }
-
     /// Set the cluster router for distributed inference routing.
     ///
     /// Must be called before `run()` or `process_direct()` to take effect.
@@ -256,88 +203,47 @@ impl AgentLoop {
         subagents.cluster_router = Some(router);
     }
 
-    /// Toggle LCM on/off at runtime. Returns the new state.
-    pub fn toggle_lcm(&self) -> bool {
-        let prev = self.shared.lcm_enabled.load(Ordering::Relaxed);
-        let next = !prev;
-        self.shared.lcm_enabled.store(next, Ordering::Relaxed);
-        next
-    }
-
-    /// Whether LCM is currently enabled.
-    pub fn lcm_enabled(&self) -> bool {
-        self.shared.lcm_enabled.load(Ordering::Relaxed)
-    }
-
     /// Check whether the in-process MLX provider is set.
 
-    /// Spawn a periodic bulletin refresh task (compaction model, when idle).
-    fn spawn_bulletin_refresh(shared: &Arc<AgentLoopShared>, running: &Arc<AtomicBool>) {
-        let core = shared.core_handle.swappable();
-        if !core.memory_enabled || core.mode().is_local() {
-            return;
-        }
-        let provider = core.memory_provider.clone();
-        let model = core.memory_model.clone();
-        let workspace = core.workspace.clone();
-        let cache = shared.bulletin_cache.clone();
-        let running = running.clone();
-
-        tokio::spawn(async move {
-            // Initial delay: let the system settle before first bulletin.
-            tokio::time::sleep(Duration::from_secs(5 * 60)).await;
-
-            while running.load(Ordering::Relaxed) {
-                debug!("Bulletin: refreshing...");
-                if let Err(e) = crate::agent::bulletin::refresh_bulletin(
-                    provider.as_ref(),
-                    &model,
-                    &workspace,
-                    &cache,
-                )
-                .await
-                {
-                    tracing::warn!("Bulletin refresh failed: {}", e);
-                }
-                // Sleep until next refresh.
-                tokio::time::sleep(Duration::from_secs(
-                    crate::agent::bulletin::DEFAULT_BULLETIN_INTERVAL_S,
-                ))
-                .await;
-            }
-        });
-        info!(
-            "Bulletin refresh task spawned (every {}min)",
-            crate::agent::bulletin::DEFAULT_BULLETIN_INTERVAL_S / 60
-        );
-    }
-
-    /// Spawn a background reflection task if observations exceed threshold.
-    ///
-    /// Skipped in local mode — the reflection would compete with the main
-    /// request for the single-model GPU, causing OOM or stalls.
+    /// Spawn a background reflection task if completed working sessions exceed
+    /// the configured threshold.
     fn spawn_background_reflection(shared: &Arc<AgentLoopShared>) {
         let core = shared.core_handle.swappable();
-        // migrated from swappable().is_local — phase 09-03
-        if !core.memory_enabled || core.mode().is_local() {
+        if !core.memory_enabled {
             return;
         }
-        let reflector = Reflector::new(
-            core.memory_provider.clone(),
-            core.memory_model.clone(),
-            &core.workspace,
-            core.reflection_threshold,
-        );
-        if reflector.should_reflect() {
-            tokio::spawn(async move {
-                info!("Background: reflecting on accumulated observations...");
-                if let Err(e) = reflector.reflect().await {
-                    tracing::warn!("Background reflection failed: {}", e);
-                } else {
-                    info!("Background reflection complete — MEMORY.md updated");
+        tokio::spawn(async move {
+            if !Reflector::should_reflect_sessions(&core.sessions, core.reflection_threshold).await
+            {
+                return;
+            }
+            let Some(manager) = core.compaction_manager.as_ref() else {
+                tracing::warn!("Background reflection skipped: no managed compaction sidecar");
+                return;
+            };
+            let lease = match manager.acquire().await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    tracing::warn!(%error, "Background reflection: compaction sidecar unavailable");
+                    return;
                 }
-            });
-        }
+            };
+            let reflector = Reflector::new(
+                core.memory_provider.clone(),
+                lease.served_model().to_string(),
+                &core.workspace,
+                core.reflection_threshold,
+                core.sessions.clone(),
+            );
+            info!("Background: reflecting on completed SQLite working memory...");
+            let result = reflector.reflect().await;
+            lease.release().await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "Background reflection failed");
+            } else {
+                info!("Background reflection complete — MEMORY.md updated");
+            }
+        });
     }
 
     /// Run the main agent loop until stopped.
@@ -351,11 +257,8 @@ impl AgentLoop {
             self.max_concurrent_chats
         );
 
-        // Spawn background reflection if observations have accumulated.
+        // Spawn background reflection if completed SQLite working memory has accumulated.
         Self::spawn_background_reflection(&self.shared);
-
-        // Spawn periodic bulletin refresh (compaction model synthesizes briefing).
-        Self::spawn_bulletin_refresh(&self.shared, &self.running);
 
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent_chats));
         // Per-session locks to serialize messages within the same conversation.
@@ -582,12 +485,10 @@ impl AgentLoop {
         &self,
         session_key: &str,
     ) -> Vec<crate::agent::context::PromptBlock> {
-        if !crate::agent::prepare_context::local_always_on_memory_enabled() {
-            return Vec::new();
-        }
         let core = self.shared.core_handle.swappable();
+        let session = core.sessions.get_or_resume(session_key).await;
         self.shared
-            .build_local_runtime_blocks(&core, session_key)
+            .build_local_runtime_blocks(&core, &session.id)
             .await
     }
 
@@ -595,16 +496,11 @@ impl AgentLoop {
     ///
     /// This resets the summary DAG and active context so stale summaries
     /// don't pollute fresh conversations after /clear.
-    pub async fn clear_lcm_engine(&self, session_key: &str) {
+    pub async fn clear_lcm_engine(&self, session_id: &str) {
         let mut engines = self.shared.lcm_engines.lock().await;
-        if engines.remove(session_key).is_some() {
-            debug!(session = %session_key, "LCM engine cleared");
+        if engines.remove(session_id).is_some() {
+            debug!(%session_id, "LCM engine cleared");
         }
-    }
-
-    /// Clear the bulletin cache (e.g. on /clear command).
-    pub fn clear_bulletin_cache(&self) {
-        self.shared.bulletin_cache.store(Arc::new(String::new()));
     }
 
     /// Signal the agent loop to stop.

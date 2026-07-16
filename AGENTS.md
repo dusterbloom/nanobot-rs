@@ -12,7 +12,8 @@ codebase with one well-tuned hot path per concern.
   no parallel "experimental" pipelines living next to the real one.
 - Local (LM Studio) and cloud (Anthropic/OpenAI/etc) are two branches of one
   `RuntimeMode` enum, not two parallel codebases.
-- Long sessions practical via JSONL session files + on-disk `MEMORY.md`.
+- Long sessions practical via SQLite session history + LCM summaries +
+  on-disk `MEMORY.md`.
 
 ## Quality Rules
 
@@ -46,15 +47,15 @@ codebase with one well-tuned hot path per concern.
 - `src/providers/`: OpenAI-compatible HTTP client (covers 9 providers) plus
   Anthropic-native client.
 - `src/channels/`: chat adapters (one file per channel).
-- `src/bus/`, `src/session/`: message types, JSONL session persistence.
+- `src/bus/`, `src/session/`: message types and SQLite session persistence.
 - `src/config/`: JSON config schema and loader.
 
 ## Testing
 
 Use `cargo build` for build validation. Use `cargo test` for unit/regression
-tests. Use `cargo run --release --bin nanobot-bench` for speed regressions when
-changing the agent loop, provider client, or context builder. See
-`CONTRIBUTING.md` for the correctness and speed regression tracks.
+tests. Use `scripts/turn_bench.sh` for matched speed regressions when changing
+the agent loop, provider client, or context builder. See `CONTRIBUTING.md` for
+the correctness and speed regression tracks.
 
 ## Code Style
 
@@ -84,7 +85,7 @@ All providers use OpenAI-compatible chat completions API via
 ## Configuration
 
 - Config: `~/.nanobot/config.json`
-- Sessions: `~/.nanobot/sessions/`
+- Sessions: `~/.nanobot/sessions.db`
 - Workspace (skills, memory): `~/.nanobot/workspace/`
 
 <!-- gitnexus:start -->

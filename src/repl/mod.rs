@@ -23,7 +23,7 @@ use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::provenance::{ClaimStatus, ClaimVerifier};
 use crate::agent::reflector::Reflector;
 use crate::cli;
-use crate::config::loader::{get_data_dir, load_config, save_config};
+use crate::config::loader::{get_data_dir, load_config};
 use crate::config::schema::Config;
 use crate::cron::service::CronService;
 use crate::heartbeat::service::{
@@ -428,17 +428,6 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
         }
     }
 
-    if config.lcm.is_enabled() {
-        if let Some(ref ep) = config.lcm.compaction_endpoint {
-            if !ep.model.trim().is_empty() {
-                models.push((
-                    ep.model.trim().to_string(),
-                    Some(config.lcm.compaction_context_size),
-                ));
-            }
-        }
-    }
-
     // Query already-loaded models so we can skip redundant loads
     let models_url = format!("{}/api/v1/models", native);
     let client = reqwest::Client::new();
@@ -612,7 +601,8 @@ fn spawn_higgs_keepalive(
 /// Adopts the id the server *actually serves* (via `GET /v1/models`) so a stale
 /// config hint can't make every warm-keep ping 404 — e.g. `lmsMainModel:
 /// "qwen36-35b"` against a Higgs that loaded `Qwen3.6-35B-A3B-4bit`, or
-/// `higgsCompactionModel: "bonsai-1.7b"` against `Bonsai-1.7B-mlx-1bit`. Falls
+/// `lcm.compactionModelDir: "/models/bonsai-1.7b"` against a served id such as
+/// `Bonsai-1.7B-mlx-1bit`. Falls
 /// back to `hint` when the server can't be queried (still loading, or not
 /// OpenAI-compatible) so we never send an empty model field.
 async fn resolve_keepalive_model(api_base: &str, api_key: &str, hint: &str) -> String {
@@ -697,7 +687,7 @@ pub(crate) fn print_help() {
     println!("  /clear, /c      - Clear working memory for current session");
     println!("  /replay         - Show session message history (/replay full | /replay N)");
     println!("  /restart, /rd   - Restart local servers (or delegation in cloud mode)");
-    println!("  /sessions, /ss  - Session management (list, export, purge, archive, index)");
+    println!("  /sessions, /ss  - Session management (list, export, purge, archive)");
     println!("  /audit          - Show audit log for current session");
     println!("  /verify         - Re-verify claims in last response");
     println!("  /provenance     - Toggle provenance display on/off");
@@ -1379,7 +1369,6 @@ pub(crate) fn apply_server_change(
         model_name,
         None,
         None,
-        None,
         is_local,
     );
 }
@@ -1393,6 +1382,39 @@ pub(crate) struct ActiveChannel {
     pub name: String,
     pub stop: Arc<AtomicBool>,
     pub handle: tokio::task::JoinHandle<()>,
+}
+
+/// Make the current concrete session eligible for exit reflection.
+///
+/// Reflection consumes only completed working-memory rows. Select from the
+/// active set first so an already completed or reflected row is never moved
+/// backwards in its lifecycle.
+async fn complete_current_working_memory_for_exit(
+    sessions: &Arc<crate::session::db::SessionDb>,
+    working_memory: &crate::agent::working_memory::WorkingMemoryStore,
+    session_key_or_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    let session = match sessions.get_latest_session(session_key_or_id).await {
+        Some(session) => Some(session),
+        None => sessions.get_session(session_key_or_id).await,
+    };
+    let Some(session) = session else {
+        return Ok(None);
+    };
+
+    let active = working_memory.list_active().await?;
+    let Some(current) = active
+        .into_iter()
+        .find(|row| row.session_id == session.id && !row.content.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if working_memory.complete(&current.session_id).await? {
+        Ok(Some(current.session_id))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn cmd_agent(
@@ -1481,7 +1503,6 @@ pub(crate) fn cmd_agent(
             Some(crate::local_discovery::decide_startup(
                 selected,
                 config.agents.defaults.local_autostart,
-                crate::config::schema::is_higgs_backend(&config.agents.defaults.local_backend),
             ))
         } else {
             None
@@ -1517,7 +1538,7 @@ pub(crate) fn cmd_agent(
                 crate::local_discovery::EndpointSource::Higgs => {
                     config.agents.defaults.local_backend = "higgs".to_string();
                     config.agents.defaults.skip_jit_gate = true;
-                    higgs_sidecar_port = Some(config.agents.defaults.higgs_port);
+                    higgs_sidecar_port = pair.port();
                 }
                 crate::local_discovery::EndpointSource::LmStudio => {
                     config.agents.defaults.local_backend = "lmstudio".to_string();
@@ -1557,12 +1578,10 @@ pub(crate) fn cmd_agent(
         let lms_features = is_local
             && !crate::config::schema::is_higgs_backend(&config.agents.defaults.local_backend);
 
-        // Higgs sidecar: auto-start when backend is "higgs" (single-message or interactive).
-        // Start even when localApiBase is set — it may point to the managed Higgs port
-        // from a previous run whose PID file survived or whose server is still loading.
-        //
-        // Exception: when localApiBase points at a REMOTE host (cluster peer, not
-        // localhost), respect the user's explicit endpoint and skip Higgs entirely.
+        // Start Higgs only after discovery produced the explicit SpawnHiggs
+        // action (`localAutostart: "higgs"` with no healthy endpoint). When a
+        // configured localApiBase points at a REMOTE host (cluster peer, not
+        // localhost), respect that explicit endpoint and skip Higgs entirely.
         // The higgs backend tag is sticky across /m switches (see cmd_lifecycle.rs:589),
         // so a stale "higgs" tag must not clobber a deliberate remote URL.
         let api_base_is_remote_host = {
@@ -1637,85 +1656,6 @@ pub(crate) fn cmd_agent(
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
-            }
-        }
-
-        // Dedicated compaction Higgs sidecar (non-contention): when
-        // `higgsCompactionPort` is set, spawn a second Higgs instance on that
-        // port so compaction/memory jobs run on a separate server (ideally a
-        // lighter model) instead of contending with the main model for GPU time.
-        //
-        // Deliberately NOT gated on `use_higgs`: that flag means "discovery
-        // found nothing and autostart wants to spawn a MAIN server" — false
-        // whenever a main endpoint is already running or the backend is LM
-        // Studio, which is exactly when the sidecar is most useful. The
-        // sidecar is self-contained (own port/PID/model) and orthogonal to
-        // how the main endpoint was provisioned.
-        if is_local {
-            if let Some(compaction_port) = config.agents.defaults.higgs_compaction_port {
-                let on_demand = config
-                    .agents
-                    .defaults
-                    .higgs_compaction_on_demand
-                    .unwrap_or(true);
-                if on_demand {
-                    // On-demand Bonsai: don't start the sidecar now — it is
-                    // spawned per-compaction (CompactionSidecarSpec::ensure_up)
-                    // and stopped right after, so it never resident-competes
-                    // with the main model between compactions. The port stays
-                    // set so the compaction provider + spec target it.
-                    info!(
-                        port = compaction_port,
-                        "higgs_compaction_on_demand_enabled_sidecar_not_started"
-                    );
-                } else {
-                let (cmodel_dir, cmodel) = crate::higgs::compaction_sidecar_config(&config);
-                match cmodel_dir {
-                    Some(dir) => {
-                        if let Some(bin) = crate::higgs::find_binary() {
-                            match crate::higgs::server_start_role(
-                                &bin,
-                                compaction_port,
-                                &dir,
-                                &cmodel,
-                                "compaction",
-                            )
-                            .await
-                            {
-                                Ok(crate::higgs::StartResult::Ready) => {
-                                    info!(port = compaction_port, model = %cmodel, "higgs_compaction_ready");
-                                }
-                                Ok(crate::higgs::StartResult::Loading { pid, port }) => {
-                                    eprintln!(
-                                        "Warning: compaction Higgs (pid {pid}) still loading model on port {port} — requests will retry until ready"
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "Warning: failed to start compaction Higgs on port {compaction_port}: {e}\n\
-                                         Compaction will fall back to the main model."
-                                    );
-                                    // Disable the compaction port so the provider
-                                    // builder doesn't point at a dead endpoint.
-                                    config.agents.defaults.higgs_compaction_port = None;
-                                }
-                            }
-                        } else {
-                            eprintln!(
-                                "Warning: Higgs binary not found, cannot start compaction sidecar; compaction will use the main model"
-                            );
-                            config.agents.defaults.higgs_compaction_port = None;
-                        }
-                    }
-                    None => {
-                        eprintln!(
-                            "Warning: higgsCompactionPort set but no model dir configured\n\
-                             (set higgsCompactionModelDir or mlxModelDir); compaction will use the main model"
-                        );
-                        config.agents.defaults.higgs_compaction_port = None;
-                    }
-                }
-                } // end always-on (!on_demand) branch
             }
         }
 
@@ -1831,7 +1771,7 @@ pub(crate) fn cmd_agent(
         // Higgs splash for both a spawned sidecar and a discovered instance.
         if is_interactive && (use_higgs || higgs_sidecar_port.is_some()) && show_splash {
             tui::register_resize_handler();
-            let higgs_port = config.agents.defaults.higgs_port;
+            let higgs_port = higgs_sidecar_port.unwrap_or(config.agents.defaults.higgs_port);
             tui::print_higgs_splash(&local_model_name, higgs_port);
         }
         if is_interactive && needs_lms && !has_remote_local {
@@ -1899,18 +1839,6 @@ pub(crate) fn cmd_agent(
                             }
                         }
 
-                        // Load LCM compaction model when configured.
-                        if config.lcm.is_enabled() {
-                            if let Some(ref ep) = config.lcm.compaction_endpoint {
-                                print!("  Loading {} (LCM compactor)... ", ep.model);
-                                io::stdout().flush().ok();
-                                match crate::lms::load_model("", lms_port, &ep.model, Some(config.lcm.compaction_context_size), config.timeouts.lms_load_secs).await {
-                                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                                }
-                            }
-                        }
-
                         local_model_name = main_model;
                         srv.lms_managed = true;
                         srv.lms_binary = Some(bin);
@@ -1935,14 +1863,13 @@ pub(crate) fn cmd_agent(
         log_startup_phase("local_backend_ready", startup_t0, &mut startup_last);
 
         // Recompute has_remote_local after potential lms setup
-        let mut has_remote_local = !config.agents.defaults.local_api_base.is_empty();
+        let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
 
         // --- Remote peer probe ---
         // If the saved endpoint is a remote peer we didn't start, probe it.
         // When the user has explicitly configured localApiBase we NEVER fall back
-        // to a local llama.cpp server: requests would go to the configured remote
-        // while the local server receives nothing.  Instead, warn and clear the
-        // dead endpoint so the user knows what happened.
+        // to a local llama.cpp server: requests must keep targeting the configured
+        // endpoint even when this best-effort startup probe misses it temporarily.
         // Skip entirely when using MLX or oMLX local backend — no LM Studio involved.
         // Also skip when discovery just validated this endpoint (<1s ago) and
         // adopted its served model — re-probing would only add latency.
@@ -1992,24 +1919,15 @@ pub(crate) fn cmd_agent(
             }
             if probe.is_empty() {
                 // Remote is unreachable.  Because localApiBase is explicitly
-                // configured, do NOT start a local llama.cpp server — requests
-                // still go to the configured URL, so a local server would be
-                // ignored.  Warn the user and clear the dead endpoint instead.
+                // configured, preserve it and let the provider report/retry the
+                // connection failure. Clearing it here would silently reactivate
+                // the default localhost:1234 route.
                 println!(
-                    "  {}{}Remote LM Studio at {} is unreachable.{} Check your localApiBase config.",
+                    "  {}{}Configured local endpoint at {} is currently unreachable.{} Requests will keep using localApiBase.",
                     tui::BOLD,
                     tui::YELLOW,
                     peer_url,
                     tui::RESET,
-                );
-                config.agents.defaults.local_api_base.clear();
-                let mut disk_cfg = load_config(None);
-                disk_cfg.agents.defaults.local_api_base.clear();
-                save_config(&disk_cfg, None);
-                has_remote_local = false;
-                println!(
-                    "  Cleared dead endpoint. Use {}/m{} to pick a model when the remote comes online.",
-                    tui::BOLD, tui::RESET,
                 );
             }
         }
@@ -2100,26 +2018,46 @@ pub(crate) fn cmd_agent(
             &config,
             &srv.local_port,
             Some(&local_model_name),
-            config.agents.defaults.higgs_compaction_port.map(|p| p.to_string()).as_deref(),
             None,
             None,
             is_local,
         );
-        // Resolve --resume / --continue to a real session key.
+        // Resolve --resume / --continue to a real session key. Explicit resume
+        // first touches the requested concrete ID, making it the latest row for
+        // that reusable key before the normal turn path resolves the key.
         let session_id = if let Some(ref id) = resume {
-            // --resume <id>: look up session by ID and use its session_key
             let core = core_handle.swappable();
-            if let Some(meta) = core.sessions.get_session(id).await {
-                info!(session_id = %meta.id, session_key = %meta.session_key, "resuming session by ID");
-                meta.session_key
-            } else {
-                eprintln!("Warning: session '{}' not found, starting new session", id);
-                session_id
+            match core.sessions.resume_session(id).await {
+                Ok(Some(meta)) => {
+                    info!(session_id = %meta.id, session_key = %meta.session_key, "resuming session by ID");
+                    meta.session_key
+                }
+                Ok(None) => {
+                    eprintln!("Warning: session '{}' not found, starting new session", id);
+                    session_id
+                }
+                Err(error) => {
+                    eprintln!("Warning: session '{}' could not be resumed: {error}", id);
+                    session_id
+                }
             }
         } else if continue_session {
-            // --continue: use latest session for the given key (default behavior
-            // of get_or_resume, so session_id as-is is correct)
-            info!(session_key = %session_id, "continuing latest session");
+            let core = core_handle.swappable();
+            if let Some(meta) = core.sessions.get_latest_session(&session_id).await {
+                match core.sessions.resume_session(&meta.id).await {
+                    Ok(Some(resumed)) => {
+                        info!(session_id = %resumed.id, session_key = %resumed.session_key, "continuing latest session");
+                    }
+                    Ok(None) => {
+                        warn!(session_id = %meta.id, "latest session disappeared before resume");
+                    }
+                    Err(error) => {
+                        warn!(session_id = %meta.id, %error, "failed to reactivate continued session");
+                    }
+                }
+            } else {
+                info!(session_key = %session_id, "no prior session found; creating one");
+            }
             session_id
         } else if session_id == "cli:default" {
             // No explicit --session / --resume / --continue: mint a fresh
@@ -2198,16 +2136,8 @@ pub(crate) fn cmd_agent(
                 &core_handle,
             )
             .await;
-            index_sessions_background();
             srv.shutdown();
         } else {
-            // Interactive REPL mode.
-            // Catch-up session indexing at startup — same reconciliation the
-            // exit path runs, so sessions from crashed runs become searchable
-            // via recall. Already-indexed sessions are skipped (idempotent);
-            // spawn_blocking keeps the fs work off the first-prompt path.
-            tokio::task::spawn_blocking(index_sessions_background);
-
             // Splash and LMS detection already happened above (before core build).
             // Skip for MLX/oMLX local — already printed banner above.
             if (lms_features || !is_local) && (!is_local || has_remote_local) && show_splash {
@@ -2302,13 +2232,6 @@ pub(crate) fn cmd_agent(
                     }
                 }
 
-                // LCM compaction model when configured.
-                if let Some(ref ep) = ctx.config.lcm.compaction_endpoint {
-                    if ctx.config.lcm.is_enabled() {
-                        models_to_warm.push(ep.model.clone());
-                    }
-                }
-
                 // Background: warming can take 30s per model — if it hasn't
                 // finished by the first message, that request JIT-loads anyway.
                 tokio::spawn(async move {
@@ -2380,69 +2303,6 @@ pub(crate) fn cmd_agent(
                 }
                 None => None,
             };
-
-            // Keepalive for the dedicated compaction Higgs sidecar (same
-            // interval as the main keepalive). Runs only when the compaction
-            // port is set, points at our own localhost sidecar, AND the sidecar
-            // is always-on — an on-demand sidecar is down between compactions,
-            // so pinging it would just spam connection-refused warnings.
-            let compaction_on_demand = ctx
-                .config
-                .agents
-                .defaults
-                .higgs_compaction_on_demand
-                .unwrap_or(true);
-            let compaction_keepalive_stop = Arc::new(AtomicBool::new(false));
-            let compaction_keepalive_handle: Option<tokio::task::JoinHandle<()>> =
-                if !compaction_on_demand {
-                    if let Some(cport) = ctx.config.agents.defaults.higgs_compaction_port {
-                    let base = format!("http://127.0.0.1:{cport}/v1");
-                    // The sidecar is always a Higgs instance regardless of the
-                    // MAIN backend tag — pass "higgs" so the keepalive isn't
-                    // dead-gated when the main backend is LM Studio.
-                    match higgs_keepalive_secs(
-                        "higgs",
-                        &base,
-                        std::env::var("NANOBOT_HIGGS_KEEPALIVE_SECS").ok().as_deref(),
-                    ) {
-                        Some(secs) => {
-                            let hint = ctx
-                                .config
-                                .agents
-                                .defaults
-                                .higgs_compaction_model
-                                .clone()
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or_else(|| local_model_name.clone());
-                            // Adopt the sidecar's actual served id (e.g.
-                            // "Bonsai-1.7B-mlx-1bit") so the ping can't 404 on
-                            // the stale higgsCompactionModel hint ("bonsai-1.7b").
-                            let model = resolve_keepalive_model(
-                                &base,
-                                &ctx.config.agents.defaults.local_api_key,
-                                &hint,
-                            )
-                            .await;
-                            info!(interval_s = secs, port = cport, model = %model, "higgs_compaction_keepalive_enabled");
-                            Some(spawn_higgs_keepalive(
-                                base,
-                                ctx.config.agents.defaults.local_api_key.clone(),
-                                model,
-                                secs,
-                                // Compaction is idle most of the time; the shared
-                                // inference_active flag is fine as a proxy.
-                                Arc::clone(&ctx.core_handle.counters.inference_active),
-                                Arc::clone(&compaction_keepalive_stop),
-                            ))
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                }
-                } else {
-                    None // on-demand sidecar: no keepalive (down between compactions)
-                };
 
             log_startup_phase("interactive_ready", startup_t0, &mut startup_last);
 
@@ -2734,10 +2594,6 @@ pub(crate) fn cmd_agent(
                 keepalive_stop.store(true, Ordering::Relaxed);
                 h.abort();
             }
-            if let Some(h) = compaction_keepalive_handle {
-                compaction_keepalive_stop.store(true, Ordering::Relaxed);
-                h.abort();
-            }
             let _ = ctx.rl.as_mut().unwrap().save_history(&history_path);
 
             // Unload trio models so LM Studio returns to just the main model.
@@ -2786,59 +2642,84 @@ pub(crate) fn cmd_agent(
                 }
             }
 
-            // Safety net: kill any managed child processes whose Drop may not
-            // have fired (e.g. Arc still held elsewhere).
-            crate::agent::pid_file::cleanup_stale_pids();
-            crate::agent::pid_file::release_agent_singleton();
-
-            // On exit, force a reflection pass if any working memory has
-            // accumulated — threshold=0 means "reflect if there is anything".
-            // This ensures facts from the just-completed session are distilled
-            // into MEMORY.md before the process exits.
+            // Exit reflection consumes completed SQLite working-memory rows.
+            // Complete the current non-empty active row first so facts from the
+            // just-finished session are eligible for distillation into MEMORY.md.
             {
                 let core = ctx.core_handle.swappable();
+                let exit_compaction_manager = core.compaction_manager.clone();
                 if core.memory_enabled {
-                    let reflector = Reflector::new(
-                        core.memory_provider.clone(),
-                        core.memory_model.clone(),
-                        &core.workspace,
-                        0, // threshold=0: reflect whenever there is any content
-                    );
-                    if reflector.should_reflect() {
-                        info!("Exit: reflecting on accumulated working memory (background)...");
-                        // On-demand Bonsai: the sidecar is down between
-                        // compactions, so bring it up for exit reflection and
-                        // stop it after (frees memory before the process exits).
-                        let exit_sidecar =
-                            crate::higgs::CompactionSidecarSpec::from_config(&ctx.config);
-                        let reflection_handle = tokio::spawn(async move {
-                            if let Some(spec) = exit_sidecar.as_ref() {
-                                if let Err(e) = spec.ensure_up().await {
-                                    warn!(error = %e, "exit_reflection_sidecar_ensure_up_failed");
-                                }
-                            }
-                            let res = reflector.reflect().await;
-                            if let Some(spec) = exit_sidecar.as_ref() {
-                                spec.release().await;
-                            }
-                            match res {
-                                Ok(()) => info!("Exit reflection complete — MEMORY.md updated"),
-                                Err(e) => warn!("Exit reflection failed: {}", e),
-                            }
-                        });
-                        // Wait up to 20s for reflection (sidecar spawn ~1s + the
-                        // summarization call); don't block exit indefinitely.
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(20),
-                            reflection_handle,
-                        ).await;
+                    match complete_current_working_memory_for_exit(
+                        &core.sessions,
+                        &core.working_memory,
+                        &ctx.session_id,
+                    )
+                    .await
+                    {
+                        Ok(Some(session_id)) => {
+                            debug!(%session_id, "completed current working memory for exit reflection")
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(%error, "failed to complete current working memory for exit reflection")
+                        }
                     }
+
+                    if Reflector::should_reflect_sessions(&core.sessions, 0).await {
+                        if let Some(compaction_manager) = core.compaction_manager.clone() {
+                            info!("Exit: reflecting on accumulated working memory...");
+                            let reflection_manager = compaction_manager.clone();
+                            let reflection = async move {
+                                let lease = match reflection_manager.acquire().await {
+                                    Ok(lease) => lease,
+                                    Err(error) => {
+                                        warn!(%error, "exit_reflection_sidecar_unavailable");
+                                        return;
+                                    }
+                                };
+                                let reflector = Reflector::new(
+                                    core.memory_provider.clone(),
+                                    lease.served_model().to_string(),
+                                    &core.workspace,
+                                    0,
+                                    core.sessions.clone(),
+                                );
+                                let res = reflector.reflect().await;
+                                lease.release().await;
+                                match res {
+                                    Ok(()) => info!("Exit reflection complete — MEMORY.md updated"),
+                                    Err(e) => warn!("Exit reflection failed: {}", e),
+                                }
+                            };
+                            // Wait up to 20s for reflection (sidecar spawn ~1s + the
+                            // summarization call); don't block exit indefinitely.
+                            if tokio::time::timeout(
+                                std::time::Duration::from_secs(20),
+                                reflection,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                warn!("Exit reflection timed out");
+                            }
+                        } else {
+                            warn!("Exit reflection skipped: no managed compaction sidecar");
+                        }
+                    }
+                }
+
+                // Reflection may be disabled or have no rows while a soft LCM
+                // task still owns a lease. Always settle an owned sidecar before
+                // dropping the runtime; external servers are ownership-safe.
+                if let Some(compaction_manager) = exit_compaction_manager {
+                    compaction_manager.shutdown_owned().await;
                 }
             }
 
-            // Re-index sessions in-process so the latest conversation is
-            // immediately searchable via recall in the next session.
-            index_sessions_background();
+            // Safety net for managed children unrelated to the compaction
+            // lease, which was synchronously settled above.
+            crate::agent::pid_file::cleanup_stale_pids();
+            crate::agent::pid_file::release_agent_singleton();
 
             println!("Goodbye!");
             // Print session resume hint so the user can pick up where they left off.
@@ -2857,44 +2738,69 @@ pub(crate) fn cmd_agent(
 }
 
 // ============================================================================
-// Post-session indexing
-// ============================================================================
-
-/// Re-index sessions so the latest conversation is searchable via the recall
-/// tool in the next session. Runs the in-process session indexer (JSONL →
-/// SESSION_*.md + knowledge store ingestion). Fire-and-forget: errors are
-/// logged but never block shutdown.
-fn index_sessions_background() {
-    let sessions_dir = match dirs::home_dir() {
-        Some(h) => h.join(".nanobot/sessions"),
-        None => {
-            warn!("Cannot determine home directory for session indexing");
-            return;
-        }
-    };
-    let memory_sessions_dir = match dirs::home_dir() {
-        Some(h) => h.join(".nanobot/workspace/memory/sessions"),
-        None => return,
-    };
-
-    let (indexed, skipped, errors) =
-        crate::agent::session_indexer::index_sessions(&sessions_dir, &memory_sessions_dir);
-
-    if indexed > 0 || errors > 0 {
-        debug!(
-            "Session indexing complete: {} indexed, {} skipped, {} errors",
-            indexed, skipped, errors
-        );
-    }
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn exit_completion_promotes_only_current_active_working_memory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sessions = Arc::new(crate::session::db::SessionDb::new(
+            &temp.path().join("sessions.db"),
+        ));
+        let current = sessions.create_session("cli:exit").await;
+        let unrelated = sessions.create_session("cli:other").await;
+        let working_memory =
+            crate::agent::working_memory::WorkingMemoryStore::new(sessions.clone());
+        working_memory
+            .update_from_compaction(&current.id, "current summary", 3)
+            .await
+            .unwrap();
+        working_memory
+            .update_from_compaction(&unrelated.id, "other summary", 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            complete_current_working_memory_for_exit(&sessions, &working_memory, "cli:exit")
+                .await
+                .unwrap(),
+            Some(current.id.clone())
+        );
+        assert_eq!(
+            working_memory
+                .list_completed()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.session_id)
+                .collect::<Vec<_>>(),
+            vec![current.id.clone()]
+        );
+        assert_eq!(
+            working_memory
+                .list_active()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.session_id)
+                .collect::<Vec<_>>(),
+            vec![unrelated.id]
+        );
+
+        working_memory.mark_reflected(&current.id).await.unwrap();
+        assert_eq!(
+            complete_current_working_memory_for_exit(&sessions, &working_memory, "cli:exit")
+                .await
+                .unwrap(),
+            None,
+            "exit completion must not move a reflected row backwards"
+        );
+        assert_eq!(working_memory.list_reflected().await.unwrap().len(), 1);
+    }
 
     #[test]
     fn shutdown_never_stops_resident_higgs() {

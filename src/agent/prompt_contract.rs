@@ -28,12 +28,11 @@ pub enum PromptSection {
     ToolUse = 7,
     WorkingMemory = 8,
     ToolPatterns = 9,
-    RecentNotes = 10,
-    BackgroundTasks = 11,
-    MemoryBriefing = 12,
+    BackgroundTasks = 10,
+    MemoryBriefing = 11,
 }
 
-static ALL_SECTIONS: [PromptSection; 13] = [
+static ALL_SECTIONS: [PromptSection; 12] = [
     PromptSection::Identity,
     PromptSection::Verification,
     PromptSection::WorkspaceContext,
@@ -44,13 +43,12 @@ static ALL_SECTIONS: [PromptSection; 13] = [
     PromptSection::ToolUse,
     PromptSection::WorkingMemory,
     PromptSection::ToolPatterns,
-    PromptSection::RecentNotes,
     PromptSection::BackgroundTasks,
     PromptSection::MemoryBriefing,
 ];
 
 impl PromptSection {
-    /// Returns all 13 variants in discriminant order.
+    /// Returns every variant in discriminant order.
     pub fn all() -> &'static [PromptSection] {
         &ALL_SECTIONS
     }
@@ -68,7 +66,6 @@ impl PromptSection {
             | Self::ToolUse
             | Self::WorkingMemory
             | Self::ToolPatterns
-            | Self::RecentNotes
             | Self::BackgroundTasks
             | Self::MemoryBriefing => PromptBlockKind::Runtime,
         }
@@ -78,11 +75,7 @@ impl PromptSection {
     pub fn shrinkable(&self) -> bool {
         matches!(
             self,
-            Self::WorkingMemory
-                | Self::ToolPatterns
-                | Self::RecentNotes
-                | Self::MemoryBriefing
-                | Self::Skills
+            Self::WorkingMemory | Self::ToolPatterns | Self::MemoryBriefing | Self::Skills
         )
     }
 
@@ -102,7 +95,6 @@ impl PromptSection {
             Self::ToolUse => 8.0,
             Self::WorkingMemory => 15.0,
             Self::ToolPatterns => 8.0,
-            Self::RecentNotes => 8.0,
             Self::BackgroundTasks => 5.0,
             Self::MemoryBriefing => 12.0,
         }
@@ -425,15 +417,14 @@ mod tests {
         assert!(PromptSection::SessionMetadata < PromptSection::ToolUse);
         assert!(PromptSection::ToolUse < PromptSection::WorkingMemory);
         assert!(PromptSection::WorkingMemory < PromptSection::ToolPatterns);
-        assert!(PromptSection::ToolPatterns < PromptSection::RecentNotes);
-        assert!(PromptSection::RecentNotes < PromptSection::BackgroundTasks);
+        assert!(PromptSection::ToolPatterns < PromptSection::BackgroundTasks);
         assert!(PromptSection::BackgroundTasks < PromptSection::MemoryBriefing);
     }
 
     #[test]
-    fn test_prompt_section_all_returns_13_variants() {
+    fn test_prompt_section_all_returns_canonical_variants() {
         let all = PromptSection::all();
-        assert_eq!(all.len(), 13);
+        assert_eq!(all.len(), 12);
         // Must be in order
         for i in 1..all.len() {
             assert!(all[i - 1] < all[i], "all() not sorted at index {}", i);
@@ -469,7 +460,6 @@ mod tests {
             PromptBlockKind::Runtime
         );
         assert_eq!(PromptSection::ToolPatterns.kind(), PromptBlockKind::Runtime);
-        assert_eq!(PromptSection::RecentNotes.kind(), PromptBlockKind::Runtime);
         assert_eq!(
             PromptSection::BackgroundTasks.kind(),
             PromptBlockKind::Runtime
@@ -485,7 +475,6 @@ mod tests {
         // Shrinkable sections
         assert!(PromptSection::WorkingMemory.shrinkable());
         assert!(PromptSection::ToolPatterns.shrinkable());
-        assert!(PromptSection::RecentNotes.shrinkable());
         assert!(PromptSection::MemoryBriefing.shrinkable());
         assert!(PromptSection::Skills.shrinkable());
         // Non-shrinkable

@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agent::knowledge_store::KnowledgeStore;
 use crate::agent::memory::MemoryStore;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
@@ -35,7 +34,7 @@ pub enum MemoryLayer {
 
 /// Query parameters for the memory ladder.
 pub struct MemoryQuery<'a> {
-    pub session_key: &'a str,
+    pub session_id: &'a str,
     pub query: &'a str,
     pub total_budget: usize,
 }
@@ -54,8 +53,6 @@ pub struct LayerResult {
 pub struct MemoryLadder<'a> {
     workspace: PathBuf,
     working_memory: &'a WorkingMemoryStore,
-    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
-    knowledge_store: Option<&'a KnowledgeStore>,
     session_db: &'a SessionDb,
 }
 
@@ -63,13 +60,11 @@ impl<'a> MemoryLadder<'a> {
     pub fn new(
         workspace: &Path,
         working_memory: &'a WorkingMemoryStore,
-        knowledge_store: Option<&'a KnowledgeStore>,
         session_db: &'a SessionDb,
     ) -> Self {
         Self {
             workspace: workspace.to_path_buf(),
             working_memory,
-            knowledge_store,
             session_db,
         }
     }
@@ -95,10 +90,7 @@ impl<'a> MemoryLadder<'a> {
     /// Iterates layers in priority order, allocating up to 50% of total budget
     /// per layer. When remaining budget reaches 0, lower layers are skipped.
     ///
-    /// Synchronous to avoid `Send` issues with `parking_lot::MutexGuard` held
-    /// across `.await` points in the caller. The only async layer (Scratch)
-    /// uses `block_in_place` internally when a query term is provided.
-    pub fn query(&self, q: &MemoryQuery<'_>) -> Vec<LayerResult> {
+    pub async fn query(&self, q: &MemoryQuery<'_>) -> Vec<LayerResult> {
         let mut results = Vec::new();
         let mut remaining = q.total_budget;
 
@@ -116,7 +108,9 @@ impl<'a> MemoryLadder<'a> {
                 allocation
             };
 
-            let content = self.fetch_layer(layer, q.session_key, q.query, allocation);
+            let content = self
+                .fetch_layer(layer, q.session_id, q.query, allocation)
+                .await;
 
             if !content.is_empty() {
                 let tokens_used = TokenBudget::estimate_str_tokens(&content);
@@ -129,10 +123,10 @@ impl<'a> MemoryLadder<'a> {
     }
 
     /// Fetch content from a single layer, truncated to the given token budget.
-    fn fetch_layer(
+    async fn fetch_layer(
         &self,
         layer: MemoryLayer,
-        session_key: &str,
+        session_id: &str,
         query: &str,
         budget: usize,
     ) -> String {
@@ -141,7 +135,14 @@ impl<'a> MemoryLadder<'a> {
                 let raw = MemoryStore::new(&self.workspace).read_long_term();
                 truncate_to_token_budget(&raw, budget)
             }
-            MemoryLayer::WorkingSession => self.working_memory.get_context(session_key, budget),
+            MemoryLayer::WorkingSession => self
+                .working_memory
+                .get_context(session_id, budget)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, %session_id, "working-memory lookup failed");
+                    String::new()
+                }),
             MemoryLayer::DurablePersonal => {
                 if query.trim().is_empty() {
                     return String::new();
@@ -175,21 +176,18 @@ impl<'a> MemoryLadder<'a> {
                 }
                 #[cfg(feature = "semantic")]
                 {
-                    if let Some(ks) = self.knowledge_store {
-                        if let Ok(hits) = ks.search(query, 10) {
-                            if hits.is_empty() {
-                                return String::new();
-                            }
-                            let formatted: Vec<String> = hits
-                                .iter()
-                                .map(|h| {
-                                    format!("[{}#{}] {}", h.source_name, h.chunk_idx, h.snippet)
-                                })
-                                .collect();
-                            truncate_to_token_budget(&formatted.join("\n"), budget)
-                        } else {
-                            String::new()
+                    if let Ok(ks) = crate::agent::knowledge_store::KnowledgeStore::open_default() {
+                        let Ok(hits) = ks.search(query, 10) else {
+                            return String::new();
+                        };
+                        if hits.is_empty() {
+                            return String::new();
                         }
+                        let formatted: Vec<String> = hits
+                            .iter()
+                            .map(|h| format!("[{}#{}] {}", h.source_name, h.chunk_idx, h.snippet))
+                            .collect();
+                        truncate_to_token_budget(&formatted.join("\n"), budget)
                     } else {
                         String::new()
                     }
@@ -206,24 +204,7 @@ impl<'a> MemoryLadder<'a> {
                 if query.is_empty() {
                     return String::new();
                 }
-                // session_db.search_messages is async; bridge it synchronously
-                // via block_in_place. That requires a *multi-threaded* runtime —
-                // production always is (Runtime::new() / #[tokio::main] default),
-                // but a current-thread runtime (e.g. #[tokio::test]) or no
-                // runtime at all would panic. Skip the session-search layer in
-                // those cases rather than crash the turn.
-                let multi_thread = tokio::runtime::Handle::try_current()
-                    .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-                    .unwrap_or(false);
-                if !multi_thread {
-                    return String::new();
-                }
-                // session_db.search_messages is async; use block_in_place to
-                // call it from synchronous context without Send issues.
-                let results = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(self.session_db.search_messages(query, 10, None))
-                });
+                let results = self.session_db.search_messages(query, 10, None).await;
                 if results.is_empty() {
                     return String::new();
                 }
@@ -309,7 +290,12 @@ fn truncate_chars_to_token_budget(text: &str, budget: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn open_db(tmp: &TempDir) -> Arc<SessionDb> {
+        Arc::new(SessionDb::new(&tmp.path().join("sessions.db")))
+    }
 
     #[test]
     fn test_layer_priority_ordering() {
@@ -339,11 +325,10 @@ mod tests {
     #[test]
     fn test_available_layers_feature_gated() {
         let tmp = TempDir::new().unwrap();
-        let wm = WorkingMemoryStore::new(tmp.path());
-        let db_path = tmp.path().join("sessions.db");
-        let session_db = SessionDb::new(&db_path);
+        let session_db = open_db(&tmp);
+        let wm = WorkingMemoryStore::new(session_db.clone());
 
-        let ladder = MemoryLadder::new(tmp.path(), &wm, None, &session_db);
+        let ladder = MemoryLadder::new(tmp.path(), &wm, session_db.as_ref());
         let layers = ladder.available_layers();
 
         let mut expected = vec![MemoryLayer::GroundTruth, MemoryLayer::WorkingSession];
@@ -356,8 +341,8 @@ mod tests {
         assert_eq!(layers, expected);
     }
 
-    #[test]
-    fn test_budget_waterfall_exhaustion() {
+    #[tokio::test]
+    async fn test_budget_waterfall_exhaustion() {
         // Create a workspace with a large MEMORY.md that fills the budget.
         let tmp = TempDir::new().unwrap();
         let mem_dir = tmp.path().join("memory");
@@ -370,19 +355,22 @@ mod tests {
             .join("\n");
         std::fs::write(mem_dir.join("MEMORY.md"), &large_content).unwrap();
 
-        let wm = WorkingMemoryStore::new(tmp.path());
+        let session_db = open_db(&tmp);
+        let session = session_db.create_session("test:session").await;
+        let wm = WorkingMemoryStore::new(session_db.clone());
         // Add some working memory too.
-        wm.update_from_compaction("test:session", "Working memory content here.", 0);
+        wm.update_from_compaction(&session.id, "Working memory content here.", 0)
+            .await
+            .unwrap();
 
-        let db_path = tmp.path().join("sessions.db");
-        let session_db = SessionDb::new(&db_path);
-
-        let ladder = MemoryLadder::new(tmp.path(), &wm, None, &session_db);
-        let results = ladder.query(&MemoryQuery {
-            session_key: "test:session",
-            query: "",
-            total_budget: 20, // Very small budget -- GroundTruth should consume most of it
-        });
+        let ladder = MemoryLadder::new(tmp.path(), &wm, session_db.as_ref());
+        let results = ladder
+            .query(&MemoryQuery {
+                session_id: &session.id,
+                query: "",
+                total_budget: 20, // Very small budget -- GroundTruth should consume most of it
+            })
+            .await;
 
         // GroundTruth should be present (it has content).
         assert!(
@@ -402,8 +390,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_soft_cap_enforcement() {
+    #[tokio::test]
+    async fn test_soft_cap_enforcement() {
         // With total_budget=100, no single layer should get more than 50 tokens.
         let tmp = TempDir::new().unwrap();
         let mem_dir = tmp.path().join("memory");
@@ -416,18 +404,21 @@ mod tests {
             .join("\n");
         std::fs::write(mem_dir.join("MEMORY.md"), &large_content).unwrap();
 
-        let wm = WorkingMemoryStore::new(tmp.path());
-        wm.update_from_compaction("test:session", &large_content, 0);
+        let session_db = open_db(&tmp);
+        let session = session_db.create_session("test:session").await;
+        let wm = WorkingMemoryStore::new(session_db.clone());
+        wm.update_from_compaction(&session.id, &large_content, 0)
+            .await
+            .unwrap();
 
-        let db_path = tmp.path().join("sessions.db");
-        let session_db = SessionDb::new(&db_path);
-
-        let ladder = MemoryLadder::new(tmp.path(), &wm, None, &session_db);
-        let results = ladder.query(&MemoryQuery {
-            session_key: "test:session",
-            query: "",
-            total_budget: 100,
-        });
+        let ladder = MemoryLadder::new(tmp.path(), &wm, session_db.as_ref());
+        let results = ladder
+            .query(&MemoryQuery {
+                session_id: &session.id,
+                query: "",
+                total_budget: 100,
+            })
+            .await;
 
         for result in &results {
             let tokens_used = TokenBudget::estimate_str_tokens(&result.content);
@@ -440,29 +431,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_scratch_query_no_panic_off_multithread_runtime() {
-        // A non-empty query exercises the Scratch layer, which bridges async
-        // search via block_in_place. Outside a multi-threaded runtime that would
-        // panic; the guard must skip it gracefully so the rest of the ladder
-        // still answers. (Runs with no tokio runtime at all.)
+    #[tokio::test]
+    async fn test_scratch_query_uses_async_sqlite_search() {
         let tmp = TempDir::new().unwrap();
         let mem_dir = tmp.path().join("memory");
         std::fs::create_dir_all(&mem_dir).unwrap();
         std::fs::write(mem_dir.join("MEMORY.md"), "A durable fact.").unwrap();
 
-        let wm = WorkingMemoryStore::new(tmp.path());
-        let db_path = tmp.path().join("sessions.db");
-        let session_db = SessionDb::new(&db_path);
+        let session_db = open_db(&tmp);
+        let session = session_db.create_session("test:session").await;
+        let wm = WorkingMemoryStore::new(session_db.clone());
 
-        let ladder = MemoryLadder::new(tmp.path(), &wm, None, &session_db);
-        let results = ladder.query(&MemoryQuery {
-            session_key: "test:session",
-            query: "find anything",
-            total_budget: 200,
-        });
+        let ladder = MemoryLadder::new(tmp.path(), &wm, session_db.as_ref());
+        let results = ladder
+            .query(&MemoryQuery {
+                session_id: &session.id,
+                query: "find anything",
+                total_budget: 200,
+            })
+            .await;
 
-        // GroundTruth still answered; Scratch was skipped (no panic).
+        // GroundTruth still answers even when SQLite has no search hit.
         assert!(results.iter().any(|r| r.layer == MemoryLayer::GroundTruth));
         assert!(!results.iter().any(|r| r.layer == MemoryLayer::Scratch));
     }

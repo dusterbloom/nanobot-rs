@@ -2,14 +2,12 @@
 //!
 //! Large tool results are reduced to a head+tail preview at ingestion
 //! (`digest_tool_result` in `tool_engine.rs`) and the full body is stashed in
-//! the per-agent `tool_result_store` and SQLite keyed by session +
-//! `tool_call_id`. This tool lets the model recover the full output (the
-//! truncated middle) on demand — one tool call, no re-execution, including
-//! after a process restart.
+//! SQLite keyed by concrete session id + `tool_call_id`. This tool lets the
+//! model recover the full output (the truncated middle) on demand — one tool
+//! call, no re-execution, including after a process restart.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -19,19 +17,15 @@ use crate::agent::tools::base::Tool;
 /// Retrieve the full, untruncated output of a prior tool call by its
 /// `tool_call_id` (the id shown in a `[truncated: ...]` preview block).
 pub struct RecallToolResultTool {
-    store: Arc<parking_lot::Mutex<HashMap<String, String>>>,
-    durable: (PathBuf, String),
+    db_path: PathBuf,
+    session_id: String,
 }
 
 impl RecallToolResultTool {
-    pub fn with_db(
-        store: Arc<parking_lot::Mutex<HashMap<String, String>>>,
-        db_path: PathBuf,
-        session_id: String,
-    ) -> Self {
+    pub fn with_db(db_path: PathBuf, session_id: String) -> Self {
         Self {
-            store,
-            durable: (db_path, session_id),
+            db_path,
+            session_id,
         }
     }
 }
@@ -72,13 +66,8 @@ impl Tool for RecallToolResultTool {
                     .to_string();
             }
         };
-        if let Some(full) = self.store.lock().get(id).cloned() {
-            return full;
-        }
-        let (db_path, session_id) = &self.durable;
-        let db = crate::session::db::SessionDb::new(db_path);
-        if let Some(full) = db.load_tool_result(session_id, id).await {
-            self.store.lock().insert(id.to_string(), full.clone());
+        let db = crate::session::db::SessionDb::new(&self.db_path);
+        if let Some(full) = db.load_tool_result(&self.session_id, id).await {
             return full;
         }
         format!(
@@ -104,11 +93,7 @@ mod tests {
                 .await
         );
 
-        let tool = RecallToolResultTool::with_db(
-            Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            db_path,
-            session.id,
-        );
+        let tool = RecallToolResultTool::with_db(db_path, session.id);
         let result = tool
             .execute(HashMap::from([(
                 "tool_call_id".to_string(),
@@ -117,5 +102,32 @@ mod tests {
             .await;
 
         assert_eq!(result, "durable body");
+    }
+
+    #[tokio::test]
+    async fn predictable_call_ids_are_isolated_by_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let db = crate::session::db::SessionDb::new(&db_path);
+        let first = db.create_session("cli:first").await;
+        let second = db.create_session("cli:second").await;
+        assert!(
+            db.store_tool_result(&first.id, "call_1", "exec", "first body")
+                .await
+        );
+        assert!(
+            db.store_tool_result(&second.id, "call_1", "exec", "second body")
+                .await
+        );
+
+        let params = HashMap::from([(
+            "tool_call_id".to_string(),
+            Value::String("call_1".to_string()),
+        )]);
+        let first_tool = RecallToolResultTool::with_db(db_path.clone(), first.id);
+        let second_tool = RecallToolResultTool::with_db(db_path, second.id);
+
+        assert_eq!(first_tool.execute(params.clone()).await, "first body");
+        assert_eq!(second_tool.execute(params).await, "second body");
     }
 }

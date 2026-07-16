@@ -3,8 +3,11 @@
 
 use serde_json::json;
 
-use nanobot::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
+use nanobot::agent::protocol::{
+    render_to_wire, CloudProtocol, ConversationProtocol, LocalProtocol,
+};
 use nanobot::agent::turn::{turn_from_legacy, ToolCall, Turn};
+use nanobot::session::SessionDb;
 
 // ─────────────────────────────────────────────────────────────
 // Phase 1: Turn enum serialization and legacy conversion
@@ -124,6 +127,49 @@ fn legacy_user_message_converts_to_turn_user() {
     assert!(matches!(t, Turn::User { .. }));
     if let Turn::User { content, .. } = t {
         assert_eq!(content, "hello");
+    }
+}
+
+#[tokio::test]
+async fn sqlite_structured_user_content_reaches_provider_wire_losslessly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SessionDb::new(&dir.path().join("sessions.db"));
+    let session = db.create_session("cli:multimodal-wire").await;
+    let multimodal = json!([
+        {"type": "text", "text": "Describe this image and audio."},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64,iVBORw0KGgo=",
+                "detail": "high"
+            }
+        },
+        {
+            "type": "input_audio",
+            "input_audio": {"data": "UklGRg==", "format": "wav"}
+        }
+    ]);
+    let object_content = json!({"type": "text", "text": "object-shaped content"});
+    db.add_messages(
+        &session.id,
+        &[
+            json!({"role": "user", "content": multimodal.clone()}),
+            json!({"role": "assistant", "content": "acknowledged"}),
+            json!({"role": "user", "content": object_content.clone()}),
+        ],
+    )
+    .await;
+
+    let history = db.get_history(&session.id, 100, 0).await;
+    assert_eq!(history[0]["content"], multimodal);
+    assert_eq!(history[2]["content"], object_content);
+
+    for wire in [
+        render_to_wire(&CloudProtocol, &history),
+        render_to_wire(&LocalProtocol::native(), &history),
+    ] {
+        assert_eq!(wire[1]["content"], history[0]["content"]);
+        assert_eq!(wire[3]["content"], history[2]["content"]);
     }
 }
 

@@ -15,10 +15,6 @@ path = "src/main.rs"
 name = "trio_bench"
 path = "src/bin/trio_bench.rs"
 
-[[bin]]
-name = "nanobot-bench"
-path = "src/bin/nanobot_bench.rs"
-
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -179,4 +175,3 @@ jack-voice = { path = "../jack-voice/jack-voice" }
 [dependencies.crossterm]
 version = "0.28"
 optional = true
-

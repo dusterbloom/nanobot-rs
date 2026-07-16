@@ -32,8 +32,8 @@ pub(crate) async fn dispatch(shared: &AgentLoopShared, msg: &InboundMessage) -> 
         "/think" => Some(cmd_think(shared, arg)),
         "/long" => Some(cmd_long(shared, arg)),
         "/context" => Some(cmd_context(shared)),
-        "/memory" => Some(cmd_memory(shared, &msg.session_key())),
-        "/lcm" => Some(cmd_lcm(shared)),
+        "/memory" => Some(cmd_memory(shared, &msg.session_key()).await),
+        "/lcm" => Some(cmd_lcm(shared, arg)),
         _ => None, // Unknown — forward to LLM
     }
 }
@@ -58,7 +58,7 @@ fn cmd_help() -> String {
         "  /long [N] - Set long-response mode",
         "  /context - Context token breakdown",
         "  /memory  - Show working memory contents",
-        "  /lcm     - Toggle Lossless Context Management",
+        "  /lcm stats - Show Lossless Context Management statistics",
     ]
     .join("\n")
 }
@@ -95,19 +95,18 @@ async fn cmd_status(shared: &AgentLoopShared) -> String {
 
 async fn cmd_clear(shared: &AgentLoopShared, session_key: &str) -> String {
     let core = shared.core_handle.swappable();
-    core.working_memory.clear(session_key);
     let session_meta = core.sessions.get_or_resume(session_key).await;
+    if let Err(error) = core.working_memory.clear(&session_meta.id).await {
+        tracing::warn!(%error, session_id = %session_meta.id, "failed to clear working memory");
+    }
     core.sessions.clear_history(&session_meta.id).await;
     let mut engines = shared.lcm_engines.lock().await;
-    engines.remove(session_key);
+    engines.remove(&session_meta.id);
     drop(engines);
     shared
         .core_handle
         .counters
         .reset_session_prompt_state(session_key);
-    shared
-        .bulletin_cache
-        .store(std::sync::Arc::new(String::new()));
     "Working memory and history cleared.".to_string()
 }
 
@@ -200,20 +199,35 @@ fn cmd_context(shared: &AgentLoopShared) -> String {
     .join("\n")
 }
 
-fn cmd_lcm(shared: &AgentLoopShared) -> String {
-    let prev = shared.lcm_enabled.load(Ordering::Relaxed);
-    let next = !prev;
-    shared.lcm_enabled.store(next, Ordering::Relaxed);
-    if next {
-        "LCM enabled — compaction active.".to_string()
-    } else {
-        "LCM disabled.".to_string()
+fn cmd_lcm(shared: &AgentLoopShared, arg: &str) -> String {
+    if arg != "stats" {
+        return "Usage: /lcm stats".to_string();
     }
+
+    let counters = &shared.core_handle.counters;
+    let compactions = counters.lcm_compaction_count.load(Ordering::Relaxed);
+    if compactions == 0 {
+        return "LCM is active. No compactions this session.".to_string();
+    }
+
+    let before = counters.lcm_tokens_before.load(Ordering::Relaxed);
+    let after = counters.lcm_tokens_after.load(Ordering::Relaxed);
+    let last_ms = counters.lcm_last_compaction_ms.load(Ordering::Relaxed);
+    let last_secs_ago =
+        crate::agent::agent_core::RuntimeCounters::now_epoch_ms().saturating_sub(last_ms) / 1000;
+    format!(
+        "LCM is active. Compactions: {compactions}. Tokens: {before} -> {after} (saved {}). Last compaction: {last_secs_ago}s ago.",
+        before.saturating_sub(after)
+    )
 }
 
-fn cmd_memory(shared: &AgentLoopShared, session_key: &str) -> String {
+async fn cmd_memory(shared: &AgentLoopShared, session_key: &str) -> String {
     let core = shared.core_handle.swappable();
-    let content = core.working_memory.get_context(session_key, 4000);
+    let session = core.sessions.get_or_resume(session_key).await;
+    let content = match core.working_memory.get_context(&session.id, 4000).await {
+        Ok(content) => content,
+        Err(error) => return format!("Could not read working memory: {error}"),
+    };
     if content.is_empty() {
         "Working memory is empty.".to_string()
     } else {

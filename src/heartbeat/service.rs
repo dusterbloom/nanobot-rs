@@ -1,15 +1,13 @@
-#![allow(dead_code)]
 //! Heartbeat service -- periodic maintenance + agent wake-up.
 //!
 //! Three layers run on each tick:
 //! 0. **Health probes** — lightweight checks (no LLM).
-//! 1. **Session indexing** — in-process JSONL → knowledge store ingestion.
-//! 2. **Maintenance commands** — cheap shell commands that run unconditionally.
-//! 3. **Agent tasks** — reads `HEARTBEAT.md` and invokes the LLM callback only
+//! 1. **Maintenance commands** — cheap shell commands that run unconditionally.
+//! 2. **Agent tasks** — reads `HEARTBEAT.md` and invokes the LLM callback only
 //!    when there are actionable tasks.  Skipped when the file is empty.
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,8 +19,7 @@ use tracing::{debug, info, warn};
 pub const DEFAULT_HEARTBEAT_INTERVAL_S: u64 = 5 * 60;
 
 /// Default maintenance commands run on every tick.
-/// Session indexing is handled in-process (see `run_session_indexing`), so
-/// this list is empty by default. Users can add custom commands via config.
+/// This list is empty by default. Users can add custom commands via config.
 pub const DEFAULT_MAINTENANCE_COMMANDS: &[&str] = &[];
 
 /// The prompt sent to the agent during a heartbeat.
@@ -131,21 +128,6 @@ impl HeartbeatService {
         self.health_registry.as_ref()
     }
 
-    /// Path to `HEARTBEAT.md` inside the workspace.
-    pub fn heartbeat_file(&self) -> PathBuf {
-        self.workspace.join("HEARTBEAT.md")
-    }
-
-    /// Read the contents of `HEARTBEAT.md`, if it exists.
-    fn read_heartbeat_file(&self) -> Option<String> {
-        let path = self.heartbeat_file();
-        if path.exists() {
-            std::fs::read_to_string(&path).ok()
-        } else {
-            None
-        }
-    }
-
     /// Start the heartbeat background loop.
     pub async fn start(&self) {
         if !self.enabled {
@@ -234,19 +216,14 @@ impl HeartbeatService {
             }
 
             // ---------------------------------------------------------------
-            // Layer 1: In-process session indexing
-            // ---------------------------------------------------------------
-            Self::run_session_indexing(&workspace);
-
-            // ---------------------------------------------------------------
-            // Layer 2: Maintenance commands (cheap, no LLM)
+            // Layer 1: Maintenance commands (cheap, no LLM)
             // ---------------------------------------------------------------
             for cmd in &maintenance_commands {
                 Self::run_maintenance_command(cmd).await;
             }
 
             // ---------------------------------------------------------------
-            // Layer 3: Agent tasks (only when HEARTBEAT.md has content)
+            // Layer 2: Agent tasks (only when HEARTBEAT.md has content)
             // ---------------------------------------------------------------
             let content = {
                 let path = workspace.join("HEARTBEAT.md");
@@ -280,26 +257,6 @@ impl HeartbeatService {
                     }
                 }
             }
-        }
-    }
-
-    /// Run in-process session indexing: JSONL → SESSION_*.md + knowledge store.
-    fn run_session_indexing(workspace: &Path) {
-        let sessions_dir = match dirs::home_dir() {
-            Some(h) => h.join(".nanobot/sessions"),
-            None => return,
-        };
-        if !sessions_dir.exists() {
-            return;
-        }
-        let memory_sessions_dir = workspace.join("memory").join("sessions");
-        let (indexed, _skipped, errors) =
-            crate::agent::session_indexer::index_sessions(&sessions_dir, &memory_sessions_dir);
-        if indexed > 0 || errors > 0 {
-            debug!(
-                "Heartbeat session indexing: {} indexed, {} errors",
-                indexed, errors
-            );
         }
     }
 
@@ -403,15 +360,7 @@ mod tests {
 
     #[test]
     fn test_default_maintenance_commands_empty() {
-        // Session indexing is now in-process, so no default shell commands needed.
         assert!(DEFAULT_MAINTENANCE_COMMANDS.is_empty());
-    }
-
-    #[test]
-    fn test_run_session_indexing_no_crash_on_missing_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Should not panic even when sessions dir doesn't exist.
-        HeartbeatService::run_session_indexing(tmp.path());
     }
 
     #[tokio::test]

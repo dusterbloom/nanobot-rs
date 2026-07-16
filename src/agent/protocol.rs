@@ -58,18 +58,6 @@ pub enum LocalReplayMode {
     TextualReplay,
 }
 
-impl LocalReplayMode {
-    fn from_env() -> Option<Self> {
-        let raw = std::env::var("NANOBOT_LOCAL_PROTOCOL_MODE").ok()?;
-        let value = raw.trim().to_ascii_lowercase();
-        match value.as_str() {
-            "native" | "tool_calls" | "native_tool_calls" => Some(Self::NativeToolCalls),
-            "text" | "textual" | "textual_replay" => Some(Self::TextualReplay),
-            _ => None,
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────
 // Trait
 // ─────────────────────────────────────────────────────────────
@@ -217,10 +205,6 @@ impl LocalProtocol {
     }
 
     pub fn auto_for_model(model: &str) -> Self {
-        if let Some(mode) = LocalReplayMode::from_env() {
-            return Self { replay_mode: mode };
-        }
-
         let caps = lookup_default(model);
         if !caps.tool_calling || caps.size_class == ModelSizeClass::Small {
             Self::textual()
@@ -955,6 +939,16 @@ mod tests {
     #[test]
     fn local_textual_is_textual_replay() {
         assert!(LocalProtocol::textual().is_textual_replay());
+    }
+
+    #[test]
+    fn local_protocol_is_derived_from_small_model_capabilities() {
+        assert!(LocalProtocol::auto_for_model("nanbeige-3b").is_textual_replay());
+    }
+
+    #[test]
+    fn local_protocol_is_derived_from_native_model_capabilities() {
+        assert!(!LocalProtocol::auto_for_model("qwen3.5-35b-a3b").is_textual_replay());
     }
 
     // ---- parse_textual_tool_calls() ----

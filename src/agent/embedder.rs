@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Thin wrapper around fastembed for local ONNX text embeddings.
 //!
 //! Single responsibility: text → f32 vector. Lazy-loads the model on first use.
@@ -17,6 +16,7 @@ use tracing::{debug, info, warn};
 pub type Embedding = Vec<f32>;
 
 /// Embedding dimensions for AllMiniLML6V2.
+#[cfg(feature = "semantic")]
 pub const EMBEDDING_DIM: usize = 384;
 
 /// Global singleton — model loads once on first embed call.
@@ -78,14 +78,6 @@ pub fn embed_batch(texts: &[&str]) -> Result<Vec<Embedding>> {
 /// Stub when semantic feature is disabled.
 #[cfg(not(feature = "semantic"))]
 pub fn embed_one(_text: &str) -> anyhow::Result<Embedding> {
-    Err(anyhow::anyhow!(
-        "Semantic search requires the 'semantic' feature flag"
-    ))
-}
-
-/// Stub when semantic feature is disabled.
-#[cfg(not(feature = "semantic"))]
-pub fn embed_batch(_texts: &[&str]) -> anyhow::Result<Vec<Embedding>> {
     Err(anyhow::anyhow!(
         "Semantic search requires the 'semantic' feature flag"
     ))

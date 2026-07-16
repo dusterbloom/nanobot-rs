@@ -341,10 +341,7 @@ impl ReplContext {
                     Ok(hits) => {
                         println!("\n  Skills matching \"{}\" (skills.sh):\n", query);
                         for h in hits.iter().take(10) {
-                            println!(
-                                "    {:>7} installs  {}@{}",
-                                h.installs, h.source, h.skill
-                            );
+                            println!("    {:>7} installs  {}@{}", h.installs, h.source, h.skill);
                         }
                         println!("\n  Install with: /skill add <source>@<skill>\n");
                     }

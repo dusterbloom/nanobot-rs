@@ -128,7 +128,9 @@ Full documentation available at [`/home/peppi/Dev/nanobot/README.md`](/home/pepp
 ## FAQ (Frequently Asked Questions)
 
 ### Does it store my conversations?
-Yes, but only locally in `~/.nanobot/sessions/`. You control what's shared.
+Yes, but only locally in `~/.nanobot/sessions.db`. Raw conversation history,
+LCM summaries, and session working state stay in that database. You control
+what's shared.
 
 ### Can I use it without an internet connection?
 Absolutely. It works fully offline with local models like Qwen3.5.
@@ -137,7 +139,11 @@ Absolutely. It works fully offline with local models like Qwen3.5.
 All tool calls are logged and auditable. Commands have timeout limits to prevent runaway processes.
 
 ### How does it learn from me?
-Your MEMORY.md file stores important facts about you, your preferences, and past work. The agent reads this every time we talk.
+`~/.nanobot/workspace/memory/MEMORY.md` stores curated facts about you, your
+preferences, and past work. It is not a transcript: raw conversations and
+session summaries remain in SQLite. When a session is complete, reflection
+reads its working-memory row from SQLite, atomically updates `MEMORY.md`, and
+records that the row was reflected.
 
 ---
 

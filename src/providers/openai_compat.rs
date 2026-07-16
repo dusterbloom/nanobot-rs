@@ -266,9 +266,14 @@ pub(crate) fn is_local_api_base(api_base: &str) -> bool {
 /// understand `developer` (OpenAI) receive it unchanged. Same pattern as the
 /// Anthropic mid-conversation `system` handling: adapt at the wire, not in the
 /// assembler.
-fn fold_developer_role_for_local(messages: Vec<serde_json::Value>, api_base: &str) -> Vec<serde_json::Value> {
+fn fold_developer_role_for_local(
+    messages: Vec<serde_json::Value>,
+    api_base: &str,
+) -> Vec<serde_json::Value> {
     if !is_local_api_base(api_base)
-        || !messages.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("developer"))
+        || !messages
+            .iter()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("developer"))
     {
         return messages;
     }
@@ -439,15 +444,17 @@ fn apply_local_reasoning_controls(
 /// request parser ignores llama.cpp's `repeat_penalty`, which made the old
 /// local safeguard a no-op on our production path. Non-Qwen local backends
 /// retain the backend-specific 1.1 control for compatibility.
-fn apply_repetition_controls(
-    body: &mut serde_json::Value,
-    api_base: &str,
-    policy_model: &str,
-) {
+fn apply_repetition_controls(body: &mut serde_json::Value, api_base: &str, policy_model: &str) {
     if !is_local_api_base(api_base) {
         return;
     }
-    if policy_model.to_ascii_lowercase().contains("qwen3") {
+    let policy_model = policy_model.to_ascii_lowercase();
+    if policy_model.contains("bonsai") {
+        // Bonsai is Qwen3-derived, but the 1-bit compaction fine-tune loops
+        // under the family-wide presence penalty. Higgs accepts this vLLM
+        // field (and ignores llama.cpp's `repeat_penalty`).
+        body["repetition_penalty"] = serde_json::json!(1.1);
+    } else if policy_model.contains("qwen3") || policy_model.contains("agents-a1") {
         body["presence_penalty"] = serde_json::json!(1.5);
         body["repetition_penalty"] = serde_json::json!(1.0);
     } else {
@@ -778,8 +785,7 @@ impl OpenAICompatProvider {
         // and "provider/" prefix for non-OpenRouter APIs (e.g. "anthropic/claude-opus-4-5"
         // becomes "claude-opus-4-5" when hitting api.anthropic.com directly).
         let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
-        let (model, policy_model) =
-            resolve_request_and_policy_model(&self.api_base, stripped);
+        let (model, policy_model) = resolve_request_and_policy_model(&self.api_base, stripped);
 
         debug!(
             "chat request: api_base={} raw_model={} stripped={} model={} policy_model={} streaming={}",
@@ -1771,11 +1777,8 @@ mod tests {
     /// the streaming-only fields — the whole point of build_chat_request.
     #[test]
     fn test_blocking_and_streaming_request_bodies_agree() {
-        let provider = OpenAICompatProvider::new(
-            "local",
-            Some("http://127.0.0.1:1234/v1"),
-            Some("qwen3-8b"),
-        );
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:1234/v1"), Some("qwen3-8b"));
         let messages = vec![
             serde_json::json!({"role": "system", "content": "prefix"}),
             serde_json::json!({"role": "user", "content": "hi"}),
@@ -2675,15 +2678,16 @@ mod tests {
         assert_eq!(local_body["reasoning_format"], "deepseek");
 
         let mut remote_body = serde_json::json!({"model": "gpt-4o"});
-        apply_local_reasoning_controls(&mut remote_body, "https://api.openai.com/v1", "gpt-4o", Some(4096));
+        apply_local_reasoning_controls(
+            &mut remote_body,
+            "https://api.openai.com/v1",
+            "gpt-4o",
+            Some(4096),
+        );
         assert!(remote_body.get("chat_template_kwargs").is_none());
         assert!(remote_body.get("reasoning_budget").is_none());
         assert!(remote_body.get("reasoning_format").is_none());
     }
-
-
-
-
 
     // --- reasoning-controls tests ---
 
@@ -2705,7 +2709,12 @@ mod tests {
     fn test_reasoning_params_sent_for_thinking_model() {
         let mut body =
             serde_json::json!({"model": "qwen3-1.7b", "messages": [], "temperature": 0.2});
-        apply_local_reasoning_controls(&mut body, "http://localhost:1234", "qwen3-1.7b", Some(1024));
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://localhost:1234",
+            "qwen3-1.7b",
+            Some(1024),
+        );
         assert_eq!(body["reasoning_budget"], 1024);
         assert_eq!(body["reasoning_format"], "deepseek");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
@@ -2756,7 +2765,6 @@ mod tests {
         assert_eq!(body["temperature"], 0.2);
     }
 
-
     #[test]
     fn test_qwen_repetition_controls_use_openai_fields_for_higgs() {
         let mut body = serde_json::json!({"model": "active", "messages": []});
@@ -2768,6 +2776,28 @@ mod tests {
         assert_eq!(body["presence_penalty"], 1.5);
         assert_eq!(body["repetition_penalty"], 1.0);
         assert!(body.get("repeat_penalty").is_none());
+        assert!(body.get("frequency_penalty").is_none());
+    }
+
+    #[test]
+    fn test_bonsai_request_controls_for_higgs() {
+        let mut body = serde_json::json!({
+            "model": "Bonsai-8B-mlx-1bit",
+            "messages": [],
+            "temperature": 0.3
+        });
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://127.0.0.1:8001/v1",
+            "Bonsai-8B-mlx-1bit",
+            None,
+        );
+        apply_repetition_controls(&mut body, "http://127.0.0.1:8001/v1", "Bonsai-8B-mlx-1bit");
+
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["repetition_penalty"], 1.1);
+        assert!(body.get("repeat_penalty").is_none());
+        assert!(body.get("presence_penalty").is_none());
         assert!(body.get("frequency_penalty").is_none());
     }
 
@@ -2789,9 +2819,6 @@ mod tests {
         assert!(body.get("presence_penalty").is_none());
         assert!(body.get("repetition_penalty").is_none());
     }
-
-
-
 
     #[test]
     fn test_is_local_api_base_private_ips() {

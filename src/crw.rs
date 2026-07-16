@@ -60,9 +60,7 @@ async fn health_check(url: &str) -> bool {
     };
     let resp = timeout(HEALTH_TIMEOUT, client.get(format!("{url}/health")).send()).await;
     match resp {
-        Ok(Ok(r)) if r.status().is_success() => {
-            parse_health(&r.text().await.unwrap_or_default())
-        }
+        Ok(Ok(r)) if r.status().is_success() => parse_health(&r.text().await.unwrap_or_default()),
         _ => false,
     }
 }
@@ -78,7 +76,10 @@ fn parse_health(body: &str) -> bool {
 /// Locate the crw-server binary: $PATH first, then the common install dirs
 /// the official installer and package managers use.
 fn find_crw_binary() -> Option<PathBuf> {
-    if let Ok(output) = std::process::Command::new("which").arg("crw-server").output() {
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("crw-server")
+        .output()
+    {
         if output.status.success() {
             let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !p.is_empty() {
@@ -107,7 +108,9 @@ mod tests {
 
     #[test]
     fn parse_health_accepts_ok_status_only() {
-        assert!(parse_health(r#"{"active_crawl_jobs":0,"status":"ok","version":"0.20.0"}"#));
+        assert!(parse_health(
+            r#"{"active_crawl_jobs":0,"status":"ok","version":"0.20.0"}"#
+        ));
         assert!(!parse_health(r#"{"status":"degraded"}"#));
         assert!(!parse_health("not json"));
         assert!(!parse_health(""));

@@ -66,10 +66,9 @@ pub async fn ensure_searxng(searxng_url: &str) -> Result<(), String> {
 
     // 4. Port reconciliation: the configured URL must actually point at the
     //    container, or every later step waits on the wrong port.
-    if let (Some(host_port), Some(cfg_port)) = (
-        container_host_port(&docker).await,
-        url_port(searxng_url),
-    ) {
+    if let (Some(host_port), Some(cfg_port)) =
+        (container_host_port(&docker).await, url_port(searxng_url))
+    {
         if host_port != cfg_port {
             return Err(format!(
                 "SearXNG container '{CONTAINER_NAME}' publishes port {host_port}, but \
@@ -437,8 +436,7 @@ async fn configure_for_local_use(docker: &str) {
     })
     .await;
     let old = std::fs::read_to_string(&tmp).unwrap_or_default();
-    let key = extract_secret_key(&old)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let key = extract_secret_key(&old).unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
 
     if std::fs::write(&tmp, render_local_settings(&key)).is_err() {
         debug!("could not write temp settings.yml");

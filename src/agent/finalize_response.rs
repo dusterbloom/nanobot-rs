@@ -5,9 +5,8 @@
 
 use std::sync::atomic::Ordering;
 
-use chrono::Utc;
 use serde_json::json;
-use tracing::{debug, instrument, warn};
+use tracing::{instrument, warn};
 
 use crate::agent::agent_loop::{AgentLoopShared, TurnContext};
 use crate::agent::token_budget::TokenBudget;
@@ -24,7 +23,7 @@ impl AgentLoopShared {
     /// Phase 3: Finalize the response -- persist session, build outbound message.
     ///
     /// Consumes the `TurnContext` (by value) since this is the terminal phase.
-    /// Stores context stats, dispatches learning observations via LearnLoop,
+    /// Stores context stats, dispatches learning updates via LearnLoop,
     /// verifies claims, and constructs the `OutboundMessage`.
     #[instrument(name = "finalize_response", skip(self, ctx), fields(
         session = %ctx.session_key,
@@ -54,7 +53,12 @@ impl AgentLoopShared {
             let wm_text = ctx
                 .core
                 .working_memory
-                .get_context(&ctx.session_key, usize::MAX);
+                .get_context(&ctx.session_id, usize::MAX)
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(%error, session_id = %ctx.session_id, "working-memory stats lookup failed");
+                    String::new()
+                });
             TokenBudget::estimate_str_tokens(&wm_text) as u64
         } else {
             0
@@ -214,35 +218,6 @@ impl AgentLoopShared {
         // checkpointed in the active tool path. This also retries any earlier
         // SQLite failure without double-inserting successful rows.
         ctx.persist_pending_protocol_messages().await;
-
-        // Auto-complete stale working memory sessions (runs on every message, cheap).
-        if ctx.core.memory_enabled {
-            for session in ctx.core.working_memory.list_active() {
-                if session.session_key != ctx.session_key {
-                    let age = Utc::now() - session.updated;
-                    if age.num_seconds() > ctx.core.session_complete_after_secs as i64 {
-                        ctx.core.working_memory.complete(&session.session_key);
-                        debug!("Auto-completed stale session: {}", session.session_key);
-                    }
-                }
-            }
-
-            // Clear current session's working memory if stale (no compaction in N turns).
-            {
-                let current = ctx.core.working_memory.get_or_create(&ctx.session_key);
-                if !current.content.is_empty()
-                    && current.last_updated_turn > 0
-                    && ctx.turn_count.saturating_sub(current.last_updated_turn)
-                        > ctx.core.stale_memory_turn_threshold
-                {
-                    ctx.core.working_memory.clear(&ctx.session_key);
-                    debug!(
-                        "Cleared stale working memory for {} (last update turn {}, current turn {})",
-                        ctx.session_key, current.last_updated_turn, ctx.turn_count
-                    );
-                }
-            }
-        }
 
         ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
 

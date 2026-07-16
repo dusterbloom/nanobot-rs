@@ -523,9 +523,9 @@ mod tests {
         let tool = SpawnTool::new();
         let callback: SpawnCallback = Arc::new(
             |_task, _label, agent: Option<String>, _model, _channel, _chat_id, _wd| {
-                Box::pin(async move {
-                    format!("agent={}", agent.unwrap_or_else(|| "none".to_string()))
-                })
+                Box::pin(
+                    async move { format!("agent={}", agent.unwrap_or_else(|| "none".to_string())) },
+                )
             },
         );
         tool.set_callback(callback).await;

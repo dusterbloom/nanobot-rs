@@ -329,7 +329,10 @@ mod tests {
 
     #[test]
     fn test_payload_kind_parse_known_and_unknown() {
-        assert_eq!(PayloadKind::parse("agent_turn"), Some(PayloadKind::AgentTurn));
+        assert_eq!(
+            PayloadKind::parse("agent_turn"),
+            Some(PayloadKind::AgentTurn)
+        );
         assert_eq!(PayloadKind::parse("reflect"), Some(PayloadKind::Reflect));
         // Unknown kinds must parse to None (logged skip downstream, no panic).
         assert_eq!(PayloadKind::parse("system_event"), None);

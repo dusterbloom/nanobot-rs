@@ -81,7 +81,10 @@ pub fn next_run_after(schedule: &CronSchedule, now_ms: i64) -> Option<i64> {
             .map(|every| now_ms + every),
         "cron" => cron_expr_next_ms(schedule.expr.as_deref(), schedule.tz.as_deref(), now_ms),
         other => {
-            warn!("Cron: unknown schedule kind '{}' — job will never fire", other);
+            warn!(
+                "Cron: unknown schedule kind '{}' — job will never fire",
+                other
+            );
             None
         }
     }
@@ -209,7 +212,10 @@ pub(crate) fn fire_job(job: &CronJob, hooks: &ExecutorHooks) {
 
 fn fire_agent_turn(job: &CronJob, inbound_tx: Option<&UnboundedSender<InboundMessage>>) {
     let Some(tx) = inbound_tx else {
-        warn!("Cron: no inbound bus wired — agent_turn job '{}' skipped", job.id);
+        warn!(
+            "Cron: no inbound bus wired — agent_turn job '{}' skipped",
+            job.id
+        );
         return;
     };
     let (channel, chat_id) = delivery_target(job);
@@ -217,7 +223,10 @@ fn fire_agent_turn(job: &CronJob, inbound_tx: Option<&UnboundedSender<InboundMes
     msg.metadata
         .insert("cron_job_id".to_string(), serde_json::json!(job.id));
     if tx.send(msg).is_err() {
-        warn!("Cron: inbound bus closed — agent_turn job '{}' dropped", job.id);
+        warn!(
+            "Cron: inbound bus closed — agent_turn job '{}' dropped",
+            job.id
+        );
     }
 }
 
@@ -235,7 +244,10 @@ fn delivery_target(job: &CronJob) -> (String, String) {
 
 fn fire_reflect(job: &CronJob, reflect: Option<&ReflectFn>) {
     let Some(reflect) = reflect else {
-        debug!("Cron: no reflect hook wired — reflect job '{}' skipped", job.id);
+        debug!(
+            "Cron: no reflect hook wired — reflect job '{}' skipped",
+            job.id
+        );
         return;
     };
     // Reflection calls the memory model — run it off the executor tick.
@@ -254,7 +266,10 @@ fn cron_expr_next_ms(expr: Option<&str>, tz: Option<&str>, now_ms: i64) -> Optio
     let schedule = match cron::Schedule::from_str(&normalized) {
         Ok(s) => s,
         Err(e) => {
-            warn!("Cron: invalid expression '{}': {} — job will never fire", expr, e);
+            warn!(
+                "Cron: invalid expression '{}': {} — job will never fire",
+                expr, e
+            );
             return None;
         }
     };
@@ -415,7 +430,10 @@ mod tests {
         let fired = advance_due_jobs(&mut store, NOW);
         assert_eq!(fired.len(), 1, "overdue job fires exactly once");
         let next = store.jobs[0].state.next_run_at_ms.expect("next run set");
-        assert!(next > NOW, "next run lands in the future, not a catch-up slot");
+        assert!(
+            next > NOW,
+            "next run lands in the future, not a catch-up slot"
+        );
         assert!(next <= NOW + 60_000);
         assert_eq!(store.jobs[0].state.last_run_at_ms, Some(NOW));
         // Same instant again: nothing further to fire.
@@ -428,7 +446,10 @@ mod tests {
     fn test_delete_after_run_removes_job_after_firing() {
         let mut oneshot = job("gone", at(NOW - 1_000), Some(NOW - 1_000), true);
         oneshot.delete_after_run = true;
-        let mut store = store_of(vec![oneshot, job("stays", every(60_000), Some(NOW + 1), true)]);
+        let mut store = store_of(vec![
+            oneshot,
+            job("stays", every(60_000), Some(NOW + 1), true),
+        ]);
         let fired = advance_due_jobs(&mut store, NOW);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].id, "gone");
@@ -484,7 +505,7 @@ mod tests {
             reflect: None,
         };
         fire_job(&bogus, &hooks); // must not panic
-        // Known kinds with missing hooks are also skips, not panics.
+                                  // Known kinds with missing hooks are also skips, not panics.
         let plain = job("p", every(60_000), Some(NOW), true);
         fire_job(&plain, &hooks);
         let mut refl = job("r", every(60_000), Some(NOW), true);

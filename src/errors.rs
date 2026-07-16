@@ -54,7 +54,6 @@ impl ProviderError {
 }
 
 /// Downcast an `anyhow::Error` and check retryability.
-#[allow(dead_code)]
 pub fn is_retryable_provider_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ProviderError>()
         .map_or(false, |pe| pe.is_retryable())

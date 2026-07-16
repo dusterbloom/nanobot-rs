@@ -1,11 +1,9 @@
-#![allow(dead_code)]
 //! Local LLM utilities: health checks, GGUF parser, model listing, context sizing.
 //!
 //! Server lifecycle (spawning, process management) is handled by LM Studio via
 //! the `lms` module. This module provides shared utilities used across the codebase.
 
 use std::collections::HashMap;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -27,19 +25,6 @@ pub(crate) struct GgufModelInfo {
 // Port & Model Utilities
 // ============================================================================
 
-/// Find an available TCP port starting from `start`.
-///
-/// Scans ports in the range `[start, start+99]` and returns the first one
-/// that can be bound. Falls back to `start` if all are occupied.
-pub(crate) fn find_available_port(start: u16) -> u16 {
-    for port in start..=start.saturating_add(99) {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    start // fallback
-}
-
 /// List all GGUF models in `~/models/`, sorted by filename.
 pub(crate) fn list_local_models() -> Vec<PathBuf> {
     let home = match dirs::home_dir() {
@@ -56,41 +41,6 @@ pub(crate) fn list_local_models() -> Vec<PathBuf> {
         .collect();
     models.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     models
-}
-
-/// Resolve a local model path given a filename or absolute/relative path.
-pub(crate) fn resolve_local_model_path(name: &str) -> Option<PathBuf> {
-    if name.trim().is_empty() {
-        return None;
-    }
-
-    let expanded = if name.starts_with("~/") || name == "~" {
-        if let Some(home) = dirs::home_dir() {
-            let without_tilde = name.trim_start_matches("~/");
-            if without_tilde.is_empty() {
-                home
-            } else {
-                home.join(without_tilde)
-            }
-        } else {
-            PathBuf::from(name)
-        }
-    } else {
-        PathBuf::from(name)
-    };
-
-    if expanded.exists() {
-        return Some(expanded);
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        let candidate = home.join("models").join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    None
 }
 
 // ============================================================================
@@ -828,20 +778,6 @@ pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
     query_context_size_from_url(&format!("http://localhost:{}", port))
 }
 
-pub(crate) async fn query_local_context_size_async(port: &str) -> Option<usize> {
-    let url = format!("http://localhost:{}/props", port);
-    let props = reqwest::Client::new()
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()?;
-    parse_props_n_ctx(&props)
-}
-
 // ============================================================================
 // Health Watchdog
 // ============================================================================
@@ -978,10 +914,6 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn can_bind_localhost() -> bool {
-        std::net::TcpListener::bind(("127.0.0.1", 0)).is_ok()
-    }
-
     // -- practical_context_cap tests --
 
     #[test]
@@ -1014,56 +946,6 @@ mod tests {
         let two_gb = 2 * 1024 * 1024 * 1024u64;
         assert_eq!(practical_context_cap(two_gb), 16384);
         assert_eq!(practical_context_cap(two_gb - 1), 8192);
-    }
-
-    // -- find_available_port tests --
-
-    #[test]
-    fn test_find_available_port_returns_valid_port() {
-        if !can_bind_localhost() {
-            return;
-        }
-        let port = find_available_port(19000);
-        assert!(port >= 19000);
-        assert!(port <= 19099);
-        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
-    }
-
-    #[test]
-    fn test_find_available_port_skips_occupied() {
-        if !can_bind_localhost() {
-            return;
-        }
-        let listener = TcpListener::bind(("127.0.0.1", 19200)).unwrap();
-        let port = find_available_port(19200);
-        assert!(port > 19200);
-        drop(listener);
-    }
-
-    #[test]
-    fn test_find_port_within_range() {
-        let start = 40000;
-        let port = find_available_port(start);
-        assert!(port >= start);
-        assert!(port < start + 100);
-    }
-
-    #[test]
-    fn test_find_port_skips_consecutive_occupied() {
-        let base: u16 = 48500;
-        let l1 = TcpListener::bind(("127.0.0.1", base));
-        let l2 = TcpListener::bind(("127.0.0.1", base + 1));
-
-        if let (Ok(_l1), Ok(_l2)) = (l1, l2) {
-            let found = find_available_port(base);
-            assert!(found >= base + 2);
-        }
-    }
-
-    #[test]
-    fn test_find_port_high_start_no_overflow() {
-        let port = find_available_port(65500);
-        assert!(port >= 65500);
     }
 
     // -- parse_gguf_metadata tests --
@@ -1194,55 +1076,6 @@ mod tests {
         if let Some(v) = vram {
             assert!(v >= 256 * 1024 * 1024, "VRAM {} seems too low", v);
         }
-    }
-
-    // -- memory-derived context ceiling (adopt path, no /props) --
-
-    /// Reproduces `core_builder::memory_context_ceiling` using only public
-    /// server fns, proving the general clamp logic: a big model on a modest
-    /// machine is bounded well below its OOM point, and a small model is bound
-    /// by the arch max (not file size) when memory is ample.
-    fn ceiling_for(model: &str, total_mem: u64, arch_max: usize) -> usize {
-        let available = ((total_mem as f64) * 0.80) as u64;
-        let mut main = estimate_model_profile_from_name(model);
-        main.max_context_length = arch_max;
-        main.practical_cap = usize::MAX;
-        let input = VramBudgetInput {
-            available_memory: available,
-            vram_cap: available,
-            overhead_per_model: 512 * 1_000_000,
-            main,
-            router: None,
-            specialist: None,
-        };
-        compute_vram_budget(&input).main_ctx
-    }
-
-    #[test]
-    fn test_memory_ceiling_clamps_large_model_below_wall() {
-        // 35B-class model on a 32 GB machine: must land well below the ~50k
-        // token point where higgs/MLX was OOM-killed, and stay above the floor.
-        let ctx = ceiling_for("qwen3.5-35b-a3b", 32 * GB, 131_072);
-        assert!(
-            (4096..40_000).contains(&ctx),
-            "35B/32GB ceiling {} not in safe band",
-            ctx
-        );
-    }
-
-    #[test]
-    fn test_memory_ceiling_small_model_bound_by_arch_not_filesize() {
-        // A tiny model with ample memory should reach the arch max, not be
-        // pinned low by the file-size heuristic.
-        let ctx = ceiling_for("qwen3-1.7b", 32 * GB, 131_072);
-        assert_eq!(ctx, 131_072, "small model should hit arch max, got {}", ctx);
-    }
-
-    #[test]
-    fn test_memory_ceiling_floors_when_weights_exceed_memory() {
-        // A 70B won't fit a 32 GB machine with usable KV; clamp to the floor.
-        let ctx = ceiling_for("llama-70b", 32 * GB, 131_072);
-        assert_eq!(ctx, 4096, "oversized model should floor at MIN_MAIN_CTX");
     }
 
     // -- VRAM budget tests --

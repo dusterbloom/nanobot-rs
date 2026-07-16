@@ -130,7 +130,10 @@ async fn find_repo_skills(
         .await
         .map_err(|e| format!("GitHub API request failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("GitHub API returned {} for {owner}/{repo}", resp.status()));
+        return Err(format!(
+            "GitHub API returned {} for {owner}/{repo}",
+            resp.status()
+        ));
     }
     let body: serde_json::Value = resp
         .json()
@@ -138,7 +141,11 @@ async fn find_repo_skills(
         .map_err(|e| format!("Failed to parse GitHub API response: {e}"))?;
 
     let mut skills = Vec::new();
-    for entry in body.get("tree").and_then(|t| t.as_array()).unwrap_or(&Vec::new()) {
+    for entry in body
+        .get("tree")
+        .and_then(|t| t.as_array())
+        .unwrap_or(&Vec::new())
+    {
         let Some(path) = entry.get("path").and_then(|p| p.as_str()) else {
             continue;
         };
@@ -236,7 +243,10 @@ mod tests {
             skill_name_from_path("skills/.curated/cli-creator/SKILL.md", "repo"),
             Some("cli-creator")
         );
-        assert_eq!(skill_name_from_path("SKILL.md", "my-skill"), Some("my-skill"));
+        assert_eq!(
+            skill_name_from_path("SKILL.md", "my-skill"),
+            Some("my-skill")
+        );
         assert_eq!(skill_name_from_path("README.md", "repo"), None);
     }
 }

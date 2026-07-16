@@ -1,14 +1,14 @@
 //! Lossless Context Management (LCM)
 //!
 //! Implements the LCM architecture from Ehrlich & Blackman (2026):
-//! - **Immutable Store**: Every message persisted verbatim in session JSONL (existing).
+//! - **Immutable Store**: Every raw message persisted verbatim in SQLite.
 //! - **Active Context**: Window sent to LLM = recent raw messages + summary nodes.
 //! - **Summary DAG**: Hierarchical summaries with lossless pointers to originals.
 //! - **Two-threshold control loop**: τ_soft (async) / τ_hard (blocking).
 //! - **Three-level escalation**: preserve_details → bullet_points → deterministic truncate.
 //!
-//! The session JSONL files serve as the immutable store. This module manages
-//! the summary DAG and active context assembly.
+//! SQLite message rows and summary nodes provide restart-safe storage. This
+//! module manages the in-memory DAG and active context assembly.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -115,6 +115,15 @@ impl SummaryDag {
         self.nodes.len()
     }
 
+    /// Most recently allocated node, regardless of sparse persisted IDs.
+    ///
+    /// Restart reconstruction preserves SQLite node IDs, so `len() - 1` is
+    /// not necessarily a node ID. Live compaction always allocates above the
+    /// greatest restored ID, making the greatest ID the node just created.
+    pub(crate) fn newest(&self) -> Option<&SummaryNode> {
+        self.nodes.iter().max_by_key(|node| node.id)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -154,8 +163,6 @@ impl ContextEntry {
 /// Configuration for the LCM engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LcmConfig {
-    /// Enable LCM (default: false for backward compatibility).
-    pub enabled: bool,
     /// Soft threshold as fraction of available context (0.0-1.0).
     /// Triggers async compaction. Default: 0.5 (50%).
     pub tau_soft: f64,
@@ -169,7 +176,6 @@ pub struct LcmConfig {
 impl Default for LcmConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
@@ -180,7 +186,6 @@ impl Default for LcmConfig {
 impl From<&LcmSchemaConfig> for LcmConfig {
     fn from(schema: &LcmSchemaConfig) -> Self {
         Self {
-            enabled: schema.is_enabled(),
             tau_soft: schema.tau_soft,
             tau_hard: schema.tau_hard,
             deterministic_target: schema.deterministic_target,
@@ -190,6 +195,7 @@ impl From<&LcmSchemaConfig> for LcmConfig {
 
 /// Default recent-raw token budget for the test helper / fallback (≈1k tokens,
 /// matching the production protect target so post-compaction lands ~1–2k).
+#[cfg(test)]
 const DEFAULT_PROTECT_TOKENS: usize = 1024;
 
 /// Token budget for the recent raw messages kept verbatim (not summarized),
@@ -221,6 +227,13 @@ pub struct LcmEngine {
     auto_expanded: std::collections::HashSet<usize>,
 }
 
+/// Mutable LCM state that must advance only after its SQLite checkpoint does.
+/// The immutable raw-message mirror is deliberately excluded from rollback.
+pub(crate) struct LcmCompactionState {
+    dag: SummaryDag,
+    active: Vec<ContextEntry>,
+}
+
 impl LcmEngine {
     pub fn new(config: LcmConfig) -> Self {
         Self {
@@ -231,6 +244,19 @@ impl LcmEngine {
             async_compaction_pending: false,
             auto_expanded: std::collections::HashSet::new(),
         }
+    }
+
+    pub(crate) fn compaction_state(&self) -> LcmCompactionState {
+        LcmCompactionState {
+            dag: self.dag.clone(),
+            active: self.active.clone(),
+        }
+    }
+
+    pub(crate) fn restore_compaction_state(&mut self, state: LcmCompactionState) {
+        self.dag = state.dag;
+        self.active = state.active;
+        self.async_compaction_pending = false;
     }
 
     /// Ingest a message into the immutable store and active context.
@@ -317,13 +343,14 @@ impl LcmEngine {
     /// - Level 2: LLM summarize with mode="bullet_points", target T/2 tokens
     /// - Level 3: Deterministic truncation to 512 tokens (no LLM)
     ///
-    /// Returns a `Turn::Summary` if compaction occurred. The caller should persist
-    /// this turn in the session JSONL so the DAG can be rebuilt on restart.
+    /// Returns a `Turn::Summary` if compaction occurred. The caller persists
+    /// its DAG node in SQLite so the active hierarchy can be rebuilt on restart.
     pub async fn compact(
         &mut self,
-        compactor: &ContextCompactor,
+        compactor: Option<&ContextCompactor>,
         budget: &TokenBudget,
         tool_def_tokens: usize,
+        failure_mode: CompactionFailureMode,
     ) -> Option<Turn> {
         let available = budget.available_budget(tool_def_tokens);
         let target = (available as f64 * self.config.tau_soft * 0.8) as usize;
@@ -333,8 +360,8 @@ impl LcmEngine {
         // context lands ~1–2k regardless of individual message size. Cap at
         // half the conversation so we always compact a meaningful portion
         // (matters when messages are small relative to the protect target).
-        let protect_tokens = protect_tokens_for_budget(available)
-            .min(self.conversation_tokens().max(1) / 2);
+        let protect_tokens =
+            protect_tokens_for_budget(available).min(self.conversation_tokens().max(1) / 2);
 
         // Find the oldest contiguous block of raw messages to compact.
         // Skip the system message (index 0) and any existing summaries.
@@ -420,6 +447,15 @@ impl LcmEngine {
         // the main model. Deterministic truncation is instant and sufficient.
         const MAX_COMPACTION_BLOCK_MESSAGES: usize = 80;
         let (summary_text, level) = if block_messages.len() > MAX_COMPACTION_BLOCK_MESSAGES {
+            if failure_mode == CompactionFailureMode::PreserveContext {
+                debug!(
+                    "LCM: soft block too large ({} msgs > {}), preserving active context",
+                    block_messages.len(),
+                    MAX_COMPACTION_BLOCK_MESSAGES
+                );
+                self.async_compaction_pending = false;
+                return None;
+            }
             info!(
                 "LCM: block too large ({} msgs > {}), using deterministic truncation",
                 block_messages.len(),
@@ -430,13 +466,22 @@ impl LcmEngine {
             (truncated, 3)
         } else {
             // Three-level escalation (Algorithm 3).
-            escalated_summary(
+            let Some(summary) = escalated_summary(
                 &block_messages,
                 target,
                 compactor,
                 self.config.deterministic_target,
+                failure_mode,
             )
             .await
+            else {
+                // Soft-threshold failures preserve the active context byte for
+                // byte. The hard path below is the only failure mode allowed to
+                // install deterministic truncation.
+                self.async_compaction_pending = false;
+                return None;
+            };
+            summary
         };
 
         let summary_tokens = TokenBudget::estimate_str_tokens(&summary_text);
@@ -546,7 +591,11 @@ impl LcmEngine {
                     continue;
                 }
                 let t = TokenBudget::estimate_message_tokens(message);
-                let weighted = if role == "tool" { t.saturating_mul(2) } else { t };
+                let weighted = if role == "tool" {
+                    t.saturating_mul(2)
+                } else {
+                    t
+                };
                 if seen_any && acc + weighted > protect_tokens {
                     break; // protect window full; this older message is compacted
                 }
@@ -611,20 +660,9 @@ impl LcmEngine {
         self.active.len()
     }
 
-    /// Access the summary DAG (for inspection in tests).
-    pub fn dag_ref(&self) -> &SummaryDag {
-        &self.dag
-    }
-
     /// Access the active context entries (for inspection in tests).
     pub fn active_entries(&self) -> &[ContextEntry] {
         &self.active
-    }
-
-    /// Find the oldest contiguous block of raw messages (for testing), using the
-    /// default ~1k-token protect budget.
-    pub fn find_oldest_raw_block(&self) -> Option<(usize, usize)> {
-        self.find_oldest_raw_block_impl(DEFAULT_PROTECT_TOKENS)
     }
 
     /// Find the oldest contiguous block of raw messages with an explicit
@@ -715,8 +753,12 @@ impl LcmEngine {
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            let relevance =
-                self.relevance(&user_text, &user_keywords, user_embedding.as_deref(), &source_text);
+            let relevance = self.relevance(
+                &user_text,
+                &user_keywords,
+                user_embedding.as_deref(),
+                &source_text,
+            );
             if relevance < 0.3 {
                 continue;
             }
@@ -809,12 +851,10 @@ impl LcmEngine {
     /// persisted `source_ids` resolve to exactly the same originals they were
     /// created against, no matter how the live context was windowed.
     ///
-    /// Legacy nodes (id_kind != "db_id", the 7th tuple element) were persisted
-    /// with POSITIONAL source ids from the pre-rowid scheme. Resolving those
-    /// against rowids would silently return the wrong originals, so they are
-    /// skipped with a warning: their summary text stays in session history,
-    /// but the node never enters the DAG — honest degradation beats wrong
-    /// expansion.
+    /// Pre-rowid nodes with POSITIONAL source ids are purged once when the
+    /// DB is opened (`SessionDb::new`) and filtered by `load_summary_nodes`,
+    /// so every node received here is db-id-keyed (the 7th tuple element is
+    /// always `"db_id"`).
     pub fn rebuild_from_db_nodes(
         raw_messages: &[Value],
         nodes: &[(usize, Vec<usize>, Vec<usize>, String, usize, u8, String)],
@@ -822,14 +862,35 @@ impl LcmEngine {
     ) -> Self {
         let mut engine = Self::new(config);
 
+        // `/clear` is an append-only boundary in SQLite. Rebuild only the raw
+        // rows and summary nodes wholly after the newest marker; otherwise an
+        // old persisted summary can resurrect cleared conversation on restart,
+        // and the internal `role: "clear"` marker itself can reach the provider.
+        let clear_index = raw_messages
+            .iter()
+            .rposition(|message| message.get("role").and_then(Value::as_str) == Some("clear"));
+        let clear_db_id = clear_index.map(|index| {
+            raw_messages[index]
+                .get("_db_id")
+                .and_then(Value::as_u64)
+                .map_or(usize::MAX, |id| id as usize)
+        });
+        let raw_after_clear = clear_index.map_or(raw_messages, |index| &raw_messages[index + 1..]);
+        let node_is_current = |source_ids: &[usize]| {
+            clear_db_id.is_none_or(|boundary| {
+                !source_ids.is_empty() && source_ids.iter().all(|source_id| *source_id > boundary)
+            })
+        };
+
         // Ingest raw messages keyed by rowid. Persisted `role: "summary"` rows
         // reference store entries and never occupy store slots themselves;
         // synthetic scaffolds are not originals. Rows without a `_db_id`
         // cannot be addressed losslessly and are skipped (get_all_messages
         // always supplies the rowid, so this is defensive only).
-        for msg in raw_messages {
+        for msg in raw_after_clear {
             let role = msg.get("role").and_then(|r| r.as_str());
-            if role == Some("summary") || crate::agent::markers::is_synthetic(msg) {
+            if matches!(role, Some("summary" | "clear")) || crate::agent::markers::is_synthetic(msg)
+            {
                 continue;
             }
             let Some(db_id) = msg.get("_db_id").and_then(|v| v.as_u64()) else {
@@ -843,38 +904,77 @@ impl LcmEngine {
         let mut summarized_ids: std::collections::HashSet<MessageId> =
             std::collections::HashSet::new();
 
-        // Nodes that have been merged into a newer summary (they appear in some
-        // other node's child_ids) are retired — re-activating them on rebuild
-        // would duplicate their content and re-accumulate summary mass. Collect
-        // the subsumed set first, then skip them when reconstructing the DAG.
-        let subsumed: std::collections::HashSet<usize> = nodes
+        // Only current nodes participate in reconstruction. In particular, a
+        // stale/corrupt row must not retire a valid node merely by naming it
+        // as a child.
+        let valid_ids: std::collections::HashSet<usize> = nodes
             .iter()
-            .flat_map(|(_, _, child_ids, _, _, _, _)| child_ids.iter().copied())
+            .filter(|(_, source_ids, _, _, _, _, _)| node_is_current(source_ids))
+            .map(|(id, _, _, _, _, _, _)| *id)
             .collect();
 
-        // Reconstruct DAG nodes, skipping legacy positional-id nodes and
-        // subsumed (merged) nodes.
-        for (id, source_ids, child_ids, text, _tokens, level, id_kind) in nodes {
-            if id_kind != "db_id" {
+        // Nodes merged into a newer summary are retired from the active DAG.
+        // Re-activating them would duplicate content and re-accumulate summary
+        // mass. Restrict child references to known valid nodes so malformed
+        // dangling IDs cannot suppress unrelated roots.
+        let subsumed: std::collections::HashSet<usize> = nodes
+            .iter()
+            .filter(|(_, source_ids, _, _, _, _, _)| node_is_current(source_ids))
+            .flat_map(|(_, _, child_ids, _, _, _, _)| child_ids.iter().copied())
+            .filter(|child_id| valid_ids.contains(child_id))
+            .collect();
+
+        // Reserve above every persisted ID, including retired children. This
+        // prevents the next live compaction from reusing a sparse/subsumed ID
+        // that still exists in SQLite.
+        engine.dag.next_id = nodes
+            .iter()
+            .map(|(id, _, _, _, _, _, _)| *id)
+            .max()
+            .map_or(0, |id| id.saturating_add(1));
+
+        // Reconstruct active DAG roots with their persisted IDs. Calling
+        // create_node() here used to renumber sparse roots from zero while
+        // leaving child_ids unchanged; a restored root could therefore point
+        // at itself and recurse forever. Preserving IDs means every retained
+        // child reference targets a retired (absent) node, so the reconstructed
+        // in-memory graph cannot contain a cycle.
+        let mut restored_ids = std::collections::HashSet::new();
+        for (id, source_ids, child_ids, text, tokens, level, _id_kind) in nodes {
+            if !node_is_current(source_ids) {
+                debug!(
+                    node_id = id,
+                    "LCM rebuild: skipping summary node before the latest clear boundary"
+                );
+                continue;
+            }
+            if !restored_ids.insert(*id) {
                 warn!(
                     node_id = id,
-                    id_kind = %id_kind,
-                    "LCM rebuild: skipping legacy summary node with positional \
-                     source_ids (would misresolve against db-id-keyed store)"
+                    "LCM rebuild: skipping duplicate summary node ID"
                 );
                 continue;
             }
             if subsumed.contains(id) {
-                debug!(node_id = id, "LCM rebuild: skipping subsumed (merged) summary node");
+                debug!(
+                    node_id = id,
+                    "LCM rebuild: skipping subsumed (merged) summary node"
+                );
                 continue;
             }
-            engine
-                .dag
-                .create_node(source_ids.clone(), child_ids.clone(), text.clone(), *level);
+            engine.dag.nodes.push(SummaryNode {
+                id: *id,
+                source_ids: source_ids.clone(),
+                child_summaries: child_ids.clone(),
+                text: text.clone(),
+                tokens: *tokens,
+                level: *level,
+            });
             for &sid in source_ids {
                 summarized_ids.insert(sid);
             }
         }
+        engine.dag.nodes.sort_by_key(|node| node.id);
 
         // Build active context: summaries first, then unsummarized raw messages.
         for node in &engine.dag.nodes {
@@ -938,6 +1038,14 @@ pub enum CompactionAction {
     Blocking,
 }
 
+/// What to do when model-backed summarization cannot produce a valid smaller
+/// summary. Soft pressure preserves context; hard pressure must converge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionFailureMode {
+    PreserveContext,
+    Deterministic,
+}
+
 // ---------------------------------------------------------------------------
 // Three-Level Escalation (Algorithm 3)
 // ---------------------------------------------------------------------------
@@ -948,61 +1056,71 @@ pub enum CompactionAction {
 async fn escalated_summary(
     messages: &[Value],
     _target_tokens: usize,
-    compactor: &ContextCompactor,
+    compactor: Option<&ContextCompactor>,
     deterministic_target: usize,
-) -> (String, u8) {
+    failure_mode: CompactionFailureMode,
+) -> Option<(String, u8)> {
     let original_tokens = TokenBudget::estimate_tokens(messages);
 
-    // Level 1: Preserve details.
-    if let Ok(summary) = compactor
-        .summarize_for_lcm(messages, "preserve_details")
-        .await
-    {
-        let tokens = TokenBudget::estimate_str_tokens(&summary);
-        if tokens < original_tokens && !contains_refusal_pattern(&summary) {
-            debug!(
-                "LCM escalation: Level 1 succeeded ({} -> {} tokens)",
-                original_tokens, tokens
-            );
-            return (summary, 1);
+    if let Some(compactor) = compactor {
+        // Level 1: Preserve details.
+        if let Ok(summary) = compactor
+            .summarize_for_lcm(messages, "preserve_details")
+            .await
+        {
+            let tokens = TokenBudget::estimate_str_tokens(&summary);
+            if tokens < original_tokens && !contains_refusal_pattern(&summary) {
+                debug!(
+                    "LCM escalation: Level 1 succeeded ({} -> {} tokens)",
+                    original_tokens, tokens
+                );
+                return Some((summary, 1));
+            }
+            if contains_refusal_pattern(&summary) {
+                debug!("LCM escalation: Level 1 contained refusal pattern, escalating");
+            } else {
+                debug!(
+                    "LCM escalation: Level 1 failed (output {} >= input {})",
+                    tokens, original_tokens
+                );
+            }
         }
-        if contains_refusal_pattern(&summary) {
-            debug!("LCM escalation: Level 1 contained refusal pattern, escalating");
-        } else {
-            debug!(
-                "LCM escalation: Level 1 failed (output {} >= input {})",
-                tokens, original_tokens
-            );
+
+        // Level 2: Bullet points, half the target.
+        if let Ok(summary) = compactor.summarize_for_lcm(messages, "bullet_points").await {
+            let tokens = TokenBudget::estimate_str_tokens(&summary);
+            if tokens < original_tokens && !contains_refusal_pattern(&summary) {
+                debug!(
+                    "LCM escalation: Level 2 succeeded ({} -> {} tokens)",
+                    original_tokens, tokens
+                );
+                return Some((summary, 2));
+            }
+            if contains_refusal_pattern(&summary) {
+                debug!("LCM escalation: Level 2 contained refusal pattern, escalating");
+            } else {
+                debug!(
+                    "LCM escalation: Level 2 failed (output {} >= input {})",
+                    tokens, original_tokens
+                );
+            }
         }
     }
 
-    // Level 2: Bullet points, half the target.
-    if let Ok(summary) = compactor.summarize_for_lcm(messages, "bullet_points").await {
-        let tokens = TokenBudget::estimate_str_tokens(&summary);
-        if tokens < original_tokens && !contains_refusal_pattern(&summary) {
-            debug!(
-                "LCM escalation: Level 2 succeeded ({} -> {} tokens)",
-                original_tokens, tokens
-            );
-            return (summary, 2);
+    match failure_mode {
+        CompactionFailureMode::PreserveContext => {
+            debug!("LCM escalation: soft failure, preserving active context");
+            None
         }
-        if contains_refusal_pattern(&summary) {
-            debug!("LCM escalation: Level 2 contained refusal pattern, escalating");
-        } else {
+        CompactionFailureMode::Deterministic => {
+            let truncated = deterministic_truncate(messages, deterministic_target);
             debug!(
-                "LCM escalation: Level 2 failed (output {} >= input {})",
-                tokens, original_tokens
+                "LCM escalation: Level 3 (deterministic truncate to {} tokens)",
+                deterministic_target
             );
+            Some((truncated, 3))
         }
     }
-
-    // Level 3: Deterministic truncation — guaranteed convergence, no LLM.
-    let truncated = deterministic_truncate(messages, deterministic_target);
-    debug!(
-        "LCM escalation: Level 3 (deterministic truncate to {} tokens)",
-        deterministic_target
-    );
-    (truncated, 3)
 }
 
 /// Deterministic truncation: extract key facts without any LLM call.
@@ -1286,7 +1404,7 @@ mod tests {
             _top_p: Option<f64>,
         ) -> anyhow::Result<LLMResponse> {
             Ok(LLMResponse {
-                content: Some("User asked multiple questions about Rust ownership.".to_string()),
+                content: Some("- User asked multiple questions about Rust ownership.".to_string()),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
                 usage: std::collections::HashMap::new(),
@@ -1358,7 +1476,12 @@ mod tests {
     #[test]
     fn test_summary_dag_create_and_retrieve() {
         let mut dag = SummaryDag::new();
-        dag.create_node(vec![0, 1, 2], vec![], "Summary of first 3 messages.".to_string(), 1);
+        dag.create_node(
+            vec![0, 1, 2],
+            vec![],
+            "Summary of first 3 messages.".to_string(),
+            1,
+        );
         assert_eq!(dag.len(), 1);
         let node = dag.get(0).unwrap();
         assert_eq!(node.source_ids, vec![0, 1, 2]);
@@ -1433,7 +1556,6 @@ mod tests {
     #[test]
     fn test_check_thresholds_none() {
         let engine = &mut LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
@@ -1457,7 +1579,6 @@ mod tests {
     #[test]
     fn test_system_prompt_excluded_from_compaction_threshold() {
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
@@ -1469,9 +1590,19 @@ mod tests {
 
         // Add 2 short conversation turns (~200 tokens total)
         ingest(&mut engine, 2, "user", "Hello, how are you?");
-        ingest(&mut engine, 3, "assistant", "I'm fine, thanks for asking! How can I help you today?");
+        ingest(
+            &mut engine,
+            3,
+            "assistant",
+            "I'm fine, thanks for asking! How can I help you today?",
+        );
         ingest(&mut engine, 4, "user", "What is the weather like?");
-        ingest(&mut engine, 5, "assistant", "I don't have access to weather data, but I can help with other things.");
+        ingest(
+            &mut engine,
+            5,
+            "assistant",
+            "I don't have access to weather data, but I can help with other things.",
+        );
 
         // 32K context, 2K reserve → 30K available, tau_soft=0.5 → soft=15K
         let budget = TokenBudget::new(32_768, 2048);
@@ -1491,7 +1622,6 @@ mod tests {
     #[test]
     fn test_conversation_tokens_trigger_compaction_when_over_threshold() {
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
@@ -1521,7 +1651,6 @@ mod tests {
     #[tokio::test]
     async fn test_huge_block_skips_llm_uses_deterministic() {
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.1,
             tau_hard: 0.3,
             deterministic_target: 64,
@@ -1554,7 +1683,14 @@ mod tests {
 
         // compact() should succeed via deterministic truncation (level 3),
         // never calling the LLM.
-        let result = engine.compact(&compactor, &budget, 0).await;
+        let result = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
         assert!(
             result.is_some(),
             "Should produce a summary via deterministic truncation"
@@ -1608,13 +1744,49 @@ mod tests {
         let body = "x".repeat(400);
         for i in 0..10 {
             ingest(engine, 2 + 2 * i, "user", &format!("Msg {i}: {body}"));
-            ingest(engine, 3 + 2 * i, "assistant", &format!("Reply {i}: {body}"));
+            ingest(
+                engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Reply {i}: {body}"),
+            );
         }
         // Protect ~400 tokens (≈ the 4 most recent messages); compact the older run.
         let (start, end) = engine.find_oldest_raw_block_with_tokens(400).unwrap();
         assert_eq!(start, 1, "block starts after the system message");
         assert!(end <= engine.active.len() - 4, "recent tail is protected");
         assert!(end > start + 1, "a non-trivial block is compacted");
+    }
+
+    #[test]
+    fn test_find_oldest_raw_block_returns_first_block() {
+        let engine = &mut LcmEngine::new(LcmConfig::default());
+        // Realistic-sized messages: token-based protect (default ~1k tokens) only
+        // yields a compact block once the conversation exceeds the protect budget,
+        // so use ~60-token messages (not 3-token ones).
+        let body = "the quick brown fox jumps over the lazy dog while the model prefills tokens "
+            .repeat(5);
+
+        ingest(engine, 1, "system", "System");
+        for i in 0..10 {
+            ingest(engine, 2 + 2 * i, "user", &format!("User {}: {}", i, body));
+            ingest(
+                engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Assistant {}: {}", i, body),
+            );
+        }
+
+        let block = engine.find_oldest_raw_block_impl(DEFAULT_PROTECT_TOKENS);
+        assert!(block.is_some());
+
+        let (start, end) = block.unwrap();
+        assert!(start >= 1, "Block should start after system message");
+        assert!(
+            end <= engine.active_len() - 4,
+            "Block should leave the recent messages protected"
+        );
     }
 
     #[test]
@@ -1639,7 +1811,7 @@ mod tests {
         ingest(engine, 2, "assistant", &body.repeat(4)); // older reasoning (~50 tok)
         ingest(engine, 3, "tool", &body.repeat(4)); // ~50 tok, weighted ~100 → overflows
         ingest(engine, 4, "assistant", "ok"); // tiny, newest
-        // protect=50: newest assistant fits (~5); tool (weighted ~100) overflows → compacted.
+                                              // protect=50: newest assistant fits (~5); tool (weighted ~100) overflows → compacted.
         let (start, end) = engine.find_oldest_raw_block_with_tokens(50).unwrap();
         assert_eq!(start, 1);
         // tool at active index 2 is in the compact block (end > 2) while the
@@ -1660,7 +1832,10 @@ mod tests {
         }
         let (start, end) = engine.find_oldest_raw_block_with_tokens(100).unwrap();
         assert_eq!(start, 1, "the giant at index 1 starts the compact block");
-        assert_eq!(end, 2, "only the giant is compacted; the 4 recent replies are protected");
+        assert_eq!(
+            end, 2,
+            "only the giant is compacted; the 4 recent replies are protected"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1671,7 +1846,6 @@ mod tests {
     async fn test_e2e_compact_level1_then_expand() {
         // Tiny context window so we can trigger compaction with few messages.
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
@@ -1726,7 +1900,14 @@ mod tests {
             "mock".to_string(),
             4096,
         );
-        let result = engine.compact(&compactor, &budget, 100).await;
+        let result = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                100,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
         assert!(result.is_some(), "Compaction should produce a summary");
 
         let summary_turn = result.unwrap();
@@ -1796,7 +1977,6 @@ mod tests {
     #[tokio::test]
     async fn test_e2e_compact_level3_deterministic_fallback() {
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
@@ -1826,7 +2006,14 @@ mod tests {
             "mock".to_string(),
             4096,
         );
-        let result = engine.compact(&compactor, &budget, 100).await;
+        let result = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                100,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
         assert!(result.is_some(), "Level 3 must always produce output");
 
         let summary_turn = result.unwrap();
@@ -1850,6 +2037,140 @@ mod tests {
         assert_eq!(expanded.len(), node.source_ids.len());
     }
 
+    #[tokio::test]
+    async fn soft_compaction_without_model_preserves_active_context() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+        ingest(&mut engine, 1, "system", "System prompt.");
+        for i in 0..10 {
+            let detail =
+                "ownership borrowing lifetimes move semantics shared references ".repeat(3);
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!("Question {i}: {detail}"),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Answer {i}: {detail}"),
+            );
+        }
+        let active_before = engine.active_context();
+        engine.request_async_compaction();
+
+        let result = engine
+            .compact(
+                None,
+                &TokenBudget::new(4096, 2048),
+                100,
+                CompactionFailureMode::PreserveContext,
+            )
+            .await;
+
+        assert!(result.is_none());
+        assert_eq!(engine.active_context(), active_before);
+        assert_eq!(engine.dag.len(), 0);
+        assert_ne!(
+            engine.check_thresholds(&TokenBudget::new(4096, 2048), 100),
+            CompactionAction::None,
+            "a failed soft pass must clear the pending bit so it can retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_compaction_huge_block_preserves_active_context() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.1,
+            tau_hard: 0.3,
+            deterministic_target: 64,
+        });
+        ingest(&mut engine, 1, "system", "System prompt.");
+        for i in 0..100 {
+            let detail = "ownership borrowing lifetimes and stable identifiers ".repeat(3);
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!("Question {i}: {detail}"),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Answer {i}: {detail}"),
+            );
+        }
+        let active_before = engine.active_context();
+        engine.request_async_compaction();
+
+        let result = engine
+            .compact(
+                None,
+                &TokenBudget::new(32_768, 2048),
+                0,
+                CompactionFailureMode::PreserveContext,
+            )
+            .await;
+
+        assert!(result.is_none());
+        assert_eq!(
+            engine.active_context(),
+            active_before,
+            "soft pressure must not install level-three truncation for huge blocks"
+        );
+        assert!(engine.dag().is_empty());
+        assert_ne!(
+            engine.check_thresholds(&TokenBudget::new(32_768, 2048), 0),
+            CompactionAction::None,
+            "failed soft compaction must remain retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_compaction_without_model_uses_deterministic_fallback() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+        ingest(&mut engine, 1, "system", "System prompt.");
+        for i in 0..10 {
+            let detail =
+                "ownership borrowing lifetimes move semantics shared references ".repeat(3);
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!("Question {i}: {detail}"),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Answer {i}: {detail}"),
+            );
+        }
+
+        let result = engine
+            .compact(
+                None,
+                &TokenBudget::new(4096, 2048),
+                100,
+                CompactionFailureMode::Deterministic,
+            )
+            .await
+            .expect("hard pressure must converge without a model");
+
+        assert!(matches!(result, Turn::Summary { level: 3, .. }));
+        assert_eq!(engine.dag.len(), 1);
+    }
+
     // -----------------------------------------------------------------------
     // E2E: lcm_expand tool round-trip
     // -----------------------------------------------------------------------
@@ -1862,7 +2183,12 @@ mod tests {
         {
             let mut e = engine.lock().await;
             ingest(&mut e, 1, "user", "What is Rust?");
-            ingest(&mut e, 2, "assistant", "Rust is a systems programming language.");
+            ingest(
+                &mut e,
+                2,
+                "assistant",
+                "Rust is a systems programming language.",
+            );
             ingest(&mut e, 3, "user", "Tell me about ownership.");
         }
 
@@ -1909,7 +2235,6 @@ mod tests {
     #[tokio::test]
     async fn test_e2e_double_compaction_lossless() {
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.2,
             tau_hard: 0.5,
             deterministic_target: 64,
@@ -1922,13 +2247,19 @@ mod tests {
                 &mut engine,
                 2 + 2 * i,
                 "user",
-                &format!("Detailed question {} about async Rust with tokio examples.", i),
+                &format!(
+                    "Detailed question {} about async Rust with tokio examples.",
+                    i
+                ),
             );
             ingest(
                 &mut engine,
                 3 + 2 * i,
                 "assistant",
-                &format!("Detailed answer {} covering spawn, select, and channels.", i),
+                &format!(
+                    "Detailed answer {} covering spawn, select, and channels.",
+                    i
+                ),
             );
         }
 
@@ -1941,12 +2272,26 @@ mod tests {
         );
 
         // First compaction.
-        let r1 = engine.compact(&compactor, &budget, 100).await;
+        let r1 = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                100,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
         assert!(r1.is_some(), "First compaction should succeed");
         let active_after_first = engine.active_len();
 
         // Second compaction (if there's still a raw block).
-        let r2 = engine.compact(&compactor, &budget, 100).await;
+        let r2 = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                100,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
         if r2.is_some() {
             assert!(
                 engine.active_len() <= active_after_first,
@@ -1977,7 +2322,6 @@ mod tests {
         // merge, summaries accumulated one-per-compaction and the post-
         // compaction floor grew without bound.
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
@@ -2001,18 +2345,47 @@ mod tests {
         ingest(&mut engine, 1, "system", "System");
         for i in 0..12 {
             ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
-            ingest(&mut engine, 3 + 2 * i, "assistant", &format!("reply {i}: {body}"));
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("reply {i}: {body}"),
+            );
         }
-        let r1 = engine.compact(&compactor, &budget, 0).await;
+        let r1 = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
         assert!(r1.is_some(), "first compaction fires");
         assert_eq!(count_summaries(&engine), 1, "one summary after round 1");
 
         // Round 2: add more turns and compact again.
         for i in 0..12 {
-            ingest(&mut engine, 100 + 2 * i, "user", &format!("more {i}: {body}"));
-            ingest(&mut engine, 101 + 2 * i, "assistant", &format!("more reply {i}: {body}"));
+            ingest(
+                &mut engine,
+                100 + 2 * i,
+                "user",
+                &format!("more {i}: {body}"),
+            );
+            ingest(
+                &mut engine,
+                101 + 2 * i,
+                "assistant",
+                &format!("more reply {i}: {body}"),
+            );
         }
-        let r2 = engine.compact(&compactor, &budget, 0).await;
+        let r2 = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
         assert!(r2.is_some(), "second compaction fires");
         assert_eq!(
             count_summaries(&engine),
@@ -2022,10 +2395,27 @@ mod tests {
 
         // Round 3: once more.
         for i in 0..12 {
-            ingest(&mut engine, 200 + 2 * i, "user", &format!("extra {i}: {body}"));
-            ingest(&mut engine, 201 + 2 * i, "assistant", &format!("extra reply {i}: {body}"));
+            ingest(
+                &mut engine,
+                200 + 2 * i,
+                "user",
+                &format!("extra {i}: {body}"),
+            );
+            ingest(
+                &mut engine,
+                201 + 2 * i,
+                "assistant",
+                &format!("extra reply {i}: {body}"),
+            );
         }
-        let _ = engine.compact(&compactor, &budget, 0).await;
+        let _ = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
         assert_eq!(
             count_summaries(&engine),
             1,
@@ -2034,14 +2424,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Benchmark: LCM compaction quality across 4 local models.
+    // Benchmark: LCM compaction quality across matched local models.
     //
     // Runs the same 10-turn conversation through each model's compaction
     // and reports: escalation level, compression ratio, latency, summary.
     //
-    // Requires LM Studio at NANOBOT_LCM_BENCH_BASE (default: http://192.168.1.22:1234/v1)
-    // with these models loaded: qwen3-0.6b, qwen3-1.7b, gemma-3n-e4b-it,
-    // nvidia-nemotron-nano-12b-v2-vl
+    // Requires an OpenAI-compatible endpoint at NANOBOT_LCM_BENCH_BASE with
+    // every comma-separated NANOBOT_LCM_BENCH_MODELS id available. This lets
+    // the release check compare the foreground model and compaction sidecar
+    // with identical input, budget, prompt, and measurement code.
     //
     // Run: cargo test test_bench_lcm_compaction_models -- --ignored --nocapture
     // -----------------------------------------------------------------------
@@ -2053,15 +2444,21 @@ mod tests {
         use std::time::Instant;
 
         let api_base = std::env::var("NANOBOT_LCM_BENCH_BASE")
-            .unwrap_or_else(|_| "http://192.168.1.22:1234/v1".to_string());
+            .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string());
 
-        // Models to benchmark (smallest → largest).
-        let models = [
-            "qwen3-0.6b",
-            "qwen3-1.7b",
-            "gemma-3n-e4b-it",
-            "nvidia-nemotron-nano-12b-v2-vl",
-        ];
+        let models: Vec<String> = std::env::var("NANOBOT_LCM_BENCH_MODELS")
+            .unwrap_or_else(|_| {
+                "qwen3-0.6b,qwen3-1.7b,gemma-3n-e4b-it,nvidia-nemotron-nano-12b-v2-vl".to_string()
+            })
+            .split(',')
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !models.is_empty(),
+            "NANOBOT_LCM_BENCH_MODELS must contain at least one model id"
+        );
 
         // Build a realistic 10-turn conversation (fixed, deterministic input).
         let mut conversation: Vec<Value> = Vec::new();
@@ -2152,7 +2549,6 @@ mod tests {
 
             // Build a fresh LCM engine with the conversation.
             let mut engine = LcmEngine::new(LcmConfig {
-                enabled: true,
                 tau_soft: 0.3,
                 tau_hard: 0.6,
                 deterministic_target: 128,
@@ -2168,7 +2564,14 @@ mod tests {
 
             // Run compaction, measure time.
             let start = Instant::now();
-            let result = engine.compact(&compactor, &budget, 100).await;
+            let result = engine
+                .compact(
+                    Some(&compactor),
+                    &budget,
+                    100,
+                    CompactionFailureMode::Deterministic,
+                )
+                .await;
             let elapsed = start.elapsed().as_millis();
 
             match result {
@@ -2314,8 +2717,7 @@ mod tests {
             "db_id".to_string(),
         )];
 
-        let engine =
-            LcmEngine::rebuild_from_db_nodes(&raw_messages, &nodes, LcmConfig::default());
+        let engine = LcmEngine::rebuild_from_db_nodes(&raw_messages, &nodes, LcmConfig::default());
 
         let raw_ids: Vec<usize> = engine
             .active
@@ -2330,14 +2732,21 @@ mod tests {
             .collect();
 
         // Unsummarized ids (1, 3, 5, 7, 8) must all be active — not orphaned.
-        assert_eq!(raw_ids, vec![1, 3, 5, 7, 8], "unsummarized raws must stay active");
+        assert_eq!(
+            raw_ids,
+            vec![1, 3, 5, 7, 8],
+            "unsummarized raws must stay active"
+        );
 
         let summary_count = engine
             .active
             .iter()
             .filter(|e| matches!(e, ContextEntry::Summary { .. }))
             .count();
-        assert_eq!(summary_count, 1, "Expected exactly 1 Summary entry in active");
+        assert_eq!(
+            summary_count, 1,
+            "Expected exactly 1 Summary entry in active"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2347,7 +2756,6 @@ mod tests {
     #[test]
     fn test_auto_expand_relevant_summary() {
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.3,
             tau_hard: 0.85,
             deterministic_target: 64,
@@ -2355,10 +2763,25 @@ mod tests {
 
         // Ingest messages about Rust ownership.
         ingest(&mut engine, 1, "system", "You are helpful.");
-        ingest(&mut engine, 2, "user", "Explain Rust ownership and borrowing rules.");
-        ingest(&mut engine, 3, "assistant", "Rust ownership means each value has one owner. Borrowing allows references.");
+        ingest(
+            &mut engine,
+            2,
+            "user",
+            "Explain Rust ownership and borrowing rules.",
+        );
+        ingest(
+            &mut engine,
+            3,
+            "assistant",
+            "Rust ownership means each value has one owner. Borrowing allows references.",
+        );
         ingest(&mut engine, 4, "user", "How do lifetimes work in Rust?");
-        ingest(&mut engine, 5, "assistant", "Lifetimes track how long references are valid.");
+        ingest(
+            &mut engine,
+            5,
+            "assistant",
+            "Lifetimes track how long references are valid.",
+        );
 
         // Manually create a summary covering messages 2-5.
         let node = engine.dag.create_node(
@@ -2383,7 +2806,12 @@ mod tests {
         ];
 
         // Now add a new user message about ownership (should trigger expansion).
-        ingest(&mut engine, 6, "user", "Tell me more about Rust ownership rules and borrow checker.");
+        ingest(
+            &mut engine,
+            6,
+            "user",
+            "Tell me more about Rust ownership rules and borrow checker.",
+        );
 
         let budget = TokenBudget::new(100_000, 8192);
         let appended = engine.auto_expand(&budget, 100);
@@ -2398,7 +2826,10 @@ mod tests {
             .active
             .iter()
             .any(|e| matches!(e, ContextEntry::Summary { .. }));
-        assert!(has_summary, "Summary must remain — expansion is append-only");
+        assert!(
+            has_summary,
+            "Summary must remain — expansion is append-only"
+        );
 
         // The appended message carries the original content, tagged synthetic.
         let content = appended[0]["content"].as_str().unwrap_or("");
@@ -2423,7 +2854,6 @@ mod tests {
     #[test]
     fn test_auto_expand_budget_aware() {
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.3,
             tau_hard: 0.85,
             deterministic_target: 64,
@@ -2442,7 +2872,10 @@ mod tests {
                 &mut engine,
                 3 + 2 * i,
                 "assistant",
-                &format!("Long answer {} about ownership, borrowing, lifetimes, and the borrow checker.", i),
+                &format!(
+                    "Long answer {} about ownership, borrowing, lifetimes, and the borrow checker.",
+                    i
+                ),
             );
         }
 
@@ -2486,15 +2919,24 @@ mod tests {
     #[test]
     fn test_auto_expand_irrelevant_query() {
         let mut engine = LcmEngine::new(LcmConfig {
-            enabled: true,
             tau_soft: 0.3,
             tau_hard: 0.85,
             deterministic_target: 64,
         });
 
         ingest(&mut engine, 1, "system", "S");
-        ingest(&mut engine, 2, "user", "Explain Rust ownership and borrowing.");
-        ingest(&mut engine, 3, "assistant", "Ownership means each value has one owner.");
+        ingest(
+            &mut engine,
+            2,
+            "user",
+            "Explain Rust ownership and borrowing.",
+        );
+        ingest(
+            &mut engine,
+            3,
+            "assistant",
+            "Ownership means each value has one owner.",
+        );
 
         let node = engine.dag.create_node(
             vec![2, 3],
@@ -2517,7 +2959,12 @@ mod tests {
         ];
 
         // Ask about something completely unrelated.
-        ingest(&mut engine, 4, "user", "What is the weather forecast for Tokyo tomorrow?");
+        ingest(
+            &mut engine,
+            4,
+            "user",
+            "What is the weather forecast for Tokyo tomorrow?",
+        );
 
         let budget = TokenBudget::new(100_000, 8192);
         assert!(
@@ -2554,7 +3001,6 @@ mod tests {
         )];
 
         let config = LcmConfig {
-            enabled: true,
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
@@ -2589,6 +3035,63 @@ mod tests {
         // Expand still works.
         let expanded = engine.expand(&[2, 3, 4, 5]);
         assert_eq!(expanded.len(), 4);
+    }
+
+    #[test]
+    fn rebuild_honors_latest_clear_boundary() {
+        let raw_messages = vec![
+            msg(1, "user", "old question"),
+            msg(2, "assistant", "old answer"),
+            msg(3, "clear", ""),
+            msg(4, "user", "new question"),
+            msg(5, "assistant", "new answer"),
+            msg(6, "user", "new tail"),
+        ];
+        let db_nodes = vec![
+            (
+                40,
+                vec![1, 2],
+                vec![],
+                "old summary".to_string(),
+                4,
+                1,
+                "db_id".to_string(),
+            ),
+            (
+                1,
+                vec![4, 5],
+                vec![],
+                "new summary".to_string(),
+                4,
+                1,
+                "db_id".to_string(),
+            ),
+        ];
+
+        let engine =
+            LcmEngine::rebuild_from_db_nodes(&raw_messages, &db_nodes, LcmConfig::default());
+        let active = engine.active_context();
+        let wire = serde_json::to_string(&active).unwrap();
+
+        assert_eq!(
+            engine.store_len(),
+            3,
+            "only post-clear raws enter the store"
+        );
+        assert_eq!(engine.dag().len(), 1, "pre-clear summaries stay retired");
+        assert_eq!(
+            engine.dag.next_id, 41,
+            "post-clear compaction must not reuse a persisted pre-clear node ID"
+        );
+        assert!(wire.contains("new summary"));
+        assert!(wire.contains("new tail"));
+        assert!(!wire.contains("old question"));
+        assert!(!wire.contains("old summary"));
+        assert!(!active
+            .iter()
+            .any(|message| { message.get("role").and_then(Value::as_str) == Some("clear") }));
+        assert!(engine.expand(&[1, 2]).is_empty());
+        assert_eq!(engine.expand(&[4, 5]).len(), 2);
     }
 
     /// THE id-drift repro. Live sessions ingest a FILTERED WINDOW of history
@@ -2662,7 +3165,15 @@ mod tests {
         // Node 0 = an old summary (subsumed). Node 1 = the merged summary whose
         // child_ids = [0]. No raw messages needed for this DAG-only check.
         let nodes: Vec<(usize, Vec<usize>, Vec<usize>, String, usize, u8, String)> = vec![
-            (0, vec![1, 2, 3], vec![], "old summary".to_string(), 10, 1, "db_id".to_string()),
+            (
+                0,
+                vec![1, 2, 3],
+                vec![],
+                "old summary".to_string(),
+                10,
+                1,
+                "db_id".to_string(),
+            ),
             (
                 1,
                 vec![1, 2, 3, 4, 5],
@@ -2677,49 +3188,109 @@ mod tests {
 
         // Only the merged node survives (the subsumed old node is skipped).
         assert_eq!(
-            engine.dag_ref().len(),
+            engine.dag().len(),
             1,
             "subsumed node must be skipped on rebuild"
         );
-        let only = engine.dag_ref().get(0).expect("one node rebuilt");
+        let only = engine
+            .dag()
+            .get(1)
+            .expect("persisted root ID must survive rebuild");
         assert_eq!(only.text, "merged summary");
         assert_eq!(only.child_summaries, vec![0]);
     }
 
-    /// Legacy summary_nodes rows (id_kind absent/legacy) carry POSITIONAL
-    /// source_ids. They must be skipped on rebuild — never resolved against
-    /// db ids — leaving all raws active.
+    /// Sparse persisted IDs used to be densely renumbered while their child
+    /// references were left untouched. If the only active root became ID 0 and
+    /// named retired child 0, `all_source_ids(0)` recursed forever. Preserve
+    /// the root ID, reserve above every persisted ID, and keep expansion keyed
+    /// exclusively by stable SQLite message IDs.
     #[test]
-    fn test_legacy_ordinal_nodes_are_skipped_not_misresolved() {
-        let full: Vec<Value> = (1..=6)
-            .map(|i| {
-                let role = if i % 2 == 1 { "user" } else { "assistant" };
-                msg(i, role, &format!("MSG_{i}"))
-            })
+    fn restart_rebuild_preserves_sparse_subsumed_ids_without_cycles() {
+        let raw_messages: Vec<Value> = (10..=14)
+            .map(|id| msg(id, "user", &format!("ORIGINAL_{id}")))
             .collect();
-        let nodes = vec![(
-            0usize,
-            vec![1usize, 2], // positional ids from the pre-rowid scheme
-            vec![],
-            "Legacy summary.".to_string(),
-            5usize,
-            1u8,
-            "legacy".to_string(),
-        )];
+        let nodes = vec![
+            (
+                0usize,
+                vec![10usize, 11],
+                vec![],
+                "retired child".to_string(),
+                4usize,
+                1u8,
+                "db_id".to_string(),
+            ),
+            (
+                17usize,
+                vec![10usize, 11, 12],
+                vec![0usize],
+                "sparse merged root".to_string(),
+                6usize,
+                1u8,
+                "db_id".to_string(),
+            ),
+        ];
 
-        let engine = LcmEngine::rebuild_from_db_nodes(&full, &nodes, LcmConfig::default());
+        let mut engine =
+            LcmEngine::rebuild_from_db_nodes(&raw_messages, &nodes, LcmConfig::default());
 
-        assert_eq!(
-            engine.dag_ref().len(),
-            0,
-            "legacy node must not enter the DAG"
+        assert!(
+            engine.dag().get(0).is_none(),
+            "retired child stays inactive"
         );
-        let raw_count = engine
-            .active_entries()
-            .iter()
-            .filter(|e| matches!(e, ContextEntry::Raw { .. }))
-            .count();
-        assert_eq!(raw_count, 6, "all raws must remain active");
+        let root = engine
+            .dag()
+            .get(17)
+            .expect("sparse persisted root ID must be preserved");
+        assert_eq!(root.child_summaries, vec![0]);
+        assert_eq!(
+            engine.dag().all_source_ids(17),
+            vec![10, 11, 12],
+            "retired child reference must not alias the restored root"
+        );
+
+        let expanded = engine.expand(&[10, 11, 12]);
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded[0].1["content"], "ORIGINAL_10");
+        assert_eq!(expanded[2].1["content"], "ORIGINAL_12");
+
+        let next = engine
+            .dag
+            .create_node(vec![13, 14], vec![17], "new live root".to_string(), 1);
+        assert_eq!(next.id, 18, "new nodes must not reuse persisted sparse IDs");
+        assert_eq!(engine.dag.newest().map(|node| node.id), Some(18));
+    }
+
+    #[test]
+    fn restart_rebuild_drops_persisted_cycles() {
+        let raw_messages = vec![msg(10, "user", "still available")];
+        let nodes = vec![
+            (
+                4usize,
+                vec![10usize],
+                vec![9usize],
+                "cycle a".to_string(),
+                2usize,
+                1u8,
+                "db_id".to_string(),
+            ),
+            (
+                9usize,
+                vec![10usize],
+                vec![4usize],
+                "cycle b".to_string(),
+                2usize,
+                1u8,
+                "db_id".to_string(),
+            ),
+        ];
+
+        let engine = LcmEngine::rebuild_from_db_nodes(&raw_messages, &nodes, LcmConfig::default());
+        assert!(
+            engine.dag().is_empty(),
+            "cyclic nodes cannot become roots"
+        );
+        assert_eq!(engine.expand(&[10])[0].1["content"], "still available");
     }
 
     /// CRIT-1 seam: after a compaction the loop used to call
@@ -2729,7 +3300,6 @@ mod tests {
     #[tokio::test]
     async fn test_store_sacred_across_compaction_and_resync() {
         let config = LcmConfig {
-            enabled: true,
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
@@ -2766,7 +3336,12 @@ mod tests {
             4096,
         );
         let summary = engine
-            .compact(&compactor, &budget, 100)
+            .compact(
+                Some(&compactor),
+                &budget,
+                100,
+                CompactionFailureMode::Deterministic,
+            )
             .await
             .expect("should compact");
         let source_ids = match &summary {
@@ -2789,7 +3364,11 @@ mod tests {
         for &id in &source_ids {
             let got = engine.expand(&[id]);
             assert_eq!(got.len(), 1, "original id {id} must still resolve");
-            let content = got[0].1.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            let content = got[0]
+                .1
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
             assert!(
                 content.contains("MARKER"),
                 "expand({id}) returned corrupted/shifted content: {content}"
@@ -2829,7 +3408,8 @@ mod tests {
             "db_id".to_string(),
         )];
 
-        let engine = LcmEngine::rebuild_from_db_nodes(&raw_messages, &db_nodes, LcmConfig::default());
+        let engine =
+            LcmEngine::rebuild_from_db_nodes(&raw_messages, &db_nodes, LcmConfig::default());
 
         assert_eq!(
             engine.store_len(),

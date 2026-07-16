@@ -46,7 +46,6 @@ impl ReplContext {
             model_name,
             None,
             None,
-            None,
             // migrated from swappable().is_local — phase 09-03
             self.core_handle.swappable().mode().is_local(),
         );
@@ -95,7 +94,22 @@ impl ReplContext {
     pub async fn cmd_restart(&mut self) {
         // Higgs managed sidecar: stop → restart with current model dir.
         if self.srv.engine == super::super::InferenceEngine::Higgs {
-            let port = self.config.agents.defaults.higgs_port;
+            if !super::autonomous_restart_allowed(&self.config) {
+                println!(
+                    "  {}Restart skipped:{} localAutostart does not authorize Higgs spawning.",
+                    tui::YELLOW,
+                    tui::RESET
+                );
+                return;
+            }
+            // `srv.local_port` is populated from the endpoint that discovery
+            // actually adopted; `higgsPort` remains only the configured spawn
+            // candidate when no server is found.
+            let port = self
+                .srv
+                .local_port
+                .parse::<u16>()
+                .unwrap_or(self.config.agents.defaults.higgs_port);
             match crate::higgs::resolve_model_dir(&self.config) {
                 Ok(model_dir) => {
                     if let Some(bin) = crate::higgs::find_binary() {
@@ -146,48 +160,18 @@ impl ReplContext {
                 tui::RESET
             );
 
-            // Also cycle the compaction sidecar if one is configured, so
-            // `/restart` brings both servers back in a known-good state.
-            if let Some(cport) = self.config.agents.defaults.higgs_compaction_port {
-                let (cmodel_dir, cmodel) = crate::higgs::compaction_sidecar_config(&self.config);
-                if let Some(dir) = cmodel_dir {
-                    if let Some(bin) = crate::higgs::find_binary() {
-                        print!("  Restarting compaction Higgs (:{cport})... ");
-                        io::stdout().flush().ok();
-                        match crate::higgs::server_restart_role(
-                            &bin, cport, &dir, &cmodel, "compaction",
-                        )
-                        .await
-                        {
-                            Ok(crate::higgs::StartResult::Ready) => {
-                                println!("{}OK{}", tui::GREEN, tui::RESET);
-                            }
-                            Ok(crate::higgs::StartResult::Loading { pid, port: _ }) => {
-                                println!(
-                                    "{}LOADING{} (pid {pid} still warming up)",
-                                    tui::YELLOW, tui::RESET,
-                                );
-                            }
-                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                        }
-                    } else {
-                        println!(
-                            "  {}Higgs binary not found, cannot restart compaction sidecar.{}",
-                            tui::YELLOW, tui::RESET,
-                        );
-                    }
-                } else {
-                    println!(
-                        "  {}Skipped compaction restart:{} no model dir configured",
-                        tui::YELLOW, tui::RESET,
-                    );
-                }
-            }
-
             return;
         }
 
         if self.srv.lms_managed {
+            if !super::autonomous_restart_allowed(&self.config) {
+                println!(
+                    "  {}Restart skipped:{} localAutostart does not authorize LM Studio spawning.",
+                    tui::YELLOW,
+                    tui::RESET
+                );
+                return;
+            }
             if let Some(ref bin) = self.srv.lms_binary.clone() {
                 let lms_port = self.config.agents.defaults.lms_port;
 
@@ -1251,7 +1235,9 @@ impl ReplContext {
                 self.config.agents.defaults.local_backend = "higgs".to_string();
                 self.config.agents.defaults.skip_jit_gate = true;
                 self.srv.engine = super::super::InferenceEngine::Higgs;
-                self.srv.local_port = self.config.agents.defaults.higgs_port.to_string();
+                if let Some(port) = pair.port() {
+                    self.srv.local_port = port.to_string();
+                }
             }
             crate::local_discovery::EndpointSource::LmStudio => {
                 self.config.agents.defaults.local_backend = "lmstudio".to_string();
@@ -1289,21 +1275,31 @@ impl ReplContext {
             crate::agent::pid_file::cleanup_stale_pids();
 
             // Discovery-first: reuse a healthy running endpoint (don't restart
-            // or double-spawn a server that is already serving). Explicit /local
-            // MAY spawn below — but only when discovery finds nothing.
+            // or double-spawn a server that is already serving). Spawning below
+            // is authorized only by localAutostart, never by localBackend.
             let discovered = self.adopt_discovered_endpoint().await;
 
-            // Try to start a local inference engine if none is active.
-            // For Higgs: always attempt start regardless of local_api_base — it may
-            // be stale from a previous session and Higgs may have stopped.
-            let is_higgs =
-                crate::config::schema::is_higgs_backend(&self.config.agents.defaults.local_backend);
+            let autostart = self.config.agents.defaults.local_autostart;
             if discovered.is_none()
-                && (self.config.agents.defaults.local_api_base.is_empty() || is_higgs)
+                && matches!(autostart, crate::config::schema::LocalAutostart::Off)
+            {
+                println!(
+                    "\n  {}{}No healthy local endpoint found.{} localAutostart is off, so nanobot will not spawn one.",
+                    tui::BOLD,
+                    tui::YELLOW,
+                    tui::RESET,
+                );
+                println!("  {}Remaining in cloud mode{}\n", tui::DIM, tui::RESET);
+                return;
+            }
+
+            // Try to start the one backend explicitly authorized by
+            // localAutostart if discovery found no healthy endpoint.
+            if discovered.is_none()
                 && !self.srv.lms_managed
                 && self.srv.engine == super::super::InferenceEngine::None
             {
-                if is_higgs {
+                if matches!(autostart, crate::config::schema::LocalAutostart::Higgs) {
                     // Higgs managed sidecar
                     match crate::higgs::resolve_model_dir(&self.config) {
                         Ok(model_dir) => {
@@ -1326,6 +1322,8 @@ impl ReplContext {
                                     Ok(crate::higgs::StartResult::Ready) => {
                                         self.srv.engine = super::super::InferenceEngine::Higgs;
                                         self.srv.local_port = port.to_string();
+                                        self.config.agents.defaults.local_backend =
+                                            "higgs".to_string();
                                         self.config.agents.defaults.skip_jit_gate = true;
                                         if let Some(name) = self.apply_higgs_endpoint(port).await {
                                             println!("  {}OK{} · {name}", tui::GREEN, tui::RESET);
@@ -1339,6 +1337,8 @@ impl ReplContext {
                                     }) => {
                                         self.srv.engine = super::super::InferenceEngine::Higgs;
                                         self.srv.local_port = loading_port.to_string();
+                                        self.config.agents.defaults.local_backend =
+                                            "higgs".to_string();
                                         self.config.agents.defaults.skip_jit_gate = true;
                                         self.config.agents.defaults.local_api_base =
                                             format!("http://127.0.0.1:{loading_port}/v1");
@@ -1475,6 +1475,7 @@ impl ReplContext {
                                 self.srv.lms_binary = Some(bin);
                                 self.srv.engine = super::super::InferenceEngine::Lms;
                                 self.srv.local_port = lms_port.to_string();
+                                self.config.agents.defaults.local_backend = "lmstudio".to_string();
                                 if self.config.agents.defaults.local_api_base.is_empty() {
                                     self.config.agents.defaults.local_api_base = format!(
                                         "http://{}:{}/v1",

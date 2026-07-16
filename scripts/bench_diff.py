@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two nanobot-bench CSVs and print a delta table.
+"""Compare two normalized benchmark CSVs and print a delta table.
 
 Usage:
     python3 scripts/bench_diff.py benches/baseline.csv /tmp/nanobot-speed.csv

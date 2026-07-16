@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use serde_json::Value;
 use tiktoken_rs::CoreBPE;
 
-use crate::agent::compaction::tool_output_digest;
+use crate::agent::context_hygiene::{shrink_tool_body, ToolBodyPolicy};
 
 /// Remove tool result messages whose `tool_call_id` is in `ids_to_remove`.
 ///
@@ -83,7 +83,7 @@ fn evict_by_age(msgs: &mut Vec<Value>, current_turn: u64, max_age_turns: usize) 
 ///
 /// Only fires when there are more than 4 tool messages. Results longer than 200 chars are
 /// replaced with a compact digest marker so the LLM can see data existed and was compressed.
-fn truncate_old_tool_results(msgs: &mut Vec<Value>) {
+fn digest_old_tool_results(msgs: &mut Vec<Value>) {
     let tool_msg_indices: Vec<usize> = msgs
         .iter()
         .enumerate()
@@ -95,8 +95,10 @@ fn truncate_old_tool_results(msgs: &mut Vec<Value>) {
         let truncate_up_to = tool_msg_indices.len() - 4;
         for &idx in &tool_msg_indices[..truncate_up_to] {
             if let Some(content) = msgs[idx].get("content").and_then(|c| c.as_str()) {
-                if content.len() > 200 {
-                    msgs[idx]["content"] = Value::String(tool_output_digest(content, 200));
+                if let Some(digest) =
+                    shrink_tool_body(content, ToolBodyPolicy::Digest { preview_len: 200 })
+                {
+                    msgs[idx]["content"] = Value::String(digest);
                 }
             }
         }
@@ -213,19 +215,6 @@ impl TokenBudget {
             reserve_response: max_response,
             used_tokens: 0,
             output_reserve: None,
-        }
-    }
-
-    /// Return a copy of this budget with `max_context` overridden. Used to cap
-    /// LCM's threshold budget to the runtime-adaptive effective ceiling without
-    /// mutating the shared budget (Phase D). `used_tokens` is reset since this
-    /// is only used for threshold math, not admission tracking.
-    pub fn with_max_context(&self, max_context: usize) -> Self {
-        Self {
-            max_context,
-            reserve_response: self.reserve_response,
-            used_tokens: 0,
-            output_reserve: self.output_reserve,
         }
     }
 
@@ -428,7 +417,7 @@ impl TokenBudget {
         }
 
         // Stage 2: Truncate old tool results to digest summaries.
-        truncate_old_tool_results(&mut msgs);
+        digest_old_tool_results(&mut msgs);
 
         if Self::estimate_tokens(&msgs) <= budget {
             return msgs;
@@ -645,7 +634,7 @@ mod tests {
         }
 
         let mut expected_tail = messages[frozen_prefix..].to_vec();
-        truncate_old_tool_results(&mut expected_tail);
+        digest_old_tool_results(&mut expected_tail);
         let target_budget =
             TokenBudget::estimate_tokens(&prefix) + TokenBudget::estimate_tokens(&expected_tail);
         assert!(

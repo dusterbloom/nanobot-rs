@@ -1,17 +1,24 @@
-# Local Reliability Plan (Red -> Green)
+# Local Reliability Regression Plan (Red -> Green)
+
+> The red phase is for a pre-fix checkout. On the current tree, run the green
+> phase; every filter is exact, the script uses an isolated temporary HOME, and
+> it fails if a named test is missing.
 
 ## Goal
-Resolve the current failure clusters and guarantee nanobot can run in `local-only` mode without cloud provider coupling.
+Keep local-only startup independent from cloud providers while preserving the
+canonical SQLite working-memory and reflection path.
 
 ## Root Causes and Fix Plan
 
-1. Archive/move failures (`EXDEV`) in memory pipeline
-- Problem: `fs::rename` across directories fails in this runtime for archive paths.
-- Files: `src/agent/observer.rs`, `src/agent/working_memory.rs`, `src/agent/reflector.rs`.
-- Plan:
-  - Add a shared file-move helper with fallback (`rename` then `copy+remove` on cross-device errors).
-  - Use it in both observation and working-memory archive paths.
-  - Stop swallowing observer archive errors when correctness depends on a successful move.
+1. Session memory lifecycle
+- Problem: the former observer and `SESSION_*.md` archive checks described a
+  storage path that no longer exists.
+- Files: `src/session/db.rs`, `src/agent/working_memory.rs`,
+  `src/agent/reflector.rs`.
+- Contract:
+  - Session-scoped working memory lives in SQLite.
+  - Reflection reads completed rows, updates `MEMORY.md`, and marks those rows
+    reflected without recreating per-session Markdown files.
 
 2. Web search test depends on process env
 - Problem: `test_web_search_no_api_key` fails when `BRAVE_API_KEY` is set in test environment.
@@ -41,6 +48,18 @@ Resolve the current failure clusters and guarantee nanobot can run in `local-onl
   - Make `get_api_base()` use the same disabled-key predicate as `get_api_key()`.
   - Add regression test for local vLLM selection when cloud providers are explicitly disabled.
 
+6. Local discovery and spawn authority
+- Problem: endpoint identity, model identity, and spawn policy must not drift
+  between Higgs and LM Studio.
+- Files: `src/local_discovery.rs`, `src/higgs.rs`.
+- Contract:
+  - Discovery adopts endpoint and model together.
+  - `localAutostart: "off"` never spawns; explicit Higgs autostart does.
+  - Higgs and LM Studio use distinct configured ports, with LM Studio on 1234
+    by default.
+  - The compaction sidecar only gains spawn authority from explicit Higgs
+    autostart, never from LM Studio autostart.
+
 ## TDD Matrix
 
 ### Red phase (must fail before fixes)
@@ -53,8 +72,8 @@ Use:
 Expected failing contracts:
 - alias normalization (`/prov`)
 - web no-key path under env contamination
-- archive move path
-- reflector archive completion path
+- SQLite working-memory lifecycle
+- reflector completion/reflection lifecycle
 - bind-dependent server path
 - local-only provider/base mismatch with `"none"` sentinel
 
@@ -69,14 +88,21 @@ Green criteria:
 - all root-cause regressions pass
 - local-only wiring tests pass:
   - `cli::tests::test_build_core_handle_local_forces_local_provider_even_with_cloud_keys`
-  - `cli::tests::test_make_eval_provider_local_uses_local_endpoint`
-  - `cli::tests::test_eval_model_name_local_is_port_scoped`
   - `config::schema::tests::test_local_vllm_provider_selected_when_cloud_disabled`
+  - `local_discovery::tests::test_decide_no_server_and_autostart_off_is_note_not_spawn`
+  - `local_discovery::tests::test_decide_no_server_spawns_only_with_explicit_autostart`
+  - `local_discovery::tests::test_candidates_cover_configured_higgs_lms_and_cluster`
+  - `higgs::tests::compaction_manager_respects_explicit_higgs_autostart`
+  - `higgs::tests::compaction_manager_never_spawns_for_lmstudio_autostart`
 
 ## Local-only Acceptance Contract
 
 When local mode is enabled:
-- core provider base must be `http://localhost:<port>/v1`
-- model label must be `local:<model>`
+- endpoint and served model are adopted as one discovery result
+- a healthy explicit `localApiBase` wins, followed by Higgs and then LM Studio
+- Higgs uses `higgsPort`; LM Studio uses `lmsPort` (default 1234)
+- `localAutostart: "off"` does not spawn a server
+- `localAutostart: "higgs"` authorizes Higgs spawning
+- model label remains `local:<model>`
 - cloud keys configured in config must not alter provider wiring for local mode
-- eval local mode must use local endpoint and not require cloud API keys
+- compaction-sidecar spawning is not authorized by LM Studio autostart

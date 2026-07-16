@@ -184,11 +184,12 @@ mod tests {
         // Seed the DB with a known message.
         let db = SessionDb::new(&tmp.path().join("sessions.db"));
         let session = db.create_session("cli:default").await;
-        let _ = db.add_message(
-            &session.id,
-            &json!({"role": "user", "content": "How do I configure Rustfmt?"}),
-        )
-        .await;
+        let _ = db
+            .add_message(
+                &session.id,
+                &json!({"role": "user", "content": "How do I configure Rustfmt?"}),
+            )
+            .await;
 
         let mut params = HashMap::new();
         params.insert("query".to_string(), json!("Rustfmt"));
@@ -208,16 +209,18 @@ mod tests {
         // Insert into two different channels.
         let cli = db.create_session("cli:default").await;
         let tg = db.create_session("telegram:42").await;
-        let _ = db.add_message(
-            &cli.id,
-            &json!({"role": "user", "content": "CLI benchmark result"}),
-        )
-        .await;
-        let _ = db.add_message(
-            &tg.id,
-            &json!({"role": "user", "content": "Telegram benchmark result"}),
-        )
-        .await;
+        let _ = db
+            .add_message(
+                &cli.id,
+                &json!({"role": "user", "content": "CLI benchmark result"}),
+            )
+            .await;
+        let _ = db
+            .add_message(
+                &tg.id,
+                &json!({"role": "user", "content": "Telegram benchmark result"}),
+            )
+            .await;
 
         let mut params = HashMap::new();
         params.insert("query".to_string(), json!("benchmark"));
@@ -243,11 +246,12 @@ mod tests {
 
         // Insert 5 matching messages.
         for i in 0..5 {
-            let _ = db.add_message(
-                &session.id,
-                &json!({"role": "user", "content": format!("Tokio async message {}", i)}),
-            )
-            .await;
+            let _ = db
+                .add_message(
+                    &session.id,
+                    &json!({"role": "user", "content": format!("Tokio async message {}", i)}),
+                )
+                .await;
         }
 
         let mut params = HashMap::new();

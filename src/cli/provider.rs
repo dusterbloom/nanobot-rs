@@ -190,7 +190,9 @@ pub(crate) fn check_api_key(config: &Config) {
         eprintln!(
             "Set one in ~/.nanobot/config.json, e.g. providers.anthropic.apiKey or providers.openrouter.apiKey"
         );
-        eprintln!("Or log in with the Claude CLI (`claude login`) to use Claude Max OAuth credentials");
+        eprintln!(
+            "Or log in with the Claude CLI (`claude login`) to use Claude Max OAuth credentials"
+        );
         std::process::exit(1);
     }
 }

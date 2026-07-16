@@ -140,9 +140,9 @@ fn build_test_core(
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: false,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -482,9 +482,9 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: false,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -549,9 +549,9 @@ fn test_delegation_with_is_local_true() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: true,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -618,9 +618,9 @@ fn test_delegation_with_is_local_false_cloud() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: false,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -659,7 +659,8 @@ fn test_delegation_with_is_local_false_cloud() {
     // Anthropic-native / OpenRouter — MockLLM.get_api_base() == None, so
     // the Anthropic branch wins).
     assert_eq!(
-        core.memory_model, "haiku",
+        core.compactor.model(),
+        "haiku",
         "Cloud + MockLLM(api_base=None) → memory_model must default to haiku"
     );
 
@@ -707,9 +708,9 @@ fn test_delegation_with_compaction_and_delegation_providers() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: true,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: Some(compaction),
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -734,7 +735,8 @@ fn test_delegation_with_compaction_and_delegation_providers() {
     // MAIN model name to a dedicated compaction sidecar would make the sidecar
     // runtime-load the big model — the contention the sidecar prevents.
     assert_eq!(
-        core.memory_model, "compaction",
+        core.compactor.model(),
+        "compaction",
         "memory_model must be the compaction provider's own model, not the main model"
     );
     assert_eq!(
@@ -792,9 +794,9 @@ fn test_delegation_with_compaction_and_delegation_providers_cloud() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: false,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: Some(compaction),
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -809,16 +811,15 @@ fn test_delegation_with_compaction_and_delegation_providers_cloud() {
         sessions_db_path: None,
     });
 
-    // pins agent_core.rs:486-509 — cloud memory path ignores
-    // `compaction_provider`; MockLLM(api_base=None) → "haiku" branch.
     assert_eq!(
-        core.memory_model, "haiku",
-        "Cloud mode: memory_model must default to haiku (not 'compaction')"
+        core.compactor.model(),
+        "compaction",
+        "Cloud mode: memory_model must follow the managed compaction provider"
     );
     assert_eq!(
         core.memory_provider.get_default_model(),
-        "main",
-        "Cloud mode: compaction_provider ignored; memory reuses main provider"
+        "compaction",
+        "Cloud mode: memory must use the managed compaction provider"
     );
 
     // Delegation plumbing still works identically on both paths.
@@ -902,9 +903,9 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: true,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: Some(provider.clone()),
+        compaction_manager: None,
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -925,7 +926,6 @@ async fn test_real_lcm_e2e_compact_and_expand() {
     let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
 
     let lcm_config = LcmSchemaConfig {
-        enabled: Some(true),
         tau_soft: 0.3, // Trigger early.
         tau_hard: 0.6,
         deterministic_target: 128,
@@ -986,9 +986,17 @@ async fn test_real_lcm_e2e_compact_and_expand() {
     }
 
     // Check LCM engine state.
+    let concrete_session = agent_loop
+        .shared
+        .core_handle
+        .swappable()
+        .sessions
+        .get_latest_session(session_key)
+        .await
+        .expect("test session must exist");
     let engines = agent_loop.shared.lcm_engines.lock().await;
     let engine_arc = engines
-        .get(session_key)
+        .get(&concrete_session.id)
         .expect("LCM engine should exist for session");
     let engine = engine_arc.lock().await;
 
@@ -996,13 +1004,13 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         "LCM E2E results: store={} active={} dag_nodes={}",
         engine.store_len(),
         engine.active_len(),
-        engine.dag_ref().len()
+        engine.dag().len()
     );
 
     // Invariant 1: store has messages from the conversation.
     // Note: with is_local + small context, trim_to_fit_with_age runs before
     // LCM ingestion, so the store only contains messages that survived trimming.
-    // The session JSONL (on-disk) is the true immutable store; the in-memory
+    // SQLite is the true immutable store; the in-memory
     // LCM store tracks what entered the active context window.
     assert!(
         engine.store_len() >= 5,
@@ -1021,14 +1029,14 @@ async fn test_real_lcm_e2e_compact_and_expand() {
 
     // Invariant 3: DAG should have at least one summary node.
     assert!(
-        engine.dag_ref().len() >= 1,
+        engine.dag().len() >= 1,
         "DAG should have at least 1 summary node, got {}",
-        engine.dag_ref().len()
+        engine.dag().len()
     );
 
     // Invariant 4: every summary node's source IDs resolve to real messages.
-    for i in 0..engine.dag_ref().len() {
-        let node = engine.dag_ref().get(i).unwrap();
+    for i in 0..engine.dag().len() {
+        let node = engine.dag().get(i).unwrap();
         let expanded = engine.expand(&node.source_ids);
         assert_eq!(
             expanded.len(),
@@ -1080,7 +1088,7 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         "  Messages: {} stored, {} active, {} summary nodes",
         engine.store_len(),
         engine.active_len(),
-        engine.dag_ref().len()
+        engine.dag().len()
     );
 
     // Cleanup.
@@ -1213,9 +1221,9 @@ fn build_trio_e2e_harness(
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -1673,9 +1681,9 @@ async fn test_trio_e2e_router_unreachable() {
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -1789,9 +1797,9 @@ async fn test_trio_e2e_specialist_unreachable() {
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -2425,9 +2433,9 @@ fn build_trio_offline_harness(
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -2474,8 +2482,31 @@ fn build_local_inline_harness_with_model(
     main: Arc<dyn LLMProvider>,
     model: &str,
 ) -> (AgentLoop, std::path::PathBuf) {
-    use crate::config::schema::LcmSchemaConfig;
+    build_local_inline_harness_with_lcm(main, model, 4096, LcmSchemaConfig::default())
+}
 
+fn build_local_inline_harness_with_lcm(
+    main: Arc<dyn LLMProvider>,
+    model: &str,
+    max_context_tokens: usize,
+    lcm_config: LcmSchemaConfig,
+) -> (AgentLoop, std::path::PathBuf) {
+    build_local_inline_harness_with_memory(
+        main,
+        model,
+        max_context_tokens,
+        lcm_config,
+        MemoryConfig::default(),
+    )
+}
+
+fn build_local_inline_harness_with_memory(
+    main: Arc<dyn LLMProvider>,
+    model: &str,
+    max_context_tokens: usize,
+    lcm_config: LcmSchemaConfig,
+    memory_config: MemoryConfig,
+) -> (AgentLoop, std::path::PathBuf) {
     let workspace = tempfile::tempdir().unwrap().keep();
     let core = build_swappable_core(SwappableCoreConfig {
         provider: main,
@@ -2485,7 +2516,7 @@ fn build_local_inline_harness_with_model(
         max_continuations: 2,
         max_tokens: 512,
         temperature: 0.3,
-        max_context_tokens: 4096,
+        max_context_tokens,
         brave_api_key: None,
         search_provider: "searxng".to_string(),
         searxng_url: "http://localhost:8888".to_string(),
@@ -2493,11 +2524,11 @@ fn build_local_inline_harness_with_model(
         search_max_results: 5,
         exec_timeout: 30,
         restrict_to_workspace: true,
-        memory_config: MemoryConfig::default(),
+        memory_config,
         is_local: true,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -2512,7 +2543,7 @@ fn build_local_inline_harness_with_model(
         sessions_db_path: Some(workspace.join("sessions.db")),
     });
 
-    let counters = test_runtime_counters(4096);
+    let counters = test_runtime_counters(max_context_tokens);
     let core_handle = AgentHandle::new(core, counters);
 
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
@@ -2529,7 +2560,7 @@ fn build_local_inline_harness_with_model(
         None,
         None,
         ProprioceptionConfig::default(),
-        LcmSchemaConfig::default(),
+        lcm_config,
         None,
     );
 
@@ -2584,13 +2615,249 @@ impl LLMProvider for WireRecordingProvider {
         Ok(if queue.len() > 1 {
             queue.pop_front().unwrap()
         } else {
-            queue.front().cloned().unwrap_or_else(|| Self::text_response("done"))
+            queue
+                .front()
+                .cloned()
+                .unwrap_or_else(|| Self::text_response("done"))
         })
     }
 
     fn get_default_model(&self) -> &str {
         &self.name
     }
+}
+
+#[tokio::test]
+async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-hard-lcm-test",
+        vec![WireRecordingProvider::text_response("foreground reply")],
+    ));
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.05,
+        tau_hard: 0.10,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "local-hard-lcm-test",
+        8192,
+        lcm_config,
+    );
+    let session_key = format!("hard-lcm-barrier-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    for turn in 0..20_u64 {
+        let detail = format!(
+            "turn {turn}: {}",
+            "persistent project detail with enough context to require lossless compaction "
+                .repeat(12)
+        );
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({"role": "user", "content": detail, "_turn": turn}),
+            )
+            .await;
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({"role": "assistant", "content": format!("acknowledged turn {turn}"), "_turn": turn}),
+            )
+            .await;
+    }
+
+    let response = agent_loop
+        .process_direct(
+            "Use the retained project details to answer briefly.",
+            &session_key,
+            "test",
+            "offline",
+        )
+        .await;
+    assert_eq!(response, "foreground reply");
+
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 1, "expected one foreground provider call");
+    let has_summary = calls[0].iter().any(|message| {
+        message.get("role").and_then(Value::as_str) != Some("system")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("[Summary of messages"))
+    });
+    assert!(
+        has_summary,
+        "hard-pressure LCM checkpoint must be installed before the foreground call"
+    );
+    assert!(calls[0].iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("Use the retained project details"))
+    }));
+    assert!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .lcm_compaction_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1
+    );
+
+    let nodes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let nodes = core.sessions.load_summary_nodes(&session.id).await;
+            if !nodes.is_empty() {
+                break nodes;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("LCM summary node must become restart-durable");
+    let raw = core.sessions.get_all_messages(&session.id).await;
+    let rebuilt = crate::agent::lcm::LcmEngine::rebuild_from_db_nodes(
+        &raw,
+        &nodes,
+        crate::agent::lcm::LcmConfig::default(),
+    );
+    assert!(rebuilt.active_context().iter().any(|message| {
+        message
+            .get("_lcm_summary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }));
+}
+
+#[tokio::test]
+async fn soft_lcm_sidecar_failure_preserves_foreground_context() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-soft-lcm-test",
+        vec![WireRecordingProvider::text_response("foreground reply")],
+    ));
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        // Deliberately above 1.0 in this focused policy test so even a tiny
+        // effective budget cannot turn the soft case into hard pressure.
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "local-soft-lcm-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("soft-lcm-preserve-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    for turn in 0..3_u64 {
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({
+                    "role": "user",
+                    "content": format!("soft-pressure-marker-{turn} {}", "context detail ".repeat(40)),
+                    "_turn": turn
+                }),
+            )
+            .await;
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({"role": "assistant", "content": format!("soft ack {turn}"), "_turn": turn}),
+            )
+            .await;
+    }
+
+    let response = agent_loop
+        .process_direct(
+            "Continue without losing context.",
+            &session_key,
+            "test",
+            "offline",
+        )
+        .await;
+    assert_eq!(response, "foreground reply");
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("soft-pressure-marker-0"))
+    }));
+    assert!(!calls[0].iter().any(|message| {
+        message.get("role").and_then(Value::as_str) != Some("system")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("[Summary of messages"))
+    }));
+}
+
+#[tokio::test]
+async fn idle_rollover_uses_a_new_session_scoped_lcm_engine() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-idle-lcm-test",
+        vec![WireRecordingProvider::text_response("foreground reply")],
+    ));
+    let memory_config = MemoryConfig {
+        session_complete_after_secs: 1,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_memory(
+        provider as Arc<dyn LLMProvider>,
+        "local-idle-lcm-test",
+        4096,
+        LcmSchemaConfig::default(),
+        memory_config,
+    );
+    let session_key = format!("idle-lcm-isolation-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("first-session-marker", &session_key, "test", "offline")
+        .await;
+    let core = agent_loop.shared.core_handle.swappable();
+    let first_id = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap()
+        .id;
+    // Expiry uses whole seconds and a strict `idle > threshold` comparison.
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+
+    agent_loop
+        .process_direct("second-session-marker", &session_key, "test", "offline")
+        .await;
+    let second_id = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap()
+        .id;
+    assert_ne!(
+        first_id, second_id,
+        "idle rollover must create a new session"
+    );
+
+    let second_engine = agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&second_id)
+        .cloned()
+        .expect("new concrete session must own its own LCM engine");
+    let active = second_engine.lock().await.active_context();
+    let wire = serde_json::to_string(&active).unwrap();
+    assert!(wire.contains("second-session-marker"));
+    assert!(!wire.contains("first-session-marker"));
 }
 
 /// Assert every wire message of `first` reappears byte-identical, in order,
@@ -2622,8 +2889,7 @@ async fn test_local_wire_prompt_prefix_stable_across_turns() {
         "local-qwen-test",
         vec![WireRecordingProvider::text_response("first reply")],
     ));
-    let (agent_loop, _ws) =
-        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
     let session_key = format!("prefix-stability-{}", uuid::Uuid::new_v4());
 
     agent_loop
@@ -2634,7 +2900,11 @@ async fn test_local_wire_prompt_prefix_stable_across_turns() {
         .await;
 
     let calls = provider.calls();
-    assert!(calls.len() >= 2, "expected two LLM calls, got {}", calls.len());
+    assert!(
+        calls.len() >= 2,
+        "expected two LLM calls, got {}",
+        calls.len()
+    );
     assert_wire_prefix(&calls[0], &calls[calls.len() - 1]);
 }
 
@@ -2698,8 +2968,7 @@ async fn test_local_wire_prompt_tool_result_appends_only() {
             WireRecordingProvider::text_response("listed."),
         ],
     ));
-    let (agent_loop, _ws) =
-        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
     let session_key = format!("prefix-tool-{}", uuid::Uuid::new_v4());
 
     agent_loop
@@ -2707,7 +2976,11 @@ async fn test_local_wire_prompt_tool_result_appends_only() {
         .await;
 
     let calls = provider.calls();
-    assert!(calls.len() >= 2, "expected two LLM calls, got {}", calls.len());
+    assert!(
+        calls.len() >= 2,
+        "expected two LLM calls, got {}",
+        calls.len()
+    );
     assert_wire_prefix(&calls[0], &calls[1]);
 }
 
@@ -2760,8 +3033,6 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
-
-static NANOBOT_LOCAL_TAIL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct EnvVarGuard {
     key: &'static str,
@@ -3014,9 +3285,6 @@ async fn test_local_truncated_response_does_not_hidden_auto_continue() {
 
 #[tokio::test]
 async fn test_local_streaming_cache_markers_append_only_across_turns() {
-    let _local_tail_lock = NANOBOT_LOCAL_TAIL_TEST_LOCK.lock().await;
-    let _tail_guard = EnvVarGuard::remove("NANOBOT_LOCAL_TAIL");
-
     let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
         "local-main",
         vec![
@@ -3124,9 +3392,6 @@ async fn test_local_streaming_cache_markers_append_only_across_turns() {
 
 #[tokio::test]
 async fn test_failed_local_call_does_not_seed_prompt_cache_marker() {
-    let _local_tail_lock = NANOBOT_LOCAL_TAIL_TEST_LOCK.lock().await;
-    let _tail_guard = EnvVarGuard::remove("NANOBOT_LOCAL_TAIL");
-
     let provider: Arc<dyn LLMProvider> = Arc::new(FailOnceThenResponseProvider::new(
         "local-main",
         crate::providers::base::LLMResponse {
@@ -3708,9 +3973,9 @@ async fn test_trio_offline_e2e_health_gate() {
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
-        local_tool_mode: crate::config::schema::LocalToolMode::default(),
         lane: Lane::default(),
         compaction_provider: None,
+        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -4195,15 +4460,15 @@ mod runtime_mode_parity_tests {
             brave_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
+            crw_url: String::new(),
             search_max_results: 5,
             exec_timeout: 30,
             restrict_to_workspace: false,
             memory_config: MemoryConfig::default(),
             is_local: true,
-            local_tool_mode: crate::config::schema::LocalToolMode::default(),
             lane: Lane::default(),
             compaction_provider: None,
+            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -4254,15 +4519,15 @@ mod runtime_mode_parity_tests {
             brave_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
+            crw_url: String::new(),
             search_max_results: 5,
             exec_timeout: 30,
             restrict_to_workspace: false,
             memory_config: MemoryConfig::default(),
             is_local: true,
-            local_tool_mode: crate::config::schema::LocalToolMode::default(),
             lane: Lane::default(),
             compaction_provider: None,
+            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -4310,15 +4575,15 @@ mod runtime_mode_parity_tests {
             brave_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
+            crw_url: String::new(),
             search_max_results: 5,
             exec_timeout: 30,
             restrict_to_workspace: false,
             memory_config: MemoryConfig::default(),
             is_local: true,
-            local_tool_mode: crate::config::schema::LocalToolMode::default(),
             lane: Lane::default(),
             compaction_provider: None,
+            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -4343,7 +4608,7 @@ mod runtime_mode_parity_tests {
     fn build_core_memory_provider_cloud_defaults_to_haiku_when_no_api_base() {
         let core = build_test_core(false, None, None);
         // provider.get_api_base() is None for MockLLM → "haiku" memory model.
-        assert_eq!(core.memory_model, "haiku");
+        assert_eq!(core.compactor.model(), "haiku");
     }
 
     /// Task 2 / Branch 3: local memory provider falls through specialist → compaction → main.
@@ -4365,15 +4630,15 @@ mod runtime_mode_parity_tests {
             brave_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
+            crw_url: String::new(),
             search_max_results: 5,
             exec_timeout: 30,
             restrict_to_workspace: false,
             memory_config: MemoryConfig::default(),
             is_local: true,
-            local_tool_mode: crate::config::schema::LocalToolMode::default(),
             lane: Lane::default(),
             compaction_provider: None,
+            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -4387,7 +4652,7 @@ mod runtime_mode_parity_tests {
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: None,
         });
-        assert_eq!(core.memory_model, "local-model");
+        assert_eq!(core.compactor.model(), "local-model");
     }
 
     /// Caps carried inside `Local { caps }` match the capabilities resolved
@@ -4409,15 +4674,15 @@ mod runtime_mode_parity_tests {
             brave_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
+            crw_url: String::new(),
             search_max_results: 5,
             exec_timeout: 30,
             restrict_to_workspace: false,
             memory_config: MemoryConfig::default(),
             is_local: true,
-            local_tool_mode: crate::config::schema::LocalToolMode::default(),
             lane: Lane::default(),
             compaction_provider: None,
+            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -4485,15 +4750,15 @@ mod runtime_mode_parity_tests {
             brave_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
+            crw_url: String::new(),
             search_max_results: 5,
             exec_timeout: 30,
             restrict_to_workspace: false,
             memory_config: MemoryConfig::default(),
             is_local: true,
-            local_tool_mode: crate::config::schema::LocalToolMode::default(),
             lane: Lane::default(),
             compaction_provider: None,
+            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -4537,15 +4802,15 @@ mod runtime_mode_parity_tests {
             brave_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
+            crw_url: String::new(),
             search_max_results: 5,
             exec_timeout: 30,
             restrict_to_workspace: false,
             memory_config: MemoryConfig::default(),
             is_local: true,
-            local_tool_mode: crate::config::schema::LocalToolMode::default(),
             lane: Lane::default(),
             compaction_provider: None,
+            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,

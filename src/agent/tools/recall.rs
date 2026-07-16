@@ -1,7 +1,7 @@
 //! Recall tool: semantic and keyword search across all memory.
 //!
 //! Uses in-process `KnowledgeStore` for hybrid BM25+vector search across
-//! indexed documents, plus a direct grep fallback over session files and MEMORY.md.
+//! indexed documents, canonical SQLite session search, and curated MEMORY.md.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,37 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::base::Tool;
-use crate::agent::knowledge_store::KnowledgeStore;
+use crate::agent::knowledge_store::{KnowledgeStore, SearchHit};
+
+/// Legacy working-memory files may still be present in an existing
+/// `knowledge.db`. They are no longer canonical and must not compete with
+/// SQLite session history during recall.
+fn is_legacy_session_source(source_name: &str) -> bool {
+    let basename = source_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(source_name);
+    basename.starts_with("SESSION_") && basename.ends_with(".md")
+}
+
+fn format_knowledge_hits(hits: &[SearchHit]) -> Option<String> {
+    let mut output = String::new();
+    for hit in hits
+        .iter()
+        .filter(|hit| !is_legacy_session_source(&hit.source_name))
+    {
+        output.push_str(&format!(
+            "### {} (chunk {})\n{}\n\n",
+            hit.source_name, hit.chunk_idx, hit.snippet
+        ));
+    }
+
+    if output.is_empty() {
+        None
+    } else {
+        Some(output.trim_end().to_string())
+    }
+}
 
 /// How a recall query is executed against the knowledge store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,26 +156,12 @@ impl RecallTool {
             QueryMode::Hybrid => store.hybrid_search(query, n).ok()?,
         };
 
-        if hits.is_empty() {
-            return None;
-        }
-
-        let mut output = String::new();
-        for hit in &hits {
-            output.push_str(&format!(
-                "### {} (chunk {})\n{}\n\n",
-                hit.source_name, hit.chunk_idx, hit.snippet
-            ));
-        }
-        Some(output.trim_end().to_string())
+        format_knowledge_hits(&hits)
     }
 
-    /// Fallback: grep through memory files directly.
+    /// Search curated MEMORY.md plus canonical SQLite session messages.
     async fn grep_memory(&self, query: &str, max_results: usize) -> String {
         let memory_dir = self.workspace.join("memory");
-        if !memory_dir.exists() {
-            return "No memory directory found.".to_string();
-        }
 
         // Search MEMORY.md
         let memory_file = memory_dir.join("MEMORY.md");
@@ -164,39 +180,18 @@ impl RecallTool {
             }
         }
 
-        // Search session files (active + archived).
-        let sessions_dir = memory_dir.join("sessions");
-        let search_dirs = [sessions_dir.clone(), sessions_dir.join("archived")];
-        for search_dir in &search_dirs {
-            if !search_dir.exists() {
-                continue;
-            }
-            if let Ok(mut entries) = tokio::fs::read_dir(search_dir).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    if results.len() >= max_results {
-                        break;
-                    }
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                        continue;
-                    }
-                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                        let lower_query = query.to_lowercase();
-                        if content.to_lowercase().contains(&lower_query) {
-                            let filename = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown");
-                            // Extract a relevant snippet (lines containing the query).
-                            let snippet: Vec<&str> = content
-                                .lines()
-                                .filter(|line| line.to_lowercase().contains(&lower_query))
-                                .take(5)
-                                .collect();
-                            results.push(format!("## {}\n{}", filename, snippet.join("\n")));
-                        }
-                    }
-                }
+        if let Some(db_path) = &self.db_path {
+            let db = crate::session::db::SessionDb::new(db_path);
+            for hit in db.search_messages(query, max_results, None).await {
+                let snippet = if hit.snippet.is_empty() {
+                    hit.content
+                } else {
+                    hit.snippet
+                };
+                results.push(format!(
+                    "## {} [{}]\n{}",
+                    hit.session_key, hit.role, snippet
+                ));
             }
         }
 
@@ -215,8 +210,7 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search memory: long-term facts (MEMORY.md), session summaries, and archived sessions. \
-         Run /sessions index first to make historical conversations searchable. \
+        "Search memory: curated long-term facts (MEMORY.md) and raw SQLite session history. \
          Use this to find past context, user preferences, or previous decisions. \
          Multi-word queries automatically use hybrid keyword+semantic search when available; \
          pass mode='keyword' for exact matches or mode='semantic' to force meaning-based search. \
@@ -262,8 +256,7 @@ impl Tool for RecallTool {
         let mode = match route {
             RecallRoute::Latest { count } => return self.latest_sessions(count).await,
             RecallRoute::Search(_) if query.is_empty() => {
-                return "Error: 'query' parameter is required and must be non-empty."
-                    .to_string()
+                return "Error: 'query' parameter is required and must be non-empty.".to_string()
             }
             RecallRoute::Search(mode) => mode,
         };
@@ -315,10 +308,21 @@ mod tests {
 
     fn make_tool() -> (TempDir, RecallTool) {
         let tmp = TempDir::new().unwrap();
-        // Create memory directory structure.
-        let mem_dir = tmp.path().join("memory");
-        std::fs::create_dir_all(mem_dir.join("sessions")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("memory")).unwrap();
         let tool = RecallTool::new(tmp.path());
+        (tmp, tool)
+    }
+
+    async fn make_db_tool(session_key: &str, messages: &[Value]) -> (TempDir, RecallTool) {
+        use crate::session::db::SessionDb;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let db_path = tmp.path().join("sessions.db");
+        let db = SessionDb::new(&db_path);
+        let session = db.create_session(session_key).await;
+        db.add_messages(&session.id, messages).await;
+        let tool = RecallTool::new(tmp.path()).with_db(Some(db_path));
         (tmp, tool)
     }
 
@@ -360,7 +364,10 @@ mod tests {
             choose_query_mode(Some("auto"), "one two three", true),
             QueryMode::Hybrid
         );
-        assert_eq!(choose_query_mode(Some("auto"), "one", true), QueryMode::Keyword);
+        assert_eq!(
+            choose_query_mode(Some("auto"), "one", true),
+            QueryMode::Keyword
+        );
     }
 
     // --- choose_route: mode="latest" is deterministic, never a search ---
@@ -459,23 +466,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_recall_latest_reads_sessions_db() {
-        use crate::session::db::SessionDb;
-        let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("memory")).unwrap();
-        let db_path = tmp.path().join("sessions.db");
-        {
-            let db = SessionDb::new(&db_path);
-            let meta = db.create_session("cli:oneshot-77").await;
-            db.add_messages(
-                &meta.id,
-                &[
-                    json!({"role": "user", "content": "unique latest question"}),
-                    json!({"role": "assistant", "content": "unique latest answer"}),
-                ],
-            )
-            .await;
-        }
-        let tool = RecallTool::new(tmp.path()).with_db(Some(db_path));
+        let (_tmp, tool) = make_db_tool(
+            "cli:oneshot-77",
+            &[
+                json!({"role": "user", "content": "unique latest question"}),
+                json!({"role": "assistant", "content": "unique latest answer"}),
+            ],
+        )
+        .await;
         let mut params = HashMap::new();
         params.insert("mode".to_string(), json!("latest"));
         let result = tool.execute(params).await;
@@ -525,23 +523,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_recall_grep_finds_session_files() {
-        let (tmp, tool) = make_tool();
-        std::fs::write(
-            tmp.path()
-                .join("memory")
-                .join("sessions")
-                .join("SESSION_abc12345.md"),
-            "---\nsession_key: \"cli:test\"\nstatus: active\n---\n\nDiscussed async Rust patterns.",
+        let (_tmp, tool) = make_db_tool(
+            "cli:test",
+            &[json!({
+                "role": "assistant",
+                "content": "Discussed async Rust patterns."
+            })],
         )
-        .unwrap();
-
-        let mut params = HashMap::new();
-        params.insert("query".to_string(), json!("async"));
-        params.insert("mode".to_string(), json!("keyword"));
-        let result = tool.execute(params).await;
+        .await;
+        let result = tool.grep_memory("async", 10).await;
         assert!(
             result.contains("async"),
-            "Should find async in session file"
+            "Should find async in the SQLite session"
         );
     }
 
@@ -551,26 +544,6 @@ mod tests {
         // Test the grep_memory fallback directly (bypasses knowledge store).
         let result = tool.grep_memory("nonexistent_xyz_123_qqq", 5).await;
         assert!(result.contains("No matches found"));
-    }
-
-    #[tokio::test]
-    async fn test_recall_grep_finds_archived_sessions() {
-        let (tmp, tool) = make_tool();
-        let archived_dir = tmp.path().join("memory").join("sessions").join("archived");
-        std::fs::create_dir_all(&archived_dir).unwrap();
-        std::fs::write(
-            archived_dir.join("SESSION_old.md"),
-            "---\nsession_key: \"cli:old\"\nstatus: archived\n---\n\nDiscussed UTF-8 encoding.",
-        )
-        .unwrap();
-
-        // Test grep_memory directly to bypass knowledge store.
-        let result = tool.grep_memory("UTF-8", 10).await;
-        assert!(
-            result.contains("UTF-8"),
-            "Should find UTF-8 in archived session file: {}",
-            result
-        );
     }
 
     #[tokio::test]
@@ -607,5 +580,36 @@ mod tests {
         if let Some(ref text) = result {
             assert!(!text.is_empty());
         }
+    }
+
+    #[test]
+    fn test_knowledge_results_exclude_legacy_session_markdown() {
+        let hits = vec![
+            SearchHit {
+                source_name: "/tmp/memory/sessions/SESSION_cli_123.md".to_string(),
+                chunk_idx: 0,
+                snippet: "stale session summary".to_string(),
+                rank: -2.0,
+            },
+            SearchHit {
+                source_name: r"C:\memory\sessions\SESSION_cli_456.md".to_string(),
+                chunk_idx: 0,
+                snippet: "stale Windows session summary".to_string(),
+                rank: -1.5,
+            },
+            SearchHit {
+                source_name: "project-notes.md".to_string(),
+                chunk_idx: 2,
+                snippet: "current durable knowledge".to_string(),
+                rank: -1.0,
+            },
+        ];
+
+        let output = format_knowledge_hits(&hits).expect("non-session hit should remain");
+        assert!(!output.contains("SESSION_cli_123.md"));
+        assert!(!output.contains("SESSION_cli_456.md"));
+        assert!(!output.contains("stale session summary"));
+        assert!(output.contains("project-notes.md"));
+        assert!(output.contains("current durable knowledge"));
     }
 }

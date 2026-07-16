@@ -874,24 +874,6 @@ impl AgentLoopShared {
         } else {
             crate::agent::metrics::emit(&metrics);
         }
-
-        // Phase D: feed this turn's TTFT + prompt size to the runtime
-        // context-ceiling detector. Local-only — cloud latency has different
-        // causes (network, provider queueing) and must not tighten a local
-        // compaction ceiling. `prefix_diverged_this_turn` suppresses tightening
-        // when this turn's TTFT was a one-off re-prefill (compaction, history
-        // edit) rather than sustained pressure — see observe_context_ceiling.
-        if ctx.core.model.starts_with("local:") {
-            if let Some(ttft_ms) = ctx.flow.ttft_ms {
-                self.core_handle
-                    .counters
-                    .observe_context_ceiling(
-                        actual_prompt.max(0) as u64,
-                        ttft_ms,
-                        ctx.flow.prefix_diverged_this_turn,
-                    );
-            }
-        }
     }
 }
 
@@ -924,7 +906,8 @@ mod tests {
 
     #[test]
     fn test_response_status_flags_dead_streams() {
-        let resp = |content: Option<&str>, tool_calls: Vec<crate::providers::base::ToolCallRequest>| {
+        let resp = |content: Option<&str>,
+                    tool_calls: Vec<crate::providers::base::ToolCallRequest>| {
             LLMResponse {
                 content: content.map(str::to_string),
                 tool_calls,
@@ -939,11 +922,23 @@ mod tests {
         };
 
         // The 600s zero-token stall signature: nothing at all.
-        assert_eq!(AgentLoopShared::response_status(&resp(None, vec![])), "empty_response");
-        assert_eq!(AgentLoopShared::response_status(&resp(Some("  \n"), vec![])), "empty_response");
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(None, vec![])),
+            "empty_response"
+        );
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(Some("  \n"), vec![])),
+            "empty_response"
+        );
         // Legitimate outcomes stay ok.
-        assert_eq!(AgentLoopShared::response_status(&resp(Some("hi"), vec![])), "ok");
-        assert_eq!(AgentLoopShared::response_status(&resp(None, vec![tc])), "ok");
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(Some("hi"), vec![])),
+            "ok"
+        );
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(None, vec![tc])),
+            "ok"
+        );
     }
 
     #[test]

@@ -144,24 +144,12 @@ impl ReplContext {
         }
     }
 
-    /// /lcm — toggle Lossless Context Management on/off.
-    /// /lcm stats — show compaction statistics without toggling.
+    /// /lcm stats — show compaction statistics. LCM is always active.
     pub(super) fn cmd_lcm(&self, arg: &str) {
-        match LcmAction::parse(arg) {
-            LcmAction::Toggle => {
-                let enabled = self.agent_loop.toggle_lcm();
-                if enabled {
-                    println!("\n  LCM \x1b[32menabled\x1b[0m — compaction active.\n");
-                } else {
-                    println!("\n  LCM \x1b[33mdisabled\x1b[0m.\n");
-                }
-            }
-            LcmAction::Stats => {
-                println!("{}", format_lcm_stats(&self.gather_lcm_stats()));
-            }
-            LcmAction::Usage => {
-                println!("\n  Usage: /lcm [stats]\n");
-            }
+        if arg.trim() == "stats" {
+            println!("{}", format_lcm_stats(&self.gather_lcm_stats()));
+        } else {
+            println!("\n  Usage: /lcm stats\n");
         }
     }
 
@@ -171,10 +159,9 @@ impl ReplContext {
 
         let counters = &self.core_handle.counters;
         let last_ms = counters.lcm_last_compaction_ms.load(Ordering::Relaxed);
-        let last_secs_ago = (last_ms > 0)
-            .then(|| RuntimeCounters::now_epoch_ms().saturating_sub(last_ms) / 1000);
+        let last_secs_ago =
+            (last_ms > 0).then(|| RuntimeCounters::now_epoch_ms().saturating_sub(last_ms) / 1000);
         LcmStats {
-            enabled: self.agent_loop.lcm_enabled(),
             compactions: counters.lcm_compaction_count.load(Ordering::Relaxed),
             tokens_before: counters.lcm_tokens_before.load(Ordering::Relaxed),
             tokens_after: counters.lcm_tokens_after.load(Ordering::Relaxed),
@@ -183,7 +170,7 @@ impl ReplContext {
     }
 
     /// /learn — trigger a reflection pass now: distill accumulated working
-    /// sessions and observations into MEMORY.md (and the knowledge graph)
+    /// completed SQLite working sessions into MEMORY.md (and the knowledge graph)
     /// without waiting for the token threshold or session exit.
     pub(super) async fn cmd_learn(&self) {
         let core = self.core_handle.swappable();
@@ -191,31 +178,31 @@ impl ReplContext {
             println!("\n  Memory system is disabled.\n");
             return;
         }
-        // threshold=0: reflect whenever there is any accumulated content.
-        let reflector = crate::agent::reflector::Reflector::new(
-            core.memory_provider.clone(),
-            core.memory_model.clone(),
-            &core.workspace,
-            0,
-        );
-        if !reflector.should_reflect() {
-            println!("\n  Nothing to learn yet — no working sessions or observations accumulated.\n");
+        if !crate::agent::reflector::Reflector::should_reflect_sessions(&core.sessions, 0).await {
+            println!("\n  Nothing to learn yet — no completed working sessions accumulated.\n");
             return;
         }
         println!("\n  Reflecting on accumulated sessions...");
-        // On-demand Bonsai: the compaction sidecar is down between compactions,
-        // so bring it up for this memory op and release it after. (No-op when
-        // always-on or no sidecar.)
-        let sidecar = crate::higgs::CompactionSidecarSpec::from_config(&self.config);
-        if let Some(spec) = sidecar.as_ref() {
-            if let Err(e) = spec.ensure_up().await {
-                println!("  (compaction sidecar unavailable: {})", e);
+        let Some(manager) = core.compaction_manager.as_ref() else {
+            println!("  Reflection skipped: no managed compaction sidecar configured.\n");
+            return;
+        };
+        let lease = match manager.acquire().await {
+            Ok(lease) => lease,
+            Err(error) => {
+                println!("  Reflection skipped: compaction sidecar unavailable: {error}\n");
+                return;
             }
-        }
+        };
+        let reflector = crate::agent::reflector::Reflector::new(
+            core.memory_provider.clone(),
+            lease.served_model().to_string(),
+            &core.workspace,
+            0,
+            core.sessions.clone(),
+        );
         let result = reflector.reflect().await;
-        if let Some(spec) = sidecar.as_ref() {
-            spec.release().await;
-        }
+        lease.release().await;
         match result {
             Ok(()) => println!("  Learned. MEMORY.md updated.\n"),
             Err(e) => println!("  Reflection failed: {}\n", e),
@@ -258,7 +245,7 @@ impl ReplContext {
         }
     }
 
-    /// /sessions — session management (list, export, purge, archive, index).
+    /// /sessions — session management (list, export, purge, archive).
     pub(super) async fn cmd_sessions(&self, arg: &str) {
         let (sub, rest) = arg
             .split_once(' ')
@@ -285,27 +272,14 @@ impl ReplContext {
                     eprintln!("Usage: /sessions purge <duration> (e.g. 7d, 24h)");
                     return;
                 }
-                crate::sessions_cmd::cmd_sessions_purge(rest);
+                crate::sessions_cmd::cmd_sessions_purge(rest).await;
             }
             "archive" => {
-                crate::sessions_cmd::cmd_sessions_archive();
-            }
-            "index" => {
-                let sessions_dir = dirs::home_dir().unwrap().join(".nanobot/sessions");
-                let core = self.core_handle.swappable();
-                let memory_sessions_dir = core.workspace.join("memory").join("sessions");
-                let (indexed, skipped, errors) = crate::agent::session_indexer::index_sessions(
-                    &sessions_dir,
-                    &memory_sessions_dir,
-                );
-                println!(
-                    "Indexed {} sessions ({} skipped, {} errors)",
-                    indexed, skipped, errors
-                );
+                crate::sessions_cmd::cmd_sessions_archive().await;
             }
             _ => {
                 eprintln!(
-                    "Unknown subcommand '{}'. Available: list, export, purge, archive, index",
+                    "Unknown subcommand '{}'. Available: list, export, purge, archive",
                     sub
                 );
             }
@@ -516,30 +490,8 @@ impl ReplContext {
     }
 }
 
-/// What `/lcm <arg>` should do.
-#[derive(Debug, PartialEq)]
-enum LcmAction {
-    /// No argument — flip LCM on/off (existing behavior).
-    Toggle,
-    /// `stats` — display counters, never toggles.
-    Stats,
-    /// Anything else — show usage, never toggles.
-    Usage,
-}
-
-impl LcmAction {
-    fn parse(arg: &str) -> Self {
-        match arg.trim() {
-            "" => Self::Toggle,
-            "stats" => Self::Stats,
-            _ => Self::Usage,
-        }
-    }
-}
-
 /// Snapshot of session LCM compaction statistics for display.
 struct LcmStats {
-    enabled: bool,
     compactions: u64,
     tokens_before: u64,
     tokens_after: u64,
@@ -548,12 +500,7 @@ struct LcmStats {
 
 /// Render LCM stats for the terminal. Pure — unit-tested below.
 fn format_lcm_stats(stats: &LcmStats) -> String {
-    let state = if stats.enabled {
-        "\x1b[32menabled\x1b[0m"
-    } else {
-        "\x1b[33mdisabled\x1b[0m"
-    };
-    let mut out = format!("\n  LCM {}\n", state);
+    let mut out = "\n  LCM \x1b[32mactive\x1b[0m\n".to_string();
 
     if stats.compactions == 0 {
         out.push_str("  No compactions this session.\n");
@@ -576,24 +523,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lcm_action_parse() {
-        assert_eq!(LcmAction::parse(""), LcmAction::Toggle);
-        assert_eq!(LcmAction::parse("stats"), LcmAction::Stats);
-        assert_eq!(LcmAction::parse(" stats "), LcmAction::Stats);
-        // Unknown args must not toggle — they fall through to usage.
-        assert_eq!(LcmAction::parse("bogus"), LcmAction::Usage);
-    }
-
-    #[test]
     fn test_format_lcm_stats_zero_compactions() {
         let s = format_lcm_stats(&LcmStats {
-            enabled: false,
             compactions: 0,
             tokens_before: 0,
             tokens_after: 0,
             last_secs_ago: None,
         });
-        assert!(s.contains("disabled"));
+        assert!(s.contains("active"));
         assert!(s.to_lowercase().contains("no compactions"));
         assert!(!s.to_lowercase().contains("last compaction"));
     }
@@ -601,13 +538,12 @@ mod tests {
     #[test]
     fn test_format_lcm_stats_with_compactions() {
         let s = format_lcm_stats(&LcmStats {
-            enabled: true,
             compactions: 3,
             tokens_before: 45000,
             tokens_after: 12000,
             last_secs_ago: Some(42),
         });
-        assert!(s.contains("enabled"));
+        assert!(s.contains("active"));
         assert!(s.contains('3'));
         assert!(s.contains("45000"));
         assert!(s.contains("12000"));

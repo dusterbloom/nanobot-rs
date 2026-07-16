@@ -511,7 +511,10 @@ mod tests {
         ];
         for m in variants {
             let wire = m.encode();
-            assert!(wire.starts_with('\x00'), "markers are NUL-prefixed: {wire:?}");
+            assert!(
+                wire.starts_with('\x00'),
+                "markers are NUL-prefixed: {wire:?}"
+            );
             assert_eq!(
                 parse_control_marker(&wire),
                 Some(m.clone()),

@@ -193,13 +193,26 @@ enum SessionsAction {
         #[arg(long, default_value = "md")]
         format: String,
     },
+    /// Import one legacy JSONL transcript, or scan the legacy sessions directory.
+    ImportJsonl {
+        /// Legacy JSONL file. Omit to scan ~/.nanobot/sessions/*.jsonl.
+        path: Option<std::path::PathBuf>,
+    },
+    /// Delete one concrete SQLite session transactionally.
+    Delete {
+        /// Session ID to delete (from `sessions list`).
+        id: String,
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
     /// Purge session and log files older than the given duration.
     Purge {
         /// Age threshold (e.g. "7d", "24h", "30d").
         #[arg(long)]
         older_than: String,
     },
-    /// Gzip session files older than 24 hours.
+    /// Show SQLite session, legacy import, log, and metrics disk usage.
     Archive,
     /// Wipe all sessions, logs, and metrics.
     Nuke {
@@ -207,8 +220,6 @@ enum SessionsAction {
         #[arg(long)]
         force: bool,
     },
-    /// Index orphaned JSONL sessions into searchable SESSION_*.md files.
-    Index,
 }
 
 #[derive(Subcommand)]
@@ -604,7 +615,9 @@ pub fn run() {
             password,
         } => cli::cmd_email(imap_host, smtp_host, username, password),
         Commands::Sessions { action } => match action {
-            SessionsAction::List => sessions_cmd::cmd_sessions_list(),
+            SessionsAction::List => tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(sessions_cmd::cmd_sessions_list()),
             SessionsAction::Resume { id, local } => repl::cmd_agent(
                 None,
                 "cli:default".to_string(),
@@ -617,23 +630,24 @@ pub fn run() {
                 let key = sessions_cmd::make_session_key(name.as_deref());
                 repl::cmd_agent(None, key, local, None, None, false)
             }
-            SessionsAction::Export { key, format } => {
-                sessions_cmd::cmd_sessions_export(&key, &format)
-            }
-            SessionsAction::Purge { older_than } => sessions_cmd::cmd_sessions_purge(&older_than),
-            SessionsAction::Archive => sessions_cmd::cmd_sessions_archive(),
-            SessionsAction::Nuke { force } => sessions_cmd::cmd_sessions_nuke(force),
-            SessionsAction::Index => {
-                let sessions_dir = dirs::home_dir().unwrap().join(".nanobot/sessions");
-                let workspace = crate::utils::helpers::get_workspace_path(None);
-                let memory_sessions_dir = workspace.join("memory").join("sessions");
-                let (indexed, skipped, errors) =
-                    agent::session_indexer::index_sessions(&sessions_dir, &memory_sessions_dir);
-                println!(
-                    "Indexed {} sessions ({} skipped, {} errors)",
-                    indexed, skipped, errors
-                );
-            }
+            SessionsAction::Export { key, format } => tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(sessions_cmd::cmd_sessions_export(&key, &format)),
+            SessionsAction::ImportJsonl { path } => tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(sessions_cmd::cmd_sessions_import(path.as_deref())),
+            SessionsAction::Delete { id, force } => tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(sessions_cmd::cmd_sessions_delete(&id, force)),
+            SessionsAction::Purge { older_than } => tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(sessions_cmd::cmd_sessions_purge(&older_than)),
+            SessionsAction::Archive => tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(sessions_cmd::cmd_sessions_archive()),
+            SessionsAction::Nuke { force } => tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(sessions_cmd::cmd_sessions_nuke(force)),
         },
         #[cfg(feature = "voice")]
         Commands::Voice { action } => match action {
@@ -659,9 +673,14 @@ mod tests {
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
         assert!(launches_interactive_ui(&parse(&["nanobot", "agent"])));
         assert!(launches_interactive_ui(&parse(&[
-            "nanobot", "sessions", "resume", "20260704_072151_f06df0"
+            "nanobot",
+            "sessions",
+            "resume",
+            "20260704_072151_f06df0"
         ])));
-        assert!(launches_interactive_ui(&parse(&["nanobot", "sessions", "new"])));
+        assert!(launches_interactive_ui(&parse(&[
+            "nanobot", "sessions", "new"
+        ])));
 
         // Non-interactive: stderr logging is fine (and wanted).
         assert!(!launches_interactive_ui(&parse(&[
@@ -815,11 +834,68 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parses_sessions_import_jsonl_with_path() {
+        let cli = Cli::try_parse_from([
+            "nanobot",
+            "sessions",
+            "import-jsonl",
+            "/tmp/legacy-session.jsonl",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sessions { action } => match action {
+                SessionsAction::ImportJsonl { path } => {
+                    assert_eq!(
+                        path,
+                        Some(std::path::PathBuf::from("/tmp/legacy-session.jsonl"))
+                    );
+                }
+                other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_sessions_import_jsonl_without_path() {
+        let cli = Cli::try_parse_from(["nanobot", "sessions", "import-jsonl"]).unwrap();
+        match cli.command {
+            Commands::Sessions { action } => match action {
+                SessionsAction::ImportJsonl { path } => assert!(path.is_none()),
+                other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
     fn test_cli_parses_sessions_nuke() {
         let cli = Cli::try_parse_from(["nanobot", "sessions", "nuke", "--force"]).unwrap();
         match cli.command {
             Commands::Sessions { action } => match action {
                 SessionsAction::Nuke { force } => {
+                    assert!(force);
+                }
+                other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_sessions_delete() {
+        let cli = Cli::try_parse_from([
+            "nanobot",
+            "sessions",
+            "delete",
+            "20260302_143022_a7f2b1",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sessions { action } => match action {
+                SessionsAction::Delete { id, force } => {
+                    assert_eq!(id, "20260302_143022_a7f2b1");
                     assert!(force);
                 }
                 other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),

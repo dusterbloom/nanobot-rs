@@ -25,7 +25,7 @@ pub enum ModelSizeClass {
     Large,
 }
 
-/// Reader capability tier for compaction (mirrors old ReaderCapability).
+/// Reader capability tier used when tailoring prompts for the active model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReaderTier {
@@ -79,9 +79,9 @@ pub struct ModelCapabilitiesOverride {
 /// Build `ModelCapabilities` from a model name string.
 ///
 /// Applies built-in pattern matching first, then overlays any config overrides.
-/// Patterns replicate the exact logic from the old scattered functions:
+/// Patterns replicate the exact logic from the former scattered functions:
 /// - `agent_core::is_small_local_model()`
-/// - `compaction::ReaderProfile::from_model()`
+/// - compaction reader-tier inference
 /// - `tool_runner::scratch_pad_round_budget()`
 /// - `openai_compat::needs_native_lms_api()`
 pub fn lookup(

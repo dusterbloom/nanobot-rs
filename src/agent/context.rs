@@ -312,8 +312,8 @@ impl ContextBuilder {
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        // Memory context (long-term facts only — observations, daily notes, and
-        // learnings have been moved out of the system prompt).
+        // Memory context is the curated cross-session MEMORY.md only. Session
+        // working memory stays in SQLite and enters through LCM summaries.
         // Use tail truncation so newest facts (appended by reflector) survive.
         let long_term = Self::_truncate_to_budget_tail(
             &self.memory.read_long_term(),
@@ -953,8 +953,8 @@ impl ContextBuilder {
 
     /// Inject pre-fetched runtime sections into the developer message.
     ///
-    /// For cloud prompts, runtime sections (working memory, daily notes,
-    /// subagent status, bulletin) are rendered and appended to the existing
+    /// For cloud prompts, runtime sections (working memory and subagent status)
+    /// are rendered and appended to the existing
     /// `developer` role message. If no developer message exists, one is created.
     ///
     /// This replaces the former `append_to_system_prompt()` calls in

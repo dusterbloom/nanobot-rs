@@ -70,7 +70,7 @@ This is model-independent. Could combine with model narration when available.
 
 1. Start llama-server with each model
 2. Run each task 3 times (variance check)
-3. Record full session logs (already in ~/.nanobot/sessions/)
+3. Export each SQLite session with `nanobot sessions export <session> --format jsonl`
 4. Score each session on the metrics above
 5. Write results in this file under "## Results"
 

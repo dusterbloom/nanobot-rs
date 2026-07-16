@@ -1,7 +1,7 @@
 //! Canonical message representation — independent of any LLM wire format.
 //!
 //! `Turn` is the single source of truth for conversation history. It is stored
-//! in session JSONL and in memory. Wire-format rendering (OpenAI / Anthropic /
+//! in `~/.nanobot/sessions.db` and in memory. Wire-format rendering (OpenAI / Anthropic /
 //! local-alternation) happens at call time via `ConversationProtocol::render()`.
 //!
 //! ## Why not store OpenAI JSON?
@@ -12,7 +12,7 @@
 //! protocol renders correctly from clean data — no repair needed.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 // ─────────────────────────────────────────────────────────────
 // Core types
@@ -41,14 +41,18 @@ pub struct ToolCall {
 
 /// Canonical conversation turn.
 ///
-/// Stored in session JSONL (`kind` tag discriminant, snake_case).
+/// Converted to and from canonical SQLite session rows (`kind` uses snake_case
+/// when a turn is serialized as JSON).
 /// Rendered to wire format by `ConversationProtocol::render()`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Turn {
     /// A message from the human / end-user.
     User {
-        content: String,
+        /// OpenAI-compatible content: plain text or structured multimodal parts.
+        /// Keeping the original JSON value prevents image/audio payloads loaded
+        /// from SQLite from being flattened before provider rendering.
+        content: Value,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         media: Vec<MediaAttachment>,
     },
@@ -74,11 +78,12 @@ pub enum Turn {
     },
 
     /// Injected system context — rendered at position 0 in the wire format.
-    /// Never persisted to session JSONL; reconstructed from workspace files each turn.
+    /// Never persisted to the session database; reconstructed from workspace files each turn.
     System { content: String },
 
     /// An LCM-produced summary replacing a block of older turns.
-    /// Persisted inline in session JSONL so the SummaryDag survives restarts.
+    /// Its summary node and source pointers are persisted in SQLite so the DAG
+    /// survives restarts.
     Summary {
         text: String,
         /// MessageIds from `LcmEngine::store` covered by this summary.
@@ -132,32 +137,12 @@ impl Turn {
         }
     }
 
-    /// Returns true if this turn should be persisted to session JSONL.
+    /// Returns true if this turn should be persisted to canonical session storage.
     /// `Turn::System` is reconstructed each turn and is never stored.
     pub fn is_persistable(&self) -> bool {
         !matches!(self, Turn::System { .. })
     }
 
-    /// Convert a `Turn::Summary` to a JSON Value for session storage.
-    ///
-    /// Returns `None` if the turn is not a summary.
-    pub fn summary_to_json(&self) -> Option<Value> {
-        if let Turn::Summary {
-            text,
-            source_ids,
-            level,
-        } = self
-        {
-            Some(json!({
-                "role": "summary",
-                "text": text,
-                "source_ids": source_ids,
-                "level": level,
-            }))
-        } else {
-            None
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -172,11 +157,12 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
     let role = v.get("role").and_then(|r| r.as_str())?;
     match role {
         "user" => {
-            let content = v
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
+            let content = match v.get("content") {
+                Some(content @ (Value::String(_) | Value::Array(_) | Value::Object(_))) => {
+                    content.clone()
+                }
+                _ => Value::String(String::new()),
+            };
             Some(Turn::User {
                 content,
                 media: vec![],
@@ -229,7 +215,7 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
             Some(Turn::System { content })
         }
         "summary" => {
-            // LCM summary entry persisted in session JSONL.
+            // LCM summary entry reconstructed from canonical session storage.
             let text = v
                 .get("text")
                 .and_then(|t| t.as_str())
@@ -420,6 +406,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_user_structured_content_converts_losslessly() {
+        let content = json!([
+            {"type": "text", "text": "What is shown?"},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,iVBORw0KGgo=",
+                    "detail": "high"
+                }
+            }
+        ]);
+        let t = turn_from_legacy(&json!({"role": "user", "content": content.clone()}))
+            .expect("structured user message should convert");
+
+        assert_eq!(
+            t,
+            Turn::User {
+                content,
+                media: vec![],
+            }
+        );
+    }
+
+    #[test]
     fn legacy_assistant_text_converts() {
         let v = json!({"role": "assistant", "content": "Hi there."});
         let t = turn_from_legacy(&v).unwrap();
@@ -531,29 +541,6 @@ mod tests {
             media: vec![]
         }
         .is_summary());
-    }
-
-    #[test]
-    fn summary_to_json_produces_role_summary() {
-        let summary = Turn::Summary {
-            text: "Earlier context summary.".into(),
-            source_ids: vec![0, 1, 2],
-            level: 2,
-        };
-        let v = summary.summary_to_json().unwrap();
-        assert_eq!(v["role"], "summary");
-        assert_eq!(v["text"], "Earlier context summary.");
-        assert_eq!(v["source_ids"], json!([0, 1, 2]));
-        assert_eq!(v["level"], 2);
-    }
-
-    #[test]
-    fn non_summary_to_json_returns_none() {
-        let user = Turn::User {
-            content: "hi".into(),
-            media: vec![],
-        };
-        assert!(user.summary_to_json().is_none());
     }
 
     #[test]

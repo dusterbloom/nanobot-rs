@@ -38,13 +38,12 @@
 
 ## Core Components
 
-### 1. Entry Points (`src/main.rs`, `src/cli.rs`, `src/sessions_cmd.rs`)
+### 1. Entry Points (`src/main.rs`, `src/app.rs`, `src/cli/`, `src/sessions_cmd.rs`)
 
-**main.rs** - CLI parsing and command routing:
+**app.rs** - CLI parsing and command routing:
 - `Commands` enum defines all CLI commands
 - Routes to handler functions in `cli.rs` and `sessions_cmd.rs`
 - Panic hook restores terminal state
-- Global `LOCAL_MODE` atomic flag for cloud/local switching
 
 **cli/** - Agent/config command implementations (split into module, 2026-03-04):
 - `mod.rs` - Onboard, gateway, channels, status, cron, tune, tests
@@ -57,11 +56,13 @@
 **sessions_cmd.rs** - Session management CLI:
 - `cmd_sessions_list()` - List sessions with date, size, message count
 - `cmd_sessions_export()` - Export session as markdown or JSONL
+- `cmd_sessions_import()` - Explicitly import legacy JSONL, once per content hash
 - `cmd_sessions_nuke()` - Wipe all sessions, logs, and metrics
-- `cmd_sessions_purge()` - Remove files older than a duration
+- `cmd_sessions_purge()` - Transactionally remove SQLite sessions older than a duration
 - `cmd_sessions_archive()` - Show disk usage summary
 - `make_session_key()` - Generate session key from optional name
-- Also available in REPL via `/sessions` (`/ss` alias) with list/export/purge/archive/index subcommands
+- List, export, purge, and archive are also available in REPL via `/sessions`
+  (`/ss` alias); legacy JSONL import is CLI-only.
 
 ### 2. Agent Loop (`src/agent/agent_loop.rs`)
 
@@ -73,21 +74,22 @@ AgentHandle (cloneable)
 └── counters: Arc<RuntimeCounters>          -- Persists across swaps
 ```
 
-**SwappableCore** contains (38 fields total, key ones shown):
+**SwappableCore** contains (key fields shown):
 - `provider: Arc<dyn LLMProvider>` - Main LLM
 - `memory_provider: Arc<dyn LLMProvider>` - For compaction/reflection
 - `router_provider: Option<Arc<dyn LLMProvider>>` - For trio routing
 - `specialist_provider: Option<Arc<dyn LLMProvider>>` - For trio execution
 - `tool_runner_provider: Option<Arc<dyn LLMProvider>>` - For delegated tool execution
 - `context: ContextBuilder` - System prompt assembly
-- `sessions: SessionManager` - Conversation persistence
+- `sessions: Arc<SessionDb>` - Canonical SQLite conversation persistence
 - `token_budget: TokenBudget` - Context window management
-- `compactor: ContextCompactor` - Background context compression
-- `learning: LearningStore` - Experience database
+- `compactor: ContextCompactor` - Summarization primitive used by LCM
+- `compaction_manager: Option<Arc<CompactionSidecarManager>>` - Shared on-demand Higgs owner
 - `working_memory: WorkingMemoryStore` - Per-session state
-- Plus: `workspace`, `model`, `max_iterations`, `max_tokens`, `temperature`, `is_local`, `brave_api_key`, `exec_timeout`, `restrict_to_workspace`, `memory_enabled`, delegation/provenance configs, and per-provider model overrides
+- Plus: `workspace`, `model`, `mode: RuntimeMode`, iteration/token settings,
+  search and execution settings, and delegation/provenance configs
 
-**RuntimeCounters** (survives core swaps, 15 fields: 13 atomic, 1 `Mutex<Vec<String>>`, 1 `Arc<AtomicBool>`):
+**RuntimeCounters** survives core swaps:
 - `delegation_healthy`, `thinking_budget`, `long_mode_turns`, `inference_active`, `last_tools_called`, etc.
 
 **Processing Phases:**
@@ -106,7 +108,7 @@ AgentHandle (cloneable)
    - Response finalization
 
 3. **finalize_response()** - Save and emit:
-   - Persist session to JSONL
+   - Persist raw messages and tool results to SQLite
    - Update working memory
    - Queue OutboundMessage
 
@@ -135,18 +137,16 @@ Modules extracted from or supporting `agent_loop.rs`:
 | `context_gate.rs` | ContentGate — pass raw / structural briefing / drill-down (I3) |
 | `confidence_gate.rs` | Confidence-based gating for router decisions |
 | `budget_calibrator.rs` | Per-task-type budget calibration |
-| `compaction.rs` | Context compaction — summarizes old messages to free token budget |
+| `compaction.rs` | Summary generation used by the LCM escalation path |
+| `lcm.rs` | Lossless context engine backed by SQLite originals and summary nodes |
 | `token_budget.rs` | Token budget tracking and enforcement |
 | `audit.rs` | Append-only audit log with hash chain integrity (provenance) |
 | `provenance.rs` | Source provenance tracking for tool results |
 | `validation.rs` | Response validation and quality checks |
-| `session_indexer.rs` | JSONL session → searchable SESSION_*.md indexer |
 | `model_prices.rs` | Per-model token pricing for cost tracking |
-| `observer.rs` | Observation/summary generation |
 | `context_hygiene.rs` | Context cleanup utilities |
 | `context_store.rs` | Persistent context state storage |
 | `knowledge_store.rs` | Knowledge base storage |
-| `bulletin.rs` | Status bulletin injection |
 | `system_state.rs` | System state introspection |
 | `agent_profiles.rs` | Subagent profile loading and management |
 | `lora_bridge.rs` | LoRA adapter hot-swap bridge, experience buffer, heuristic surprise gate |
@@ -258,10 +258,9 @@ trait Tool: Send + Sync {
 ## Context (time, workspace, model)
 ## Verification Protocol (if provenance enabled)
 ## AGENTS.md / SOUL.md / USER.md / TOOLS.md / IDENTITY.md (bootstrap files)
-## Session Context (CONTEXT-{channel}.md, fallback to CONTEXT.md)
 # Memory
 ## Long-term Memory (MEMORY.md only, tail-truncated)
-## (daily notes and learnings are NOT in the system prompt)
+## Session working memory (loaded from SQLite for the concrete session ID)
 # Skills (XML summary, lazy loading)
 # Active Skills (eager-loaded, always:true)
 # Subagent Profiles
@@ -280,20 +279,21 @@ Cloud (`scale_budgets`): bootstrap 2%, memory 1%, skills 4%, profiles 2%, cap 40
 - `system_prompt_cap` - Hard limit (0 = disabled for cloud defaults)
 - Automatic scaling for large context windows (1M tokens)
 
-### 6. Session Management (`src/session/manager.rs`)
+### 6. Session Management (`src/session/db.rs`)
 
-**JSONL Format:**
-```
-{"_type":"metadata","created_at":"...","updated_at":"...","metadata":{}}
-{"role":"user","content":"hello","timestamp":"..."}
-{"role":"assistant","content":"hi","timestamp":"..."}
-{"role":"assistant","tool_calls":[...]}  # Preserves tool context
-{"role":"tool","tool_call_id":"...","name":"read_file","content":"..."}
-```
+`~/.nanobot/sessions.db` is the sole live session store. It uses WAL mode for
+concurrent readers and keeps related state under concrete session IDs:
 
-**Rotation Policy:**
-- Daily rotation: `{session_key}_{YYYY-MM-DD}.jsonl` (cross-day starts fresh)
-- Size rotation: When >1MB (same-day only, carries last 10 messages)
+- `sessions` and `messages` — metadata, stable message rows, and raw content
+- `summary_nodes` — LCM summaries with pointers to source rows
+- `tool_results` — results keyed by `(session_id, tool_call_id)`
+- `session_snapshots` — resumable REPL/TUI state
+- `working_memory` — latest session summary, turn, and reflection status
+- `legacy_imports` — source path and content hash for idempotent JSONL migration
+
+Session deletion, age-based purge, and nuke remove dependent rows
+transactionally. JSONL remains available only through explicit import/export;
+there is no heartbeat, shutdown, or background indexer.
 
 ### 7. Channel System (`src/channels/`)
 
@@ -325,26 +325,15 @@ trait Channel: Send + Sync {
 
 **MemoryStore (`memory.rs`):**
 - Long-term memory: `memory/MEMORY.md`
-- Daily notes: `memory/YYYY-MM-DD.md`
 - Atomic writes (temp + rename)
 
 **WorkingMemoryStore (`working_memory.rs`):**
-- Per-session state in flat Markdown files (`SESSION_{hash}.md` with YAML frontmatter)
-- Stored at `{workspace}/memory/sessions/`
+- Per-session state in the SQLite `working_memory` table
+- Keyed by concrete session ID, not a reusable channel/chat key
 - Auto-completes after inactivity
 - Injected into system prompt
-
-**SessionIndexer (`session_indexer.rs`):**
-- Bridges raw JSONL sessions → searchable `SESSION_{hash}.md` files
-- `extract_session_content()` — pure function: extracts user+assistant messages from JSONL lines
-- `index_sessions()` — scans `~/.nanobot/sessions/`, creates `.md` for orphaned JSONL files
-- Indexed files have `status: indexed` (distinct from `active`/`completed`/`archived`)
-- Run via `/sessions index` (REPL) or `nanobot sessions index` (CLI)
-
-**LearningStore (`learning.rs`):**
-- Experience database in JSONL (`{workspace}/memory/learnings.jsonl`)
-- Append-only with file-level locking
-- Used for reflection and improvement
+- Reflection atomically updates curated `memory/MEMORY.md`, then marks completed
+  working-memory rows reflected
 
 ### 9. Skills System (`src/agent/skills.rs`)
 
@@ -422,10 +411,10 @@ Config {
 - `enabled`, `max_depth` (delegation depth, default 3), `python` (enable python_eval), `delegate` (enable recursive workers), `budget_multiplier` (0.0-1.0, default 0.5)
 
 **LcmSchemaConfig (6 fields):**
-- `enabled` (default: false), `tau_soft` (async compaction threshold, default 0.5), `tau_hard` (blocking compaction threshold, default 0.85), `deterministic_target` (Level 3 truncation target tokens, default 512), `compaction_endpoint` (optional `ModelEndpoint` for dedicated compaction model), `compaction_context_size` (compaction model context window, default 4096)
+- `tau_soft` (async compaction threshold, default 0.5), `tau_hard` (blocking compaction threshold, default 0.85), `deterministic_target` (Level 3 target, default 512), `compaction_model_dir`, `compaction_port`, and `compaction_context_size` (default 4096)
 
-**ProprioceptionConfig (8 fields):**
-- `enabled`, `dynamic_tool_scoping`, `audience_aware_compaction`, `grounding_interval`, `gradient_memory`, `raw_window`, `light_window`, `aha_channel`
+**ProprioceptionConfig:**
+- `enabled`, `audience_aware_compaction`, `grounding_interval`, `gradient_memory`, `raw_window`, `light_window`, `aha_channel`, `proactive_retrieval`
 
 **ToolDelegationConfig (18 fields):**
 - `mode: DelegationMode` — enum: `Inline` (no delegation), `Delegated` (default, tool runner model), `Trio` (strict role separation)
@@ -446,13 +435,14 @@ Config {
 - `ProbeState` state machine: Unknown → Healthy (on success) → Degraded (after 3 consecutive failures) → Healthy (on recovery)
 - `is_healthy(name)` — optimistic default (unknown probes return true)
 - `build_registry(config)` — config-driven factory, registers probes for enabled features
-- `LcmCompactionProbe` — GET `/health` with 5s timeout, 60s interval
 - States readable via `/status` REPL command (HEALTH section)
 
-**Compaction Timeout Guard (`agent_loop.rs`):**
-- Both compaction spawns wrapped in 30s `tokio::time::timeout`
-- `in_flight` flag always resets (outside timeout scope)
-- Pre-flight check skips compaction when endpoint degraded
+**Managed LCM Sidecar (`higgs.rs`, `agent_loop/shared.rs`):**
+- One `CompactionSidecarManager` owns process state and reference-counted leases for LCM, learning, cron reflection, and exit reflection
+- Lease acquisition resolves the literal served model through `/v1/models`; acquisition is bounded at 75s and failures enter a 5–60s manager-owned health backoff
+- Each compaction call is bounded at 150s; hard pressure waits up to 155s for an in-flight soft job before proceeding
+- Soft failures preserve the active context; hard failures use LCM level-three deterministic compression without routing to the main model
+- Dropping the last lease stops only a Higgs process spawned by the manager; external sidecars remain running
 
 ### 12. Event Bus (`src/bus/events.rs`)
 
@@ -576,8 +566,8 @@ Loop until no tool calls or max iterations
     ▼
 Final response assembled
     │
-    ├── Session saved to JSONL
-    ├── Working memory updated
+    ├── Session and tool results saved to SQLite
+    ├── SQLite working memory updated
     └── OutboundMessage sent
     │
     ▼
@@ -593,23 +583,26 @@ Telegram API sends response
 Token usage exceeds threshold
     │
     ▼
-Background compaction task spawned
+Per-session LcmEngine checks soft and hard thresholds
     │
-    ├── Snapshot current messages
-    └── Call memory_provider to summarize
-    │
-    ▼
-CompactionResult received
-    │
-    ├── Compact summary of old messages
-    └── Recent messages preserved verbatim
+    ├── Soft: acquire a managed sidecar lease asynchronously
+    │         └── Failure preserves the active context and enters health backoff
+    └── Hard: wait before foreground inference
+              └── Unavailable/timeout → deterministic level-three compression
     │
     ▼
-Applied to live conversation
+Resolve the actual served model id and compact an eligible block
     │
-    ├── Fresh system message
-    ├── Compaction summary
-    └── Messages after watermark
+    ├── Persist the LCM summary node and parent pointers in SQLite
+    ├── Persist the working-memory checkpoint in the same transaction
+    └── Keep raw originals addressable by stable SQLite message ids
+    │
+    ▼
+Install the durable checkpoint into the active context
+    │
+    ├── Summary replaces only the compacted prefix
+    ├── Recent messages remain verbatim
+    └── Relevant originals can be expanded from SQLite-backed LCM state
 ```
 
 ## Key Design Patterns
@@ -644,28 +637,21 @@ Applied to live conversation
 ```
 ~/.nanobot/
 ├── config.json           # Main configuration
+├── sessions.db           # Raw messages, LCM nodes, tool results, snapshots, working memory
 ├── metrics.jsonl          # Per-request LLM call metrics (10MB rotation)
 ├── metrics.jsonl.1        # Previous metrics backup
 ├── logs/                  # Daily rotated structured logs
 │   └── nanobot.2026-02-21.log
-├── sessions/             # Conversation history
-│   └── cli_default_2026-02-21.jsonl
+├── sessions/             # Optional legacy JSONL migration inputs only
 └── workspace/
     ├── AGENTS.md         # Agent instructions
     ├── SOUL.md           # Personality
     ├── USER.md           # User preferences
-    ├── CONTEXT.md        # Session context
-    ├── CONTEXT-cli.md    # Per-channel context
     ├── memory/
-    │   ├── MEMORY.md     # Long-term facts
-    │   ├── 2026-02-20.md # Daily notes
-    │   └── sessions/     # Working memory + indexed sessions
-    │       ├── SESSION_{hash}.md  # Compaction summaries + indexed JSONL extracts
-    │       └── archived/          # Completed sessions
+    │   └── MEMORY.md     # Curated cross-session facts
     ├── skills/           # Custom skills
     ├── profiles/         # Subagent profiles
     ├── events.jsonl      # Subagent results
-    ├── observations/     # LLM-generated summaries
     └── audit.jsonl       # Tool call log (provenance)
 ```
 
@@ -901,6 +887,6 @@ self.bootstrap_budget = (max_context_tokens / 50).clamp(300, 2_000); // 2%
 2. **Channel Abstraction** - Easy to add new chat platforms
 3. **Tool Trait** - Clean extensibility for capabilities
 4. **Context Budget System** - Prevents context overflow
-5. **Session Rotation** - Prevents unbounded file growth
-6. **JSONL Storage** - Human-readable, easy debugging
+5. **Transactional Session Lifecycle** - Explicit purge/nuke without orphaned state
+6. **SQLite Storage** - Concurrent, searchable, and lossless; JSONL stays portable for import/export
 7. **Async-First Design** - Scales well for concurrent users

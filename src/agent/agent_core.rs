@@ -5,7 +5,7 @@
 //! compaction utilities.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -43,9 +43,12 @@ pub struct SwappableCore {
     pub max_tokens: u32,
     pub temperature: f64,
     pub context: ContextBuilder,
-    pub sessions: SessionDb,
+    pub sessions: Arc<SessionDb>,
     pub token_budget: TokenBudget,
     pub compactor: ContextCompactor,
+    /// Shared owner for the optional on-demand Higgs compaction model. The
+    /// provider, model id, and lifecycle manager swap atomically with the core.
+    pub compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
     pub working_memory: WorkingMemoryStore,
     pub working_memory_budget: usize,
     pub brave_api_key: Option<String>,
@@ -58,13 +61,11 @@ pub struct SwappableCore {
     pub restrict_to_workspace: bool,
     pub memory_enabled: bool,
     pub memory_provider: Arc<dyn LLMProvider>,
-    pub memory_model: String,
     pub reflection_threshold: usize,
     /// Typed runtime descriptor. Single source of truth for "is this a local
     /// backend?" via `mode().is_local()`. The legacy `is_local: bool` field was
     /// removed in R6 — it duplicated information already carried by this enum.
     pub mode: RuntimeMode,
-    pub local_tool_mode: crate::config::schema::LocalToolMode,
     pub lane: Lane,
     pub anti_drift: AntiDriftConfig,
     pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
@@ -82,7 +83,6 @@ pub struct SwappableCore {
     pub provenance_config: ProvenanceConfig,
     pub max_tool_result_chars: usize,
     pub session_complete_after_secs: u64,
-    pub stale_memory_turn_threshold: u64,
     pub max_message_age_turns: usize,
     pub max_history_turns: usize,
     pub model_capabilities: crate::agent::model_capabilities::ModelCapabilities,
@@ -210,10 +210,6 @@ pub struct RuntimeCounters {
     /// extension of the last send. Re-anchored on every send. See
     /// `agent::prefix_guard`.
     pub prompt_cache_watermark: parking_lot::Mutex<std::collections::HashMap<String, usize>>,
-    /// Sessions whose system/runtime prompt already advertised LCM summaries.
-    /// Adding that block after a cache is warm mutates the prompt head, so it is
-    /// introduced only at a cold/checkpoint boundary and then kept stable.
-    pub lcm_prompt_advertised: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// Per-session prompt epoch. Bumped by `/clear` and model switches so a
     /// resident local server cannot keep continuing from a stale KV cache when
     /// the next user prompt happens to be a prefix of the old conversation.
@@ -226,22 +222,6 @@ pub struct RuntimeCounters {
     pub lcm_tokens_after: AtomicU64,
     /// Epoch ms of the most recently installed compaction (0 = never).
     pub lcm_last_compaction_ms: AtomicU64,
-    /// Runtime-adaptive context ceiling (Phase D). Starts at the resolved
-    /// context budget; tightened when a slow cache-miss turn signals the model
-    /// is thrashing at the current size under memory pressure; loosened slowly
-    /// on sustained fast turns. LCM compaction thresholds scale to this, so a
-    /// slow miss makes the next compaction fire earlier.
-    pub effective_context_ceiling: AtomicUsize,
-    /// Upper bound `effective_context_ceiling` loosens back toward (= the
-    /// resolved context budget at startup).
-    pub default_context_ceiling: AtomicUsize,
-    /// Consecutive fast-turn counter driving the loosen logic.
-    pub consecutive_fast_turns: AtomicUsize,
-    /// Hot cache for full tool outputs stashed before in-context digesting.
-    /// SQLite is the durable source for restart-safe recall; this map avoids a
-    /// database read while the producing process is still alive.
-    pub tool_result_store:
-        Arc<parking_lot::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl RuntimeCounters {
@@ -273,111 +253,11 @@ impl RuntimeCounters {
             prompt_fingerprints: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_tool_hashes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_cache_watermark: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            lcm_prompt_advertised: parking_lot::Mutex::new(std::collections::HashSet::new()),
             prompt_session_epoch: parking_lot::Mutex::new(std::collections::HashMap::new()),
             lcm_compaction_count: AtomicU64::new(0),
             lcm_tokens_before: AtomicU64::new(0),
             lcm_tokens_after: AtomicU64::new(0),
             lcm_last_compaction_ms: AtomicU64::new(0),
-            effective_context_ceiling: AtomicUsize::new(max_context_tokens),
-            default_context_ceiling: AtomicUsize::new(max_context_tokens),
-            consecutive_fast_turns: AtomicUsize::new(0),
-            tool_result_store: Arc::new(parking_lot::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-        }
-    }
-
-    /// Phase D runtime context-ceiling detector.
-    ///
-    /// Called after every local inference with the turn's prompt-token count and
-    /// time-to-first-token. A prefix-cache *hit* is near-instant regardless of
-    /// context size; a warm *miss* costs `prompt_tokens / WARM_RATE`; a
-    /// pressured miss (weights evicted by the prefill working set) is far
-    /// slower — that is the "waiting minutes" stall. When we observe one, the
-    /// context at this size is too big under current pressure, so we tighten
-    /// the effective ceiling: LCM then compacts earlier, the next turn's
-    /// worst-case miss is smaller, and the model stops thrashing. Sustained
-    /// fast turns loosen it back toward the default — so a better-quantized
-    /// model or freed memory naturally raises the ceiling again.
-    ///
-    /// `prefix_diverged` MUST be true on any turn whose prompt was not an
-    /// append-only extension of the previous call (a compaction summary was
-    /// installed, a tool result was re-digested, etc.). Such a turn forces the
-    /// server to re-prefill past the divergence point, so its TTFT is a one-off
-    /// re-prefill cost — NOT evidence that the current context size is
-    /// unsustainable. Tightening here is a positive-feedback death spiral:
-    /// tighten → LCM compacts earlier → the compaction rewrites the prefix →
-    /// the next turn diverges and re-prefills → read as "slow" → tighten again.
-    /// Observed in the wild as 19456→13908→12384 across two turns. So on a
-    /// diverged turn we observe neutrally: no tighten, no fast-turn credit.
-    pub fn observe_context_ceiling(
-        &self,
-        prompt_tokens: u64,
-        ttft_ms: u64,
-        prefix_diverged: bool,
-    ) {
-        const MISS_BUDGET_MS: u64 = 30_000;
-        const WARM_RATE_TPS: f64 = 3000.0;
-        const SLOW_MISS_FACTOR: f64 = 2.5;
-        const FAST_TTFT_MS: u64 = 5_000;
-        const FAST_RUNS_TO_LOOSEN: usize = 8;
-        const LOOSEN_FRAC: f64 = 1.15;
-        const MIN_CEILING: usize = 4096;
-
-        // A diverged-prefix turn's TTFT is a re-prefill cost, not pressure.
-        // Do not act on it either direction: tightening here causes the
-        // compaction→diverge→re-prefill→tighten spiral described above.
-        if prefix_diverged {
-            return;
-        }
-        let expected_warm_ms = (prompt_tokens as f64 / WARM_RATE_TPS * 1000.0) as u64;
-        // Only treat a slow turn as "context too big" when the context is a
-        // meaningful fraction of the current ceiling. A slow turn at LOW context
-        // is a cold model (weights evicted, e.g. right after compaction or a
-        // sidecar spawn) — shrinking the ceiling further won't help and causes
-        // erratic over-tightening. Require prompt ≥ 50% of the ceiling.
-        let cur_ceiling = self.effective_context_ceiling.load(Ordering::Relaxed);
-        let big_context_threshold = (cur_ceiling as f64 * 0.5) as u64;
-        // Slow, pressured miss at a large context → thrashing; back off.
-        if ttft_ms > MISS_BUDGET_MS
-            && (ttft_ms as f64) > SLOW_MISS_FACTOR * expected_warm_ms.max(1) as f64
-            && prompt_tokens >= big_context_threshold
-        {
-            let new_ceiling = (((prompt_tokens as f64) * 0.8) as usize).max(MIN_CEILING);
-            let prev = self
-                .effective_context_ceiling
-                .fetch_min(new_ceiling, Ordering::Relaxed);
-            if new_ceiling < prev {
-                self.consecutive_fast_turns.store(0, Ordering::Relaxed);
-                tracing::info!(
-                    ttft_ms,
-                    prompt_tokens,
-                    from = prev,
-                    to = new_ceiling,
-                    "context_ceiling_tightened_slow_miss"
-                );
-            }
-            return;
-        }
-        // Fast turn → the model is comfortable; accumulate toward a loosen.
-        if ttft_ms < FAST_TTFT_MS {
-            let n = self.consecutive_fast_turns.fetch_add(1, Ordering::Relaxed) + 1;
-            if n >= FAST_RUNS_TO_LOOSEN {
-                self.consecutive_fast_turns.store(0, Ordering::Relaxed);
-                let cur = self.effective_context_ceiling.load(Ordering::Relaxed);
-                let default = self.default_context_ceiling.load(Ordering::Relaxed);
-                let raised = ((cur as f64) * LOOSEN_FRAC).min(default as f64) as usize;
-                if raised > cur {
-                    self.effective_context_ceiling
-                        .store(raised, Ordering::Relaxed);
-                    tracing::debug!(
-                        from = cur, to = raised, default, "context_ceiling_loosened_sustained_fast"
-                    );
-                }
-            }
-        } else {
-            self.consecutive_fast_turns.store(0, Ordering::Relaxed);
         }
     }
 
@@ -390,7 +270,6 @@ impl RuntimeCounters {
         self.prompt_fingerprints.lock().remove(session_key);
         self.prompt_tool_hashes.lock().remove(session_key);
         self.prompt_cache_watermark.lock().remove(session_key);
-        self.lcm_prompt_advertised.lock().remove(session_key);
 
         let mut epochs = self.prompt_session_epoch.lock();
         let next = epochs
@@ -523,9 +402,9 @@ pub struct SwappableCoreConfig {
     pub restrict_to_workspace: bool,
     pub memory_config: MemoryConfig,
     pub is_local: bool,
-    pub local_tool_mode: crate::config::schema::LocalToolMode,
     pub lane: Lane,
     pub compaction_provider: Option<Arc<dyn LLMProvider>>,
+    pub compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
     pub tool_delegation: ToolDelegationConfig,
     pub provenance: ProvenanceConfig,
     pub max_tool_result_chars: usize,
@@ -574,9 +453,9 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         restrict_to_workspace,
         memory_config,
         is_local,
-        local_tool_mode,
         lane,
         compaction_provider,
+        compaction_manager,
         tool_delegation,
         provenance,
         max_tool_result_chars,
@@ -640,7 +519,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
             .join(".nanobot")
             .join("sessions.db")
     });
-    let sessions = SessionDb::new(&db_path);
+    let sessions = Arc::new(SessionDb::new(&db_path));
 
     // Branch 3 (Wave 2): memory-provider resolution is extracted into a named
     // helper dispatched via `match mode`. See `resolve_memory_provider` below.
@@ -658,27 +537,20 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     // window so conversation + tool defs still fit.
     let effective_reserve = mode.reserve_cap(max_tokens as usize, max_context_tokens);
     let token_budget = TokenBudget::new(max_context_tokens, effective_reserve);
-    let compaction_ctx_size = if memory_config.compaction_model_context_size > 0 {
-        memory_config.compaction_model_context_size
-    } else {
-        max_context_tokens
-    };
+    let compaction_ctx_size = compaction_manager
+        .as_ref()
+        .map_or(max_context_tokens, |manager| manager.context_size());
     let compactor = ContextCompactor::new(
         memory_provider.clone(),
         memory_model.clone(),
         compaction_ctx_size,
-    )
-    .with_thresholds(
-        memory_config.compaction_threshold_percent,
-        memory_config.compaction_threshold_tokens,
-    )
-    .with_max_merge_rounds(memory_config.compaction.max_merge_rounds);
+    );
     debug!(
         memory_model = %memory_model,
         compaction_ctx_size = compaction_ctx_size,
         "agent_core: compactor initialized"
     );
-    let working_memory = WorkingMemoryStore::new(&workspace);
+    let working_memory = WorkingMemoryStore::new(sessions.clone());
 
     // Build tool runner provider if delegation is enabled.
     let (tool_runner_provider, tool_runner_model) = if tool_delegation.enabled {
@@ -739,6 +611,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         sessions,
         token_budget,
         compactor,
+        compaction_manager,
         working_memory,
         // Scale working memory like other budgets. If the user left it at
         // the default (600), apply proportional scaling; otherwise respect their override.
@@ -756,10 +629,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         restrict_to_workspace,
         memory_enabled: memory_config.enabled,
         memory_provider,
-        memory_model,
         reflection_threshold: memory_config.reflection_threshold,
         mode,
-        local_tool_mode,
         lane,
         anti_drift: trio_config.anti_drift.clone(),
         tool_runner_provider,
@@ -777,7 +648,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         provenance_config: provenance,
         max_tool_result_chars,
         session_complete_after_secs: memory_config.session_complete_after_secs,
-        stale_memory_turn_threshold: memory_config.stale_memory_turn_threshold,
         max_message_age_turns: memory_config.max_message_age_turns,
         max_history_turns: memory_config.max_history_turns,
         model_capabilities,
@@ -800,13 +670,13 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
 /// Extracted from `build_swappable_core` in Wave 2 (09-02). Dispatch is
 /// driven by [`RuntimeMode`] via exhaustive `match` (G5 BRANCH → TYPE).
 ///
-/// Priority (per pre-Wave-2 behaviour, preserved bit-identically):
-///  1. Explicit `memory.model` / `memory.provider` from config.json.
-///  2. Cloud default: "haiku" (cheap, fast summarisation) when the main
-///     provider is Anthropic native or OpenRouter; otherwise falls back to
-///     the main model.
-///  3. Local default: trio specialist (if available) → dedicated compaction
-///     provider → main provider.
+/// Priority after core-builder normalization:
+///  1. Managed LCM compaction provider, when configured. Canonical `lcm.*`
+///     clears the legacy explicit memory route before this function runs.
+///  2. Explicit `memory.model` / `memory.provider` when no manager exists.
+///  3. Cloud default: "haiku" (cheap, fast summarisation) when the main
+///     provider is Anthropic native or OpenRouter; otherwise the main model.
+///  4. Local default: trio specialist (if available) → main provider.
 fn resolve_memory_provider(
     mode: &RuntimeMode,
     memory_config: &MemoryConfig,
@@ -818,19 +688,16 @@ fn resolve_memory_provider(
     match mode {
         RuntimeMode::Local { .. } => {
             let mem_model = if !memory_config.model.is_empty() {
-                // `memory.model` is the real id the sidecar serves — normalized
-                // to the spawn dir's basename by `normalize_memory_model_for_
-                // sidecar` when it targets localhost. The legacy `"active"`
-                // transport alias was removed: higgs-nightly serves each model
-                // under its real id and 404s on "active".
+                // Explicit memory providers use their configured model id.
+                // Managed Higgs sidecars take the next branch, whose provider
+                // is bound to the literal id resolved from `/v1/models`.
                 memory_config.model.clone()
-            } else if let Some(sp) = specialist_provider {
-                // Trio specialist is ideal for summarisation tasks.
-                sp.get_default_model().to_string()
             } else if let Some(ref cp) = compaction_provider {
-                // Dedicated compaction sidecar: the model name must match the
-                // provider it rides with, never the main model's name.
+                // The managed sidecar owns compaction and reflection when it is
+                // configured; its real served id must ride with its provider.
                 cp.get_default_model().to_string()
+            } else if let Some(sp) = specialist_provider {
+                sp.get_default_model().to_string()
             } else {
                 model.to_string()
             };
@@ -841,11 +708,11 @@ fn resolve_memory_provider(
                         Some(&mem_model),
                         provider.get_api_base(),
                     )
-                } else if let Some(sp) = specialist_provider {
-                    // Reuse trio specialist provider when no explicit memory provider.
-                    sp.clone()
                 } else if let Some(cp) = compaction_provider {
                     cp
+                } else if let Some(sp) = specialist_provider {
+                    // Reuse trio specialist provider when no managed compactor exists.
+                    sp.clone()
                 } else {
                     // In local mode, provider is already the local server — use it directly.
                     provider.clone()
@@ -855,6 +722,8 @@ fn resolve_memory_provider(
         RuntimeMode::Cloud => {
             let mem_model = if !memory_config.model.is_empty() {
                 memory_config.model.clone()
+            } else if let Some(ref cp) = compaction_provider {
+                cp.get_default_model().to_string()
             } else if provider.get_api_base().is_none()
                 || provider
                     .get_api_base()
@@ -871,6 +740,8 @@ fn resolve_memory_provider(
                         mem_provider_cfg,
                         Some(&mem_model),
                     )
+                } else if let Some(cp) = compaction_provider {
+                    cp
                 } else {
                     provider.clone()
                 };
@@ -883,26 +754,7 @@ fn resolve_memory_provider(
 // History limit scaling
 // ---------------------------------------------------------------------------
 
-/// Scale history message count with context window size (LCM disabled).
-///
-/// Small models (16K) can't afford 100 messages of history — that alone
-/// can eat 40%+ of the context. Scale linearly: ~87 msgs at 32K, ~349 at
-/// 128K, clamped to [6, 600].
-///
-/// This is the trim-only mode: with no compactor behind it, trimming is the
-/// sole defense against context overflow, so the ceiling stays conservative
-/// at ~0.4·C.
-pub(crate) fn history_limit(max_context_tokens: usize) -> usize {
-    // Real-world average is ~150 tokens per message (user queries + assistant
-    // responses). Reserve up to 40% of context for history — long multi-turn
-    // and tool-heavy sessions keep more history append-only, which also keeps
-    // the inference server's prefix cache warm (fewer turn-boundary drops).
-    let max_history_tokens = max_context_tokens * 4 / 10;
-    let limit = max_history_tokens / 150;
-    limit.clamp(6, 600)
-}
-
-/// History message limit when LCM compaction is enabled.
+/// History message limit before LCM's overflow backstop trims raw history.
 ///
 /// The trim ceiling (limit · 150 tokens, enforced by filter_history Stage 6)
 /// MUST sit comfortably ABOVE LCM's soft compaction threshold
@@ -911,7 +763,7 @@ pub(crate) fn history_limit(max_context_tokens: usize) -> usize {
 /// fires. That is exactly what happened with the 0.4·C / 600-message limits:
 /// at C=200K the ceiling was 600·150 = 90K tokens vs a ~97K soft limit.
 ///
-/// So with LCM on, allow ~0.7·C of history and raise the upper clamp so it
+/// LCM therefore allows ~0.7·C of history and raises the upper clamp so it
 /// doesn't bite at large contexts (0.7·200000/150 ≈ 933 > 600). Long-session
 /// hygiene is compaction's job here; trim is only the overflow backstop.
 pub(crate) fn history_limit_lcm(max_context_tokens: usize) -> usize {
@@ -927,24 +779,64 @@ pub(crate) fn history_limit_lcm(max_context_tokens: usize) -> usize {
 /// Pending compaction result ready to be swapped into the conversation.
 pub(crate) struct PendingCompaction {
     pub result: crate::agent::compaction::CompactionResult,
-    pub watermark: usize, // messages.len() when compaction was spawned
+    /// Exact live array that LCM compacted. Installation is allowed only when
+    /// the current array still starts with these bytes; that makes appended
+    /// tool traffic safe without guessing from a stale numeric watermark.
+    pub snapshot: Vec<Value>,
+}
+
+impl PendingCompaction {
+    pub(crate) fn watermark(&self) -> usize {
+        self.snapshot.len()
+    }
+
+    pub(crate) fn matches_snapshot_prefix(&self, messages: &[Value]) -> bool {
+        messages.starts_with(&self.snapshot)
+    }
 }
 
 /// Swap compacted messages into the live conversation, preserving
 /// messages added after the compaction snapshot was taken.
-pub(crate) fn apply_compaction_result(messages: &mut Vec<Value>, pending: PendingCompaction) {
-    let new_messages: Vec<Value> = if pending.watermark < messages.len() {
-        messages[pending.watermark..].to_vec()
-    } else {
-        vec![]
-    };
-    let mut swapped = Vec::with_capacity(1 + pending.result.messages.len() + new_messages.len());
-    swapped.push(messages[0].clone()); // fresh system msg
-    if pending.result.messages.len() > 1 {
-        swapped.extend_from_slice(&pending.result.messages[1..]); // skip stale system msg
+pub(crate) fn apply_compaction_result(
+    messages: &mut Vec<Value>,
+    pending: PendingCompaction,
+) -> bool {
+    if !pending.matches_snapshot_prefix(messages) {
+        return false;
     }
+
+    let new_messages = messages[pending.watermark()..].to_vec();
+    // The result carries the complete snapshot prompt prefix. Preserve the
+    // current copy of that non-durable prefix, then append every compacted LCM
+    // conversation entry. In particular, result[0] is not assumed to be a
+    // system message: LCM's active context itself deliberately has no system.
+    let prompt_prefix_len = |values: &[Value]| {
+        values
+            .iter()
+            .take_while(|message| {
+                matches!(
+                    message.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                )
+            })
+            .count()
+    };
+    let live_prefix_len = prompt_prefix_len(messages);
+    let result_prefix_len = prompt_prefix_len(&pending.result.messages);
+    let mut swapped = Vec::with_capacity(
+        live_prefix_len
+            + pending
+                .result
+                .messages
+                .len()
+                .saturating_sub(result_prefix_len)
+            + new_messages.len(),
+    );
+    swapped.extend_from_slice(&messages[..live_prefix_len]);
+    swapped.extend_from_slice(&pending.result.messages[result_prefix_len..]);
     swapped.extend(new_messages);
     *messages = swapped;
+    true
 }
 
 /// Append a suffix to the first (system) message's content.
@@ -983,16 +875,67 @@ mod tests {
             );
         }
 
-        // Regression pin: non-LCM mode is unchanged (conservative 0.4*C/150,
-        // clamped to [6, 600]).
-        assert_eq!(history_limit(32768), 87);
-        assert_eq!(history_limit(1000), 6); // lower clamp
-        assert_eq!(history_limit(1_000_000), 600); // upper clamp
-        assert_eq!(history_limit(200000), 533);
-
         // LCM mode keeps the lower clamp and scales past the old 600 cap.
         assert_eq!(history_limit_lcm(1000), 6);
         assert_eq!(history_limit_lcm(200000), 933);
+    }
+
+    #[test]
+    fn compaction_swap_preserves_prompt_prefix_summary_and_appended_suffix() {
+        let snapshot = vec![
+            serde_json::json!({"role": "system", "content": "system"}),
+            serde_json::json!({"role": "developer", "content": "developer"}),
+            serde_json::json!({"role": "user", "content": "old", "_db_id": 1}),
+        ];
+        let mut live = snapshot.clone();
+        live.push(serde_json::json!({
+            "role": "tool",
+            "content": "new result",
+            "tool_call_id": "call-1",
+            "_db_id": 2
+        }));
+        let summary = serde_json::json!({
+            "role": "user",
+            "content": "summary",
+            "_lcm_summary": true
+        });
+        let pending = PendingCompaction {
+            result: crate::agent::compaction::CompactionResult {
+                messages: vec![snapshot[0].clone(), snapshot[1].clone(), summary.clone()],
+            },
+            snapshot,
+        };
+
+        assert!(apply_compaction_result(&mut live, pending));
+        assert_eq!(live[0]["role"], "system");
+        assert_eq!(live[1]["role"], "developer");
+        assert_eq!(live[2], summary);
+        assert_eq!(live[3]["content"], "new result");
+    }
+
+    #[test]
+    fn compaction_swap_rejects_a_rewritten_snapshot_without_mutation() {
+        let snapshot = vec![
+            serde_json::json!({"role": "system", "content": "system"}),
+            serde_json::json!({"role": "user", "content": "old", "_db_id": 1}),
+        ];
+        let mut live = vec![
+            snapshot[0].clone(),
+            serde_json::json!({"role": "user", "content": "rewritten", "_db_id": 2}),
+        ];
+        let before = live.clone();
+        let pending = PendingCompaction {
+            result: crate::agent::compaction::CompactionResult {
+                messages: vec![
+                    snapshot[0].clone(),
+                    serde_json::json!({"role": "user", "content": "summary", "_lcm_summary": true}),
+                ],
+            },
+            snapshot,
+        };
+
+        assert!(!apply_compaction_result(&mut live, pending));
+        assert_eq!(live, before);
     }
 
     #[test]
@@ -1043,114 +986,13 @@ mod tests {
             .prompt_cache_watermark
             .lock()
             .insert(session.to_string(), 7);
-        counters
-            .lcm_prompt_advertised
-            .lock()
-            .insert(session.to_string());
 
         assert_eq!(counters.reset_session_prompt_state(session), 1);
         assert!(!counters.prompt_fingerprints.lock().contains_key(session));
         assert!(!counters.prompt_cache_watermark.lock().contains_key(session));
-        assert!(!counters.lcm_prompt_advertised.lock().contains(session));
         assert_eq!(counters.session_prompt_epoch(session), 1);
 
         assert_eq!(counters.reset_session_prompt_state(session), 2);
         assert_eq!(counters.session_prompt_epoch(session), 2);
-    }
-
-    // -- Phase D: runtime context-ceiling detection -----------------------
-
-    fn ceiling_counters() -> RuntimeCounters {
-        RuntimeCounters::new_with_config(32768, &CircuitBreakerConfig::default())
-    }
-
-    #[test]
-    fn ceiling_slow_pressured_miss_tightens() {
-        let c = ceiling_counters();
-        // 20k prompt, 120s TTFT — a pressured miss (warm would be ~6.7s).
-        // Stable prefix (diverged=false): this is genuine pressure.
-        c.observe_context_ceiling(20_000, 120_000, false);
-        assert_eq!(
-            c.effective_context_ceiling.load(Ordering::Relaxed),
-            16_000,
-            "should back off to 0.8 × the size that stalled"
-        );
-    }
-
-    #[test]
-    fn ceiling_slow_low_context_does_not_tighten() {
-        // A slow turn at LOW context is a cold model (e.g. right after
-        // compaction or a sidecar spawn evicted the weights), NOT an oversize
-        // context. Must NOT tighten — doing so caused erratic over-tightening
-        // on post-compaction re-prefills.
-        let c = ceiling_counters(); // default ceiling 32768
-        c.observe_context_ceiling(3_316, 55_000, false); // 3.3k prompt, 55s ttft
-        assert_eq!(
-            c.effective_context_ceiling.load(Ordering::Relaxed),
-            32768,
-            "cold-model stall must not tighten the ceiling"
-        );
-    }
-
-    #[test]
-    fn ceiling_cache_hit_does_not_tighten() {
-        let c = ceiling_counters();
-        // 20k prompt but 3s TTFT — a prefix-cache hit. No tightening.
-        c.observe_context_ceiling(20_000, 3_000, false);
-        assert_eq!(c.effective_context_ceiling.load(Ordering::Relaxed), 32768);
-    }
-
-    #[test]
-    fn ceiling_warm_miss_under_budget_kept() {
-        // 30k prompt, 12s TTFT — a warm miss (expected ~10s), under the 30s
-        // budget. Not a pressured stall, so the ceiling must not drop.
-        let c = ceiling_counters();
-        c.observe_context_ceiling(30_000, 12_000, false);
-        assert_eq!(c.effective_context_ceiling.load(Ordering::Relaxed), 32768);
-    }
-
-    #[test]
-    fn ceiling_sustained_fast_loosens_back_up() {
-        let c = ceiling_counters();
-        c.observe_context_ceiling(20_000, 120_000, false); // tighten to 16k
-        let tightened = c.effective_context_ceiling.load(Ordering::Relaxed);
-        assert_eq!(tightened, 16_000);
-        for _ in 0..8 {
-            c.observe_context_ceiling(1_000, 1_000, false); // fast turns
-        }
-        let after = c.effective_context_ceiling.load(Ordering::Relaxed);
-        assert!(after > tightened, "expected loosen after sustained fast, got {after}");
-        assert!(after <= 32768, "never exceeds the default");
-    }
-
-    #[test]
-    fn ceiling_never_drops_below_floor() {
-        let c = ceiling_counters();
-        // Tiny prompt but very slow — still floor at 4k, not 800.
-        c.observe_context_ceiling(1_000, 120_000, false);
-        assert!(c.effective_context_ceiling.load(Ordering::Relaxed) >= 4096);
-    }
-
-    #[test]
-    fn ceiling_diverged_prefix_does_not_tighten() {
-        // Regression for the slow-miss watchdog death spiral: a slow, big-context
-        // turn whose TTFT is a re-prefill (compaction just installed / history
-        // edited) must NOT tighten the ceiling. Tightening here fed the spiral:
-        // tighten → LCM compacts → prefix rewrites → next turn re-prefills →
-        // slow again → tighten again (observed 19456→13908→12384). The re-prefill
-        // cost is one-off, not evidence the context size is unsustainable.
-        let c = ceiling_counters(); // default ceiling 32768
-        c.observe_context_ceiling(20_000, 120_000, true);
-        assert_eq!(
-            c.effective_context_ceiling.load(Ordering::Relaxed),
-            32768,
-            "a re-prefill (diverged prefix) must not tighten — that is the spiral"
-        );
-        // And it must not count as a fast turn toward loosening either —
-        // a diverged turn is observed neutrally.
-        // (No observable counter for fast-turn credit; the tighten assertion
-        // above is the contract. A follow-up diverged turn stays neutral too.)
-        c.observe_context_ceiling(20_000, 120_000, true);
-        assert_eq!(c.effective_context_ceiling.load(Ordering::Relaxed), 32768);
     }
 }

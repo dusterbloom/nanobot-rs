@@ -249,8 +249,14 @@ mod tests {
         assert_eq!(job.payload.channel.as_deref(), Some("telegram"));
         assert_eq!(job.payload.to.as_deref(), Some("12345"));
         // The model needs id + next-run time to report back to the user.
-        assert!(result.contains(&job.id), "result must contain job id: {result}");
-        assert!(result.contains("next run"), "result must report next run: {result}");
+        assert!(
+            result.contains(&job.id),
+            "result must contain job id: {result}"
+        );
+        assert!(
+            result.contains("next run"),
+            "result must report next run: {result}"
+        );
         assert!(
             !result.contains("use CLI") && !result.contains("nanobot cron"),
             "placeholder text must be gone: {result}"

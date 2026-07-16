@@ -13,12 +13,16 @@
 //! - `filter_history()` from the `filters` module applies the same
 //!   windowing/clear-marker/orphan-skip logic that the JSONL manager used.
 
+use std::collections::HashMap;
+use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::Value as SqlValue, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -83,15 +87,16 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
 END;
 
 CREATE TABLE IF NOT EXISTS summary_nodes (
-    id            INTEGER PRIMARY KEY,
-    session_id    TEXT NOT NULL REFERENCES sessions(id),
+    id            INTEGER NOT NULL,
+    session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     source_ids    TEXT NOT NULL,
     child_ids     TEXT DEFAULT '[]',
     text          TEXT NOT NULL,
     tokens        INTEGER NOT NULL,
     level         INTEGER NOT NULL,
     created_at    TEXT NOT NULL,
-    id_kind       TEXT
+    id_kind       TEXT,
+    PRIMARY KEY (session_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_summary_nodes_session ON summary_nodes(session_id);
 
@@ -109,7 +114,46 @@ CREATE TABLE IF NOT EXISTS session_snapshots (
     recent_commands TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS working_memory (
+    session_id        TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    content           TEXT NOT NULL DEFAULT '',
+    status            TEXT NOT NULL DEFAULT 'active'
+                      CHECK(status IN ('active', 'completed', 'reflected')),
+    last_updated_turn INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_working_memory_status
+    ON working_memory(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS legacy_imports (
+    source_path    TEXT PRIMARY KEY,
+    content_sha256 TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    message_count  INTEGER NOT NULL,
+    imported_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_legacy_imports_session
+    ON legacy_imports(session_id);
+CREATE INDEX IF NOT EXISTS idx_legacy_imports_content
+    ON legacy_imports(content_sha256);
 "#;
+
+const WORKING_MEMORY_COLUMNS: &str = "\
+    SELECT wm.session_id, s.session_key, wm.content, wm.status, \
+           wm.last_updated_turn, wm.created_at, wm.updated_at \
+    FROM working_memory wm JOIN sessions s ON s.id = wm.session_id";
+const WORKING_MEMORY_SELECT_ALL: &str = "\
+    SELECT wm.session_id, s.session_key, wm.content, wm.status, \
+           wm.last_updated_turn, wm.created_at, wm.updated_at \
+    FROM working_memory wm JOIN sessions s ON s.id = wm.session_id \
+    ORDER BY wm.updated_at DESC";
+const WORKING_MEMORY_SELECT_WITH_STATUS: &str = "\
+    SELECT wm.session_id, s.session_key, wm.content, wm.status, \
+           wm.last_updated_turn, wm.created_at, wm.updated_at \
+    FROM working_memory wm JOIN sessions s ON s.id = wm.session_id \
+    WHERE wm.status = ?1 ORDER BY wm.updated_at DESC";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -165,6 +209,102 @@ pub struct SessionSnapshot {
     pub updated_at: DateTime<Utc>,
 }
 
+/// SQLite row backing the active-task summary for one concrete session.
+///
+/// This is deliberately keyed by `session_id`, not the reusable channel/chat
+/// key. A fresh session created after an idle timeout must never inherit the
+/// previous session's compacted working state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkingMemoryRecord {
+    pub session_id: String,
+    pub session_key: String,
+    pub content: String,
+    pub status: String,
+    pub last_updated_turn: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Result of importing one legacy JSONL session file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyImportOutcome {
+    Imported {
+        session_id: String,
+        message_count: usize,
+    },
+    AlreadyImported {
+        session_id: String,
+        message_count: usize,
+    },
+}
+
+/// A legacy file is immutable once imported. Reusing its path with different
+/// bytes is rejected so migration never silently duplicates or rewrites a
+/// historical session.
+#[derive(Debug)]
+pub enum LegacyImportError {
+    Io(std::io::Error),
+    InvalidJson {
+        line: usize,
+        source: serde_json::Error,
+    },
+    ChangedFile {
+        path: PathBuf,
+        imported_sha256: String,
+        current_sha256: String,
+    },
+    Database(rusqlite::Error),
+    MessageInsert {
+        line: usize,
+    },
+    MissingSessionKey,
+}
+
+impl fmt::Display for LegacyImportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "legacy JSONL I/O failed: {error}"),
+            Self::InvalidJson { line, source } => {
+                write!(f, "legacy JSONL line {line} is invalid: {source}")
+            }
+            Self::ChangedFile { path, .. } => {
+                write!(f, "legacy JSONL changed after import: {}", path.display())
+            }
+            Self::Database(error) => write!(f, "legacy JSONL database import failed: {error}"),
+            Self::MessageInsert { line } => {
+                write!(f, "legacy JSONL message insert failed at line {line}")
+            }
+            Self::MissingSessionKey => write!(
+                f,
+                "legacy JSONL has no metadata session_key and no fallback was supplied"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LegacyImportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::InvalidJson { source, .. } => Some(source),
+            Self::Database(error) => Some(error),
+            Self::ChangedFile { .. } | Self::MessageInsert { .. } | Self::MissingSessionKey => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for LegacyImportError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<rusqlite::Error> for LegacyImportError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Database(value)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SessionDb
 // ---------------------------------------------------------------------------
@@ -188,8 +328,11 @@ impl SessionDb {
             panic!("Failed to open session DB at {}: {}", db_path.display(), e)
         });
 
-        // Enable WAL for concurrent read access.
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
+        // WAL permits concurrent readers. Foreign keys make newly-created
+        // databases self-cleaning; deletion methods below still delete every
+        // dependent table explicitly so databases created by older versions
+        // (whose foreign keys lacked ON DELETE clauses) behave identically.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .unwrap_or_else(|e| warn!("Could not enable WAL mode: {}", e));
 
         // Create schema.
@@ -200,6 +343,95 @@ impl SessionDb {
         // the messages rowid). The error on already-migrated DBs (duplicate
         // column) is expected and ignored.
         let _ = conn.execute("ALTER TABLE summary_nodes ADD COLUMN id_kind TEXT", []);
+
+        // Pre-migration rows (id_kind absent) carry POSITIONAL source_ids
+        // that cannot be resolved against the db-id-keyed LCM store. Purge
+        // them once here instead of skipping them on every load. Idempotent:
+        // subsequent opens find no such rows and stay silent.
+        match conn.execute(
+            "DELETE FROM summary_nodes WHERE id_kind IS NULL OR id_kind != 'db_id'",
+            [],
+        ) {
+            Ok(purged) if purged > 0 => warn!(
+                "purged {} legacy summary nodes with unresolvable positional ids; \
+                 their text remains in session history",
+                purged
+            ),
+            Ok(_) => {}
+            Err(e) => warn!("Failed to purge legacy summary nodes: {}", e),
+        }
+
+        // Early SQLite builds keyed LCM node ids globally even though the DAG
+        // allocates them per session. Migrate once to the composite key before
+        // any writer can replace another session's node with the same id.
+        let session_id_is_key: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('summary_nodes') \
+                 WHERE name = 'session_id' AND pk > 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if session_id_is_key == 0 {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE summary_nodes_v2 (
+                     id INTEGER NOT NULL,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     source_ids TEXT NOT NULL,
+                     child_ids TEXT DEFAULT '[]',
+                     text TEXT NOT NULL,
+                     tokens INTEGER NOT NULL,
+                     level INTEGER NOT NULL,
+                     created_at TEXT NOT NULL,
+                     id_kind TEXT,
+                     PRIMARY KEY (session_id, id)
+                 );
+                 INSERT INTO summary_nodes_v2
+                     (id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind)
+                 SELECT id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind
+                 FROM summary_nodes;
+                 DROP TABLE summary_nodes;
+                 ALTER TABLE summary_nodes_v2 RENAME TO summary_nodes;
+                 CREATE INDEX idx_summary_nodes_session ON summary_nodes(session_id);
+                 COMMIT;",
+            )
+            .unwrap_or_else(|error| panic!("Failed to migrate LCM summary node keys: {error}"));
+        }
+
+        // Import provenance outlives imported sessions. Older schemas tied the
+        // journal to `sessions` with ON DELETE CASCADE, which allowed deleting
+        // a session and then importing the same immutable JSONL again. Detach
+        // the journal while retaining its historical session id for audit.
+        let legacy_imports_has_session_fk: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('legacy_imports')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if legacy_imports_has_session_fk > 0 {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE legacy_imports_v2 (
+                     source_path TEXT PRIMARY KEY,
+                     content_sha256 TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     message_count INTEGER NOT NULL,
+                     imported_at TEXT NOT NULL
+                 );
+                 INSERT INTO legacy_imports_v2
+                     (source_path, content_sha256, session_id, message_count, imported_at)
+                 SELECT source_path, content_sha256, session_id, message_count, imported_at
+                 FROM legacy_imports;
+                 DROP TABLE legacy_imports;
+                 ALTER TABLE legacy_imports_v2 RENAME TO legacy_imports;
+                 CREATE INDEX idx_legacy_imports_session ON legacy_imports(session_id);
+                 CREATE INDEX idx_legacy_imports_content ON legacy_imports(content_sha256);
+                 COMMIT;",
+            )
+            .unwrap_or_else(|error| panic!("Failed to detach legacy import provenance: {error}"));
+        }
 
         Self {
             conn: Mutex::new(conn),
@@ -266,12 +498,59 @@ impl SessionDb {
                         max_idle_secs,
                         "session_expired: creating fresh session"
                     );
+                    let now = Utc::now().to_rfc3339();
+                    let conn = self.conn.lock().await;
+                    if let Err(error) =
+                        set_working_memory_status_locked(&conn, &meta.id, "completed", &now)
+                    {
+                        warn!(
+                            session_id = %meta.id,
+                            %error,
+                            "failed to complete expired session working memory"
+                        );
+                    }
+                    drop(conn);
                     return self.create_session(key).await;
                 }
+            }
+
+            // A completed/reflected row is terminal for one inactive epoch, not
+            // for the concrete session forever. Continuing the session reopens
+            // its latest snapshot so the next LCM checkpoint can replace it.
+            let now = Utc::now().to_rfc3339();
+            let conn = self.conn.lock().await;
+            if let Err(error) = reactivate_working_memory_locked(&conn, &meta.id, &now) {
+                warn!(
+                    session_id = %meta.id,
+                    %error,
+                    "failed to reactivate resumed session working memory"
+                );
             }
             return meta;
         }
         self.create_session(key).await
+    }
+
+    /// Select one concrete session for explicit resume.
+    ///
+    /// Touching `updated_at` makes that exact ID the latest session for its
+    /// reusable key before the normal message path resolves the key. The same
+    /// transaction reopens working memory while preserving its content/turn.
+    pub async fn resume_session(&self, id: &str) -> rusqlite::Result<Option<SessionMeta>> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        reactivate_working_memory_locked(&tx, id, &now)?;
+        tx.commit()?;
+        drop(conn);
+        Ok(self.get_session(id).await)
     }
 
     /// Load a session by its unique ID. Returns `None` if not found.
@@ -368,6 +647,203 @@ impl SessionDb {
         .collect()
     }
 
+    /// Delete one session and every derived/persisted row that belongs to it.
+    ///
+    /// The cascade is explicit and transactional for compatibility with
+    /// databases created before foreign-key cascades were enabled.
+    pub async fn delete_session(&self, session_id: &str) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        let deleted = delete_session_rows(&tx, session_id)?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Delete sessions whose last update predates `cutoff` in one transaction.
+    pub async fn purge_sessions_before(&self, cutoff: DateTime<Utc>) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        let session_ids = select_session_ids(
+            &tx,
+            "SELECT id FROM sessions WHERE updated_at < ?1 ORDER BY id",
+            Some(cutoff.to_rfc3339()),
+        )?;
+        let mut deleted = 0;
+        for session_id in session_ids {
+            deleted += usize::from(delete_session_rows(&tx, &session_id)?);
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Delete all sessions and all session-owned rows in one transaction.
+    /// Immutable legacy-import provenance is intentionally retained.
+    pub async fn nuke_sessions(&self) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        let session_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
+        // Delete whole tables rather than iterating only known sessions so a
+        // database created by an older version cannot retain orphan rows.
+        tx.execute("DELETE FROM working_memory", [])?;
+        tx.execute("DELETE FROM tool_results", [])?;
+        tx.execute("DELETE FROM summary_nodes", [])?;
+        tx.execute("DELETE FROM session_snapshots", [])?;
+        tx.execute("DELETE FROM messages", [])?;
+        tx.execute("DELETE FROM sessions", [])?;
+        tx.commit()?;
+        Ok(session_count.max(0) as usize)
+    }
+
+    /// Import an immutable legacy JSONL transcript as a new SQLite session.
+    ///
+    /// Content SHA-256 is the cross-path identity. Every observed source path
+    /// is journaled as immutable: identical bytes at a new path are a no-op,
+    /// while changing bytes at any journaled path is an error. Session creation,
+    /// all messages, and the migration marker commit atomically.
+    pub async fn import_legacy_jsonl(
+        &self,
+        source_path: &Path,
+        session_key: &str,
+    ) -> Result<LegacyImportOutcome, LegacyImportError> {
+        let canonical_path = fs::canonicalize(source_path)?;
+        let bytes = fs::read(&canonical_path)?;
+        let content_sha256 = sha256_hex(&bytes);
+        let source_path_text = canonical_path.to_string_lossy().into_owned();
+
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        let existing: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT content_sha256, session_id, message_count \
+                 FROM legacy_imports WHERE source_path = ?1",
+                params![source_path_text],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        if let Some((imported_sha256, session_id, message_count)) = existing {
+            if imported_sha256 == content_sha256 {
+                tx.commit()?;
+                return Ok(LegacyImportOutcome::AlreadyImported {
+                    session_id,
+                    message_count: message_count as usize,
+                });
+            }
+            return Err(LegacyImportError::ChangedFile {
+                path: canonical_path,
+                imported_sha256,
+                current_sha256: content_sha256,
+            });
+        }
+
+        // A renamed or copied legacy transcript must not create a duplicate
+        // session. Record the alias path as immutable too, so later changing
+        // that copy is rejected even when the original imported session has
+        // since been purged.
+        let identical_content: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT session_id, message_count FROM legacy_imports \
+                 WHERE content_sha256 = ?1 ORDER BY imported_at, source_path LIMIT 1",
+                params![content_sha256],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((session_id, message_count)) = identical_content {
+            tx.execute(
+                "INSERT INTO legacy_imports \
+                 (source_path, content_sha256, session_id, message_count, imported_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    source_path_text,
+                    content_sha256,
+                    session_id,
+                    message_count,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(LegacyImportOutcome::AlreadyImported {
+                session_id,
+                message_count: message_count.max(0) as usize,
+            });
+        }
+
+        let text = std::str::from_utf8(&bytes).map_err(|error| {
+            LegacyImportError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })?;
+        let mut messages = Vec::new();
+        let mut metadata_session_key = None;
+        for (index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value = serde_json::from_str::<Value>(line).map_err(|source| {
+                LegacyImportError::InvalidJson {
+                    line: index + 1,
+                    source,
+                }
+            })?;
+            if value.get("_type").and_then(Value::as_str) == Some("metadata") {
+                if metadata_session_key.is_none() {
+                    metadata_session_key = value
+                        .get("session_key")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|key| !key.is_empty())
+                        .map(str::to_string);
+                }
+                continue;
+            }
+            messages.push((index + 1, value));
+        }
+
+        // Metadata is the authoritative identity embedded by the legacy
+        // writer. The caller-provided key is only a fallback for older files
+        // that contain message rows alone.
+        let effective_session_key = metadata_session_key
+            .as_deref()
+            .unwrap_or_else(|| session_key.trim());
+        if effective_session_key.is_empty() {
+            return Err(LegacyImportError::MissingSessionKey);
+        }
+
+        let now = Utc::now();
+        let session_id = generate_session_id(&now);
+        let now_text = now.to_rfc3339();
+        tx.execute(
+            "INSERT INTO sessions \
+             (id, session_key, created_at, updated_at, message_count, metadata) \
+             VALUES (?1, ?2, ?3, ?3, 0, '{}')",
+            params![session_id, effective_session_key, now_text],
+        )?;
+
+        for (line, message) in &messages {
+            if insert_message_locked(&tx, &session_id, message).is_none() {
+                return Err(LegacyImportError::MessageInsert { line: *line });
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO legacy_imports \
+             (source_path, content_sha256, session_id, message_count, imported_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                source_path_text,
+                content_sha256,
+                session_id,
+                messages.len() as i64,
+                now_text,
+            ],
+        )?;
+        tx.commit()?;
+
+        Ok(LegacyImportOutcome::Imported {
+            session_id,
+            message_count: messages.len(),
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Message operations
     // -----------------------------------------------------------------------
@@ -384,8 +860,37 @@ impl SessionDb {
         max_messages: usize,
         max_turns: usize,
     ) -> Vec<Value> {
-        let raw = self.get_all_messages(session_id).await;
-        filter_history(&raw, max_messages, max_turns)
+        let mut raw = self.get_all_messages(session_id).await;
+
+        // The history filter still performs text-specific truncation and token
+        // estimation. Give it a JSON text projection for structured content,
+        // then restore the exact persisted value by stable row id before the
+        // messages are replayed to the provider.
+        let mut structured_content = HashMap::new();
+        for message in &mut raw {
+            let Some(content) = message.get("content") else {
+                continue;
+            };
+            if content.is_string() {
+                continue;
+            }
+            let Some(db_id) = message.get("_db_id").and_then(Value::as_i64) else {
+                continue;
+            };
+            structured_content.insert(db_id, content.clone());
+            message["content"] = Value::String(content.to_string());
+        }
+
+        let mut history = filter_history(&raw, max_messages, max_turns);
+        for message in &mut history {
+            let Some(db_id) = message.get("_db_id").and_then(Value::as_i64) else {
+                continue;
+            };
+            if let Some(content) = structured_content.remove(&db_id) {
+                message["content"] = content;
+            }
+        }
+        history
     }
 
     /// Add a single raw JSON message to `session_id` and persist it.
@@ -458,11 +963,7 @@ impl SessionDb {
     }
 
     /// Load a complete tool output previously stored by [`store_tool_result`].
-    pub async fn load_tool_result(
-        &self,
-        session_id: &str,
-        tool_call_id: &str,
-    ) -> Option<String> {
+    pub async fn load_tool_result(&self, session_id: &str, tool_call_id: &str) -> Option<String> {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT content FROM tool_results WHERE session_id = ?1 AND tool_call_id = ?2",
@@ -556,6 +1057,108 @@ impl SessionDb {
         .ok()
     }
 
+    // -----------------------------------------------------------------------
+    // Per-session working memory
+    // -----------------------------------------------------------------------
+
+    /// Load the working-memory row for a concrete session, creating an empty
+    /// active row when the session exists but has not compacted yet.
+    pub async fn get_or_create_working_memory(
+        &self,
+        session_id: &str,
+    ) -> rusqlite::Result<Option<WorkingMemoryRecord>> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO working_memory \
+             (session_id, content, status, last_updated_turn, created_at, updated_at) \
+             SELECT id, '', 'active', 0, ?2, ?2 FROM sessions WHERE id = ?1",
+            params![session_id, now],
+        )?;
+        load_working_memory_locked(&conn, session_id)
+    }
+
+    /// Replace one session's complete working-memory snapshot.
+    pub async fn save_working_memory(
+        &self,
+        session_id: &str,
+        content: &str,
+        status: &str,
+        last_updated_turn: u64,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().await;
+        upsert_working_memory_locked(&conn, session_id, content, status, last_updated_turn)
+    }
+
+    /// Change only the lifecycle status for one session's working memory.
+    pub async fn set_working_memory_status(
+        &self,
+        session_id: &str,
+        status: &str,
+    ) -> rusqlite::Result<bool> {
+        validate_working_memory_status(status)?;
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        set_working_memory_status_locked(&conn, session_id, status, &now)
+    }
+
+    /// Change a set of working-memory rows in one transaction. Either every
+    /// requested session advances or none do.
+    pub async fn set_working_memory_status_batch(
+        &self,
+        session_ids: &[String],
+        status: &str,
+    ) -> rusqlite::Result<usize> {
+        validate_working_memory_status(status)?;
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        for session_id in session_ids {
+            if !set_working_memory_status_locked(&tx, session_id, status, &now)? {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+        }
+        tx.commit()?;
+        Ok(session_ids.len())
+    }
+
+    /// Clear the derived working snapshot while preserving its session row.
+    pub async fn clear_working_memory(&self, session_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let changed = conn.execute(
+            "UPDATE working_memory \
+             SET content = '', status = 'active', last_updated_turn = 0, updated_at = ?2 \
+             WHERE session_id = ?1",
+            params![session_id, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// List working-memory rows in most-recently-updated order.
+    pub async fn list_working_memory(
+        &self,
+        status: Option<&str>,
+    ) -> rusqlite::Result<Vec<WorkingMemoryRecord>> {
+        if let Some(status) = status {
+            validate_working_memory_status(status)?;
+        }
+        let conn = self.conn.lock().await;
+        let sql = if status.is_some() {
+            WORKING_MEMORY_SELECT_WITH_STATUS
+        } else {
+            WORKING_MEMORY_SELECT_ALL
+        };
+        let mut stmt = conn.prepare(sql)?;
+        if let Some(status) = status {
+            let rows = stmt.query_map(params![status], row_to_working_memory)?;
+            Ok(rows.filter_map(Result::ok).collect())
+        } else {
+            let rows = stmt.query_map([], row_to_working_memory)?;
+            Ok(rows.filter_map(Result::ok).collect())
+        }
+    }
+
     /// Return all messages for `session_id` without any filtering, ordered by
     /// insertion order (ascending `id`). Used for export and LCM rebuild.
     pub async fn get_all_messages(&self, session_id: &str) -> Vec<Value> {
@@ -575,7 +1178,7 @@ impl SessionDb {
         let rows = stmt.query_map(params![session_id], |row| {
             let id: i64 = row.get(0)?;
             let role: String = row.get(1)?;
-            let content: Option<String> = row.get(2)?;
+            let content: SqlValue = row.get(2)?;
             let tool_calls_json: Option<String> = row.get(3)?;
             let tool_call_id: Option<String> = row.get(4)?;
             let tool_name: Option<String> = row.get(5)?;
@@ -644,7 +1247,8 @@ impl SessionDb {
     ) -> Vec<SearchResult> {
         let conn = self.conn.lock().await;
         if let Some(key_filter) = session_key_filter {
-            let sql = "SELECT m.session_id, s.session_key, m.role, m.content, m.timestamp,
+            let sql = "SELECT m.session_id, s.session_key, m.role,
+                              CAST(m.content AS TEXT), m.timestamp,
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snip, rank
                        FROM messages_fts
                        JOIN messages m ON m.id = messages_fts.rowid
@@ -673,7 +1277,8 @@ impl SessionDb {
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default()
         } else {
-            let sql = "SELECT m.session_id, s.session_key, m.role, m.content, m.timestamp,
+            let sql = "SELECT m.session_id, s.session_key, m.role,
+                              CAST(m.content AS TEXT), m.timestamp,
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snip, rank
                        FROM messages_fts
                        JOIN messages m ON m.id = messages_fts.rowid
@@ -719,26 +1324,8 @@ impl SessionDb {
         level: u8,
     ) {
         let conn = self.conn.lock().await;
-        let source_json = serde_json::to_string(source_ids).unwrap_or_else(|_| "[]".to_string());
-        let child_json = serde_json::to_string(child_ids).unwrap_or_else(|_| "[]".to_string());
-        let now = Utc::now().to_rfc3339();
-        // id_kind = 'db_id': source_ids are messages rowids. Rows without this
-        // marker predate the rowid scheme (positional ids) and are skipped on
-        // rebuild — see `load_summary_nodes`.
-        if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO summary_nodes \
-             (id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'db_id')",
-            params![
-                node_id as i64,
-                session_id,
-                source_json,
-                child_json,
-                text,
-                tokens as i64,
-                level as i64,
-                now,
-            ],
+        if let Err(e) = save_summary_node_locked(
+            &conn, session_id, node_id, source_ids, child_ids, text, tokens, level,
         ) {
             warn!(
                 "Failed to save summary node {} for session {}: {}",
@@ -747,14 +1334,47 @@ impl SessionDb {
         }
     }
 
+    /// Atomically persist the durable half of an LCM checkpoint before its
+    /// compacted message array is eligible for foreground installation.
+    pub async fn save_compaction_checkpoint(
+        &self,
+        session_id: &str,
+        node_id: usize,
+        source_ids: &[usize],
+        child_ids: &[usize],
+        text: &str,
+        tokens: usize,
+        level: u8,
+        working_memory: Option<(&str, u64)>,
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        save_summary_node_locked(
+            &tx, session_id, node_id, source_ids, child_ids, text, tokens, level,
+        )?;
+        if let Some((content, turn)) = working_memory {
+            let updated = upsert_working_memory_locked(&tx, session_id, content, "active", turn)?;
+            if !updated {
+                let session_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                    params![&session_id],
+                    |row| row.get(0),
+                )?;
+                if !session_exists {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+            }
+        }
+        tx.commit()
+    }
+
     /// Load all summary nodes for a session, ordered by ID.
     ///
     /// Returns a vec of (node_id, source_ids, child_ids, text, tokens, level,
-    /// id_kind). `id_kind` is `"db_id"` for nodes whose source_ids are stable
-    /// messages rowids; anything else (NULL rows predate the rowid scheme and
-    /// load as `"legacy"`) carries POSITIONAL source_ids that must NOT be
-    /// resolved against rowids — `rebuild_from_db_nodes` skips such nodes with
-    /// a warning instead of misresolving them.
+    /// id_kind). `id_kind` is always `"db_id"`: source_ids are stable messages
+    /// rowids. Pre-migration rows with positional source_ids are purged once
+    /// when the DB is opened (see `SessionDb::new`); the WHERE clause keeps
+    /// the invariant local.
     pub async fn load_summary_nodes(
         &self,
         session_id: &str,
@@ -762,7 +1382,8 @@ impl SessionDb {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
             "SELECT id, source_ids, child_ids, text, tokens, level, id_kind \
-             FROM summary_nodes WHERE session_id = ?1 ORDER BY id ASC",
+             FROM summary_nodes WHERE session_id = ?1 AND id_kind = 'db_id' \
+             ORDER BY id ASC",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -778,28 +1399,30 @@ impl SessionDb {
             let text: String = row.get(3)?;
             let tokens: i64 = row.get(4)?;
             let level: i64 = row.get(5)?;
-            let id_kind: Option<String> = row.get(6)?;
+            let id_kind: String = row.get(6)?;
             Ok((id, source_str, child_str, text, tokens, level, id_kind))
         });
 
         match rows {
             Ok(r) => r
                 .flatten()
-                .map(|(id, source_str, child_str, text, tokens, level, id_kind)| {
-                    let source_ids: Vec<usize> =
-                        serde_json::from_str(&source_str).unwrap_or_default();
-                    let child_ids: Vec<usize> =
-                        serde_json::from_str(&child_str).unwrap_or_default();
-                    (
-                        id as usize,
-                        source_ids,
-                        child_ids,
-                        text,
-                        tokens as usize,
-                        level as u8,
-                        id_kind.unwrap_or_else(|| "legacy".to_string()),
-                    )
-                })
+                .map(
+                    |(id, source_str, child_str, text, tokens, level, id_kind)| {
+                        let source_ids: Vec<usize> =
+                            serde_json::from_str(&source_str).unwrap_or_default();
+                        let child_ids: Vec<usize> =
+                            serde_json::from_str(&child_str).unwrap_or_default();
+                        (
+                            id as usize,
+                            source_ids,
+                            child_ids,
+                            text,
+                            tokens as usize,
+                            level as u8,
+                            id_kind,
+                        )
+                    },
+                )
                 .collect(),
             Err(e) => {
                 warn!(
@@ -824,11 +1447,11 @@ impl SessionDb {
         const SQL: &str = "\
             SELECT * FROM ( \
                 SELECT s.id, s.session_key, s.updated_at, \
-                    (SELECT m.content FROM messages m \
+                    (SELECT CAST(m.content AS TEXT) FROM messages m \
                      WHERE m.session_id = s.id AND m.role = 'user' \
                        AND m.synthetic = 0 AND m.content IS NOT NULL AND m.content != '' \
                      ORDER BY m.id DESC LIMIT 1) AS last_user, \
-                    (SELECT m.content FROM messages m \
+                    (SELECT CAST(m.content AS TEXT) FROM messages m \
                      WHERE m.session_id = s.id AND m.role = 'assistant' \
                        AND m.synthetic = 0 AND m.content IS NOT NULL AND m.content != '' \
                      ORDER BY m.id DESC LIMIT 1) AS last_assistant \
@@ -880,6 +1503,191 @@ impl SessionDb {
 // Private helpers
 // ---------------------------------------------------------------------------
 
+fn upsert_working_memory_locked(
+    conn: &Connection,
+    session_id: &str,
+    content: &str,
+    status: &str,
+    last_updated_turn: u64,
+) -> rusqlite::Result<bool> {
+    validate_working_memory_status(status)?;
+    let now = Utc::now().to_rfc3339();
+    let changed = conn.execute(
+        "INSERT INTO working_memory \
+         (session_id, content, status, last_updated_turn, created_at, updated_at) \
+         SELECT id, ?2, ?3, ?4, ?5, ?5 FROM sessions WHERE id = ?1 \
+         ON CONFLICT(session_id) DO UPDATE SET \
+           content=excluded.content, status=excluded.status, \
+           last_updated_turn=excluded.last_updated_turn, updated_at=excluded.updated_at \
+         WHERE excluded.last_updated_turn >= working_memory.last_updated_turn \
+           AND CASE excluded.status \
+                 WHEN 'active' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END \
+               >= CASE working_memory.status \
+                 WHEN 'active' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END",
+        params![session_id, content, status, last_updated_turn as i64, now],
+    )?;
+    Ok(changed > 0)
+}
+
+fn set_working_memory_status_locked(
+    conn: &Connection,
+    session_id: &str,
+    status: &str,
+    now: &str,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE working_memory SET status = ?2, updated_at = ?3 \
+         WHERE session_id = ?1 \
+           AND (status = ?2 \
+                OR (status = 'active' AND ?2 = 'completed') \
+                OR (status = 'completed' AND ?2 = 'reflected'))",
+        params![session_id, status, now],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Explicit resume is the sole backwards lifecycle transition. It preserves the
+/// snapshot and turn while preventing a stale reflector batch from advancing a
+/// newly-active row directly to `reflected`.
+fn reactivate_working_memory_locked(
+    conn: &Connection,
+    session_id: &str,
+    now: &str,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE working_memory SET status = 'active', updated_at = ?2 \
+         WHERE session_id = ?1 AND status != 'active'",
+        params![session_id, now],
+    )?;
+    Ok(changed > 0)
+}
+
+fn save_summary_node_locked(
+    conn: &Connection,
+    session_id: &str,
+    node_id: usize,
+    source_ids: &[usize],
+    child_ids: &[usize],
+    text: &str,
+    tokens: usize,
+    level: u8,
+) -> rusqlite::Result<()> {
+    let source_json = serde_json::to_string(source_ids).unwrap_or_else(|_| "[]".to_string());
+    let child_json = serde_json::to_string(child_ids).unwrap_or_else(|_| "[]".to_string());
+    let now = Utc::now().to_rfc3339();
+    // `db_id` means source ids are stable messages rowids. Older positional
+    // nodes lack the marker and are deliberately skipped during reconstruction.
+    conn.execute(
+        "INSERT INTO summary_nodes \
+         (id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'db_id') \
+         ON CONFLICT(session_id, id) DO UPDATE SET \
+         source_ids = excluded.source_ids, child_ids = excluded.child_ids, \
+         text = excluded.text, tokens = excluded.tokens, level = excluded.level, \
+         created_at = excluded.created_at, id_kind = excluded.id_kind",
+        params![
+            node_id as i64,
+            session_id,
+            source_json,
+            child_json,
+            text,
+            tokens as i64,
+            level as i64,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_working_memory_locked(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<WorkingMemoryRecord>> {
+    let sql = format!("{WORKING_MEMORY_COLUMNS} WHERE wm.session_id = ?1");
+    conn.query_row(&sql, params![session_id], row_to_working_memory)
+        .optional()
+}
+
+fn row_to_working_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkingMemoryRecord> {
+    let created_at: String = row.get(5)?;
+    let updated_at: String = row.get(6)?;
+    Ok(WorkingMemoryRecord {
+        session_id: row.get(0)?,
+        session_key: row.get(1)?,
+        content: row.get(2)?,
+        status: row.get(3)?,
+        last_updated_turn: row.get::<_, i64>(4)?.max(0) as u64,
+        created_at: parse_datetime(&created_at),
+        updated_at: parse_datetime(&updated_at),
+    })
+}
+
+fn validate_working_memory_status(status: &str) -> rusqlite::Result<()> {
+    if matches!(status, "active" | "completed" | "reflected") {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::InvalidParameterName(format!(
+            "invalid working-memory status: {status}"
+        )))
+    }
+}
+
+fn parse_datetime(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|date| date.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+fn select_session_ids(
+    tx: &Transaction<'_>,
+    sql: &str,
+    parameter: Option<String>,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = tx.prepare(sql)?;
+    if let Some(parameter) = parameter {
+        let rows = stmt.query_map(params![parameter], |row| row.get(0))?;
+        rows.collect()
+    } else {
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
+    }
+}
+
+/// Remove all rows owned by `session_id`. Keep this explicit rather than
+/// relying solely on `ON DELETE CASCADE`: older databases were created without
+/// cascade clauses, and SQLite cannot retrofit them with `ALTER TABLE`.
+fn delete_session_rows(tx: &Transaction<'_>, session_id: &str) -> rusqlite::Result<bool> {
+    tx.execute(
+        "DELETE FROM working_memory WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    tx.execute(
+        "DELETE FROM tool_results WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    tx.execute(
+        "DELETE FROM summary_nodes WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    tx.execute(
+        "DELETE FROM session_snapshots WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    tx.execute(
+        "DELETE FROM messages WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    let deleted = tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+    Ok(deleted > 0)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Generate a session ID from the current timestamp.
 ///
 /// Format: `YYYYMMDD_HHMMSS_XXXXXX` where the last segment is derived from
@@ -926,7 +1734,25 @@ fn parse_json_vec(json: String) -> Vec<String> {
 fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) -> Option<i64> {
     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
 
-    let content = msg.get("content").and_then(|v| v.as_str());
+    // SQLite's dynamic value types provide an unambiguous tag without a
+    // schema migration: ordinary strings remain TEXT for search/readability,
+    // while every other explicit JSON value is serialized into a BLOB. This
+    // distinguishes JSON null from a missing content field and prevents media
+    // arrays/objects from being flattened into a string during replay.
+    let content = match msg.get("content") {
+        Some(Value::String(text)) => SqlValue::Text(text.clone()),
+        Some(value) => match serde_json::to_vec(value) {
+            Ok(encoded) => SqlValue::Blob(encoded),
+            Err(e) => {
+                warn!(
+                    "Failed to encode message content for session {}: {}",
+                    session_id, e
+                );
+                return None;
+            }
+        },
+        None => SqlValue::Null,
+    };
 
     let tool_calls_json: Option<String> = msg
         .get("tool_calls")
@@ -1026,7 +1852,7 @@ fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) -> Op
 fn reconstruct_message(
     id: i64,
     role: String,
-    content: Option<String>,
+    content: SqlValue,
     tool_calls_json: Option<String>,
     tool_call_id: Option<String>,
     tool_name: Option<String>,
@@ -1038,9 +1864,21 @@ fn reconstruct_message(
     // `_db_id` is the stable rowid — the LCM engine's MessageId. It is an
     // internal-only field: filter_history preserves it, the protocol render
     // drops it before the wire call.
+    // Rows written before structured-content support contain TEXT or NULL.
+    // New non-string values are JSON BLOBs, so mixed old/new databases replay
+    // without a migration while preserving the original JSON type exactly.
+    let content = match content {
+        SqlValue::Null => Value::String(String::new()),
+        SqlValue::Text(text) => Value::String(text),
+        SqlValue::Blob(encoded) => serde_json::from_slice(&encoded)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&encoded).into_owned())),
+        SqlValue::Integer(value) => json!(value),
+        SqlValue::Real(value) => json!(value),
+    };
+
     let mut msg = json!({
         "role": role,
-        "content": content.unwrap_or_default(),
+        "content": content,
         "timestamp": timestamp,
         "_db_id": id,
     });
@@ -1192,6 +2030,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_rollover_completes_the_expired_working_memory() {
+        let (db, _dir) = make_db();
+        let original = db.create_session("telegram:idle-memory").await;
+        db.save_working_memory(&original.id, "durable session summary", "active", 7)
+            .await
+            .unwrap();
+        {
+            let old_time = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                params![old_time, original.id],
+            )
+            .unwrap();
+        }
+
+        let fresh = db
+            .get_or_resume_with_idle("telegram:idle-memory", 3600)
+            .await;
+        assert_ne!(fresh.id, original.id);
+        let expired = db
+            .get_or_create_working_memory(&original.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.status, "completed");
+        assert_eq!(expired.content, "durable session summary");
+        assert_eq!(expired.last_updated_turn, 7);
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_selects_exact_id_and_reopens_working_memory() {
+        let (db, _dir) = make_db();
+        let requested = db.create_session("cli:shared-name").await;
+        db.save_working_memory(&requested.id, "old snapshot", "active", 5)
+            .await
+            .unwrap();
+        assert!(db
+            .set_working_memory_status(&requested.id, "completed")
+            .await
+            .unwrap());
+        assert!(db
+            .set_working_memory_status(&requested.id, "reflected")
+            .await
+            .unwrap());
+        let newer = db.create_session("cli:shared-name").await;
+        assert_eq!(
+            db.get_latest_session("cli:shared-name").await.unwrap().id,
+            newer.id
+        );
+
+        let resumed = db
+            .resume_session(&requested.id)
+            .await
+            .unwrap()
+            .expect("requested concrete session exists");
+        assert_eq!(resumed.id, requested.id);
+        assert_eq!(
+            db.get_latest_session("cli:shared-name").await.unwrap().id,
+            requested.id,
+            "the requested ID, not merely the latest reusable key, must resume"
+        );
+        let memory = db
+            .get_or_create_working_memory(&requested.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(memory.status, "active");
+        assert_eq!(memory.content, "old snapshot");
+        assert_eq!(memory.last_updated_turn, 5);
+        assert!(db
+            .save_working_memory(&requested.id, "continued snapshot", "active", 6)
+            .await
+            .unwrap());
+        assert!(
+            !db.set_working_memory_status(&requested.id, "reflected")
+                .await
+                .unwrap(),
+            "a stale reflector batch must not advance a reactivated row"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_session_returns_none_for_missing_id() {
         let (db, _dir) = make_db();
         let result = db.get_session("nonexistent_id_xyz").await;
@@ -1207,13 +2128,15 @@ mod tests {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:test").await;
 
-        let _ = db.add_message(&meta.id, &json!({"role": "user", "content": "hello"}))
+        let _ = db
+            .add_message(&meta.id, &json!({"role": "user", "content": "hello"}))
             .await;
-        let _ = db.add_message(
-            &meta.id,
-            &json!({"role": "assistant", "content": "hi there"}),
-        )
-        .await;
+        let _ = db
+            .add_message(
+                &meta.id,
+                &json!({"role": "assistant", "content": "hi there"}),
+            )
+            .await;
 
         let history = db.get_history(&meta.id, 100, 0).await;
         assert_eq!(history.len(), 2);
@@ -1221,6 +2144,66 @@ mod tests {
         assert_eq!(history[0]["content"], "hello");
         assert_eq!(history[1]["role"], "assistant");
         assert_eq!(history[1]["content"], "hi there");
+    }
+
+    #[tokio::test]
+    async fn test_structured_message_content_round_trips_losslessly() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:structured-content").await;
+        let media_content = json!([
+            {"type": "text", "text": "Describe this image and recording."},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,iVBORw0KGgo=",
+                    "detail": "high"
+                }
+            },
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "UklGRg==", "format": "wav"}
+            }
+        ]);
+        let object_content = json!({"type": "text", "text": "object payload"});
+        let messages = vec![
+            json!({"role": "user", "content": "plain text"}),
+            json!({"role": "assistant", "content": null}),
+            json!({"role": "user", "content": media_content.clone()}),
+            json!({"role": "assistant", "content": object_content.clone()}),
+        ];
+
+        db.add_messages(&meta.id, &messages).await;
+
+        let replayed = db.get_all_messages(&meta.id).await;
+        assert_eq!(replayed.len(), messages.len());
+        assert_eq!(replayed[0]["content"], "plain text");
+        assert_eq!(replayed[1]["content"], Value::Null);
+        assert_eq!(replayed[2]["content"], media_content);
+        assert_eq!(replayed[3]["content"], object_content);
+
+        // The filtered replay path used by foreground inference must retain
+        // the same multimodal array rather than converting it to JSON text.
+        let history = db.get_history(&meta.id, 100, 0).await;
+        assert_eq!(history[2]["content"], replayed[2]["content"]);
+
+        // String-only convenience APIs expose structured content as JSON text
+        // rather than dropping their rows because SQLite stored it as a BLOB.
+        let search = db.search_messages("Describe", 10, None).await;
+        assert_eq!(search.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&search[0].content).unwrap(),
+            replayed[2]["content"]
+        );
+        let tails = db.latest_session_tails("different-session", 1).await;
+        assert_eq!(tails.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&tails[0].last_user).unwrap(),
+            replayed[2]["content"]
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&tails[0].last_assistant).unwrap(),
+            replayed[3]["content"]
+        );
     }
 
     #[tokio::test]
@@ -1260,6 +2243,31 @@ mod tests {
             Some("full exact body".to_string())
         );
         assert_eq!(reopened.path(), db_path.as_path());
+    }
+
+    #[tokio::test]
+    async fn predictable_tool_call_ids_are_isolated_by_session() {
+        let (db, _dir) = make_db();
+        let first = db.create_session("cli:first-tool-session").await;
+        let second = db.create_session("cli:second-tool-session").await;
+
+        assert!(
+            db.store_tool_result(&first.id, "call_0", "read_file", "first body")
+                .await
+        );
+        assert!(
+            db.store_tool_result(&second.id, "call_0", "read_file", "second body")
+                .await
+        );
+
+        assert_eq!(
+            db.load_tool_result(&first.id, "call_0").await.as_deref(),
+            Some("first body")
+        );
+        assert_eq!(
+            db.load_tool_result(&second.id, "call_0").await.as_deref(),
+            Some("second body")
+        );
     }
 
     #[tokio::test]
@@ -1313,11 +2321,12 @@ mod tests {
         let (db, _dir) = make_db();
         let meta = db.create_session("test:turn_tag").await;
 
-        let _ = db.add_message(
-            &meta.id,
-            &json!({"role": "user", "content": "hello", "_turn": 7}),
-        )
-        .await;
+        let _ = db
+            .add_message(
+                &meta.id,
+                &json!({"role": "user", "content": "hello", "_turn": 7}),
+            )
+            .await;
 
         let all = db.get_all_messages(&meta.id).await;
         assert_eq!(all[0].get("_turn").and_then(|v| v.as_i64()), Some(7));
@@ -1328,11 +2337,12 @@ mod tests {
         let (db, _dir) = make_db();
         let meta = db.create_session("test:synthetic").await;
 
-        let _ = db.add_message(
-            &meta.id,
-            &json!({"role": "user", "content": "injected", "_synthetic": true}),
-        )
-        .await;
+        let _ = db
+            .add_message(
+                &meta.id,
+                &json!({"role": "user", "content": "injected", "_synthetic": true}),
+            )
+            .await;
 
         // get_all_messages returns it raw (with the flag).
         let all = db.get_all_messages(&meta.id).await;
@@ -1442,7 +2452,8 @@ mod tests {
         let second = db.create_session("cli:default").await;
 
         // Add a message to the second session to bump its updated_at.
-        let _ = db.add_message(&second.id, &json!({"role": "user", "content": "bump"}))
+        let _ = db
+            .add_message(&second.id, &json!({"role": "user", "content": "bump"}))
             .await;
 
         let latest = db
@@ -1469,11 +2480,12 @@ mod tests {
         let (db, _dir) = make_db();
 
         let original = db.create_session("cli:default").await;
-        let _ = db.add_message(
-            &original.id,
-            &json!({"role": "user", "content": "message from yesterday"}),
-        )
-        .await;
+        let _ = db
+            .add_message(
+                &original.id,
+                &json!({"role": "user", "content": "message from yesterday"}),
+            )
+            .await;
 
         // Simulate "today" resumption — must return the same session.
         let resumed = db.get_or_resume("cli:default").await;
@@ -1497,9 +2509,11 @@ mod tests {
         let meta = db.create_session("cli:count").await;
         assert_eq!(meta.message_count, 0);
 
-        let _ = db.add_message(&meta.id, &json!({"role": "user", "content": "one"}))
+        let _ = db
+            .add_message(&meta.id, &json!({"role": "user", "content": "one"}))
             .await;
-        let _ = db.add_message(&meta.id, &json!({"role": "assistant", "content": "two"}))
+        let _ = db
+            .add_message(&meta.id, &json!({"role": "assistant", "content": "two"}))
             .await;
 
         let loaded = db.get_session(&meta.id).await.expect("session exists");
@@ -1527,7 +2541,8 @@ mod tests {
     async fn test_fts_search_no_match() {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:fts2").await;
-        let _ = db.add_message(&meta.id, &json!({"role": "user", "content": "Hello world"}))
+        let _ = db
+            .add_message(&meta.id, &json!({"role": "user", "content": "Hello world"}))
             .await;
         let results = db.search_messages("xyznonexistent", 10, None).await;
         assert!(results.is_empty());
@@ -1538,16 +2553,18 @@ mod tests {
         let (db, _dir) = make_db();
         let cli = db.create_session("cli:default").await;
         let tg = db.create_session("telegram:42").await;
-        let _ = db.add_message(
-            &cli.id,
-            &json!({"role": "user", "content": "CLI Rust question"}),
-        )
-        .await;
-        let _ = db.add_message(
-            &tg.id,
-            &json!({"role": "user", "content": "Telegram Rust question"}),
-        )
-        .await;
+        let _ = db
+            .add_message(
+                &cli.id,
+                &json!({"role": "user", "content": "CLI Rust question"}),
+            )
+            .await;
+        let _ = db
+            .add_message(
+                &tg.id,
+                &json!({"role": "user", "content": "Telegram Rust question"}),
+            )
+            .await;
         let results = db.search_messages("Rust", 10, Some("cli:")).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_key, "cli:default");
@@ -1557,11 +2574,12 @@ mod tests {
     async fn test_fts_rebuild() {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:rebuild").await;
-        let _ = db.add_message(
-            &meta.id,
-            &json!({"role": "user", "content": "Rebuild test message"}),
-        )
-        .await;
+        let _ = db
+            .add_message(
+                &meta.id,
+                &json!({"role": "user", "content": "Rebuild test message"}),
+            )
+            .await;
         db.rebuild_fts_index().await;
         let results = db.search_messages("Rebuild", 10, None).await;
         assert!(!results.is_empty());
@@ -1710,22 +2728,78 @@ mod tests {
         assert_eq!(text1, "Summary of technical discussion.");
         assert_eq!(*tokens1, 12);
         assert_eq!(*level1, 2);
+    }
 
-        // A pre-migration row (no id_kind) must load as "legacy" — never as
-        // db-id-addressable.
-        {
+    /// Pre-migration summary_nodes rows (id_kind NULL or non-"db_id") carry
+    /// POSITIONAL source_ids that cannot be resolved against the db-id-keyed
+    /// LCM store. Opening the DB purges them once; db_id rows survive.
+    #[tokio::test]
+    async fn test_open_purges_legacy_summary_nodes() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.db");
+        let meta = {
+            let db = SessionDb::new(&db_path);
+            let meta = db.create_session("cli:legacy_purge").await;
+            db.save_summary_node(&meta.id, 0, &[1, 2], &[], "modern", 3, 1)
+                .await;
+            // Mimic a pre-migration DB: raw rows with NULL and stale id_kind.
             let conn = db.conn.lock().await;
             conn.execute(
                 "INSERT INTO summary_nodes \
                  (id, session_id, source_ids, child_ids, text, tokens, level, created_at) \
-                 VALUES (99, ?1, '[0,1]', '[]', 'old positional node', 4, 1, '2025-01-01T00:00:00Z')",
+                 VALUES (98, ?1, '[0,1]', '[]', 'null-kind positional', 4, 1, \
+                 '2025-01-01T00:00:00Z')",
                 rusqlite::params![meta.id],
             )
             .unwrap();
-        }
-        let nodes = db.load_summary_nodes(&meta.id).await;
-        let legacy = nodes.iter().find(|n| n.0 == 99).unwrap();
-        assert_eq!(legacy.6, "legacy");
+            conn.execute(
+                "INSERT INTO summary_nodes \
+                 (id, session_id, source_ids, child_ids, text, tokens, level, created_at, \
+                 id_kind) \
+                 VALUES (99, ?1, '[0,1]', '[]', 'legacy positional', 4, 1, \
+                 '2025-01-01T00:00:00Z', 'legacy')",
+                rusqlite::params![meta.id],
+            )
+            .unwrap();
+            meta
+        };
+
+        // Re-open: the migration path purges the legacy rows exactly once.
+        let db = SessionDb::new(&db_path);
+        let conn = db.conn.lock().await;
+        let remaining: Vec<(i64, Option<String>)> = conn
+            .prepare("SELECT id, id_kind FROM summary_nodes WHERE session_id = ?1")
+            .unwrap()
+            .query_map(rusqlite::params![meta.id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![(0, Some("db_id".to_string()))],
+            "legacy rows must be purged at open; db_id rows must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_node_ids_are_isolated_per_session() {
+        let (db, _dir) = make_db();
+        let first = db.create_session("cli:dag-first").await;
+        let second = db.create_session("cli:dag-second").await;
+
+        db.save_summary_node(&first.id, 0, &[11], &[], "first", 1, 1)
+            .await;
+        db.save_summary_node(&second.id, 0, &[22], &[], "second", 1, 1)
+            .await;
+
+        let first_nodes = db.load_summary_nodes(&first.id).await;
+        let second_nodes = db.load_summary_nodes(&second.id).await;
+        assert_eq!(first_nodes.len(), 1);
+        assert_eq!(second_nodes.len(), 1);
+        assert_eq!(first_nodes[0].3, "first");
+        assert_eq!(second_nodes[0].3, "second");
     }
 
     // -----------------------------------------------------------------------
@@ -1791,7 +2865,8 @@ mod tests {
         .await;
 
         let current = db.create_session("cli:oneshot-current").await;
-        let _ = db.add_message(&current.id, &json!({"role": "user", "content": "hello"}))
+        let _ = db
+            .add_message(&current.id, &json!({"role": "user", "content": "hello"}))
             .await;
 
         let tails = db.latest_session_tails(&current.id, 3).await;
@@ -1845,5 +2920,402 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].3, "Updated.");
         assert_eq!(nodes[0].4, 6);
+    }
+
+    #[tokio::test]
+    async fn working_memory_is_isolated_by_concrete_session_id() {
+        let (db, _dir) = make_db();
+        let first = db.create_session("telegram:shared-chat").await;
+        let second = db.create_session("telegram:shared-chat").await;
+
+        assert!(db
+            .save_working_memory(&first.id, "first session state", "completed", 7)
+            .await
+            .unwrap());
+        assert!(db
+            .save_working_memory(&second.id, "second session state", "active", 2)
+            .await
+            .unwrap());
+
+        let first_memory = db
+            .get_or_create_working_memory(&first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_memory = db
+            .get_or_create_working_memory(&second.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_memory.content, "first session state");
+        assert_eq!(first_memory.status, "completed");
+        assert_eq!(first_memory.last_updated_turn, 7);
+        assert_eq!(second_memory.content, "second session state");
+        assert_eq!(second_memory.status, "active");
+        assert_ne!(first_memory.session_id, second_memory.session_id);
+    }
+
+    #[tokio::test]
+    async fn working_memory_updates_are_monotonic_and_lifecycle_terminal() {
+        let (db, _dir) = make_db();
+        let session = db.create_session("cli:monotonic-memory").await;
+        assert!(db
+            .save_working_memory(&session.id, "newer", "active", 10)
+            .await
+            .unwrap());
+        assert!(!db
+            .save_working_memory(&session.id, "stale", "active", 9)
+            .await
+            .unwrap());
+        assert!(db
+            .set_working_memory_status(&session.id, "completed")
+            .await
+            .unwrap());
+        assert!(!db
+            .save_working_memory(&session.id, "late active", "active", 11)
+            .await
+            .unwrap());
+        assert!(db
+            .set_working_memory_status(&session.id, "reflected")
+            .await
+            .unwrap());
+        assert!(!db
+            .save_working_memory(&session.id, "late completed", "completed", 12)
+            .await
+            .unwrap());
+        assert!(!db
+            .set_working_memory_status(&session.id, "active")
+            .await
+            .unwrap());
+
+        let memory = db
+            .get_or_create_working_memory(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(memory.content, "newer");
+        assert_eq!(memory.last_updated_turn, 10);
+        assert_eq!(memory.status, "reflected");
+    }
+
+    #[tokio::test]
+    async fn lcm_checkpoint_commits_summary_and_working_memory_together() {
+        let (db, _dir) = make_db();
+        let session = db.create_session("cli:lcm-checkpoint").await;
+        db.save_compaction_checkpoint(
+            &session.id,
+            4,
+            &[11, 12],
+            &[1],
+            "durable summary",
+            4,
+            2,
+            Some(("durable summary", 17)),
+        )
+        .await
+        .unwrap();
+
+        let nodes = db.load_summary_nodes(&session.id).await;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].0, 4);
+        assert_eq!(nodes[0].3, "durable summary");
+        let memory = db
+            .get_or_create_working_memory(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(memory.content, "durable summary");
+        assert_eq!(memory.last_updated_turn, 17);
+
+        assert!(db
+            .save_compaction_checkpoint(
+                "missing-session",
+                5,
+                &[21],
+                &[],
+                "must roll back",
+                3,
+                1,
+                Some(("must roll back", 1)),
+            )
+            .await
+            .is_err());
+        let conn = db.conn.lock().await;
+        let leaked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM summary_nodes WHERE id = 5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_session_transactionally_removes_all_owned_rows() {
+        let (db, dir) = make_db();
+        let jsonl = dir.path().join("legacy.jsonl");
+        std::fs::write(&jsonl, "{\"role\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        let session_id = match db
+            .import_legacy_jsonl(&jsonl, "legacy:cascade")
+            .await
+            .unwrap()
+        {
+            LegacyImportOutcome::Imported { session_id, .. } => session_id,
+            LegacyImportOutcome::AlreadyImported { .. } => unreachable!(),
+        };
+        assert!(
+            db.store_tool_result(&session_id, "call_1", "read_file", "raw body")
+                .await
+        );
+        db.save_summary_node(&session_id, 901, &[1], &[], "summary", 2, 1)
+            .await;
+        assert!(db
+            .save_working_memory(&session_id, "working", "completed", 1)
+            .await
+            .unwrap());
+        db.save_snapshot(&SessionSnapshot {
+            version: 1,
+            session_key: "legacy:cascade".to_string(),
+            session_id: session_id.clone(),
+            cwd: "/tmp".to_string(),
+            model: "test".to_string(),
+            tui_mode: "chat".to_string(),
+            show_thinking: false,
+            input_draft: String::new(),
+            prompt_history: vec![],
+            recent_paths: vec![],
+            recent_commands: vec![],
+            updated_at: Utc::now(),
+        })
+        .await;
+
+        assert!(db.delete_session(&session_id).await.unwrap());
+        assert!(!db.delete_session(&session_id).await.unwrap());
+        assert!(db.get_session(&session_id).await.is_none());
+        assert!(db.get_all_messages(&session_id).await.is_empty());
+        assert!(db.load_tool_result(&session_id, "call_1").await.is_none());
+        assert!(db.load_summary_nodes(&session_id).await.is_empty());
+        assert!(db
+            .get_or_create_working_memory(&session_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db.load_snapshot("legacy:cascade").await.is_none());
+
+        {
+            let conn = db.conn.lock().await;
+            let imports: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM legacy_imports WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(imports, 1, "immutable import provenance must survive");
+        }
+        assert_eq!(
+            db.import_legacy_jsonl(&jsonl, "legacy:cascade")
+                .await
+                .unwrap(),
+            LegacyImportOutcome::AlreadyImported {
+                session_id: session_id.clone(),
+                message_count: 1,
+            }
+        );
+        std::fs::write(&jsonl, "{\"role\":\"user\",\"content\":\"changed\"}\n").unwrap();
+        assert!(matches!(
+            db.import_legacy_jsonl(&jsonl, "legacy:cascade").await,
+            Err(LegacyImportError::ChangedFile { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn purge_and_nuke_cascade_in_single_database_transactions() {
+        let (db, _dir) = make_db();
+        let old = db.create_session("cli:old").await;
+        let fresh = db.create_session("cli:fresh").await;
+        db.save_working_memory(&old.id, "old", "active", 1)
+            .await
+            .unwrap();
+        db.save_working_memory(&fresh.id, "fresh", "active", 1)
+            .await
+            .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                params![
+                    (Utc::now() - chrono::Duration::days(10)).to_rfc3339(),
+                    old.id
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO legacy_imports \
+                 (source_path, content_sha256, session_id, message_count, imported_at) \
+                 VALUES ('/tmp/purged.jsonl', 'purged-hash', ?1, 1, ?2)",
+                params![&old.id, Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let removed = db
+            .purge_sessions_before(Utc::now() - chrono::Duration::days(1))
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(db.get_session(&old.id).await.is_none());
+        assert!(db.get_session(&fresh.id).await.is_some());
+        assert_eq!(db.list_working_memory(None).await.unwrap().len(), 1);
+        {
+            let conn = db.conn.lock().await;
+            let imports: i64 = conn
+                .query_row("SELECT COUNT(*) FROM legacy_imports", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(imports, 1);
+        }
+
+        assert_eq!(db.nuke_sessions().await.unwrap(), 1);
+        assert!(db.list_sessions(None, 100).await.is_empty());
+        assert!(db.list_working_memory(None).await.unwrap().is_empty());
+        let conn = db.conn.lock().await;
+        let imports: i64 = conn
+            .query_row("SELECT COUNT(*) FROM legacy_imports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(imports, 1, "nuke must retain immutable import provenance");
+    }
+
+    #[tokio::test]
+    async fn legacy_jsonl_import_is_idempotent_and_rejects_changed_file() {
+        let (db, dir) = make_db();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"_type\":\"metadata\",\"session_key\":\"cli:legacy\"}\n",
+                "{\"role\":\"user\",\"content\":\"question\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"answer\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let first = db
+            .import_legacy_jsonl(&path, "cli:fallback-must-not-win")
+            .await
+            .unwrap();
+        let (session_id, message_count) = match first {
+            LegacyImportOutcome::Imported {
+                session_id,
+                message_count,
+            } => (session_id, message_count),
+            LegacyImportOutcome::AlreadyImported { .. } => unreachable!(),
+        };
+        assert_eq!(message_count, 2);
+        assert_eq!(
+            db.get_session(&session_id).await.unwrap().session_key,
+            "cli:legacy",
+            "legacy metadata session_key must be authoritative"
+        );
+        let second = db.import_legacy_jsonl(&path, "cli:legacy").await.unwrap();
+        assert_eq!(
+            second,
+            LegacyImportOutcome::AlreadyImported {
+                session_id: session_id.clone(),
+                message_count: 2,
+            }
+        );
+        let copied_path = dir.path().join("copied-session.jsonl");
+        std::fs::copy(&path, &copied_path).unwrap();
+        assert_eq!(
+            db.import_legacy_jsonl(&copied_path, "cli:duplicate-copy")
+                .await
+                .unwrap(),
+            LegacyImportOutcome::AlreadyImported {
+                session_id: session_id.clone(),
+                message_count: 2,
+            },
+            "identical bytes at another path must not create a second session"
+        );
+        assert_eq!(db.list_sessions(Some("cli:legacy"), 10).await.len(), 1);
+
+        std::fs::write(
+            &copied_path,
+            "{\"role\":\"user\",\"content\":\"changed copy\"}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            db.import_legacy_jsonl(&copied_path, "cli:duplicate-copy")
+                .await,
+            Err(LegacyImportError::ChangedFile { .. })
+        ));
+
+        std::fs::write(&path, "{\"role\":\"user\",\"content\":\"changed\"}\n").unwrap();
+        let changed = db.import_legacy_jsonl(&path, "cli:legacy").await;
+        assert!(matches!(
+            changed,
+            Err(LegacyImportError::ChangedFile { .. })
+        ));
+        assert_eq!(db.get_all_messages(&session_id).await.len(), 2);
+        assert_eq!(db.list_sessions(Some("cli:legacy"), 10).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_jsonl_rolls_back_without_creating_session() {
+        let (db, dir) = make_db();
+        let path = dir.path().join("broken.jsonl");
+        std::fs::write(&path, "{\"role\":\"user\"}\nnot-json\n").unwrap();
+
+        let result = db.import_legacy_jsonl(&path, "cli:broken").await;
+        assert!(matches!(
+            result,
+            Err(LegacyImportError::InvalidJson { line: 2, .. })
+        ));
+        assert!(db.list_sessions(Some("cli:broken"), 10).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_import_fk_migration_preserves_detached_provenance() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys=ON;
+                 CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, session_key TEXT NOT NULL, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, message_count INTEGER DEFAULT 0,
+                    metadata TEXT DEFAULT '{}'
+                 );
+                 CREATE TABLE legacy_imports (
+                    source_path TEXT PRIMARY KEY, content_sha256 TEXT NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    message_count INTEGER NOT NULL, imported_at TEXT NOT NULL
+                 );
+                 INSERT INTO sessions VALUES
+                    ('old-session', 'legacy:old', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z', 1, '{}');
+                 INSERT INTO legacy_imports VALUES
+                    ('/tmp/old.jsonl', 'abc123', 'old-session', 1,
+                     '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let db = SessionDb::new(&path);
+        assert!(db.delete_session("old-session").await.unwrap());
+        let conn = db.conn.lock().await;
+        let foreign_keys: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('legacy_imports')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let records: i64 = conn
+            .query_row("SELECT COUNT(*) FROM legacy_imports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 0);
+        assert_eq!(records, 1);
     }
 }

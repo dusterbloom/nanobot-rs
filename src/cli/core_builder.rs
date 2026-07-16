@@ -95,55 +95,6 @@ fn resolved_local_context_tokens(
     }
 }
 
-/// Physical-memory ceiling on context tokens for a locally-served model whose
-/// server does not advertise its own context window (e.g. higgs/MLX has no
-/// `/props`).
-///
-/// Estimates weights + KV cost from the model name(s) and the machine's memory,
-/// then reuses the VRAM budget solver — so the trio's co-resident router and
-/// specialist models (when they share this endpoint) are subtracted too, and
-/// the main model gets a context that actually fits. The user's configured
-/// `localMaxContextTokens` is honoured as the architectural upper bound; memory
-/// is the real binding constraint below it.
-fn memory_context_ceiling(config: &Config, main_model: &str) -> usize {
-    use crate::server;
-
-    let (vram, ram) = server::detect_available_memory();
-    // Reserve ~20% of total for the OS, the serving runtime, and nanobot itself.
-    let available = ((vram.unwrap_or(ram) as f64) * 0.80) as u64;
-
-    let mut main = server::estimate_model_profile_from_name(main_model);
-    // Honour the user's stated architectural max; let memory bind below it
-    // rather than the estimator's conservative 32K default.
-    main.max_context_length = config.agents.defaults.local_max_context_tokens;
-    // This is a *memory* ceiling: only physical memory and the arch max should
-    // bind it. Neutralise the file-size "practical cap" quality heuristic, which
-    // would otherwise pin small models far below what their memory allows.
-    main.practical_cap = usize::MAX;
-
-    // Co-resident trio models share the same unified memory only when they have
-    // no separate endpoint of their own. Subtract their weight footprint.
-    let coresident = |model: &str, endpoint: &Option<crate::config::schema::ModelEndpoint>| {
-        (config.trio.enabled && !model.is_empty() && endpoint.is_none())
-            .then(|| server::estimate_model_profile_from_name(model))
-    };
-    let router = coresident(&config.trio.router_model, &config.trio.router_endpoint);
-    let specialist = coresident(&config.trio.specialist_model, &config.trio.specialist_endpoint);
-
-    let input = server::VramBudgetInput {
-        available_memory: available,
-        // Real memory governs here — don't apply the trio's fixed VRAM cap,
-        // which is tuned for discrete GPUs and would wrongly shrink the budget
-        // on a large unified-memory machine.
-        vram_cap: available,
-        overhead_per_model: 512 * 1_000_000,
-        main,
-        router,
-        specialist,
-    };
-    server::compute_vram_budget(&input).main_ctx
-}
-
 /// Strip GGUF quantisation suffix and extension from a model filename to get
 /// the bare model identifier that LM Studio / remote servers recognise.
 ///
@@ -195,9 +146,33 @@ pub(super) struct LocalProviders {
     /// Real model identity used for capabilities, prompt policy, UI, and snapshots.
     pub semantic_model_id: String,
     pub compaction: Option<Arc<dyn LLMProvider>>,
+    pub compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
     pub delegation: Option<Arc<dyn LLMProvider>>,
     pub specialist: Option<Arc<dyn LLMProvider>>,
     pub max_context_tokens: usize,
+}
+
+/// Construct the provider and lifecycle owner as one unit so every consumer
+/// uses the exact endpoint/model identity the manager starts.
+fn make_managed_compaction_provider(
+    config: &Config,
+) -> (
+    Option<Arc<dyn LLMProvider>>,
+    Option<Arc<crate::higgs::CompactionSidecarManager>>,
+) {
+    let manager = crate::higgs::CompactionSidecarManager::from_config(config);
+    let provider = manager.as_ref().map(|manager| -> Arc<dyn LLMProvider> {
+        factory::create_openai_compat(
+            factory::ProviderSpec::local_with_key(
+                &manager.base_url(),
+                Some(manager.model_hint()),
+                &config.agents.defaults.local_api_key,
+            )
+            .with_timeout_config(&config.timeouts)
+            .with_retry(config.retry.clone()),
+        )
+    });
+    (provider, manager)
 }
 
 fn shared_local_role_model<'a>(configured_role_model: &'a str, main_model_id: &'a str) -> &'a str {
@@ -255,7 +230,6 @@ pub(super) fn make_local_providers(
     config: &Config,
     local_port: &str,
     local_model_name: Option<&str>,
-    compaction_port: Option<&str>,
     delegation_port: Option<&str>,
     specialist_port: Option<&str>,
 ) -> LocalProviders {
@@ -307,60 +281,16 @@ pub(super) fn make_local_providers(
         detected_context_tokens,
         config.agents.defaults.local_max_context_tokens,
     );
-    // ALWAYS bound the context by both the memory-derived ceiling AND the
-    // user's localMaxContextTokens config cap — regardless of whether the
-    // server reports its own n_ctx. A server reporting 262k native context
-    // (e.g. higgs serving a 256k model) must NOT bypass the 32k practical
-    // cap on a 32GB machine, or compaction never fires and the model
-    // thrashes on memory pressure.
-    let max_context_tokens = if !is_apple_fm_model(&model_id) {
-        let ceiling = memory_context_ceiling(config, &model_id);
-        if ceiling < max_context_tokens {
-            tracing::info!(
-                configured = max_context_tokens,
-                memory_ceiling = ceiling,
-                model = %model_id,
-                "Clamping context to memory-safe ceiling"
-            );
-        }
-        max_context_tokens.min(ceiling)
-    } else {
-        max_context_tokens
-    };
-    // Always respect the user's explicit localMaxContextTokens cap.
+    // The serving endpoint's advertised limit and the user's explicit cap are
+    // the only context authorities. Model-name/RAM heuristics proved too
+    // brittle across quantizations and unified-memory pressure profiles.
     let max_context_tokens =
         max_context_tokens.min(config.agents.defaults.local_max_context_tokens);
 
-    // Compaction provider (separate port only).
-    //
-    // IMPORTANT: build the URL directly from the port. We must NOT use
-    // `local_base_url(config, p)` here — that helper honours
-    // `local_api_base`, which after Higgs auto-start points at the MAIN
-    // higgs port, silently routing compaction traffic to the wrong server
-    // (the bug this fixed). The compaction port always targets a localhost
-    // sidecar, so we construct the URL explicitly.
-    // Wire model is ALWAYS "active": the sidecar serves exactly one model, and
-    // the Higgs transport indirection (resolve_request_and_policy_model) sends
-    // "active" on the wire whenever the provider's default model is "active" —
-    // so no config name (higgsCompactionModel / memory.model / dir basename)
-    // ever has to match the sidecar's runtime model name. `None` would be
-    // worse than wrong: OpenAICompatProvider falls back to a cloud placeholder
-    // default, disabling the indirection.
-    let compaction: Option<Arc<dyn LLMProvider>> =
-        compaction_port.map(|p| -> Arc<dyn LLMProvider> {
-            let base = format!("http://127.0.0.1:{p}/v1");
-            // higgs-nightly serves the sidecar under the spawn dir's basename
-            // and 404s on the legacy "active" alias, so address it by the real
-            // served id (e.g. "Bonsai-1.7B-mlx-1bit"). Falls back to "active"
-            // only when no compaction model dir is configured (legacy path).
-            let served = crate::higgs::compaction_sidecar_served_model(config);
-            factory::create_openai_compat(
-                factory::ProviderSpec::local_with_key(&base, served.as_deref().or(Some("active")), api_key)
-                    .with_jit_gate_opt(jit_gate.clone())
-                    .with_timeout_config(&config.timeouts)
-                    .with_retry(config.retry.clone()),
-            )
-        });
+    // The managed compactor is one typed unit: lifecycle owner, endpoint, and
+    // the literal model id Higgs serves. Building them together prevents the
+    // provider from drifting to the main endpoint or a stale model alias.
+    let (compaction, compaction_manager) = make_managed_compaction_provider(config);
 
     // Helper: create a provider for a trio role with endpoint resolution.
     let make_role_provider = |role_name: &str,
@@ -445,30 +375,23 @@ pub(super) fn make_local_providers(
         main,
         semantic_model_id,
         compaction,
+        compaction_manager,
         delegation,
         specialist,
         max_context_tokens,
     }
 }
 
-/// When the memory provider targets the localhost compaction sidecar, override
-/// `memory.model` with the id higgs-nightly actually serves (the spawn dir's
-/// basename). higgs-nightly 404s on the legacy "active" alias AND on stale short
-/// names from config (e.g. `bonsai-1.7b-mlx` vs served `Bonsai-1.7B-mlx-1bit`).
-/// Non-sidecar memory providers (cloud, remote) are left unchanged.
+/// Bind memory/LCM work to the same managed sidecar identity and context size.
+/// Canonical `lcm.*` configuration owns this route. The legacy explicit memory
+/// provider must not bypass the managed lease endpoint or its served model id.
 fn normalize_memory_model_for_sidecar(
     mut memory: crate::config::schema::MemoryConfig,
-    config: &Config,
+    manager: Option<&Arc<crate::higgs::CompactionSidecarManager>>,
 ) -> crate::config::schema::MemoryConfig {
-    let targets_sidecar = memory
-        .provider
-        .as_ref()
-        .and_then(|p| p.api_base.as_deref())
-        .is_some_and(|b| b.contains("127.0.0.1") || b.contains("localhost"));
-    if targets_sidecar {
-        if let Some(served) = crate::higgs::compaction_sidecar_served_model(config) {
-            memory.model = served;
-        }
+    if let Some(manager) = manager {
+        memory.model = manager.model_hint().to_string();
+        memory.provider = None;
     }
     memory
 }
@@ -484,6 +407,7 @@ fn core_config_from(
     max_context_tokens: usize,
     is_local: bool,
     compaction: Option<Arc<dyn LLMProvider>>,
+    compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
     delegation: Option<Arc<dyn LLMProvider>>,
     specialist: Option<Arc<dyn LLMProvider>>,
 ) -> SwappableCoreConfig {
@@ -519,11 +443,14 @@ fn core_config_from(
         search_max_results: config.tools.web.search.max_results,
         exec_timeout: config.tools.exec_.timeout,
         restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
-        memory_config: normalize_memory_model_for_sidecar(config.memory.clone(), config),
+        memory_config: normalize_memory_model_for_sidecar(
+            config.memory.clone(),
+            compaction_manager.as_ref(),
+        ),
         is_local,
-        local_tool_mode: config.tools.local_tool_mode.clone(),
         lane,
         compaction_provider: compaction,
+        compaction_manager,
         tool_delegation: config.tool_delegation.clone(),
         provenance: config.provenance.clone(),
         max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
@@ -545,17 +472,15 @@ pub(crate) fn build_core_handle(
     config: &Config,
     local_port: &str,
     local_model_name: Option<&str>,
-    compaction_port: Option<&str>,
     delegation_port: Option<&str>,
     specialist_port: Option<&str>,
     is_local: bool,
 ) -> SharedCoreHandle {
-    let (provider, model, max_context_tokens, cp, dp, sp) = if is_local {
+    let (provider, model, max_context_tokens, cp, cm, dp, sp) = if is_local {
         let lp = make_local_providers(
             config,
             local_port,
             local_model_name,
-            compaction_port,
             delegation_port,
             specialist_port,
         );
@@ -568,6 +493,7 @@ pub(crate) fn build_core_handle(
             model,
             ctx,
             lp.compaction,
+            lp.compaction_manager,
             lp.delegation,
             lp.specialist,
         )
@@ -575,7 +501,16 @@ pub(crate) fn build_core_handle(
         let provider = create_provider(config);
         let model = config.agents.defaults.model.clone();
         let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
-        (provider, model, ctx, None, None, None)
+        let (compaction, compaction_manager) = make_managed_compaction_provider(config);
+        (
+            provider,
+            model,
+            ctx,
+            compaction,
+            compaction_manager,
+            None,
+            None,
+        )
     };
 
     let core = build_swappable_core(core_config_from(
@@ -585,6 +520,7 @@ pub(crate) fn build_core_handle(
         max_context_tokens,
         is_local,
         cp,
+        cm,
         dp,
         sp,
     ));
@@ -609,17 +545,15 @@ pub(crate) fn rebuild_core(
     config: &Config,
     local_port: &str,
     local_model_name: Option<&str>,
-    compaction_port: Option<&str>,
     delegation_port: Option<&str>,
     specialist_port: Option<&str>,
     is_local: bool,
 ) {
-    let (provider, model, max_context_tokens, cp, dp, sp) = if is_local {
+    let (provider, model, max_context_tokens, cp, cm, dp, sp) = if is_local {
         let lp = make_local_providers(
             config,
             local_port,
             local_model_name,
-            compaction_port,
             delegation_port,
             specialist_port,
         );
@@ -631,6 +565,7 @@ pub(crate) fn rebuild_core(
             model,
             ctx,
             lp.compaction,
+            lp.compaction_manager,
             lp.delegation,
             lp.specialist,
         )
@@ -638,7 +573,16 @@ pub(crate) fn rebuild_core(
         let provider = create_provider(config);
         let model = config.agents.defaults.model.clone();
         let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
-        (provider, model, ctx, None, None, None)
+        let (compaction, compaction_manager) = make_managed_compaction_provider(config);
+        (
+            provider,
+            model,
+            ctx,
+            compaction,
+            compaction_manager,
+            None,
+            None,
+        )
     };
 
     let new_core = build_swappable_core(core_config_from(
@@ -648,6 +592,7 @@ pub(crate) fn rebuild_core(
         max_context_tokens,
         is_local,
         cp,
+        cm,
         dp,
         sp,
     ));
@@ -681,22 +626,8 @@ pub(crate) fn create_agent_loop(
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
-    let mut lcm_config = config.lcm.clone();
-    // Inject the local API key so the LCM compactor can authenticate with oMLX.
-    lcm_config.api_key = config.agents.defaults.local_api_key.clone();
-    // migrated from swappable().is_local — phase 09-03
-    // LCM auto-enable: inline match (single site) — keep the dispatch local
-    // to the one call rather than adding a RuntimeMode::lcm_auto() method.
-    if core_handle.swappable().mode().is_local() && !lcm_config.is_enabled() {
-        tracing::info!("Auto-enabling LCM for local mode");
-        lcm_config.enabled = Some(true);
-    }
-    let compaction_sidecar = crate::higgs::CompactionSidecarSpec::from_config(config);
-    if let Some(spec) = compaction_sidecar.as_ref() {
-        spec.bind_lcm_endpoint_model(&mut lcm_config);
-    }
-
-    let agent_loop = AgentLoop::new(
+    let lcm_config = config.lcm.clone();
+    AgentLoop::new(
         core_handle,
         inbound_rx,
         outbound_tx,
@@ -709,10 +640,7 @@ pub(crate) fn create_agent_loop(
         config.proprioception.clone(),
         lcm_config,
         health_registry,
-    );
-    agent_loop.set_compaction_sidecar(compaction_sidecar);
-
-    agent_loop
+    )
 }
 
 /// Set up cluster discovery for REPL path. Returns the ClusterState so callers

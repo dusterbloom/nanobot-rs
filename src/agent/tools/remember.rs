@@ -184,6 +184,11 @@ impl Tool for RememberTool {
 
         let memory_path = self.workspace.join("memory").join("MEMORY.md");
 
+        // Share one read/modify/write transaction with reflection. Reflection
+        // may spend time deriving a new MEMORY.md from SQLite, so waiting here
+        // prevents either writer from replacing facts based on stale content.
+        let _memory_guard = crate::agent::memory::memory_transaction_lock().lock().await;
+
         // Read existing content (start fresh if file doesn't exist yet).
         let current = fs::read_to_string(&memory_path).await.unwrap_or_default();
 
@@ -547,5 +552,31 @@ mod tests {
             result
         );
         assert!(dir.path().join("memory").join("MEMORY.md").exists());
+    }
+
+    #[tokio::test]
+    async fn test_execute_waits_for_memory_transaction_lock() {
+        use std::time::Duration;
+
+        let guard = crate::agent::memory::memory_transaction_lock().lock().await;
+        let dir = TempDir::new().unwrap();
+        let tool = RememberTool::new(dir.path().to_path_buf());
+        let mut args = HashMap::new();
+        args.insert("fact".to_string(), json!("Serialized memory write"));
+
+        let mut task = tokio::spawn(async move { tool.execute(args).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut task)
+                .await
+                .is_err(),
+            "remember should wait while reflection owns the memory transaction"
+        );
+
+        drop(guard);
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("remember should resume after the transaction releases")
+            .expect("remember task should complete");
+        assert!(result.starts_with("Remembered:"), "got: {result}");
     }
 }
