@@ -28,9 +28,9 @@ use crate::bus::events::InboundMessage;
 /// worked example small models copy) stays in one place.
 const LCM_EXPAND_GUIDE: &str =
     "Your conversation history is managed by LCM. When earlier turns are \
-     compressed, you will see a block marked [Summary of messages X-Y (IDs: …)]. \
-     To read the exact originals, call lcm_expand with those IDs — for example \
-     lcm_expand({\"message_ids\": [5, 6, 7, 8]}). Expansion is lossless and safe: \
+     compressed, you will see a block marked [Summary of messages X-Y. …]. \
+     To read the exact originals, copy that range into lcm_expand — for example \
+     lcm_expand({\"message_ids\": \"120-158\"}). Expansion is lossless and safe: \
      the full originals are always retrievable, so nothing is ever permanently \
      lost by summarizing. The system may also auto-expand relevant summaries for you.";
 

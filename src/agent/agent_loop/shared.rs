@@ -284,6 +284,11 @@ impl TurnContext {
                 .and_then(|value| value.as_str());
             if self.messages[index].get("_db_id").is_some()
                 || crate::agent::markers::is_synthetic(&self.messages[index])
+                // LCM summary blocks are engine-owned VIEWS of already-persisted
+                // rows (they carry no _db_id by design). Persisting one creates
+                // a fresh raw user row every turn, which later compactions
+                // re-summarize — recursive summary-of-summary pollution.
+                || self.messages[index].get("_lcm_summary").is_some()
                 || matches!(role, Some("system" | "developer" | "summary"))
             {
                 continue;

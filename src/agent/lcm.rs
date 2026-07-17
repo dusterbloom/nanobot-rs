@@ -54,6 +54,49 @@ pub struct SummaryNode {
     pub level: u8,
 }
 
+/// Compress sorted message IDs into a compact range string: `5-8,12,14-20`.
+///
+/// Summary headers used to embed every ID (144 five-digit rowids ≈ 1KB of
+/// noise per summary). Ranges keep the header tiny and are directly accepted
+/// by `lcm_expand` (`parse_id_runs` understands `a-b`).
+pub fn format_id_ranges(ids: &[MessageId]) -> String {
+    let mut sorted: Vec<MessageId> = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i];
+        let mut end = start;
+        while i + 1 < sorted.len() && sorted[i + 1] == end + 1 {
+            i += 1;
+            end = sorted[i];
+        }
+        parts.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        });
+        i += 1;
+    }
+    parts.join(",")
+}
+
+/// Build the wire message that represents a summary node in the active
+/// context. Single source of truth for the header format (live compaction and
+/// restart rebuild must render byte-identically for the prompt prefix cache).
+fn summary_wire_message(source_ids: &[MessageId], text: &str) -> Value {
+    let ranges = format_id_ranges(source_ids);
+    json!({
+        "role": "user",
+        "_lcm_summary": true,
+        "content": format!(
+            "[Summary of messages {ranges}. To read the exact originals call \
+             lcm_expand({{\"message_ids\": \"{ranges}\"}}).]\n\n{text}"
+        )
+    })
+}
+
 /// The summary DAG: tracks all summary nodes and the active context composition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryDag {
@@ -270,6 +313,12 @@ impl LcmEngine {
     ///   `get_history` supplies their rowid.
     /// - `_db_id` already in the store → skipped (returns the existing id).
     pub fn ingest(&mut self, message: Value) -> Option<MessageId> {
+        // Summary wire blocks are views of rows already in the store, never
+        // originals. (Rows persisted by a pre-fix bug carry `_lcm_summary` in
+        // metadata; refusing them here keeps old DBs from re-polluting.)
+        if message.get("_lcm_summary").is_some() {
+            return None;
+        }
         let msg_id = message.get("_db_id").and_then(|v| v.as_u64())? as usize;
         if self.store.contains_key(&msg_id) {
             return Some(msg_id);
@@ -391,8 +440,21 @@ impl LcmEngine {
                     block_messages.push(message.clone());
                     raw_count += 1;
                 }
-                ContextEntry::Summary { node_id, message } => {
-                    block_messages.push(message.clone());
+                ContextEntry::Summary { node_id, .. } => {
+                    // Fold the node's TEXT into the summarization input — not
+                    // the wire message, whose "[Summary … IDs: …]" header is ID
+                    // noise. Feeding the header made deterministic truncation
+                    // keep the ID list as the "first sentence", producing
+                    // summaries that were literally ID spam with content lost.
+                    let text = self
+                        .dag
+                        .get(*node_id)
+                        .map(|n| n.text.clone())
+                        .unwrap_or_default();
+                    block_messages.push(json!({
+                        "role": "user",
+                        "content": format!("[Earlier summary]\n{text}")
+                    }));
                     for sid in self.dag.all_source_ids(*node_id) {
                         if !source_ids.contains(&sid) {
                             source_ids.push(sid);
@@ -515,24 +577,8 @@ impl LcmEngine {
         );
         let node_id = node.id;
 
-        // Build the summary message with lossless pointers.
-        // Include source message IDs so the model knows it can lcm_expand them.
-        let id_list: String = source_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let summary_message = json!({
-            "role": "user",
-            "_lcm_summary": true,
-            "content": format!(
-                "[Summary of messages {}-{} (IDs: {}). Use lcm_expand to retrieve originals.]\n\n{}",
-                source_ids.first().unwrap_or(&0),
-                source_ids.last().unwrap_or(&0),
-                id_list,
-                summary_text
-            )
-        });
+        // Build the summary message with lossless pointers (compact ranges).
+        let summary_message = summary_wire_message(&source_ids, &summary_text);
 
         // Replace the block in active context with the summary.
         let mut new_active = Vec::with_capacity(self.active.len());
@@ -889,7 +935,9 @@ impl LcmEngine {
         // always supplies the rowid, so this is defensive only).
         for msg in raw_after_clear {
             let role = msg.get("role").and_then(|r| r.as_str());
-            if matches!(role, Some("summary" | "clear")) || crate::agent::markers::is_synthetic(msg)
+            if matches!(role, Some("summary" | "clear"))
+                || crate::agent::markers::is_synthetic(msg)
+                || msg.get("_lcm_summary").is_some()
             {
                 continue;
             }
@@ -978,23 +1026,7 @@ impl LcmEngine {
 
         // Build active context: summaries first, then unsummarized raw messages.
         for node in &engine.dag.nodes {
-            let id_list: String = node
-                .source_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let summary_message = json!({
-                "role": "user",
-                "_lcm_summary": true,
-                "content": format!(
-                    "[Summary of messages {}-{} (IDs: {}). Use lcm_expand to retrieve originals.]\n\n{}",
-                    node.source_ids.first().unwrap_or(&0),
-                    node.source_ids.last().unwrap_or(&0),
-                    id_list,
-                    node.text
-                )
-            });
+            let summary_message = summary_wire_message(&node.source_ids, &node.text);
             engine.active.push(ContextEntry::Summary {
                 node_id: node.id,
                 message: summary_message,
@@ -1296,8 +1328,8 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
 
     fn description(&self) -> &str {
         "Retrieve the exact original messages behind a compressed \
-         [Summary of messages X-Y (IDs: …)] block. Pass the IDs from that block \
-         as an integer array, e.g. lcm_expand({\"message_ids\": [5, 6, 7, 8]}). \
+         [Summary of messages …] block. Copy the range from that block, \
+         e.g. lcm_expand({\"message_ids\": \"120-158\"}). \
          Expansion is lossless — the originals are always available."
     }
 
@@ -1306,9 +1338,10 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
             "type": "object",
             "properties": {
                 "message_ids": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "description": "Message IDs from a [Summary … (IDs: …)] block. Example: [5, 6, 7, 8]"
+                    // No "type": accepts the range string from the summary
+                    // header, an integer array, or a single integer — small
+                    // models emit all three shapes.
+                    "description": "Message IDs to expand: the range string shown in the summary block (e.g. \"120-158\" or \"120-140,150-158\"), or an array of integers."
                 }
             },
             "required": ["message_ids"]
@@ -2313,6 +2346,97 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_format_id_ranges_compact_and_roundtrip() {
+        assert_eq!(format_id_ranges(&[5, 6, 7, 8]), "5-8");
+        assert_eq!(format_id_ranges(&[50756]), "50756");
+        assert_eq!(
+            format_id_ranges(&[50756, 50757, 50758, 50760, 50762, 50763]),
+            "50756-50758,50760,50762-50763"
+        );
+        // Unsorted + duplicate input still yields canonical ranges.
+        assert_eq!(format_id_ranges(&[8, 5, 6, 6, 7]), "5-8");
+
+        // The header range must round-trip through the lcm_expand parser —
+        // this is the contract that lets a small model copy it verbatim.
+        let ids: Vec<usize> = vec![50756, 50757, 50758, 50760, 50762, 50763];
+        assert_eq!(parse_id_runs(&format_id_ranges(&ids)), ids);
+    }
+
+    #[tokio::test]
+    async fn test_merge_recompaction_does_not_keep_id_spam() {
+        // Regression: re-compacting a block containing a prior summary used to
+        // feed the summary's WIRE message (header with every source ID) into
+        // deterministic truncation, whose "first sentence" was the ID list —
+        // the merged summary became ID spam with all content lost.
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+        let budget = TokenBudget::new(4096, 1024);
+        let body = "the quick brown fox jumps over the lazy dog while the model prefills tokens ";
+
+        ingest(&mut engine, 1, "system", "System");
+        for i in 0..12 {
+            ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
+            ingest(&mut engine, 3 + 2 * i, "assistant", &format!("re {i}: {body}"));
+        }
+        // Round 1: no compactor → level 3 deterministic.
+        let r1 = engine
+            .compact(None, &budget, 0, CompactionFailureMode::Deterministic)
+            .await;
+        assert!(r1.is_some());
+
+        // Round 2: merge the prior summary with new raws, again level 3.
+        for i in 0..12 {
+            ingest(&mut engine, 100 + 2 * i, "user", &format!("more {i}: {body}"));
+            ingest(
+                &mut engine,
+                101 + 2 * i,
+                "assistant",
+                &format!("more re {i}: {body}"),
+            );
+        }
+        let r2 = engine
+            .compact(None, &budget, 0, CompactionFailureMode::Deterministic)
+            .await;
+        assert!(r2.is_some());
+
+        let node = engine.dag().newest().unwrap();
+        assert!(
+            !node.text.contains("Summary of messages"),
+            "merged summary text must not contain a prior wire header: {}",
+            node.text
+        );
+        assert!(
+            !node.text.contains("lcm_expand"),
+            "merged summary text must not contain expand instructions: {}",
+            node.text
+        );
+
+        // The wire message header carries compact ranges that round-trip.
+        let wire = engine
+            .active_entries()
+            .iter()
+            .find_map(|e| match e {
+                ContextEntry::Summary { message, .. } => message
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string()),
+                _ => None,
+            })
+            .unwrap();
+        let ranges = format_id_ranges(&node.source_ids);
+        assert!(
+            wire.contains(&format!("{{\"message_ids\": \"{ranges}\"}}")),
+            "wire header must show a copyable lcm_expand call: {wire}"
+        );
+        let mut expected = node.source_ids.clone();
+        expected.sort_unstable();
+        assert_eq!(parse_id_runs(&ranges), expected);
     }
 
     #[tokio::test]

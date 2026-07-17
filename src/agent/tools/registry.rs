@@ -677,6 +677,10 @@ impl ToolRegistry {
         "web_fetch",
         "message",
         "recall_tool_result",
+        // The system prompt instructs the model to expand LCM summaries; the
+        // schema must be advertised or local models fall back to guessing
+        // (observed: recall_tool_result with invented ids).
+        "lcm_expand",
     ];
 
     /// Internal Lean-catalog builder: condense every available schema before
@@ -701,7 +705,9 @@ impl ToolRegistry {
         // slimming. read_file's `lines` paging syntax is the prime case: strip
         // it and the local model can't page large files and re-prefills the
         // whole file each turn.
-        const KEEP_PARAM_DESCRIPTIONS: &[&str] = &["read_file"];
+        // lcm_expand's param teaches the copyable range-string form ("120-158")
+        // — strip it and small models invent shapes.
+        const KEEP_PARAM_DESCRIPTIONS: &[&str] = &["read_file", "lcm_expand"];
         let mut defs = self.get_local_definitions();
         for def in &mut defs {
             let name = def

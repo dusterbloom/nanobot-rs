@@ -51,6 +51,29 @@ pub fn extract_web_content(raw: &str) -> String {
     raw.to_string()
 }
 
+/// Replace fenced code blocks with a short placeholder.
+///
+/// web_fetch is for reading pages, not scraping source: code blocks dominate
+/// token budgets on technical pages while contributing little to prose
+/// comprehension. An unclosed fence is left untouched.
+fn strip_code_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("```") {
+        let after_open = &rest[open + 3..];
+        let Some(close) = after_open.find("```") else {
+            break; // unclosed fence — leave as-is
+        };
+        let block = &after_open[..close];
+        let lines = block.lines().count().saturating_sub(1).max(1);
+        out.push_str(&rest[..open]);
+        out.push_str(&format!("[code block omitted: {lines} lines]"));
+        rest = &after_open[close + 3..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Validate a URL: must be http(s) with a valid, non-private domain.
 ///
 /// Blocks local/private addresses to prevent SSRF attacks where the LLM
@@ -525,7 +548,8 @@ fn crw_envelope(resp: &serde_json::Value, url: &str, max_chars: usize) -> Option
         .and_then(|s| s.as_u64())
         .unwrap_or(200);
 
-    let (text, truncated) = truncate_at_boundary(markdown.to_string(), max_chars);
+    let (text, truncated) =
+        truncate_at_boundary(flatten_markdown_noise(&strip_code_blocks(markdown)), max_chars);
     Some(
         serde_json::json!({
             "url": url,
@@ -625,8 +649,9 @@ impl Tool for WebFetchTool {
                 },
                 "extractMode": {
                     "type": "string",
-                    "enum": ["markdown", "text"],
-                    "default": "markdown"
+                    "enum": ["readable", "markdown", "text"],
+                    "default": "readable",
+                    "description": "readable = prose only (links/images flattened); markdown = keep link targets"
                 },
                 "maxChars": {
                     "type": "integer",
@@ -646,7 +671,7 @@ impl Tool for WebFetchTool {
         let extract_mode = params
             .get("extractMode")
             .and_then(|v| v.as_str())
-            .unwrap_or("markdown");
+            .unwrap_or("readable");
 
         let max_chars = params
             .get("maxChars")
@@ -787,9 +812,34 @@ impl Tool for WebFetchTool {
 /// and boilerplate.  Falls back to the old `scraper`-based extraction on
 /// parse errors or when `dom_smoothie` returns empty content.
 fn extract_html_content(html: &str, mode: &str) -> String {
+    let text = strip_code_blocks(&extract_html_content_inner(html, mode));
+    if mode == "readable" {
+        flatten_markdown_noise(&text)
+    } else {
+        text
+    }
+}
+
+/// Flatten markdown markup that costs tokens without aiding comprehension:
+/// images are dropped, links keep only their text. Pages like news front
+/// pages are mostly link targets by byte count.
+fn flatten_markdown_noise(text: &str) -> String {
+    static RE_IMAGE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
+    static RE_LINK: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap());
+    static RE_MD_ESCAPE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\\([\\`*_{}\[\]()#+.!|-])").unwrap());
+    let text = RE_IMAGE.replace_all(text, "");
+    let text = RE_LINK.replace_all(&text, "$1");
+    let text = RE_MD_ESCAPE.replace_all(&text, "$1");
+    normalize_whitespace(&text)
+}
+
+fn extract_html_content_inner(html: &str, mode: &str) -> String {
     use dom_smoothie::{Config, Readability, TextMode};
 
-    let text_mode = if mode == "markdown" {
+    let text_mode = if mode == "markdown" || mode == "readable" {
         TextMode::Markdown
     } else {
         TextMode::Formatted
@@ -839,7 +889,7 @@ fn fallback_extract(html: &str, mode: &str) -> String {
     for sel_str in &selectors {
         if let Ok(sel) = Selector::parse(sel_str) {
             if let Some(el) = document.select(&sel).next() {
-                body_text = if mode == "markdown" {
+                body_text = if mode == "markdown" || mode == "readable" {
                     rewrite_html(&el.html(), false)
                 } else {
                     el.text().collect::<Vec<_>>().join(" ")
@@ -867,6 +917,41 @@ fn fallback_extract(html: &str, mode: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+#[test]
+#[ignore = "scratch: needs /tmp/kimi.html + /tmp/hn.html downloaded"]
+fn live_readable_savings_check() {
+    for (name, path) in [("KIMI", "/tmp/kimi.html"), ("HN", "/tmp/hn.html")] {
+        let html = std::fs::read_to_string(path).unwrap();
+        let before = extract_html_content_inner(&html, "markdown").len();
+        let readable = extract_html_content(&html, "readable");
+        assert!(!readable.contains("```"));
+        eprintln!(
+            "{} chars markdown={} readable={} saved={}%",
+            name,
+            before,
+            readable.len(),
+            100 - readable.len() * 100 / before.max(1)
+        );
+        eprintln!(
+            "{} sample: {}",
+            name,
+            &readable[..readable.len().min(300)].replace('\n', " | ")
+        );
+    }
+}
+
+    #[test]
+    fn test_strip_code_blocks() {
+        let input = "Intro prose.\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nMore prose.\n\n```\nplain block\n```\nTail.";
+        let out = strip_code_blocks(input);
+        assert!(!out.contains("println"), "code must be stripped: {out}");
+        assert!(out.contains("Intro prose.") && out.contains("More prose.") && out.contains("Tail."));
+        assert!(out.contains("[code block omitted: 3 lines]"), "{out}");
+        // Unclosed fence is left untouched (better than eating the page tail).
+        let unclosed = "Prose ```rust\nfn f() {}";
+        assert_eq!(strip_code_blocks(unclosed), unclosed);
+    }
 
     // -----------------------------------------------------------------------
     // crw scrape envelope

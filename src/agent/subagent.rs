@@ -1335,9 +1335,16 @@ impl SubagentManager {
             cb.build_system_prompt(None, None)
         };
 
-        // Append subagent behavioral constraints.
+        // Lead with the subagent marker so the prompt diverges from the main
+        // agent's at byte 0. Local resident servers (higgs) match sessions by
+        // prompt prefix: a subagent sharing the main prompt's head gets
+        // CONTINUED into the main session's KV/drafter cache, and the branch
+        // corrupts speculative-decode state (observed: persistent "DFlash
+        // context transaction diverged" 500s). Byte-0 divergence forces a
+        // separate server-side session.
         format!(
-            "{base_prompt}\n\n\
+            "## Subagent worker\n\n\
+             {base_prompt}\n\n\
              ## Subagent Instructions\n\
              - You are a subagent. Focus only on the assigned task.\n\
              - Use tools to accomplish the task (read files, write files, execute commands, search web).\n\
