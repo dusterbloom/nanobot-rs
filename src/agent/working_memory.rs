@@ -131,18 +131,6 @@ impl WorkingMemoryStore {
         Ok(kept.join("\n"))
     }
 
-    /// Replace the complete derived snapshot after compaction.
-    pub async fn update_from_compaction(
-        &self,
-        session_id: &str,
-        summary: &str,
-        turn: u64,
-    ) -> rusqlite::Result<bool> {
-        self.sessions
-            .save_working_memory(session_id, summary.trim(), "active", turn)
-            .await
-    }
-
     pub async fn complete(&self, session_id: &str) -> rusqlite::Result<bool> {
         if self.get_or_create(session_id).await?.is_none() {
             return Ok(false);
@@ -210,54 +198,24 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    async fn make_store() -> (TempDir, WorkingMemoryStore, String) {
+    async fn make_store() -> (TempDir, Arc<SessionDb>, WorkingMemoryStore, String) {
         let temp = TempDir::new().unwrap();
         let db = Arc::new(SessionDb::new(&temp.path().join("sessions.db")));
         let session = db.create_session("cli:test").await;
-        (temp, WorkingMemoryStore::new(db), session.id)
-    }
-
-    #[tokio::test]
-    async fn save_and_load_roundtrip() {
-        let (_temp, store, session_id) = make_store().await;
-        assert!(store
-            .update_from_compaction(&session_id, "## Goal\nShip it", 9)
-            .await
-            .unwrap());
-
-        let loaded = store.get_or_create(&session_id).await.unwrap().unwrap();
-        assert_eq!(loaded.content, "## Goal\nShip it");
-        assert_eq!(loaded.last_updated_turn, 9);
-        assert_eq!(loaded.status, SessionStatus::Active);
-    }
-
-    #[tokio::test]
-    async fn compactions_replace_instead_of_append() {
-        let (_temp, store, session_id) = make_store().await;
-        store
-            .update_from_compaction(&session_id, "old snapshot", 1)
-            .await
-            .unwrap();
-        store
-            .update_from_compaction(&session_id, "new snapshot", 2)
-            .await
-            .unwrap();
-        let loaded = store.get_or_create(&session_id).await.unwrap().unwrap();
-        assert_eq!(loaded.content, "new snapshot");
-        assert_eq!(loaded.last_updated_turn, 2);
+        (temp, db.clone(), WorkingMemoryStore::new(db), session.id)
     }
 
     #[tokio::test]
     async fn context_respects_budget_and_line_boundaries() {
-        let (_temp, store, session_id) = make_store().await;
-        store
-            .update_from_compaction(
-                &session_id,
-                "first short line\nsecond longer line\nthird line",
-                1,
-            )
-            .await
-            .unwrap();
+        let (_temp, db, store, session_id) = make_store().await;
+        db.save_working_memory(
+            &session_id,
+            "first short line\nsecond longer line\nthird line",
+            "active",
+            1,
+        )
+        .await
+        .unwrap();
         let context = store.get_context(&session_id, 5).await.unwrap();
         assert!(!context.is_empty());
         assert!(context.len() < "first short line\nsecond longer line\nthird line".len());
@@ -266,9 +224,8 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_is_persisted_in_sqlite() {
-        let (temp, store, session_id) = make_store().await;
-        store
-            .update_from_compaction(&session_id, "facts", 3)
+        let (temp, db, store, session_id) = make_store().await;
+        db.save_working_memory(&session_id, "facts", "active", 3)
             .await
             .unwrap();
         assert!(store.complete(&session_id).await.unwrap());
@@ -285,9 +242,8 @@ mod tests {
 
     #[tokio::test]
     async fn reflected_batch_rolls_back_if_any_session_is_missing() {
-        let (_temp, store, session_id) = make_store().await;
-        store
-            .update_from_compaction(&session_id, "facts", 1)
+        let (_temp, db, store, session_id) = make_store().await;
+        db.save_working_memory(&session_id, "facts", "active", 1)
             .await
             .unwrap();
         store.complete(&session_id).await.unwrap();
@@ -304,9 +260,8 @@ mod tests {
 
     #[tokio::test]
     async fn clear_resets_snapshot_but_keeps_session() {
-        let (_temp, store, session_id) = make_store().await;
-        store
-            .update_from_compaction(&session_id, "temporary state", 4)
+        let (_temp, db, store, session_id) = make_store().await;
+        db.save_working_memory(&session_id, "temporary state", "active", 4)
             .await
             .unwrap();
         store.complete(&session_id).await.unwrap();
@@ -320,14 +275,14 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_session_never_creates_orphan_memory() {
-        let (_temp, store, _session_id) = make_store().await;
+        let (_temp, db, store, _session_id) = make_store().await;
         assert!(store
             .get_or_create("missing-session")
             .await
             .unwrap()
             .is_none());
-        assert!(!store
-            .update_from_compaction("missing-session", "leak", 1)
+        assert!(!db
+            .save_working_memory("missing-session", "leak", "active", 1)
             .await
             .unwrap());
     }

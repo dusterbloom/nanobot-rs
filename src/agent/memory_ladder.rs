@@ -1,12 +1,16 @@
 //! Memory Ladder: priority-ordered memory layer facade.
 //!
-//! Provides a unified query interface over 5 named memory layers with
+//! Provides a unified query interface over 4 named memory layers with
 //! budget-aware priority waterfall allocation. Layers fill highest-priority
 //! first; when the token budget is exhausted, lower-priority layers are skipped.
+//!
+//! Long-term memory (`MEMORY.md`) is NOT a ladder layer: it is injected
+//! exactly once, by `ContextBuilder::collect_static_sections`'s
+//! `PromptSection::MemoryBriefing` static section (both cloud and local
+//! paths). A `GroundTruth` layer used to duplicate that same file into the
+//! cloud path's runtime sections (`prepare_context::collect_cloud_runtime_sections`)
+//! -- removed so `MEMORY.md` content reaches the wire exactly once.
 
-use std::path::{Path, PathBuf};
-
-use crate::agent::memory::MemoryStore;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
 use crate::session::db::SessionDb;
@@ -14,22 +18,20 @@ use crate::session::db::SessionDb;
 /// Named memory layers in priority order (lower discriminant = higher priority).
 ///
 /// The Ord derivation on `#[repr(u8)]` gives us correct comparison:
-/// `GroundTruth < WorkingSession < DurablePersonal < SearchIndex < Scratch`.
+/// `WorkingSession < DurablePersonal < SearchIndex < Scratch`.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemoryLayer {
-    /// Long-term memory (MEMORY.md) -- always available.
-    GroundTruth = 0,
     /// Per-session working memory -- always available.
-    WorkingSession = 1,
+    WorkingSession = 0,
     /// Knowledge graph entities -- requires `knowledge-graph` feature.
     #[cfg_attr(not(feature = "knowledge-graph"), allow(dead_code))]
-    DurablePersonal = 2,
+    DurablePersonal = 1,
     /// FTS5 semantic search -- requires `semantic` feature.
     #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
-    SearchIndex = 3,
+    SearchIndex = 2,
     /// Session history search -- always available.
-    Scratch = 4,
+    Scratch = 3,
 }
 
 /// Query parameters for the memory ladder.
@@ -51,19 +53,13 @@ pub struct LayerResult {
 /// Borrows from `SwappableCore` and `AgentLoopShared` -- lifetime `'a`
 /// covers the turn in which the query executes.
 pub struct MemoryLadder<'a> {
-    workspace: PathBuf,
     working_memory: &'a WorkingMemoryStore,
     session_db: &'a SessionDb,
 }
 
 impl<'a> MemoryLadder<'a> {
-    pub fn new(
-        workspace: &Path,
-        working_memory: &'a WorkingMemoryStore,
-        session_db: &'a SessionDb,
-    ) -> Self {
+    pub fn new(working_memory: &'a WorkingMemoryStore, session_db: &'a SessionDb) -> Self {
         Self {
-            workspace: workspace.to_path_buf(),
             working_memory,
             session_db,
         }
@@ -73,7 +69,7 @@ impl<'a> MemoryLadder<'a> {
     ///
     /// DurablePersonal requires `knowledge-graph`, SearchIndex requires `semantic`.
     pub fn available_layers(&self) -> Vec<MemoryLayer> {
-        let mut layers = vec![MemoryLayer::GroundTruth, MemoryLayer::WorkingSession];
+        let mut layers = vec![MemoryLayer::WorkingSession];
 
         #[cfg(feature = "knowledge-graph")]
         layers.push(MemoryLayer::DurablePersonal);
@@ -131,10 +127,6 @@ impl<'a> MemoryLadder<'a> {
         budget: usize,
     ) -> String {
         match layer {
-            MemoryLayer::GroundTruth => {
-                let raw = MemoryStore::new(&self.workspace).read_long_term();
-                truncate_to_token_budget(&raw, budget)
-            }
             MemoryLayer::WorkingSession => self
                 .working_memory
                 .get_context(session_id, budget)
@@ -299,7 +291,6 @@ mod tests {
 
     #[test]
     fn test_layer_priority_ordering() {
-        assert!(MemoryLayer::GroundTruth < MemoryLayer::WorkingSession);
         assert!(MemoryLayer::WorkingSession < MemoryLayer::DurablePersonal);
         assert!(MemoryLayer::DurablePersonal < MemoryLayer::SearchIndex);
         assert!(MemoryLayer::SearchIndex < MemoryLayer::Scratch);
@@ -307,16 +298,15 @@ mod tests {
 
     #[test]
     fn test_all_layers_count() {
-        // Explicitly construct all 5 variants to verify the enum has exactly 5.
+        // Explicitly construct all 4 variants to verify the enum has exactly 4.
         let all = [
-            MemoryLayer::GroundTruth,
             MemoryLayer::WorkingSession,
             MemoryLayer::DurablePersonal,
             MemoryLayer::SearchIndex,
             MemoryLayer::Scratch,
         ];
-        assert_eq!(all.len(), 5);
-        // Verify discriminants are sequential 0..=4.
+        assert_eq!(all.len(), 4);
+        // Verify discriminants are sequential 0..=3.
         for (i, layer) in all.iter().enumerate() {
             assert_eq!(*layer as u8, i as u8);
         }
@@ -328,10 +318,10 @@ mod tests {
         let session_db = open_db(&tmp);
         let wm = WorkingMemoryStore::new(session_db.clone());
 
-        let ladder = MemoryLadder::new(tmp.path(), &wm, session_db.as_ref());
+        let ladder = MemoryLadder::new(&wm, session_db.as_ref());
         let layers = ladder.available_layers();
 
-        let mut expected = vec![MemoryLayer::GroundTruth, MemoryLayer::WorkingSession];
+        let mut expected = vec![MemoryLayer::WorkingSession];
         #[cfg(feature = "knowledge-graph")]
         expected.push(MemoryLayer::DurablePersonal);
         #[cfg(feature = "semantic")]
@@ -343,39 +333,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_budget_waterfall_exhaustion() {
-        // Create a workspace with a large MEMORY.md that fills the budget.
+        // Fill working memory (the highest-priority layer now that MEMORY.md
+        // is injected exclusively by ContextBuilder's static MemoryBriefing
+        // section, not through the ladder) with enough content to consume
+        // the entire budget.
         let tmp = TempDir::new().unwrap();
-        let mem_dir = tmp.path().join("memory");
-        std::fs::create_dir_all(&mem_dir).unwrap();
+        let session_db = open_db(&tmp);
+        let session = session_db.create_session("test:session").await;
+        let wm = WorkingMemoryStore::new(session_db.clone());
 
-        // Write enough content to consume the entire budget.
         let large_content = (0..500)
             .map(|i| format!("Important fact number {} about the user's preferences.", i))
             .collect::<Vec<_>>()
             .join("\n");
-        std::fs::write(mem_dir.join("MEMORY.md"), &large_content).unwrap();
-
-        let session_db = open_db(&tmp);
-        let session = session_db.create_session("test:session").await;
-        let wm = WorkingMemoryStore::new(session_db.clone());
-        // Add some working memory too.
-        wm.update_from_compaction(&session.id, "Working memory content here.", 0)
+        session_db
+            .save_working_memory(&session.id, &large_content, "active", 0)
             .await
             .unwrap();
 
-        let ladder = MemoryLadder::new(tmp.path(), &wm, session_db.as_ref());
+        let ladder = MemoryLadder::new(&wm, session_db.as_ref());
         let results = ladder
             .query(&MemoryQuery {
                 session_id: &session.id,
                 query: "",
-                total_budget: 20, // Very small budget -- GroundTruth should consume most of it
+                total_budget: 20, // Very small budget -- WorkingSession should consume most of it
             })
             .await;
 
-        // GroundTruth should be present (it has content).
+        // WorkingSession should be present (it has content).
         assert!(
-            results.iter().any(|r| r.layer == MemoryLayer::GroundTruth),
-            "GroundTruth should be present"
+            results
+                .iter()
+                .any(|r| r.layer == MemoryLayer::WorkingSession),
+            "WorkingSession should be present"
         );
 
         // Total tokens used should not exceed budget.
@@ -394,24 +384,20 @@ mod tests {
     async fn test_soft_cap_enforcement() {
         // With total_budget=100, no single layer should get more than 50 tokens.
         let tmp = TempDir::new().unwrap();
-        let mem_dir = tmp.path().join("memory");
-        std::fs::create_dir_all(&mem_dir).unwrap();
+        let session_db = open_db(&tmp);
+        let session = session_db.create_session("test:session").await;
+        let wm = WorkingMemoryStore::new(session_db.clone());
 
-        // Large MEMORY.md that could fill 100+ tokens.
         let large_content = (0..200)
             .map(|i| format!("Line {} with enough words to accumulate tokens quickly.", i))
             .collect::<Vec<_>>()
             .join("\n");
-        std::fs::write(mem_dir.join("MEMORY.md"), &large_content).unwrap();
-
-        let session_db = open_db(&tmp);
-        let session = session_db.create_session("test:session").await;
-        let wm = WorkingMemoryStore::new(session_db.clone());
-        wm.update_from_compaction(&session.id, &large_content, 0)
+        session_db
+            .save_working_memory(&session.id, &large_content, "active", 0)
             .await
             .unwrap();
 
-        let ladder = MemoryLadder::new(tmp.path(), &wm, session_db.as_ref());
+        let ladder = MemoryLadder::new(&wm, session_db.as_ref());
         let results = ladder
             .query(&MemoryQuery {
                 session_id: &session.id,
@@ -434,15 +420,15 @@ mod tests {
     #[tokio::test]
     async fn test_scratch_query_uses_async_sqlite_search() {
         let tmp = TempDir::new().unwrap();
-        let mem_dir = tmp.path().join("memory");
-        std::fs::create_dir_all(&mem_dir).unwrap();
-        std::fs::write(mem_dir.join("MEMORY.md"), "A durable fact.").unwrap();
-
         let session_db = open_db(&tmp);
         let session = session_db.create_session("test:session").await;
         let wm = WorkingMemoryStore::new(session_db.clone());
+        session_db
+            .save_working_memory(&session.id, "A durable fact.", "active", 0)
+            .await
+            .unwrap();
 
-        let ladder = MemoryLadder::new(tmp.path(), &wm, session_db.as_ref());
+        let ladder = MemoryLadder::new(&wm, session_db.as_ref());
         let results = ladder
             .query(&MemoryQuery {
                 session_id: &session.id,
@@ -451,8 +437,10 @@ mod tests {
             })
             .await;
 
-        // GroundTruth still answers even when SQLite has no search hit.
-        assert!(results.iter().any(|r| r.layer == MemoryLayer::GroundTruth));
+        // WorkingSession still answers even when SQLite has no search hit.
+        assert!(results
+            .iter()
+            .any(|r| r.layer == MemoryLayer::WorkingSession));
         assert!(!results.iter().any(|r| r.layer == MemoryLayer::Scratch));
     }
 

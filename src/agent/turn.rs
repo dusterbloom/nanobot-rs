@@ -142,7 +142,6 @@ impl Turn {
     pub fn is_persistable(&self) -> bool {
         !matches!(self, Turn::System { .. })
     }
-
 }
 
 // ─────────────────────────────────────────────────────────────

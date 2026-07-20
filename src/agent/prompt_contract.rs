@@ -27,12 +27,11 @@ pub enum PromptSection {
     SessionMetadata = 6,
     ToolUse = 7,
     WorkingMemory = 8,
-    ToolPatterns = 9,
-    BackgroundTasks = 10,
-    MemoryBriefing = 11,
+    BackgroundTasks = 9,
+    MemoryBriefing = 10,
 }
 
-static ALL_SECTIONS: [PromptSection; 12] = [
+static ALL_SECTIONS: [PromptSection; 11] = [
     PromptSection::Identity,
     PromptSection::Verification,
     PromptSection::WorkspaceContext,
@@ -42,7 +41,6 @@ static ALL_SECTIONS: [PromptSection; 12] = [
     PromptSection::SessionMetadata,
     PromptSection::ToolUse,
     PromptSection::WorkingMemory,
-    PromptSection::ToolPatterns,
     PromptSection::BackgroundTasks,
     PromptSection::MemoryBriefing,
 ];
@@ -57,15 +55,16 @@ impl PromptSection {
     pub fn kind(&self) -> PromptBlockKind {
         match self {
             Self::Identity => PromptBlockKind::Prefix,
-            Self::Verification
-            | Self::WorkspaceContext
+            Self::Verification | Self::Skills => PromptBlockKind::Static,
+            // These vary per-request (depend on user message content, loaded
+            // files, workspace state) → Runtime so they don't poison the
+            // byte-stable system prefix that higgs radix-caches.
+            Self::WorkspaceContext
             | Self::OnDemandContext
-            | Self::Skills
-            | Self::RequestedSkills => PromptBlockKind::Static,
-            Self::SessionMetadata
+            | Self::RequestedSkills
+            | Self::SessionMetadata
             | Self::ToolUse
             | Self::WorkingMemory
-            | Self::ToolPatterns
             | Self::BackgroundTasks
             | Self::MemoryBriefing => PromptBlockKind::Runtime,
         }
@@ -75,7 +74,7 @@ impl PromptSection {
     pub fn shrinkable(&self) -> bool {
         matches!(
             self,
-            Self::WorkingMemory | Self::ToolPatterns | Self::MemoryBriefing | Self::Skills
+            Self::WorkingMemory | Self::MemoryBriefing | Self::Skills
         )
     }
 
@@ -94,7 +93,6 @@ impl PromptSection {
             Self::SessionMetadata => 3.0,
             Self::ToolUse => 8.0,
             Self::WorkingMemory => 15.0,
-            Self::ToolPatterns => 8.0,
             Self::BackgroundTasks => 5.0,
             Self::MemoryBriefing => 12.0,
         }
@@ -154,6 +152,8 @@ pub struct AssemblyResult {
     pub system_content: String,
     /// Developer-level content (non-Identity sections for cloud, empty for local).
     pub developer_content: String,
+    /// Fully ordered sections that contributed to the assembled output.
+    pub sections: Vec<SectionEntry>,
     /// Backward-compatible assembly report.
     pub report: PromptAssemblyReport,
 }
@@ -164,62 +164,95 @@ pub trait PromptAssembler {
     fn assemble(&self, ctx: &AssemblyContext) -> AssemblyResult;
 }
 
-/// Two-pass overflow enforcement.
+/// Single-pass, priority-ordered overflow enforcement.
 ///
-/// **Pass 1 (drop):** Walk from highest discriminant (lowest priority) to lowest,
-/// excluding sections until total fits within `cap`.
+/// Walks from highest discriminant (lowest priority) to lowest. Each
+/// over-budget section is *shrunk* in place when it is shrinkable and a
+/// partial truncation absorbs the remaining overshoot; otherwise it is
+/// dropped. Strict priority order: a low-priority shrinkable section is
+/// sacrificed before a higher-priority non-shrinkable one is even considered.
 ///
-/// **Pass 2 (shrink):** If still over budget, find the last included shrinkable
-/// section and truncate its content to fit.
-fn enforce_budget(sections: &mut Vec<SectionEntry>, cap: usize) {
-    // Measure actual tokens for each included section.
+/// (The previous two-pass variant dropped non-shrinkable sections first,
+/// which evicted the 185-token WorkspaceContext to fix a 12-token overshoot
+/// while lower-priority shrinkable sections survived untouched.)
+fn enforce_budget(sections: &mut [SectionEntry], cap: usize) {
     let mut total: usize = sections
         .iter()
         .filter(|s| s.included)
         .map(|s| s.actual_tokens)
         .sum();
 
-    if total <= cap {
-        return;
-    }
-
-    // Pass 1: Drop from tail (highest discriminant = lowest priority).
-    // Skip shrinkable sections on the first pass -- they get a chance to be
-    // truncated in Pass 2 before being dropped entirely.
     for i in (0..sections.len()).rev() {
         if total <= cap {
-            break;
+            return;
         }
-        if !sections[i].included || sections[i].shrinkable {
+        if !sections[i].included {
             continue;
         }
-        tracing::warn!(
-            "Prompt overflow: dropping section {:?} ({} tokens)",
-            sections[i].section,
-            sections[i].actual_tokens,
-        );
-        total -= sections[i].actual_tokens;
-        sections[i].included = false;
-    }
-
-    // Pass 1b: If still over budget, drop shrinkable sections from tail too,
-    // but leave at least one shrinkable section for Pass 2 to truncate.
-    if total > cap {
-        let shrinkable_count = sections
-            .iter()
-            .filter(|s| s.included && s.shrinkable)
-            .count();
-        let mut remaining_shrinkable = shrinkable_count;
-        for i in (0..sections.len()).rev() {
-            if total <= cap {
-                break;
+        let overshoot = total - cap;
+        if sections[i].shrinkable && overshoot < sections[i].actual_tokens {
+            // Shrink this section to absorb the overshoot. The chars/4 heuristic
+            // underestimates dense tokens (identifiers, code) relative to the
+            // tiktoken counter used by `estimate_str_tokens`, so re-measuring
+            // after a single truncation can still overshoot the cap. Loop,
+            // tightening the target by the observed overshoot each pass until
+            // the re-measured count actually fits (or the section is emptied).
+            let mut target_tokens = sections[i].actual_tokens - overshoot;
+            let content = sections[i].block.content().to_string();
+            let old_tokens = sections[i].actual_tokens;
+            loop {
+                let target_chars = target_tokens.saturating_mul(4);
+                if target_chars == 0 || content.len() <= target_chars {
+                    break;
+                }
+                let truncated_end =
+                    crate::utils::helpers::floor_char_boundary(&content, target_chars);
+                let truncated_content = &content[..truncated_end];
+                let new_block =
+                    PromptBlock::new(sections[i].block.report_title(), truncated_content);
+                let new_tokens = TokenBudget::estimate_str_tokens(&new_block.render());
+                // Accept when the re-measured count fits the target, allowing a
+                // 1-token slack because the char/4 heuristic and tiktoken can
+                // disagree by a single token at fine granularity. Shrinking
+                // further would only walk the target down to zero and drop
+                // useful (still-fitting) content.
+                if new_tokens <= target_tokens + 1 {
+                    tracing::warn!(
+                        "Prompt overflow: shrinking section {:?} from {} to {} tokens",
+                        sections[i].section,
+                        old_tokens,
+                        new_tokens,
+                    );
+                    sections[i].block = new_block;
+                    sections[i].actual_tokens = new_tokens;
+                    total = total - old_tokens + new_tokens;
+                    break;
+                }
+                let deficit = new_tokens - target_tokens;
+                if target_tokens <= deficit {
+                    // Cannot shrink enough to matter — drop the section.
+                    tracing::warn!(
+                        "Prompt overflow: dropping section {:?} ({} tokens)",
+                        sections[i].section,
+                        old_tokens,
+                    );
+                    sections[i].block =
+                        PromptBlock::new(sections[i].block.report_title(), "");
+                    sections[i].actual_tokens = 0;
+                    sections[i].included = false;
+                    total -= old_tokens;
+                    break;
+                }
+                target_tokens -= deficit;
             }
-            if !sections[i].included || !sections[i].shrinkable {
+        } else {
+            // Never drop the Identity section: it is the byte-stable cached
+            // prefix contract (the harness identity + model line) and must
+            // survive even when the budget is too small to hold everything.
+            // Dropping it would empty the cached prefix and force a full
+            // re-prefill every turn — the worst possible cache outcome.
+            if sections[i].section == PromptSection::Identity {
                 continue;
-            }
-            // Keep the last shrinkable section for Pass 2.
-            if remaining_shrinkable <= 1 {
-                break;
             }
             tracing::warn!(
                 "Prompt overflow: dropping section {:?} ({} tokens)",
@@ -228,41 +261,7 @@ fn enforce_budget(sections: &mut Vec<SectionEntry>, cap: usize) {
             );
             total -= sections[i].actual_tokens;
             sections[i].included = false;
-            remaining_shrinkable -= 1;
         }
-    }
-
-    if total <= cap {
-        return;
-    }
-
-    // Pass 2: Shrink the last included shrinkable section.
-    if let Some(idx) = sections
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, s)| s.included && s.shrinkable)
-        .map(|(i, _)| i)
-        .next()
-    {
-        let overshoot = total.saturating_sub(cap);
-        let target_tokens = sections[idx].actual_tokens.saturating_sub(overshoot);
-        // Estimate chars from target tokens (inverse: ~4 chars per token).
-        let target_chars = target_tokens.saturating_mul(4);
-        let content = sections[idx].block.content();
-        let truncated_end = crate::utils::helpers::floor_char_boundary(content, target_chars);
-        let truncated_content = &content[..truncated_end];
-        let old_tokens = sections[idx].actual_tokens;
-        let new_block = PromptBlock::new(sections[idx].block.report_title(), truncated_content);
-        let new_tokens = TokenBudget::estimate_str_tokens(&new_block.render());
-        tracing::warn!(
-            "Prompt overflow: shrinking section {:?} from {} to {} tokens",
-            sections[idx].section,
-            old_tokens,
-            new_tokens,
-        );
-        sections[idx].block = new_block;
-        sections[idx].actual_tokens = new_tokens;
     }
 }
 
@@ -364,6 +363,7 @@ impl PromptAssembler for CloudAssembler {
         AssemblyResult {
             system_content,
             developer_content,
+            sections,
             report,
         }
     }
@@ -395,6 +395,7 @@ impl PromptAssembler for LocalAssembler {
         AssemblyResult {
             system_content,
             developer_content: String::new(),
+            sections,
             report,
         }
     }
@@ -416,15 +417,14 @@ mod tests {
         assert!(PromptSection::RequestedSkills < PromptSection::SessionMetadata);
         assert!(PromptSection::SessionMetadata < PromptSection::ToolUse);
         assert!(PromptSection::ToolUse < PromptSection::WorkingMemory);
-        assert!(PromptSection::WorkingMemory < PromptSection::ToolPatterns);
-        assert!(PromptSection::ToolPatterns < PromptSection::BackgroundTasks);
+        assert!(PromptSection::WorkingMemory < PromptSection::BackgroundTasks);
         assert!(PromptSection::BackgroundTasks < PromptSection::MemoryBriefing);
     }
 
     #[test]
     fn test_prompt_section_all_returns_canonical_variants() {
         let all = PromptSection::all();
-        assert_eq!(all.len(), 12);
+        assert_eq!(all.len(), 11);
         // Must be in order
         for i in 1..all.len() {
             assert!(all[i - 1] < all[i], "all() not sorted at index {}", i);
@@ -434,22 +434,25 @@ mod tests {
     #[test]
     fn test_prompt_section_kind_mapping() {
         assert_eq!(PromptSection::Identity.kind(), PromptBlockKind::Prefix);
-        // Static sections
+        // Static sections: hard-coded/bounded content that doesn't vary
+        // per-request, so it's safe in the byte-stable cached prefix.
+        assert_eq!(PromptSection::Verification.kind(), PromptBlockKind::Static);
+        assert_eq!(PromptSection::Skills.kind(), PromptBlockKind::Static);
+        // Runtime sections: vary per-request (user message content, loaded
+        // files, workspace state, session metadata) → excluded from the
+        // stable prefix so they don't poison the local prefix cache.
         assert_eq!(
             PromptSection::WorkspaceContext.kind(),
-            PromptBlockKind::Static
+            PromptBlockKind::Runtime
         );
         assert_eq!(
             PromptSection::OnDemandContext.kind(),
-            PromptBlockKind::Static
+            PromptBlockKind::Runtime
         );
-        assert_eq!(PromptSection::Skills.kind(), PromptBlockKind::Static);
         assert_eq!(
             PromptSection::RequestedSkills.kind(),
-            PromptBlockKind::Static
+            PromptBlockKind::Runtime
         );
-        assert_eq!(PromptSection::Verification.kind(), PromptBlockKind::Static);
-        // Runtime sections
         assert_eq!(
             PromptSection::SessionMetadata.kind(),
             PromptBlockKind::Runtime
@@ -459,7 +462,6 @@ mod tests {
             PromptSection::WorkingMemory.kind(),
             PromptBlockKind::Runtime
         );
-        assert_eq!(PromptSection::ToolPatterns.kind(), PromptBlockKind::Runtime);
         assert_eq!(
             PromptSection::BackgroundTasks.kind(),
             PromptBlockKind::Runtime
@@ -474,7 +476,6 @@ mod tests {
     fn test_prompt_section_shrinkable() {
         // Shrinkable sections
         assert!(PromptSection::WorkingMemory.shrinkable());
-        assert!(PromptSection::ToolPatterns.shrinkable());
         assert!(PromptSection::MemoryBriefing.shrinkable());
         assert!(PromptSection::Skills.shrinkable());
         // Non-shrinkable
@@ -709,6 +710,37 @@ mod tests {
         assert!(result.report.total_tokens > 0);
         // Cap tokens should be set
         assert!(result.report.cap_tokens.is_some());
+    }
+
+    #[test]
+    fn test_small_overshoot_shrinks_low_priority_instead_of_dropping_high_priority() {
+        // Regression: bonsai-27b session 2026-07-17. Cap 500, sections
+        // Identity(133) + Verification(26) + WorkspaceContext(185) +
+        // Skills(71) + MemoryBriefing(97) = ~512. The old two-pass logic
+        // dropped WorkspaceContext (priority 2!) to fix a ~12-token
+        // overshoot; MemoryBriefing (priority 11, shrinkable) must absorb
+        // it instead.
+        let sections = vec![
+            make_entry(PromptSection::Identity, "Identity", &"word ".repeat(133)),
+            make_entry(PromptSection::Verification, "Verify", &"word ".repeat(26)),
+            make_entry(PromptSection::WorkspaceContext, "WS", &"word ".repeat(185)),
+            make_entry(PromptSection::Skills, "Skills", &"word ".repeat(71)),
+            make_entry(PromptSection::MemoryBriefing, "Memory", &"word ".repeat(97)),
+        ];
+        // context_window chosen so cap ≈ 500 (0.3 * 1667)
+        let ctx = make_ctx(1667, 0.3, sections);
+        let result = LocalAssembler.assemble(&ctx);
+
+        let get = |t: &str| result.report.blocks.iter().find(|b| b.title == t).unwrap();
+        assert!(get("WS").included, "WorkspaceContext must survive overflow");
+        assert!(get("Skills").included, "Skills must survive overflow");
+        let mem = get("Memory");
+        assert!(mem.included, "MemoryBriefing should be shrunk, not dropped");
+        assert!(
+            mem.tokens < 97,
+            "MemoryBriefing should have absorbed the overshoot, got {} tokens",
+            mem.tokens
+        );
     }
 
     #[test]

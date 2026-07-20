@@ -27,3 +27,13 @@ pub fn is_synthetic(msg: &serde_json::Value) -> bool {
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
+
+/// True if a synthetic scaffold was sent to the model and must be replayed
+/// byte-for-byte on later reloads (see [`scaffold_user`]). These MUST be
+/// persisted: dropping one on reload shifts every later message left and
+/// diverges the server-side prompt prefix (a full re-prefill on local).
+pub fn is_cache_replay(msg: &serde_json::Value) -> bool {
+    msg.get("_cache_replay")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}

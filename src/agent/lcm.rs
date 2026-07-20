@@ -5,7 +5,11 @@
 //! - **Active Context**: Window sent to LLM = recent raw messages + summary nodes.
 //! - **Summary DAG**: Hierarchical summaries with lossless pointers to originals.
 //! - **Two-threshold control loop**: τ_soft (async) / τ_hard (blocking).
-//! - **Three-level escalation**: preserve_details → bullet_points → deterministic truncate.
+//! - **Escalating summarization**: preserve_details → bullet_points. No
+//!   deterministic-truncation fallback for a missing/failing compactor or a
+//!   babble/degenerate summary — those leave the context uncompacted this
+//!   round instead. Deterministic truncation still fires as an instant path
+//!   for oversized blocks, where an LLM call would be prohibitively slow.
 //!
 //! SQLite message rows and summary nodes provide restart-safe storage. This
 //! module manages the in-memory DAG and active context assembly.
@@ -13,12 +17,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::agent::anti_drift;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::turn::Turn;
@@ -527,23 +533,26 @@ impl LcmEngine {
                 deterministic_truncate(&block_messages, self.config.deterministic_target);
             (truncated, 3)
         } else {
-            // Three-level escalation (Algorithm 3).
-            let Some(summary) = escalated_summary(
-                &block_messages,
-                target,
-                compactor,
-                self.config.deterministic_target,
-                failure_mode,
-            )
-            .await
-            else {
-                // Soft-threshold failures preserve the active context byte for
-                // byte. The hard path below is the only failure mode allowed to
-                // install deterministic truncation.
-                self.async_compaction_pending = false;
-                return None;
-            };
-            summary
+            // Escalating LLM summarization (Algorithm 3, levels 1-2). There is
+            // no deterministic-truncation fallback here: a missing compactor,
+            // a failed LLM call, or a babble/degenerate summary all leave the
+            // active context uncompacted this round rather than installing a
+            // lossy truncation silently. Compaction simply retries next turn.
+            match escalated_summary(&block_messages, target, compactor).await {
+                Ok(Some(summary)) => summary,
+                Ok(None) => {
+                    self.async_compaction_pending = false;
+                    return None;
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        "LCM: compaction summarization failed, leaving context uncompacted this round"
+                    );
+                    self.async_compaction_pending = false;
+                    return None;
+                }
+            }
         };
 
         let summary_tokens = TokenBudget::estimate_str_tokens(&summary_text);
@@ -681,7 +690,13 @@ impl LcmEngine {
             output.push_str(&format!("[msg {}] {}: {}\n\n", id, role, content));
         }
         if output.is_empty() {
-            output = "No messages found for the given IDs.".to_string();
+            output = "No messages found for the given IDs. lcm_expand only expands \
+                      LCM summary blocks from the CURRENT session — the IDs you passed \
+                      are not in this session's compaction graph (they may belong to a \
+                      past session). To retrieve a different past session's full \
+                      transcript, use session_search(mode=\"session\", session=KEY) with \
+                      that session's key."
+                .to_string();
         }
         output
     }
@@ -1082,31 +1097,47 @@ pub enum CompactionFailureMode {
 // Three-Level Escalation (Algorithm 3)
 // ---------------------------------------------------------------------------
 
-/// Escalated summarization: tries increasingly aggressive strategies.
+/// Escalated summarization: tries increasingly aggressive LLM strategies.
 ///
-/// Returns (summary_text, escalation_level).
+/// Returns `Ok(Some((summary_text, escalation_level)))` on success, `Ok(None)`
+/// when there is no compactor to summarize with or every level produced
+/// output that failed the acceptance checks, and `Err` when the LLM call
+/// itself failed or the output scored as babble/degenerate — both fatal to
+/// this compaction attempt, with no retry ladder. There is no deterministic-
+/// truncation fallback: any failure here leaves the context uncompacted this
+/// round rather than silently degrading it.
 async fn escalated_summary(
     messages: &[Value],
     _target_tokens: usize,
     compactor: Option<&ContextCompactor>,
-    deterministic_target: usize,
-    failure_mode: CompactionFailureMode,
-) -> Option<(String, u8)> {
+) -> Result<Option<(String, u8)>> {
     let original_tokens = TokenBudget::estimate_tokens(messages);
 
-    if let Some(compactor) = compactor {
-        // Level 1: Preserve details.
-        if let Ok(summary) = compactor
-            .summarize_for_lcm(messages, "preserve_details")
-            .await
-        {
+    let Some(compactor) = compactor else {
+        debug!("LCM escalation: no compactor available, leaving context uncompacted");
+        return Ok(None);
+    };
+
+    // Level 1: Preserve details. A transport/fidelity-gate error here is
+    // recoverable — Level 2's more constrained prompt gets a chance before
+    // giving up. A babble/degenerate result is NOT recoverable: reject
+    // immediately, no retry ladder.
+    match compactor.summarize_for_lcm(messages, "preserve_details").await {
+        Ok(summary) => {
+            if let Some(score) = anti_drift::score_summary_babble(&summary) {
+                warn!(
+                    score,
+                    "LCM escalation: Level 1 summary scored as babble, rejecting"
+                );
+                anyhow::bail!("LCM summary rejected as babble (score={:.2})", score);
+            }
             let tokens = TokenBudget::estimate_str_tokens(&summary);
             if tokens < original_tokens && !contains_refusal_pattern(&summary) {
                 debug!(
                     "LCM escalation: Level 1 succeeded ({} -> {} tokens)",
                     original_tokens, tokens
                 );
-                return Some((summary, 1));
+                return Ok(Some((summary, 1)));
             }
             if contains_refusal_pattern(&summary) {
                 debug!("LCM escalation: Level 1 contained refusal pattern, escalating");
@@ -1117,42 +1148,39 @@ async fn escalated_summary(
                 );
             }
         }
-
-        // Level 2: Bullet points, half the target.
-        if let Ok(summary) = compactor.summarize_for_lcm(messages, "bullet_points").await {
-            let tokens = TokenBudget::estimate_str_tokens(&summary);
-            if tokens < original_tokens && !contains_refusal_pattern(&summary) {
-                debug!(
-                    "LCM escalation: Level 2 succeeded ({} -> {} tokens)",
-                    original_tokens, tokens
-                );
-                return Some((summary, 2));
-            }
-            if contains_refusal_pattern(&summary) {
-                debug!("LCM escalation: Level 2 contained refusal pattern, escalating");
-            } else {
-                debug!(
-                    "LCM escalation: Level 2 failed (output {} >= input {})",
-                    tokens, original_tokens
-                );
-            }
+        Err(error) => {
+            debug!(%error, "LCM escalation: Level 1 summarization call failed, escalating");
         }
     }
 
-    match failure_mode {
-        CompactionFailureMode::PreserveContext => {
-            debug!("LCM escalation: soft failure, preserving active context");
-            None
-        }
-        CompactionFailureMode::Deterministic => {
-            let truncated = deterministic_truncate(messages, deterministic_target);
-            debug!(
-                "LCM escalation: Level 3 (deterministic truncate to {} tokens)",
-                deterministic_target
-            );
-            Some((truncated, 3))
-        }
+    // Level 2: Bullet points, more aggressive compression. This is the last
+    // level — an error here has nowhere left to escalate to, so it
+    // propagates as the caller-visible failure for this compaction attempt.
+    let summary = compactor.summarize_for_lcm(messages, "bullet_points").await?;
+    if let Some(score) = anti_drift::score_summary_babble(&summary) {
+        warn!(
+            score,
+            "LCM escalation: Level 2 summary scored as babble, rejecting"
+        );
+        anyhow::bail!("LCM summary rejected as babble (score={:.2})", score);
     }
+    let tokens = TokenBudget::estimate_str_tokens(&summary);
+    if tokens < original_tokens && !contains_refusal_pattern(&summary) {
+        debug!(
+            "LCM escalation: Level 2 succeeded ({} -> {} tokens)",
+            original_tokens, tokens
+        );
+        return Ok(Some((summary, 2)));
+    }
+    if contains_refusal_pattern(&summary) {
+        debug!("LCM escalation: Level 2 contained refusal pattern, leaving context uncompacted");
+    } else {
+        debug!(
+            "LCM escalation: Level 2 failed (output {} >= input {}), leaving context uncompacted",
+            tokens, original_tokens
+        );
+    }
+    Ok(None)
 }
 
 /// Deterministic truncation: extract key facts without any LLM call.
@@ -1328,9 +1356,13 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
 
     fn description(&self) -> &str {
         "Retrieve the exact original messages behind a compressed \
-         [Summary of messages …] block. Copy the range from that block, \
-         e.g. lcm_expand({\"message_ids\": \"120-158\"}). \
-         Expansion is lossless — the originals are always available."
+         [Summary of messages …] block FROM THE CURRENT SESSION. Copy the range \
+         from that block, e.g. lcm_expand({\"message_ids\": \"120-158\"}). \
+         Expansion is lossless — the originals are always available. \
+         NOTE: this only works on summary blocks in the current conversation; it \
+         cannot reach past sessions. To retrieve the FULL transcript of a DIFFERENT \
+         past session, use session_search(mode=\"session\", session=KEY) with that \
+         session's key instead."
     }
 
     fn parameters(&self) -> Value {
@@ -1357,8 +1389,11 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
         };
 
         if msg_ids.is_empty() {
-            return "Error: no valid message IDs provided. Pass the IDs from the \
-                    [Summary … (IDs: …)] block as an array, e.g. [5, 6, 7, 8]."
+            return "Error: no valid message IDs provided. lcm_expand only expands LCM \
+                    summary blocks from the CURRENT session, and needs IDs from a \
+                    [Summary … (IDs: …)] block as an array, e.g. [5, 6, 7, 8]. To read a \
+                    PAST session's full transcript, use session_search(mode=\"session\", \
+                    session=KEY) with that session's key (search first to get the key)."
                 .to_string();
         }
 
@@ -1469,6 +1504,96 @@ mod tests {
 
         fn get_default_model(&self) -> &str {
             "mock-failing"
+        }
+    }
+
+    /// Mock LLM that reflects real input content back as short bullets
+    /// instead of a fixed canned string. Unlike `SummarizerMock`, this
+    /// survives the compaction fidelity gate's topic-anchor checks
+    /// (`compaction.rs::collect_topic_anchors`) across arbitrary/evolving
+    /// input, because it echoes the leading words of every source line
+    /// rather than always returning the same text.
+    struct EchoSummarizerMock;
+
+    #[async_trait]
+    impl LLMProvider for EchoSummarizerMock {
+        async fn chat(
+            &self,
+            messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            let request = messages
+                .iter()
+                .rev()
+                .find_map(|m| m.get("content").and_then(|c| c.as_str()))
+                .unwrap_or("");
+            let source = request
+                .split("[SOURCE_BEGIN]\n")
+                .nth(1)
+                .and_then(|s| s.split("\n[SOURCE_END]").next())
+                .unwrap_or(request);
+            let heads: Vec<String> = source
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| line.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+                .collect();
+            // The fidelity gate caps a handoff at 15 bullets; group source
+            // lines into at most 15 buckets so every line still contributes
+            // its distinguishing words somewhere in the output.
+            let chunk_size = heads.len().div_ceil(15).max(1);
+            let bullets: Vec<String> = heads
+                .chunks(chunk_size)
+                .map(|group| format!("- {}", group.join("; ")))
+                .collect();
+            Ok(LLMResponse {
+                content: Some(bullets.join("\n")),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock-echo-summarizer"
+        }
+    }
+
+    /// Mock LLM that returns a degenerate, filler-heavy wall of text — scores
+    /// as babble under the anti-drift pollution heuristics regardless of
+    /// input, so the babble gate must reject it before persistence.
+    struct BabbleMock;
+
+    #[async_trait]
+    impl LLMProvider for BabbleMock {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            let babble = format!(
+                "well so basically actually honestly {}I ran the whole thing myself",
+                "well so basically actually honestly ".repeat(40)
+            );
+            Ok(LLMResponse {
+                content: Some(babble),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock-babble"
         }
     }
 
@@ -2004,11 +2129,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // E2E: compact with failing LLM → Level 3 deterministic fallback
+    // E2E: compact with failing LLM → no deterministic fallback
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_e2e_compact_level3_deterministic_fallback() {
+    async fn test_e2e_compact_llm_error_leaves_context_uncompacted() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
@@ -2031,9 +2156,12 @@ mod tests {
             );
         }
 
+        let active_before = engine.active_context();
         let budget = TokenBudget::new(4096, 2048);
 
-        // Compact with failing LLM → falls through to Level 3.
+        // Compact with a failing LLM: the summarization call errors, so
+        // compaction must NOT fall back to deterministic truncation — it
+        // leaves the context untouched and retryable next turn.
         let compactor = ContextCompactor::new(
             Arc::new(FailingMock) as Arc<dyn LLMProvider>,
             "mock".to_string(),
@@ -2047,27 +2175,89 @@ mod tests {
                 CompactionFailureMode::Deterministic,
             )
             .await;
-        assert!(result.is_some(), "Level 3 must always produce output");
 
-        let summary_turn = result.unwrap();
-        let summary_text = match &summary_turn {
-            Turn::Summary { text, .. } => text.clone(),
-            _ => panic!("Expected Turn::Summary"),
-        };
-        // Level 3 uses first_sentence extraction.
         assert!(
-            summary_text.contains("User:") || summary_text.contains("Assistant:"),
-            "Deterministic truncation should contain role prefixes"
+            result.is_none(),
+            "an LLM error must never fall back to silent deterministic truncation"
         );
+        assert_eq!(
+            engine.active_context(),
+            active_before,
+            "context must be preserved byte for byte on failure"
+        );
+        assert_eq!(engine.dag.len(), 0, "no summary node created on failure");
 
-        // DAG node should be level 3.
-        assert_eq!(engine.dag.len(), 1);
-        let node = engine.dag.get(0).unwrap();
-        assert_eq!(node.level, 3, "Should fall through to Level 3");
+        // Lossless: originals still directly retrievable from the store.
+        for id in engine.store_ids() {
+            assert_eq!(engine.expand(&[id]).len(), 1);
+        }
+    }
 
-        // Lossless: originals still retrievable.
-        let expanded = engine.expand(&node.source_ids);
-        assert_eq!(expanded.len(), node.source_ids.len());
+    // -----------------------------------------------------------------------
+    // E2E: compact with a babble-scoring summary → rejected, never persisted
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_e2e_compact_babble_summary_leaves_context_uncompacted() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+
+        ingest(&mut engine, 1, "system", "System prompt.");
+        for i in 0..10 {
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!("Question {i} about lifetimes and borrowing rules in Rust, with examples of move semantics and shared references across scopes. "),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Answer {i} explains ownership semantics in detail, covering how values are dropped, how borrows prevent aliasing, and where lifetimes annotations are required. "),
+            );
+        }
+
+        let active_before = engine.active_context();
+        let budget = TokenBudget::new(4096, 2048);
+
+        // The LLM returns a degenerate, filler-heavy, repetitive wall of
+        // text — real-world motivation is a small local model producing
+        // babble that used to get persisted verbatim as memory. The
+        // anti-drift babble gate must reject it before it is ever
+        // persisted, exactly like an LLM error: uncompacted this round, no
+        // retry ladder to a different level.
+        let compactor = ContextCompactor::new(
+            Arc::new(BabbleMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            4096,
+        );
+        let result = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                100,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+
+        assert!(
+            result.is_none(),
+            "a babble/degenerate summary must never be persisted"
+        );
+        assert_eq!(
+            engine.active_context(),
+            active_before,
+            "context must be preserved byte for byte when the summary is rejected"
+        );
+        assert_eq!(
+            engine.dag.len(),
+            0,
+            "no summary node created for a rejected babble summary"
+        );
     }
 
     #[tokio::test]
@@ -2166,7 +2356,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hard_compaction_without_model_uses_deterministic_fallback() {
+    async fn hard_compaction_without_model_leaves_context_uncompacted() {
+        // With no compactor at all, hard pressure can no longer converge via
+        // deterministic truncation — that fallback was deleted (silent
+        // truncation is never acceptable). It leaves the context uncompacted
+        // and retryable, same as a soft failure; a separate hard trim
+        // elsewhere in the pipeline is what actually protects the request.
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
@@ -2189,6 +2384,7 @@ mod tests {
                 &format!("Answer {i}: {detail}"),
             );
         }
+        let active_before = engine.active_context();
 
         let result = engine
             .compact(
@@ -2197,11 +2393,14 @@ mod tests {
                 100,
                 CompactionFailureMode::Deterministic,
             )
-            .await
-            .expect("hard pressure must converge without a model");
+            .await;
 
-        assert!(matches!(result, Turn::Summary { level: 3, .. }));
-        assert_eq!(engine.dag.len(), 1);
+        assert!(
+            result.is_none(),
+            "no compactor means no compaction, never silent truncation"
+        );
+        assert_eq!(engine.active_context(), active_before);
+        assert_eq!(engine.dag.len(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -2382,17 +2581,41 @@ mod tests {
         ingest(&mut engine, 1, "system", "System");
         for i in 0..12 {
             ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
-            ingest(&mut engine, 3 + 2 * i, "assistant", &format!("re {i}: {body}"));
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("re {i}: {body}"),
+            );
         }
-        // Round 1: no compactor → level 3 deterministic.
+        // Round 1: LLM-backed compaction (Level 1). Uses a content-echoing
+        // mock (not the fixed-text SummarizerMock) because round 2 re-feeds
+        // evolving input through the same compactor, and a canned reply
+        // fails the compaction fidelity gate's topic-anchor check on the
+        // second round.
+        let compactor = ContextCompactor::new(
+            Arc::new(EchoSummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            4096,
+        );
         let r1 = engine
-            .compact(None, &budget, 0, CompactionFailureMode::Deterministic)
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
             .await;
         assert!(r1.is_some());
 
-        // Round 2: merge the prior summary with new raws, again level 3.
+        // Round 2: merge the prior summary with new raws.
         for i in 0..12 {
-            ingest(&mut engine, 100 + 2 * i, "user", &format!("more {i}: {body}"));
+            ingest(
+                &mut engine,
+                100 + 2 * i,
+                "user",
+                &format!("more {i}: {body}"),
+            );
             ingest(
                 &mut engine,
                 101 + 2 * i,
@@ -2401,7 +2624,12 @@ mod tests {
             );
         }
         let r2 = engine
-            .compact(None, &budget, 0, CompactionFailureMode::Deterministic)
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
             .await;
         assert!(r2.is_some());
 
@@ -2450,8 +2678,11 @@ mod tests {
             tau_hard: 0.6,
             deterministic_target: 64,
         });
+        // Content-echoing mock: three compaction rounds re-feed evolving
+        // input through the same compactor, and a fixed canned reply fails
+        // the compaction fidelity gate's topic-anchor check past round 1.
         let compactor = ContextCompactor::new(
-            Arc::new(SummarizerMock) as Arc<dyn LLMProvider>,
+            Arc::new(EchoSummarizerMock) as Arc<dyn LLMProvider>,
             "mock".to_string(),
             4096,
         );
@@ -3410,10 +3641,7 @@ mod tests {
         ];
 
         let engine = LcmEngine::rebuild_from_db_nodes(&raw_messages, &nodes, LcmConfig::default());
-        assert!(
-            engine.dag().is_empty(),
-            "cyclic nodes cannot become roots"
-        );
+        assert!(engine.dag().is_empty(), "cyclic nodes cannot become roots");
         assert_eq!(engine.expand(&[10])[0].1["content"], "still available");
     }
 
@@ -3454,8 +3682,11 @@ mod tests {
         let store_before = engine.store_len();
 
         let budget = TokenBudget::new(4096, 2048);
+        // Content-echoing mock: the per-message MARKER_USER_{i}/
+        // MARKER_ASSISTANT_{i} tokens are unique-per-message topic anchors
+        // that a fixed canned reply can't cover.
         let compactor = ContextCompactor::new(
-            Arc::new(SummarizerMock) as Arc<dyn LLMProvider>,
+            Arc::new(EchoSummarizerMock) as Arc<dyn LLMProvider>,
             "mock".to_string(),
             4096,
         );

@@ -399,7 +399,8 @@ mod tests {
         for i in 0..count {
             let key = format!("test_session:{}", i);
             let session = sessions.create_session(&key).await;
-            wm.update_from_compaction(&session.id, &"x".repeat(content_size), 0)
+            sessions
+                .save_working_memory(&session.id, &"x".repeat(content_size), "active", 0)
                 .await
                 .unwrap();
             wm.complete(&session.id).await.unwrap();

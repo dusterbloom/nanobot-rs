@@ -17,8 +17,8 @@ pub const MICRO_TOOLS: &[&str] = &[
     "ctx_grep",
     "ctx_length",
     "ctx_summarize",
-    "mem_store",
-    "mem_recall",
+    "scratch_store",
+    "scratch_recall",
     "set_phase",
 ];
 
@@ -233,8 +233,8 @@ pub fn micro_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
-                "name": "mem_store",
-                "description": "Store a key-value pair in working memory. Persists across tool calls in this delegation session.",
+                "name": "scratch_store",
+                "description": "Store a key-value pair in scratch storage for this delegation loop; NOT persisted across turns.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -248,8 +248,8 @@ pub fn micro_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
-                "name": "mem_recall",
-                "description": "Recall a value from working memory by key. Returns error message if not found.",
+                "name": "scratch_recall",
+                "description": "Recall a value from scratch storage for this delegation loop; NOT persisted across turns. Returns error message if not found.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -304,7 +304,7 @@ pub fn execute_micro_tool(
             Some(len) => len.to_string(),
             None => format!("Error: variable '{}' not found.", variable),
         },
-        "mem_store" => {
+        "scratch_store" => {
             let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
             let value = args
                 .get("value")
@@ -317,7 +317,7 @@ pub fn execute_micro_tool(
                 store.mem_store(key, value)
             }
         }
-        "mem_recall" => {
+        "scratch_recall" => {
             let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
             store.mem_recall(key)
         }
@@ -692,42 +692,42 @@ mod tests {
     }
 
     #[test]
-    fn test_mem_store_via_micro_tool() {
+    fn test_scratch_store_via_micro_tool() {
         let mut store = ContextStore::new();
         let mut args = HashMap::new();
         args.insert("key".to_string(), json!("findings"));
         args.insert("value".to_string(), json!("Found 3 items"));
-        let result = execute_micro_tool(&mut store, "mem_store", &args);
+        let result = execute_micro_tool(&mut store, "scratch_store", &args);
         assert!(result.contains("Stored"));
 
         // Recall via micro-tool
         let mut recall_args = HashMap::new();
         recall_args.insert("key".to_string(), json!("findings"));
-        let recalled = execute_micro_tool(&mut store, "mem_recall", &recall_args);
+        let recalled = execute_micro_tool(&mut store, "scratch_recall", &recall_args);
         assert_eq!(recalled, "Found 3 items");
     }
 
     #[test]
     fn test_is_micro_tool_includes_memory() {
-        assert!(is_micro_tool("mem_store"));
-        assert!(is_micro_tool("mem_recall"));
+        assert!(is_micro_tool("scratch_store"));
+        assert!(is_micro_tool("scratch_recall"));
     }
 
     #[test]
-    fn test_mem_tool_definitions_present() {
+    fn test_scratch_tool_definitions_present() {
         let defs = micro_tool_definitions();
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
         assert!(
-            names.contains(&"mem_store"),
-            "Should include mem_store, got: {:?}",
+            names.contains(&"scratch_store"),
+            "Should include scratch_store, got: {:?}",
             names
         );
         assert!(
-            names.contains(&"mem_recall"),
-            "Should include mem_recall, got: {:?}",
+            names.contains(&"scratch_recall"),
+            "Should include scratch_recall, got: {:?}",
             names
         );
     }

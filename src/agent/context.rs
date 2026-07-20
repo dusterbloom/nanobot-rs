@@ -224,7 +224,7 @@ impl ContextBuilder {
             long_term_memory_budget: 200,
             skills_budget: 300,
             profiles_budget: 200,
-            system_prompt_cap: 500,
+            system_prompt_cap: 50,
             provenance_enabled: false,
             lazy_skills: false,
             skill_disclosure: "compact".to_string(),
@@ -241,7 +241,7 @@ impl ContextBuilder {
             self.long_term_memory_budget = 80;
             self.skills_budget = 100;
             self.profiles_budget = 80;
-            self.system_prompt_cap = 500;
+            self.system_prompt_cap = 50;
             return;
         }
 
@@ -252,7 +252,7 @@ impl ContextBuilder {
         self.long_term_memory_budget = 80;
         self.skills_budget = 100;
         self.profiles_budget = 80;
-        self.system_prompt_cap = 500;
+        self.system_prompt_cap = 50;
     }
 
     /// Scale prompt component budgets proportionally to the model's context window.
@@ -411,7 +411,7 @@ impl ContextBuilder {
     /// static and runtime blocks. The final result is capped end-to-end.
     ///
     /// Delegates to `LocalAssembler` for budget-aware section assembly.
-    pub fn build_local_system_prompt(
+    fn _build_local_sections_with_runtime(
         &self,
         skill_names: Option<&[String]>,
         channel: Option<&str>,
@@ -419,11 +419,8 @@ impl ContextBuilder {
         is_voice_message: bool,
         detected_language: Option<&str>,
         runtime_blocks: &[PromptBlock],
-    ) -> String {
-        use crate::agent::prompt_contract::{
-            AssemblyContext, LocalAssembler, PromptAssembler, PromptSection, SectionEntry,
-            SectionSource,
-        };
+    ) -> Vec<crate::agent::prompt_contract::SectionEntry> {
+        use crate::agent::prompt_contract::{PromptSection, SectionEntry, SectionSource};
 
         let mut sections = self._collect_local_sections(
             skill_names,
@@ -433,15 +430,16 @@ impl ContextBuilder {
             detected_language,
         );
 
-        // Convert runtime PromptBlocks to SectionEntry values.
         for block in runtime_blocks {
             let title = block.report_title();
             let section = match title.as_str() {
+                "Context Management" => PromptSection::ToolUse,
                 "Working Memory" => PromptSection::WorkingMemory,
-                "Tool Patterns" => PromptSection::ToolPatterns,
                 "Background Tasks" => PromptSection::BackgroundTasks,
+                "Session Metadata" => PromptSection::SessionMetadata,
                 _ => PromptSection::MemoryBriefing,
             };
+
             sections.push(SectionEntry {
                 section,
                 block: block.clone(),
@@ -453,23 +451,128 @@ impl ContextBuilder {
             });
         }
 
-        // The permanent local prefix has a semantic budget, not a model-window
-        // percentage. Keep the guarantee even for callers that toggle
+        sections
+    }
+
+    /// Build local prompt sections and split them into stable and runtime suffixes.
+    ///
+    /// The returned value contains:
+    /// 1) stable content (prefix: Prefix + Static sections)
+    /// 2) runtime content (suffix: Runtime sections)
+    /// 3) full assembly report with byte-level post-budgeting applied to all sections.
+    pub(crate) fn build_local_system_prompt_parts(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        is_voice_message: bool,
+        detected_language: Option<&str>,
+        runtime_blocks: &[PromptBlock],
+    ) -> (String, String, PromptAssemblyReport) {
+        use crate::agent::prompt_contract::{AssemblyContext, LocalAssembler, PromptAssembler};
+
+        const SECTION_SEPARATOR: &str = "\n\n---\n\n";
+
+        let sections = self._build_local_sections_with_runtime(
+            skill_names,
+            channel,
+            chat_id,
+            is_voice_message,
+            detected_language,
+            runtime_blocks,
+        );
+
+        // The permanent local prefix has a HARD semantic budget, not a model-
+        // window percentage. Keep the guarantee even for callers that toggle
         // `local_prompt_mode` on a default builder without calling
-        // `set_lite_mode` first.
+        // `set_lite_mode` first. 50 tokens is the ceiling for the cached prefix:
+        // identity + a shrunk skills index (+ provenance rules if enabled).
         let prompt_cap = if self.system_prompt_cap > 0 {
-            self.system_prompt_cap.min(500)
+            self.system_prompt_cap.min(50)
         } else {
-            500
+            50
         };
         let context_window = (prompt_cap as f64 / 0.3).round() as usize;
 
-        let ctx = AssemblyContext {
+        // Split into the byte-stable cached prefix (Prefix + Static) and the
+        // per-turn runtime tail (Runtime). ONLY the stable prefix is subject to
+        // the budget cap — the runtime tail is appended after it and must never
+        // be dropped by the prefix budget, or it would both vanish from the lean
+        // prompt and diverge the cached prefix (the whole point of the split).
+        // The runtime tail is excluded from the cache prefix entirely, so it is
+        // free to vary per turn without poisoning Higgs's radix cache.
+        let mut stable_sections = Vec::new();
+        let mut runtime_sections = Vec::new();
+        for s in sections {
+            match s.section.kind() {
+                PromptBlockKind::Runtime => runtime_sections.push(s),
+                PromptBlockKind::Prefix | PromptBlockKind::Static => stable_sections.push(s),
+            }
+        }
+
+        // Stable prefix: assembled under the cache budget (≤ prompt_cap tokens).
+        let stable_ctx = AssemblyContext {
             context_window,
             system_prompt_cap_pct: 0.3,
-            sections,
+            sections: stable_sections,
         };
-        LocalAssembler.assemble(&ctx).system_content
+        let stable_assembled = LocalAssembler.assemble(&stable_ctx);
+        let stable = stable_assembled.system_content;
+
+        // Runtime tail: assembled WITHOUT the prefix budget. It is never a cache
+        // prefix, so dropping it under the 50-token cap would only lose content
+        // (voice constraints, LCM expand guide, workspace context) for no cache win.
+        let runtime_ctx = AssemblyContext {
+            context_window: context_window.max(2_000_000),
+            system_prompt_cap_pct: 1.0,
+            sections: runtime_sections,
+        };
+        let runtime_assembled = LocalAssembler.assemble(&runtime_ctx);
+        let runtime = runtime_assembled.system_content;
+
+        let combined = if runtime.is_empty() {
+            stable.clone()
+        } else {
+            format!("{}\n\n---\n\n{}", stable, runtime)
+        };
+
+        // Combined report: stable blocks first, then runtime blocks, with the
+        // cache cap attributed to the stable prefix.
+        let mut blocks = stable_assembled.report.blocks;
+        blocks.extend(runtime_assembled.report.blocks);
+        let report = PromptAssemblyReport {
+            prompt: combined.clone(),
+            total_tokens: TokenBudget::estimate_str_tokens(&combined),
+            cap_tokens: Some(prompt_cap),
+            blocks,
+        };
+
+        (stable, runtime, report)
+    }
+
+    pub fn build_local_system_prompt(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        is_voice_message: bool,
+        detected_language: Option<&str>,
+        runtime_blocks: &[PromptBlock],
+    ) -> String {
+        let (stable_prompt, runtime_prompt, _) = self.build_local_system_prompt_parts(
+            skill_names,
+            channel,
+            chat_id,
+            is_voice_message,
+            detected_language,
+            runtime_blocks,
+        );
+
+        if runtime_prompt.is_empty() {
+            stable_prompt
+        } else {
+            format!("{}\n\n---\n\n{}", stable_prompt, runtime_prompt)
+        }
     }
 
     /// Describe the compact local prompt assembly with per-block token counts.
@@ -484,51 +587,15 @@ impl ContextBuilder {
         detected_language: Option<&str>,
         runtime_blocks: &[PromptBlock],
     ) -> PromptAssemblyReport {
-        use crate::agent::prompt_contract::{
-            AssemblyContext, LocalAssembler, PromptAssembler, PromptSection, SectionEntry,
-            SectionSource,
-        };
-
-        let mut sections = self._collect_local_sections(
+        let (_, _, report) = self.build_local_system_prompt_parts(
             skill_names,
             channel,
             chat_id,
             is_voice_message,
             detected_language,
+            runtime_blocks,
         );
-
-        for block in runtime_blocks {
-            let title = block.report_title();
-            let section = match title.as_str() {
-                "Working Memory" => PromptSection::WorkingMemory,
-                "Tool Patterns" => PromptSection::ToolPatterns,
-                "Background Tasks" => PromptSection::BackgroundTasks,
-                _ => PromptSection::MemoryBriefing,
-            };
-            sections.push(SectionEntry {
-                section,
-                block: block.clone(),
-                allocated_tokens: 0,
-                actual_tokens: 0,
-                source: SectionSource::Runtime(title),
-                included: true,
-                shrinkable: section.shrinkable(),
-            });
-        }
-
-        let prompt_cap = if self.system_prompt_cap > 0 {
-            self.system_prompt_cap.min(500)
-        } else {
-            500
-        };
-        let context_window = (prompt_cap as f64 / 0.3).round() as usize;
-
-        let ctx = AssemblyContext {
-            context_window,
-            system_prompt_cap_pct: 0.3,
-            sections,
-        };
-        LocalAssembler.assemble(&ctx).report
+        report
     }
 
     /// Date-only session stamp (NOT wall-clock).
@@ -1122,16 +1189,8 @@ impl ContextBuilder {
             };
             (
                 format!(
-                    "You are nanobot, a tool-using assistant.\n\
-                     {model_line}\n\
-                     Project: {cwd}\n\
-                     Workspace: {workspace_path} (nanobot state, not the user's project).\n\n\
-                     Act on the user's request. Use tools when evidence or changes are needed; \
-                     never invent results or claim work you did not perform. Keep changes scoped \
-                     and verify them. Project paths are relative to the project. Use `recall` to \
-                     load memory only when relevant; use `read_skill __list__` to discover skills \
-                     and `read_skill <name>` to load one. Answer directly and concisely unless \
-                     asked for detail."
+                    "You are nanobot. {model_line}. \
+                     Use tools; quote [VERBATIM TOOL OUTPUT] verbatim."
                 ),
                 String::new(),
                 String::new(),
@@ -1654,6 +1713,73 @@ mod tests {
         assert!(
             !p1.contains("Current time:"),
             "per-minute timestamp must not be in the cached prefix"
+        );
+    }
+
+    #[test]
+    fn test_local_system_prefix_stable_when_runtime_varies() {
+        let (_tmp, cb) = make_context();
+
+        let (stable_1, runtime_1, _) = cb.build_local_system_prompt_parts(
+            None,
+            None,
+            None,
+            false,
+            None,
+            &[PromptBlock::new("Context Management", "A")],
+        );
+
+        let (stable_2, runtime_2, _) = cb.build_local_system_prompt_parts(
+            None,
+            None,
+            None,
+            false,
+            None,
+            &[PromptBlock::new(
+                "Context Management",
+                "Completely different runtime body",
+            )],
+        );
+
+        let stable_prefix_len = 256;
+        let stable_prefix_1 = stable_1
+            .get(0..crate::utils::helpers::floor_char_boundary(&stable_1, stable_prefix_len))
+            .unwrap_or("");
+        let stable_prefix_2 = stable_2
+            .get(0..crate::utils::helpers::floor_char_boundary(&stable_2, stable_prefix_len))
+            .unwrap_or("");
+
+        assert_eq!(
+            stable_prefix_1, stable_prefix_2,
+            "stable prefix must be byte-identical across runtime changes",
+        );
+        assert_ne!(
+            runtime_1, runtime_2,
+            "runtime suffix should vary when context differs"
+        );
+        assert_eq!(
+            stable_1, stable_2,
+            "stable sections should remain equal end-to-end"
+        );
+
+        // Cache invariant: the byte-stable prefix stays within the 50-token
+        // ceiling no matter how the per-turn runtime tail changes.
+        let stable_tokens = TokenBudget::estimate_str_tokens(&stable_1);
+        assert!(
+            stable_tokens <= 50,
+            "stable prefix ({stable_tokens} tokens) must stay within the 50-token ceiling"
+        );
+        assert_ne!(
+            runtime_1, runtime_2,
+            "runtime suffix should vary when context differs"
+        );
+
+        let preview_chars = 64 * 4;
+        println!(
+            "local stable prefix preview: {}",
+            stable_1
+                .get(0..crate::utils::helpers::floor_char_boundary(&stable_1, preview_chars))
+                .unwrap_or("")
         );
     }
 
@@ -2217,7 +2343,7 @@ mod tests {
         let mut cb = ContextBuilder::new_lite(tmp.path());
         cb.set_lite_mode(4_096);
 
-        assert_eq!(cb.system_prompt_cap, 500);
+        assert_eq!(cb.system_prompt_cap, 50);
         assert_eq!(cb.bootstrap_budget, 160);
         assert_eq!(cb.long_term_memory_budget, 80);
         assert_eq!(cb.skills_budget, 100);
@@ -2315,10 +2441,8 @@ mod tests {
         // Identity stays in system, but memory/skills become on-demand.
         let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
         let system_content = system_msg["content"].as_str().unwrap();
-        assert!(system_content.contains("You are nanobot"));
+        assert!(system_content.contains("nanobot"));
         assert!(!system_content.contains("User prefers dark mode"));
-        assert!(system_content.contains("Use `recall` to load memory"));
-        assert!(system_content.contains("read_skill __list__"));
     }
 
     #[test]
@@ -2341,33 +2465,57 @@ mod tests {
 
         let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
         let system_content = system_msg["content"].as_str().unwrap();
-        assert!(system_content.contains("Model: mlx:Qwen3-8B-MLX-4bit"));
-        assert!(system_content.contains("tool-using assistant"));
+        assert!(system_content.contains("mlx:Qwen3-8B-MLX-4bit"));
         assert!(!system_content.contains("User prefers Rust"));
-        assert!(system_content.contains("read_skill __list__"));
     }
 
     #[test]
     fn test_local_builtin_skeleton_stays_within_token_budget() {
         // Pi-style local context starts with a tiny stable harness contract.
         // Product policy and runtime facts belong in code, tools, or dynamic
-        // context rather than permanent prose.
+        // context rather than permanent prose. The cached prefix is capped at
+        // 50 tokens (10x leaner than the former 500) and must stay byte-identical
+        // across turns so Higgs's radix prefix cache can reuse it.
         let tmp = TempDir::new().unwrap();
         let mut cb = ContextBuilder::new(tmp.path());
         cb.model_name = "local:Qwen3-35B.gguf".to_string();
         cb.local_prompt_mode = true;
 
-        let prompt = cb.build_local_system_prompt(None, None, None, false, None, &[]);
-        let tokens = TokenBudget::estimate_str_tokens(&prompt);
-        println!("Pi-style local built-in skeleton: {tokens} tokens");
-        assert!(
-            tokens <= 180,
-            "built-in local skeleton ({tokens} tokens) exceeds budget of 180"
+        let (stable_a, runtime_a, _) = cb.build_local_system_prompt_parts(
+            None,
+            None,
+            None,
+            false,
+            None,
+            &[],
         );
-        assert!(!prompt.contains("## Values"));
-        assert!(!prompt.contains("## When unsure"));
-        assert!(!prompt.contains("## Never"));
-        assert!(!prompt.contains("Today's date"));
+        let (stable_b, _, _) = cb.build_local_system_prompt_parts(
+            None,
+            None,
+            None,
+            false,
+            None,
+            &[],
+        );
+
+        // Cache invariant: the stable prefix is byte-identical across turns.
+        assert_eq!(
+            stable_a, stable_b,
+            "stable cached prefix must not vary between turns"
+        );
+
+        let tokens = TokenBudget::estimate_str_tokens(&stable_a);
+        println!("Pi-style local cached prefix: {tokens} tokens");
+        assert!(
+            tokens <= 50,
+            "local cached prefix ({tokens} tokens) exceeds the 50-token ceiling"
+        );
+        // The runtime tail is free to vary and must not be folded into the prefix.
+        assert!(runtime_a.is_empty(), "empty-workspace run has no runtime tail");
+        assert!(!stable_a.contains("## Values"));
+        assert!(!stable_a.contains("## When unsure"));
+        assert!(!stable_a.contains("## Never"));
+        assert!(!stable_a.contains("Today's date"));
     }
 
     #[test]
@@ -2429,21 +2577,30 @@ mod tests {
         cb.local_prompt_mode = true;
 
         let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
-        let total_tokens = TokenBudget::estimate_tokens(&messages);
         let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
         let system_content = system_msg["content"].as_str().unwrap();
 
-        // Local prompt loads project instructions and a compact skill index,
-        // but the whole stable prefix remains bounded.
+        // The cached prefix itself must stay within the 50-token ceiling even
+        // with bootstrap/skills present: the variable-size workspace content is
+        // placed in the runtime tail, not the byte-stable prefix.
+        let (stable, _runtime, _) =
+            cb.build_local_system_prompt_parts(None, None, None, false, None, &[]);
+        let stable_tokens = TokenBudget::estimate_str_tokens(&stable);
         assert!(
-            total_tokens < 550,
-            "local prompt with bootstrap content should stay near 500 tokens, got {} tokens",
-            total_tokens
+            stable_tokens <= 52,
+            "local cached prefix ({stable_tokens} tokens) must stay within the 50-token ceiling (+2 tiktoken slack)"
         );
-        // Bootstrap content should now be included (at least partially).
+        // The stable prefix still carries the model identity and the on-demand
+        // skills hint (the skill index is advertised, not enumerated, so the
+        // model fetches full skill bodies via the `read_skill` tool).
+        assert!(stable.contains("nanobot"));
+        assert!(stable.contains("mlx:Qwen3-8B-MLX-4bit"));
+        assert!(stable.contains("read_skill"));
+
+        // Bootstrap content is assembled (in the runtime tail) and the full
+        // prompt still exposes it; long-term memory stays out of the local prompt.
         assert!(system_content.contains("Bootstrap directive"));
-        assert!(system_content.contains("radio"));
-        // Long-term memory is still excluded from local prompt (loaded via recall).
+        assert!(system_content.contains("read_skill"));
         assert!(!system_content.contains("LONG TERM MEMORY LONG TERM MEMORY"));
     }
 

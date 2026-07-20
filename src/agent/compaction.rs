@@ -113,6 +113,7 @@ pub struct CompactionResult {
 }
 
 /// Summarizes LCM chunks through the currently acquired compaction endpoint.
+#[derive(Clone)]
 pub struct ContextCompactor {
     provider: Arc<dyn LLMProvider>,
     model: String,
@@ -156,6 +157,14 @@ impl ContextCompactor {
     #[cfg(test)]
     pub(crate) fn model(&self) -> &str {
         &self.model
+    }
+
+    /// The configured context-window budget (tokens) this compactor sizes
+    /// its summarization chunking against. Exposed so a fallback compactor
+    /// built for a different provider (e.g. the main model, when a managed
+    /// sidecar is unreachable) can reuse the same tuning.
+    pub(crate) fn context_size(&self) -> usize {
+        self.compaction_context_size
     }
 
     /// Dynamic input budget derived from the compaction model's context size.
@@ -344,18 +353,23 @@ impl ContextCompactor {
             anyhow::bail!("Summarization rejected for repetition loop");
         }
 
+        // Small summarizers reliably drop long URLs/paths; rejecting here
+        // would livelock compaction (the same literal stays missing on every
+        // retry), so splice missing literals back mechanically instead.
         let missing = protected_literals
             .iter()
             .filter(|literal| !text.contains(literal.as_str()))
-            .take(3)
             .cloned()
             .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            anyhow::bail!(
-                "Summarization missing protected literal(s): {}",
-                missing.join(", ")
-            );
-        }
+        let text = if missing.is_empty() {
+            text
+        } else {
+            let mut patched = text;
+            for literal in &missing {
+                patched.push_str(&format!("\n- ref: {literal}"));
+            }
+            patched
+        };
 
         let summary_words = normalized_words(&text).into_iter().collect::<HashSet<_>>();
         let missing_topics = topic_anchors
@@ -942,19 +956,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_summarize_text_rejects_missing_protected_literal() {
+    async fn test_summarize_text_splices_missing_protected_literal() {
         let source = "Use `/Users/peppi/.nanobot/sessions.db`; model `Bonsai-8B-mlx-1bit`; revision `019934f87a61a654e3960ea22f53688e0d2c49ba`.";
         let provider = Arc::new(MockProvider::new(
-            "Use /Users/peppi/.nanobot/sessions.db with Bonsai-8B-mlx-1bit.",
+            "- Use /Users/peppi/.nanobot/sessions.db with Bonsai-8B-mlx-1bit.",
         ));
         let compactor = ContextCompactor::new(provider, "test".into(), 4096);
 
-        let error = compactor
+        let summary = compactor
             .summarize_text(source, SUMMARIZE_PROMPT)
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("missing protected literal"), "{error}");
+            .unwrap();
+        assert!(
+            summary.contains("019934f87a61a654e3960ea22f53688e0d2c49ba"),
+            "dropped literal must be spliced back: {summary}"
+        );
     }
 
     #[tokio::test]

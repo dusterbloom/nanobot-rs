@@ -48,6 +48,7 @@ pub mod protocol;
 pub(crate) mod provenance;
 pub(crate) mod reasoning;
 pub mod reflector;
+pub(crate) mod retention;
 pub(crate) mod role_policy;
 pub mod router;
 pub(crate) mod router_fallback;
