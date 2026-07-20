@@ -45,6 +45,9 @@ pub(crate) enum ResponseKind {
     },
     /// Provider returned an error detail in the response body.
     ProviderError(String),
+    /// Local model completed, but the payload is malformed protocol scaffolding
+    /// or a degenerate repetition loop. Treat it as failed, not as a user-visible answer.
+    PathologicalLocalOutput { reason: &'static str },
     /// Response was truncated (finish_reason=length) with non-empty content.
     Truncated(String),
     /// Response is empty after thinking consumed the entire output budget.
@@ -108,6 +111,12 @@ pub(crate) fn classify_response(
     }
 
     let content = response.content.as_deref().unwrap_or("");
+    if is_local && !response.has_tool_calls() {
+        if let Some(reason) = pathological_local_output_reason(content) {
+            return ResponseKind::PathologicalLocalOutput { reason };
+        }
+    }
+
     let has_native_tools = response.has_tool_calls();
     let has_visible_text = !content.trim().is_empty();
 
@@ -260,6 +269,45 @@ fn send_delta(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, text: &st
     }
 }
 
+fn send_retract_reply(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>) {
+    if let Some(ref tx) = tx {
+        let _ = tx.send(ControlMarker::RetractReply.encode());
+    }
+}
+
+fn pathological_local_output_reason(content: &str) -> Option<&'static str> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("<tool_call") || lower.contains("<tool_code") || lower.contains("</tool_code")
+    {
+        return Some("malformed_tool_markup");
+    }
+
+    let mut prev = '\0';
+    let mut run = 0usize;
+    for ch in trimmed.chars() {
+        if ch == prev {
+            run += 1;
+        } else {
+            prev = ch;
+            run = 1;
+        }
+        if run >= 160 && is_degenerate_repeated_char(ch) {
+            return Some("repeated_character_loop");
+        }
+    }
+
+    None
+}
+
+fn is_degenerate_repeated_char(ch: char) -> bool {
+    ch.is_ascii_punctuation() || ch == '\u{2588}' || ch == '\u{259e}'
+}
+
 fn is_cancelled(token: &Option<tokio_util::sync::CancellationToken>) -> bool {
     token.as_ref().map_or(false, |t| t.is_cancelled())
 }
@@ -402,6 +450,22 @@ impl AgentLoopShared {
             }
 
             ResponseKind::ProviderError(err_msg) => self.handle_provider_error(ctx, &err_msg).await,
+
+            ResponseKind::PathologicalLocalOutput { reason } => {
+                warn!(
+                    model = %ctx.core.model,
+                    reason,
+                    "pathological_local_output_discarded"
+                );
+                if ctx.flow.content_was_streamed {
+                    send_retract_reply(&ctx.text_delta_tx);
+                    ctx.flow.content_was_streamed = false;
+                }
+                send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
+                StepResult::Done(IterationOutcome::Error(
+                    "The local model produced malformed or repetitive protocol text, so I discarded that response. Try the request again; if it repeats, restart the local backend.".to_string(),
+                ))
+            }
 
             ResponseKind::Truncated(partial) => {
                 let full = self.handle_truncated(ctx, &response, partial).await;
@@ -778,6 +842,14 @@ impl AgentLoopShared {
             .map_or(true, |c| c.trim().is_empty());
         if no_content && response.tool_calls.is_empty() {
             "empty_response"
+        } else if response.tool_calls.is_empty()
+            && response
+                .content
+                .as_deref()
+                .and_then(pathological_local_output_reason)
+                .is_some()
+        {
+            "pathological_response"
         } else {
             "ok"
         }
@@ -943,6 +1015,32 @@ mod tests {
             AgentLoopShared::response_status(&resp(None, vec![tc])),
             "ok"
         );
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(Some("<tool_call>\n<tool_code>"), vec![])),
+            "pathological_response"
+        );
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(Some(&"!".repeat(180)), vec![])),
+            "pathological_response"
+        );
+    }
+
+    #[test]
+    fn test_classify_pathological_local_output() {
+        let resp = make_response(Some("<tool_call>\n<tool_code>\n!!!!!!!!"), "stop");
+        let kind = classify_response(&resp, true, false, false, &default_retries(), false);
+        assert!(matches!(
+            kind,
+            ResponseKind::PathologicalLocalOutput {
+                reason: "malformed_tool_markup"
+            }
+        ));
+
+        let cloud_kind = classify_response(&resp, false, false, false, &default_retries(), false);
+        assert!(!matches!(
+            cloud_kind,
+            ResponseKind::PathologicalLocalOutput { .. }
+        ));
     }
 
     #[test]

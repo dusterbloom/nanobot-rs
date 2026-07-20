@@ -120,6 +120,7 @@ impl ReplContext {
                             port,
                             &model_dir,
                             &self.config.agents.defaults.local_model,
+                            self.config.agents.defaults.higgs_draft_model.as_deref(),
                         )
                         .await
                         {
@@ -1316,6 +1317,7 @@ impl ReplContext {
                                     port,
                                     &model_dir,
                                     &self.config.agents.defaults.local_model,
+                                    self.config.agents.defaults.higgs_draft_model.as_deref(),
                                 )
                                 .await
                                 {

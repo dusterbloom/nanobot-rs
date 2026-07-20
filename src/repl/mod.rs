@@ -1610,7 +1610,15 @@ pub(crate) fn cmd_agent(
             match crate::higgs::resolve_model_dir(&config) {
                 Ok(model_dir) => {
                     if let Some(bin) = crate::higgs::find_binary() {
-                        match crate::higgs::server_start(&bin, higgs_port, &model_dir, &config.agents.defaults.local_model).await {
+                        match crate::higgs::server_start(
+                            &bin,
+                            higgs_port,
+                            &model_dir,
+                            &config.agents.defaults.local_model,
+                            config.agents.defaults.higgs_draft_model.as_deref(),
+                        )
+                        .await
+                        {
                             Ok(crate::higgs::StartResult::Ready) => {
                                 higgs_sidecar_port = Some(higgs_port);
                                 config.agents.defaults.local_api_base =

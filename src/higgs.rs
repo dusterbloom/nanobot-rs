@@ -116,8 +116,9 @@ pub(crate) async fn server_start(
     port: u16,
     model_dir: &str,
     local_model: &str,
+    draft_model: Option<&str>,
 ) -> Result<StartResult, String> {
-    server_start_role(bin, port, model_dir, local_model, "higgs").await
+    server_start_role(bin, port, model_dir, local_model, "higgs", draft_model).await
 }
 
 /// Start a Higgs instance for a named role. `role == "higgs"` is the main
@@ -130,6 +131,7 @@ pub(crate) async fn server_start_role(
     model_dir: &str,
     local_model: &str,
     role: &str,
+    draft_model: Option<&str>,
 ) -> Result<StartResult, String> {
     // Already running and healthy?
     if let Some(pid) = read_pid_for(role) {
@@ -201,6 +203,14 @@ pub(crate) async fn server_start_role(
     // HIGGS_CHUNKED_PREFILL_CHUNK_SIZE overrides the hardcoded 1024 floor
     // for throughput profile (384 *max(1024) = 1024 for huge+MoE).
     cmd.env("HIGGS_CHUNKED_PREFILL_CHUNK_SIZE", "4096");
+    if let Some(drafter) = draft_model.map(str::trim).filter(|p| !p.is_empty()) {
+        cmd.env("HIGGS_DFLASH_PATH", drafter);
+        set_child_env_default(&mut cmd, "HIGGS_BONSAI_TG_LUT4", "1");
+        set_child_env_default(&mut cmd, "HIGGS_BONSAI_TG_LUT4_FUSED_MLP", "0");
+        set_child_env_default(&mut cmd, "HIGGS_DFLASH_VERIFY_MODE", "block");
+        set_child_env_default(&mut cmd, "HIGGS_DSPARK_DRAFT_CAP", "4");
+        set_child_env_default(&mut cmd, "HIGGS_DSPARK_TARGET_HEAD", "0");
+    }
     cmd.args([
         "serve",
         "--model",
@@ -635,6 +645,7 @@ impl CompactionSidecarManager {
                 &self.spec.dir,
                 &self.model_hint,
                 &self.role,
+                None,
             )
             .await
             {
@@ -1444,8 +1455,9 @@ pub(crate) async fn server_restart(
     port: u16,
     model_dir: &str,
     local_model: &str,
+    draft_model: Option<&str>,
 ) -> Result<StartResult, String> {
-    server_restart_role(bin, port, model_dir, local_model, "higgs").await
+    server_restart_role(bin, port, model_dir, local_model, "higgs", draft_model).await
 }
 
 /// Restart a Higgs instance for a named role (stop then start).
@@ -1455,10 +1467,17 @@ pub(crate) async fn server_restart_role(
     model_dir: &str,
     local_model: &str,
     role: &str,
+    draft_model: Option<&str>,
 ) -> Result<StartResult, String> {
     server_stop_role(role)?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    server_start_role(bin, port, model_dir, local_model, role).await
+    server_start_role(bin, port, model_dir, local_model, role, draft_model).await
+}
+
+fn set_child_env_default(cmd: &mut std::process::Command, key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        cmd.env(key, value);
+    }
 }
 
 /// Check if the running Higgs is serving a model that matches `expected_dir`.

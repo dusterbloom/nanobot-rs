@@ -49,8 +49,9 @@ You: What's the weather like?
 
 Toggle between cloud and local inference mid-conversation. nanobot first adopts
 an already-running compatible endpoint. It starts a server only when
-`agents.defaults.localAutostart` explicitly selects `"higgs"` or
-`"lmstudio"`; the default, `"off"`, never spawns one.
+`agents.defaults.localAutostart` selects `"higgs"`, `"lmstudio"`, or `"off"`;
+the default, `"higgs"`, starts the managed Higgs sidecar when discovery finds no
+healthy local endpoint.
 
 ```
 You: /local  # with localAutostart: "lmstudio"
@@ -279,14 +280,38 @@ Key agent settings in `config.json`:
 | `agents.defaults.maxTokens` | `8192` | Max response tokens |
 | `agents.defaults.maxContextTokens` | `128000` | Context window size |
 | `agents.defaults.maxConcurrentChats` | `4` | Parallel chat limit (gateway) |
-| `agents.defaults.localAutostart` | `off` | Spawn policy when discovery finds no local endpoint: `off`, `higgs`, or `lmstudio` |
+| `agents.defaults.localAutostart` | `higgs` | Spawn policy when discovery finds no local endpoint: `off`, `higgs`, or `lmstudio` |
 | `agents.defaults.higgsPort` | `8091` | Main managed Higgs endpoint |
 | `agents.defaults.lmsPort` | `1234` | LM Studio endpoint |
+| `agents.defaults.higgsDraftModel` | unset | Optional DFlash/dSpark drafter sidecar path exported as `HIGGS_DFLASH_PATH` when Nanobot starts Higgs |
 
 Local discovery prefers an explicitly configured endpoint, then Higgs, then LM
 Studio. `localBackend` is derived from the endpoint that answers; it is not a
 second spawn switch. For LM Studio autostart, install
 [LM Studio](https://lmstudio.ai/) and its CLI (`lms`).
+
+For Bonsai-27B dSpark on managed Higgs, set the target and drafter paths:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "localAutostart": "higgs",
+      "higgsPort": 8000,
+      "localModel": "bonsai-27b",
+      "lmsMainModel": "bonsai-27b",
+      "mlxModelDir": "/path/to/Bonsai-27B-mlx-1bit",
+      "higgsDraftModel": "/path/to/Bonsai-27B-dspark-mlx"
+    }
+  }
+}
+```
+
+When `higgsDraftModel` is set, Nanobot also supplies the proven Bonsai defaults
+for a child Higgs process unless already overridden in the environment:
+row4/TG-LUT on, fused MLP off, dSpark draft cap 4, block verification with
+Higgs fail-closed domain checks, and the full Q4 proposal head when the sidecar
+contains it.
 
 ### Voice settings (`voice` block in `config.json`)
 

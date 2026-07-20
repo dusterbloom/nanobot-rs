@@ -313,6 +313,11 @@ pub struct AgentDefaults {
     /// Default: ~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mlx_model_dir: Option<String>,
+    /// Optional Higgs DFlash/dSpark drafter sidecar path for the main managed
+    /// Higgs server. When set, nanobot exports it as HIGGS_DFLASH_PATH before
+    /// spawning Higgs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub higgs_draft_model: Option<String>,
     /// Number of draft tokens per speculative decoding step (default: 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_draft_tokens: Option<u32>,
@@ -519,6 +524,7 @@ impl Default for AgentDefaults {
             higgs_compaction_model_dir: None,
             local_backend: default_local_backend(),
             mlx_model_dir: None,
+            higgs_draft_model: None,
             num_draft_tokens: None,
             mlx_preset: default_mlx_preset(),
             instructions_path: None,
@@ -2602,6 +2608,19 @@ mod tests {
         let json = r#"{}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.agents.defaults.local_api_base.is_empty());
+    }
+
+    #[test]
+    fn test_higgs_draft_model_deserialization() {
+        let json = r#"{"agents":{"defaults":{"higgsDraftModel":"/models/Bonsai-27B-dspark-mlx"}}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.agents.defaults.higgs_draft_model.as_deref(),
+            Some("/models/Bonsai-27B-dspark-mlx")
+        );
+
+        let empty: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(empty.agents.defaults.higgs_draft_model.is_none());
     }
 
     #[test]
