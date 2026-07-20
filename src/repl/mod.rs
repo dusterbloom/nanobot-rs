@@ -2755,12 +2755,12 @@ mod tests {
         let unrelated = sessions.create_session("cli:other").await;
         let working_memory =
             crate::agent::working_memory::WorkingMemoryStore::new(sessions.clone());
-        working_memory
-            .update_from_compaction(&current.id, "current summary", 3)
+        sessions
+            .save_working_memory(&current.id, "current summary", "active", 3)
             .await
             .unwrap();
-        working_memory
-            .update_from_compaction(&unrelated.id, "other summary", 2)
+        sessions
+            .save_working_memory(&unrelated.id, "other summary", "active", 2)
             .await
             .unwrap();
 

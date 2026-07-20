@@ -202,23 +202,27 @@ fn reflector_distills_to_memory_and_graph() {
         // distinctive user preferences (short sessions to fit 8K context).
         let wm = WorkingMemoryStore::new(sessions.clone());
         let prefs = sessions.create_session("cli:prefs").await;
-        wm.update_from_compaction(
-            &prefs.id,
-            "User said their favorite programming language is Haskell and they always use the Catppuccin color theme. They prefer functional programming paradigms.",
-            0,
-        )
-        .await
-        .unwrap();
+        sessions
+            .save_working_memory(
+                &prefs.id,
+                "User said their favorite programming language is Haskell and they always use the Catppuccin color theme. They prefer functional programming paradigms.",
+                "active",
+                0,
+            )
+            .await
+            .unwrap();
         wm.complete(&prefs.id).await.unwrap();
 
         let tools = sessions.create_session("cli:tools").await;
-        wm.update_from_compaction(
-            &tools.id,
-            "User mentioned they use Helix as their primary editor and prefer nix for package management. They run NixOS on their server.",
-            0,
-        )
-        .await
-        .unwrap();
+        sessions
+            .save_working_memory(
+                &tools.id,
+                "User mentioned they use Helix as their primary editor and prefer nix for package management. They run NixOS on their server.",
+                "active",
+                0,
+            )
+            .await
+            .unwrap();
         wm.complete(&tools.id).await.unwrap();
 
         // Create Reflector with real LLM provider pointed at LM Studio.
