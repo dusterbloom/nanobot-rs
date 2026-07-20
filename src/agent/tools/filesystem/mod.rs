@@ -167,7 +167,14 @@ impl Tool for ReadFileTool {
         }
         let max_lines =
             bounded_usize_param(&params, "max_lines", DEFAULT_READ_LINES, MAX_READ_LINES);
-        render_range(&content, 1, max_lines.min(total), path, total, self.char_budget)
+        render_range(
+            &content,
+            1,
+            max_lines.min(total),
+            path,
+            total,
+            self.char_budget,
+        )
     }
 }
 

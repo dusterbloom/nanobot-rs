@@ -681,6 +681,12 @@ impl ToolRegistry {
         // schema must be advertised or local models fall back to guessing
         // (observed: recall_tool_result with invented ids).
         "lcm_expand",
+        // Memory tools: medium local models (e.g. Qwen3.6-35B-A3B) fail to route
+        // through the `tool` proxy meta-tool reliably, so they get dedicated
+        // slim schemas instead of proxy-only reachability.
+        "recall",
+        "remember",
+        "session_search",
     ];
 
     /// Internal Lean-catalog builder: condense every available schema before
@@ -730,29 +736,17 @@ impl ToolRegistry {
         defs
     }
 
-    /// Lean production surface: core tools as slim schemas + the proxy meta-tool.
+    /// Lean production surface: a SINGLE meta-tool (`tool`) advertised at turn 1.
     ///
-    /// Roughly half the tokens of the full slim surface. Long-tail tools stay
-    /// registered and executable — only their DEFINITIONS are omitted; the
-    /// model reaches them via `tool(name)` inspect / `tool(name, args)`
-    /// dispatch. The set is static per session (fixed name lists), so the
-    /// prompt-head tool block stays prefix-cache stable.
+    /// Lazy-load contract — the proxy unlocks every registered tool on demand:
+    /// `tool("name")` returns the tool's full parameter schema, `tool("name", args)`
+    /// executes it. No per-tool schemas live in the prompt head, so the
+    /// cold-prefill tool block is one small definition (~150 tokens) instead of
+    /// the ~1.4k of individual slim schemas. The model pulls a tool's schema
+    /// only when it actually needs it, and because inspect returns the FULL
+    /// (non-slimmed) schema, it forms correct arguments instead of guessing.
     pub fn get_lean_definitions(&self) -> Vec<serde_json::Value> {
-        let mut defs: Vec<serde_json::Value> = self
-            .get_slim_definitions()
-            .into_iter()
-            .filter(|d| {
-                let name = d
-                    .pointer("/function/name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                Self::CORE_TOOLS.contains(&name) || Self::LEAN_EXTRA_TOOLS.contains(&name)
-            })
-            .collect();
-        Self::sort_definitions(&mut defs);
-        // Proxy meta-tool goes LAST so the core schemas stay a stable prefix.
-        defs.extend(self.get_proxy_definition());
-        defs
+        self.get_proxy_definition()
     }
 
     // -------------------------------------------------------------------
@@ -810,8 +804,20 @@ impl ToolRegistry {
         hints.sort();
 
         let description = format!(
-            "Use any tool. Available: {}. \
-             Pass name only to see full parameters, or name+args to execute.",
+            "Meta-tool that unlocks EVERY other tool — call it to use any capability. \
+             USAGE: (1) tool(\"NAME\") with NO args returns that tool's full parameter schema; \
+             (2) tool(\"NAME\", {{\"arg\": value}}) runs it. Always inspect first so you pass \
+             correct arguments. \
+             MEMORY SYSTEM: your history is summarised by LCM; past-session summaries appear as \
+             '[Summary of messages X-Y…]' and are losslessly expandable via \
+              tool(\"lcm_expand\", {{\"message_ids\": \"120-158\"}}). To search ALL past sessions use \
+              tool(\"session_search\", {{\"mode\": \"search\", \"query\": \"…\"}}) — pass a few keywords (it \
+              tolerates verbose phrasing); then mode='session' dumps a full past session by its key. To pull \
+              the actual story/content, mode='in_session' with a keyword returns the matching messages IN FULL, \
+              relevance-ranked. mode='extract' with message_ids=N recovers one complete message by its [msg N] id. \
+              recall/remember read and write long-term memory. \
+             AVAILABLE TOOLS: {}. EXAMPLE: tool(\"session_search\") then \
+             tool(\"session_search\", {{\"mode\": \"search\", \"query\": \"docker\"}}).",
             hints.join(", ")
         );
 
@@ -952,9 +958,15 @@ mod tests {
         println!(
             "tool surface: count={count} full={full} local={local} slim={slim} lean={lean} proxy={proxy}"
         );
+        // Lean surface is now a SINGLE proxy definition (~150 tokens), paid on
+        // every cold prefill. This is the lazy-load contract: one tool at turn 1.
+        assert_eq!(
+            lean, proxy,
+            "lean surface must be exactly the proxy definition (proxy-only lean)"
+        );
         assert!(
-            lean <= 1400,
-            "lean tool defs (the local default) ballooned to {lean} tokens (budget 1400) — \
+            lean <= 400,
+            "lean tool defs (the local default) ballooned to {lean} tokens (budget 400) — \
              every token here is cold-prefill cost on the local path"
         );
         assert!(
@@ -963,42 +975,47 @@ mod tests {
         );
     }
 
-    /// Lean surface contract: core tools present as slim schemas, proxy
-    /// meta-tool appended last, long-tail tools NOT present as top-level
-    /// definitions, and the output byte-identical across calls (the tool
-    /// block is hashed for prefix-cache stability).
+    /// Lean surface contract: EXACTLY one tool (the `tool` proxy) advertised at
+    /// turn 1. It must teach inspect-then-execute and advertise every reachable
+    /// lean tool by name, and stay byte-identical across calls (the tool block
+    /// is hashed for prefix-cache stability).
     #[test]
     fn test_lean_definitions_surface() {
         let ws = tempfile::tempdir().unwrap();
         let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
         register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
         let lean = reg.get_lean_definitions();
-        let names: Vec<&str> = lean
-            .iter()
-            .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
-            .collect();
 
-        assert!(names.contains(&"read_file"), "core tool missing: {names:?}");
+        // Lazy-load contract: exactly ONE tool advertised at turn 1.
+        assert_eq!(lean.len(), 1, "lean surface must be the single proxy tool");
+        let name = lean[0].pointer("/function/name").and_then(|v| v.as_str());
+        assert_eq!(name, Some("tool"), "only the proxy meta-tool is advertised");
+
+        let desc = lean[0]
+            .pointer("/function/description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // The proxy description must teach inspect-then-execute so the model
+        // forms correct arguments instead of guessing (the earlier failure mode).
         assert!(
-            names.contains(&"recall_tool_result"),
-            "preview recovery tool missing: {names:?}"
+            desc.contains("full parameter"),
+            "proxy must teach inspect-then-execute: {desc}"
         );
-        assert_eq!(
-            names.last(),
-            Some(&"tool"),
-            "proxy meta-tool must be the last definition: {names:?}"
-        );
-        // Long-tail tools are reachable only via the proxy, never top-level.
-        let allowed: Vec<&str> = ToolRegistry::CORE_TOOLS
+
+        // Every reachable lean tool must be named in the proxy so the model
+        // knows what it can unlock. Only assert tools actually registered here.
+        let available: std::collections::HashSet<String> = reg.available_tool_names().into_iter().collect();
+        for t in ToolRegistry::CORE_TOOLS
             .iter()
-            .chain(ToolRegistry::LEAN_EXTRA_TOOLS)
-            .copied()
-            .chain(std::iter::once("tool"))
-            .collect();
-        for n in &names {
-            assert!(allowed.contains(n), "unexpected top-level lean def: {n}");
+            .chain(ToolRegistry::LEAN_EXTRA_TOOLS.iter())
+        {
+            if available.contains(*t) {
+                assert!(
+                    desc.contains(t),
+                    "proxy must advertise reachable tool '{t}': {desc}"
+                );
+            }
         }
-        assert!(!names.contains(&"browser") && !names.contains(&"send_email"));
 
         // Determinism: byte-identical across two calls on the same registry.
         let a = serde_json::to_vec(&lean).unwrap();

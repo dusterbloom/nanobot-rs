@@ -222,7 +222,7 @@ async fn analyze_via_scratch_pad(
     let cost_limit = config.budget.as_ref().map_or(0.0, |b| b.cost_limit);
     let prices = config.budget.as_ref().and_then(|b| b.prices.clone());
 
-    let system_prompt = "You analyze stored data. Use micro-tools to inspect, mem_store to save findings.\nWhen you have enough information, write your final summary. STOP.\nPrevious findings are listed below — build on them, don't repeat work.\n/nothink";
+    let system_prompt = "You analyze stored data. Use micro-tools to inspect, scratch_store to save findings.\nWhen you have enough information, write your final summary. STOP.\nPrevious findings are listed below — build on them, don't repeat work.\n/nothink";
 
     for round in 0..max_rounds {
         // Check cancellation.
@@ -408,7 +408,7 @@ async fn analyze_via_scratch_pad(
                             };
                             context_store.mem_store(&key, result);
                         }
-                        _ => {} // mem_store/mem_recall/set_phase handle persistence internally
+                        _ => {} // scratch_store/scratch_recall/set_phase handle persistence internally
                     }
                 } else if worker_tools::is_worker_tool(&tc.name) {
                     let result =

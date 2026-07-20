@@ -548,8 +548,10 @@ fn crw_envelope(resp: &serde_json::Value, url: &str, max_chars: usize) -> Option
         .and_then(|s| s.as_u64())
         .unwrap_or(200);
 
-    let (text, truncated) =
-        truncate_at_boundary(flatten_markdown_noise(&strip_code_blocks(markdown)), max_chars);
+    let (text, truncated) = truncate_at_boundary(
+        flatten_markdown_noise(&strip_code_blocks(markdown)),
+        max_chars,
+    );
     Some(
         serde_json::json!({
             "url": url,
@@ -918,35 +920,37 @@ fn fallback_extract(html: &str, mode: &str) -> String {
 mod tests {
     use super::*;
 
-#[test]
-#[ignore = "scratch: needs /tmp/kimi.html + /tmp/hn.html downloaded"]
-fn live_readable_savings_check() {
-    for (name, path) in [("KIMI", "/tmp/kimi.html"), ("HN", "/tmp/hn.html")] {
-        let html = std::fs::read_to_string(path).unwrap();
-        let before = extract_html_content_inner(&html, "markdown").len();
-        let readable = extract_html_content(&html, "readable");
-        assert!(!readable.contains("```"));
-        eprintln!(
-            "{} chars markdown={} readable={} saved={}%",
-            name,
-            before,
-            readable.len(),
-            100 - readable.len() * 100 / before.max(1)
-        );
-        eprintln!(
-            "{} sample: {}",
-            name,
-            &readable[..readable.len().min(300)].replace('\n', " | ")
-        );
+    #[test]
+    #[ignore = "scratch: needs /tmp/kimi.html + /tmp/hn.html downloaded"]
+    fn live_readable_savings_check() {
+        for (name, path) in [("KIMI", "/tmp/kimi.html"), ("HN", "/tmp/hn.html")] {
+            let html = std::fs::read_to_string(path).unwrap();
+            let before = extract_html_content_inner(&html, "markdown").len();
+            let readable = extract_html_content(&html, "readable");
+            assert!(!readable.contains("```"));
+            eprintln!(
+                "{} chars markdown={} readable={} saved={}%",
+                name,
+                before,
+                readable.len(),
+                100 - readable.len() * 100 / before.max(1)
+            );
+            eprintln!(
+                "{} sample: {}",
+                name,
+                &readable[..readable.len().min(300)].replace('\n', " | ")
+            );
+        }
     }
-}
 
     #[test]
     fn test_strip_code_blocks() {
         let input = "Intro prose.\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nMore prose.\n\n```\nplain block\n```\nTail.";
         let out = strip_code_blocks(input);
         assert!(!out.contains("println"), "code must be stripped: {out}");
-        assert!(out.contains("Intro prose.") && out.contains("More prose.") && out.contains("Tail."));
+        assert!(
+            out.contains("Intro prose.") && out.contains("More prose.") && out.contains("Tail.")
+        );
         assert!(out.contains("[code block omitted: 3 lines]"), "{out}");
         // Unclosed fence is left untouched (better than eating the page tail).
         let unclosed = "Prose ```rust\nfn f() {}";

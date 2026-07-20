@@ -1054,6 +1054,32 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
     // behavioral — it throttled legitimate narrated side-effect chains.
 }
 
+/// First `max_chars` of the most recent real tool result in `messages`.
+///
+/// Skips prior boundary rejections (they are tool-role messages too — quoting
+/// one back would nudge the model toward the rejection text instead of the
+/// actual result). Returns `None` when no tool result exists yet.
+fn last_tool_result_snippet(messages: &[Value], max_chars: usize) -> Option<String> {
+    let content = messages.iter().rev().find_map(|m| {
+        if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
+            return None;
+        }
+        let c = m.get("content").and_then(|c| c.as_str())?;
+        if c.starts_with("response boundary:") {
+            return None;
+        }
+        Some(c)
+    })?;
+    let cleaned = content
+        .trim_start_matches("[VERBATIM TOOL OUTPUT — do not paraphrase]")
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let end = crate::utils::helpers::floor_char_boundary(cleaned, max_chars);
+    Some(cleaned[..end].replace('\n', " "))
+}
+
 /// Inject an error result for a side-effect tool call rejected by the
 /// response boundary.
 ///
@@ -1062,11 +1088,23 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
 /// rejected call must not extend its own boundary, or the loop would
 /// livelock: nudge → reject → nudge → …).
 fn inject_boundary_rejection(ctx: &mut TurnContext, tc: &ToolCallRequest) {
-    let msg = format!(
-        "response boundary: {} was not executed — first respond with what the \
-         previous tool results showed; it can run in a later step.",
-        tc.name
-    );
+    // Quote the prior result inline: small local models don't reliably look
+    // back through context to find what they should report on, so give them
+    // the material to comply with right here at the tail.
+    let prior = last_tool_result_snippet(&ctx.messages, 160);
+    let msg = match prior {
+        Some(snippet) => format!(
+            "response boundary: {} was not executed — first respond with what the \
+             previous tool results showed (last result began: \"{}\"); it can run \
+             in a later step.",
+            tc.name, snippet
+        ),
+        None => format!(
+            "response boundary: {} was not executed — first respond with what the \
+             previous tool results showed; it can run in a later step.",
+            tc.name
+        ),
+    };
     if ctx.core.provenance_config.enabled {
         ContextBuilder::add_tool_result_immutable(&mut ctx.messages, &tc.id, &tc.name, &msg);
     } else {
@@ -1168,8 +1206,12 @@ pub(crate) async fn execute_tools_inline(
 
     // Behavioral response-boundary arming. `parallel`/`sequential` hold only the
     // EXECUTED (non-blocked) calls, so a boundary-rejected call cannot re-arm.
+    // Failed side-effect calls (timeouts, errors) don't arm either: there is no
+    // result to report, so retrying is the model's legitimate next move — the
+    // duplicate-call guard still bounds runaway retries.
     let executed: Vec<&str> = ordered_results
         .iter()
+        .filter(|result| result.result.ok)
         .map(|result| result.tool_name.as_str())
         .collect();
 
@@ -1540,6 +1582,24 @@ mod tests {
             "local:qwen36-35b",
             None
         ));
+    }
+
+    #[test]
+    fn test_last_tool_result_snippet_skips_rejections_and_truncates() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "tool", "name": "exec", "content": "[VERBATIM TOOL OUTPUT — do not paraphrase] line one\nline two"}),
+            serde_json::json!({"role": "tool", "name": "exec", "content": "response boundary: exec was not executed"}),
+        ];
+        // Boundary rejection is skipped; the real result is found, marker
+        // stripped, newlines flattened.
+        let s = last_tool_result_snippet(&messages, 160).unwrap();
+        assert_eq!(s, "line one line two");
+        // Truncation respects char boundaries.
+        let s = last_tool_result_snippet(&messages, 4).unwrap();
+        assert_eq!(s, "line");
+        // No tool results at all → None.
+        assert!(last_tool_result_snippet(&messages[..1], 160).is_none());
     }
 
     #[test]

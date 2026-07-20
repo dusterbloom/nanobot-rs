@@ -2112,10 +2112,10 @@ fn test_build_analysis_state_with_both() {
 
 #[tokio::test]
 async fn test_scratch_pad_memory_accumulates_across_rounds() {
-    // Verify that mem_store findings from round N appear in the
+    // Verify that scratch_store findings from round N appear in the
     // user message sent to the LLM in round N+1.
     //
-    // Round 0: model calls mem_store("finding_1", "first result")
+    // Round 0: model calls scratch_store("finding_1", "first result")
     // Round 1: model sees "finding_1: first result" in state → returns summary
 
     struct MemoryCapturingProvider {
@@ -2139,12 +2139,12 @@ async fn test_scratch_pad_memory_accumulates_across_rounds() {
             let n = self.call_count.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => {
-                    // Round 0: call mem_store to save a finding
+                    // Round 0: call scratch_store to save a finding
                     Ok(crate::providers::base::LLMResponse {
                         content: None,
                         tool_calls: vec![ToolCallRequest {
                             id: "mem_0".to_string(),
-                            name: "mem_store".to_string(),
+                            name: "scratch_store".to_string(),
                             arguments: {
                                 let mut m = HashMap::new();
                                 m.insert("key".to_string(), json!("finding_1"));
