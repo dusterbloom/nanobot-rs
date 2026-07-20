@@ -36,6 +36,12 @@ pub struct ProviderSpec {
     pub constrained_tool_calls: bool,
     /// Whether to send Higgs' `session_id` extension for cache-resident turns.
     pub higgs_session_cache: bool,
+    /// OpenAI-compatible repetition penalty.
+    pub repetition_penalty: Option<f64>,
+    /// OpenAI-compatible frequency penalty.
+    pub frequency_penalty: Option<f64>,
+    /// OpenAI-compatible presence penalty.
+    pub presence_penalty: Option<f64>,
 }
 
 impl ProviderSpec {
@@ -56,6 +62,9 @@ impl ProviderSpec {
             lms_native_probe_secs: 2,
             constrained_tool_calls: true,
             higgs_session_cache: false,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
         }
     }
 
@@ -75,6 +84,9 @@ impl ProviderSpec {
             lms_native_probe_secs: 2,
             constrained_tool_calls: true,
             higgs_session_cache: false,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
         }
     }
 
@@ -108,6 +120,19 @@ impl ProviderSpec {
         self.higgs_session_cache = enabled;
         self
     }
+
+    /// Attach OpenAI-compatible sampling penalties to this provider spec.
+    pub fn with_sampling_penalties(
+        mut self,
+        repetition_penalty: Option<f64>,
+        frequency_penalty: Option<f64>,
+        presence_penalty: Option<f64>,
+    ) -> Self {
+        self.repetition_penalty = repetition_penalty;
+        self.frequency_penalty = frequency_penalty;
+        self.presence_penalty = presence_penalty;
+        self
+    }
 }
 
 /// Create an OpenAI-compatible provider from a spec.
@@ -126,6 +151,11 @@ pub fn create_openai_compat(spec: ProviderSpec) -> Arc<dyn LLMProvider> {
     if let Some(gate) = spec.jit_gate {
         prov = prov.with_jit_gate(gate);
     }
+    prov = prov.with_sampling_penalties(
+        spec.repetition_penalty,
+        spec.frequency_penalty,
+        spec.presence_penalty,
+    );
     prov = prov.with_retry_config(
         spec.retry.provider_min_secs,
         spec.retry.provider_max_secs,
@@ -307,6 +337,9 @@ mod tests {
             lms_native_probe_secs: 2,
             constrained_tool_calls: true,
             higgs_session_cache: false,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
         };
         let provider = create_openai_compat(spec);
         assert_eq!(provider.get_default_model(), "gpt-4");

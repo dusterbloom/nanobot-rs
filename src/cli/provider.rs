@@ -39,6 +39,11 @@ fn load_oauth_provider(sub_model: &str) -> anyhow::Result<Arc<dyn LLMProvider>> 
 pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
     use tracing::info;
     let model = &config.agents.defaults.model;
+    let (repetition_penalty, frequency_penalty, presence_penalty) = (
+        config.agents.defaults.repetition_penalty,
+        config.agents.defaults.frequency_penalty,
+        config.agents.defaults.presence_penalty,
+    );
 
     // "claude-max" or "claude-max/opus" -> OAuth token from Claude CLI credentials.
     if model.starts_with("claude-max") {
@@ -95,6 +100,9 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
             lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
             constrained_tool_calls: config.agents.defaults.constrained_tool_calls,
             higgs_session_cache: false,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
         });
     }
 
@@ -143,6 +151,9 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
         lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
         constrained_tool_calls: config.agents.defaults.constrained_tool_calls,
         higgs_session_cache: false,
+        repetition_penalty,
+        frequency_penalty,
+        presence_penalty,
     })
 }
 

@@ -905,6 +905,9 @@ impl SubagentManager {
                             lms_native_probe_secs: 2,
                             constrained_tool_calls: true,
                             higgs_session_cache: false,
+                            repetition_penalty: None,
+                            frequency_penalty: None,
+                            presence_penalty: None,
                         },
                     );
                 return (provider, rest, targets_local);

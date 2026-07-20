@@ -50,6 +50,12 @@ pub struct OpenAICompatProvider {
     /// Whether to forward nanobot's internal per-conversation marker as Higgs'
     /// top-level `session_id` extension. Disabled for every non-Higgs provider.
     higgs_session_cache: bool,
+    /// Optional OpenAI-compatible repetition penalty override.
+    repetition_penalty: Option<f64>,
+    /// Optional OpenAI-compatible frequency penalty override.
+    frequency_penalty: Option<f64>,
+    /// Optional OpenAI-compatible presence penalty override.
+    presence_penalty: Option<f64>,
 }
 
 pub(crate) const NANOBOT_HIGGS_SESSION_ID_FIELD: &str = "_nanobot_higgs_session_id";
@@ -147,6 +153,9 @@ impl OpenAICompatProvider {
             lms_native_probe_secs: 2,
             constrained_tool_calls: true,
             higgs_session_cache: false,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
         }
     }
 
@@ -162,6 +171,19 @@ impl OpenAICompatProvider {
     /// Enable Higgs' cache-resident continuation extension for this provider.
     pub fn with_higgs_session_cache(mut self, enabled: bool) -> Self {
         self.higgs_session_cache = enabled;
+        self
+    }
+
+    /// Attach OpenAI-compatible sampling penalties.
+    pub fn with_sampling_penalties(
+        mut self,
+        repetition_penalty: Option<f64>,
+        frequency_penalty: Option<f64>,
+        presence_penalty: Option<f64>,
+    ) -> Self {
+        self.repetition_penalty = repetition_penalty;
+        self.frequency_penalty = frequency_penalty;
+        self.presence_penalty = presence_penalty;
         self
     }
 
@@ -897,6 +919,15 @@ impl OpenAICompatProvider {
         // Local models can enter a sampling loop where a token sequence echoes
         // until max_tokens; use the model/backend's actual sampling fields.
         apply_repetition_controls(&mut body, &self.api_base, policy_model);
+        if let Some(repetition_penalty) = self.repetition_penalty {
+            body["repetition_penalty"] = serde_json::json!(repetition_penalty);
+        }
+        if let Some(frequency_penalty) = self.frequency_penalty {
+            body["frequency_penalty"] = serde_json::json!(frequency_penalty);
+        }
+        if let Some(presence_penalty) = self.presence_penalty {
+            body["presence_penalty"] = serde_json::json!(presence_penalty);
+        }
         // Strict-validation servers (Apple FM) reject object schemas that omit a
         // `required` key; normalize every outgoing tool schema (no-op elsewhere).
         normalize_tool_schemas(&mut body);
@@ -1826,6 +1857,55 @@ mod tests {
             obj.remove("return_progress");
         }
         assert_eq!(blocking, streaming);
+    }
+
+    #[test]
+    fn test_build_chat_request_injects_sampling_penalties_when_set() {
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:1234/v1"), Some("qwen3-8b"))
+                .with_sampling_penalties(Some(1.15), Some(0.7), Some(-0.3));
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+
+        let (_, body) = provider.build_chat_request(
+            &messages,
+            None,
+            Some("qwen3-8b"),
+            256,
+            0.2,
+            None,
+            Some(0.9),
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+
+        assert_eq!(body["repetition_penalty"], serde_json::json!(1.15));
+        assert_eq!(body["frequency_penalty"], serde_json::json!(0.7));
+        assert_eq!(body["presence_penalty"], serde_json::json!(-0.3));
+    }
+
+    #[test]
+    fn test_build_chat_request_omits_sampling_penalties_when_unset() {
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:1234/v1"), Some("qwen3-8b"));
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+
+        let (_, body) = provider.build_chat_request(
+            &messages,
+            None,
+            Some("llama-3.2-1b"),
+            256,
+            0.2,
+            None,
+            Some(0.9),
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+
+        assert!(body.get("repetition_penalty").is_none());
+        assert!(body.get("frequency_penalty").is_none());
+        assert!(body.get("presence_penalty").is_none());
     }
 
     #[test]

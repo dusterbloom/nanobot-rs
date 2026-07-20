@@ -160,6 +160,12 @@ fn make_managed_compaction_provider(
     Option<Arc<dyn LLMProvider>>,
     Option<Arc<crate::higgs::CompactionSidecarManager>>,
 ) {
+    let (repetition_penalty, frequency_penalty, presence_penalty) = (
+        config.agents.defaults.repetition_penalty,
+        config.agents.defaults.frequency_penalty,
+        config.agents.defaults.presence_penalty,
+    );
+
     let manager = crate::higgs::CompactionSidecarManager::from_config(config);
     let provider = manager.as_ref().map(|manager| -> Arc<dyn LLMProvider> {
         factory::create_openai_compat(
@@ -169,7 +175,12 @@ fn make_managed_compaction_provider(
                 &config.agents.defaults.local_api_key,
             )
             .with_timeout_config(&config.timeouts)
-            .with_retry(config.retry.clone()),
+            .with_retry(config.retry.clone())
+            .with_sampling_penalties(
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+            ),
         )
     });
     (provider, manager)
@@ -258,13 +269,27 @@ pub(super) fn make_local_providers(
 
     let api_key = &config.agents.defaults.local_api_key;
     let constrained = config.agents.defaults.constrained_tool_calls;
+    let (repetition_penalty, frequency_penalty, presence_penalty) = (
+        config.agents.defaults.repetition_penalty,
+        config.agents.defaults.frequency_penalty,
+        config.agents.defaults.presence_penalty,
+    );
 
     let main: Arc<dyn LLMProvider> = factory::create_openai_compat(
         factory::ProviderSpec::local_with_key(&base_url, Some(&model_id), api_key)
             .with_jit_gate_opt(jit_gate.clone())
             .with_timeout_config(&config.timeouts)
             .with_retry(config.retry.clone())
-            .with_higgs_session_cache(is_higgs_backend(&config.agents.defaults.local_backend)),
+            .with_sampling_penalties(repetition_penalty, frequency_penalty, presence_penalty)
+            // Disable higgs session_id (cache-resident KV) so every request routes
+            // through higgs's generate_inner path, which consults the radix prefix
+            // cache. The system+tools prefix is byte-identical across requests and
+            // sessions, so radix hits it on every turn after the first-ever cold
+            // prefill — dropping TTFT from ~26s to ~1-2s. The session path
+            // (generate_continued_impl) bypasses radix (store_prefix_cache=false)
+            // and crashes on the hybrid model if enabled, so radix-via-generate_inner
+            // is both faster AND safer.
+            .with_higgs_session_cache(false),
     );
 
     // Auto-detect context size from the active server; fall back to config default.
@@ -312,6 +337,9 @@ pub(super) fn make_local_providers(
                 lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
                 constrained_tool_calls: constrained,
                 higgs_session_cache: false,
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
             }));
         }
 
@@ -330,7 +358,12 @@ pub(super) fn make_local_providers(
                     .with_jit_gate_opt(jit_gate.clone())
                     .with_timeout_config(&config.timeouts)
                     .with_retry(config.retry.clone())
-                    .with_constrained_tool_calls(constrained),
+                    .with_constrained_tool_calls(constrained)
+                    .with_sampling_penalties(
+                        repetition_penalty,
+                        frequency_penalty,
+                        presence_penalty,
+                    ),
             ));
         }
 
@@ -344,7 +377,12 @@ pub(super) fn make_local_providers(
                 )
                 .with_timeout_config(&config.timeouts)
                 .with_retry(config.retry.clone())
-                .with_constrained_tool_calls(constrained),
+                .with_constrained_tool_calls(constrained)
+                .with_sampling_penalties(
+                    repetition_penalty,
+                    frequency_penalty,
+                    presence_penalty,
+                ),
             )
         })
     };

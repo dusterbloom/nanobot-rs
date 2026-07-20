@@ -1759,6 +1759,7 @@ mod tests {
     #[test]
     fn compaction_manager_respects_explicit_higgs_autostart() {
         let mut off = crate::config::schema::Config::default();
+        off.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Off;
         off.lcm.compaction_port = Some(28002);
         off.lcm.compaction_model_dir = Some("/models/autostart-off".to_string());
         let off_manager = CompactionSidecarManager::from_config(&off).unwrap();

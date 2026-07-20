@@ -131,6 +131,9 @@ impl ClusterRouter {
                     lms_native_probe_secs: 2,
                     constrained_tool_calls: true,
                     higgs_session_cache: false,
+                    repetition_penalty: None,
+                    frequency_penalty: None,
+                    presence_penalty: None,
                 };
                 let provider = factory::create_openai_compat(spec);
                 tracing::info!(
