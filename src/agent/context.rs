@@ -224,7 +224,7 @@ impl ContextBuilder {
             long_term_memory_budget: 200,
             skills_budget: 300,
             profiles_budget: 200,
-            system_prompt_cap: 50,
+            system_prompt_cap: 1000,
             provenance_enabled: false,
             lazy_skills: false,
             skill_disclosure: "compact".to_string(),
@@ -248,11 +248,17 @@ impl ContextBuilder {
         // Pi-style local context has a fixed semantic cost instead of growing
         // with the model window. More context belongs to the conversation and
         // on-demand retrieval, not to an increasingly large permanent prompt.
-        self.bootstrap_budget = (max_context_tokens / 100).clamp(160, 250);
+            // The bootstrap (AGENTS.md workflow + SOUL.md/USER.md persona) is now
+            // part of the byte-stable cached prefix, so it must stay under the
+            // 1000-token stable cap alongside identity + skills. ~2% of context
+            // keeps workflow + persona together while staying well under pi's
+            // ~1000-token system prompt. Clamped to 800 so identity + skills +
+            // bootstrap always fit the 1000-token stable cap without overflow.
+        self.bootstrap_budget = (max_context_tokens / 50).clamp(200, 800);
         self.long_term_memory_budget = 80;
         self.skills_budget = 100;
         self.profiles_budget = 80;
-        self.system_prompt_cap = 50;
+        self.system_prompt_cap = 1000;
     }
 
     /// Scale prompt component budgets proportionally to the model's context window.
@@ -260,11 +266,16 @@ impl ContextBuilder {
     /// Without this, a 1M-context model gets the same 1500-token bootstrap cap
     /// as a 16K model — wasting 99.85% of available system prompt space.
     pub fn scale_budgets(&mut self, max_context_tokens: usize) {
-        self.bootstrap_budget = (max_context_tokens / 50).clamp(500, 20_000); // 2%
-        self.long_term_memory_budget = (max_context_tokens / 100).clamp(200, 10_000); // 1%
-        self.skills_budget = (max_context_tokens / 25).clamp(500, 20_000); // 4%
-        self.profiles_budget = (max_context_tokens / 50).clamp(300, 10_000); // 2%
-                                                                             // Cloud models: generous cap (40% of context), or 0 to disable.
+        // Pi lesson: a permanent system prompt has a fixed semantic cost; growing
+        // it with the model window wastes context that belongs to the conversation
+        // (more belongs in history and on-demand retrieval). Cap component budgets
+        // so even a 1M-token model keeps a lean (~15k-token) prompt instead of
+        // ballooning to ~23k as the old 20k clamps allowed.
+        self.bootstrap_budget = (max_context_tokens / 50).clamp(500, 4_000); // 2%
+        self.long_term_memory_budget = (max_context_tokens / 100).clamp(200, 3_000); // 1%
+        self.skills_budget = (max_context_tokens / 25).clamp(500, 6_000); // 4%
+        self.profiles_budget = (max_context_tokens / 50).clamp(300, 2_000); // 2%
+        // Cloud models: generous hard cap (40% of context) as a safety net only.
         self.system_prompt_cap = max_context_tokens * 2 / 5; // 40%
     }
 
@@ -485,12 +496,15 @@ impl ContextBuilder {
         // The permanent local prefix has a HARD semantic budget, not a model-
         // window percentage. Keep the guarantee even for callers that toggle
         // `local_prompt_mode` on a default builder without calling
-        // `set_lite_mode` first. 50 tokens is the ceiling for the cached prefix:
-        // identity + a shrunk skills index (+ provenance rules if enabled).
+        // `set_lite_mode` first. The stable cached prefix (identity + skills +
+        // the byte-stable workspace bootstrap) is capped at 1000 tokens so Higgs's
+        // radix prefix cache can reuse it across turns without re-prefilling the
+        // whole system prompt. (Formerly 50; the workspace bootstrap was wrongly
+        // excluded from the cache, forcing a full re-prefill every turn.)
         let prompt_cap = if self.system_prompt_cap > 0 {
-            self.system_prompt_cap.min(50)
+            self.system_prompt_cap.min(1000)
         } else {
-            50
+            1000
         };
         let context_window = (prompt_cap as f64 / 0.3).round() as usize;
 
@@ -520,8 +534,9 @@ impl ContextBuilder {
         let stable = stable_assembled.system_content;
 
         // Runtime tail: assembled WITHOUT the prefix budget. It is never a cache
-        // prefix, so dropping it under the 50-token cap would only lose content
-        // (voice constraints, LCM expand guide, workspace context) for no cache win.
+        // prefix, so dropping it under the stable cap would only lose content
+        // (voice constraints, LCM expand guide) for no cache win. The workspace
+        // bootstrap is now part of the byte-stable prefix above, not this tail.
         let runtime_ctx = AssemblyContext {
             context_window: context_window.max(2_000_000),
             system_prompt_cap_pct: 1.0,
@@ -1189,8 +1204,7 @@ impl ContextBuilder {
             };
             (
                 format!(
-                    "You are nanobot. {model_line}. \
-                     Use tools; quote [VERBATIM TOOL OUTPUT] verbatim."
+                    "You are nanobot. {model_line}. Use tools; quote [VERBATIM TOOL OUTPUT] verbatim."
                 ),
                 String::new(),
                 String::new(),
@@ -1220,21 +1234,6 @@ impl ContextBuilder {
                 format!("\n\n## Model\nYou are powered by: {}", self.model_name)
             };
 
-            // Cost-aware delegation hint for expensive models.
-            let is_expensive = self.model_name.contains("opus")
-                || self.model_name.contains("gpt-4o")
-                || self.model_name.contains("claude-max");
-            let delegation_hint = if is_expensive && !self.agent_profiles.is_empty() {
-                "\n\n## Cost Efficiency\n\
-                 You are an expensive model. Delegate mechanical tasks to cheap subagents via `spawn`:\n\
-                 - File writes, web fetches, shell commands whose output you don't need immediately\n\
-                 - Multi-step research that would burn >1000 tokens of intermediate results\n\
-                 - Build/test cycles\n\
-                 Only do it yourself when the result feeds directly into your next sentence."
-            } else {
-                ""
-            };
-
             (
                 format!(
                     "You are nanobot, a helpful AI assistant with tools for file I/O, shell, \
@@ -1245,7 +1244,7 @@ impl ContextBuilder {
                  - Use absolute paths or paths relative to the project directory."
                     .to_string(),
                 format!(
-                    "{delegation_hint}\n\n## Memory\n\
+                    "## Memory\n\
                      Working Memory is injected automatically (session state). \
                      Long-term facts: {workspace_path}/memory/MEMORY.md.\n\
                      Use `recall` to search all memory (sessions, facts, archives).\n\n\
@@ -1309,7 +1308,7 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
         // into the prompt so the agent knows its identity and user preferences.
         // Previously this only listed file names as "available via read_file"
         // which meant local agents started with zero context.
-        let bootstrap = self._load_bootstrap_files_within_budget(self.bootstrap_budget.min(200));
+        let bootstrap = self._load_bootstrap_files_within_budget(self.bootstrap_budget.min(800));
         if !bootstrap.is_empty() {
             blocks.push(PromptBlock::new("Workspace Context", bootstrap));
         }
@@ -1762,12 +1761,12 @@ mod tests {
             "stable sections should remain equal end-to-end"
         );
 
-        // Cache invariant: the byte-stable prefix stays within the 50-token
+        // Cache invariant: the byte-stable prefix stays within the stable cache
         // ceiling no matter how the per-turn runtime tail changes.
         let stable_tokens = TokenBudget::estimate_str_tokens(&stable_1);
         assert!(
-            stable_tokens <= 50,
-            "stable prefix ({stable_tokens} tokens) must stay within the 50-token ceiling"
+            stable_tokens <= 1000,
+            "stable prefix ({stable_tokens} tokens) must stay within the 1000-token ceiling"
         );
         assert_ne!(
             runtime_1, runtime_2,
@@ -2473,9 +2472,10 @@ mod tests {
     fn test_local_builtin_skeleton_stays_within_token_budget() {
         // Pi-style local context starts with a tiny stable harness contract.
         // Product policy and runtime facts belong in code, tools, or dynamic
-        // context rather than permanent prose. The cached prefix is capped at
-        // 50 tokens (10x leaner than the former 500) and must stay byte-identical
-        // across turns so Higgs's radix prefix cache can reuse it.
+        // context rather than permanent prose. The cached prefix holds identity
+        // + skills + the byte-stable workspace bootstrap, capped at 1000 tokens,
+        // and must stay byte-identical across turns so Higgs's radix prefix cache
+        // can reuse it.
         let tmp = TempDir::new().unwrap();
         let mut cb = ContextBuilder::new(tmp.path());
         cb.model_name = "local:Qwen3-35B.gguf".to_string();
@@ -2507,8 +2507,8 @@ mod tests {
         let tokens = TokenBudget::estimate_str_tokens(&stable_a);
         println!("Pi-style local cached prefix: {tokens} tokens");
         assert!(
-            tokens <= 50,
-            "local cached prefix ({tokens} tokens) exceeds the 50-token ceiling"
+            tokens <= 1000,
+            "local cached prefix ({tokens} tokens) exceeds the 1000-token ceiling"
         );
         // The runtime tail is free to vary and must not be folded into the prefix.
         assert!(runtime_a.is_empty(), "empty-workspace run has no runtime tail");
@@ -2580,15 +2580,16 @@ mod tests {
         let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
         let system_content = system_msg["content"].as_str().unwrap();
 
-        // The cached prefix itself must stay within the 50-token ceiling even
-        // with bootstrap/skills present: the variable-size workspace content is
-        // placed in the runtime tail, not the byte-stable prefix.
+        // The cached prefix itself must stay within the 1000-token ceiling even
+        // with bootstrap/skills present: the byte-stable workspace bootstrap is
+        // now part of the cached prefix (not the runtime tail), so it must still
+        // fit under the cap.
         let (stable, _runtime, _) =
             cb.build_local_system_prompt_parts(None, None, None, false, None, &[]);
         let stable_tokens = TokenBudget::estimate_str_tokens(&stable);
         assert!(
-            stable_tokens <= 52,
-            "local cached prefix ({stable_tokens} tokens) must stay within the 50-token ceiling (+2 tiktoken slack)"
+            stable_tokens <= 1000,
+            "local cached prefix ({stable_tokens} tokens) must stay within the 1000-token ceiling"
         );
         // The stable prefix still carries the model identity and the on-demand
         // skills hint (the skill index is advertised, not enumerated, so the
@@ -2597,7 +2598,7 @@ mod tests {
         assert!(stable.contains("mlx:Qwen3-8B-MLX-4bit"));
         assert!(stable.contains("read_skill"));
 
-        // Bootstrap content is assembled (in the runtime tail) and the full
+        // Bootstrap content is part of the byte-stable prefix, so the full
         // prompt still exposes it; long-term memory stays out of the local prompt.
         assert!(system_content.contains("Bootstrap directive"));
         assert!(system_content.contains("read_skill"));

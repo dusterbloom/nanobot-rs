@@ -4967,7 +4967,8 @@ mod runtime_mode_parity_tests {
     /// Task 2 / Branch 1–2: context builder reflects the mode's lite/full defaults.
     /// Cloud: `local_prompt_mode == false`, `system_prompt_cap == 0` prior to scaling
     /// (then scale_budgets sets it to 40% of ctx). Local: `local_prompt_mode == true`,
-    /// `system_prompt_cap` capped by set_lite_mode's `(ctx*3/10).clamp(500, 4000)`.
+    /// `system_prompt_cap` is a fixed 1000-token cached-prefix cap set by set_lite_mode
+    /// (the tiny-model ≤4K branch keeps a leaner 50-token prefix).
     #[test]
     fn build_core_context_cap_cloud_uses_full_scaling() {
         let core = build_test_core(false, None, None);
@@ -5017,9 +5018,10 @@ mod runtime_mode_parity_tests {
             ),
         });
         assert!(core.context.local_prompt_mode);
-        // Local prompt cost is fixed rather than scaling with the model window,
-        // and is capped at 50 tokens so the byte-stable cached prefix stays lean.
-        assert_eq!(core.context.system_prompt_cap, 50);
+        // Local prompt cost is fixed rather than scaling with the model window:
+        // the byte-stable cached prefix (identity + skills + workspace bootstrap)
+        // is capped at 1000 tokens so Higgs's radix prefix cache can reuse it.
+        assert_eq!(core.context.system_prompt_cap, 1000);
     }
 
     /// Task 2 / Branch 3: cloud memory provider/model follows the pre-Wave-2 path.

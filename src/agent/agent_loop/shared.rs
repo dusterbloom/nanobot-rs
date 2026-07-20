@@ -1663,10 +1663,11 @@ impl AgentLoopShared {
     /// Returns `(active_defs, saved_defs)` where `saved_defs` preserves the
     /// pre-trio-stripping state for router passthrough fallback.
     fn select_tool_definitions(&self, ctx: &mut TurnContext) -> (Vec<Value>, Vec<Value>) {
-        // One production catalog for every runtime mode. Long-tail tools stay
-        // executable through the proxy meta-tool, while the stable Lean schema
-        // keeps provider behavior and prompt-prefix caching identical.
-        let mut tool_defs = ctx.tools.get_lean_definitions();
+        // One production catalog for every runtime mode. Four hot coding tools
+        // are native at turn 1; the long tail stays executable through the
+        // `tool` proxy meta-tool, keeping the cold-prefill tool block small and
+        // the prompt-prefix cache stable.
+        let mut tool_defs = ctx.tools.get_core_plus_proxy_definitions();
         // Tool-averse models (no tool-calling training, e.g. VibeThinker):
         // the native `tools` parameter confuses or errors their chat
         // templates, and nothing else would teach them the textual syntax the

@@ -55,12 +55,16 @@ impl PromptSection {
     pub fn kind(&self) -> PromptBlockKind {
         match self {
             Self::Identity => PromptBlockKind::Prefix,
-            Self::Verification | Self::Skills => PromptBlockKind::Static,
+            // WorkspaceContext is the workspace bootstrap (AGENTS.md workflow +
+            // SOUL.md/USER.md persona). It is byte-stable within a session, so it
+            // belongs in the cached radix prefix — classifying it Static lets Higgs
+            // reuse the prefix across turns instead of re-prefilling the whole
+            // system prompt every turn.
+            Self::Verification | Self::Skills | Self::WorkspaceContext => PromptBlockKind::Static,
             // These vary per-request (depend on user message content, loaded
             // files, workspace state) → Runtime so they don't poison the
             // byte-stable system prefix that higgs radix-caches.
-            Self::WorkspaceContext
-            | Self::OnDemandContext
+            Self::OnDemandContext
             | Self::RequestedSkills
             | Self::SessionMetadata
             | Self::ToolUse
@@ -443,7 +447,7 @@ mod tests {
         // stable prefix so they don't poison the local prefix cache.
         assert_eq!(
             PromptSection::WorkspaceContext.kind(),
-            PromptBlockKind::Runtime
+            PromptBlockKind::Static
         );
         assert_eq!(
             PromptSection::OnDemandContext.kind(),

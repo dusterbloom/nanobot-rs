@@ -689,9 +689,22 @@ impl ToolRegistry {
         "session_search",
     ];
 
+    /// The four hot coding tools advertised as native schemas at turn 1
+    /// (pi's minimal surface). Everything else stays reachable via the `tool`
+    /// proxy meta-tool. Keeps the cold-prefill tool block small while sparing
+    /// the model an inspect round-trip for the tools it uses every turn.
+    const CORE_NATIVE_TOOLS: &'static [&'static str] = &[
+        "read_file",
+        "write_file",
+        "edit_file",
+        "exec",
+    ];
+
     /// Internal Lean-catalog builder: condense every available schema before
-    /// selecting the fixed production subset.
-    fn get_local_definitions(&self) -> Vec<serde_json::Value> {
+    /// selecting the fixed production subset. `pub(crate)` so the delegation
+    /// (sub-agent) path can also send condensed descriptions without losing
+    /// any tool (unlike `get_lean_definitions`, which is a fixed subset).
+    pub(crate) fn get_local_definitions(&self) -> Vec<serde_json::Value> {
         let mut defs: Vec<serde_json::Value> = self
             .tools
             .values()
@@ -749,6 +762,47 @@ impl ToolRegistry {
         self.get_proxy_definition()
     }
 
+    /// Core-plus-proxy surface: four hot coding tools as native schemas at
+    /// turn 1 (`read_file`, `write_file`, `edit_file`, `exec`), plus the `tool`
+    /// proxy meta-tool for everything else. The model no longer pays an inspect
+    /// round-trip for the tools it uses every turn, while the proxy keeps the
+    /// long tail executable on demand (no tool lost).
+    pub fn get_core_plus_proxy_definitions(&self) -> Vec<serde_json::Value> {
+        let mut defs: Vec<serde_json::Value> = Self::CORE_NATIVE_TOOLS
+            .iter()
+            .filter_map(|name| {
+                self.tools
+                    .get(*name)
+                    .filter(|t| t.is_available())
+                    .map(|t| t.to_schema())
+            })
+            .collect();
+        Self::condense_definitions(&mut defs);
+        // Slim parameter descriptions (pi-style leanness); keep read_file's
+        // `lines` paging syntax, which small models need to page large files.
+        for def in &mut defs {
+            let name = def
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name == "read_file" {
+                continue;
+            }
+            if let Some(params) = def.pointer_mut("/function/parameters/properties") {
+                if let Some(props) = params.as_object_mut() {
+                    for (_k, prop) in props.iter_mut() {
+                        if let Some(obj) = prop.as_object_mut() {
+                            obj.remove("description");
+                        }
+                    }
+                }
+            }
+        }
+        Self::sort_definitions(&mut defs);
+        defs.extend(self.get_proxy_definition_excluding(Self::CORE_NATIVE_TOOLS));
+        defs
+    }
+
     // -------------------------------------------------------------------
     // Tool proxy: single compact schema for local models
     // -------------------------------------------------------------------
@@ -795,11 +849,20 @@ impl ToolRegistry {
     ///
     /// Token cost: ~90 tokens vs ~2045 for 15 individual schemas.
     fn get_proxy_definition(&self) -> Vec<serde_json::Value> {
+        self.get_proxy_definition_excluding(&[])
+    }
+
+    /// Like [`get_proxy_definition`], but omits `exclude` tool names from the
+    /// advertised catalog. Used by `get_core_plus_proxy_definitions` so the
+    /// four native core tools aren't double-listed (once as native schemas,
+    /// once in the proxy catalog).
+    fn get_proxy_definition_excluding(&self, exclude: &[&str]) -> Vec<serde_json::Value> {
         let mut hints: Vec<String> = self
             .tools
             .values()
             .filter(|t| t.is_available())
             .map(|t| Self::tool_hint(t.as_ref()))
+            .filter(|h| !exclude.iter().any(|e| h.starts_with(e)))
             .collect();
         hints.sort();
 
@@ -955,8 +1018,9 @@ mod tests {
         let slim = TokenBudget::estimate_tool_def_tokens(&reg.get_slim_definitions());
         let lean = TokenBudget::estimate_tool_def_tokens(&reg.get_lean_definitions());
         let proxy = TokenBudget::estimate_tool_def_tokens(&reg.get_proxy_definition());
+        let core_proxy = TokenBudget::estimate_tool_def_tokens(&reg.get_core_plus_proxy_definitions());
         println!(
-            "tool surface: count={count} full={full} local={local} slim={slim} lean={lean} proxy={proxy}"
+            "tool surface: count={count} full={full} local={local} slim={slim} lean={lean} proxy={proxy} core_proxy={core_proxy}"
         );
         // Lean surface is now a SINGLE proxy definition (~150 tokens), paid on
         // every cold prefill. This is the lazy-load contract: one tool at turn 1.
@@ -972,6 +1036,43 @@ mod tests {
         assert!(
             slim <= 2500,
             "slim tool defs ballooned to {slim} tokens (budget 2500) across {count} tools"
+        );
+        assert!(
+            core_proxy <= 800,
+            "core+proxy surface ballooned to {core_proxy} tokens (budget 800) — \
+             4 native schemas + proxy must stay cheap on the local cold path"
+        );
+    }
+
+    /// Core-plus-proxy surface: exactly 4 native core tools + the `tool` proxy,
+    /// and the proxy catalog must NOT re-advertise the core tools.
+    #[test]
+    fn test_core_plus_proxy_surface() {
+        let ws = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        let defs = reg.get_core_plus_proxy_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"read_file"), "core+proxy missing read_file: {names:?}");
+        assert!(names.contains(&"write_file"), "core+proxy missing write_file: {names:?}");
+        assert!(names.contains(&"edit_file"), "core+proxy missing edit_file: {names:?}");
+        assert!(names.contains(&"exec"), "core+proxy missing exec: {names:?}");
+        assert!(names.contains(&"tool"), "core+proxy missing tool proxy: {names:?}");
+        assert_eq!(names.len(), 5, "core+proxy must be 4 native + 1 proxy, got {names:?}");
+        let proxy_desc = defs
+            .iter()
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("tool"))
+            .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        assert!(
+            !proxy_desc.contains("read_file("),
+            "proxy must not re-advertise core tool read_file"
+        );
+        assert!(
+            !proxy_desc.contains("exec("),
+            "proxy must not re-advertise core tool exec"
         );
     }
 

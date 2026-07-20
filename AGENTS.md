@@ -35,6 +35,18 @@ codebase with one well-tuned hot path per concern.
 - File tools must validate paths and honor workspace restrictions when configured.
 - Web-fetched content must be marked tainted before reaching exec tools.
 
+## Operating Conventions
+
+- **Long-running processes via `tmux`, not background bash.** The exec tool runs
+  commands synchronously and returns when they exit; there is no background-task
+  manager by design. Run dev servers, test watchers, and REPLs inside `tmux`
+  sessions so they persist and stay inspectable (`tmux ls`, `tmux attach`). This
+  mirrors pi's "bash is all you need" stance and keeps process state observable.
+- **Externalize planning and todos to files.** Use `PLAN.md` / `TODO.md` in the
+  workspace instead of in-prompt task lists — file state survives compaction, is
+  shareable across sessions, and avoids confusing the model with bookkeeping.
+  Check items off as you go; do not maintain a running to-do inside the chat.
+
 ## Layout
 
 - `src/main.rs`, `src/cli/`, `src/repl/`: command-line and REPL entrypoints.

@@ -584,7 +584,10 @@ pub async fn run_tool_loop(
 
     // Get tool definitions — filtered to ONLY the tools the main model requested.
     // The delegation model must not discover tools it wasn't asked to use.
-    let all_tool_defs = tools.get_definitions();
+    // Use condensed (first-two-sentence) descriptions: pi's lesson is that a
+    // minimal tool schema is enough even for frontier models, and it saves the
+    // delegation model's context for the actual task.
+    let all_tool_defs = tools.get_local_definitions();
     let mut tool_defs: Vec<Value> = all_tool_defs
         .into_iter()
         .filter(|def| {
