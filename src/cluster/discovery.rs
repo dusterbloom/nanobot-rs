@@ -29,6 +29,14 @@ const MAX_CONCURRENT_PROBES: usize = 20;
 /// HTTP timeout for a single `/v1/models` probe.
 const PROBE_TIMEOUT_SECS: u64 = 3;
 
+/// Hard wall-clock budget for the /24 subnet scan. The scan fans out thousands
+/// of TCP connect probes (254 IPs × scan_ports, each up to `PROBE_TIMEOUT_SECS`);
+/// left unbounded it dominates the first turn for single-node setups. This cap
+/// guarantees discovery can never delay startup/turn by more than a few seconds,
+/// regardless of `auto_discover` or LAN size. Live peers found before the budget
+/// is hit are still recorded.
+const SUBNET_SCAN_BUDGET_SECS: u64 = 3;
+
 /// mDNS browse window before moving on.
 const MDNS_BROWSE_TIMEOUT_SECS: u64 = 5;
 
@@ -147,7 +155,21 @@ impl ClusterDiscovery {
                     ports = self.config.scan_ports.len(),
                     "cluster_subnet_scan_start"
                 );
-                let subnet_endpoints = self.scan_subnet(&subnet_ips).await;
+                let subnet_endpoints = match tokio::time::timeout(
+                    Duration::from_secs(SUBNET_SCAN_BUDGET_SECS),
+                    self.scan_subnet(&subnet_ips),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::warn!(
+                            budget_secs = SUBNET_SCAN_BUDGET_SECS,
+                            "cluster_subnet_scan_budget_exceeded"
+                        );
+                        Vec::new()
+                    }
+                };
                 // scan_subnet already updates state for live peers; collect for dedup.
                 let _ = subnet_endpoints;
             }
