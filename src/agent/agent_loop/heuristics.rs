@@ -76,10 +76,52 @@ pub(super) fn should_strip_tools_for_trio(
     router_probe_healthy: bool,
     circuit_breaker_available: bool,
 ) -> bool {
-    let result =
-        is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available;
-    tracing::debug!(strip_tools = result, "trio_strip_decision");
-    result
+        let result =
+            is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available;
+        tracing::debug!(strip_tools = result, "trio_strip_decision");
+        result
+    }
+
+/// Outcome of the repeated successful tool-call breaker for one executed round.
+pub(crate) enum RepeatBreakerAction {
+    /// Not a repeat (or first occurrence) — no action.
+    Continue,
+    /// Identical round repeated past threshold for the first time: nudge the
+    /// model that tool results are already in context.
+    Nudge,
+    /// Repeated again after a nudge: stop the loop.
+    Stop,
+}
+
+/// Pure decision for the repeated successful tool-call breaker.
+///
+/// `last`/`prev` are the normalized tool-call keys of the current and previous
+/// executed rounds (empty if no tools ran). `prior_rounds` is the consecutive
+/// repeat count carried from the previous round; `prior_nudged` whether we have
+/// already nudged. Returns `(action, new_rounds, new_nudged)`.
+///
+/// The model "fires" tools without consuming their results when it dispatches
+/// the exact same calls (name + args) two rounds in a row. We nudge once; if it
+/// repeats again after the nudge we stop, rather than burning the whole budget.
+pub(crate) fn evaluate_repeated_tool_round(
+    last: &[String],
+    prev: &[String],
+    prior_rounds: u32,
+    prior_nudged: bool,
+    max: u32,
+) -> (RepeatBreakerAction, u32, bool) {
+    let is_repeat = !last.is_empty() && last == prev;
+    let rounds = if is_repeat { prior_rounds + 1 } else { 0 };
+    let nudged = if is_repeat { prior_nudged } else { false };
+    if rounds >= max && nudged {
+        (RepeatBreakerAction::Stop, rounds, nudged)
+    } else if rounds >= max {
+        // Nudge, and keep the counter one below threshold so a single further
+        // repeat forces Stop.
+        (RepeatBreakerAction::Nudge, max - 1, true)
+    } else {
+        (RepeatBreakerAction::Continue, rounds, nudged)
+    }
 }
 
 const ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD: usize = 3;
@@ -229,7 +271,10 @@ pub(crate) fn appears_incomplete(content: &str) -> bool {
 // ============================================================================
 #[cfg(test)]
 mod tests {
-    use super::{adaptive_max_tokens, should_strip_tools_for_trio};
+    use super::{
+        adaptive_max_tokens, evaluate_repeated_tool_round, RepeatBreakerAction,
+        should_strip_tools_for_trio,
+    };
     use crate::config::schema::AdaptiveTokenConfig;
 
     // -----------------------------------------------------------------------
@@ -375,5 +420,86 @@ mod tests {
             cfg.adaptive_long_form_min_tokens + 500,
             "local long-form: bump then +thinking"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // evaluate_repeated_tool_round — pins the repeated-tool-call breaker
+    // decision (shared.rs:1135-1186). Two identical successful rounds in a row
+    // nudge; a third after the nudge stops.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repeat_breaker_first_identical_round_is_continue() {
+        // R1 dispatches [recall:X]; prev is empty → not a repeat.
+        let (action, rounds, nudged) = evaluate_repeated_tool_round(
+            &["recall:X".to_string()],
+            &[],
+            0,
+            false,
+            2,
+        );
+        assert!(matches!(action, RepeatBreakerAction::Continue));
+        assert_eq!(rounds, 0);
+        assert!(!nudged);
+    }
+
+    #[test]
+    fn test_repeat_breaker_two_identical_rounds_nudges() {
+        // R2 dispatches [recall:X] again, identical to prev → count hits max → Nudge.
+        let (action, rounds, nudged) = evaluate_repeated_tool_round(
+            &["recall:X".to_string()],
+            &["recall:X".to_string()],
+            1,
+            false,
+            2,
+        );
+        assert!(matches!(action, RepeatBreakerAction::Nudge));
+        // Counter held one below threshold so the next repeat forces Stop.
+        assert_eq!(rounds, 1);
+        assert!(nudged);
+    }
+
+    #[test]
+    fn test_repeat_breaker_third_identical_round_after_nudge_stops() {
+        // R3 identical again, already nudged → Stop.
+        let (action, _rounds, nudged) = evaluate_repeated_tool_round(
+            &["recall:X".to_string()],
+            &["recall:X".to_string()],
+            1,
+            true,
+            2,
+        );
+        assert!(matches!(action, RepeatBreakerAction::Stop));
+        assert!(nudged);
+    }
+
+    #[test]
+    fn test_repeat_breaker_different_round_resets() {
+        // A round with different tools breaks the streak.
+        let (action, rounds, nudged) = evaluate_repeated_tool_round(
+            &["recall:Y".to_string()],
+            &["recall:X".to_string()],
+            1,
+            true,
+            2,
+        );
+        assert!(matches!(action, RepeatBreakerAction::Continue));
+        assert_eq!(rounds, 0);
+        assert!(!nudged, "streak must reset when the round changes");
+    }
+
+    #[test]
+    fn test_repeat_breaker_no_tools_round_is_not_a_repeat() {
+        // A round that executed no tools must not trigger the breaker.
+        let (action, rounds, nudged) = evaluate_repeated_tool_round(
+            &[],
+            &["recall:X".to_string()],
+            1,
+            false,
+            2,
+        );
+        assert!(matches!(action, RepeatBreakerAction::Continue));
+        assert_eq!(rounds, 0);
+        assert!(!nudged);
     }
 }

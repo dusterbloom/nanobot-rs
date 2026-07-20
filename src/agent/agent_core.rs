@@ -20,7 +20,7 @@ use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
 use crate::config::schema::{
-    AdaptiveTokenConfig, AntiDriftConfig, CircuitBreakerConfig, MemoryConfig, ProvenanceConfig,
+    AdaptiveTokenConfig, CircuitBreakerConfig, MemoryConfig, ProvenanceConfig,
     ToolDelegationConfig, TrioConfig,
 };
 use crate::providers::base::LLMProvider;
@@ -67,7 +67,6 @@ pub struct SwappableCore {
     /// removed in R6 — it duplicated information already carried by this enum.
     pub mode: RuntimeMode,
     pub lane: Lane,
-    pub anti_drift: AntiDriftConfig,
     pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
     pub tool_runner_model: Option<String>,
     pub router_provider: Option<Arc<dyn LLMProvider>>,
@@ -83,11 +82,12 @@ pub struct SwappableCore {
     pub provenance_config: ProvenanceConfig,
     pub max_tool_result_chars: usize,
     pub session_complete_after_secs: u64,
-    pub max_message_age_turns: usize,
     pub max_history_turns: usize,
     pub model_capabilities: crate::agent::model_capabilities::ModelCapabilities,
-    /// Number of recent messages to keep untruncated in context hygiene (default: 20).
-    pub hygiene_keep_last_messages: usize,
+    /// Single owner of hygiene/anti-drift/budget-trim retention knobs. See
+    /// `agent::retention` — replaces the formerly separate `anti_drift`,
+    /// `max_message_age_turns`, and `hygiene_keep_last_messages` fields.
+    pub retention: crate::agent::retention::RetentionPolicy,
     /// When true, specialist is instructed to return strict JSON and the response
     /// is parsed as `SpecialistResponse`. Sourced from `TrioConfig::specialist_output_schema`.
     pub specialist_output_schema: bool,
@@ -632,7 +632,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         reflection_threshold: memory_config.reflection_threshold,
         mode,
         lane,
-        anti_drift: trio_config.anti_drift.clone(),
         tool_runner_provider,
         tool_runner_model,
         router_provider,
@@ -648,10 +647,12 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         provenance_config: provenance,
         max_tool_result_chars,
         session_complete_after_secs: memory_config.session_complete_after_secs,
-        max_message_age_turns: memory_config.max_message_age_turns,
         max_history_turns: memory_config.max_history_turns,
         model_capabilities,
-        hygiene_keep_last_messages: memory_config.hygiene.keep_last_messages,
+        retention: crate::agent::retention::RetentionPolicy::from_config(
+            &memory_config,
+            &trio_config.anti_drift,
+        ),
         specialist_output_schema: trio_config.specialist_output_schema,
         trace_log: trio_config.trace_log,
         reasoning_config,
@@ -702,14 +703,19 @@ fn resolve_memory_provider(
                 model.to_string()
             };
             let mem_provider: Arc<dyn LLMProvider> =
-                if let Some(ref mem_provider_cfg) = memory_config.provider {
+                if let Some(cp) = compaction_provider {
+                    // A managed compaction sidecar is the one endpoint source
+                    // for local memory ops — it wins over an explicit
+                    // `memory.provider`, which would otherwise silently point
+                    // compaction at a different server than the sidecar
+                    // startup/health-check machinery manages.
+                    cp
+                } else if let Some(ref mem_provider_cfg) = memory_config.provider {
                     crate::providers::factory::from_provider_config_for_model_with_default_base(
                         mem_provider_cfg,
                         Some(&mem_model),
                         provider.get_api_base(),
                     )
-                } else if let Some(cp) = compaction_provider {
-                    cp
                 } else if let Some(sp) = specialist_provider {
                     // Reuse trio specialist provider when no managed compactor exists.
                     sp.clone()

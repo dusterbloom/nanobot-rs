@@ -496,7 +496,9 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
     assert_eq!(
         core.tool_runner_model.as_deref(),
@@ -563,7 +565,9 @@ fn test_delegation_with_is_local_true() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
 
     assert!(core.mode().is_local());
@@ -632,7 +636,9 @@ fn test_delegation_with_is_local_false_cloud() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
 
     // pins agent_core.rs: is_local plumbs through to the core unchanged
@@ -722,7 +728,9 @@ fn test_delegation_with_compaction_and_delegation_providers() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
 
     // Compaction provider goes to memory_provider, delegation to tool_runner
@@ -808,7 +816,9 @@ fn test_delegation_with_compaction_and_delegation_providers_cloud() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
 
     assert_eq!(
@@ -917,7 +927,9 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
     let counters = test_runtime_counters(2048);
     let core_handle = AgentHandle::new(core, counters);
@@ -1235,7 +1247,9 @@ fn build_trio_e2e_harness(
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
 
     let counters = test_runtime_counters(4096);
@@ -1695,7 +1709,9 @@ async fn test_trio_e2e_router_unreachable() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
     let counters = test_runtime_counters(4096);
     let core_handle = AgentHandle::new(core, counters);
@@ -1811,7 +1827,9 @@ async fn test_trio_e2e_specialist_unreachable() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
     let counters = test_runtime_counters(4096);
     let core_handle = AgentHandle::new(core, counters);
@@ -2447,7 +2465,9 @@ fn build_trio_offline_harness(
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
 
     let counters = test_runtime_counters(4096);
@@ -2507,6 +2527,34 @@ fn build_local_inline_harness_with_memory(
     lcm_config: LcmSchemaConfig,
     memory_config: MemoryConfig,
 ) -> (AgentLoop, std::path::PathBuf) {
+    build_local_inline_harness_with_memory_and_compaction(
+        main,
+        model,
+        max_context_tokens,
+        lcm_config,
+        memory_config,
+        None,
+        None,
+    )
+}
+
+/// Same as [`build_local_inline_harness_with_memory`], but lets a test wire
+/// a distinct compaction-capable provider (`resolve_memory_provider`'s
+/// specialist fallback slot) instead of implicitly reusing `main`, and/or a
+/// managed compaction sidecar manager. Needed for hard/soft LCM tests where
+/// compaction now genuinely calls an LLM (no more silent deterministic-
+/// truncation fallback) and must not silently consume the foreground
+/// `WireRecordingProvider`'s call log, or must exercise a real sidecar
+/// acquire-failure path.
+fn build_local_inline_harness_with_memory_and_compaction(
+    main: Arc<dyn LLMProvider>,
+    model: &str,
+    max_context_tokens: usize,
+    lcm_config: LcmSchemaConfig,
+    memory_config: MemoryConfig,
+    compaction: Option<Arc<dyn LLMProvider>>,
+    compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
+) -> (AgentLoop, std::path::PathBuf) {
     let workspace = tempfile::tempdir().unwrap().keep();
     let core = build_swappable_core(SwappableCoreConfig {
         provider: main,
@@ -2528,19 +2576,21 @@ fn build_local_inline_harness_with_memory(
         is_local: true,
         lane: Lane::default(),
         compaction_provider: None,
-        compaction_manager: None,
+        compaction_manager,
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
         delegation_provider: None,
-        specialist_provider: None,
+        specialist_provider: compaction,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
 
     let counters = test_runtime_counters(max_context_tokens);
@@ -2565,6 +2615,134 @@ fn build_local_inline_harness_with_memory(
     );
 
     (agent_loop, workspace)
+}
+
+/// Cloud-mode counterpart to `build_local_inline_harness_with_memory_and_compaction`
+/// (`is_local: false`). Exercises the real system+developer assembly split
+/// (`ContextBuilder::collect_static_sections`) plus `prepare_context`'s
+/// `collect_cloud_runtime_sections` (MemoryLadder, background-task status) --
+/// the two mechanisms that once double-injected `MEMORY.md`.
+fn build_cloud_inline_harness_with_memory(
+    main: Arc<dyn LLMProvider>,
+    model: &str,
+    memory_config: MemoryConfig,
+) -> (AgentLoop, std::path::PathBuf) {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let max_context_tokens = 128_000;
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider: main,
+        workspace: workspace.clone(),
+        model: model.to_string(),
+        max_iterations: 5,
+        max_continuations: 2,
+        max_tokens: 512,
+        temperature: 0.3,
+        max_context_tokens,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        crw_url: String::new(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: true,
+        memory_config,
+        is_local: false,
+        lane: Lane::default(),
+        compaction_provider: None,
+        compaction_manager: None,
+        tool_delegation: ToolDelegationConfig::default(),
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        delegation_provider: None,
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
+    });
+
+    let counters = test_runtime_counters(max_context_tokens);
+    let core_handle = AgentHandle::new(core, counters);
+
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+
+    let agent_loop = AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx,
+        None,
+        1,
+        None,
+        None,
+        None,
+        ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    );
+
+    (agent_loop, workspace)
+}
+
+/// Regression test for the MEMORY.md double-injection bug: `ContextBuilder::
+/// collect_static_sections` used to be one injector and `MemoryLadder`'s
+/// (now-removed) `GroundTruth` layer -- reached via `prepare_context::
+/// collect_cloud_runtime_sections` -- was a second, silently duplicating
+/// long-term memory content into the assembled cloud-path messages.
+///
+/// Inspects `TurnContext.messages` directly (via `prepare_context`, the
+/// method that actually assembles system+developer content) rather than the
+/// protocol-rendered wire sent to a provider -- `render_to_wire`/
+/// `turn_from_legacy` has a separate, pre-existing gap where `role:
+/// "developer"` messages aren't converted to a `Turn` at all and are dropped
+/// during rendering, which is an unrelated protocol-layer bug, not a memory
+/// double-injection.
+#[tokio::test]
+async fn memory_md_appears_exactly_once_in_assembled_cloud_messages() {
+    let provider = MockLLM::named("cloud-memory-dedup-test");
+    let (agent_loop, workspace) = build_cloud_inline_harness_with_memory(
+        provider,
+        "cloud-memory-dedup-test",
+        MemoryConfig::default(),
+    );
+
+    // Distinctive content only `MEMORY.md` contains -- `collect_static_sections`
+    // (the sole intended injector) reads it from disk via `MemoryStore`.
+    const MARKER: &str = "XYZZY-UNIQUE-MEMORY-MARKER-42: the user prefers oat milk.";
+    let memory_dir = workspace.join("memory");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+    std::fs::write(memory_dir.join("MEMORY.md"), MARKER).unwrap();
+
+    let session_key = format!("cloud-memory-dedup-{}", uuid::Uuid::new_v4());
+    let mut msg = InboundMessage::new("test", "user", "offline", "Hello there.");
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key));
+
+    let turn_ctx = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+
+    // Count substring occurrences (not just how many messages contain it) so
+    // a duplicate concatenated into the SAME message -- e.g. two blocks
+    // folded into one `developer` message -- is caught too.
+    let occurrences: usize = turn_ctx
+        .messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .map(|content| content.matches(MARKER).count())
+        .sum();
+    assert_eq!(
+        occurrences, 1,
+        "MEMORY.md content must appear exactly once across the assembled cloud-path messages, got {}",
+        occurrences
+    );
 }
 
 /// Records the full wire `messages` array of every `chat()` call and replays
@@ -2633,17 +2811,29 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
         "local-hard-lcm-test",
         vec![WireRecordingProvider::text_response("foreground reply")],
     ));
+    // Compaction now genuinely calls an LLM (no more silent deterministic-
+    // truncation fallback), so it needs its own mock — otherwise it would
+    // consume/interleave with the foreground provider's call log below.
+    let compaction_provider = Arc::new(WireRecordingProvider::new(
+        "local-hard-lcm-compaction",
+        vec![WireRecordingProvider::text_response(
+            "- Prior turns retained project detail context for later reference.",
+        )],
+    ));
     let lcm_config = LcmSchemaConfig {
         tau_soft: 0.05,
         tau_hard: 0.10,
         deterministic_target: 64,
         ..Default::default()
     };
-    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+    let (agent_loop, _workspace) = build_local_inline_harness_with_memory_and_compaction(
         provider.clone() as Arc<dyn LLMProvider>,
         "local-hard-lcm-test",
         8192,
         lcm_config,
+        MemoryConfig::default(),
+        Some(compaction_provider as Arc<dyn LLMProvider>),
+        None,
     );
     let session_key = format!("hard-lcm-barrier-{}", uuid::Uuid::new_v4());
     let core = agent_loop.shared.core_handle.swappable();
@@ -2680,12 +2870,20 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
 
     let calls = provider.calls();
     assert_eq!(calls.len(), 1, "expected one foreground provider call");
+    // Internal fields like `_lcm_summary` are stripped before messages hit
+    // the wire, so `calls[0]` can't be checked via that tag. Match the
+    // summary wire message's exact phrasing instead of a bare "[Summary of
+    // messages" substring — the LCM_EXPAND_GUIDE instructional text
+    // (prepare_context.rs) contains that same lead-in as a generic example
+    // ("copy that range into lcm_expand — for example ..."), which would
+    // false-positive this check even if compaction never installed
+    // anything. `summary_wire_message` (lcm.rs) uniquely phrases it "To read
+    // the exact originals call lcm_expand(...)".
     let has_summary = calls[0].iter().any(|message| {
-        message.get("role").and_then(Value::as_str) != Some("system")
-            && message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| content.contains("[Summary of messages"))
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("To read the exact originals call"))
     });
     assert!(
         has_summary,
@@ -2746,16 +2944,44 @@ async fn soft_lcm_sidecar_failure_preserves_foreground_context() {
         deterministic_target: 64,
         ..Default::default()
     };
-    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+
+    // A managed sidecar IS configured, but points at a port nothing is
+    // listening on, so `manager.acquire()` fails fast. `localAutostart` is
+    // explicitly off so acquire fails via health-check rather than trying
+    // (and failing) to spawn a real `higgs` binary in this unit test.
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead_listener.local_addr().unwrap().port();
+    drop(dead_listener);
+    let mut sidecar_config = crate::config::schema::Config::default();
+    sidecar_config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Off;
+    sidecar_config.lcm.compaction_port = Some(dead_port);
+    sidecar_config.lcm.compaction_model_dir = Some("/tmp/nanobot-test-dead-compactor".to_string());
+    let compaction_manager = crate::higgs::CompactionSidecarManager::from_config(&sidecar_config);
+    assert!(
+        compaction_manager.is_some(),
+        "test setup: sidecar manager must be configured"
+    );
+
+    let (agent_loop, _workspace) = build_local_inline_harness_with_memory_and_compaction(
         provider.clone() as Arc<dyn LLMProvider>,
         "local-soft-lcm-test",
         1_000_000,
         lcm_config,
+        MemoryConfig::default(),
+        None,
+        compaction_manager,
     );
     let session_key = format!("soft-lcm-preserve-{}", uuid::Uuid::new_v4());
     let core = agent_loop.shared.core_handle.swappable();
     let session = core.sessions.get_or_resume(&session_key).await;
-    for turn in 0..3_u64 {
+    // 8 turns of padded content: the LCM engine protects a ~2048-token tail
+    // of the most recent raw messages (see `protect_tokens_for_budget`) and
+    // only compacts the oldest block beyond that. It must clear
+    // `MIN_COMPACTION_TOKENS` (200) or compaction skips silently without
+    // ever calling the provider — this volume keeps the oldest block
+    // comfortably above that floor so the sidecar-failure fallback to the
+    // main provider is actually exercised.
+    for turn in 0..8_u64 {
         core.sessions
             .add_message(
                 &session.id,
@@ -2783,21 +3009,58 @@ async fn soft_lcm_sidecar_failure_preserves_foreground_context() {
         )
         .await;
     assert_eq!(response, "foreground reply");
+
+    // Async (soft) compaction runs in a background task, and the sidecar
+    // acquire failure now involves a real (fast, but non-instant) health
+    // check — give it a moment to reach the main-provider fallback before
+    // inspecting the call log.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while provider.calls().len() <= 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background compaction attempt against the main provider must complete");
+
+    // Sidecar acquire failed, so compaction fell back to compacting against
+    // the main provider directly (Task 3a) — the mock's canned reply isn't a
+    // valid bullet-only handoff, so both escalation levels reject it and
+    // compaction leaves the context uncompacted rather than ever installing
+    // the deleted deterministic-truncation fallback. That fallback attempt
+    // is real: `provider` sees more than just the one foreground call.
     let calls = provider.calls();
-    assert_eq!(calls.len(), 1);
-    assert!(calls[0].iter().any(|message| {
+    assert!(
+        calls.len() > 1,
+        "compaction must have been attempted against the main provider after the sidecar failed, got {} call(s)",
+        calls.len()
+    );
+    // The last call is the LCM escalation attempt (Level 1/2 summarization),
+    // not the original foreground chat call — it must still carry the
+    // original source content it's being asked to summarize, proving
+    // nothing was silently dropped before compaction gave up.
+    let last_call = calls.last().expect("at least one call recorded");
+    assert!(last_call.iter().any(|message| {
         message
             .get("content")
             .and_then(Value::as_str)
             .is_some_and(|content| content.contains("soft-pressure-marker-0"))
     }));
-    assert!(!calls[0].iter().any(|message| {
-        message.get("role").and_then(Value::as_str) != Some("system")
-            && message
+    assert!(
+        !calls.iter().flatten().any(|message| {
+            // Match the summary wire message's exact phrasing, not a bare
+            // "[Summary of messages" substring — the LCM_EXPAND_GUIDE
+            // instructional text (prepare_context.rs) contains that same
+            // lead-in as a generic example and would false-positive this
+            // check. `summary_wire_message` (lcm.rs) uniquely phrases an
+            // actually-installed summary "To read the exact originals call
+            // lcm_expand(...)".
+            message
                 .get("content")
                 .and_then(Value::as_str)
-                .is_some_and(|content| content.contains("[Summary of messages"))
-    }));
+                .is_some_and(|content| content.contains("To read the exact originals call"))
+        }),
+        "no summary — real or the deleted deterministic-truncation fallback — was ever installed"
+    );
 }
 
 #[tokio::test]
@@ -3030,6 +3293,154 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
         4,
         "two allowed reads followed by two blocked duplicate rounds must force finalization"
     );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Regression (prod, session cli:oneshot, bonsai-27b): a turn that runs a
+/// side-effect tool (exec) arms the response boundary, which injects a
+/// synthetic `scaffold_user` nudge into the conversation. That nudge is
+/// rendered into the wire but never persisted. When a later tool round appends
+/// after it, the nudge sits MID-history; on the NEXT turn the reloaded history
+/// no longer contains it, so turn N+1's wire is no longer a byte-prefix of
+/// turn N's last wire — the local server re-prefills the whole context
+/// (`prompt_prefix_diverged`, ~30-200s on a 27B). This is the observed 38→32
+/// wire shrink diverging at an empty `[assistant]` carrier.
+#[tokio::test]
+async fn test_wire_prefix_stable_across_turn_after_side_effect_boundary_nudge() {
+    let mut exec_args = std::collections::HashMap::new();
+    exec_args.insert("command".to_string(), json!("echo hi"));
+    let exec_call = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: exec_args,
+        }],
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+    let mut ls_args = std::collections::HashMap::new();
+    ls_args.insert("path".to_string(), json!("."));
+    let listdir_call = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_ls".to_string(),
+            name: "list_dir".to_string(),
+            arguments: ls_args,
+        }],
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+    // Turn 1: exec (arms boundary → nudge injected before the next call) then a
+    // second tool round (list_dir) that lands AFTER the nudge, then a final
+    // text reply. Turn 2: a plain text reply.
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![
+            exec_call,
+            listdir_call,
+            WireRecordingProvider::text_response("done turn one"),
+            WireRecordingProvider::text_response("turn two reply"),
+        ],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("boundary-nudge-prefix-{}", uuid::Uuid::new_v4());
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent_loop.process_direct("run something", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("turn 1 must terminate");
+
+    let turn1_calls = provider.calls().len();
+    assert!(turn1_calls >= 2, "turn 1 must make multiple provider calls");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent_loop.process_direct("what did you find?", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("turn 2 must terminate");
+
+    let calls = provider.calls();
+    assert!(
+        calls.len() > turn1_calls,
+        "turn 2 must make at least one provider call (had {turn1_calls}, now {})",
+        calls.len()
+    );
+
+    // Turn N's last wire must be a byte-prefix of turn N+1's first wire.
+    assert_wire_prefix(&calls[turn1_calls - 1], &calls[turn1_calls]);
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Full production shape (log 2026-07-17, cli:oneshot, bonsai-27b): repeated
+/// identical `exec` calls — the first ones execute (arming the response
+/// boundary, injecting its scaffold nudge), the rest are duplicate-blocked
+/// until the tool-loop circuit breaker forces a text response. The NEXT turn's
+/// reloaded wire must still be a byte-suffix extension of the previous turn's
+/// last wire (no mid-history shrink, no `prompt_prefix_diverged`).
+#[tokio::test]
+async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
+    let exec_call = |id: usize| {
+        let mut arguments = std::collections::HashMap::new();
+        arguments.insert("command".to_string(), json!("echo hi"));
+        crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: format!("tc_exec_{id}"),
+                name: "exec".to_string(),
+                arguments,
+            }],
+            finish_reason: "tool_calls".to_string(),
+            usage: std::collections::HashMap::new(),
+        }
+    };
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![
+            exec_call(1),
+            exec_call(2),
+            exec_call(3),
+            exec_call(4),
+            exec_call(5),
+            exec_call(6),
+            exec_call(7),
+            WireRecordingProvider::text_response("turn two reply"),
+        ],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("dup-exec-breaker-prefix-{}", uuid::Uuid::new_v4());
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        agent_loop.process_direct("run the check", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("turn 1 (duplicate exec loop) must terminate");
+
+    let turn1_calls = provider.calls().len();
+    assert!(turn1_calls >= 2, "turn 1 must make multiple provider calls");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        agent_loop.process_direct("so what happened?", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("turn 2 must terminate");
+
+    let calls = provider.calls();
+    assert!(
+        calls.len() > turn1_calls,
+        "turn 2 must make at least one provider call (had {turn1_calls}, now {})",
+        calls.len()
+    );
+    assert_wire_prefix(&calls[turn1_calls - 1], &calls[turn1_calls]);
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -3987,7 +4398,9 @@ async fn test_trio_offline_e2e_health_gate() {
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
     });
 
     let counters = test_runtime_counters(4096);
@@ -4480,7 +4893,9 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-            sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
         });
         assert!(core.mode().is_local(), "fixture is is_local=true");
         assert!(
@@ -4539,7 +4954,9 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-            sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
         });
         // ctx/4 == 4096; min(4096, 4096) == 4096.
         assert_eq!(core.mode().reserve_cap(4096, 16_384), 4096);
@@ -4595,11 +5012,14 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-            sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
         });
         assert!(core.context.local_prompt_mode);
-        // Local prompt cost is fixed rather than scaling with the model window.
-        assert_eq!(core.context.system_prompt_cap, 500);
+        // Local prompt cost is fixed rather than scaling with the model window,
+        // and is capped at 50 tokens so the byte-stable cached prefix stays lean.
+        assert_eq!(core.context.system_prompt_cap, 50);
     }
 
     /// Task 2 / Branch 3: cloud memory provider/model follows the pre-Wave-2 path.
@@ -4650,7 +5070,9 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-            sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
         });
         assert_eq!(core.compactor.model(), "local-model");
     }
@@ -4694,7 +5116,9 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-            sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
         });
         match core.mode() {
             RuntimeMode::Local { caps } => {
@@ -4770,7 +5194,9 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-            sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
         });
         assert_eq!(core.mode().grounding_role(), "user");
     }
@@ -4822,7 +5248,9 @@ mod runtime_mode_parity_tests {
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
             adaptive_tokens: AdaptiveTokenConfig::default(),
-            sessions_db_path: Some(std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4()))),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
         });
         // mlx: prefix model: mode is Local, but protocol selection still
         // falls through to CloudProtocol via the `!starts_with("mlx:")` guard.

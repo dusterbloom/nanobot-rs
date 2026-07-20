@@ -13,11 +13,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::agent::anti_drift;
 use crate::agent::audit::{AuditLog, ToolEvent};
-use crate::agent::context_hygiene;
+use crate::agent::compaction::ContextCompactor;
 use crate::agent::lcm::{
     CompactionAction, CompactionFailureMode, LcmCompactionState, LcmConfig, LcmEngine,
+};
+use crate::agent::agent_loop::heuristics::{
+    evaluate_repeated_tool_round, RepeatBreakerAction,
 };
 use crate::agent::policy;
 use crate::agent::prefix_guard;
@@ -282,8 +284,15 @@ impl TurnContext {
             let role = self.messages[index]
                 .get("role")
                 .and_then(|value| value.as_str());
+            // Cache-replay scaffolds (boundary nudges, checkpoint notices, …)
+            // were sent to the model, so they are part of the warm prompt
+            // prefix. They MUST be persisted or the next turn's reloaded
+            // history shrinks and diverges the prefix (`prompt_prefix_diverged`
+            // — the observed 38→32 mid-session wire shrink). filter_history
+            // replays them on reload without counting them as turns.
             if self.messages[index].get("_db_id").is_some()
-                || crate::agent::markers::is_synthetic(&self.messages[index])
+                || (crate::agent::markers::is_synthetic(&self.messages[index])
+                    && !crate::agent::markers::is_cache_replay(&self.messages[index]))
                 // LCM summary blocks are engine-owned VIEWS of already-persisted
                 // rows (they carry no _db_id by design). Persisting one creates
                 // a fresh raw user row every turn, which later compactions
@@ -396,6 +405,18 @@ pub(crate) struct FlowControl {
     /// Metrics for a provider response that requested tools. Emission is
     /// deferred until routing/execution knows the truthful executed count.
     pub(crate) pending_request_metrics: Option<crate::agent::metrics::RequestMetrics>,
+    /// Normalized keys of the tool calls dispatched in the most recent
+    /// executed round (empty if the round ran no tools). Set in
+    /// `step_execute_tools`; read by the repeated-tool-call loop breaker.
+    pub(crate) last_round_keys: Vec<String>,
+    /// Normalized keys of the previously executed round, for repeat detection.
+    pub(crate) prev_round_keys: Vec<String>,
+    /// Consecutive executed rounds that dispatched the identical tool calls as
+    /// the previous round. Drives the repeated-tool-call loop breaker.
+    pub(crate) consecutive_repeat_rounds: u32,
+    /// True once we've already nudged about a repeating tool call; the next
+    /// repeat forces a stop instead of nudging again.
+    pub(crate) repeat_nudged: bool,
 }
 
 impl FlowControl {
@@ -449,8 +470,28 @@ pub(crate) struct CompactionHandle {
 
 #[derive(Clone, Copy)]
 enum CompactionSidecarAttempt {
+    /// Try to acquire a lease from the managed compaction sidecar, if one is
+    /// configured, before compacting.
     Acquire,
+    /// Don't attempt a sidecar acquire this round (e.g. a prior attempt in
+    /// the same blocking pass already timed out) — go straight to the main
+    /// provider so the retry isn't spent waiting on an unresponsive sidecar
+    /// again.
     Skip,
+}
+
+/// Build a compactor bound directly to the main provider/model, bypassing a
+/// managed compaction sidecar that is unreachable (or was never configured
+/// for a fresh attempt). Reuses the sidecar-tuned context-window budget so
+/// summarization chunking stays unchanged; only the endpoint and served
+/// model differ. Never `None` — this is what keeps compaction from silently
+/// degrading to truncation when the sidecar is down.
+fn main_provider_compactor(core: &SwappableCore) -> ContextCompactor {
+    ContextCompactor::new(
+        core.provider.clone(),
+        core.model.clone(),
+        core.compactor.context_size(),
+    )
 }
 
 /// Cancellation-safe ownership of one tentative LCM mutation. Unless SQLite
@@ -507,35 +548,42 @@ async fn execute_lcm_compaction(
     failure_mode: CompactionFailureMode,
     sidecar_attempt: CompactionSidecarAttempt,
 ) -> Option<PendingCompaction> {
-    let (lease, resolved_compactor) = match sidecar_attempt {
+    let (lease, resolved_compactor): (_, ContextCompactor) = match sidecar_attempt {
         CompactionSidecarAttempt::Acquire => match core.compaction_manager.as_ref() {
             Some(manager) => {
                 match tokio::time::timeout(COMPACTION_ACQUIRE_TIMEOUT, manager.acquire()).await {
                     Ok(Ok(lease)) => {
                         let compactor = core.compactor.for_model(lease.served_model().to_string());
-                        (Some(lease), Some(compactor))
+                        (Some(lease), compactor)
                     }
                     Ok(Err(error)) => {
                         tracing::warn!(
                             %error,
                             ?failure_mode,
-                            "compaction_sidecar_acquire_failed"
+                            model = %core.model,
+                            "compaction sidecar unavailable — compacting with main model"
                         );
-                        (None, None)
+                        (None, main_provider_compactor(&core))
                     }
                     Err(_) => {
                         tracing::warn!(
                             timeout_secs = COMPACTION_ACQUIRE_TIMEOUT.as_secs(),
                             ?failure_mode,
-                            "compaction_sidecar_acquire_timed_out"
+                            model = %core.model,
+                            "compaction sidecar unavailable — compacting with main model"
                         );
-                        (None, None)
+                        (None, main_provider_compactor(&core))
                     }
                 }
             }
-            None => (None, None),
+            // No managed sidecar configured at all — the core's base
+            // compactor already resolves to the right endpoint (explicit
+            // memory.provider / specialist / main provider).
+            None => (None, core.compactor.clone()),
         },
-        CompactionSidecarAttempt::Skip => (None, None),
+        // Already timed out once this round; don't re-attempt a sidecar
+        // acquire that just failed — go straight to the main provider.
+        CompactionSidecarAttempt::Skip => (None, main_provider_compactor(&core)),
     };
 
     // Keep the engine locked through SQLite commit. A failed checkpoint rolls
@@ -546,7 +594,7 @@ async fn execute_lcm_compaction(
     let summary_turn = mutation
         .engine_mut()
         .compact(
-            resolved_compactor.as_ref(),
+            Some(&resolved_compactor),
             &core.token_budget,
             0,
             failure_mode,
@@ -667,9 +715,66 @@ async fn execute_lcm_compaction(
 #[cfg(test)]
 mod lcm_checkpoint_tests {
     use super::LcmCompactionMutation;
+    use crate::agent::compaction::ContextCompactor;
     use crate::agent::lcm::{CompactionFailureMode, LcmConfig, LcmEngine};
     use crate::agent::token_budget::TokenBudget;
+    use crate::providers::base::{LLMProvider, LLMResponse};
     use serde_json::json;
+    use std::sync::Arc;
+
+    /// Mock LLM that returns a short summary — just enough to exercise the
+    /// checkpoint-rollback-on-drop machinery below, which doesn't care which
+    /// escalation level produced the summary.
+    /// Reflects real input content back as short bullets instead of a fixed
+    /// canned string, so it survives the compaction fidelity gate's
+    /// topic-anchor / protected-literal checks (`compaction.rs`) for
+    /// whatever conversation this test feeds it.
+    struct StubSummarizer;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for StubSummarizer {
+        async fn chat(
+            &self,
+            messages: &[serde_json::Value],
+            _tools: Option<&[serde_json::Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            let request = messages
+                .iter()
+                .rev()
+                .find_map(|m| m.get("content").and_then(|c| c.as_str()))
+                .unwrap_or("");
+            let source = request
+                .split("[SOURCE_BEGIN]\n")
+                .nth(1)
+                .and_then(|s| s.split("\n[SOURCE_END]").next())
+                .unwrap_or(request);
+            let heads: Vec<String> = source
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| line.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+                .collect();
+            let chunk_size = heads.len().div_ceil(15).max(1);
+            let bullets: Vec<String> = heads
+                .chunks(chunk_size)
+                .map(|group| format!("- {}", group.join("; ")))
+                .collect();
+            Ok(LLMResponse {
+                content: Some(bullets.join("\n")),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "stub-summarizer"
+        }
+    }
 
     #[tokio::test]
     async fn failed_checkpoint_persistence_restores_tentative_engine_state() {
@@ -691,12 +796,17 @@ mod lcm_checkpoint_tests {
         let dag_before = engine.dag().len();
         let store_before = engine.store_len();
 
+        let compactor = ContextCompactor::new(
+            Arc::new(StubSummarizer) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            4096,
+        );
         {
             let mut mutation = LcmCompactionMutation::new(&mut engine);
             let compacted = mutation
                 .engine_mut()
                 .compact(
-                    None,
+                    Some(&compactor),
                     &TokenBudget::new(4096, 512),
                     0,
                     CompactionFailureMode::Deterministic,
@@ -902,6 +1012,10 @@ impl AgentLoopShared {
         let mut nudge_sent = false;
         let mut consecutive_empty = 0u32; // text-only responses with no tool calls
         const MAX_CONSECUTIVE_EMPTY: u32 = 3;
+        // Executed rounds that dispatch the identical tool calls (name + args) as
+        // the previous round. The model is firing tools without consuming their
+        // results; two in a row means it never "sees" the output that came back.
+        const MAX_CONSECUTIVE_REPEAT_ROUNDS: u32 = 2;
         while iteration < ctx.core.max_iterations {
             // Early exit if cancelled (e.g. user pressed Esc/Enter in REPL).
             if ctx.is_cancelled() {
@@ -1037,6 +1151,44 @@ impl AgentLoopShared {
 
                     // Successful tool execution — reset the empty counter.
                     consecutive_empty = 0;
+
+                    // Repeated successful tool-call breaker: the model fires
+                    // tools without consuming their results when it dispatches
+                    // the identical calls two rounds in a row. Nudge once that
+                    // the results are already in context; stop if it repeats
+                    // again after the nudge.
+                    let (action, new_rounds, new_nudged) = evaluate_repeated_tool_round(
+                        &ctx.flow.last_round_keys,
+                        &ctx.flow.prev_round_keys,
+                        ctx.flow.consecutive_repeat_rounds,
+                        ctx.flow.repeat_nudged,
+                        MAX_CONSECUTIVE_REPEAT_ROUNDS,
+                    );
+                    ctx.flow.consecutive_repeat_rounds = new_rounds;
+                    ctx.flow.repeat_nudged = new_nudged;
+                    ctx.flow.prev_round_keys = ctx.flow.last_round_keys.clone();
+
+                    match action {
+                        RepeatBreakerAction::Stop => {
+                            warn!(
+                                "tool_loop_breaker: repeated identical tool calls after nudge, forcing stop"
+                            );
+                            ctx.messages.push(crate::agent::markers::scaffold_user(
+                                "[System] You called the same tool(s) with the same arguments again even though the results are already in your context above. Stopping to avoid an infinite loop — use the results you already have, or give your final answer.".to_string(),
+                            ));
+                        }
+                        RepeatBreakerAction::Nudge => {
+                            warn!(
+                                "tool_loop_breaker: {} consecutive identical tool rounds, injecting result-available nudge",
+                                new_rounds + 1
+                            );
+                            ctx.messages.push(crate::agent::markers::scaffold_user(
+                                "[System] Your tool results are already in the conversation above — you just called the same tool(s) with the same arguments again without using them. The output is present; stop re-calling and either act on the results or give your final answer.".to_string(),
+                            ));
+                        }
+                        RepeatBreakerAction::Continue => {}
+                    }
+
                     iteration += 1;
                     // Consume step budget if plan-guided.
                     {
@@ -1059,6 +1211,11 @@ impl AgentLoopShared {
                     ctx.restore_thinking_budget();
                     consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
+                    // A finished turn breaks any repeating-tool-call streak.
+                    ctx.flow.consecutive_repeat_rounds = 0;
+                    ctx.flow.repeat_nudged = false;
+                    ctx.flow.prev_round_keys.clear();
+                    ctx.flow.last_round_keys.clear();
                     iteration += 1;
                     // In plan-guided mode, advance to next step.
                     let should_continue = {
@@ -1147,24 +1304,35 @@ impl AgentLoopShared {
         // is re-anchored on every send in step_call; 0 = cold / post-trim /
         // post-compaction, i.e. unrestricted cleanup while a re-prefill is
         // already sunk cost. See `agent::prefix_guard`.
-        let frozen_prefix = counters
+        let cache_watermark = counters
             .prompt_cache_watermark
             .lock()
             .get(&ctx.session_key)
             .copied()
             .unwrap_or(0);
+        // Persisted-row floor: rows with a `_db_id` are replayed VERBATIM from
+        // SQLite on the next turn's reload, so an in-memory-only rewrite of
+        // them (anti-drift collapse, hygiene dedup/drop) is reverted at the
+        // turn boundary — the next reload no longer matches the previous wire
+        // and the server re-prefills the whole context. This floor holds even
+        // when the cache watermark was cleared by a sanctioned reset (stall
+        // checkpoint, trim): the reset pays for ONE re-prefill, not for a
+        // second one when the reload reverts the rewrite. Cleanup passes may
+        // only touch the unpersisted scratch tail.
+        let persisted_floor = ctx
+            .messages
+            .iter()
+            .rposition(|m| m.get("_db_id").is_some())
+            .map_or(0, |i| i + 1);
+        let frozen_prefix = cache_watermark.max(persisted_floor);
 
-        // --- Context Hygiene: clean up conversation history ---
+        // --- Retention shaping: context hygiene, then (local-only, gated)
+        // anti-drift quality cleanup. Single owner: `agent::retention`.
+        let run_anti_drift =
+            ctx.core.mode().needs_anti_drift() && ctx.core.retention.anti_drift.enabled;
         prefix_guard::with_frozen_prefix(&mut ctx.messages, frozen_prefix, |m| {
-            context_hygiene::hygiene_pipeline(m, ctx.core.hygiene_keep_last_messages);
+            ctx.core.retention.apply_shaping(m, iteration, run_anti_drift);
         });
-
-        // --- Anti-Drift: quality-based cleanup for local models ---
-        if ctx.core.mode().needs_anti_drift() && ctx.core.anti_drift.enabled {
-            prefix_guard::with_frozen_prefix(&mut ctx.messages, frozen_prefix, |m| {
-                anti_drift::pre_completion_pipeline(m, iteration, &ctx.core.anti_drift);
-            });
-        }
 
         // --- Proprioception: update SystemState ---
         if self.proprioception_config.enabled {
@@ -1324,16 +1492,15 @@ impl AgentLoopShared {
             .get(&ctx.session_key)
             .copied()
             .unwrap_or(0);
-        let (trimmed_messages, trim_disposition) = ctx
-            .core
-            .token_budget
-            .trim_to_fit_with_age_preserving_prefix(
-                &ctx.messages,
-                tool_def_tokens,
-                ctx.turn_count,
-                ctx.core.max_message_age_turns,
-                frozen_prefix,
-            );
+        let (trimmed_messages, trim_disposition) = ctx.core.retention.apply_budget(
+            &ctx.core.token_budget,
+            &ctx.messages,
+            tool_def_tokens,
+            crate::agent::retention::BudgetMode::Normal {
+                turn_count: ctx.turn_count,
+            },
+            frozen_prefix,
+        );
         let prefix_preserved = matches!(
             trim_disposition,
             crate::agent::token_budget::PrefixTrimDisposition::Preserved
@@ -1430,11 +1597,14 @@ impl AgentLoopShared {
                 .get(&ctx.session_key)
                 .copied()
                 .unwrap_or(0);
-            // tool_def_tokens=0 is conservative (trims more aggressively).
-            let (trimmed_messages, trim_disposition) = ctx
-                .core
-                .token_budget
-                .trim_to_fit_with_age_preserving_prefix(&ctx.messages, 0, 0, 0, frozen_prefix);
+            // Emergency mode is conservative (ignores age, trims more aggressively).
+            let (trimmed_messages, trim_disposition) = ctx.core.retention.apply_budget(
+                &ctx.core.token_budget,
+                &ctx.messages,
+                0,
+                crate::agent::retention::BudgetMode::Emergency,
+                frozen_prefix,
+            );
             let prefix_preserved = matches!(
                 trim_disposition,
                 crate::agent::token_budget::PrefixTrimDisposition::Preserved
@@ -1815,7 +1985,7 @@ impl AgentLoopShared {
                 {
                     Ok(pending) => pending,
                     Err(_) => {
-                        warn!("LCM blocking compaction timed out; applying deterministic fallback");
+                        warn!("LCM blocking compaction timed out; retrying against the main model directly (no sidecar re-acquire)");
                         execute_lcm_compaction(
                             core,
                             session_id,
@@ -2461,6 +2631,9 @@ impl AgentLoopShared {
     ))]
     async fn step_execute_tools(&self, ctx: &mut TurnContext, response: LLMResponse) -> StepResult {
         let counters = &self.core_handle.counters;
+        // Reset the per-round dispatched-key record; set again only when tools
+        // actually execute so a no-tool round can't leave a stale key behind.
+        ctx.flow.last_round_keys.clear();
 
         let routed_tool_calls = match crate::agent::router::route_tool_calls(
             ctx,
@@ -2520,6 +2693,12 @@ impl AgentLoopShared {
                 }
                 tc
             })
+            .collect();
+
+        // Snapshot the dispatched tool-call keys for the repeated-call breaker.
+        let dispatched_keys: Vec<String> = routed_tool_calls
+            .iter()
+            .map(|tc| crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments))
             .collect();
 
         // Context pressure check: if high, log a warning. The correct
@@ -2611,6 +2790,7 @@ impl AgentLoopShared {
                 // Delegation handled execution — continue the main loop.
                 ctx.emit_pending_request_metrics(routed_tool_calls.len() as u32);
                 ctx.flow.tool_rounds_completed = ctx.flow.tool_rounds_completed.saturating_add(1);
+                ctx.flow.last_round_keys = dispatched_keys.clone();
                 return StepResult::Done(IterationOutcome::Continue);
             }
         }
@@ -2663,6 +2843,7 @@ impl AgentLoopShared {
             return StepResult::Done(IterationOutcome::Finished(String::new()));
         }
 
+        ctx.flow.last_round_keys = dispatched_keys.clone();
         StepResult::Done(IterationOutcome::Continue)
     }
 }

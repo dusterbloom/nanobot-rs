@@ -328,11 +328,15 @@ impl AgentLoopShared {
         // Anti-drift post-completion: collapse babble (before classification).
         // migrated from swappable().is_local — phase 09-03
         if ctx.core.mode().needs_anti_drift()
-            && ctx.core.anti_drift.enabled
+            && ctx.core.retention.anti_drift.enabled
             && !response.has_tool_calls()
         {
             if let Some(ref mut content) = response.content {
-                anti_drift::post_completion_pipeline(content, &ctx.messages, &ctx.core.anti_drift);
+                anti_drift::post_completion_pipeline(
+                    content,
+                    &ctx.messages,
+                    &ctx.core.retention.anti_drift,
+                );
             }
         }
 
