@@ -79,7 +79,7 @@ pub struct LanePolicy {
 pub enum PromptProfile {
     /// All 13 sections included.
     Action,
-    /// Excludes ToolPatterns and BackgroundTasks.
+    /// Excludes BackgroundTasks.
     Answer,
 }
 
@@ -88,10 +88,7 @@ impl PromptProfile {
     pub fn includes(&self, section: PromptSection) -> bool {
         match self {
             PromptProfile::Action => true,
-            PromptProfile::Answer => !matches!(
-                section,
-                PromptSection::ToolPatterns | PromptSection::BackgroundTasks
-            ),
+            PromptProfile::Answer => !matches!(section, PromptSection::BackgroundTasks),
         }
     }
 }
@@ -183,14 +180,13 @@ mod tests {
     }
 
     #[test]
-    fn prompt_profile_answer_excludes_tool_patterns_and_background() {
-        assert!(!PromptProfile::Answer.includes(PromptSection::ToolPatterns));
+    fn prompt_profile_answer_excludes_background() {
         assert!(!PromptProfile::Answer.includes(PromptSection::BackgroundTasks));
     }
 
     #[test]
     fn prompt_profile_answer_includes_other_sections() {
-        let excluded = [PromptSection::ToolPatterns, PromptSection::BackgroundTasks];
+        let excluded = [PromptSection::BackgroundTasks];
         for section in PromptSection::all() {
             if excluded.contains(section) {
                 continue;

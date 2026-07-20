@@ -32,7 +32,10 @@ const LCM_EXPAND_GUIDE: &str =
      To read the exact originals, copy that range into lcm_expand — for example \
      lcm_expand({\"message_ids\": \"120-158\"}). Expansion is lossless and safe: \
      the full originals are always retrievable, so nothing is ever permanently \
-     lost by summarizing. The system may also auto-expand relevant summaries for you.";
+     lost by summarizing. The system may also auto-expand relevant summaries for you. \
+     NOTE: lcm_expand only expands summaries from the CURRENT session. To retrieve the \
+     FULL content of a DIFFERENT past session, use session_search(mode=\"session\", \
+     session=KEY) with that session's key — do not call lcm_expand for past sessions.";
 
 /// Append the previous-session continuity note to the system message.
 ///
@@ -135,7 +138,7 @@ impl AgentLoopShared {
 
         // 1. Memory layers via MemoryLadder.
         if core.memory_enabled {
-            let ladder = MemoryLadder::new(&core.workspace, &core.working_memory, &core.sessions);
+            let ladder = MemoryLadder::new(&core.working_memory, &core.sessions);
             let memory_multiplier = core.lane.policy().memory.budget_multiplier;
             let adjusted_budget = (core.working_memory_budget as f64 * memory_multiplier) as usize;
             let results = ladder
@@ -192,7 +195,7 @@ impl AgentLoopShared {
         }
 
         // Filter sections by lane prompt profile (e.g. Answer lane excludes
-        // ToolPatterns and BackgroundTasks).
+        // BackgroundTasks).
         let prompt_profile = core.lane.policy().prompt;
         sections.retain(|entry| prompt_profile.includes(entry.section));
 
@@ -421,9 +424,6 @@ impl AgentLoopShared {
             detected_language.as_deref(),
         );
         let build_msgs_ms = lap_ms();
-        // The just-pushed user message is the last element; everything before
-        // it (the prompt prefix plus history) is already persisted or static.
-        let new_start = messages.len() - 1;
 
         // Local prompts receive only the fixed LCM guide at runtime. Volatile
         // working-memory/status injection and per-turn relevance tails were
@@ -448,7 +448,7 @@ impl AgentLoopShared {
         }
 
         if core.context.local_prompt_mode {
-            let rebuilt = core.context.build_local_system_prompt(
+            let (stable_prompt, _runtime_suffix, _) = core.context.build_local_system_prompt_parts(
                 None,
                 Some(&msg.channel),
                 Some(&msg.chat_id),
@@ -456,8 +456,15 @@ impl AgentLoopShared {
                 detected_language.as_deref(),
                 &local_runtime_blocks,
             );
+            // System message = STABLE ONLY. Runtime sections (Context Management,
+            // WorkingMemory, SessionMetadata, etc.) are dropped entirely — they
+            // are either empty, meta-instructions the model ignores, or low-
+            // quality observations that add ~250 tokens of noise, break the
+            // prefix cache every turn, and cost ~4.5s of prefill time.
+            // The memory/context features still work server-side (lcm, DB, memory
+            // model) without being injected into the prompt.
             if let Some(first) = messages.first_mut() {
-                first["content"] = json!(rebuilt);
+                first["content"] = json!(stable_prompt);
             }
         }
 
@@ -477,6 +484,11 @@ impl AgentLoopShared {
         // append-only, but make each new epoch a cold prompt prefix.
         apply_session_prompt_epoch(&mut messages, counters.session_prompt_epoch(&session_key));
         let sections_ms = lap_ms();
+
+        // The just-pushed user message is the last element; everything before
+        // it (the prompt prefix plus history) is already persisted or static.
+        // Local split-system insertion happens above, so compute this here.
+        let new_start = messages.len() - 1;
 
         // Tag the current user message (last in the array) with turn number
         // for age-based eviction in trim_to_fit.
@@ -584,6 +596,10 @@ impl AgentLoopShared {
                 provider_request: Default::default(),
                 tool_rounds_completed: 0,
                 pending_request_metrics: None,
+                last_round_keys: Vec::new(),
+                prev_round_keys: Vec::new(),
+                consecutive_repeat_rounds: 0,
+                repeat_nudged: false,
             },
             health_registry: self.health_registry.clone(),
             taint_state: TaintState::new(),
