@@ -302,24 +302,25 @@ impl HealthProbe for SearXNGProbe {
     }
 
     async fn check(&self) -> ProbeResult {
-        let url = format!("{}/health", self.base_url);
         let start = Instant::now();
-        match self.client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => ProbeResult {
-                healthy: true,
-                latency_ms: start.elapsed().as_millis() as u64,
-            },
-            Ok(_) => ProbeResult {
-                healthy: false,
-                latency_ms: start.elapsed().as_millis() as u64,
-            },
-            Err(e) => {
-                warn!("SearXNG health check failed: {}", e);
-                ProbeResult {
-                    healthy: false,
-                    latency_ms: start.elapsed().as_millis() as u64,
+        // /healthz is the modern SearXNG liveness endpoint; /health is legacy
+        // and some deployments rate-limit it to HTTP 429 while /healthz stays
+        // 200. Try both; first 2xx wins.
+        for ep in ["healthz", "health"] {
+            let url = format!("{}/{ep}", self.base_url);
+            if let Ok(resp) = self.client.get(&url).send().await {
+                if resp.status().is_success() {
+                    return ProbeResult {
+                        healthy: true,
+                        latency_ms: start.elapsed().as_millis() as u64,
+                    };
                 }
             }
+        }
+        warn!("SearXNG health check failed on /healthz and /health");
+        ProbeResult {
+            healthy: false,
+            latency_ms: start.elapsed().as_millis() as u64,
         }
     }
 }
