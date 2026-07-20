@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::config::schema::AntiDriftConfig;
@@ -113,6 +113,23 @@ fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionScore 
     }
 }
 
+/// Reject-threshold for scoring standalone text (e.g. a produced LCM
+/// compaction summary) as babble/degenerate. Mirrors `AntiDriftConfig`'s
+/// default `pollution_threshold` — summaries don't carry a dedicated config
+/// knob; reusing the same score and threshold as the per-turn pollution gate
+/// keeps a single quality bar instead of a second tunable.
+pub(crate) const SUMMARY_BABBLE_THRESHOLD: f32 = 0.6;
+
+/// Score arbitrary text (e.g. a produced LCM summary) for pollution signals
+/// using the same heuristics applied to per-turn assistant messages. Returns
+/// `Some(score)` when the text crosses the babble/degenerate threshold —
+/// callers must not persist it — or `None` when it's clean enough to keep.
+pub(crate) fn score_summary_babble(text: &str) -> Option<f32> {
+    let synthetic = json!({"role": "assistant", "content": text});
+    let scored = score_message(&synthetic, &[]);
+    (scored.score >= SUMMARY_BABBLE_THRESHOLD).then_some(scored.score)
+}
+
 /// Fraction of words that are filler phrases.
 fn filler_ratio(content: &str) -> f32 {
     let lower = content.to_lowercase();
@@ -133,6 +150,46 @@ fn filler_ratio(content: &str) -> f32 {
     }
 
     filler_count as f32 / words.len() as f32
+}
+
+/// Lexical diversity: fraction of distinct words over total words.
+/// Degenerate babble repeats a handful of words (low diversity); a story,
+/// explanation, or prose uses many distinct words (high diversity).
+fn lexical_diversity(content: &str) -> f32 {
+    let words: Vec<&str> = content.split_whitespace().collect();
+    if words.is_empty() {
+        return 1.0;
+    }
+    let unique = words.iter().collect::<std::collections::HashSet<_>>().len();
+    unique as f32 / words.len() as f32
+}
+
+/// Decide whether a long assistant response is degenerate babble that must be
+/// collapsed. Length alone is NOT enough: a long story, explanation, or code
+/// block is legitimate and must be preserved verbatim so it survives into
+/// sessions.db and stays recallable via extract / lcm_expand. We collapse only
+/// when the text is genuinely low-quality: filler-heavy, lexically repetitive,
+/// or carrying hallucination markers (fake tool calls / unbacked "I ran" claims).
+fn is_babble(content: &str, max_tokens: usize) -> bool {
+    let word_count = content.split_whitespace().count();
+    if word_count <= max_tokens {
+        return false;
+    }
+    if content.contains("```") {
+        // Code blocks are legitimate long content — never collapse them.
+        return false;
+    }
+    if filler_ratio(content) > 0.30 {
+        return true;
+    }
+    if lexical_diversity(content) < 0.45 {
+        return true;
+    }
+    let has_fake_tool = content.contains("[Called")
+        || content.contains("<tool_call>")
+        || content.contains("<function_call>");
+    let has_claim = content.contains("I ran") || content.contains("I executed");
+    has_fake_tool || has_claim
 }
 
 /// Word-trigram Jaccard similarity between two strings.
@@ -369,14 +426,18 @@ fn recent_assistant_used_tools(messages: &[Value]) -> bool {
 
 /// Run the post-completion anti-drift pipeline on the response content.
 ///
-/// Collapses babble: if response exceeds babble_max_tokens and has no tool
-/// calls, truncate to first 2 sentences + marker.
+/// Collapses babble only when it is genuinely low-quality (see `is_babble`):
+/// filler-heavy, lexically repetitive, or carrying hallucination markers. A
+/// long story, explanation, or code block is preserved verbatim so the original
+/// survives into sessions.db and stays recallable via extract / lcm_expand.
 pub fn post_completion_pipeline(
     content: &mut String,
     _messages: &[Value],
     config: &AntiDriftConfig,
 ) {
-    collapse_babble(content, config.babble_max_tokens);
+    if is_babble(content, config.babble_max_tokens) {
+        collapse_babble(content, config.babble_max_tokens);
+    }
 }
 
 /// Truncate babble responses to first 2 sentences + marker.
@@ -890,6 +951,64 @@ mod tests {
             content.contains("[response condensed]"),
             "Long content after thinking strip should be condensed"
         );
+    }
+
+    #[test]
+    fn test_e2e_long_story_preserved_not_collapsed() {
+        // A long coherent story must survive verbatim so it stays recallable.
+        let story = "The operator asked nano32 to recall the morning. Clouds drifted \
+            above the harbor while the agent summarized three conversations. A lighthouse \
+            blinked across the bay. The model retrieved the diary entry without hesitation. \
+            Wind carried salt through the open window. Memory crystals hummed in the server \
+            rack. She replied with a quiet parable about two threads of time. The user smiled \
+            and closed the notebook. Nothing was lost in the archive. A second story followed \
+            about the river and the signal. The ember glowed beneath the lattice. Horizons \
+            expanded as the chronicle turned. Quantum whispers reached the beacon. The spiral \
+            held steady through the cascade. Verse after verse the agent remembered everything.";
+
+        // Use a low threshold so a readable story still exceeds babble_max_tokens.
+        let mut config = AntiDriftConfig::default();
+        config.babble_max_tokens = 20;
+
+        let mut content = story.to_string();
+        post_completion_pipeline(&mut content, &[], &config);
+
+        assert_eq!(
+            content, story,
+            "A long coherent story must NOT be collapsed — it must stay recallable"
+        );
+    }
+
+    #[test]
+    fn test_is_babble_gate() {
+        // Lower threshold so readable content still trips the length check.
+        let mut config = AntiDriftConfig::default();
+        config.babble_max_tokens = 30;
+
+        // Long, lexically diverse prose is NOT babble — preserved verbatim.
+        let story = "The operator asked nano32 to recall the morning. Clouds drifted \
+            above the harbor while the agent summarized three conversations. A lighthouse \
+            blinked across the bay. The model retrieved the diary entry without hesitation. \
+            Wind carried salt through the open window. Memory crystals hummed in the server \
+            rack. She replied with a quiet parable about two threads of time. The user smiled \
+            and closed the notebook. Nothing was lost in the archive.";
+        let mut content = story.to_string();
+        post_completion_pipeline(&mut content, &[], &config);
+        assert_eq!(content, story, "diverse long prose preserved");
+
+        // Long repetitive padding IS babble and collapses.
+        let mut padded = format!(
+            "First sentence here. Second sentence here. {}",
+            "And then more and more words follow in the third fourth fifth sentences. ".repeat(40)
+        );
+        post_completion_pipeline(&mut padded, &[], &config);
+        assert!(padded.contains("[response condensed]"), "repetitive padding collapses");
+
+        // Long code block is NOT babble (legitimate long content).
+        let code = format!("```\n{}\n```", "fn main() {}\n".repeat(60));
+        let mut content = code.clone();
+        post_completion_pipeline(&mut content, &[], &config);
+        assert_eq!(content, code, "long code block preserved");
     }
 
     #[test]
