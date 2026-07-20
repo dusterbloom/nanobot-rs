@@ -244,6 +244,24 @@ pub struct AgentDefaults {
     pub max_tokens: u32,
     #[serde(default = "default_temperature")]
     pub temperature: f64,
+    #[serde(
+        rename = "repetition_penalty",
+        alias = "repetitionPenalty",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repetition_penalty: Option<f64>,
+    #[serde(
+        rename = "frequency_penalty",
+        alias = "frequencyPenalty",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub frequency_penalty: Option<f64>,
+    #[serde(
+        rename = "presence_penalty",
+        alias = "presencePenalty",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub presence_penalty: Option<f64>,
     #[serde(default = "default_max_tool_iterations")]
     pub max_tool_iterations: u32,
     #[serde(default = "default_max_context_tokens")]
@@ -417,20 +435,21 @@ pub fn is_higgs_backend(backend: &str) -> bool {
 
 /// Sole local-server spawning policy (`agents.defaults.localAutostart`).
 ///
-/// `Off` is the default: nanobot never spawns an inference server, including
-/// from explicit `/local` and `/restart` commands. Discovery of an already
-/// running endpoint remains available.
-/// Unknown config values deserialize to `Off` (never silently enable spawning).
+/// `Higgs` is the default: an omitted `localAutostart` key spawns the managed
+/// Higgs sidecar when discovery finds nothing. Discovery of an already
+/// running endpoint always runs first regardless.
+/// Unknown config values (typos) still deserialize to `Off` — only a
+/// recognized value can enable spawning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LocalAutostart {
-    /// Spawn the managed Higgs sidecar when discovery finds nothing.
+    /// Spawn the managed Higgs sidecar when discovery finds nothing (default).
+    #[default]
     Higgs,
     /// Spawn LM Studio when discovery finds nothing.
     Lmstudio,
-    /// Never spawn autonomously (default). `#[serde(other)]` folds unknown
-    /// config values here so a typo can't enable spawning.
-    #[default]
+    /// Never spawn autonomously. `#[serde(other)]` folds unknown config
+    /// values here so a typo can't silently enable spawning.
     #[serde(other)]
     Off,
 }
@@ -483,6 +502,9 @@ impl Default for AgentDefaults {
             constrained_tool_calls: default_constrained_tool_calls(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tool_iterations: default_max_tool_iterations(),
             max_context_tokens: default_max_context_tokens(),
             max_concurrent_chats: default_max_concurrent_chats(),
@@ -1211,18 +1233,22 @@ fn default_session_complete_after_secs() -> u64 {
     3600
 }
 
+/// Shared default for both `max_message_age_turns` and `max_history_turns`.
+///
+/// Single source of truth (rather than two constants a comment promises to
+/// keep in sync): age-based eviction must not rewrite turns older than the
+/// history load already drops them at, or trim busts the prefix cache for
+/// turns the model never even sees. Keeps many turns append-only so the
+/// inference server's prefix cache stays warm across a long session.
+/// Capable long-context models (e.g. Qwen3.6, 256K) comfortably hold this.
+const DEFAULT_RETENTION_TURNS: usize = 60;
+
 fn default_max_message_age_turns() -> usize {
-    // Keep in step with `default_max_history_turns` (60) so anti-drift's
-    // age-based eviction doesn't rewrite old turns — busting the prefix cache —
-    // before the history turn-limit would drop them.
-    60
+    DEFAULT_RETENTION_TURNS
 }
 
 fn default_max_history_turns() -> usize {
-    // Keep many turns append-only so the inference server's prefix cache stays
-    // warm across a long session (drops past this limit force a re-prefill).
-    // Capable long-context models (e.g. Qwen3.6, 256K) comfortably hold this.
-    60
+    DEFAULT_RETENTION_TURNS
 }
 
 fn default_reflection_threshold() -> usize {
@@ -1643,18 +1669,10 @@ fn default_grounding_interval() -> u32 {
     8
 }
 
-fn default_raw_window() -> usize {
-    5
-}
-
-fn default_light_window() -> usize {
-    20
-}
-
 /// Configuration for the ensemble proprioception system.
 ///
-/// Controls shared body awareness, audience-aware compaction, heartbeat
-/// grounding, gradient memory, and priority interrupts.
+/// Controls shared body awareness, heartbeat grounding, and priority
+/// interrupts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProprioceptionConfig {
@@ -1662,25 +1680,9 @@ pub struct ProprioceptionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Audience-aware compaction prompts (default: true).
-    #[serde(default = "default_true")]
-    pub audience_aware_compaction: bool,
-
     /// Turns between grounding injections. 0 = disabled (default: 8).
     #[serde(default = "default_grounding_interval")]
     pub grounding_interval: u32,
-
-    /// Enable gradient memory (3-tier compaction) (default: true).
-    #[serde(default = "default_true")]
-    pub gradient_memory: bool,
-
-    /// Number of most recent turns kept raw (default: 5).
-    #[serde(default = "default_raw_window")]
-    pub raw_window: usize,
-
-    /// Number of turns in the light-compression tier (default: 20).
-    #[serde(default = "default_light_window")]
-    pub light_window: usize,
 
     /// Enable the aha channel for priority interrupts (default: true).
     #[serde(default = "default_true")]
@@ -1695,11 +1697,7 @@ impl Default for ProprioceptionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            audience_aware_compaction: true,
             grounding_interval: default_grounding_interval(),
-            gradient_memory: true,
-            raw_window: default_raw_window(),
-            light_window: default_light_window(),
             aha_channel: true,
             proactive_retrieval: true,
         }
@@ -1832,7 +1830,13 @@ fn default_cluster_scan_interval() -> u64 {
 pub struct ClusterConfig {
     /// Enable cluster mode (default: false).
     pub enabled: bool,
-    /// Enable mDNS + HTTP probe auto-discovery (default: true when enabled).
+    /// Enable mDNS + HTTP probe auto-discovery (default: false).
+    ///
+    /// When true, every startup scans the local /24 subnet (up to 254 IPs ×
+    /// scan_ports, 3s connect timeout each) — tens to hundreds of seconds of
+    /// pure overhead for a single-node setup with no inference peers, and it
+    /// delays the first turn. Keep false unless you actually run LAN peers;
+    /// manual `endpoints` are probed regardless of this flag.
     pub auto_discover: bool,
     /// Manual peer endpoint URLs (e.g. ["http://192.168.1.50:52415"]).
     pub endpoints: Vec<String>,
@@ -1851,7 +1855,7 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            auto_discover: true,
+            auto_discover: false,
             endpoints: Vec::new(),
             scan_ports: default_cluster_scan_ports(),
             scan_interval_secs: default_cluster_scan_interval(),
@@ -2607,10 +2611,10 @@ mod tests {
     }
 
     #[test]
-    fn test_local_autostart_defaults_to_off() {
+    fn test_local_autostart_defaults_to_higgs() {
         let json = r#"{}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.agents.defaults.local_autostart, LocalAutostart::Off);
+        assert_eq!(cfg.agents.defaults.local_autostart, LocalAutostart::Higgs);
     }
 
     #[test]
@@ -2647,7 +2651,7 @@ mod tests {
     fn test_local_autostart_serializes_camel_case() {
         let cfg = Config::default();
         let json = serde_json::to_string(&cfg).unwrap();
-        assert!(json.contains(r#""localAutostart":"off""#));
+        assert!(json.contains(r#""localAutostart":"higgs""#));
     }
 
     #[test]
