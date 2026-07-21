@@ -20,6 +20,7 @@ use crate::providers::base::{LLMResponse, ToolCallRequest};
 use std::sync::Arc;
 
 use super::agent_loop::{ResponseBoundary, TurnContext};
+use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
 use crate::agent::tools::base::ToolConcurrency;
 
 const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
@@ -64,7 +65,9 @@ async fn stash_oversized_tool_result(
     data: &str,
     cap: usize,
 ) -> bool {
-    if tool_name == "recall_tool_result" || data.chars().count() <= cap {
+    if tool_name == "recall_tool_result"
+        || (data.chars().count() <= cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES)
+    {
         return false;
     }
     sessions
@@ -167,11 +170,12 @@ fn digest_tool_result(
     if tool_name == "recall_tool_result" {
         return data.to_string();
     }
+    let prompt_cap = cap.min(TOOL_RESULT_REPLAY_MAX_BYTES);
     let total_chars = data.chars().count();
-    if total_chars <= cap {
+    if total_chars <= prompt_cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES {
         return data.to_string();
     }
-    build_tool_result_preview(tool_name, args, data, cap, tool_call_id)
+    build_tool_result_preview(tool_name, args, data, prompt_cap, tool_call_id)
 }
 
 /// Head+tail preview builder retained as the reference for the truncation
@@ -243,6 +247,14 @@ pub(crate) fn is_side_effect_tool(name: &str) -> bool {
     matches!(name, "exec" | "write_file")
 }
 
+/// Tools whose result must be consumed and reported before another call of
+/// the same class. Memory reads/writes are included because silently chaining
+/// them was observed to leave a turn with no final answer and to amplify bad
+/// recall/remember output.
+pub(crate) fn requires_result_report(name: &str) -> bool {
+    is_side_effect_tool(name) || matches!(name, "recall" | "remember")
+}
+
 /// Decide whether to arm the response boundary after a tool-execution round.
 ///
 /// Behavioral, not positional: arm ONLY when a side-effect tool (exec/write_file)
@@ -254,8 +266,8 @@ pub(crate) fn is_side_effect_tool(name: &str) -> bool {
 /// rejected call cannot re-arm the boundary.
 fn should_arm_boundary(assistant_content: Option<&str>, executed_tools: &[&str]) -> bool {
     let reported = assistant_content.is_some_and(|c| !c.trim().is_empty());
-    let ran_side_effect = executed_tools.iter().any(|n| is_side_effect_tool(n));
-    ran_side_effect && !reported
+    let ran_reportable_tool = executed_tools.iter().any(|n| requires_result_report(n));
+    ran_reportable_tool && !reported
 }
 
 /// Decide whether an armed boundary blocks this response's side-effect calls.
@@ -1173,7 +1185,7 @@ pub(crate) async fn execute_tools_inline(
     );
     let (blocked, allowed): (Vec<&ToolCallRequest>, Vec<&ToolCallRequest>) = routed_tool_calls
         .iter()
-        .partition(|tc| blocks && is_side_effect_tool(&tc.name));
+        .partition(|tc| blocks && requires_result_report(&tc.name));
     for tc in &blocked {
         inject_boundary_rejection(ctx, tc);
     }
@@ -1498,6 +1510,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn replay_byte_cap_stashes_even_below_configured_char_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("test:replay-byte-cap").await;
+        let data = format!(
+            "{}MIDDLE_SECRET{}",
+            "head\n".repeat(1200),
+            "tail\n".repeat(600)
+        );
+        assert!(data.len() > TOOL_RESULT_REPLAY_MAX_BYTES);
+        assert!(data.chars().count() < 10_000);
+
+        let stashed = stash_oversized_tool_result(
+            &sessions,
+            &session.id,
+            "call_replay_cap",
+            "read_file",
+            &data,
+            10_000,
+        )
+        .await;
+        let injected = if must_preserve_unstashed_raw(&data, 10_000, stashed) {
+            data.clone()
+        } else {
+            digest_tool_result(
+                "read_file",
+                &HashMap::new(),
+                &data,
+                10_000,
+                "call_replay_cap",
+            )
+        };
+
+        assert!(stashed);
+        assert!(injected.contains("recall_tool_result"));
+        assert!(injected.contains("call_replay_cap"));
+        assert!(!injected.contains("MIDDLE_SECRET"));
+        let replay_body = crate::agent::context_hygiene::cap_tool_result_for_replay(&injected);
+        assert!(
+            replay_body.len() <= TOOL_RESULT_REPLAY_MAX_BYTES + 40,
+            "final prompt body must be replay-cap stable"
+        );
+        assert!(replay_body.contains("recall_tool_result"));
+        assert!(replay_body.contains("call_replay_cap"));
+        assert_eq!(
+            sessions
+                .load_tool_result(&session.id, "call_replay_cap")
+                .await
+                .as_deref(),
+            Some(data.as_str())
+        );
+    }
+
     #[test]
     fn digest_tool_result_points_to_sqlite_recall() {
         let mut args = HashMap::new();
@@ -1626,13 +1692,22 @@ mod tests {
             &["write_file"]
         ));
 
-        // no side-effect tool ran -> never arm, report or not
+        // ordinary read tools do not arm
         assert!(!should_arm_boundary(None, &["read_file", "list_dir"]));
         assert!(!should_arm_boundary(
             Some("here are the files"),
             &["read_file"]
         ));
         assert!(!should_arm_boundary(None, &[]));
+
+        // Memory operations must be consumed before another memory call. This
+        // ensures a recall/remember round gets a clean answer attempt.
+        assert!(should_arm_boundary(None, &["recall"]));
+        assert!(should_arm_boundary(None, &["remember"]));
+        assert!(!should_arm_boundary(
+            Some("I found the requested preference."),
+            &["recall"]
+        ));
     }
 
     #[test]

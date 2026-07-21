@@ -433,8 +433,14 @@ static XML_TOOL_CALL_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 // Extracts function name from `<function=NAME>` or `<function name="NAME">`.
+//
+// Keep this intentionally strict. Local models sometimes omit the `>` after
+// the function name, producing fragments like `<function=list_dir\n</function>`.
+// A permissive `[^">]+` capture turns that into a real tool name and leaks XML
+// into the tool engine/TUI.
 static XML_FUNCTION_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)<function[= ]+"?([^">]+)"?>"#).expect("xml function name regex")
+    Regex::new(r#"(?i)<function(?:=|\s+name=)"?([A-Za-z_][A-Za-z0-9_]*)"?\s*>"#)
+        .expect("xml function name regex")
 });
 
 // Extracts `<parameter=KEY>VALUE</parameter>` pairs.
@@ -1138,6 +1144,37 @@ And also:
     fn parse_xml_no_match() {
         let text = "No tool calls here. Just some <b>HTML</b>.";
         assert!(parse_xml_tool_calls(text).is_empty());
+    }
+
+    #[test]
+    fn parse_xml_rejects_function_name_spanning_close_tag() {
+        let text = r#"<tool_call>
+  <function=list_dir
+</function>
+</tool_call>"#;
+        let calls = parse_xml_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "malformed function tags must not become executable tool names"
+        );
+        let stripped = strip_xml_tool_calls(text);
+        assert!(!stripped.contains("</function"));
+    }
+
+    #[test]
+    fn parse_xml_rejects_function_name_spanning_parameter_tag() {
+        let text = r#"<tool_call>
+  <function=read_file
+  <parameter=path>/tmp/x</parameter>
+  </function>
+</tool_call>"#;
+        let calls = parse_xml_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "malformed function tags must not capture parameter markup"
+        );
+        let stripped = strip_xml_tool_calls(text);
+        assert!(!stripped.contains("<parameter=path"));
     }
 
     #[test]

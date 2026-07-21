@@ -60,6 +60,15 @@ pub struct OpenAICompatProvider {
 
 pub(crate) const NANOBOT_HIGGS_SESSION_ID_FIELD: &str = "_nanobot_higgs_session_id";
 
+fn is_valid_tool_call_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 /// Normalize Claude model short-names so the API always gets the canonical ID.
 ///
 /// - `"opus"` / `"sonnet"` / `"haiku"` → latest canonical ID
@@ -1412,6 +1421,14 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            if !is_valid_tool_call_name(&name) {
+                warn!(
+                    id = %id,
+                    raw_name = %name,
+                    "dropping_malformed_tool_call_name"
+                );
+                continue;
+            }
 
             // Arguments come as a JSON string that we need to parse.
             let arguments_raw = function
@@ -1580,6 +1597,14 @@ async fn parse_sse_stream(
                 indices.sort();
                 for idx in indices {
                     let (id, name, args_str) = tool_calls_acc.remove(&idx).unwrap();
+                    if !is_valid_tool_call_name(&name) {
+                        warn!(
+                            id = %id,
+                            raw_name = %name,
+                            "dropping_malformed_tool_call_name"
+                        );
+                        continue;
+                    }
                     let arguments: HashMap<String, serde_json::Value> =
                         match serde_json::from_str(&args_str) {
                             Ok(map) => map,
@@ -1770,6 +1795,14 @@ async fn parse_sse_stream(
     indices.sort();
     for idx in indices {
         let (id, name, args_str) = tool_calls_acc.remove(&idx).unwrap();
+        if !is_valid_tool_call_name(&name) {
+            warn!(
+                id = %id,
+                raw_name = %name,
+                "dropping_malformed_tool_call_name"
+            );
+            continue;
+        }
         let arguments: HashMap<String, serde_json::Value> = match serde_json::from_str(&args_str) {
             Ok(map) => map,
             Err(e) => {
@@ -2218,6 +2251,38 @@ mod tests {
         assert_eq!(resp.usage.get("prompt_tokens"), Some(&50));
         assert_eq!(resp.usage.get("completion_tokens"), Some(&30));
         assert_eq!(resp.usage.get("total_tokens"), Some(&80));
+    }
+
+    #[test]
+    fn test_parse_response_drops_malformed_tool_call_names() {
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Let me read that.",
+                    "tool_calls": [{
+                        "id": "call_bad",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file\n<parameter=path",
+                            "arguments": "{}"
+                        }
+                    }, {
+                        "id": "call_good",
+                        "type": "function",
+                        "function": {
+                            "name": "exec",
+                            "arguments": "{\"command\":\"pwd\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_good");
+        assert_eq!(resp.tool_calls[0].name, "exec");
     }
 
     #[test]

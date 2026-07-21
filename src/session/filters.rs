@@ -6,7 +6,7 @@
 use serde_json::Value;
 use tracing::warn;
 
-use crate::agent::context_hygiene::{shrink_tool_body, ToolBodyPolicy};
+use crate::agent::context_hygiene::{cap_tool_result_for_replay, TOOL_RESULT_REPLAY_MAX_BYTES};
 
 /// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
 ///
@@ -178,7 +178,8 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
             // age-based), so it never shifts the prompt prefix — no extra
             // re-prefill, unlike dropping or sliding truncation.
             let raw = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let content = if role == "tool" {
+            let tool_name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let content = if role == "tool" && tool_name != "recall_tool_result" {
                 cap_tool_body(raw)
             } else {
                 raw.to_string()
@@ -287,18 +288,10 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     mapped[keep_from..].to_vec()
 }
 
-/// Max bytes retained for a tool-result body in wire history (~2k tokens).
-/// Generous enough that typical tool outputs (web_fetch defaults to ~2k chars)
-/// pass through untouched; only large dumps (multi-source news, big fetches)
-/// are trimmed, with a marker so the model knows content was elided.
-const TOOL_BODY_MAX_BYTES: usize = 8000;
-
-/// Cap an oversized tool-result body to [`TOOL_BODY_MAX_BYTES`], truncating on a
-/// UTF-8 char boundary. Deterministic in its input, so the same stored tool
-/// result always renders identically — keeping the prompt prefix byte-stable.
+/// Cap an oversized tool-result body to the shared replay limit. Deterministic
+/// in its input, so the same stored tool result always renders identically.
 fn cap_tool_body(content: &str) -> String {
-    shrink_tool_body(content, ToolBodyPolicy::ByteCap(TOOL_BODY_MAX_BYTES))
-        .unwrap_or_else(|| content.to_string())
+    cap_tool_result_for_replay(content)
 }
 
 #[cfg(test)]
@@ -1130,7 +1123,7 @@ mod tests {
         // render is deterministic — the same stored result yields identical wire
         // bytes on every reload, so it never shifts the prompt prefix (no extra
         // re-prefill). Small tool bodies and non-tool content pass through.
-        let big = "x".repeat(TOOL_BODY_MAX_BYTES + 5000);
+        let big = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5000);
         let messages = vec![
             user("fetch something"),
             tool_call_assistant("t1"),
@@ -1152,7 +1145,7 @@ mod tests {
             .unwrap();
         let body = big_tool["content"].as_str().unwrap();
         assert!(
-            body.len() <= TOOL_BODY_MAX_BYTES + 40,
+            body.len() <= TOOL_RESULT_REPLAY_MAX_BYTES + 40,
             "oversized tool body must be capped"
         );
         assert!(
@@ -1173,5 +1166,34 @@ mod tests {
             a[0]["content"], "fetch something",
             "user content not capped"
         );
+    }
+
+    #[test]
+    fn test_recall_tool_result_body_is_not_replay_capped() {
+        let big = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5000);
+        let messages = vec![
+            user("recall it"),
+            tool_call_assistant("recall_1"),
+            json!({
+                "role": "tool",
+                "tool_call_id": "recall_1",
+                "name": "recall_tool_result",
+                "content": big,
+            }),
+        ];
+
+        let result = filter_history(&messages, 0, 0);
+        let tool = result
+            .iter()
+            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "recall_1")
+            .unwrap();
+        assert_eq!(
+            tool["content"].as_str().unwrap().len(),
+            TOOL_RESULT_REPLAY_MAX_BYTES + 5000
+        );
+        assert!(!tool["content"]
+            .as_str()
+            .unwrap()
+            .contains("[tool output truncated]"));
     }
 }

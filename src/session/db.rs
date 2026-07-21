@@ -1239,51 +1239,112 @@ impl SessionDb {
             .collect()
     }
 
-/// Turn a (possibly verbose, natural-language) search string into two FTS5 MATCH
-/// expressions: an AND of the significant content keywords (precise) and an OR of
-/// the same keywords (high recall). FTS operators ("or"/"and"/"not") and common
-/// English function words are dropped so a sentence like "find the first session
-/// where I told the Diary of Two Threads story" collapses to `diary two threads`.
-fn build_recall_queries(raw: &str) -> (String, String) {
-    let terms = Self::recall_keywords(raw);
-    let quoted: Vec<String> = terms.iter().map(|t| format!("\"{}\"", t)).collect();
-    let and_q = quoted.join(" ");
-    let or_q = quoted.join(" OR ");
-    (and_q, or_q)
-}
-
-/// Strip FTS operators and common English function words from a (possibly verbose,
-/// natural-language) query, leaving the significant content keywords. Used both by
-/// the FTS5 query builder and by `in_session` filtering so a sentence like "find the
-/// first session where I told the Diary of Two Threads story" collapses to
-/// `["diary", "two", "threads"]`.
-pub fn recall_keywords(raw: &str) -> Vec<String> {
-    const STOP: &[&str] = &[
-        "or", "and", "not", "the", "a", "an", "i", "you", "it", "to", "of", "in", "on", "for",
-        "with", "is", "was", "were", "my", "me", "this", "that", "these", "those", "first",
-        "time", "wrote", "written", "generated", "tell", "told", "find", "finds", "finding",
-        "story", "stories", "session", "sessions", "share", "shared", "about", "what", "when",
-        "where", "who", "how", "why", "which", "please", "could", "would", "can", "did", "do",
-        "does", "get", "give", "gives", "make", "made", "set", "future", "past", "few", "days",
-        "ago", "title", "titled", "called", "name", "named",
-    ];
-    let mut terms: Vec<String> = raw
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|t| t.to_lowercase())
-        .filter(|t| t.len() >= 2 && !STOP.contains(&t.as_str()))
-        .collect();
-    terms.dedup();
-    if terms.is_empty() {
-        // Nothing usable left; fall back to raw words so we never silently no-op.
-        terms = raw
-            .split_whitespace()
-            .filter(|t| t.len() >= 2)
-            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
-            .filter(|t| !t.is_empty())
-            .collect();
+    /// Turn a (possibly verbose, natural-language) search string into two FTS5 MATCH
+    /// expressions: an AND of the significant content keywords (precise) and an OR of
+    /// the same keywords (high recall). FTS operators ("or"/"and"/"not") and common
+    /// English function words are dropped so a sentence like "find the first session
+    /// where I told the Diary of Two Threads story" collapses to `diary two threads`.
+    fn build_recall_queries(raw: &str) -> (String, String) {
+        let terms = Self::recall_keywords(raw);
+        let quoted: Vec<String> = terms.iter().map(|t| format!("\"{}\"", t)).collect();
+        let and_q = quoted.join(" ");
+        let or_q = quoted.join(" OR ");
+        (and_q, or_q)
     }
-    terms
-}
+
+    /// Strip FTS operators and common English function words from a (possibly verbose,
+    /// natural-language) query, leaving the significant content keywords. Used both by
+    /// the FTS5 query builder and by `in_session` filtering so a sentence like "find the
+    /// first session where I told the Diary of Two Threads story" collapses to
+    /// `["diary", "two", "threads"]`.
+    pub fn recall_keywords(raw: &str) -> Vec<String> {
+        const STOP: &[&str] = &[
+            "or",
+            "and",
+            "not",
+            "the",
+            "a",
+            "an",
+            "i",
+            "you",
+            "it",
+            "to",
+            "of",
+            "in",
+            "on",
+            "for",
+            "with",
+            "is",
+            "was",
+            "were",
+            "my",
+            "me",
+            "this",
+            "that",
+            "these",
+            "those",
+            "first",
+            "time",
+            "wrote",
+            "written",
+            "generated",
+            "tell",
+            "told",
+            "find",
+            "finds",
+            "finding",
+            "story",
+            "stories",
+            "session",
+            "sessions",
+            "share",
+            "shared",
+            "about",
+            "what",
+            "when",
+            "where",
+            "who",
+            "how",
+            "why",
+            "which",
+            "please",
+            "could",
+            "would",
+            "can",
+            "did",
+            "do",
+            "does",
+            "get",
+            "give",
+            "gives",
+            "make",
+            "made",
+            "set",
+            "future",
+            "past",
+            "few",
+            "days",
+            "ago",
+            "title",
+            "titled",
+            "called",
+            "name",
+            "named",
+            "remember",
+            "remembered",
+            "recall",
+            "memory",
+            "context",
+            "identity",
+        ];
+        let mut terms: Vec<String> = raw
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|t| t.to_lowercase())
+            .filter(|t| t.len() >= 2 && !STOP.contains(&t.as_str()))
+            .collect();
+        terms.dedup();
+        terms
+    }
 
     pub async fn search_messages(
         &self,
@@ -1298,6 +1359,9 @@ pub fn recall_keywords(raw: &str) -> Vec<String> {
         // nothing. Strip FTS operators + function words down to content keywords and
         // AND those; fall back to OR of the same keywords for maximum recall.
         let (and_q, or_q) = Self::build_recall_queries(query);
+        if and_q.is_empty() {
+            return Vec::new();
+        }
         for match_expr in [&and_q, &or_q] {
             let results = Self::run_match(&conn, match_expr, session_key_filter, limit);
             if !results.is_empty() {
@@ -1356,8 +1420,10 @@ pub fn recall_keywords(raw: &str) -> Vec<String> {
                 return Vec::new();
             }
         };
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
         stmt.query_map(param_refs.as_slice(), |row| {
             Ok(SearchResult {
                 session_id: row.get(0)?,
@@ -2008,8 +2074,9 @@ mod tests {
         // A verbose natural-language query collapses to its content keywords so
         // FTS5 (implicit AND) actually matches the story instead of requiring
         // every noise word to co-occur.
-        let (and_q, or_q) =
-            SessionDb::build_recall_queries("find the first session where I told the Diary of Two Threads story");
+        let (and_q, or_q) = SessionDb::build_recall_queries(
+            "find the first session where I told the Diary of Two Threads story",
+        );
         assert_eq!(and_q, "\"diary\" \"two\" \"threads\"");
         assert_eq!(or_q, "\"diary\" OR \"two\" OR \"threads\"");
 

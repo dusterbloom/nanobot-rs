@@ -13,13 +13,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::agent::agent_loop::heuristics::{evaluate_repeated_tool_round, RepeatBreakerAction};
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::lcm::{
     CompactionAction, CompactionFailureMode, LcmCompactionState, LcmConfig, LcmEngine,
-};
-use crate::agent::agent_loop::heuristics::{
-    evaluate_repeated_tool_round, RepeatBreakerAction,
 };
 use crate::agent::policy;
 use crate::agent::prefix_guard;
@@ -756,7 +754,12 @@ mod lcm_checkpoint_tests {
             let heads: Vec<String> = source
                 .lines()
                 .filter(|line| !line.trim().is_empty())
-                .map(|line| line.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+                .map(|line| {
+                    line.split_whitespace()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
                 .collect();
             let chunk_size = heads.len().div_ceil(15).max(1);
             let bullets: Vec<String> = heads
@@ -1331,7 +1334,9 @@ impl AgentLoopShared {
         let run_anti_drift =
             ctx.core.mode().needs_anti_drift() && ctx.core.retention.anti_drift.enabled;
         prefix_guard::with_frozen_prefix(&mut ctx.messages, frozen_prefix, |m| {
-            ctx.core.retention.apply_shaping(m, iteration, run_anti_drift);
+            ctx.core
+                .retention
+                .apply_shaping(m, iteration, run_anti_drift);
         });
 
         // --- Proprioception: update SystemState ---
@@ -2748,7 +2753,7 @@ impl AgentLoopShared {
         let boundary_blocks_batch = ctx.flow.boundary == ResponseBoundary::Armed
             && routed_tool_calls
                 .iter()
-                .any(|tc| crate::agent::tool_engine::is_side_effect_tool(&tc.name));
+                .any(|tc| crate::agent::tool_engine::requires_result_report(&tc.name));
         // Resolve provider+model from explicit config.
         let delegation_provider = ctx.core.tool_runner_provider.clone();
         let delegation_model = ctx.core.tool_runner_model.clone();

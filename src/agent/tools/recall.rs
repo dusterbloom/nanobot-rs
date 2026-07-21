@@ -42,6 +42,34 @@ fn format_knowledge_hits(hits: &[SearchHit]) -> Option<String> {
     }
 }
 
+/// Rank curated `MEMORY.md` facts against the meaningful words in a natural
+/// language query. Unlike the old full-line substring check, this handles
+/// calls such as "what does Peppi prefer?" without falling through to broad
+/// session-history search just because the whole sentence is not in the file.
+fn matching_memory_facts<'a>(content: &'a str, query: &str, limit: usize) -> Vec<&'a str> {
+    let terms = crate::session::db::SessionDb::recall_keywords(query);
+    if terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranked: Vec<(usize, usize, &str)> = content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let fact = line.trim_start().strip_prefix("- ")?.trim();
+            let lower = fact.to_lowercase();
+            let score = terms.iter().filter(|term| lower.contains(*term)).count();
+            (score > 0).then_some((score, index, fact))
+        })
+        .collect();
+    ranked.sort_by_key(|(score, index, _)| (std::cmp::Reverse(*score), *index));
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, fact)| fact)
+        .collect()
+}
+
 /// How a recall query is executed against the knowledge store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryMode {
@@ -159,7 +187,12 @@ impl RecallTool {
         format_knowledge_hits(&hits)
     }
 
-    /// Search curated MEMORY.md plus canonical SQLite session messages.
+    /// Search curated MEMORY.md, falling back to canonical user messages.
+    ///
+    /// Curated facts are authoritative for cross-session recall. Raw history is
+    /// searched only when no curated fact matches, and assistant/tool messages
+    /// are excluded so old model claims and tool payloads do not masquerade as
+    /// user memory.
     async fn grep_memory(&self, query: &str, max_results: usize) -> String {
         let memory_dir = self.workspace.join("memory");
 
@@ -169,29 +202,41 @@ impl RecallTool {
 
         if memory_file.exists() {
             if let Ok(content) = tokio::fs::read_to_string(&memory_file).await {
-                let lower_query = query.to_lowercase();
-                let matching_lines: Vec<&str> = content
-                    .lines()
-                    .filter(|line| line.to_lowercase().contains(&lower_query))
-                    .collect();
-                if !matching_lines.is_empty() {
-                    results.push(format!("## MEMORY.md\n{}", matching_lines.join("\n")));
+                let facts = matching_memory_facts(&content, query, max_results);
+                if !facts.is_empty() {
+                    let bullets = facts
+                        .into_iter()
+                        .map(|fact| format!("- {fact}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    results.push(format!("## Curated memory\n{bullets}"));
                 }
             }
         }
 
-        if let Some(db_path) = &self.db_path {
-            let db = crate::session::db::SessionDb::new(db_path);
-            for hit in db.search_messages(query, max_results, None).await {
-                let snippet = if hit.snippet.is_empty() {
-                    hit.content
-                } else {
-                    hit.snippet
-                };
-                results.push(format!(
-                    "## {} [{}]\n{}",
-                    hit.session_key, hit.role, snippet
-                ));
+        if results.is_empty() {
+            if let Some(db_path) = &self.db_path {
+                let db = crate::session::db::SessionDb::new(db_path);
+                for hit in db
+                    .search_messages(query, max_results.saturating_mul(4), None)
+                    .await
+                {
+                    if hit.role != "user" {
+                        continue;
+                    }
+                    let snippet = if hit.snippet.is_empty() {
+                        hit.content
+                    } else {
+                        hit.snippet
+                    };
+                    results.push(format!(
+                        "## {} [{}]\n{}",
+                        hit.session_key, hit.role, snippet
+                    ));
+                    if results.len() >= max_results {
+                        break;
+                    }
+                }
             }
         }
 
@@ -246,13 +291,20 @@ impl Tool for RecallTool {
     async fn execute(&self, params: HashMap<String, Value>) -> String {
         let explicit_mode = params.get("mode").and_then(|v| v.as_str());
         let count = params.get("count").and_then(|v| v.as_u64());
+        let has_query_param = params.contains_key("query");
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
 
-        let route = choose_route(explicit_mode, count, query, cfg!(feature = "semantic"));
+        let effective_mode = if explicit_mode.is_none() && !has_query_param {
+            Some("latest")
+        } else {
+            explicit_mode
+        };
+
+        let route = choose_route(effective_mode, count, query, cfg!(feature = "semantic"));
         let mode = match route {
             RecallRoute::Latest { count } => return self.latest_sessions(count).await,
             RecallRoute::Search(_) if query.is_empty() => {
@@ -261,29 +313,33 @@ impl Tool for RecallTool {
             RecallRoute::Search(mode) => mode,
         };
 
+        if crate::session::db::SessionDb::recall_keywords(query).is_empty() {
+            return "No specific memory topic found in the query. Ask about a person, preference, decision, project, or other concrete detail."
+                .to_string();
+        }
+
         let n = 5;
-        let mut sections: Vec<String> = Vec::new();
+        let canonical = self.grep_memory(query, n).await;
+        let mut sections = if canonical.starts_with("No matches found") {
+            Vec::new()
+        } else {
+            vec![canonical.clone()]
+        };
 
-        // Try knowledge store first (hybrid BM25 + vector search).
-        if let Some(results) = self.knowledge_search(query, n, mode) {
-            let label = match mode {
-                QueryMode::Keyword => "Keyword Search Results",
-                QueryMode::Hybrid => "Hybrid Search Results",
-            };
-            sections.push(format!("## {}\n{}", label, results));
-        }
-
-        // Always supplement with grep over raw memory files (catches un-indexed content).
-        let grep_results = self.grep_memory(query, n).await;
-        if !grep_results.contains("No matches found")
-            && !grep_results.contains("No memory directory")
-        {
-            sections.push(grep_results);
-        }
-
-        // If knowledge store had nothing, and grep had nothing, report it.
+        // The document index is a fallback, not a peer of curated memory and
+        // raw user history. Merging all three made stale indexed context drown
+        // out the canonical answer.
         if sections.is_empty() {
-            sections.push(self.grep_memory(query, n).await);
+            if let Some(results) = self.knowledge_search(query, n, mode) {
+                let label = match mode {
+                    QueryMode::Keyword => "Indexed document results",
+                    QueryMode::Hybrid => "Indexed document results (hybrid)",
+                };
+                sections.push(format!("## {label}\n{results}"));
+            }
+        }
+        if sections.is_empty() {
+            sections.push(canonical);
         }
 
         // Truncate total output to avoid blowing context (UTF-8 safe).
@@ -522,11 +578,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recall_grep_finds_session_files() {
+    async fn test_recall_natural_query_prefers_curated_fact_over_session_noise() {
+        let (tmp, tool) = make_db_tool(
+            "cli:test",
+            &[
+                json!({"role": "user", "content": "old context about Rust tooling"}),
+                json!({"role": "assistant", "content": "Peppi prefers an invented Rust workflow"}),
+            ],
+        )
+        .await;
+        std::fs::write(
+            tmp.path().join("memory").join("MEMORY.md"),
+            "- Peppi prefers concise answers\n- Favorite language is Rust\n",
+        )
+        .unwrap();
+
+        let result = tool.grep_memory("what does Peppi prefer", 5).await;
+        assert!(
+            result.contains("Peppi prefers concise answers"),
+            "got: {result}"
+        );
+        assert!(!result.contains("invented Rust workflow"), "got: {result}");
+        assert!(!result.contains("old context"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_recall_grep_finds_user_session_messages() {
         let (_tmp, tool) = make_db_tool(
             "cli:test",
             &[json!({
-                "role": "assistant",
+                "role": "user",
                 "content": "Discussed async Rust patterns."
             })],
         )
@@ -536,6 +617,32 @@ mod tests {
             result.contains("async"),
             "Should find async in the SQLite session"
         );
+    }
+
+    #[tokio::test]
+    async fn test_recall_session_fallback_excludes_assistant_claims() {
+        let (_tmp, tool) = make_db_tool(
+            "cli:test",
+            &[
+                json!({"role": "assistant", "content": "User definitely prefers chartreuse windows"}),
+                json!({"role": "tool", "content": "chartreuse tool payload"}),
+            ],
+        )
+        .await;
+        let result = tool.grep_memory("chartreuse", 5).await;
+        assert!(result.contains("No matches found"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_recall_rejects_topicless_memory_query() {
+        let (_tmp, tool) = make_tool();
+        let result = tool
+            .execute(HashMap::from([(
+                "query".to_string(),
+                json!("what do you remember about me"),
+            )]))
+            .await;
+        assert!(result.contains("No specific memory topic"), "got: {result}");
     }
 
     #[tokio::test]
@@ -563,11 +670,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recall_missing_query_param() {
+    async fn test_recall_missing_query_param_defaults_to_latest() {
         let (_tmp, tool) = make_tool();
         let params = HashMap::new();
         let result = tool.execute(params).await;
-        assert!(result.contains("Error"));
+        assert!(
+            result.contains("Latest-session recall unavailable"),
+            "missing query should take deterministic latest route, got: {result}"
+        );
     }
 
     #[test]

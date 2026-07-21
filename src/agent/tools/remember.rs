@@ -10,6 +10,8 @@ use tokio::fs;
 
 use super::base::{PermissionLevel, Tool};
 
+const MAX_FACT_CHARS: usize = 180;
+
 /// Tool that manages facts in MEMORY.md under dated sections.
 pub struct RememberTool {
     workspace: PathBuf,
@@ -142,7 +144,7 @@ impl Tool for RememberTool {
     }
 
     fn description(&self) -> &str {
-        "Manage long-term memory facts in MEMORY.md. Default action is add; also supports list, replace, delete, and dedupe so memory can be maintained instead of only appended."
+        "Manage curated long-term facts in MEMORY.md. Add only concise, durable facts explicitly stated by the user; do not infer emotions, intent, causality, or narrative context. One fact per call, at most 180 characters. Default action is add when fact is present; otherwise list."
     }
 
     fn parameters(&self) -> Value {
@@ -156,7 +158,8 @@ impl Tool for RememberTool {
                 },
                 "fact": {
                     "type": "string",
-                    "description": "Fact to add or exact fact to delete"
+                    "maxLength": MAX_FACT_CHARS,
+                    "description": "One concise fact to add, or the exact fact to delete. For add, use only an explicit user-stated fact; no interpretation or session narrative."
                 },
                 "old_fact": {
                     "type": "string",
@@ -179,8 +182,14 @@ impl Tool for RememberTool {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
-            .unwrap_or("add")
-            .to_ascii_lowercase();
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| {
+                if args.contains_key("fact") {
+                    "add".to_string()
+                } else {
+                    "list".to_string()
+                }
+            });
 
         let memory_path = self.workspace.join("memory").join("MEMORY.md");
 
@@ -198,6 +207,9 @@ impl Tool for RememberTool {
                     Ok(f) => f,
                     Err(e) => return e,
                 };
+                if let Err(error) = validate_new_fact(fact) {
+                    return error;
+                }
                 if memory_has_fact(&current, fact) {
                     return format!("Already remembered: {}", fact.trim());
                 }
@@ -233,6 +245,9 @@ impl Tool for RememberTool {
                     Ok(f) => f,
                     Err(e) => return e,
                 };
+                if let Err(error) = validate_new_fact(new_fact) {
+                    return error;
+                }
                 let (updated, count) = replace_fact(&current, old_fact, new_fact);
                 if count == 0 {
                     return format!(
@@ -297,6 +312,27 @@ fn required_string<'a>(args: &'a HashMap<String, Value>, key: &str) -> Result<&'
         Some(s) if !s.is_empty() => Ok(s),
         _ => Err(format!("Error: Missing required parameter: {}", key)),
     }
+}
+
+fn validate_new_fact(fact: &str) -> Result<(), String> {
+    let fact = fact.trim();
+    let chars = fact.chars().count();
+    if chars > MAX_FACT_CHARS {
+        return Err(format!(
+            "Error: Memory fact is too verbose ({chars} characters; maximum {MAX_FACT_CHARS}). Store one concise, explicit user-stated fact without interpretation."
+        ));
+    }
+    if fact.contains('\n')
+        || fact.contains('\r')
+        || fact.starts_with("- ")
+        || fact.starts_with("# ")
+    {
+        return Err(
+            "Error: Memory fact must be one plain-text fact, not a list or multi-line narrative."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn fact_text_from_line(line: &str) -> Option<&str> {
@@ -435,11 +471,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_fact_param_returns_error() {
+    async fn test_missing_fact_param_defaults_to_list() {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
         let result = tool.execute(HashMap::new()).await;
-        assert!(result.starts_with("Error:"), "got: {}", result);
+        assert_eq!(result, "No memory facts found.");
+    }
+
+    #[tokio::test]
+    async fn test_add_rejects_verbose_interpretive_fact() {
+        let dir = TempDir::new().unwrap();
+        let tool = RememberTool::new(dir.path().to_path_buf());
+        let verbose = "Peppi said something memorable during this session, which means the user was expressing a complex emotional reaction to the agent and the surrounding project context, with additional speculative narrative details that were never explicitly established.";
+        let result = tool
+            .execute(HashMap::from([("fact".to_string(), json!(verbose))]))
+            .await;
+        assert!(result.contains("too verbose"), "got: {result}");
+        assert!(!dir.path().join("memory").join("MEMORY.md").exists());
+    }
+
+    #[tokio::test]
+    async fn test_add_rejects_multiline_fact() {
+        let dir = TempDir::new().unwrap();
+        let tool = RememberTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute(HashMap::from([(
+                "fact".to_string(),
+                json!("First claim\n- inferred second claim"),
+            )]))
+            .await;
+        assert!(result.contains("one plain-text fact"), "got: {result}");
     }
 
     #[tokio::test]

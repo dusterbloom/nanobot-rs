@@ -44,6 +44,21 @@ pub enum ToolBodyPolicy {
     Digest { preview_len: usize },
 }
 
+/// Max bytes retained for a tool-result body in replayable prompt history.
+///
+/// The same cap must apply before a tool result enters live `ctx.messages` and
+/// when session history is loaded from SQLite. Otherwise a same-turn prompt can
+/// warm the server cache with bytes that the next turn will never replay.
+pub(crate) const TOOL_RESULT_REPLAY_MAX_BYTES: usize = 8000;
+
+pub(crate) fn cap_tool_result_for_replay(content: &str) -> String {
+    shrink_tool_body(
+        content,
+        ToolBodyPolicy::ByteCap(TOOL_RESULT_REPLAY_MAX_BYTES),
+    )
+    .unwrap_or_else(|| content.to_string())
+}
+
 /// Shrink a tool-result body according to `policy`.
 ///
 /// Returns `Some(replacement)` when the body was shrunk, `None` when it is

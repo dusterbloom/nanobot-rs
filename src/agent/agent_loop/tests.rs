@@ -3248,6 +3248,90 @@ async fn test_local_wire_prompt_tool_result_appends_only() {
 }
 
 #[tokio::test]
+async fn test_local_wire_prefix_stable_across_batched_tool_results_and_next_turn() {
+    let mut args_a = std::collections::HashMap::new();
+    args_a.insert("path".to_string(), json!("big_a.txt"));
+    let mut args_b = std::collections::HashMap::new();
+    args_b.insert("path".to_string(), json!("big_b.txt"));
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![
+                    crate::providers::base::ToolCallRequest {
+                        id: "tc_big_a".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: args_a,
+                    },
+                    crate::providers::base::ToolCallRequest {
+                        id: "tc_big_b".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: args_b,
+                    },
+                ],
+                finish_reason: "tool_calls".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+            WireRecordingProvider::text_response("done turn one"),
+            WireRecordingProvider::text_response("turn two reply"),
+        ],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    std::fs::write(workspace.join("big_a.txt"), "alpha\n".repeat(1600)).unwrap();
+    std::fs::write(workspace.join("big_b.txt"), "beta\n".repeat(1700)).unwrap();
+    let session_key = format!("batched-tools-prefix-{}", uuid::Uuid::new_v4());
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent_loop.process_direct("read both files", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("turn 1 must terminate");
+    let turn1_calls = provider.calls().len();
+    assert_eq!(turn1_calls, 2, "turn 1 should call before and after tools");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent_loop.process_direct("what did you see?", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("turn 2 must terminate");
+
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 3, "turn 2 should add one provider call");
+    assert_wire_prefix(&calls[0], &calls[1]);
+    assert_wire_prefix(&calls[1], &calls[2]);
+
+    let call1_roles: Vec<_> = calls[1]
+        .iter()
+        .map(|m| m["role"].as_str().unwrap_or("?"))
+        .collect();
+    let joined = call1_roles.join(",");
+    assert!(
+        joined.contains("assistant,user,assistant,user"),
+        "batched local tool results must be separated without mutating earlier wire messages: {joined}"
+    );
+    assert!(calls[1].iter().any(|m| {
+        m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("read_file(tc_big_a)")
+    }));
+    assert!(calls[1].iter().any(|m| {
+        m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("read_file(tc_big_b)")
+    }));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
     let duplicate_call = |id: usize| {
         let mut arguments = std::collections::HashMap::new();

@@ -11,6 +11,8 @@ use base64::Engine;
 use chrono::Local;
 use serde_json::{json, Value};
 
+use crate::agent::context_hygiene::cap_tool_result_for_replay;
+
 use crate::agent::memory::MemoryStore;
 use crate::agent::skills::SkillsLoader;
 use crate::agent::token_budget::TokenBudget;
@@ -248,12 +250,12 @@ impl ContextBuilder {
         // Pi-style local context has a fixed semantic cost instead of growing
         // with the model window. More context belongs to the conversation and
         // on-demand retrieval, not to an increasingly large permanent prompt.
-            // The bootstrap (AGENTS.md workflow + SOUL.md/USER.md persona) is now
-            // part of the byte-stable cached prefix, so it must stay under the
-            // 1000-token stable cap alongside identity + skills. ~2% of context
-            // keeps workflow + persona together while staying well under pi's
-            // ~1000-token system prompt. Clamped to 800 so identity + skills +
-            // bootstrap always fit the 1000-token stable cap without overflow.
+        // The bootstrap (AGENTS.md workflow + SOUL.md/USER.md persona) is now
+        // part of the byte-stable cached prefix, so it must stay under the
+        // 1000-token stable cap alongside identity + skills. ~2% of context
+        // keeps workflow + persona together while staying well under pi's
+        // ~1000-token system prompt. Clamped to 800 so identity + skills +
+        // bootstrap always fit the 1000-token stable cap without overflow.
         self.bootstrap_budget = (max_context_tokens / 50).clamp(200, 800);
         self.long_term_memory_budget = 80;
         self.skills_budget = 100;
@@ -275,7 +277,7 @@ impl ContextBuilder {
         self.long_term_memory_budget = (max_context_tokens / 100).clamp(200, 3_000); // 1%
         self.skills_budget = (max_context_tokens / 25).clamp(500, 6_000); // 4%
         self.profiles_budget = (max_context_tokens / 50).clamp(300, 2_000); // 2%
-        // Cloud models: generous hard cap (40% of context) as a safety net only.
+                                                                            // Cloud models: generous hard cap (40% of context) as a safety net only.
         self.system_prompt_cap = max_context_tokens * 2 / 5; // 40%
     }
 
@@ -1122,11 +1124,16 @@ impl ContextBuilder {
         tool_name: &str,
         result: &str,
     ) {
+        let content = if tool_name == "recall_tool_result" {
+            result.to_string()
+        } else {
+            cap_tool_result_for_replay(result)
+        };
         messages.push(json!({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
-            "content": result,
+            "content": content,
         }));
     }
 
@@ -1144,11 +1151,16 @@ impl ContextBuilder {
             "[VERBATIM TOOL OUTPUT — do not paraphrase]\n{}\n[END TOOL OUTPUT]",
             result
         );
+        let content = if tool_name == "recall_tool_result" {
+            wrapped
+        } else {
+            cap_tool_result_for_replay(&wrapped)
+        };
         messages.push(json!({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
-            "content": wrapped,
+            "content": content,
         }));
     }
 
@@ -2124,6 +2136,17 @@ mod tests {
         assert_eq!(messages[1]["name"], "tool_b");
     }
 
+    #[test]
+    fn test_add_tool_result_applies_replay_cap_before_live_prompt() {
+        let mut messages: Vec<Value> = Vec::new();
+        let body = "x".repeat(crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES + 1024);
+        ContextBuilder::add_tool_result(&mut messages, "c1", "read_file", &body);
+
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.len() < body.len());
+        assert!(content.ends_with("[tool output truncated]"));
+    }
+
     // ----- add_assistant_message -----
 
     #[test]
@@ -2204,6 +2227,18 @@ mod tests {
         let content = messages[0]["content"].as_str().unwrap();
         assert!(content.contains("[VERBATIM TOOL OUTPUT"));
         assert!(content.contains("[END TOOL OUTPUT]"));
+    }
+
+    #[test]
+    fn test_add_tool_result_immutable_caps_after_wrapping() {
+        let mut messages: Vec<Value> = Vec::new();
+        let body = "x".repeat(crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES + 1024);
+        ContextBuilder::add_tool_result_immutable(&mut messages, "c1", "read_file", &body);
+
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.len() < body.len() + 128);
+        assert!(content.starts_with("[VERBATIM TOOL OUTPUT"));
+        assert!(content.ends_with("[tool output truncated]"));
     }
 
     #[test]
@@ -2481,22 +2516,10 @@ mod tests {
         cb.model_name = "local:Qwen3-35B.gguf".to_string();
         cb.local_prompt_mode = true;
 
-        let (stable_a, runtime_a, _) = cb.build_local_system_prompt_parts(
-            None,
-            None,
-            None,
-            false,
-            None,
-            &[],
-        );
-        let (stable_b, _, _) = cb.build_local_system_prompt_parts(
-            None,
-            None,
-            None,
-            false,
-            None,
-            &[],
-        );
+        let (stable_a, runtime_a, _) =
+            cb.build_local_system_prompt_parts(None, None, None, false, None, &[]);
+        let (stable_b, _, _) =
+            cb.build_local_system_prompt_parts(None, None, None, false, None, &[]);
 
         // Cache invariant: the stable prefix is byte-identical across turns.
         assert_eq!(
@@ -2511,7 +2534,10 @@ mod tests {
             "local cached prefix ({tokens} tokens) exceeds the 1000-token ceiling"
         );
         // The runtime tail is free to vary and must not be folded into the prefix.
-        assert!(runtime_a.is_empty(), "empty-workspace run has no runtime tail");
+        assert!(
+            runtime_a.is_empty(),
+            "empty-workspace run has no runtime tail"
+        );
         assert!(!stable_a.contains("## Values"));
         assert!(!stable_a.contains("## When unsure"));
         assert!(!stable_a.contains("## Never"));
