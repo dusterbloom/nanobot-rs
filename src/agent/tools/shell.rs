@@ -72,6 +72,11 @@ pub struct ExecTool {
     deny_patterns: Vec<String>,
     allow_patterns: Vec<String>,
     restrict_to_workspace: bool,
+    /// Retained for API stability and future per-tool capping. Truncation now
+    /// happens in the tool-result ingestion layer (`tool_engine.rs`) so the
+    /// full body reaches the SQLite stash for search/slice/recall. See the
+    /// comment in `execute`.
+    #[allow(dead_code)]
     max_output_chars: usize,
 }
 
@@ -296,8 +301,12 @@ impl ExecTool {
 
     /// Resolve the working directory from params, falling back to the
     /// configured default, then `current_dir()`, then `"."`.
-    fn resolve_cwd(&self, params: &HashMap<String, serde_json::Value>) -> String {
-        params
+    ///
+    /// A leading `~` (or a bare `~`) is expanded to the user's home directory
+    /// so that callers may pass paths like `~/Dev/nanobot-rs`. This reuses the
+    /// shared [`crate::utils::helpers::expand_tilde`] used by the filesystem
+    /// and config layers, keeping path-expansion logic in a single place.
+    fn resolve_cwd(&self, params: &HashMap<String, serde_json::Value>) -> String {        let raw = params
             .get("working_dir")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -306,7 +315,31 @@ impl ExecTool {
                 std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| ".".to_string())
-            })
+            });
+        crate::utils::helpers::expand_tilde(&raw)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// Produce a context-aware hint for a process-spawn failure.
+    ///
+    /// `sh` itself essentially never fails to spawn, so a failure here is
+    /// almost always a bad `current_dir`. We disambiguate so the caller sees a
+    /// hint that points at the *actual* problem instead of a misleading
+    /// "command not in PATH" message.
+    fn spawn_error_hint(&self, error: &std::io::Error, cwd: &str) -> String {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "Error executing command: working directory does not exist: `{}`. \
+                 Hint: verify the path is correct and absolute (or use an expanded `~`).",
+                cwd
+            )
+        } else {
+            format!(
+                "Error executing command: {}. Hint: verify the command exists and is in PATH.",
+                error
+            )
+        }
     }
 }
 
@@ -395,29 +428,25 @@ impl Tool for ExecTool {
                         parts.join("\n")
                     }
                 }
-                Err(e) => format!(
-                    "Error executing command: {}. Hint: verify the command exists and is in PATH.",
-                    e
-                ),
+                Err(e) => self.spawn_error_hint(&e, &cwd),
             }
         })
         .await;
 
-        let mut output = match result {
+        let output = match result {
             Ok(s) => s,
             Err(_) => {
                 format!("Error: Command timed out after {} seconds. Hint: try a simpler command or break it into smaller steps, or set a longer timeout.", timeout)
             }
         };
 
-        // Truncate very long output.
-        let max_len = self.max_output_chars;
-        if output.len() > max_len {
-            let overflow = output.len() - max_len;
-            output.truncate(crate::utils::helpers::floor_char_boundary(&output, max_len));
-            output.push_str(&format!("\n... (truncated, {} more chars)", overflow));
-        }
-
+        // NOTE: no truncation here. The tool-result ingestion layer
+        // (`inject_tool_result` / `build_tool_result_preview` in
+        // `tool_engine.rs`) stashes the FULL body to SQLite and replaces it in
+        // context with a bounded head+tail preview, plus a recall/search
+        // pointer. Truncating here would destroy data before it can be stashed,
+        // making search_tool_result/slice_tool_result/recall_tool_result
+        // operate on already-lossy data.
         output
     }
 
@@ -461,10 +490,7 @@ impl Tool for ExecTool {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    return format!(
-                    "Error executing command: {}. Hint: verify the command exists and is in PATH.",
-                    e
-                )
+                    return self.spawn_error_hint(&e, &cwd);
                 }
             };
 
@@ -558,18 +584,13 @@ impl Tool for ExecTool {
         })
         .await;
 
-        let mut output = match result {
+        let output = match result {
             Ok(s) => s,
             Err(_) => format!("Error: Command timed out after {} seconds. Hint: try a simpler command or break it into smaller steps, or set a longer timeout.", timeout),
         };
 
-        let max_len = self.max_output_chars;
-        if output.len() > max_len {
-            let overflow = output.len() - max_len;
-            output.truncate(crate::utils::helpers::floor_char_boundary(&output, max_len));
-            output.push_str(&format!("\n... (truncated, {} more chars)", overflow));
-        }
-
+        // No truncation: the tool-result ingestion layer (see comment in
+        // `execute`) stashes the full body and bounds the in-context preview.
         output
     }
 }
@@ -1536,5 +1557,56 @@ mod tests {
         );
         assert!(msg.contains("Hint:"));
         assert!(msg.contains("PATH"));
+    }
+
+    fn resolve_cwd_param(cwd: Option<&str>) -> String {
+        let tool = ExecTool::new(10, None, None, None, false, 30000);
+        let mut params: HashMap<String, serde_json::Value> = HashMap::new();
+        if let Some(c) = cwd {
+            params.insert("working_dir".to_string(), serde_json::json!(c));
+        }
+        tool.resolve_cwd(&params)
+    }
+
+    #[test]
+    fn test_resolve_cwd_expands_tilde() {
+        let home = dirs::home_dir().expect("home dir available in test env");
+
+        // `~` alone resolves to the home directory.
+        assert_eq!(PathBuf::from(resolve_cwd_param(Some("~"))), home);
+
+        // `~/foo` resolves to `$HOME/foo`.
+        assert_eq!(
+            PathBuf::from(resolve_cwd_param(Some("~/foo"))),
+            home.join("foo")
+        );
+
+        // A plain absolute path is passed through unchanged.
+        assert_eq!(
+            PathBuf::from(resolve_cwd_param(Some("/tmp"))),
+            PathBuf::from("/tmp")
+        );
+    }
+
+    #[test]
+    fn test_spawn_error_hint_bad_cwd() {
+        // A `NotFound` error should hint at a bad working directory, not PATH.
+        let tool = ExecTool::new(10, None, None, None, false, 30000);
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let msg = tool.spawn_error_hint(&err, "/nonexistent/path");
+        assert!(
+            msg.contains("working directory does not exist"),
+            "expected cwd hint, got: {msg}"
+        );
+        assert!(!msg.contains("PATH"), "should not mention PATH for bad cwd");
+    }
+
+    #[test]
+    fn test_spawn_error_hint_other_error() {
+        // Non-NotFound errors should keep the generic PATH hint.
+        let tool = ExecTool::new(10, None, None, None, false, 30000);
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let msg = tool.spawn_error_hint(&err, "/tmp");
+        assert!(msg.contains("PATH"), "expected PATH hint, got: {msg}");
     }
 }

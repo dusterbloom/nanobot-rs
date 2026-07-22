@@ -18,6 +18,7 @@ pub mod remember;
 pub mod search_context;
 pub mod session_search;
 pub mod shell;
+pub mod stash_search;
 pub mod spawn;
 pub mod system_info;
 pub mod todo;

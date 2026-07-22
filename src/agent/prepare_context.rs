@@ -333,6 +333,23 @@ impl AgentLoopShared {
             ),
         ));
 
+        // Bounded retrieval over stashed results: search (grep) and slice
+        // (line-range) without ever loading the full body into context.
+        // These complement recall_tool_result for the common case where only
+        // a few matching lines are needed.
+        tools.register(Box::new(
+            crate::agent::tools::stash_search::SearchToolResultTool::with_db(
+                core.sessions.path().to_path_buf(),
+                session_id.clone(),
+            ),
+        ));
+        tools.register(Box::new(
+            crate::agent::tools::stash_search::SliceToolResultTool::with_db(
+                core.sessions.path().to_path_buf(),
+                session_id.clone(),
+            ),
+        ));
+
         // Get session history. Track count so we know where new messages start.
         // The trim ceiling must stay above LCM's soft
         // compaction threshold, or compaction never fires (see history_limit_lcm).
