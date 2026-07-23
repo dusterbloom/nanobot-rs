@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{require_str, Tool, ToolConcurrency};
+use super::base::{Tool, ToolConcurrency};
 use crate::agent::skills::SkillsLoader;
 
 /// Tool that reads a skill's full content by name.
@@ -33,8 +33,8 @@ impl Tool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Read a skill's full instructions by name. Use this when the skills \
-         summary in the system prompt mentions a skill you want to use."
+        "Read a skill's full instructions by name. Call with no name (or empty) \
+         to list all available skills with their descriptions."
     }
 
     fn concurrency(&self) -> ToolConcurrency {
@@ -47,21 +47,25 @@ impl Tool for ReadSkillTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "The skill name (as shown in the <name> tag of the skills list)"
+                    "description": "The skill name (as shown in the skills list). Omit to list all skills."
                 }
             },
-            "required": ["name"]
         })
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let name = require_str!(params, "name");
+        // No name (or empty, or the legacy "__list__" sentinel) → list all
+        // skills. Same discoverability contract as the `tool` proxy: call with
+        // no args to discover, call with a name to load.
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let want_list = name.is_empty() || name == "__list__";
 
-        let loader = SkillsLoader::new(&self.workspace, None);
-
-        // Special sentinel: return the full XML summary (T1 view).
-        if name == "__list__" {
-            let summary = loader.build_skills_summary();
+        if want_list {
+            let summary = SkillsLoader::new(&self.workspace, None).build_skills_summary();
             return if summary.is_empty() {
                 "No skills are installed.".to_string()
             } else {
@@ -69,6 +73,7 @@ impl Tool for ReadSkillTool {
             };
         }
 
+        let loader = SkillsLoader::new(&self.workspace, None);
         match loader.load_skill(name) {
             Some(content) => content,
             None => {
@@ -131,12 +136,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_name_param() {
+    async fn test_missing_name_param_lists_skills() {
+        // No name → list all skills (same discoverability contract as the
+        // `tool` proxy). Replaces the old error-on-missing-name behavior that
+        // left the model unable to discover skills without the obscure
+        // "__list__" sentinel.
         let (_tmp, tool) = make_workspace_with_skill("test", "body");
         let params = HashMap::new();
         let result = tool.execute(params).await;
-        assert!(result.contains("Error:"));
-        assert!(result.contains("'name' parameter"));
+        assert!(
+            result.starts_with("<skills>"),
+            "missing name should list skills, got: {result}"
+        );
+        assert!(result.contains("test"));
     }
 
     #[test]

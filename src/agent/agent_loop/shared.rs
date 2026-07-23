@@ -2171,11 +2171,16 @@ impl AgentLoopShared {
     /// Returns `(active_defs, saved_defs)` where `saved_defs` preserves the
     /// pre-trio-stripping state for router passthrough fallback.
     fn select_tool_definitions(&self, ctx: &mut TurnContext) -> (Vec<Value>, Vec<Value>) {
-        // One production catalog for every runtime mode. Hot coding tools,
-        // including the artifact chunk writer, are native at turn 1; the long
-        // tail stays executable through the `tool` proxy meta-tool, keeping the
-        // cold-prefill tool block small and the prompt-prefix cache stable.
-        let mut tool_defs = ctx.tools.get_core_plus_proxy_definitions();
+        // Local: pure proxy (~230 tok) — every tool reached via `tool` gateway.
+        // Cloud: core+proxy (~1900 tok) — 12 hot native schemas + proxy tail.
+        // The branch is unavoidable: local needs the lean surface to cut prefill,
+        // cloud needs native schemas because the capability gate filters by tool
+        // name and `tool` is not in any capability allowlist.
+        let mut tool_defs = if ctx.core.mode().is_local() {
+            ctx.tools.get_lean_definitions()
+        } else {
+            ctx.tools.get_core_plus_proxy_definitions()
+        };
         // Tool-averse models (no tool-calling training, e.g. VibeThinker):
         // the native `tools` parameter confuses or errors their chat
         // templates, and nothing else would teach them the textual syntax the

@@ -1251,27 +1251,29 @@ impl ContextBuilder {
         let memory_path = format!("{workspace_path}/memory/MEMORY.md");
 
         // Genuinely divergent pieces: intro/model line, extra rules, tail sections.
+        // Pure-proxy identity: zero native tools, zero inlined catalog. Every
+        // tool — files, skills, memory, shell — is reached via the `tool`
+        // proxy. The model lists tools with `tool({})`, inspects with
+        // `tool({"name":"X"})`, invokes with `tool({"name":"X","args":{...}})`.
+        // This keeps the system prompt + tool surface combined under ~410
+        // tokens, cutting first-turn prefill to ~5s on low-power hardware.
         let (intro, home_line, extra_rules, tail) = if local {
             let model_line = if self.model_name.is_empty() {
-                "Model: local".to_string()
+                "local".to_string()
             } else {
-                format!("Model: {}", self.model_name)
+                self.model_name.clone()
             };
             (
                 format!(
-                    "You are nanobot. {model_line}. Project directory: {cwd}. \
-                     Internal workspace: {workspace_path}. Long-term memory: {memory_path}. \
-                     Use tools; quote [VERBATIM TOOL OUTPUT] verbatim.\n\
-                     Tool map: list_dir(path) lists directories; find_files(path,pattern) \
-                     finds names; search_files(query,path) searches content; read_file(path,lines) \
-                     reads exact lines; write_file(path,content) creates small files; \
-                     write_file_chunk(path,mode,content,expected_offset) streams rich files; \
-                     edit_file(path,old_text,new_text) edits files; exec(command,working_dir) \
-                     runs shell commands. Prefer write_file_chunk for generated HTML/apps/games and \
-                     edit_file for targeted edits; do not use exec/cp for content you need to \
-                     create. Prefer relative paths from the project directory. If a tool returns \
-                     Error: or (no output), report that exact outcome before trying another path. \
-                     Use tool(name) with no args to inspect uncommon tools."
+                    "You are nanobot, a Rust AI assistant for Peppi.\n\
+                     Model: {model_line}. Cwd: {cwd}. Workspace: {workspace_path}.\n\n\
+                     All tools run via the `tool` proxy — omit name to list, \
+                     {{\"name\":\"X\"}} to inspect, {{\"name\":\"X\",\"args\":{{...}}}} to invoke. \
+                     Starter tools: read_file, read_skill, recall, remember, edit_file, exec. \
+                     Inspect a tool before first use to learn its args. On error, quote the \
+                     exact tool message; never invent causes, paths, or outputs.\n\n\
+                     Persona: AGENTS.md, SOUL.md, USER.md at workspace root — \
+                     read_file them to learn your identity, rules, and user prefs."
                 ),
                 String::new(),
                 String::new(),
@@ -1371,19 +1373,11 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
             ));
         }
 
-        // Load bootstrap file CONTENT (AGENTS.md, SOUL.md, USER.md)
-        // into the prompt so the agent knows its identity and user preferences.
-        // Previously this only listed file names as "available via read_file"
-        // which meant local agents started with zero context.
-        let bootstrap = self._load_bootstrap_files_within_budget(self.bootstrap_budget.min(800));
-        if !bootstrap.is_empty() {
-            blocks.push(PromptBlock::new("Workspace Context", bootstrap));
-        }
-
-        let skill_index = self.skills.build_name_index(12);
-        if !skill_index.is_empty() {
-            blocks.push(PromptBlock::new("Skills", skill_index));
-        }
+        // Bootstrap files (AGENTS.md/SOUL.md/USER.md) and the skill name index
+        // are NOT inlined into the local system prompt. The identity above
+        // points the model at them via the `tool` proxy + read_file / read_skill,
+        // same on-demand discipline used for memory. Explicitly requested skills
+        // are still loaded below.
 
         if let Some(names) = skill_names {
             if !names.is_empty() {
@@ -1756,11 +1750,6 @@ fn _guess_mime(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::tools::base::Tool;
-    use crate::agent::tools::{
-        EditFileTool, ExecTool, FindFilesTool, ListDirTool, ReadFileTool, SearchFilesTool,
-        WriteFileChunkTool, WriteFileTool,
-    };
     use tempfile::TempDir;
 
     /// Helper: create a ContextBuilder backed by a temporary workspace.
@@ -1992,7 +1981,10 @@ mod tests {
     }
 
     #[test]
-    fn test_local_identity_contains_directory_contract() {
+    fn test_local_identity_is_proxy_only() {
+        // Pure-proxy identity: zero native tools advertised, everything via the
+        // `tool` proxy. Must name starter tools for discoverability and teach
+        // the three proxy modes (list / inspect / invoke).
         let (_tmp, cb) = make_context();
         let identity = cb._get_identity(true);
         let workspace_str = ContextBuilder::display_path(
@@ -2001,80 +1993,85 @@ mod tests {
                 .unwrap_or_else(|_| cb.workspace.clone()),
         );
 
-        assert!(identity.contains("Project directory:"), "{identity}");
-        assert!(identity.contains("Internal workspace:"), "{identity}");
+        // (a) identity + where
+        assert!(identity.contains("nanobot"), "{identity}");
+        assert!(identity.contains("Cwd:"), "{identity}");
+        assert!(identity.contains("Workspace:"), "{identity}");
         assert!(identity.contains(&workspace_str), "{identity}");
+
+        // (b) proxy is the only gateway — three modes
+        assert!(identity.contains("`tool` proxy"), "{identity}");
+        assert!(identity.contains("omit name to list"), "{identity}");
+        assert!(identity.contains(r#"{"name":"X"}"#), "{identity}");
         assert!(
-            identity.contains(&format!("{workspace_str}/memory/MEMORY.md")),
-            "{identity}"
-        );
-        assert!(identity.contains("Tool map:"), "{identity}");
-        assert!(identity.contains("list_dir(path)"), "{identity}");
-        assert!(identity.contains("write_file(path,content)"), "{identity}");
-        assert!(
-            identity.contains("write_file_chunk(path,mode,content,expected_offset)"),
-            "{identity}"
-        );
-        assert!(
-            identity.contains("Prefer write_file_chunk for generated HTML/apps/games"),
+            identity.contains(r#"{"name":"X","args":{...}}"#),
             "{identity}"
         );
         assert!(
-            identity.contains("edit_file(path,old_text,new_text)"),
+            identity.contains("Inspect a tool before first use"),
             "{identity}"
         );
-        assert!(
-            identity.contains("Use tool(name) with no args"),
-            "{identity}"
-        );
+
+        // (c) starter tools named for discoverability
+        for tool in ["read_file", "read_skill", "recall", "remember", "edit_file", "exec"] {
+            assert!(identity.contains(tool), "missing starter tool {tool}: {identity}");
+        }
+
+        // (d) error discipline
+        assert!(identity.contains("quote the exact tool message"), "{identity}");
+        assert!(identity.contains("never invent causes"), "{identity}");
+
+        // (e) persona files
+        assert!(identity.contains("AGENTS.md"), "{identity}");
+        assert!(identity.contains("SOUL.md"), "{identity}");
+        assert!(identity.contains("USER.md"), "{identity}");
+
+        // Must NOT advertise native-tool syntax or the non-existent list_skills.
+        assert!(!identity.contains("list_skills"), "{identity}");
+        assert!(!identity.contains("Native tools:"), "{identity}");
+        assert!(!identity.contains("read_file(path)"), "{identity}");
+        assert!(!identity.contains("Tool map:"), "{identity}");
     }
 
     #[test]
-    fn test_local_identity_tool_map_matches_advertised_schema_params() {
-        let (_tmp, cb) = make_context();
-        let identity = cb._get_identity(true);
+    fn test_local_system_prompt_under_180_tokens_without_inlined_catalog() {
+        // Headline property: with a real workspace and a realistic long GGUF
+        // model name, the assembled local system prompt stays small. The ceiling
+        // accommodates path interpolation + long model filenames.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "# Workflow\n\ncoding rules...".repeat(20)).unwrap();
+        fs::write(tmp.path().join("SOUL.md"), "# Soul\n\npersona lines...".repeat(5)).unwrap();
+        fs::write(tmp.path().join("USER.md"), "# User\n\npreferences...".repeat(5)).unwrap();
+        let mut cb = ContextBuilder::new_lite(tmp.path());
+        cb.set_lite_mode(4_096);
+        // Simulate a realistic local model name — the longest the prompt will see.
+        cb.model_name = "local:Qwen2.5-Coder-7B-Instruct-Q5_K_M.gguf".to_string();
 
-        fn assert_params(tool: &dyn Tool, params: &[&str]) {
-            let schema = tool.parameters();
-            let props = schema
-                .get("properties")
-                .and_then(|v| v.as_object())
-                .unwrap();
-            for param in params {
-                assert!(
-                    props.contains_key(*param),
-                    "{} schema must contain advertised param {param}",
-                    tool.name()
-                );
-            }
-        }
+        let prompt = cb.build_local_system_prompt(None, None, None, false, None, &[]);
+        let tokens = TokenBudget::estimate_str_tokens(&prompt);
 
-        assert!(identity.contains("list_dir(path)"), "{identity}");
-        assert_params(&ListDirTool, &["path"]);
-        assert!(identity.contains("find_files(path,pattern)"), "{identity}");
-        assert_params(&FindFilesTool, &["path", "pattern"]);
-        assert!(identity.contains("search_files(query,path)"), "{identity}");
-        assert_params(&SearchFilesTool, &["query", "path"]);
-        assert!(identity.contains("read_file(path,lines)"), "{identity}");
-        assert_params(&ReadFileTool::default(), &["path", "lines"]);
-        assert!(identity.contains("write_file(path,content)"), "{identity}");
-        assert_params(&WriteFileTool, &["path", "content"]);
         assert!(
-            identity.contains("write_file_chunk(path,mode,content,expected_offset)"),
-            "{identity}"
+            tokens <= 200,
+            "local system prompt must stay <= 200 tokens with realistic model name (got {tokens}):\n{prompt}"
         );
-        assert_params(
-            &WriteFileChunkTool,
-            &["path", "mode", "content", "expected_offset"],
+
+        // Bootstrap catalog content must NOT be inlined — model fetches on demand.
+        assert!(
+            !prompt.contains("coding rules"),
+            "AGENTS.md body must not be inlined into local prompt"
         );
         assert!(
-            identity.contains("edit_file(path,old_text,new_text)"),
-            "{identity}"
+            !prompt.contains("persona lines"),
+            "SOUL.md body must not be inlined into local prompt"
         );
-        assert_params(&EditFileTool, &["path", "old_text", "new_text"]);
-        assert!(identity.contains("exec(command,working_dir)"), "{identity}");
-        let exec = ExecTool::new(1, None, None, None, false, 1000);
-        assert_params(&exec, &["command", "working_dir"]);
+        assert!(
+            !prompt.contains("preferences"),
+            "USER.md body must not be inlined into local prompt"
+        );
+        assert!(
+            !prompt.contains("## Workspace Context"),
+            "local prompt must not carry the Workspace Context block"
+        );
     }
 
     #[test]
@@ -2776,9 +2773,10 @@ mod tests {
         let system_content = system_msg["content"].as_str().unwrap();
 
         // The cached prefix itself must stay within the 1000-token ceiling even
-        // with bootstrap/skills present: the byte-stable workspace bootstrap is
-        // now part of the cached prefix (not the runtime tail), so it must still
-        // fit under the cap.
+        // with bootstrap/skills present. After the ratel-ai-style shrink, the
+        // identity advertises the catalog as fetch hooks (read_file / read_skill
+        // / recall) instead of inlining it, so a workspace full of large files
+        // can no longer push the prefix over the cap.
         let (stable, _runtime, _) =
             cb.build_local_system_prompt_parts(None, None, None, false, None, &[]);
         let stable_tokens = TokenBudget::estimate_str_tokens(&stable);
@@ -2786,17 +2784,20 @@ mod tests {
             stable_tokens <= 1000,
             "local cached prefix ({stable_tokens} tokens) must stay within the 1000-token ceiling"
         );
-        // The stable prefix still carries the model identity and the on-demand
-        // skills hint (the skill index is advertised, not enumerated, so the
-        // model fetches full skill bodies via the `read_skill` tool).
+        // The stable prefix carries the model identity and the proxy hooks.
         assert!(stable.contains("nanobot"));
         assert!(stable.contains("mlx:Qwen3-8B-MLX-4bit"));
+        assert!(stable.contains("`tool` proxy"));
         assert!(stable.contains("read_skill"));
+        assert!(stable.contains("recall"));
 
-        // Bootstrap content is part of the byte-stable prefix, so the full
-        // prompt still exposes it; long-term memory stays out of the local prompt.
-        assert!(system_content.contains("Bootstrap directive"));
-        assert!(system_content.contains("read_skill"));
+        // On-demand contract: AGENTS.md / MEMORY.md / skill bodies are NOT
+        // inlined into the local system prompt — the model fetches them via the
+        // tools advertised in the identity. The bootstrap *names* appear as
+        // pointers, but their *bodies* never enter the cached prefix.
+        assert!(system_content.contains("AGENTS.md"));
+        assert!(!system_content.contains("Bootstrap directive"));
+        assert!(!system_content.contains("Full skill body"));
         assert!(!system_content.contains("LONG TERM MEMORY LONG TERM MEMORY"));
     }
 

@@ -704,10 +704,8 @@ impl ToolRegistry {
         "session_search",
     ];
 
-    /// Hot local tools advertised as native schemas at turn 1. Everything else
-    /// stays reachable via the `tool` proxy meta-tool. Keeps the cold-prefill
-    /// tool block stable while sparing the model an inspect round-trip for the
-    /// tools it uses every turn.
+    /// Hot tools advertised as native schemas for CLOUD models at turn 1.
+    /// Local models skip these entirely (pure proxy) — see `select_tool_definitions`.
     const CORE_NATIVE_TOOLS: &'static [&'static str] = &[
         "read_file",
         "list_dir",
@@ -819,20 +817,14 @@ impl ToolRegistry {
             })
             .collect();
         Self::condense_definitions(&mut defs);
-        // Slim parameter descriptions (pi-style leanness); keep read_file's
-        // discovery/search syntax, which small models need before they can
-        // choose a correct file path without proxy-inspection indirection.
+        // Slim parameter descriptions (pi-style leanness); keep the discovery
+        // hooks' param descriptions so the model knows how to call them without
+        // a proxy round-trip.
         const KEEP_PARAM_DESCRIPTIONS: &[&str] = &[
             "read_file",
-            "list_dir",
-            "find_files",
-            "search_files",
-            "write_file",
-            "write_file_chunk",
-            "edit_file",
-            "recall_tool_result",
-            "search_tool_result",
-            "slice_tool_result",
+            "read_skill",
+            "recall",
+            "remember",
         ];
         for def in &mut defs {
             Self::remove_local_hot_model_hazards(def);
@@ -1000,11 +992,12 @@ impl ToolRegistry {
         hints.sort();
 
         let description = format!(
-            "Proxy for uncommon tools. Use \
-             {{\"name\":\"NAME\",\"args\":{{\"arg\":\"value\"}}}}. Omit args to inspect full parameter schema. \
-             Expand summaries with {{\"name\":\"lcm_expand\",\"args\":{{\"message_ids\":\"120-158\"}}}}; \
-             search sessions with {{\"name\":\"session_search\",\"args\":{{\"mode\":\"search\",\"query\":\"keywords\"}}}}. \
-             Tools: {}.",
+            "Gateway to all tools. Omit name to list every available tool. \
+             Provide {{\"name\":\"NAME\"}} to inspect that tool's full parameter \
+             schema, or {{\"name\":\"NAME\",\"args\":{{\"arg\":\"value\"}}}} to invoke it. \
+             Starter tools: read_file, read_skill (no args lists skills), recall \
+             (memory search), remember, edit_file, exec, write_file_chunk. \
+             Full catalog: {}.",
             hints.join(", ")
         );
 
@@ -1016,10 +1009,9 @@ impl ToolRegistry {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Tool name" },
-                        "args": { "type": "object", "description": "Tool arguments (omit to see schema)" }
-                    },
-                    "required": ["name"]
+                        "name": { "type": "string", "description": "Tool name (omit to list all)" },
+                        "args": { "type": "object", "description": "Tool arguments (omit to inspect schema)" }
+                    }
                 }
             }
         })]
@@ -1033,15 +1025,25 @@ impl ToolRegistry {
         ctx: Option<&ToolExecutionContext>,
     ) -> ToolExecutionResult {
         let tool_name = match params.get("name").and_then(|v| v.as_str()) {
-            Some(n) => n.to_string(),
+            Some(n) => n.trim().to_string(),
             None => {
+                // No name → list mode (success, not error). The prompt teaches
+                // this as the discovery path; returning a failure here would
+                // make the model think the proxy is broken (the bonsai bug).
                 let names = self.available_tool_names();
-                return ToolExecutionResult::failure(format!(
-                    "Missing 'name'. Available tools: {}",
+                return ToolExecutionResult::success(format!(
+                    "Available tools: {}",
                     names.join(", ")
                 ));
             }
         };
+        if tool_name.is_empty() {
+            let names = self.available_tool_names();
+            return ToolExecutionResult::success(format!(
+                "Available tools: {}",
+                names.join(", ")
+            ));
+        }
 
         let mut args_for_dispatch = params.get("args").cloned();
         if args_for_dispatch
@@ -1200,13 +1202,17 @@ mod tests {
         );
         assert!(
             core_proxy <= 1900,
-            "core+proxy surface ballooned to {core_proxy} tokens (budget 1900) — \
-             native discovery/recovery schemas + proxy must stay bounded on the local cold path"
+            "core+proxy surface (cloud path) ballooned to {core_proxy} tokens (budget 1900)"
+        );
+        assert!(
+            lean <= 400,
+            "lean surface (local path) ballooned to {lean} tokens (budget 400) — \
+             every token here is cold-prefill cost on the local path"
         );
     }
 
-    /// Core-plus-proxy surface: native hot tools + the `tool` proxy, and the
-    /// proxy catalog must NOT re-advertise the native tools.
+    /// Core-plus-proxy surface: 12 hot native schemas + the `tool` proxy for
+    /// the CLOUD path. Local uses lean (proxy-only) via select_tool_definitions.
     #[test]
     fn test_core_plus_proxy_surface() {
         let ws = tempfile::tempdir().unwrap();
@@ -1217,109 +1223,24 @@ mod tests {
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        for expected in [
-            "read_file",
-            "list_dir",
-            "find_files",
-            "search_files",
-            "write_file_chunk",
-            "edit_file",
-            "exec",
-            "recall",
-            "remember",
-            "recall_tool_result",
-            "search_tool_result",
-            "slice_tool_result",
-        ] {
-            assert!(
-                names.contains(&expected),
-                "core+proxy missing {expected}: {names:?}"
-            );
-        }
-        assert!(
-            names.contains(&"tool"),
-            "core+proxy missing tool proxy: {names:?}"
-        );
+        // 12 hot native tools + 1 proxy = 13 total for cloud.
         assert_eq!(
             names.len(),
             13,
-            "core+proxy must be 12 native + 1 proxy, got {names:?}"
+            "cloud core+proxy must be 12 native + 1 proxy, got {names:?}"
         );
-        let edit = defs
-            .iter()
-            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("edit_file"))
-            .expect("edit_file schema present");
-        let chunk = defs
-            .iter()
-            .find(|d| {
-                d.pointer("/function/name").and_then(|v| v.as_str()) == Some("write_file_chunk")
-            })
-            .expect("write_file_chunk schema present");
-        assert!(
-            chunk
-                .pointer("/function/parameters/properties/content/description")
-                .and_then(|v| v.as_str())
-                .is_some(),
-            "local hot write_file_chunk schema must preserve content parameter meaning"
-        );
-        assert!(
-            chunk
-                .pointer("/function/parameters/properties/expected_offset/description")
-                .and_then(|v| v.as_str())
-                .is_some(),
-            "local hot write_file_chunk schema must preserve offset sequencing"
-        );
-        assert!(
-            chunk
-                .pointer("/function/parameters/properties/final_sha256")
-                .is_none(),
-            "optional final hash check stays inspectable but should not bloat the hot schema"
-        );
-        assert!(
-            edit.pointer("/function/parameters/properties/old_text/description")
-                .and_then(|v| v.as_str())
-                .is_some(),
-            "local hot edit_file schema must preserve old_text parameter meaning"
-        );
-        assert!(
-            edit.pointer("/function/parameters/properties/new_text/description")
-                .and_then(|v| v.as_str())
-                .is_some(),
-            "local hot edit_file schema must preserve new_text parameter meaning"
-        );
-        assert!(
-            edit.pointer("/function/parameters/properties/expected_sha256")
-                .is_none(),
-            "local hot edit_file schema must not advertise optional expected_sha256"
-        );
+        assert!(names.contains(&"tool"), "missing proxy: {names:?}");
+        for expected in ["read_file", "edit_file", "exec", "recall"] {
+            assert!(names.contains(&expected), "cloud missing {expected}: {names:?}");
+        }
+        // The proxy must teach all three modes and name starter tools.
         let proxy_desc = defs
             .iter()
             .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("tool"))
             .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
             .unwrap_or("");
-        for native in [
-            "read_file",
-            "list_dir",
-            "find_files",
-            "search_files",
-            "write_file_chunk",
-            "edit_file",
-            "exec",
-            "recall",
-            "remember",
-            "recall_tool_result",
-            "search_tool_result",
-            "slice_tool_result",
-        ] {
-            assert!(
-                !proxy_desc.contains(&format!("{native}(")),
-                "proxy must not re-advertise native tool {native}"
-            );
-        }
-        assert!(
-            proxy_desc.contains("write_file"),
-            "full write_file must remain reachable through the proxy: {proxy_desc}"
-        );
+        assert!(proxy_desc.contains("Omit name to list"), "{proxy_desc}");
+        assert!(proxy_desc.contains("read_file"), "{proxy_desc}");
     }
 
     #[test]
@@ -1329,23 +1250,12 @@ mod tests {
         register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
         let core_defs = reg.get_core_plus_proxy_definitions();
         let defs = reg.get_artifact_core_plus_proxy_definitions();
+        // Both surfaces are pure-proxy; they must be byte-identical so the chat
+        // template's prompt-head tool block stays hash-stable for prefix cache.
         assert_eq!(
             serde_json::to_string(&defs).unwrap(),
             serde_json::to_string(&core_defs).unwrap(),
             "artifact turns must not switch tool catalogs; the chat template renders tools at the prompt head"
-        );
-        let names: Vec<&str> = defs
-            .iter()
-            .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
-            .collect();
-
-        assert!(
-            names.contains(&"write_file_chunk"),
-            "artifact surface must expose chunk writer natively: {names:?}"
-        );
-        assert!(
-            !names.contains(&"write_file"),
-            "full write_file stays proxy-reachable so artifact-capable turns do not carry two write schemas: {names:?}"
         );
         let proxy_desc = defs
             .iter()
@@ -1353,12 +1263,12 @@ mod tests {
             .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
             .unwrap_or("");
         assert!(
-            proxy_desc.contains("write_file"),
-            "artifact proxy must keep full write_file reachable: {proxy_desc}"
+            proxy_desc.contains("write_file_chunk"),
+            "proxy must keep chunk writer reachable: {proxy_desc}"
         );
         assert!(
-            !proxy_desc.contains("write_file_chunk("),
-            "chunk writer is native on artifact turns and should not be duplicated in proxy"
+            proxy_desc.contains("write_file"),
+            "proxy must keep full write_file reachable: {proxy_desc}"
         );
     }
 
@@ -2789,15 +2699,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_missing_name_returns_error() {
+    async fn test_proxy_missing_name_returns_tool_list() {
+        // No name → list mode (success). The prompt teaches "omit name to list"
+        // so this MUST return a success with the catalog, not a failure error.
+        // Returning a failure here was the bonsai confabulation trigger.
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("read_file")));
 
         let result = registry.execute("tool", HashMap::new()).await;
-        assert!(!result.ok, "Missing name should fail");
+        assert!(result.ok, "Missing name should return success with tool list");
         assert!(
-            result.data.contains("Missing 'name'"),
-            "Error should mention missing name: {}",
+            result.data.contains("read_file"),
+            "Should list available tools: {}",
             result.data
         );
     }
