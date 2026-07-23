@@ -14,7 +14,8 @@ use super::{
     ApplyPatchTool, BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, FileInfoTool,
     FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool,
     RememberTool, SearchContextTool, SearchFilesTool, SessionSearchTool, SystemInfoTool,
-    ToolStatusTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileTool,
+    ToolStatusTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileChunkTool,
+    WriteFileTool,
 };
 use crate::config::schema::CodeExecutionConfig;
 
@@ -28,7 +29,7 @@ pub struct ToolConfig {
     pub restrict_to_workspace: bool,
     pub max_tool_result_chars: usize,
     pub brave_api_key: Option<String>,
-    /// When true, exclude write_file and edit_file.
+    /// When true, exclude file mutation tools.
     pub read_only: bool,
     /// If set, only register tools in this list. Empty = register all.
     pub tools_filter: Option<Vec<String>>,
@@ -88,6 +89,8 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    const MAX_PROXIED_WRITE_FILE_BYTES: usize = 262144;
+
     /// Normalize model-emitted tool names/params into canonical tool contract.
     ///
     /// This keeps small/local models focused by repairing common drift:
@@ -275,7 +278,12 @@ impl ToolRegistry {
     /// after this.
     pub fn register_standard_tools(&mut self, config: &ToolConfig) {
         let should_include = |name: &str| -> bool {
-            if config.read_only && matches!(name, "write_file" | "edit_file" | "apply_patch") {
+            if config.read_only
+                && matches!(
+                    name,
+                    "write_file" | "write_file_chunk" | "edit_file" | "apply_patch"
+                )
+            {
                 return false;
             }
             if let Some(ref filter) = config.tools_filter {
@@ -292,6 +300,9 @@ impl ToolRegistry {
         }
         if should_include("write_file") {
             self.register(Box::new(WriteFileTool));
+        }
+        if should_include("write_file_chunk") {
+            self.register(Box::new(WriteFileChunkTool));
         }
         if should_include("edit_file") {
             self.register(Box::new(EditFileTool));
@@ -677,6 +688,10 @@ impl ToolRegistry {
         "web_fetch",
         "message",
         "recall_tool_result",
+        // Bounded retrieval over stashed results (search/slice without loading
+        // the full body). See stash_search.rs.
+        "search_tool_result",
+        "slice_tool_result",
         // The system prompt instructs the model to expand LCM summaries; the
         // schema must be advertised or local models fall back to guessing
         // (observed: recall_tool_result with invented ids).
@@ -689,15 +704,23 @@ impl ToolRegistry {
         "session_search",
     ];
 
-    /// The four hot coding tools advertised as native schemas at turn 1
-    /// (pi's minimal surface). Everything else stays reachable via the `tool`
-    /// proxy meta-tool. Keeps the cold-prefill tool block small while sparing
-    /// the model an inspect round-trip for the tools it uses every turn.
+    /// Hot local tools advertised as native schemas at turn 1. Everything else
+    /// stays reachable via the `tool` proxy meta-tool. Keeps the cold-prefill
+    /// tool block stable while sparing the model an inspect round-trip for the
+    /// tools it uses every turn.
     const CORE_NATIVE_TOOLS: &'static [&'static str] = &[
         "read_file",
-        "write_file",
+        "list_dir",
+        "find_files",
+        "search_files",
+        "write_file_chunk",
         "edit_file",
         "exec",
+        "recall",
+        "remember",
+        "recall_tool_result",
+        "search_tool_result",
+        "slice_tool_result",
     ];
 
     /// Internal Lean-catalog builder: condense every available schema before
@@ -726,9 +749,11 @@ impl ToolRegistry {
         // whole file each turn.
         // lcm_expand's param teaches the copyable range-string form ("120-158")
         // — strip it and small models invent shapes.
-        const KEEP_PARAM_DESCRIPTIONS: &[&str] = &["read_file", "lcm_expand"];
+        const KEEP_PARAM_DESCRIPTIONS: &[&str] =
+            &["read_file", "write_file", "edit_file", "lcm_expand"];
         let mut defs = self.get_local_definitions();
         for def in &mut defs {
+            Self::remove_local_hot_model_hazards(def);
             let name = def
                 .pointer("/function/name")
                 .and_then(|v| v.as_str())
@@ -762,13 +787,29 @@ impl ToolRegistry {
         self.get_proxy_definition()
     }
 
-    /// Core-plus-proxy surface: four hot coding tools as native schemas at
-    /// turn 1 (`read_file`, `write_file`, `edit_file`, `exec`), plus the `tool`
-    /// proxy meta-tool for everything else. The model no longer pays an inspect
-    /// round-trip for the tools it uses every turn, while the proxy keeps the
-    /// long tail executable on demand (no tool lost).
+    /// Core-plus-proxy surface: hot local tools as native schemas at turn 1,
+    /// plus the `tool` proxy meta-tool for everything else. The model no longer
+    /// pays an inspect round-trip for the tools it uses every turn, while the
+    /// proxy keeps the long tail executable on demand (no tool lost).
     pub fn get_core_plus_proxy_definitions(&self) -> Vec<serde_json::Value> {
-        let mut defs: Vec<serde_json::Value> = Self::CORE_NATIVE_TOOLS
+        self.get_core_plus_proxy_definitions_for(Self::CORE_NATIVE_TOOLS, Self::CORE_NATIVE_TOOLS)
+    }
+
+    /// Artifact surface for local models.
+    ///
+    /// Keep this byte-identical to the normal core-plus-proxy surface. The chat
+    /// template renders tool schemas at the prompt head, so switching tool
+    /// catalogs mid-session busts the retained local KV cache.
+    pub fn get_artifact_core_plus_proxy_definitions(&self) -> Vec<serde_json::Value> {
+        self.get_core_plus_proxy_definitions()
+    }
+
+    fn get_core_plus_proxy_definitions_for(
+        &self,
+        native_tools: &[&'static str],
+        proxy_excludes: &[&'static str],
+    ) -> Vec<serde_json::Value> {
+        let mut defs: Vec<serde_json::Value> = native_tools
             .iter()
             .filter_map(|name| {
                 self.tools
@@ -779,13 +820,27 @@ impl ToolRegistry {
             .collect();
         Self::condense_definitions(&mut defs);
         // Slim parameter descriptions (pi-style leanness); keep read_file's
-        // `lines` paging syntax, which small models need to page large files.
+        // discovery/search syntax, which small models need before they can
+        // choose a correct file path without proxy-inspection indirection.
+        const KEEP_PARAM_DESCRIPTIONS: &[&str] = &[
+            "read_file",
+            "list_dir",
+            "find_files",
+            "search_files",
+            "write_file",
+            "write_file_chunk",
+            "edit_file",
+            "recall_tool_result",
+            "search_tool_result",
+            "slice_tool_result",
+        ];
         for def in &mut defs {
+            Self::remove_local_hot_model_hazards(def);
             let name = def
                 .pointer("/function/name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if name == "read_file" {
+            if KEEP_PARAM_DESCRIPTIONS.contains(&name) {
                 continue;
             }
             if let Some(params) = def.pointer_mut("/function/parameters/properties") {
@@ -799,8 +854,44 @@ impl ToolRegistry {
             }
         }
         Self::sort_definitions(&mut defs);
-        defs.extend(self.get_proxy_definition_excluding(Self::CORE_NATIVE_TOOLS));
+        defs.extend(self.get_proxy_definition_excluding(proxy_excludes));
         defs
+    }
+
+    fn remove_local_hot_model_hazards(def: &mut serde_json::Value) {
+        let name = def
+            .pointer("/function/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match name {
+            "edit_file" => {
+                if let Some(props) = def
+                    .pointer_mut("/function/parameters/properties")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    // Optional hashes/patches stay executable, but local hot
+                    // schemas should not invite fabricated guards. Inspect the
+                    // full schema through `tool("edit_file")` when needed.
+                    props.remove("expected_sha256");
+                    props.remove("patch");
+                }
+                if let Some(required) = def.pointer_mut("/function/parameters/required") {
+                    *required = serde_json::json!(["path", "old_text", "new_text"]);
+                }
+            }
+            "write_file_chunk" => {
+                if let Some(props) = def
+                    .pointer_mut("/function/parameters/properties")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    // The hot path needs offset sequencing. Final hash checking
+                    // remains available through proxy inspect without charging
+                    // every local cold prefill for optional verification text.
+                    props.remove("final_sha256");
+                }
+            }
+            _ => {}
+        }
     }
 
     // -------------------------------------------------------------------
@@ -841,6 +932,48 @@ impl ToolRegistry {
         }
     }
 
+    fn flattened_proxy_key_allowed(tool_name: &str, key: &str, tool: &dyn Tool) -> bool {
+        let params = tool.parameters();
+        let in_schema = params
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .is_some_and(|props| props.contains_key(key));
+        if in_schema {
+            return true;
+        }
+
+        match tool_name {
+            "read_file" | "write_file" | "edit_file" | "file_info" | "workspace_diff" => {
+                matches!(key, "file_path" | "filepath" | "file")
+            }
+            "list_dir" | "find_files" | "search_files" => {
+                matches!(key, "dir_path" | "directory" | "dir")
+            }
+            "web_search" => matches!(key, "q" | "search_query"),
+            "spawn" => matches!(key, "id"),
+            _ => false,
+        }
+    }
+
+    fn flattened_proxy_args_for_dispatch(
+        &self,
+        tool_name: &str,
+        extras: serde_json::Map<String, Value>,
+    ) -> Option<Value> {
+        if extras.is_empty() {
+            return None;
+        }
+        let tool = self.tools.get(tool_name)?;
+        if extras
+            .keys()
+            .all(|key| Self::flattened_proxy_key_allowed(tool_name, key, tool.as_ref()))
+        {
+            Some(Value::Object(extras))
+        } else {
+            None
+        }
+    }
+
     /// Build a single compact proxy schema that lists all available tools.
     ///
     /// Returns one tool definition called `"tool"` whose description embeds
@@ -867,20 +1000,11 @@ impl ToolRegistry {
         hints.sort();
 
         let description = format!(
-            "Meta-tool that unlocks EVERY other tool — call it to use any capability. \
-             USAGE: (1) tool(\"NAME\") with NO args returns that tool's full parameter schema; \
-             (2) tool(\"NAME\", {{\"arg\": value}}) runs it. Always inspect first so you pass \
-             correct arguments. \
-             MEMORY SYSTEM: your history is summarised by LCM; past-session summaries appear as \
-             '[Summary of messages X-Y…]' and are losslessly expandable via \
-              tool(\"lcm_expand\", {{\"message_ids\": \"120-158\"}}). To search ALL past sessions use \
-              tool(\"session_search\", {{\"mode\": \"search\", \"query\": \"…\"}}) — pass a few keywords (it \
-              tolerates verbose phrasing); then mode='session' dumps a full past session by its key. To pull \
-              the actual story/content, mode='in_session' with a keyword returns the matching messages IN FULL, \
-              relevance-ranked. mode='extract' with message_ids=N recovers one complete message by its [msg N] id. \
-              recall/remember read and write long-term memory. \
-             AVAILABLE TOOLS: {}. EXAMPLE: tool(\"session_search\") then \
-             tool(\"session_search\", {{\"mode\": \"search\", \"query\": \"docker\"}}).",
+            "Proxy for uncommon tools. Use \
+             {{\"name\":\"NAME\",\"args\":{{\"arg\":\"value\"}}}}. Omit args to inspect full parameter schema. \
+             Expand summaries with {{\"name\":\"lcm_expand\",\"args\":{{\"message_ids\":\"120-158\"}}}}; \
+             search sessions with {{\"name\":\"session_search\",\"args\":{{\"mode\":\"search\",\"query\":\"keywords\"}}}}. \
+             Tools: {}.",
             hints.join(", ")
         );
 
@@ -919,7 +1043,20 @@ impl ToolRegistry {
             }
         };
 
-        match params.get("args") {
+        let mut args_for_dispatch = params.get("args").cloned();
+        if args_for_dispatch
+            .as_ref()
+            .is_none_or(|v| matches!(v, serde_json::Value::Null))
+        {
+            let extras: serde_json::Map<String, serde_json::Value> = params
+                .iter()
+                .filter(|(k, _)| k.as_str() != "name" && k.as_str() != "args")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            args_for_dispatch = self.flattened_proxy_args_for_dispatch(&tool_name, extras);
+        }
+
+        match args_for_dispatch.as_ref() {
             None | Some(serde_json::Value::Null) => {
                 // Inspect mode: return tool's full schema
                 match self.tools.get(&tool_name) {
@@ -956,6 +1093,17 @@ impl ToolRegistry {
                         );
                     }
                 };
+                if tool_name == "write_file"
+                    && inner_params
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.len() > Self::MAX_PROXIED_WRITE_FILE_BYTES)
+                {
+                    return ToolExecutionResult::failure(format!(
+                        "write_file content exceeds the {}-byte proxy limit; use write_file_chunk with mode=start, append, then finish",
+                        Self::MAX_PROXIED_WRITE_FILE_BYTES
+                    ));
+                }
                 self.execute_inner(&tool_name, inner_params, ctx).await
             }
         }
@@ -996,6 +1144,18 @@ mod tests {
     fn register_test_result_recall(registry: &mut ToolRegistry, db_path: std::path::PathBuf) {
         registry.register(Box::new(
             crate::agent::tools::recall_tool_result::RecallToolResultTool::with_db(
+                db_path.clone(),
+                "test-session".to_string(),
+            ),
+        ));
+        registry.register(Box::new(
+            crate::agent::tools::stash_search::SearchToolResultTool::with_db(
+                db_path.clone(),
+                "test-session".to_string(),
+            ),
+        ));
+        registry.register(Box::new(
+            crate::agent::tools::stash_search::SliceToolResultTool::with_db(
                 db_path,
                 "test-session".to_string(),
             ),
@@ -1018,7 +1178,8 @@ mod tests {
         let slim = TokenBudget::estimate_tool_def_tokens(&reg.get_slim_definitions());
         let lean = TokenBudget::estimate_tool_def_tokens(&reg.get_lean_definitions());
         let proxy = TokenBudget::estimate_tool_def_tokens(&reg.get_proxy_definition());
-        let core_proxy = TokenBudget::estimate_tool_def_tokens(&reg.get_core_plus_proxy_definitions());
+        let core_proxy =
+            TokenBudget::estimate_tool_def_tokens(&reg.get_core_plus_proxy_definitions());
         println!(
             "tool surface: count={count} full={full} local={local} slim={slim} lean={lean} proxy={proxy} core_proxy={core_proxy}"
         );
@@ -1038,41 +1199,166 @@ mod tests {
             "slim tool defs ballooned to {slim} tokens (budget 2500) across {count} tools"
         );
         assert!(
-            core_proxy <= 800,
-            "core+proxy surface ballooned to {core_proxy} tokens (budget 800) — \
-             4 native schemas + proxy must stay cheap on the local cold path"
+            core_proxy <= 1900,
+            "core+proxy surface ballooned to {core_proxy} tokens (budget 1900) — \
+             native discovery/recovery schemas + proxy must stay bounded on the local cold path"
         );
     }
 
-    /// Core-plus-proxy surface: exactly 4 native core tools + the `tool` proxy,
-    /// and the proxy catalog must NOT re-advertise the core tools.
+    /// Core-plus-proxy surface: native hot tools + the `tool` proxy, and the
+    /// proxy catalog must NOT re-advertise the native tools.
     #[test]
     fn test_core_plus_proxy_surface() {
         let ws = tempfile::tempdir().unwrap();
-        let reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
         let defs = reg.get_core_plus_proxy_definitions();
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        assert!(names.contains(&"read_file"), "core+proxy missing read_file: {names:?}");
-        assert!(names.contains(&"write_file"), "core+proxy missing write_file: {names:?}");
-        assert!(names.contains(&"edit_file"), "core+proxy missing edit_file: {names:?}");
-        assert!(names.contains(&"exec"), "core+proxy missing exec: {names:?}");
-        assert!(names.contains(&"tool"), "core+proxy missing tool proxy: {names:?}");
-        assert_eq!(names.len(), 5, "core+proxy must be 4 native + 1 proxy, got {names:?}");
+        for expected in [
+            "read_file",
+            "list_dir",
+            "find_files",
+            "search_files",
+            "write_file_chunk",
+            "edit_file",
+            "exec",
+            "recall",
+            "remember",
+            "recall_tool_result",
+            "search_tool_result",
+            "slice_tool_result",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "core+proxy missing {expected}: {names:?}"
+            );
+        }
+        assert!(
+            names.contains(&"tool"),
+            "core+proxy missing tool proxy: {names:?}"
+        );
+        assert_eq!(
+            names.len(),
+            13,
+            "core+proxy must be 12 native + 1 proxy, got {names:?}"
+        );
+        let edit = defs
+            .iter()
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("edit_file"))
+            .expect("edit_file schema present");
+        let chunk = defs
+            .iter()
+            .find(|d| {
+                d.pointer("/function/name").and_then(|v| v.as_str()) == Some("write_file_chunk")
+            })
+            .expect("write_file_chunk schema present");
+        assert!(
+            chunk
+                .pointer("/function/parameters/properties/content/description")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "local hot write_file_chunk schema must preserve content parameter meaning"
+        );
+        assert!(
+            chunk
+                .pointer("/function/parameters/properties/expected_offset/description")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "local hot write_file_chunk schema must preserve offset sequencing"
+        );
+        assert!(
+            chunk
+                .pointer("/function/parameters/properties/final_sha256")
+                .is_none(),
+            "optional final hash check stays inspectable but should not bloat the hot schema"
+        );
+        assert!(
+            edit.pointer("/function/parameters/properties/old_text/description")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "local hot edit_file schema must preserve old_text parameter meaning"
+        );
+        assert!(
+            edit.pointer("/function/parameters/properties/new_text/description")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "local hot edit_file schema must preserve new_text parameter meaning"
+        );
+        assert!(
+            edit.pointer("/function/parameters/properties/expected_sha256")
+                .is_none(),
+            "local hot edit_file schema must not advertise optional expected_sha256"
+        );
+        let proxy_desc = defs
+            .iter()
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("tool"))
+            .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        for native in [
+            "read_file",
+            "list_dir",
+            "find_files",
+            "search_files",
+            "write_file_chunk",
+            "edit_file",
+            "exec",
+            "recall",
+            "remember",
+            "recall_tool_result",
+            "search_tool_result",
+            "slice_tool_result",
+        ] {
+            assert!(
+                !proxy_desc.contains(&format!("{native}(")),
+                "proxy must not re-advertise native tool {native}"
+            );
+        }
+        assert!(
+            proxy_desc.contains("write_file"),
+            "full write_file must remain reachable through the proxy: {proxy_desc}"
+        );
+    }
+
+    #[test]
+    fn test_artifact_core_plus_proxy_surface_matches_core_for_prefix_stability() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        let core_defs = reg.get_core_plus_proxy_definitions();
+        let defs = reg.get_artifact_core_plus_proxy_definitions();
+        assert_eq!(
+            serde_json::to_string(&defs).unwrap(),
+            serde_json::to_string(&core_defs).unwrap(),
+            "artifact turns must not switch tool catalogs; the chat template renders tools at the prompt head"
+        );
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            names.contains(&"write_file_chunk"),
+            "artifact surface must expose chunk writer natively: {names:?}"
+        );
+        assert!(
+            !names.contains(&"write_file"),
+            "full write_file stays proxy-reachable so artifact-capable turns do not carry two write schemas: {names:?}"
+        );
         let proxy_desc = defs
             .iter()
             .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("tool"))
             .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
             .unwrap_or("");
         assert!(
-            !proxy_desc.contains("read_file("),
-            "proxy must not re-advertise core tool read_file"
+            proxy_desc.contains("write_file"),
+            "artifact proxy must keep full write_file reachable: {proxy_desc}"
         );
         assert!(
-            !proxy_desc.contains("exec("),
-            "proxy must not re-advertise core tool exec"
+            !proxy_desc.contains("write_file_chunk("),
+            "chunk writer is native on artifact turns and should not be duplicated in proxy"
         );
     }
 
@@ -1105,7 +1391,8 @@ mod tests {
 
         // Every reachable lean tool must be named in the proxy so the model
         // knows what it can unlock. Only assert tools actually registered here.
-        let available: std::collections::HashSet<String> = reg.available_tool_names().into_iter().collect();
+        let available: std::collections::HashSet<String> =
+            reg.available_tool_names().into_iter().collect();
         for t in ToolRegistry::CORE_TOOLS
             .iter()
             .chain(ToolRegistry::LEAN_EXTRA_TOOLS.iter())
@@ -1140,12 +1427,21 @@ mod tests {
     /// Echoes the full params as JSON (used to validate request normalization).
     struct ParamEchoTool {
         tool_name: String,
+        param_names: Vec<String>,
     }
 
     impl ParamEchoTool {
         fn new(name: &str) -> Self {
             Self {
                 tool_name: name.to_string(),
+                param_names: Vec::new(),
+            }
+        }
+
+        fn with_params(name: &str, param_names: &[&str]) -> Self {
+            Self {
+                tool_name: name.to_string(),
+                param_names: param_names.iter().map(|p| p.to_string()).collect(),
             }
         }
     }
@@ -1161,9 +1457,21 @@ mod tests {
         }
 
         fn parameters(&self) -> serde_json::Value {
+            let properties: serde_json::Map<String, serde_json::Value> = self
+                .param_names
+                .iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        serde_json::json!({
+                            "type": "string",
+                        }),
+                    )
+                })
+                .collect();
             serde_json::json!({
                 "type": "object",
-                "properties": {}
+                "properties": properties
             })
         }
 
@@ -2343,6 +2651,108 @@ mod tests {
         assert!(
             result.data.contains("hello"),
             "Should contain dispatched tool output: {}",
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_rejects_large_write_file_payload_and_routes_to_chunk_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("artifact.html");
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WriteFileTool));
+        registry.register(Box::new(WriteFileChunkTool));
+
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("write_file"));
+        params.insert(
+            "args".to_string(),
+            serde_json::json!({
+                "path": file_path,
+                "content": "x".repeat(4097),
+            }),
+        );
+
+        let result = registry.execute("tool", params).await;
+
+        assert!(!result.ok, "large proxied write_file must be rejected");
+        assert!(
+            result.data.contains("write_file_chunk"),
+            "rejection must route the model to the bounded writer: {}",
+            result.data
+        );
+        assert!(
+            !file_path.exists(),
+            "rejected large payload must not reach write_file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_direct_write_file_keeps_large_payload_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("direct.txt");
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WriteFileTool));
+
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), serde_json::json!(file_path));
+        params.insert("content".to_string(), serde_json::json!("x".repeat(4097)));
+
+        let result = registry.execute("write_file", params).await;
+
+        assert!(
+            result.ok,
+            "proxy guard must not alter direct/cloud write_file calls: {:?}",
+            result.error
+        );
+        assert_eq!(std::fs::metadata(file_path).unwrap().len(), 4097);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_dispatch_accepts_flattened_args() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::with_params("recall", &["mode"])));
+
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("recall"));
+        params.insert("mode".to_string(), serde_json::json!("latest"));
+
+        let result = registry.execute("tool", params).await;
+        assert!(
+            result.ok,
+            "Flattened proxy dispatch should succeed: {:?}",
+            result.error
+        );
+        assert!(
+            result.data.contains("latest"),
+            "Flattened mode should be moved into args: {}",
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_stray_metadata_keeps_inspect_mode() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("read_file"));
+        params.insert("reason".to_string(), serde_json::json!("need schema first"));
+
+        let result = registry.execute("tool", params).await;
+        assert!(
+            result.ok,
+            "Stray metadata should not dispatch tool: {:?}",
+            result.error
+        );
+        assert!(
+            result.data.contains("\"parameters\""),
+            "Stray metadata should leave proxy in inspect mode: {}",
+            result.data
+        );
+        assert!(
+            !result.data.contains("read_file:default"),
+            "Inspect mode must not execute the underlying tool: {}",
             result.data
         );
     }
