@@ -50,9 +50,9 @@ pub(crate) use response::RetryState;
 pub(crate) use shared::*;
 // Re-export remaining heuristic functions at module-private level for use
 // within this module and its submodules (shared uses them via super::).
-use heuristics::{
-    adaptive_max_tokens, last_user_message, render_via_protocol, should_strip_tools_for_trio,
-};
+#[cfg(test)]
+use heuristics::adaptive_max_tokens;
+use heuristics::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
 
 // ---------------------------------------------------------------------------
 // Tool proxy wrappers

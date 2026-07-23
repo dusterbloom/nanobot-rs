@@ -192,7 +192,8 @@ impl SessionSearchTool {
         let key = match params.get("session").and_then(|v| v.as_str()) {
             Some(k) if !k.trim().is_empty() => k.trim().to_string(),
             _ => {
-                return "Error: mode='extract' requires a 'session' parameter (the session key).".to_string();
+                return "Error: mode='extract' requires a 'session' parameter (the session key)."
+                    .to_string();
             }
         };
         let raw = match params.get("message_ids").and_then(|v| v.as_str()) {
@@ -311,9 +312,9 @@ impl Tool for SessionSearchTool {
                     "type": "string",
                     "enum": ["search", "session", "in_session", "extract"],
                     "description": "search = keyword FTS5 over all past sessions (default); \
-session = dump the full transcript of one session by key; \
-in_session = search WITHIN one session by keyword, returning matching messages with their [msg N] ids; \
-extract = pull specific messages from one session by their ids."
+        session = dump the full transcript of one session by key; \
+        in_session = search WITHIN one session by keyword, returning matching messages with their [msg N] ids; \
+        extract = pull specific messages from one session by their ids."
                 },
                 "session": {
                     "type": "string",
@@ -375,7 +376,8 @@ extract = pull specific messages from one session by their ids."
              To read the FULL transcript (the complete story/conversation) of a session, copy its \
              Session key below and call:\n\
              session_search(mode=\"session\", session=KEY)\n\n",
-            results.len(), query
+            results.len(),
+            query
         );
         for (i, r) in results.iter().enumerate() {
             let snippet = if !r.snippet.is_empty() {
@@ -439,7 +441,11 @@ mod tests {
         let required = params["required"].as_array().unwrap();
         // `query` is optional now: search mode needs it, but session mode uses
         // `session` instead. Neither is globally required.
-        assert!(required.is_empty(), "expected no globally-required params, got: {:?}", required);
+        assert!(
+            required.is_empty(),
+            "expected no globally-required params, got: {:?}",
+            required
+        );
     }
 
     #[tokio::test]
@@ -647,9 +653,16 @@ mod tests {
         sp.insert("query".to_string(), json!("find the first session where I told the Diary of Two Threads story set in the future"));
         let search = tool.execute(sp).await;
         assert!(search.contains("Found"), "search failed: {}", search);
-        assert!(search.contains(key), "search did not surface the story session: {}", search);
         assert!(
-            search.contains(&format!("session_search(mode=\"session\", session=\"{}\")", key)),
+            search.contains(key),
+            "search did not surface the story session: {}",
+            search
+        );
+        assert!(
+            search.contains(&format!(
+                "session_search(mode=\"session\", session=\"{}\")",
+                key
+            )),
             "search result missing extract-style next-step hint: {}",
             search
         );
@@ -660,9 +673,21 @@ mod tests {
         dp.insert("session".to_string(), json!(key));
         let dump = tool.execute(dp).await;
         assert!(dump.contains("Full session"), "got: {}", dump);
-        assert!(dump.contains("truncated"), "expected truncation for long transcript: {}", dump);
-        assert!(dump.contains("in_session"), "dump missing in_session handoff: {}", dump);
-        assert!(dump.contains("extract"), "dump missing extract handoff: {}", dump);
+        assert!(
+            dump.contains("truncated"),
+            "expected truncation for long transcript: {}",
+            dump
+        );
+        assert!(
+            dump.contains("in_session"),
+            "dump missing in_session handoff: {}",
+            dump
+        );
+        assert!(
+            dump.contains("extract"),
+            "dump missing extract handoff: {}",
+            dump
+        );
 
         // 3) Extract the story message by its [msg N] id -> full, untruncated text.
         let db = SessionDb::new(&tmp.path().join("sessions.db"));
@@ -727,18 +752,35 @@ mod tests {
         // Story message has far more keyword hits -> surfaces first.
         let story_pos = out.find("Diary of Two Threads Entry 1 nano32").unwrap();
         let converge_pos = out.find("the two threads converge").unwrap();
-        assert!(story_pos < converge_pos, "story should rank before low-hit msg");
+        assert!(
+            story_pos < converge_pos,
+            "story should rank before low-hit msg"
+        );
         // Full content returned, not truncated.
-        assert!(out.contains(&story.trim_end()), "in_session truncated the story");
-        assert!(!out.contains("... (truncated"), "in_session must not truncate");
+        assert!(
+            out.contains(&story.trim_end()),
+            "in_session truncated the story"
+        );
+        assert!(
+            !out.contains("... (truncated"),
+            "in_session must not truncate"
+        );
         // Relevance header present.
-        assert!(out.contains("returned in full"), "in_session missing full-content note");
+        assert!(
+            out.contains("returned in full"),
+            "in_session missing full-content note"
+        );
     }
 
     #[tokio::test]
     async fn test_session_mode_requires_session_key() {
         let tmp = TempDir::new().unwrap();
-        let tool = seed_session(&tmp, "cli:default", &[json!({"role": "user", "content": "hi"})]).await;
+        let tool = seed_session(
+            &tmp,
+            "cli:default",
+            &[json!({"role": "user", "content": "hi"})],
+        )
+        .await;
         let mut params = HashMap::new();
         params.insert("mode".to_string(), json!("session"));
         let result = tool.execute(params).await;
@@ -752,7 +794,12 @@ mod tests {
     #[tokio::test]
     async fn test_session_mode_unknown_key_errors() {
         let tmp = TempDir::new().unwrap();
-        let tool = seed_session(&tmp, "cli:default", &[json!({"role": "user", "content": "hi"})]).await;
+        let tool = seed_session(
+            &tmp,
+            "cli:default",
+            &[json!({"role": "user", "content": "hi"})],
+        )
+        .await;
         let mut params = HashMap::new();
         params.insert("mode".to_string(), json!("session"));
         params.insert("session".to_string(), json!("does_not_exist_xyz"));
@@ -805,8 +852,16 @@ mod tests {
 
         assert!(result.contains("Found 2 matching"), "got: {}", result);
         // Both matches present, with their message ids.
-        assert!(result.contains("[msg 2]") && result.contains("beta two"), "got: {}", result);
-        assert!(result.contains("[msg 3]") && result.contains("gamma three"), "got: {}", result);
+        assert!(
+            result.contains("[msg 2]") && result.contains("beta two"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("[msg 3]") && result.contains("gamma three"),
+            "got: {}",
+            result
+        );
         // Non-matching messages must be excluded.
         assert!(!result.contains("alpha one"), "got: {}", result);
         assert!(!result.contains("delta four"), "got: {}", result);
@@ -815,12 +870,21 @@ mod tests {
     #[tokio::test]
     async fn test_in_session_requires_query() {
         let tmp = TempDir::new().unwrap();
-        let tool = seed_session(&tmp, "cli:default", &[json!({"role": "user", "content": "hi"})]).await;
+        let tool = seed_session(
+            &tmp,
+            "cli:default",
+            &[json!({"role": "user", "content": "hi"})],
+        )
+        .await;
         let mut params = HashMap::new();
         params.insert("mode".to_string(), json!("in_session"));
         params.insert("session".to_string(), json!("cli:default"));
         let result = tool.execute(params).await;
-        assert!(result.contains("Error") && result.contains("query"), "got: {}", result);
+        assert!(
+            result.contains("Error") && result.contains("query"),
+            "got: {}",
+            result
+        );
     }
 
     // --- mode="extract": pull exact turns by id ---
@@ -847,18 +911,35 @@ mod tests {
         let result = tool.execute(params).await;
 
         assert!(result.contains("Extracted 2 message(s)"), "got: {}", result);
-        assert!(result.contains("beta two") && result.contains("gamma three"), "got: {}", result);
-        assert!(!result.contains("alpha one") && !result.contains("delta four"), "got: {}", result);
+        assert!(
+            result.contains("beta two") && result.contains("gamma three"),
+            "got: {}",
+            result
+        );
+        assert!(
+            !result.contains("alpha one") && !result.contains("delta four"),
+            "got: {}",
+            result
+        );
     }
 
     #[tokio::test]
     async fn test_extract_requires_message_ids() {
         let tmp = TempDir::new().unwrap();
-        let tool = seed_session(&tmp, "cli:default", &[json!({"role": "user", "content": "hi"})]).await;
+        let tool = seed_session(
+            &tmp,
+            "cli:default",
+            &[json!({"role": "user", "content": "hi"})],
+        )
+        .await;
         let mut params = HashMap::new();
         params.insert("mode".to_string(), json!("extract"));
         params.insert("session".to_string(), json!("cli:default"));
         let result = tool.execute(params).await;
-        assert!(result.contains("Error") && result.contains("message_ids"), "got: {}", result);
+        assert!(
+            result.contains("Error") && result.contains("message_ids"),
+            "got: {}",
+            result
+        );
     }
 }

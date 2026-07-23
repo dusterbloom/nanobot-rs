@@ -6,7 +6,7 @@
 
 mod write;
 
-pub use write::WriteFileTool;
+pub use write::{WriteFileChunkTool, WriteFileTool};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -149,21 +149,29 @@ impl Tool for ReadFileTool {
         };
 
         // Binary detection: null bytes in first 512 bytes.
+        let display_path = file_path.to_string_lossy().to_string();
         if crate::utils::helpers::is_binary(&bytes) {
-            return format!("[Binary file: {}, {} bytes]", path, bytes.len());
+            return format!("[Binary file: {}, {} bytes]", display_path, bytes.len());
         }
 
         let content = String::from_utf8_lossy(&bytes).to_string();
+        let content_sha256 = sha256_hex(&bytes);
         let total = content.lines().count();
         if total == 0 {
-            return format!("# {} (0 lines)\n", path);
+            return format!("# {} (0 lines) sha256={}\n", display_path, content_sha256);
         }
 
         // Explicit range → render it. Bare read → first DEFAULT_READ_LINES,
         // ds4-style, so the model never dumps a whole file unless it asks
         // (lines="1:"). Both paths share the deterministic renderer below.
         if let Some(lines_param) = params.get("lines").and_then(|v| v.as_str()) {
-            return extract_line_range(&content, lines_param, path, self.char_budget);
+            return extract_line_range(
+                &content,
+                lines_param,
+                &display_path,
+                self.char_budget,
+                &content_sha256,
+            );
         }
         let max_lines =
             bounded_usize_param(&params, "max_lines", DEFAULT_READ_LINES, MAX_READ_LINES);
@@ -171,9 +179,10 @@ impl Tool for ReadFileTool {
             &content,
             1,
             max_lines.min(total),
-            path,
+            &display_path,
             total,
             self.char_budget,
+            &content_sha256,
         )
     }
 }
@@ -207,6 +216,11 @@ fn diagnose_missing_old_text(content: &str, old_text: &str) -> String {
         return "Error: old_text not found — trailing whitespace on one or more lines differs. Match trailing spaces/tabs exactly, or re-read the file first.".to_string();
     }
     "Error: old_text not found in file. Make sure it matches exactly. Hint: use read_file to see the current file contents, then copy the exact text to match.".to_string()
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Tool to edit a file by replacing text.
@@ -273,10 +287,16 @@ impl Tool for EditFileTool {
         };
 
         if let Some(expected) = params.get("expected_sha256").and_then(|v| v.as_str()) {
+            if !is_sha256_hex(expected) {
+                return format!(
+                    "Error: invalid expected_sha256 '{}'. Omit expected_sha256 unless you copied the 64-character sha256 value from read_file or file_info.",
+                    expected.trim()
+                );
+            }
             let actual = sha256_hex(content.as_bytes());
             if !expected.trim().eq_ignore_ascii_case(&actual) {
                 return format!(
-                    "Error: File changed before edit. expected_sha256={}, actual_sha256={}. Re-read the file or inspect workspace_diff before retrying.",
+                    "Error: File changed before edit. expected_sha256={}, actual_sha256={}. Re-read the file or inspect workspace_diff before retrying; omit expected_sha256 if you did not copy it from read_file or file_info.",
                     expected.trim(),
                     actual
                 );
@@ -1434,7 +1454,13 @@ fn truncate_chars_with_notice(s: &str, max_chars: usize) -> String {
 /// Extract a line range from content.
 ///
 /// `range` format: "start:end" (1-indexed, inclusive) or "start:" (to end).
-fn extract_line_range(content: &str, range: &str, path: &str, char_budget: usize) -> String {
+fn extract_line_range(
+    content: &str,
+    range: &str,
+    path: &str,
+    char_budget: usize,
+    sha256: &str,
+) -> String {
     let parts: Vec<&str> = range.splitn(2, ':').collect();
     if parts.len() != 2 {
         return format!(
@@ -1480,7 +1506,7 @@ fn extract_line_range(content: &str, range: &str, path: &str, char_budget: usize
         return format!("Error: Start line {} is after end line {}.", start, end);
     }
 
-    render_range(content, start, end, path, total, char_budget)
+    render_range(content, start, end, path, total, char_budget, sha256)
 }
 
 /// Render a 1-indexed inclusive line range with line numbers, a header
@@ -1505,6 +1531,7 @@ fn render_range(
     path: &str,
     total: usize,
     char_budget: usize,
+    sha256: &str,
 ) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let end = end.min(total);
@@ -1516,7 +1543,7 @@ fn render_range(
     // Always render at least one line. The reserve covers the "# path (lines…)"
     // header, the VERBATIM wrapper, and the next-chunk marker so the total
     // stays under the cap and `digest_tool_result` never fires its `"[...]"`.
-    let budget = char_budget.saturating_sub(path.len().saturating_add(160));
+    let budget = char_budget.saturating_sub(path.len().saturating_add(240));
     let mut eff_end = start;
     let mut cost: usize = 0;
     for i in start..=end {
@@ -1537,11 +1564,12 @@ fn render_range(
         .collect();
 
     let mut out = format!(
-        "# {} (lines {}-{} of {})\n{}",
+        "# {} (lines {}-{} of {}) sha256={}\n{}",
         path,
         start,
         end,
         total,
+        sha256,
         selected.join("\n")
     );
     if end < total {
@@ -1557,11 +1585,11 @@ fn render_range(
     out
 }
 
-/// Expand a path: `~` → home dir, relative paths → workspace-relative.
+/// Expand a path: `~` → home dir, relative paths → workspace-aware.
 ///
 /// Small/delegation models sometimes omit the full workspace prefix and
-/// pass bare filenames like `MEMORY.md`. Resolving against the workspace
-/// makes these succeed instead of failing with "File not found".
+/// pass bare filenames like `MEMORY.md`. Resolve against the project first,
+/// then the workspace, then the workspace memory directory for that alias.
 pub(crate) fn expand_path(path: &str) -> PathBuf {
     if path.starts_with('~') {
         return crate::utils::helpers::expand_tilde(path);
@@ -1604,6 +1632,12 @@ pub(crate) fn resolve_read_path(path: &str) -> PathBuf {
 }
 
 fn resolve_relative_path(relative: &Path, cwd: Option<&Path>, workspace: &Path) -> PathBuf {
+    if let Some(memory_alias) = workspace_memory_alias(relative, workspace) {
+        if memory_alias.exists() {
+            return memory_alias;
+        }
+    }
+
     if let Some(cwd_path) = cwd {
         let cwd_resolved = cwd_path.join(relative);
         if cwd_resolved.exists() {
@@ -1617,6 +1651,14 @@ fn resolve_relative_path(relative: &Path, cwd: Option<&Path>, workspace: &Path) 
     }
 
     relative.to_path_buf()
+}
+
+fn workspace_memory_alias(relative: &Path, workspace: &Path) -> Option<PathBuf> {
+    if relative.components().count() == 1 && relative == Path::new("MEMORY.md") {
+        Some(workspace.join("memory").join("MEMORY.md"))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1666,6 +1708,38 @@ mod tests {
 
         let out = resolve_relative_path(Path::new("note.txt"), Some(&cwd), &ws);
         assert_eq!(out, ws.join("note.txt"));
+    }
+
+    #[test]
+    fn test_resolve_relative_path_maps_bare_memory_to_workspace_memory() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("cwd");
+        let ws = tmp.path().join("workspace");
+        let memory_dir = ws.join("memory");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(memory_dir.join("MEMORY.md"), "from-memory").unwrap();
+
+        let out = resolve_relative_path(Path::new("MEMORY.md"), Some(&cwd), &ws);
+        assert_eq!(out, memory_dir.join("MEMORY.md"));
+    }
+
+    #[test]
+    fn test_resolve_relative_path_reserves_bare_memory_alias() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("cwd");
+        let ws = tmp.path().join("workspace");
+        let memory_dir = ws.join("memory");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(cwd.join("MEMORY.md"), "from-cwd").unwrap();
+        std::fs::write(memory_dir.join("MEMORY.md"), "from-memory").unwrap();
+
+        let out = resolve_relative_path(Path::new("MEMORY.md"), Some(&cwd), &ws);
+        assert_eq!(out, memory_dir.join("MEMORY.md"));
+
+        let project_out = resolve_relative_path(Path::new("./MEMORY.md"), Some(&cwd), &ws);
+        assert_eq!(project_out, cwd.join("./MEMORY.md"));
     }
 
     #[test]
@@ -1938,21 +2012,23 @@ mod tests {
     #[test]
     fn test_extract_line_range_basic() {
         let content = "alpha\nbeta\ngamma\ndelta\nepsilon";
-        let result = extract_line_range(content, "2:4", "test.txt", 7_000);
+        let hash = sha256_hex(content.as_bytes());
+        let result = extract_line_range(content, "2:4", "test.txt", 7_000, &hash);
         assert!(result.contains("lines 2-4 of 5"));
+        assert!(result.contains(&format!("sha256={hash}")));
         assert!(result.contains("beta"));
         assert!(result.contains("delta"));
     }
 
     #[test]
     fn test_extract_line_range_invalid_format() {
-        let result = extract_line_range("content", "bad", "test.txt", 7_000);
+        let result = extract_line_range("content", "bad", "test.txt", 7_000, "hash");
         assert!(result.contains("Error"));
     }
 
     #[test]
     fn test_extract_line_range_out_of_bounds() {
-        let result = extract_line_range("one\ntwo", "5:10", "test.txt", 7_000);
+        let result = extract_line_range("one\ntwo", "5:10", "test.txt", 7_000, "hash");
         assert!(result.contains("exceeds file length"));
     }
 
@@ -1966,7 +2042,8 @@ mod tests {
             .map(|i| format!("    let x_{i} = some_call(arg_one, arg_two);"))
             .collect::<Vec<_>>()
             .join("\n");
-        let out = render_range(&content, 1, 1000, "src/big_module.rs", 5000, 7_000);
+        let hash = sha256_hex(content.as_bytes());
+        let out = render_range(&content, 1, 1000, "src/big_module.rs", 5000, 7_000, &hash);
 
         assert!(
             !out.contains("[truncated:"),
@@ -2003,7 +2080,8 @@ mod tests {
             .map(|i| format!("    let x_{i} = some_call(arg_one, arg_two);"))
             .collect::<Vec<_>>()
             .join("\n");
-        let out = render_range(&content, 1, 1000, "src/big.rs", 5000, 2_500);
+        let hash = sha256_hex(content.as_bytes());
+        let out = render_range(&content, 1, 1000, "src/big.rs", 5000, 2_500, &hash);
 
         assert!(
             !out.contains("[...]"),
@@ -2086,10 +2164,39 @@ mod tests {
             ("old_text", "current"),
             ("new_text", "next"),
         ]);
-        params.insert("expected_sha256".to_string(), serde_json::json!("deadbeef"));
+        params.insert(
+            "expected_sha256".to_string(),
+            serde_json::json!("0".repeat(64)),
+        );
         let result = tool.execute(params).await;
         assert!(
             result.starts_with("Error: File changed before edit"),
+            "{result}"
+        );
+
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "current\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_rejects_malformed_expected_sha256() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("guarded.txt");
+        std::fs::write(&file_path, "current\n").unwrap();
+
+        let tool = EditFileTool;
+        let mut params = make_params(&[
+            ("path", file_path.to_str().unwrap()),
+            ("old_text", "current"),
+            ("new_text", "next"),
+        ]);
+        params.insert(
+            "expected_sha256".to_string(),
+            serde_json::json!("not-a-real-hash"),
+        );
+        let result = tool.execute(params).await;
+        assert!(
+            result.starts_with("Error: invalid expected_sha256"),
             "{result}"
         );
 

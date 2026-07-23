@@ -76,11 +76,11 @@ pub(super) fn should_strip_tools_for_trio(
     router_probe_healthy: bool,
     circuit_breaker_available: bool,
 ) -> bool {
-        let result =
-            is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available;
-        tracing::debug!(strip_tools = result, "trio_strip_decision");
-        result
-    }
+    let result =
+        is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available;
+    tracing::debug!(strip_tools = result, "trio_strip_decision");
+    result
+}
 
 /// Outcome of the repeated successful tool-call breaker for one executed round.
 pub(crate) enum RepeatBreakerAction {
@@ -126,6 +126,194 @@ pub(crate) fn evaluate_repeated_tool_round(
 
 const ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD: usize = 3;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LocalArtifactAction {
+    Simple,
+    Rich,
+}
+
+fn strip_request_lead_in(lower: &str) -> &str {
+    [
+        "please ",
+        "can you ",
+        "could you ",
+        "would you ",
+        "i want you to ",
+        "i need you to ",
+        "i would like you to ",
+        "i'd like you to ",
+        "i want to ",
+        "let's ",
+        "let us ",
+    ]
+    .iter()
+    .find_map(|prefix| lower.strip_prefix(prefix))
+    .unwrap_or(lower)
+}
+
+pub(super) fn local_artifact_action(user_text: &str) -> Option<LocalArtifactAction> {
+    let lower = user_text.trim().to_ascii_lowercase();
+    let request = strip_request_lead_in(&lower);
+    let action = [
+        "build ",
+        "create ",
+        "edit ",
+        "generate ",
+        "implement ",
+        "make ",
+        "modify ",
+        "save ",
+        "update ",
+        "write ",
+    ]
+    .iter()
+    .any(|action| request.starts_with(action));
+    let artifact = request.contains("file")
+        || request.contains("folder")
+        || request.contains("html")
+        || request.contains(".html")
+        || request.contains("javascript")
+        || request.contains(" js")
+        || request.contains(".js")
+        || request.contains("css")
+        || request.contains(".css")
+        || request.contains("script")
+        || request.contains("page")
+        || request.contains("game")
+        || request.contains("app")
+        || request.contains("playable")
+        || request.contains("code");
+    if !action || !artifact {
+        return None;
+    }
+
+    let rich_artifact = request.contains("html")
+        || request.contains(".html")
+        || request.contains("javascript")
+        || request.contains(".js")
+        || request.contains(".css")
+        || request.contains("css")
+        || request.contains("game")
+        || request.contains("app")
+        || request.contains("playable");
+
+    Some(if rich_artifact {
+        LocalArtifactAction::Rich
+    } else {
+        LocalArtifactAction::Simple
+    })
+}
+
+fn strip_followup_lead_in(lower: &str) -> &str {
+    [
+        "also ", "and ", "now ", "then ", "next ", "instead ", "but ", "ok ", "okay ",
+    ]
+    .iter()
+    .find_map(|prefix| lower.strip_prefix(prefix))
+    .unwrap_or(lower)
+}
+
+fn contains_artifact_reference(request: &str) -> bool {
+    [
+        " it",
+        " that",
+        " this",
+        "the file",
+        "the folder",
+        "the page",
+        "the app",
+        "the game",
+        "the html",
+        "the script",
+        "button",
+        "layout",
+        "style",
+        "color",
+        "font",
+        "screen",
+        "counter",
+        "score",
+        "canvas",
+        "animation",
+        "responsive",
+        "mobile",
+        "header",
+        "footer",
+        "label",
+        "menu",
+        "toolbar",
+        "panel",
+        "modal",
+        "background",
+    ]
+    .iter()
+    .any(|needle| request.contains(needle))
+}
+
+fn looks_like_artifact_followup(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    let request = strip_followup_lead_in(strip_request_lead_in(strip_followup_lead_in(&lower)));
+    if request.starts_with("continue")
+        || request.starts_with("keep going")
+        || request.starts_with("finish")
+        || request.starts_with("complete")
+        || request.contains("get it done")
+    {
+        return true;
+    }
+    let action = [
+        "add ", "adjust ", "align ", "center ", "change ", "delete ", "edit ", "fix ", "make ",
+        "modify ", "move ", "put ", "remove ", "rename ", "replace ", "save ", "set ", "style ",
+        "tweak ", "update ", "use ",
+    ]
+    .iter()
+    .any(|action| request.starts_with(action));
+    if !action {
+        return false;
+    }
+
+    contains_artifact_reference(request)
+        || request.starts_with("add ")
+        || request.starts_with("fix ")
+        || request.starts_with("remove ")
+        || request.starts_with("save ")
+        || request.starts_with("update ")
+}
+
+pub(super) fn local_artifact_action_with_sticky(
+    user_text: &str,
+    sticky_action: Option<LocalArtifactAction>,
+) -> Option<LocalArtifactAction> {
+    local_artifact_action(user_text)
+        .or_else(|| sticky_action.filter(|_| looks_like_artifact_followup(user_text)))
+}
+
+fn adaptive_fallback_max_tokens(
+    base: u32,
+    user_text: &str,
+    recent_tool_calls: usize,
+    cfg: &AdaptiveTokenConfig,
+) -> u32 {
+    let lower = user_text.to_lowercase();
+    let is_long_form = lower.contains("explain in detail")
+        || lower.contains("write a ")
+        || lower.contains("create a script")
+        || lower.contains("write code")
+        || lower.contains("implement ")
+        || lower.contains("full example")
+        || lower.starts_with("write ")
+        || user_text.len() > cfg.adaptive_long_form_trigger_chars as usize;
+
+    if is_long_form {
+        base.max(cfg.adaptive_long_form_min_tokens)
+    } else if recent_tool_calls > ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD {
+        base.min(cfg.adaptive_tool_heavy_max_tokens)
+            .max(cfg.adaptive_tool_heavy_min_tokens)
+    } else {
+        base
+    }
+}
+
 pub(super) fn adaptive_max_tokens(
     base: u32,
     had_long: bool,
@@ -135,27 +323,55 @@ pub(super) fn adaptive_max_tokens(
     thinking_budget: Option<u32>,
     cfg: &AdaptiveTokenConfig,
 ) -> u32 {
+    let artifact_action = is_local.then(|| local_artifact_action(user_text)).flatten();
+    adaptive_max_tokens_for_artifact_action(
+        base,
+        had_long,
+        user_text,
+        recent_tool_calls,
+        is_local,
+        artifact_action,
+        thinking_budget,
+        cfg,
+    )
+}
+
+pub(super) fn adaptive_max_tokens_for_artifact_action(
+    base: u32,
+    had_long: bool,
+    user_text: &str,
+    recent_tool_calls: usize,
+    is_local: bool,
+    local_artifact_action: Option<LocalArtifactAction>,
+    thinking_budget: Option<u32>,
+    cfg: &AdaptiveTokenConfig,
+) -> u32 {
     let mut effective = if had_long {
         base.max(cfg.adaptive_long_mode_min_tokens)
-    } else {
-        let lower = user_text.to_lowercase();
-        let is_long_form = lower.contains("explain in detail")
-            || lower.contains("write a ")
-            || lower.contains("create a script")
-            || lower.contains("write code")
-            || lower.contains("implement ")
-            || lower.contains("full example")
-            || lower.starts_with("write ")
-            || user_text.len() > cfg.adaptive_long_form_trigger_chars as usize;
-
-        if is_long_form {
-            base.max(cfg.adaptive_long_form_min_tokens)
-        } else if recent_tool_calls > ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD {
-            base.min(cfg.adaptive_tool_heavy_max_tokens)
-                .max(cfg.adaptive_tool_heavy_min_tokens)
-        } else {
-            base
+    } else if is_local {
+        match local_artifact_action {
+            Some(LocalArtifactAction::Rich) => {
+                // Browser-playable artifacts often need a large `write_file`
+                // payload; the post-tool cap is too small and causes a plain
+                // text dump instead of a completed file action.
+                base.max(cfg.adaptive_long_mode_min_tokens)
+            }
+            Some(LocalArtifactAction::Simple) => {
+                // Local models need enough decode room to finish structured
+                // action payloads. Keep ordinary post-tool reporting
+                // latency-focused below.
+                base.max(cfg.adaptive_long_form_min_tokens)
+            }
+            None if recent_tool_calls > 0 => {
+                // Local post-tool passes are latency-sensitive unless the
+                // user's follow-up asks us to create or update an artifact.
+                base.min(cfg.adaptive_tool_heavy_max_tokens)
+                    .max(cfg.adaptive_tool_heavy_min_tokens)
+            }
+            None => adaptive_fallback_max_tokens(base, user_text, recent_tool_calls, cfg),
         }
+    } else {
+        adaptive_fallback_max_tokens(base, user_text, recent_tool_calls, cfg)
     };
 
     if is_local {
@@ -272,8 +488,9 @@ pub(crate) fn appears_incomplete(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        adaptive_max_tokens, evaluate_repeated_tool_round, RepeatBreakerAction,
-        should_strip_tools_for_trio,
+        adaptive_max_tokens, adaptive_max_tokens_for_artifact_action, evaluate_repeated_tool_round,
+        local_artifact_action_with_sticky, should_strip_tools_for_trio, LocalArtifactAction,
+        RepeatBreakerAction,
     };
     use crate::config::schema::AdaptiveTokenConfig;
 
@@ -422,6 +639,150 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_adaptive_max_tokens_local_post_tool_stays_tool_heavy() {
+        let cfg = AdaptiveTokenConfig::default();
+        let base = 1024u32;
+        let long_form_trigger = "implement a complete multi-step edit after reading the file";
+
+        let local_post_tool =
+            adaptive_max_tokens(base, false, long_form_trigger, 1, true, None, &cfg);
+        assert_eq!(
+            local_post_tool, cfg.adaptive_long_form_min_tokens,
+            "the artifact request keeps elevated headroom after a tool call"
+        );
+
+        let local_long_mode =
+            adaptive_max_tokens(base, true, long_form_trigger, 1, true, None, &cfg);
+        assert_eq!(
+            local_long_mode, cfg.adaptive_long_mode_min_tokens,
+            "/long still overrides the local post-tool cap"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_max_tokens_escalates_local_file_and_tool_action_turns() {
+        let cfg = AdaptiveTokenConfig::default();
+        let base = 1024u32;
+
+        let file_generation = adaptive_max_tokens(
+            base,
+            false,
+            "Create a file named report.md",
+            0,
+            true,
+            None,
+            &cfg,
+        );
+        assert_eq!(
+            file_generation, cfg.adaptive_long_form_min_tokens,
+            "local file generation needs enough room to emit a complete tool call"
+        );
+
+        let post_tool =
+            adaptive_max_tokens(base, false, "Summarize the result", 1, true, None, &cfg);
+        assert_eq!(
+            post_tool, base,
+            "ordinary local post-tool reporting remains latency-focused"
+        );
+
+        let ordinary_local = adaptive_max_tokens(base, false, "What is Rust?", 0, true, None, &cfg);
+        assert_eq!(ordinary_local, base);
+
+        let cloud_file = adaptive_max_tokens(
+            base,
+            false,
+            "Create a file named report.md",
+            0,
+            false,
+            None,
+            &cfg,
+        );
+        assert_eq!(cloud_file, base, "cloud long-form sizing remains unchanged");
+    }
+
+    #[test]
+    fn test_adaptive_max_tokens_local_html_game_request_uses_long_mode_headroom() {
+        let cfg = AdaptiveTokenConfig::default();
+        let base = 2048u32;
+
+        let tetris_request = adaptive_max_tokens(
+            base,
+            false,
+            "I want you to create a colorfun and fun tetris game in a single HTML file at `~/Dev/tetris`",
+            2,
+            true,
+            None,
+            &cfg,
+        );
+        assert_eq!(
+            tetris_request, cfg.adaptive_long_mode_min_tokens,
+            "local HTML/game artifact creation needs enough room to complete a write_file call"
+        );
+    }
+
+    #[test]
+    fn test_local_artifact_action_with_sticky_recognizes_followups() {
+        let sticky = Some(LocalArtifactAction::Rich);
+
+        assert_eq!(
+            local_artifact_action_with_sticky("make it harder", sticky),
+            Some(LocalArtifactAction::Rich)
+        );
+        assert_eq!(
+            local_artifact_action_with_sticky("also add a score counter", sticky),
+            Some(LocalArtifactAction::Rich)
+        );
+        assert_eq!(
+            local_artifact_action_with_sticky("continue please", sticky),
+            Some(LocalArtifactAction::Rich)
+        );
+        assert_eq!(
+            local_artifact_action_with_sticky("can you get it done", sticky),
+            Some(LocalArtifactAction::Rich)
+        );
+        assert_eq!(
+            local_artifact_action_with_sticky("update the file", Some(LocalArtifactAction::Simple)),
+            Some(LocalArtifactAction::Simple)
+        );
+    }
+
+    #[test]
+    fn test_local_artifact_action_with_sticky_stays_bounded_to_followup_edits() {
+        let sticky = Some(LocalArtifactAction::Rich);
+
+        assert_eq!(
+            local_artifact_action_with_sticky("make it harder", None),
+            None
+        );
+        assert_eq!(
+            local_artifact_action_with_sticky("what time is it?", sticky),
+            None
+        );
+        assert_eq!(
+            local_artifact_action_with_sticky("make me a sandwich", sticky),
+            None
+        );
+    }
+
+    #[test]
+    fn test_adaptive_max_tokens_uses_sticky_rich_artifact_action() {
+        let cfg = AdaptiveTokenConfig::default();
+        let base = 1024u32;
+
+        let out = adaptive_max_tokens_for_artifact_action(
+            base,
+            false,
+            "make it harder",
+            1,
+            true,
+            local_artifact_action_with_sticky("make it harder", Some(LocalArtifactAction::Rich)),
+            None,
+            &cfg,
+        );
+        assert_eq!(out, cfg.adaptive_long_mode_min_tokens);
+    }
+
     // -----------------------------------------------------------------------
     // evaluate_repeated_tool_round — pins the repeated-tool-call breaker
     // decision (shared.rs:1135-1186). Two identical successful rounds in a row
@@ -431,13 +792,8 @@ mod tests {
     #[test]
     fn test_repeat_breaker_first_identical_round_is_continue() {
         // R1 dispatches [recall:X]; prev is empty → not a repeat.
-        let (action, rounds, nudged) = evaluate_repeated_tool_round(
-            &["recall:X".to_string()],
-            &[],
-            0,
-            false,
-            2,
-        );
+        let (action, rounds, nudged) =
+            evaluate_repeated_tool_round(&["recall:X".to_string()], &[], 0, false, 2);
         assert!(matches!(action, RepeatBreakerAction::Continue));
         assert_eq!(rounds, 0);
         assert!(!nudged);
@@ -491,13 +847,8 @@ mod tests {
     #[test]
     fn test_repeat_breaker_no_tools_round_is_not_a_repeat() {
         // A round that executed no tools must not trigger the breaker.
-        let (action, rounds, nudged) = evaluate_repeated_tool_round(
-            &[],
-            &["recall:X".to_string()],
-            1,
-            false,
-            2,
-        );
+        let (action, rounds, nudged) =
+            evaluate_repeated_tool_round(&[], &["recall:X".to_string()], 1, false, 2);
         assert!(matches!(action, RepeatBreakerAction::Continue));
         assert_eq!(rounds, 0);
         assert!(!nudged);

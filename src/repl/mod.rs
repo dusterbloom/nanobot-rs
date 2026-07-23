@@ -988,6 +988,7 @@ async fn stream_and_render_inner(
                                             prefill.on_progress(processed, total);
                                         }
                                     }
+                                    ControlMarker::BackendActivity { .. } => {}
                                     ControlMarker::CacheStatus(_) => {}
                                 }
                             } else {

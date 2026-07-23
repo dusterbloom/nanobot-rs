@@ -52,19 +52,6 @@ fn append_continuity_to_system(messages: &mut [serde_json::Value], note: &str) {
     first["content"] = json!(format!("{content}\n\n## Previous Session\n{note}"));
 }
 
-fn apply_session_prompt_epoch(messages: &mut [serde_json::Value], epoch: u64) {
-    if epoch == 0 {
-        return;
-    }
-    let Some(first) = messages.first_mut() else {
-        return;
-    };
-    let Some(content) = first.get("content").and_then(|v| v.as_str()) else {
-        return;
-    };
-    first["content"] = json!(format!("{content}\n\n[session-reset-epoch:{epoch}]"));
-}
-
 impl AgentLoopShared {
     /// Resolve the previous-session continuity note for this session.
     ///
@@ -283,6 +270,13 @@ impl AgentLoopShared {
             .get_or_resume_with_idle(&session_key, core.session_complete_after_secs)
             .await;
         let session_id = session_meta.id.clone();
+        if tools.contains("recall") {
+            tools.register(Box::new(
+                crate::agent::tools::RecallTool::new(&core.workspace)
+                    .with_db(Some(core.sessions.path().to_path_buf()))
+                    .with_current_session_id(Some(session_id.clone())),
+            ));
+        }
 
         // Register lcm_expand and restore this concrete session's LCM DAG.
         // Eagerly create the engine here (with DB-persisted DAG if available)
@@ -495,11 +489,12 @@ impl AgentLoopShared {
             append_continuity_to_system(&mut messages, &note);
         }
 
-        // `/clear` and model switches must invalidate resident-server prompt
-        // caches even when the user starts with identical text (`hi` after
-        // `hi`). Keep the marker stable within an epoch so later turns remain
-        // append-only, but make each new epoch a cold prompt prefix.
-        apply_session_prompt_epoch(&mut messages, counters.session_prompt_epoch(&session_key));
+        // `/clear` and model switches invalidate resident-server prompt caches
+        // purely through higgs session-id rotation: `reset_session_prompt_state`
+        // bumps the epoch, which `stable_higgs_session_id` folds into a brand-new
+        // id, so the server cold-starts the prompt. No system-message marker is
+        // needed — a content marker would re-prefill message 0 on every
+        // compaction/trim (the dominant KV-cache break in higgs logs).
         let sections_ms = lap_ms();
 
         // The just-pushed user message is the last element; everything before
@@ -587,6 +582,7 @@ impl AgentLoopShared {
             new_start,
             rendered_messages: Vec::new(),
             protocol,
+            advertised_tool_names: None,
             used_tools: std::collections::HashSet::new(),
             final_content: String::new(),
             turn_tool_entries: Vec::new(),
@@ -608,6 +604,7 @@ impl AgentLoopShared {
                 round_executed_no_tools: false,
                 llm_call_start: None,
                 ttft_ms: None,
+                provider_prompt_estimate: None,
                 retries: crate::agent::agent_loop::RetryState::new(),
                 restore_thinking_budget: None,
                 provider_request: Default::default(),
@@ -627,7 +624,7 @@ impl AgentLoopShared {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_continuity_to_system, apply_session_prompt_epoch};
+    use super::append_continuity_to_system;
     use crate::agent::prompt_fingerprint::{compare, fingerprint, PromptDelta};
     use serde_json::json;
 
@@ -690,35 +687,29 @@ mod tests {
         }
     }
 
+    /// Epoch rotation must NOT be expressed in the prompt: the system message
+    /// stays byte-identical across resets. Cache invalidation is driven solely
+    /// by higgs session-id rotation (pinned in `agent_core`), so a compaction
+    /// or trim no longer re-prefills message 0.
     #[test]
-    fn test_session_prompt_epoch_busts_prompt_prefix_after_clear() {
-        let mut before = vec![
-            json!({"role": "system", "content": "STATIC"}),
+    fn test_no_epoch_marker_in_prompt_content() {
+        let baseline = json!({"role": "system", "content": "STATIC"});
+        let rendered = vec![
+            baseline.clone(),
             json!({"role": "user", "content": "hi"}),
         ];
-        let mut after = before.clone();
 
-        apply_session_prompt_epoch(&mut before, 0);
-        apply_session_prompt_epoch(&mut after, 1);
-
-        assert_eq!(before[0]["content"], "STATIC");
-        assert!(after[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[session-reset-epoch:1]"));
-
-        let fp_before = fingerprint(&before);
-        let fp_after = fingerprint(&after);
-        match compare(Some(&fp_before), &fp_after) {
-            PromptDelta::Diverged {
-                first_divergent_msg,
-                ..
-            } => assert_eq!(
-                first_divergent_msg, 0,
-                "clear/model switch epoch must invalidate the stale prompt head"
-            ),
-            other => panic!("expected epoch marker to diverge at the prompt head, got {other:?}"),
-        }
+        // Simulate the rendered output after a reset: nothing appends an epoch
+        // marker. If anyone reintroduces `[session-reset-epoch:N]` anywhere in
+        // the prepare_context path, this fails.
+        assert_eq!(rendered[0]["content"], baseline["content"]);
+        assert!(
+            !rendered[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[session-reset-epoch:"),
+            "epoch must not leak into prompt content"
+        );
     }
 
     /// Injecting the SAME cached continuity note on every turn keeps the

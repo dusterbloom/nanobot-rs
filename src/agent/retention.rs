@@ -102,9 +102,13 @@ impl RetentionPolicy {
                     self.max_message_age_turns,
                     frozen_prefix,
                 ),
-            BudgetMode::Emergency => {
-                token_budget.trim_to_fit_with_age_preserving_prefix(messages, 0, 0, 0, frozen_prefix)
-            }
+            BudgetMode::Emergency => token_budget.trim_to_fit_with_age_preserving_prefix(
+                messages,
+                0,
+                0,
+                0,
+                frozen_prefix,
+            ),
         }
     }
 }
@@ -210,7 +214,10 @@ mod tests {
             messages.push(json!({"role": "user", "content": format!("q{i}")}));
             messages.push(json!({"role": "assistant", "content": fat.clone()}));
         }
-        assert!(TokenBudget::estimate_tokens(&messages) > 1500, "test setup must be over budget");
+        assert!(
+            TokenBudget::estimate_tokens(&messages) > 1500,
+            "test setup must be over budget"
+        );
 
         let (trimmed, _) = p.apply_budget(
             &token_budget,

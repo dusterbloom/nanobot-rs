@@ -59,6 +59,50 @@ pub(crate) fn cap_tool_result_for_replay(content: &str) -> String {
     .unwrap_or_else(|| content.to_string())
 }
 
+/// Tool-result status is part of the protocol contract, not display text.
+/// Keep this shared so provenance wrappers, boundary rejections, legacy replay,
+/// and raw live results all agree on whether a tool actually succeeded.
+pub(crate) fn tool_result_status_text(content: &str) -> &str {
+    content
+        .trim_start()
+        .strip_prefix("[VERBATIM TOOL OUTPUT — do not paraphrase]")
+        .unwrap_or_else(|| content.trim_start())
+        .trim_start()
+}
+
+pub(crate) fn tool_result_ok(content: &str) -> bool {
+    let normalized = tool_result_status_text(content).trim();
+    !(normalized.starts_with("Error:")
+        || normalized.starts_with("response boundary:")
+        || normalized.starts_with("No stored output for tool_call_id=")
+        || normalized == "(no result)")
+}
+
+/// Replace a persisted `recall_tool_result` body with a stable replay receipt.
+///
+/// The live turn that requested recall sees the raw bytes. On later SQLite
+/// reloads, replaying those bytes would turn a one-time explicit recall into a
+/// permanent prompt balloon. Keep only identity and the exact re-recall handle.
+pub(crate) fn recall_tool_result_replay_reference(
+    content: &str,
+    source_tool_call_id: Option<&str>,
+) -> String {
+    let digest = tool_output_digest(content, 0);
+    let recall_hint = source_tool_call_id.map(|id| {
+        let encoded_id = serde_json::to_string(id).unwrap_or_else(|_| "\"<tool_call_id>\"".into());
+        format!(
+            "; exact bytes remain in SQLite; recall again with recall_tool_result({{\"tool_call_id\": {encoded_id}}})"
+        )
+    });
+    format!(
+        "[recall_tool_result output was shown raw once and is omitted from replay; {digest}{}]",
+        recall_hint.unwrap_or_else(|| {
+            "; exact bytes remain in SQLite; use the tool_call_id from the recall call if needed"
+                .to_string()
+        })
+    )
+}
+
 /// Shrink a tool-result body according to `policy`.
 ///
 /// Returns `Some(replacement)` when the body was shrunk, `None` when it is
@@ -784,5 +828,19 @@ mod tests {
 
         let tool_calls = messages[0].get("tool_calls").and_then(|tc| tc.as_array());
         assert!(tool_calls.is_none() || tool_calls.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_tool_result_ok_normalizes_known_failure_markers() {
+        assert!(!tool_result_ok("Error: file missing"));
+        assert!(!tool_result_ok(
+            "[VERBATIM TOOL OUTPUT — do not paraphrase]\nError: file missing\n[END TOOL OUTPUT]"
+        ));
+        assert!(!tool_result_ok("response boundary: exec was not executed"));
+        assert!(!tool_result_ok("(no result)"));
+        assert!(!tool_result_ok(
+            "No stored output for tool_call_id='missing' in this session"
+        ));
+        assert!(tool_result_ok("Finished dev profile"));
     }
 }

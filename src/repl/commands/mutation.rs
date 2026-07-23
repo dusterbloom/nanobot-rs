@@ -109,10 +109,15 @@ impl ReplContext {
         }
     }
 
-    /// /long [N] — boost max_tokens to 8192 for the next N turns (default 3).
+    /// /long [N] — boost max_tokens to the configured long-mode floor for the next N turns (default 3).
     /// /long 0 resets to normal adaptive mode.
     pub(super) fn cmd_long(&self, arg: &str) {
         let counters = &self.core_handle.counters;
+        let long_mode_tokens = self
+            .core_handle
+            .swappable()
+            .adaptive_tokens
+            .adaptive_long_mode_min_tokens;
         if !arg.is_empty() {
             match arg.parse::<u32>() {
                 Ok(0) => {
@@ -127,9 +132,10 @@ impl ReplContext {
                         .long_mode_turns
                         .store(clamped, std::sync::atomic::Ordering::Relaxed);
                     println!(
-                        "\n  Long mode \x1b[32menabled\x1b[0m for {} turn{} (max_tokens=8192).\n",
+                        "\n  Long mode \x1b[32menabled\x1b[0m for {} turn{} (max_tokens={}).\n",
                         clamped,
-                        if clamped > 1 { "s" } else { "" }
+                        if clamped > 1 { "s" } else { "" },
+                        long_mode_tokens
                     );
                 }
                 Err(_) => {
@@ -140,7 +146,10 @@ impl ReplContext {
             counters
                 .long_mode_turns
                 .store(3, std::sync::atomic::Ordering::Relaxed);
-            println!("\n  Long mode \x1b[32menabled\x1b[0m for 3 turns (max_tokens=8192).\n");
+            println!(
+                "\n  Long mode \x1b[32menabled\x1b[0m for 3 turns (max_tokens={}).\n",
+                long_mode_tokens
+            );
         }
     }
 

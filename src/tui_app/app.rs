@@ -35,6 +35,7 @@ use crate::agent::audit::ToolEvent;
 use crate::repl::commands::ModelEntry;
 use crate::repl::{parse_control_marker, CacheResetReason, CacheStatus, ControlMarker};
 use crate::session::db::SessionSnapshot;
+use crate::turn_stream::BackendActivity;
 
 const BRAND: &str = "\u{259e}"; // ▞  the nanobot wordmark glyph
 const DOT: &str = "\u{2022}"; //   •  status / user marker
@@ -376,8 +377,11 @@ enum ToolState {
 
 /// Live turn-local status shown exactly where the answer will start.
 enum ActivityPhase {
+    WaitingForBackend,
     Prefill,
     Thinking,
+    AwaitingToolPayload,
+    ToolPayload,
     Decoding,
 }
 
@@ -392,6 +396,7 @@ enum Cell {
         prefill_estimate: Option<u64>,
         prefill_tps: Option<f32>,
         prefill_tps_estimated: bool,
+        backend_idle_ms: Option<u64>,
         cache: Option<CacheStatus>,
     },
     /// Assistant text. Streamed deltas append here until a tool interrupts.
@@ -919,6 +924,7 @@ impl App {
             prefill_estimate: None,
             prefill_tps: None,
             prefill_tps_estimated: false,
+            backend_idle_ms: None,
             cache: None,
         });
         self.streaming = true;
@@ -964,6 +970,11 @@ impl App {
                 }
             }
             Some(ControlMarker::CacheStatus(status)) => self.upsert_activity_cache(status),
+            Some(ControlMarker::BackendActivity { phase, idle_ms }) => {
+                if self.streaming {
+                    self.upsert_backend_activity(phase, idle_ms);
+                }
+            }
             Some(ControlMarker::Tokens(n)) => self.turn_tokens += n,
             Some(ControlMarker::DecodeMs(ms)) => {
                 self.turn_decode_secs += ms as f32 / 1000.0;
@@ -1099,7 +1110,17 @@ impl App {
         (None, false)
     }
 
-    fn upsert_activity(&mut self, phase: ActivityPhase, prefill: Option<(u64, u64)>) {
+    fn upsert_backend_activity(&mut self, phase: BackendActivity, idle_ms: u64) {
+        let phase = match phase {
+            BackendActivity::WaitingForHeaders => ActivityPhase::WaitingForBackend,
+            BackendActivity::Prefill => ActivityPhase::Prefill,
+            BackendActivity::AwaitingToolPayload => ActivityPhase::AwaitingToolPayload,
+            BackendActivity::ToolPayload => ActivityPhase::ToolPayload,
+            BackendActivity::Decoding => ActivityPhase::Decoding,
+        };
+        let prefill = matches!(phase, ActivityPhase::Prefill)
+            .then_some(self.prefill)
+            .flatten();
         let (rate, rate_estimated) = self.activity_prefill_rate();
         if let Some(Cell::Activity {
             phase: p,
@@ -1107,6 +1128,7 @@ impl App {
             prefill_estimate,
             prefill_tps,
             prefill_tps_estimated,
+            backend_idle_ms,
             ..
         }) = self.transcript.last_mut()
         {
@@ -1115,6 +1137,7 @@ impl App {
             *prefill_estimate = self.prefill_estimate;
             *prefill_tps = rate;
             *prefill_tps_estimated = rate_estimated;
+            *backend_idle_ms = Some(idle_ms);
         } else {
             self.transcript.push(Cell::Activity {
                 phase,
@@ -1122,6 +1145,38 @@ impl App {
                 prefill_estimate: self.prefill_estimate,
                 prefill_tps: rate,
                 prefill_tps_estimated: rate_estimated,
+                backend_idle_ms: Some(idle_ms),
+                cache: self.turn_cache,
+            });
+        }
+    }
+
+    fn upsert_activity(&mut self, phase: ActivityPhase, prefill: Option<(u64, u64)>) {
+        let (rate, rate_estimated) = self.activity_prefill_rate();
+        if let Some(Cell::Activity {
+            phase: p,
+            prefill: pf,
+            prefill_estimate,
+            prefill_tps,
+            prefill_tps_estimated,
+            backend_idle_ms,
+            ..
+        }) = self.transcript.last_mut()
+        {
+            *p = phase;
+            *pf = prefill;
+            *prefill_estimate = self.prefill_estimate;
+            *prefill_tps = rate;
+            *prefill_tps_estimated = rate_estimated;
+            *backend_idle_ms = None;
+        } else {
+            self.transcript.push(Cell::Activity {
+                phase,
+                prefill,
+                prefill_estimate: self.prefill_estimate,
+                prefill_tps: rate,
+                prefill_tps_estimated: rate_estimated,
+                backend_idle_ms: None,
                 cache: None,
             });
         }
@@ -1159,6 +1214,7 @@ impl App {
                 prefill_estimate: self.prefill_estimate,
                 prefill_tps: self.activity_prefill_rate().0,
                 prefill_tps_estimated: self.activity_prefill_rate().1,
+                backend_idle_ms: None,
                 cache: Some(cache),
             });
         }
@@ -2388,6 +2444,17 @@ fn activity_marker(elapsed_s: f32) -> String {
     FRAMES[((elapsed_s * 6.0) as usize) % 4].to_string()
 }
 
+fn push_backend_idle(segs: &mut Vec<(String, Style)>, backend_idle_ms: Option<u64>) {
+    let Some(ms) = backend_idle_ms.filter(|ms| *ms > 0) else {
+        return;
+    };
+    segs.push((" · ".to_string(), dim()));
+    segs.push((
+        format!("no stream {:.1}s", ms as f32 / 1000.0),
+        dim_color(WARN_COLOR),
+    ));
+}
+
 fn cell_consumes_assistant_mark(cell: &Cell) -> bool {
     matches!(
         cell,
@@ -2474,6 +2541,9 @@ fn cache_status_label(status: CacheStatus) -> (String, Color) {
             }
             CacheResetReason::LcmCheckpoint => {
                 ("cache reset · lcm checkpoint".to_string(), WARN_COLOR)
+            }
+            CacheResetReason::StalledProviderRequest => {
+                ("cache reset · stalled request".to_string(), WARN_COLOR)
             }
         },
     }
@@ -3154,6 +3224,7 @@ fn cell_lines_with_reply_mark(
             prefill_estimate,
             prefill_tps,
             prefill_tps_estimated,
+            backend_idle_ms,
             cache,
         } => {
             let mut segs = vec![
@@ -3162,6 +3233,14 @@ fn cell_lines_with_reply_mark(
                 (" ".to_string(), Style::default()),
             ];
             match phase {
+                ActivityPhase::WaitingForBackend => {
+                    segs.push((
+                        "waiting for backend bytes".to_string(),
+                        dim_color(WARN_COLOR),
+                    ));
+                    push_backend_idle(&mut segs, *backend_idle_ms);
+                    segs.push((format!(" · {:.1}s", elapsed_s), dim()));
+                }
                 ActivityPhase::Prefill => {
                     segs.push(("prefill".to_string(), dim_color(pal().accent)));
                     if let Some(cache) = cache {
@@ -3210,10 +3289,22 @@ fn cell_lines_with_reply_mark(
                             segs.push((label, dim_color(pal().accent)));
                         }
                     }
+                    push_backend_idle(&mut segs, *backend_idle_ms);
                     segs.push((format!(" · {:.1}s", elapsed_s), dim()));
                 }
                 ActivityPhase::Thinking => {
                     segs.push(("thinking".to_string(), dim_color(WARN_COLOR)));
+                    push_backend_idle(&mut segs, *backend_idle_ms);
+                    segs.push((format!(" · {:.1}s", elapsed_s), dim()));
+                }
+                ActivityPhase::AwaitingToolPayload => {
+                    segs.push(("generating tool payload".to_string(), dim_color(WARN_COLOR)));
+                    push_backend_idle(&mut segs, *backend_idle_ms);
+                    segs.push((format!(" · {:.1}s", elapsed_s), dim()));
+                }
+                ActivityPhase::ToolPayload => {
+                    segs.push(("streaming tool payload".to_string(), dim_color(WARN_COLOR)));
+                    push_backend_idle(&mut segs, *backend_idle_ms);
                     segs.push((format!(" · {:.1}s", elapsed_s), dim()));
                 }
                 ActivityPhase::Decoding => {
@@ -3224,6 +3315,7 @@ fn cell_lines_with_reply_mark(
                         ]];
                     }
                     segs.push(("decoding".to_string(), dim_color(pal().accent)));
+                    push_backend_idle(&mut segs, *backend_idle_ms);
                     segs.push((format!(" · {:.1}s", elapsed_s), dim()));
                 }
             }
@@ -3908,6 +4000,99 @@ mod tests {
         assert!(
             rendered.contains("~250 tok/s"),
             "estimated rate should be marked approximate: {rendered}"
+        );
+    }
+
+    #[test]
+    fn backend_activity_waiting_headers_renders_idle_status() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("\u{0}backend:waiting_headers:12000");
+
+        match app.transcript.get(1) {
+            Some(Cell::Activity {
+                phase: ActivityPhase::WaitingForBackend,
+                backend_idle_ms: Some(12000),
+                ..
+            }) => {}
+            _ => panic!("expected backend waiting activity"),
+        }
+        let rendered = flatten_text(Text::from(app.transcript_rows(100)));
+        assert!(
+            rendered.contains("waiting for backend bytes"),
+            "backend wait label should render: {rendered}"
+        );
+        assert!(
+            rendered.contains("no stream 12.0s"),
+            "backend silence time should render: {rendered}"
+        );
+    }
+
+    #[test]
+    fn backend_activity_awaiting_tool_payload_renders_idle_status() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("\u{0}backend:awaiting_tool_payload:64000");
+
+        match app.transcript.get(1) {
+            Some(Cell::Activity {
+                phase: ActivityPhase::AwaitingToolPayload,
+                backend_idle_ms: Some(64000),
+                ..
+            }) => {}
+            _ => panic!("expected awaiting-tool-payload activity"),
+        }
+        let rendered = flatten_text(Text::from(app.transcript_rows(100)));
+        assert!(
+            rendered.contains("generating tool payload"),
+            "awaiting-tool-payload label should render: {rendered}"
+        );
+        assert!(
+            rendered.contains("no stream 64.0s"),
+            "awaiting-tool-payload silence time should render: {rendered}"
+        );
+    }
+
+    #[test]
+    fn backend_activity_tool_payload_renders_idle_status() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("\u{0}backend:tool_payload:5000");
+
+        match app.transcript.get(1) {
+            Some(Cell::Activity {
+                phase: ActivityPhase::ToolPayload,
+                backend_idle_ms: Some(5000),
+                ..
+            }) => {}
+            _ => panic!("expected tool-payload activity"),
+        }
+        let rendered = flatten_text(Text::from(app.transcript_rows(100)));
+        assert!(
+            rendered.contains("streaming tool payload"),
+            "tool-payload label should render: {rendered}"
+        );
+        assert!(
+            rendered.contains("no stream 5.0s"),
+            "tool-payload silence time should render: {rendered}"
+        );
+    }
+
+    #[test]
+    fn completed_prefill_then_payload_generation_does_not_render_as_prefill() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("\u{0}prefill:3300/3300");
+        app.on_delta("\u{0}backend:awaiting_tool_payload:5000");
+
+        let rendered = flatten_text(Text::from(app.transcript_rows(100)));
+        assert!(
+            rendered.contains("generating tool payload"),
+            "completed prefill should transition to payload generation: {rendered}"
+        );
+        assert!(
+            !rendered.contains("prefill"),
+            "completed prefill must not overwrite payload generation: {rendered}"
         );
     }
 
@@ -4639,6 +4824,36 @@ mod tests {
             rendered.contains("cache reset · lcm checkpoint"),
             "lcm checkpoint should be visible: {rendered}"
         );
+    }
+
+    #[test]
+    fn stalled_provider_request_reset_is_explicit() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("\u{0}cache:reset:stalled_provider_request");
+        app.on_delta("real");
+        app.finish_turn(String::new());
+
+        match app.transcript.last() {
+            Some(Cell::Meta {
+                cache:
+                    Some(CacheStatus::Reset {
+                        reason: CacheResetReason::StalledProviderRequest,
+                    }),
+                ..
+            }) => {}
+            _ => panic!("expected stalled provider request reset in meta"),
+        }
+        let rendered: String = cell_lines(app.transcript.last().unwrap(), Mode::Calm, 1.0)
+            .iter()
+            .flatten()
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert!(
+            rendered.contains("cache reset · stalled request"),
+            "stalled provider request should not be labeled as LCM: {rendered}"
+        );
+        assert!(!rendered.contains("lcm checkpoint"));
     }
 
     #[test]

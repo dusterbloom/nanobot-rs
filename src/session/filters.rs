@@ -6,7 +6,11 @@
 use serde_json::Value;
 use tracing::warn;
 
-use crate::agent::context_hygiene::{cap_tool_result_for_replay, TOOL_RESULT_REPLAY_MAX_BYTES};
+#[cfg(test)]
+use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
+use crate::agent::context_hygiene::{
+    cap_tool_result_for_replay, recall_tool_result_replay_reference, tool_result_ok,
+};
 
 /// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
 ///
@@ -74,6 +78,52 @@ fn is_cache_replay_synthetic(msg: &Value) -> bool {
         || content.starts_with("[System notice]")
         || content.starts_with("[System] Loop detected:")
         || content.starts_with("[system] Report what the previous tool results showed before")
+}
+
+fn recalled_source_tool_call_id(messages: &[Value], tool_msg_index: usize) -> Option<String> {
+    let recall_call_id = messages
+        .get(tool_msg_index)?
+        .get("tool_call_id")
+        .and_then(|v| v.as_str())?;
+
+    messages[..tool_msg_index]
+        .iter()
+        .rev()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .filter_map(|m| m.get("tool_calls").and_then(|v| v.as_array()))
+        .flat_map(|calls| calls.iter())
+        .find(|call| call.get("id").and_then(|v| v.as_str()) == Some(recall_call_id))
+        .and_then(recall_tool_call_source_id)
+}
+
+fn recall_tool_call_source_id(call: &Value) -> Option<String> {
+    if call
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|v| v.as_str())
+        != Some("recall_tool_result")
+    {
+        return None;
+    }
+
+    let args = call
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .or_else(|| call.get("arguments"))?;
+    if let Some(raw) = args.as_str() {
+        let parsed: Value = serde_json::from_str(raw).ok()?;
+        return parsed
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+    }
+    args.get("tool_call_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn failed_recall_tool_result(content: &str) -> bool {
+    !tool_result_ok(content)
 }
 
 /// Advance an index past leading `role: "tool"` messages whose parent
@@ -159,7 +209,8 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     // Stage 5: filter and map each surviving message to wire format.
     let mapped: Vec<Value> = messages[safe_start..]
         .iter()
-        .filter(|m| {
+        .enumerate()
+        .filter(|(_, m)| {
             // Skip synthetic router/specialist injections. Cache-replay
             // scaffolds were already sent to the model, so dropping them on
             // reload would mutate the warm prompt prefix.
@@ -169,17 +220,27 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
                 // Skip internal LCM summary entries — not valid wire format.
                 && m.get("role").and_then(|r| r.as_str()) != Some("summary")
         })
-        .map(|m| {
+        .map(|(offset, m)| {
             let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             // Tool results are the bulkiest, lowest-value-once-stale part of
             // history (web_fetch / skill dumps). Cap their body to a generous,
             // FIXED size so one large dump can't crowd conversation out of the
             // token budget. The cap is applied identically on every reload (not
             // age-based), so it never shifts the prompt prefix — no extra
-            // re-prefill, unlike dropping or sliding truncation.
+            // re-prefill, unlike dropping or sliding truncation. Recalled raw
+            // outputs are one-shot: the requesting turn saw exact bytes, but
+            // replay gets only a stable digest/handle so recall cannot become
+            // a permanent prompt balloon.
             let raw = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let tool_name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let content = if role == "tool" && tool_name != "recall_tool_result" {
+            let content = if role == "tool" && tool_name == "recall_tool_result" {
+                if failed_recall_tool_result(raw) {
+                    raw.to_string()
+                } else {
+                    let source_id = recalled_source_tool_call_id(messages, safe_start + offset);
+                    recall_tool_result_replay_reference(raw, source_id.as_deref())
+                }
+            } else if role == "tool" {
                 cap_tool_body(raw)
             } else {
                 raw.to_string()
@@ -1169,11 +1230,22 @@ mod tests {
     }
 
     #[test]
-    fn test_recall_tool_result_body_is_not_replay_capped() {
+    fn test_recall_tool_result_body_becomes_one_shot_replay_reference() {
         let big = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5000);
         let messages = vec![
             user("recall it"),
-            tool_call_assistant("recall_1"),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "recall_1",
+                    "type": "function",
+                    "function": {
+                        "name": "recall_tool_result",
+                        "arguments": "{\"tool_call_id\":\"original_tool_call\"}"
+                    }
+                }]
+            }),
             json!({
                 "role": "tool",
                 "tool_call_id": "recall_1",
@@ -1187,13 +1259,85 @@ mod tests {
             .iter()
             .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "recall_1")
             .unwrap();
-        assert_eq!(
-            tool["content"].as_str().unwrap().len(),
-            TOOL_RESULT_REPLAY_MAX_BYTES + 5000
+        let content = tool["content"].as_str().unwrap();
+        assert!(
+            content.len() < 512,
+            "replay reference must stay compact, got {} bytes",
+            content.len()
         );
-        assert!(!tool["content"]
-            .as_str()
-            .unwrap()
-            .contains("[tool output truncated]"));
+        assert!(content.contains("shown raw once"));
+        assert!(content.contains("TOOL_OUTPUT_DIGEST v1"));
+        assert!(content.contains("len:13000"));
+        assert!(content.contains("original_tool_call"));
+        assert!(!content.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn test_failed_recall_tool_result_replays_exact_error() {
+        let error =
+            "No stored output for tool_call_id='missing' in this session. Re-run the original tool.";
+        let messages = vec![
+            user("recall it"),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "recall_1",
+                    "type": "function",
+                    "function": {
+                        "name": "recall_tool_result",
+                        "arguments": "{\"tool_call_id\":\"missing\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "recall_1",
+                "name": "recall_tool_result",
+                "content": error,
+            }),
+        ];
+
+        let result = filter_history(&messages, 0, 0);
+        let tool = result
+            .iter()
+            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "recall_1")
+            .unwrap();
+        assert_eq!(tool["content"], error);
+        assert!(!tool["content"].as_str().unwrap().contains("shown raw once"));
+    }
+
+    #[test]
+    fn test_wrapped_failed_recall_tool_result_replays_exact_error() {
+        let error = "[VERBATIM TOOL OUTPUT — do not paraphrase]\nError: No stored output for tool_call_id='missing' in this session. Re-run the original tool.\n[END TOOL OUTPUT]";
+        let messages = vec![
+            user("recall it"),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "recall_1",
+                    "type": "function",
+                    "function": {
+                        "name": "recall_tool_result",
+                        "arguments": "{\"tool_call_id\":\"missing\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "recall_1",
+                "name": "recall_tool_result",
+                "content": error,
+            }),
+        ];
+
+        let result = filter_history(&messages, 0, 0);
+        let tool = result
+            .iter()
+            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "recall_1")
+            .unwrap();
+        assert_eq!(tool["content"], error);
+        assert!(!tool["content"].as_str().unwrap().contains("shown raw once"));
     }
 }

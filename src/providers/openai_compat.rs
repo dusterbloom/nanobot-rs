@@ -59,6 +59,8 @@ pub struct OpenAICompatProvider {
 }
 
 pub(crate) const NANOBOT_HIGGS_SESSION_ID_FIELD: &str = "_nanobot_higgs_session_id";
+pub(crate) const NANOBOT_HIGGS_DROP_SESSION_ID_FIELD: &str = "_nanobot_higgs_drop_session_id";
+pub(crate) const NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: &str = "_nanobot_higgs_drop_session_ids";
 
 fn is_valid_tool_call_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -368,22 +370,34 @@ fn is_private_ip(url: &str) -> bool {
 
 fn request_messages_and_higgs_session_id(
     messages: &[serde_json::Value],
-) -> (Vec<serde_json::Value>, Option<u64>) {
+) -> (Vec<serde_json::Value>, Option<u64>, Vec<u64>) {
     let mut session_id = None;
+    let mut drop_session_ids = Vec::new();
     let cleaned = messages
         .iter()
         .map(|msg| {
             let mut msg = msg.clone();
             if let Some(obj) = msg.as_object_mut() {
+                obj.remove("ok");
                 let marker = obj.remove(NANOBOT_HIGGS_SESSION_ID_FIELD);
                 if session_id.is_none() {
                     session_id = marker.and_then(|v| v.as_u64());
+                }
+                let drop_marker = obj.remove(NANOBOT_HIGGS_DROP_SESSION_ID_FIELD);
+                if let Some(drop_session_id) = drop_marker.and_then(|v| v.as_u64()) {
+                    drop_session_ids.push(drop_session_id);
+                }
+                let drop_markers = obj.remove(NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD);
+                if let Some(markers) = drop_markers.and_then(|v| v.as_array().cloned()) {
+                    drop_session_ids.extend(markers.into_iter().filter_map(|v| v.as_u64()));
                 }
             }
             msg
         })
         .collect();
-    (cleaned, session_id)
+    drop_session_ids.sort_unstable();
+    drop_session_ids.dedup();
+    (cleaned, session_id, drop_session_ids)
 }
 
 /// Models that should keep template thinking enabled by default on local
@@ -828,7 +842,8 @@ impl OpenAICompatProvider {
             matches!(kind, RequestKind::Streaming)
         );
 
-        let (request_messages, higgs_session_id) = request_messages_and_higgs_session_id(messages);
+        let (request_messages, higgs_session_id, higgs_drop_session_ids) =
+            request_messages_and_higgs_session_id(messages);
         let request_messages = fold_developer_role_for_local(request_messages, &self.api_base);
 
         // Inject cache_control breakpoints for Anthropic prompt caching.
@@ -886,13 +901,22 @@ impl OpenAICompatProvider {
             if let Some(session_id) = higgs_session_id {
                 body["session_id"] = serde_json::json!(session_id);
             }
+            match higgs_drop_session_ids.as_slice() {
+                [] => {}
+                [drop_session_id] => {
+                    body["drop_session_id"] = serde_json::json!(drop_session_id);
+                }
+                drop_session_ids => {
+                    body["drop_session_ids"] = serde_json::json!(drop_session_ids);
+                }
+            }
         }
         // Definitive cache-engagement diagnostic. Both `higgs_session_cache`
         // (the provider flag, set when localBackend=higgs) AND `session_id`
         // (the marker extracted from the message array at line ~795) must be
         // present for body["session_id"] to be sent. If this logs
-        // session_id_set=false on a higgs backend, the prefix cache is never
-        // engaged — that is the root cause of per-turn re-prefill bursts.
+        // session_id_set=false on a higgs backend, retained session-KV reuse is
+        // not engaged; exact radix/disk prefix caches may still hit.
         // Cross-reference with the response-side `local_llm_raw_usage` log:
         // session_id_set=true + cache_read=0 ⇒ the server received the id but
         // is not serving a cached prefix.
@@ -901,6 +925,9 @@ impl OpenAICompatProvider {
             higgs_session_cache = self.higgs_session_cache,
             session_id_set = body.get("session_id").is_some(),
             session_id_value = ?higgs_session_id,
+            drop_session_id_set = body.get("drop_session_id").is_some(),
+            drop_session_ids_set = body.get("drop_session_ids").is_some(),
+            drop_session_ids_value = ?higgs_drop_session_ids,
             "higgs_session_cache_request"
         );
         apply_local_reasoning_controls(&mut body, &self.api_base, policy_model, thinking_budget);
@@ -1250,13 +1277,16 @@ impl LLMProvider for OpenAICompatProvider {
         // The JIT permit is moved into the task and held until the stream ends,
         // preventing other providers from switching models mid-stream.
         let byte_stream = response.bytes_stream();
-        tokio::spawn(async move {
+        let abort_on_drop = tokio::spawn(async move {
             parse_sse_stream(byte_stream, tx).await;
             // Permit drops here when the stream is fully consumed.
             drop(jit_permit);
         });
 
-        Ok(StreamHandle { rx })
+        Ok(StreamHandle {
+            rx,
+            abort_on_drop: Some(abort_on_drop),
+        })
     }
 
     fn get_default_model(&self) -> &str {
@@ -1265,6 +1295,10 @@ impl LLMProvider for OpenAICompatProvider {
 
     fn get_api_base(&self) -> Option<&str> {
         Some(&self.api_base)
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        self.higgs_session_cache
     }
 }
 
@@ -1721,11 +1755,15 @@ async fn parse_sse_stream(
                                     if let Some(args_val) = function.get("arguments") {
                                         if let Some(s) = args_val.as_str() {
                                             entry.2.push_str(s);
+                                            if !s.is_empty() {
+                                                let _ = tx.send(StreamChunk::ToolCallDelta);
+                                            }
                                         } else if args_val.is_object() || args_val.is_array() {
                                             entry.2.push_str(
                                                 &serde_json::to_string(args_val)
                                                     .unwrap_or_default(),
                                             );
+                                            let _ = tx.send(StreamChunk::ToolCallDelta);
                                         }
                                     }
                                 }
@@ -1765,6 +1803,22 @@ async fn parse_sse_stream(
         tool_calls = tool_calls_acc.len(),
         "sse_stream_ended_without_done"
     );
+    if full_content.is_empty()
+        && full_reasoning.is_empty()
+        && full_inline_thinking.is_empty()
+        && tool_calls_acc.is_empty()
+    {
+        let _ = tx.send(StreamChunk::Done(LLMResponse {
+            content: Some(
+                "LLM stream ended before the backend produced any response content or tool-call payload."
+                    .to_string(),
+            ),
+            tool_calls: Vec::new(),
+            finish_reason: "error".to_string(),
+            usage,
+        }));
+        return;
+    }
     // Fallback chain: API reasoning_content first, then inline <think> blocks.
     let content = if !full_content.is_empty() {
         if !full_reasoning.is_empty() {
@@ -1893,6 +1947,42 @@ mod tests {
     }
 
     #[test]
+    fn test_build_chat_request_strips_internal_tool_result_status() {
+        let provider = OpenAICompatProvider::new("sk-test", Some(OPENAI_API_BASE), Some("gpt-4o"));
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                "id": "tc_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"x\"}"}
+            }]}),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "tc_1",
+                "name": "read_file",
+                "ok": false,
+                "content": "Error: File not found",
+            }),
+        ];
+
+        let (_, body) = provider.build_chat_request(
+            &messages,
+            None,
+            Some("gpt-4o"),
+            64,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+
+        let sent_tool = body["messages"][1].as_object().unwrap();
+        assert!(!sent_tool.contains_key("ok"));
+        assert_eq!(sent_tool.get("content").unwrap(), "Error: File not found");
+    }
+
+    #[test]
     fn test_build_chat_request_injects_sampling_penalties_when_set() {
         let provider =
             OpenAICompatProvider::new("local", Some("http://127.0.0.1:1234/v1"), Some("qwen3-8b"))
@@ -1948,16 +2038,170 @@ mod tests {
                 "role": "system",
                 "content": "stable prefix",
                 NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+                NANOBOT_HIGGS_DROP_SESSION_ID_FIELD: 41_u64,
             }),
             serde_json::json!({"role": "user", "content": "hello"}),
         ];
 
-        let (cleaned, session_id) = request_messages_and_higgs_session_id(&messages);
+        let (cleaned, session_id, drop_session_id) =
+            request_messages_and_higgs_session_id(&messages);
 
         assert_eq!(session_id, Some(42));
+        assert_eq!(drop_session_id, vec![41]);
         assert!(cleaned[0].get(NANOBOT_HIGGS_SESSION_ID_FIELD).is_none());
+        assert!(cleaned[0]
+            .get(NANOBOT_HIGGS_DROP_SESSION_ID_FIELD)
+            .is_none());
         assert_eq!(cleaned[0]["content"], serde_json::json!("stable prefix"));
         assert_eq!(cleaned[1], messages[1]);
+    }
+
+    #[test]
+    fn test_request_messages_extracts_higgs_drop_session_id_array_marker() {
+        let messages = vec![serde_json::json!({
+            "role": "system",
+            "content": "stable prefix",
+            NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+            NANOBOT_HIGGS_DROP_SESSION_ID_FIELD: 41_u64,
+            NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: [40_u64, 41_u64],
+        })];
+
+        let (cleaned, session_id, drop_session_ids) =
+            request_messages_and_higgs_session_id(&messages);
+
+        assert_eq!(session_id, Some(42));
+        assert_eq!(drop_session_ids, vec![40, 41]);
+        assert!(cleaned[0].get(NANOBOT_HIGGS_SESSION_ID_FIELD).is_none());
+        assert!(cleaned[0]
+            .get(NANOBOT_HIGGS_DROP_SESSION_ID_FIELD)
+            .is_none());
+        assert!(cleaned[0]
+            .get(NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD)
+            .is_none());
+    }
+
+    #[test]
+    fn test_build_chat_request_sends_higgs_drop_session_id_when_enabled() {
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:9000/v1"), Some("bonsai"))
+                .with_higgs_session_cache(true);
+        let messages = vec![serde_json::json!({
+            "role": "system",
+            "content": "stable prefix",
+            NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+            NANOBOT_HIGGS_DROP_SESSION_ID_FIELD: 41_u64,
+        })];
+
+        let (_, body) = provider.build_chat_request(
+            &messages,
+            None,
+            Some("bonsai"),
+            256,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+
+        assert_eq!(body["session_id"], serde_json::json!(42));
+        assert_eq!(body["drop_session_id"], serde_json::json!(41));
+        assert!(body["messages"][0]
+            .get(NANOBOT_HIGGS_SESSION_ID_FIELD)
+            .is_none());
+        assert!(body["messages"][0]
+            .get(NANOBOT_HIGGS_DROP_SESSION_ID_FIELD)
+            .is_none());
+    }
+
+    #[test]
+    fn test_build_chat_request_sends_higgs_drop_session_ids_when_enabled() {
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:9000/v1"), Some("bonsai"))
+                .with_higgs_session_cache(true);
+        let messages = vec![serde_json::json!({
+            "role": "system",
+            "content": "stable prefix",
+            NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+            NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: [40_u64, 41_u64],
+        })];
+
+        let (_, body) = provider.build_chat_request(
+            &messages,
+            None,
+            Some("bonsai"),
+            256,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+
+        assert_eq!(body["session_id"], serde_json::json!(42));
+        assert_eq!(body["drop_session_ids"], serde_json::json!([40, 41]));
+        assert!(body.get("drop_session_id").is_none());
+        assert!(body["messages"][0]
+            .get(NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD)
+            .is_none());
+    }
+
+    /// The retained-session protocol must be engaged by the provider's advertised
+    /// capability (`higgs_session_cache`, set when `localBackend=higgs`), NOT by
+    /// sniffing port 8091. A higgs-nightly server on any other port must still
+    /// advertise support so the agent loop rotates its session id on
+    /// compaction/trim instead of re-prefilling under a stale id.
+    #[test]
+    fn test_higgs_session_cache_capability_independent_of_port() {
+        // Non-8091 port: capability still follows the flag, not the port.
+        let on = OpenAICompatProvider::new("local", Some("http://127.0.0.1:8092/v1"), Some("m"))
+            .with_higgs_session_cache(true);
+        let off = OpenAICompatProvider::new("local", Some("http://127.0.0.1:8092/v1"), Some("m"));
+        assert!(
+            on.supports_higgs_session_cache(),
+            "higgs backend on a non-8091 port must still advertise capability"
+        );
+        assert!(
+            !off.supports_higgs_session_cache(),
+            "non-higgs backend must not advertise capability"
+        );
+    }
+
+    #[test]
+    fn test_build_chat_request_strips_higgs_markers_when_disabled() {
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:9000/v1"), Some("bonsai"));
+        let messages = vec![serde_json::json!({
+            "role": "system",
+            "content": "stable prefix",
+            NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+            NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: [40_u64, 41_u64],
+        })];
+
+        let (_, body) = provider.build_chat_request(
+            &messages,
+            None,
+            Some("bonsai"),
+            256,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+
+        assert!(body.get("session_id").is_none());
+        assert!(body.get("drop_session_id").is_none());
+        assert!(body.get("drop_session_ids").is_none());
+        assert!(body["messages"][0]
+            .get(NANOBOT_HIGGS_SESSION_ID_FIELD)
+            .is_none());
+        assert!(body["messages"][0]
+            .get(NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD)
+            .is_none());
     }
 
     // R1 — Apple FM rejects object schemas missing `required` (HTTP 400, verified
@@ -3340,12 +3584,19 @@ mod tests {
         parse_sse_stream(stream, tx).await;
 
         let mut done_response = None;
+        let mut tool_call_deltas = 0usize;
         while let Ok(chunk) = rx.try_recv() {
-            if let StreamChunk::Done(resp) = chunk {
-                done_response = Some(resp);
+            match chunk {
+                StreamChunk::ToolCallDelta => tool_call_deltas += 1,
+                StreamChunk::Done(resp) => done_response = Some(resp),
+                _ => {}
             }
         }
 
+        assert!(
+            tool_call_deltas >= 4,
+            "name and argument fragments should reset the stream watchdog"
+        );
         let resp = done_response.expect("should have received Done despite no [DONE]");
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].name, "read_file");
@@ -3412,9 +3663,12 @@ mod tests {
         }
 
         let resp = done_response.expect("should produce Done even for empty stream");
+        assert_eq!(resp.finish_reason, "error");
         assert!(
-            resp.content.is_none(),
-            "empty stream should have no content"
+            resp.content
+                .as_deref()
+                .is_some_and(|content| content.contains("backend produced any response")),
+            "empty stream should explain the provider failure"
         );
         assert!(
             resp.tool_calls.is_empty(),

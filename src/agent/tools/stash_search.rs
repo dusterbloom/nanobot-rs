@@ -78,9 +78,7 @@ fn clamp_results(requested: Option<u64>) -> usize {
 
 /// Clamp `context_lines` into `[0, MAX_CONTEXT_LINES]`.
 fn clamp_context(requested: Option<u64>) -> usize {
-    requested
-        .unwrap_or(0)
-        .clamp(0, MAX_CONTEXT_LINES as u64) as usize
+    requested.unwrap_or(0).clamp(0, MAX_CONTEXT_LINES as u64) as usize
 }
 
 /// Build `context_lines` worth of surrounding lines, prefixed with the match
@@ -211,12 +209,7 @@ impl Tool for SearchToolResultTool {
                     if !out.is_empty() {
                         out.push('\n');
                     }
-                    out.push_str(&render_with_context(
-                        *line_no,
-                        text,
-                        lines,
-                        context_lines,
-                    ));
+                    out.push_str(&render_with_context(*line_no, text, lines, context_lines));
                     shown += 1;
                 }
             }
@@ -313,10 +306,7 @@ impl Tool for SliceToolResultTool {
                     .to_string();
             }
         };
-        let start = params
-            .get("start")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
+        let start = params.get("start").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
         let end = params
             .get("end")
             .and_then(|v| v.as_u64())

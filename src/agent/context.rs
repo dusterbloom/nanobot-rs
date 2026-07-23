@@ -11,7 +11,7 @@ use base64::Engine;
 use chrono::Local;
 use serde_json::{json, Value};
 
-use crate::agent::context_hygiene::cap_tool_result_for_replay;
+use crate::agent::context_hygiene::{cap_tool_result_for_replay, tool_result_ok};
 
 use crate::agent::memory::MemoryStore;
 use crate::agent::skills::SkillsLoader;
@@ -1124,6 +1124,26 @@ impl ContextBuilder {
         tool_name: &str,
         result: &str,
     ) {
+        Self::add_tool_result_with_status(
+            messages,
+            tool_call_id,
+            tool_name,
+            result,
+            tool_result_ok(result),
+        );
+    }
+
+    /// Add a tool result with structured status preserved for protocol renderers.
+    pub fn add_tool_result_with_status(
+        messages: &mut Vec<Value>,
+        tool_call_id: &str,
+        tool_name: &str,
+        result: &str,
+        ok: bool,
+    ) {
+        // Recalled bytes are intentionally one-shot: keep them raw for the
+        // immediate follow-up LLM call, then session replay replaces the
+        // persisted tool message with a compact digest/reference.
         let content = if tool_name == "recall_tool_result" {
             result.to_string()
         } else {
@@ -1133,6 +1153,7 @@ impl ContextBuilder {
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
+            "ok": ok,
             "content": content,
         }));
     }
@@ -1147,10 +1168,29 @@ impl ContextBuilder {
         tool_name: &str,
         result: &str,
     ) {
+        Self::add_tool_result_immutable_with_status(
+            messages,
+            tool_call_id,
+            tool_name,
+            result,
+            tool_result_ok(result),
+        );
+    }
+
+    /// Add an immutable tool result with structured status preserved.
+    pub fn add_tool_result_immutable_with_status(
+        messages: &mut Vec<Value>,
+        tool_call_id: &str,
+        tool_name: &str,
+        result: &str,
+        ok: bool,
+    ) {
         let wrapped = format!(
             "[VERBATIM TOOL OUTPUT — do not paraphrase]\n{}\n[END TOOL OUTPUT]",
             result
         );
+        // Same one-shot recall rule as `add_tool_result`: provenance wrapping
+        // is visible live, while SQLite replay later emits only a reference.
         let content = if tool_name == "recall_tool_result" {
             wrapped
         } else {
@@ -1160,6 +1200,7 @@ impl ContextBuilder {
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
+            "ok": ok,
             "content": content,
         }));
     }
@@ -1207,6 +1248,8 @@ impl ContextBuilder {
             .map(|p| Self::display_path(&p))
             .unwrap_or_else(|_| ".".to_string());
 
+        let memory_path = format!("{workspace_path}/memory/MEMORY.md");
+
         // Genuinely divergent pieces: intro/model line, extra rules, tail sections.
         let (intro, home_line, extra_rules, tail) = if local {
             let model_line = if self.model_name.is_empty() {
@@ -1216,7 +1259,19 @@ impl ContextBuilder {
             };
             (
                 format!(
-                    "You are nanobot. {model_line}. Use tools; quote [VERBATIM TOOL OUTPUT] verbatim."
+                    "You are nanobot. {model_line}. Project directory: {cwd}. \
+                     Internal workspace: {workspace_path}. Long-term memory: {memory_path}. \
+                     Use tools; quote [VERBATIM TOOL OUTPUT] verbatim.\n\
+                     Tool map: list_dir(path) lists directories; find_files(path,pattern) \
+                     finds names; search_files(query,path) searches content; read_file(path,lines) \
+                     reads exact lines; write_file(path,content) creates small files; \
+                     write_file_chunk(path,mode,content,expected_offset) streams rich files; \
+                     edit_file(path,old_text,new_text) edits files; exec(command,working_dir) \
+                     runs shell commands. Prefer write_file_chunk for generated HTML/apps/games and \
+                     edit_file for targeted edits; do not use exec/cp for content you need to \
+                     create. Prefer relative paths from the project directory. If a tool returns \
+                     Error: or (no output), report that exact outcome before trying another path. \
+                     Use tool(name) with no args to inspect uncommon tools."
                 ),
                 String::new(),
                 String::new(),
@@ -1258,7 +1313,7 @@ impl ContextBuilder {
                 format!(
                     "## Memory\n\
                      Working Memory is injected automatically (session state). \
-                     Long-term facts: {workspace_path}/memory/MEMORY.md.\n\
+                     Long-term facts: {memory_path}.\n\
                      Use `recall` to search all memory (sessions, facts, archives).\n\n\
                      If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your \
                      approach — it takes precedence."
@@ -1316,7 +1371,7 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
             ));
         }
 
-        // Load bootstrap file CONTENT (SOUL.md, USER.md, TOOLS.md, etc.)
+        // Load bootstrap file CONTENT (AGENTS.md, SOUL.md, USER.md)
         // into the prompt so the agent knows its identity and user preferences.
         // Previously this only listed file names as "available via read_file"
         // which meant local agents started with zero context.
@@ -1701,6 +1756,11 @@ fn _guess_mime(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tools::base::Tool;
+    use crate::agent::tools::{
+        EditFileTool, ExecTool, FindFilesTool, ListDirTool, ReadFileTool, SearchFilesTool,
+        WriteFileChunkTool, WriteFileTool,
+    };
     use tempfile::TempDir;
 
     /// Helper: create a ContextBuilder backed by a temporary workspace.
@@ -1932,6 +1992,92 @@ mod tests {
     }
 
     #[test]
+    fn test_local_identity_contains_directory_contract() {
+        let (_tmp, cb) = make_context();
+        let identity = cb._get_identity(true);
+        let workspace_str = ContextBuilder::display_path(
+            &cb.workspace
+                .canonicalize()
+                .unwrap_or_else(|_| cb.workspace.clone()),
+        );
+
+        assert!(identity.contains("Project directory:"), "{identity}");
+        assert!(identity.contains("Internal workspace:"), "{identity}");
+        assert!(identity.contains(&workspace_str), "{identity}");
+        assert!(
+            identity.contains(&format!("{workspace_str}/memory/MEMORY.md")),
+            "{identity}"
+        );
+        assert!(identity.contains("Tool map:"), "{identity}");
+        assert!(identity.contains("list_dir(path)"), "{identity}");
+        assert!(identity.contains("write_file(path,content)"), "{identity}");
+        assert!(
+            identity.contains("write_file_chunk(path,mode,content,expected_offset)"),
+            "{identity}"
+        );
+        assert!(
+            identity.contains("Prefer write_file_chunk for generated HTML/apps/games"),
+            "{identity}"
+        );
+        assert!(
+            identity.contains("edit_file(path,old_text,new_text)"),
+            "{identity}"
+        );
+        assert!(
+            identity.contains("Use tool(name) with no args"),
+            "{identity}"
+        );
+    }
+
+    #[test]
+    fn test_local_identity_tool_map_matches_advertised_schema_params() {
+        let (_tmp, cb) = make_context();
+        let identity = cb._get_identity(true);
+
+        fn assert_params(tool: &dyn Tool, params: &[&str]) {
+            let schema = tool.parameters();
+            let props = schema
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .unwrap();
+            for param in params {
+                assert!(
+                    props.contains_key(*param),
+                    "{} schema must contain advertised param {param}",
+                    tool.name()
+                );
+            }
+        }
+
+        assert!(identity.contains("list_dir(path)"), "{identity}");
+        assert_params(&ListDirTool, &["path"]);
+        assert!(identity.contains("find_files(path,pattern)"), "{identity}");
+        assert_params(&FindFilesTool, &["path", "pattern"]);
+        assert!(identity.contains("search_files(query,path)"), "{identity}");
+        assert_params(&SearchFilesTool, &["query", "path"]);
+        assert!(identity.contains("read_file(path,lines)"), "{identity}");
+        assert_params(&ReadFileTool::default(), &["path", "lines"]);
+        assert!(identity.contains("write_file(path,content)"), "{identity}");
+        assert_params(&WriteFileTool, &["path", "content"]);
+        assert!(
+            identity.contains("write_file_chunk(path,mode,content,expected_offset)"),
+            "{identity}"
+        );
+        assert_params(
+            &WriteFileChunkTool,
+            &["path", "mode", "content", "expected_offset"],
+        );
+        assert!(
+            identity.contains("edit_file(path,old_text,new_text)"),
+            "{identity}"
+        );
+        assert_params(&EditFileTool, &["path", "old_text", "new_text"]);
+        assert!(identity.contains("exec(command,working_dir)"), "{identity}");
+        let exec = ExecTool::new(1, None, None, None, false, 1000);
+        assert_params(&exec, &["command", "working_dir"]);
+    }
+
+    #[test]
     fn test_build_system_prompt_includes_bootstrap_file() {
         let tmp = TempDir::new().unwrap();
         // Write a bootstrap file that ContextBuilder looks for.
@@ -2123,7 +2269,21 @@ mod tests {
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["tool_call_id"], "call_123");
         assert_eq!(messages[0]["name"], "read_file");
+        assert_eq!(messages[0]["ok"], true);
         assert_eq!(messages[0]["content"], "file content");
+    }
+
+    #[test]
+    fn test_add_tool_result_preserves_failure_status() {
+        let mut messages: Vec<Value> = Vec::new();
+        ContextBuilder::add_tool_result(
+            &mut messages,
+            "call_123",
+            "list_dir",
+            "Error: Directory not found: /bad/path",
+        );
+
+        assert_eq!(messages[0]["ok"], false);
     }
 
     #[test]
@@ -2145,6 +2305,15 @@ mod tests {
         let content = messages[0]["content"].as_str().unwrap();
         assert!(content.len() < body.len());
         assert!(content.ends_with("[tool output truncated]"));
+    }
+
+    #[test]
+    fn test_add_tool_result_keeps_recall_tool_result_raw_for_live_turn() {
+        let mut messages: Vec<Value> = Vec::new();
+        let body = "x".repeat(crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES + 1024);
+        ContextBuilder::add_tool_result(&mut messages, "c1", "recall_tool_result", &body);
+
+        assert_eq!(messages[0]["content"].as_str().unwrap(), body);
     }
 
     // ----- add_assistant_message -----

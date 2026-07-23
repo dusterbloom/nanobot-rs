@@ -693,11 +693,14 @@ impl LLMProvider for AnthropicProvider {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let byte_stream = response.bytes_stream();
 
-        tokio::spawn(async move {
+        let abort_on_drop = tokio::spawn(async move {
             parse_anthropic_sse(byte_stream, tx).await;
         });
 
-        Ok(StreamHandle { rx })
+        Ok(StreamHandle {
+            rx,
+            abort_on_drop: Some(abort_on_drop),
+        })
     }
 
     fn get_default_model(&self) -> &str {

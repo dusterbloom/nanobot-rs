@@ -25,7 +25,7 @@ impl Capability {
             // replace an oversized result with a pointer to this tool. Cloud
             // capability gating must not leave that pointer uncallable.
             Capability::Read => &["read_file", "list_dir", "recall_tool_result"],
-            Capability::Write => &["write_file", "edit_file"],
+            Capability::Write => &["write_file", "write_file_chunk", "edit_file"],
             Capability::Execute => &["exec"],
             Capability::Http => &["web_search", "web_fetch", "browser"],
             Capability::Memory => &["recall", "remember", "session_search"],

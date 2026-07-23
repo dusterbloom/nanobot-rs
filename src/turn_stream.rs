@@ -306,7 +306,44 @@ pub(crate) enum ControlMarker {
         processed: u64,
         total: u64,
     },
+    BackendActivity {
+        phase: BackendActivity,
+        idle_ms: u64,
+    },
     CacheStatus(CacheStatus),
+}
+
+/// Agent-side backend progress state for a live LLM call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendActivity {
+    WaitingForHeaders,
+    Prefill,
+    AwaitingToolPayload,
+    ToolPayload,
+    Decoding,
+}
+
+impl BackendActivity {
+    fn as_wire(self) -> &'static str {
+        match self {
+            BackendActivity::WaitingForHeaders => "waiting_headers",
+            BackendActivity::Prefill => "prefill",
+            BackendActivity::AwaitingToolPayload => "awaiting_tool_payload",
+            BackendActivity::ToolPayload => "tool_payload",
+            BackendActivity::Decoding => "decoding",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "waiting_headers" => Some(BackendActivity::WaitingForHeaders),
+            "prefill" => Some(BackendActivity::Prefill),
+            "awaiting_tool_payload" => Some(BackendActivity::AwaitingToolPayload),
+            "tool_payload" => Some(BackendActivity::ToolPayload),
+            "decoding" => Some(BackendActivity::Decoding),
+            _ => None,
+        }
+    }
 }
 
 /// Prompt-cache relationship between this LLM call and the previous one.
@@ -335,6 +372,7 @@ pub(crate) enum CacheResetReason {
     Trim,
     EmergencyTrim,
     LcmCheckpoint,
+    StalledProviderRequest,
 }
 
 impl CacheResetReason {
@@ -343,6 +381,7 @@ impl CacheResetReason {
             CacheResetReason::Trim => "trim",
             CacheResetReason::EmergencyTrim => "emergency_trim",
             CacheResetReason::LcmCheckpoint => "lcm_checkpoint",
+            CacheResetReason::StalledProviderRequest => "stalled_provider_request",
         }
     }
 }
@@ -360,6 +399,9 @@ impl ControlMarker {
             ControlMarker::PrefillEstimate(n) => format!("\x00prefill_estimate:{n}"),
             ControlMarker::PrefillProgress { processed, total } => {
                 format!("\x00prefill:{processed}/{total}")
+            }
+            ControlMarker::BackendActivity { phase, idle_ms } => {
+                format!("\x00backend:{}:{idle_ms}", phase.as_wire())
             }
             ControlMarker::CacheStatus(status) => match status {
                 CacheStatus::First { messages } => format!("\x00cache:first:{messages}"),
@@ -405,6 +447,13 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
             total: t.parse().ok()?,
         });
     }
+    if let Some(backend) = rest.strip_prefix("backend:") {
+        let (phase, idle_ms) = backend.split_once(':')?;
+        return Some(ControlMarker::BackendActivity {
+            phase: BackendActivity::from_wire(phase)?,
+            idle_ms: idle_ms.parse().ok()?,
+        });
+    }
     if let Some(cache) = rest.strip_prefix("cache:") {
         let mut parts = cache.split(':');
         return match parts.next()? {
@@ -425,6 +474,7 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
                     "trim" => CacheResetReason::Trim,
                     "emergency_trim" => CacheResetReason::EmergencyTrim,
                     "lcm_checkpoint" => CacheResetReason::LcmCheckpoint,
+                    "stalled_provider_request" => CacheResetReason::StalledProviderRequest,
                     _ => return None,
                 };
                 Some(ControlMarker::CacheStatus(CacheStatus::Reset { reason }))
@@ -489,6 +539,18 @@ mod tests {
                 processed: 1_200,
                 total: 2_400,
             },
+            ControlMarker::BackendActivity {
+                phase: BackendActivity::WaitingForHeaders,
+                idle_ms: 8_000,
+            },
+            ControlMarker::BackendActivity {
+                phase: BackendActivity::AwaitingToolPayload,
+                idle_ms: 2_500,
+            },
+            ControlMarker::BackendActivity {
+                phase: BackendActivity::ToolPayload,
+                idle_ms: 500,
+            },
             ControlMarker::CacheStatus(CacheStatus::First { messages: 3 }),
             ControlMarker::CacheStatus(CacheStatus::AppendOnly {
                 added: 2,
@@ -507,6 +569,9 @@ mod tests {
             }),
             ControlMarker::CacheStatus(CacheStatus::Reset {
                 reason: CacheResetReason::LcmCheckpoint,
+            }),
+            ControlMarker::CacheStatus(CacheStatus::Reset {
+                reason: CacheResetReason::StalledProviderRequest,
             }),
         ];
         for m in variants {

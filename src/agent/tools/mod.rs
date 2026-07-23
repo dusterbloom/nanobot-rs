@@ -18,8 +18,8 @@ pub mod remember;
 pub mod search_context;
 pub mod session_search;
 pub mod shell;
-pub mod stash_search;
 pub mod spawn;
+pub mod stash_search;
 pub mod system_info;
 pub mod todo;
 pub mod tool_status;
@@ -34,7 +34,7 @@ pub use email::{CheckInboxTool, SendEmailTool};
 pub use file_preview::FilePreviewTool;
 pub use filesystem::{
     EditFileTool, FileInfoTool, FindFilesTool, ListDirTool, ReadFileTool, SearchFilesTool,
-    WorkspaceDiffTool, WriteFileTool,
+    WorkspaceDiffTool, WriteFileChunkTool, WriteFileTool,
 };
 pub use message::{MessageTool, SendCallback};
 pub use read_skill::ReadSkillTool;

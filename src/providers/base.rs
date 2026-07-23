@@ -46,16 +46,17 @@ impl LLMResponse {
 
     /// Returns `true` if this response represents an LLM provider error.
     ///
-    /// NOTE: As of 2026-02-20, no provider actually sets `finish_reason = "error"`.
-    /// Provider-level errors are returned as `Err(ProviderError)` from `chat()`.
-    /// This exists as defensive code for future providers that may use this convention.
+    /// `finish_reason = "error"` is synthesized by the streaming layer when a
+    /// stream ends without producing any content or tool-call payload (see
+    /// `parse_sse_stream`); hard transport/provider failures are still returned
+    /// as `Err(ProviderError)` from `chat()`.
     pub fn is_error(&self) -> bool {
         self.finish_reason == "error"
     }
 
     /// Returns the error detail if this response is an error, else `None`.
     ///
-    /// See `is_error()` note — currently no provider triggers this path.
+    /// See `is_error()` note.
     pub fn error_detail(&self) -> Option<&str> {
         if self.is_error() {
             Some(self.content.as_deref().unwrap_or("Unknown LLM error"))
@@ -72,10 +73,11 @@ pub enum StreamChunk {
     TextDelta(String),
     /// Incremental thinking/reasoning content (extended thinking).
     ThinkingDelta(String),
-    /// A streamed tool call started (its function name arrived). Emitted so
-    /// consumers can mark end-of-prefill: responses that go straight into
-    /// tool calls produce no text/thinking deltas and would otherwise never
-    /// record TTFT. Full calls are delivered in `Done`.
+    /// A streamed tool-call fragment arrived (function name or arguments).
+    /// Emitted so consumers can mark end-of-prefill and reset idle watchdogs:
+    /// pure tool-call responses may produce no text/thinking deltas while still
+    /// generating a large JSON argument payload. Full calls are delivered in
+    /// `Done`.
     ToolCallDelta,
     /// Server-reported prefill progress (`prompt_progress` chunks from
     /// llama.cpp/higgs when the request set `return_progress`). `processed`
@@ -88,6 +90,18 @@ pub enum StreamChunk {
 /// Handle to a streaming LLM response.
 pub struct StreamHandle {
     pub rx: tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+    /// Provider-owned parser/read task. Dropping the handle aborts it so local
+    /// streams that stop making progress release their HTTP request and JIT
+    /// permit immediately instead of lingering until the backend timeout.
+    pub abort_on_drop: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.abort_on_drop.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// How the model should choose tools for a request. Maps to OpenAI `tool_choice`.
@@ -191,7 +205,10 @@ pub trait LLMProvider: Send + Sync {
             let _ = tx.send(StreamChunk::TextDelta(content.clone()));
         }
         let _ = tx.send(StreamChunk::Done(response));
-        Ok(StreamHandle { rx })
+        Ok(StreamHandle {
+            rx,
+            abort_on_drop: None,
+        })
     }
 
     /// Get the default model for this provider.
@@ -200,5 +217,15 @@ pub trait LLMProvider: Send + Sync {
     /// Get the API base URL (for health checks). Returns None for cloud providers.
     fn get_api_base(&self) -> Option<&str> {
         None
+    }
+
+    /// Whether this provider speaks the higgs retained-session protocol
+    /// (`session_id` / `drop_session_id(s)` request fields). Drives KV-cache
+    /// session-id rotation on the agent side. Defaults to `false`; the
+    /// OpenAI-compatible provider overrides it to return its `higgs_session_cache`
+    /// flag (set when `localBackend=higgs`), so the capability — not the port —
+    /// decides whether the agent rotates the session id on compaction/trim.
+    fn supports_higgs_session_cache(&self) -> bool {
+        false
     }
 }

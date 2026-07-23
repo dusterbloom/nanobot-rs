@@ -22,7 +22,7 @@ static RE_QUOTED_OUTPUT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(output|result|returns?|shows?|returned|produced)\b[:\s]*\n?```[^\n]*\n([\s\S]*?)```").unwrap()
 });
 static RE_ACTION_PAST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|verified|built|compiled|installed|copied)\b").unwrap()
+    Regex::new(r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|listed|verified|built|compiled|installed|copied)\b").unwrap()
 });
 static RE_ACTION_PRESENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b[Ll]et me (check|run|verify|look|see|test|try|build|install|copy)\b")
@@ -34,6 +34,9 @@ static RE_ACTION_WHEN: LazyLock<Regex> = LazyLock::new(|| {
 static RE_NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(\d+)\s+(files?|lines?|errors?|tests?|warnings?|results?|matches?|items?)\b")
         .unwrap()
+});
+static RE_TOOL_RESULT_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(read_file|list_dir|find_files|search_files|exec|recall|remember|recall_tool_result|search_tool_result|slice_tool_result)\b[^.\n]{0,140}\b(succeeded|returned|showed|shows|listed|found|exists|contains|worked|completed|done|ready|updated|failed|error|not found|permission denied|timed? ?out)\b").unwrap()
 });
 static RE_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(build|compile|install|copy|cp|mv|mkdir|chmod|sudo|cargo|npm|pip|make|test|deploy|push|pull|merge)\b[^.\n]{0,30}\b(succeeded|failed|worked|completed|finished|passed|done|ready|updated|error|broke|broken|permission denied|not found|timed? ?out)\b").unwrap()
@@ -94,6 +97,9 @@ impl<'a> ClaimVerifier<'a> {
 
         // Extract action claims ("I read/wrote/created/...").
         claims.extend(self.extract_action_claims(text));
+
+        // Extract direct named-tool result claims ("list_dir showed ...").
+        claims.extend(self.extract_tool_result_claims(text));
 
         // Extract numeric assertions.
         claims.extend(self.extract_numeric_claims(text));
@@ -249,6 +255,7 @@ impl<'a> ClaimVerifier<'a> {
     fn action_to_tool_hint(action: &str) -> Option<&'static str> {
         match action {
             "read" => Some("read_file"),
+            "listed" => Some("list_dir"),
             "wrote" | "created" | "modified" | "updated" => Some("write_file"),
             "deleted" | "removed" => Some("exec"),
             "executed" | "ran" | "run" | "verified" | "verify" | "built" | "build" | "compiled"
@@ -260,6 +267,22 @@ impl<'a> ClaimVerifier<'a> {
             "edited" => Some("edit_file"),
             _ => None,
         }
+    }
+
+    fn extract_tool_result_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
+        let mut claims = Vec::new();
+        for cap in RE_TOOL_RESULT_CLAIM.captures_iter(text) {
+            if let (Some(full), Some(tool)) = (cap.get(0), cap.get(1)) {
+                let status = self.match_tool_result_claim(tool.as_str(), full.as_str());
+                claims.push(AnnotatedClaim {
+                    span: (full.start(), full.end()),
+                    claim_type: "tool_result".to_string(),
+                    status,
+                    text: full.as_str().to_string(),
+                });
+            }
+        }
+        claims
     }
 
     fn extract_numeric_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
@@ -423,7 +446,6 @@ impl<'a> ClaimVerifier<'a> {
             || lower.contains("timed out")
             || lower.contains("timeout");
 
-        // Look at exec tool results to verify outcome claims.
         let exec_entries: Vec<&AuditEntry> = self
             .entries
             .iter()
@@ -434,17 +456,51 @@ impl<'a> ClaimVerifier<'a> {
             return ClaimStatus::Claimed;
         }
 
-        // Check if the claimed outcome matches actual tool results.
-        let last_exec = exec_entries.last().unwrap();
-        if claims_success && last_exec.result_ok {
-            return ClaimStatus::Derived;
-        }
-        if claims_failure && !last_exec.result_ok {
+        if claims_failure && exec_entries.iter().any(|e| !e.result_ok) {
             return ClaimStatus::Derived;
         }
 
-        // Outcome contradicts actual result → fabrication.
+        if claims_success {
+            if let Some(latest) = exec_entries.iter().rev().next() {
+                if latest.result_ok {
+                    return ClaimStatus::Derived;
+                }
+            }
+        }
+
+        // A success claim contradicts the latest matching failed command result.
         ClaimStatus::Claimed
+    }
+
+    fn match_tool_result_claim(&self, tool: &str, claim_text: &str) -> ClaimStatus {
+        let matching_entries: Vec<&AuditEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.tool_name == tool)
+            .collect();
+        if matching_entries.is_empty() {
+            return ClaimStatus::Claimed;
+        }
+
+        let lower = claim_text.to_lowercase();
+        let claims_failure = lower.contains("failed")
+            || lower.contains("error")
+            || lower.contains("not found")
+            || lower.contains("permission denied")
+            || lower.contains("timed out")
+            || lower.contains("timeout");
+
+        if claims_failure {
+            if matching_entries.iter().any(|e| !e.result_ok) {
+                ClaimStatus::Derived
+            } else {
+                ClaimStatus::Claimed
+            }
+        } else if matching_entries.iter().any(|e| e.result_ok) {
+            ClaimStatus::Derived
+        } else {
+            ClaimStatus::Claimed
+        }
     }
 
     fn match_action_against_entries(&self, action: &str, tool_hint: Option<&str>) -> ClaimStatus {
@@ -456,7 +512,8 @@ impl<'a> ClaimVerifier<'a> {
 
         // Check if there's a matching tool call.
         if let Some(hint) = tool_hint {
-            if self.entries.iter().any(|e| e.tool_name.contains(hint)) {
+            let mut matched = self.entries.iter().filter(|e| e.tool_name.contains(hint));
+            if matched.next().is_some() {
                 return ClaimStatus::Observed;
             }
         }
@@ -468,9 +525,13 @@ impl<'a> ClaimVerifier<'a> {
                 vec!["write_file", "write", "edit_file"]
             }
             "deleted" | "removed" => vec!["exec"],
+            "listed" => vec!["list_dir"],
             "checked" | "check" | "look" | "see" => {
                 vec![
                     "exec",
+                    "list_dir",
+                    "find_files",
+                    "search_files",
                     "web_search",
                     "web_fetch",
                     "search",
@@ -900,6 +961,145 @@ mod tests {
         assert!(!action_claims.is_empty());
         // Tool WAS called → Observed, not Claimed.
         assert_eq!(action_claims[0].status, ClaimStatus::Observed);
+    }
+
+    #[test]
+    fn test_failed_matching_tool_observes_action_claim() {
+        let entries = vec![make_entry(
+            "list_dir",
+            "c1",
+            json!({"path": "/bad/path"}),
+            "Error: Directory not found: /bad/path",
+            false,
+        )];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("I listed the directory and saw the files.");
+        let action_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim")
+            .collect();
+
+        assert!(!action_claims.is_empty());
+        assert_eq!(action_claims[0].status, ClaimStatus::Observed);
+    }
+
+    #[test]
+    fn test_failed_matching_tool_observes_honest_failure_action_claim() {
+        let entries = vec![make_entry(
+            "exec",
+            "c1",
+            json!({"command": "cargo build"}),
+            "Error: build failed",
+            false,
+        )];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("I ran cargo build and it failed with Error: build failed.");
+        let action_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim")
+            .collect();
+
+        assert!(!action_claims.is_empty());
+        assert_eq!(action_claims[0].status, ClaimStatus::Observed);
+    }
+
+    #[test]
+    fn test_retry_success_claim_can_follow_failed_attempt() {
+        let entries = vec![
+            make_entry(
+                "exec",
+                "c1",
+                json!({"command": "cargo build"}),
+                "Error: stale lock",
+                false,
+            ),
+            make_entry(
+                "exec",
+                "c2",
+                json!({"command": "cargo build"}),
+                "Finished dev profile",
+                true,
+            ),
+        ];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("cargo build completed after retry.");
+        let outcome_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "outcome")
+            .collect();
+
+        assert!(!outcome_claims.is_empty());
+        assert_eq!(outcome_claims[0].status, ClaimStatus::Derived);
+    }
+
+    #[test]
+    fn test_unrelated_success_does_not_prove_failed_command_outcome() {
+        let entries = vec![
+            make_entry(
+                "exec",
+                "c1",
+                json!({"command": "cargo build"}),
+                "Error: stale lock",
+                false,
+            ),
+            make_entry(
+                "read_file",
+                "c2",
+                json!({"path": "Cargo.toml"}),
+                "[package]",
+                true,
+            ),
+        ];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("cargo build completed.");
+        let outcome_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "outcome")
+            .collect();
+
+        assert!(!outcome_claims.is_empty());
+        assert_eq!(outcome_claims[0].status, ClaimStatus::Claimed);
+    }
+
+    #[test]
+    fn test_failed_named_tool_contradicts_success_claim() {
+        let entries = vec![make_entry(
+            "list_dir",
+            "c1",
+            json!({"path": "/bad/path"}),
+            "Error: Directory not found: /bad/path",
+            false,
+        )];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier
+            .verify("list_dir - The /bad/path directory exists and contains project files.");
+        let tool_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "tool_result")
+            .collect();
+
+        assert!(!tool_claims.is_empty());
+        assert_eq!(tool_claims[0].status, ClaimStatus::Claimed);
+    }
+
+    #[test]
+    fn test_failed_named_tool_supports_failure_claim() {
+        let entries = vec![make_entry(
+            "list_dir",
+            "c1",
+            json!({"path": "/bad/path"}),
+            "Error: Directory not found: /bad/path",
+            false,
+        )];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("list_dir failed with Directory not found.");
+        let tool_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "tool_result")
+            .collect();
+
+        assert!(!tool_claims.is_empty());
+        assert_eq!(tool_claims[0].status, ClaimStatus::Derived);
     }
 
     #[test]

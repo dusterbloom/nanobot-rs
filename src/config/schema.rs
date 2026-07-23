@@ -349,19 +349,19 @@ pub struct AgentDefaults {
     /// Hard cap on thinking budget tokens for small local models (default: 256).
     #[serde(default = "default_local_thinking_small_model_cap")]
     pub local_thinking_small_model_cap: u32,
-    /// Minimum max_tokens when long-mode is active (default: 8192).
+    /// Minimum max_tokens when long-mode is active (default: 12288).
     #[serde(default = "default_adaptive_long_mode_min_tokens")]
     pub adaptive_long_mode_min_tokens: u32,
-    /// Minimum max_tokens for long-form prompts (default: 4096).
+    /// Minimum max_tokens for long-form prompts (default: 6144).
     #[serde(default = "default_adaptive_long_form_min_tokens")]
     pub adaptive_long_form_min_tokens: u32,
     /// Character length threshold above which a prompt is considered long-form (default: 500).
     #[serde(default = "default_adaptive_long_form_trigger_chars")]
     pub adaptive_long_form_trigger_chars: u32,
-    /// Maximum max_tokens cap when recent tool calls are heavy (default: 1024).
+    /// Maximum max_tokens cap when recent tool calls are heavy (default: 2048).
     #[serde(default = "default_adaptive_tool_heavy_max_tokens")]
     pub adaptive_tool_heavy_max_tokens: u32,
-    /// Minimum max_tokens floor when recent tool calls are heavy (default: 512).
+    /// Minimum max_tokens floor when recent tool calls are heavy (default: 1024).
     #[serde(default = "default_adaptive_tool_heavy_min_tokens")]
     pub adaptive_tool_heavy_min_tokens: u32,
 }
@@ -476,11 +476,11 @@ fn default_local_thinking_small_model_cap() -> u32 {
 }
 
 fn default_adaptive_long_mode_min_tokens() -> u32 {
-    8192
+    12288
 }
 
 fn default_adaptive_long_form_min_tokens() -> u32 {
-    4096
+    6144
 }
 
 fn default_adaptive_long_form_trigger_chars() -> u32 {
@@ -576,8 +576,8 @@ impl Default for AdaptiveTokenConfig {
             local_thinking_reserve_tokens: 512,
             local_thinking_min_completion_tokens: 256,
             local_thinking_small_model_cap: 256,
-            adaptive_long_mode_min_tokens: 8192,
-            adaptive_long_form_min_tokens: 4096,
+            adaptive_long_mode_min_tokens: 12288,
+            adaptive_long_form_min_tokens: 6144,
             adaptive_long_form_trigger_chars: 500,
             adaptive_tool_heavy_max_tokens: 2048,
             adaptive_tool_heavy_min_tokens: 1024,
@@ -2990,6 +2990,18 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.agents.defaults.adaptive_tool_heavy_max_tokens, 2048);
         assert_eq!(cfg.agents.defaults.adaptive_tool_heavy_min_tokens, 1024);
+    }
+
+    #[test]
+    fn test_adaptive_long_defaults_cover_rich_local_artifacts() {
+        // Qwen3.6 generated a polished single-file Tetris game at ~16.5KB,
+        // which required 6039 completion tokens for the write_file payload.
+        // Keep the rich-artifact/long-mode floor comfortably above that.
+        assert_eq!(default_adaptive_long_form_min_tokens(), 6144);
+        assert_eq!(default_adaptive_long_mode_min_tokens(), 12288);
+        let cfg = Config::default();
+        assert_eq!(cfg.agents.defaults.adaptive_long_form_min_tokens, 6144);
+        assert_eq!(cfg.agents.defaults.adaptive_long_mode_min_tokens, 12288);
     }
 
     #[test]

@@ -1002,7 +1002,10 @@ mod tests {
             "And then more and more words follow in the third fourth fifth sentences. ".repeat(40)
         );
         post_completion_pipeline(&mut padded, &[], &config);
-        assert!(padded.contains("[response condensed]"), "repetitive padding collapses");
+        assert!(
+            padded.contains("[response condensed]"),
+            "repetitive padding collapses"
+        );
 
         // Long code block is NOT babble (legitimate long content).
         let code = format!("```\n{}\n```", "fn main() {}\n".repeat(60));

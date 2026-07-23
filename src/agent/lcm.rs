@@ -375,6 +375,16 @@ impl LcmEngine {
         tool_def_tokens: usize,
     ) -> CompactionAction {
         let available = budget.available_budget(tool_def_tokens);
+        self.check_thresholds_with_available(available)
+    }
+
+    /// Check thresholds against an already-adjusted conversation budget.
+    ///
+    /// The normal path uses the model context window minus response/tool
+    /// reserves. Callers with a stricter backend admission cap can pass that
+    /// effective conversation budget here without rewriting the shared
+    /// `TokenBudget`.
+    pub fn check_thresholds_with_available(&self, available: usize) -> CompactionAction {
         // Use conversation tokens only — the system prompt is fixed overhead
         // that cannot be compacted and must not trigger the threshold.
         let current = self.conversation_tokens();
@@ -1122,7 +1132,10 @@ async fn escalated_summary(
     // recoverable — Level 2's more constrained prompt gets a chance before
     // giving up. A babble/degenerate result is NOT recoverable: reject
     // immediately, no retry ladder.
-    match compactor.summarize_for_lcm(messages, "preserve_details").await {
+    match compactor
+        .summarize_for_lcm(messages, "preserve_details")
+        .await
+    {
         Ok(summary) => {
             if let Some(score) = anti_drift::score_summary_babble(&summary) {
                 warn!(
@@ -1156,7 +1169,9 @@ async fn escalated_summary(
     // Level 2: Bullet points, more aggressive compression. This is the last
     // level — an error here has nowhere left to escalate to, so it
     // propagates as the caller-visible failure for this compaction attempt.
-    let summary = compactor.summarize_for_lcm(messages, "bullet_points").await?;
+    let summary = compactor
+        .summarize_for_lcm(messages, "bullet_points")
+        .await?;
     if let Some(score) = anti_drift::score_summary_babble(&summary) {
         warn!(
             score,
@@ -1540,7 +1555,12 @@ mod tests {
             let heads: Vec<String> = source
                 .lines()
                 .filter(|line| !line.trim().is_empty())
-                .map(|line| line.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+                .map(|line| {
+                    line.split_whitespace()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
                 .collect();
             // The fidelity gate caps a handoff at 15 bullets; group source
             // lines into at most 15 buckets so every line still contributes
@@ -1799,6 +1819,36 @@ mod tests {
             engine.check_thresholds(&budget, 0),
             CompactionAction::Async,
             "Conversation tokens over soft threshold should trigger async compaction"
+        );
+    }
+
+    #[test]
+    fn test_thresholds_can_use_retained_session_available_budget() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.5,
+            tau_hard: 0.85,
+            deterministic_target: 512,
+        });
+        ingest(&mut engine, 1, "system", "You are helpful.");
+        ingest(
+            &mut engine,
+            2,
+            "user",
+            &"retained session pressure ".repeat(400),
+        );
+
+        let large_model_budget = TokenBudget::new(32_768, 2048);
+        assert_eq!(
+            engine.check_thresholds(&large_model_budget, 0),
+            CompactionAction::None,
+            "model context alone should not compact yet"
+        );
+
+        let retained_available = engine.conversation_tokens();
+        assert_eq!(
+            engine.check_thresholds_with_available(retained_available),
+            CompactionAction::Blocking,
+            "retained cap pressure should force blocking compaction first"
         );
     }
 

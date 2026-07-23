@@ -26,6 +26,20 @@ use crate::config::schema::{
 use crate::providers::base::LLMProvider;
 use crate::session::db::SessionDb;
 
+const LOCAL_ARTIFACT_INTENT_TTL_TURNS: u64 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalArtifactIntentState {
+    is_rich: bool,
+    expires_after_turn: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PromptCalibration {
+    pub(crate) estimated_prompt_tokens: u64,
+    pub(crate) actual_prompt_tokens: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Shared core (identical across all agents, swappable on /local toggle)
 // ---------------------------------------------------------------------------
@@ -171,6 +185,10 @@ pub struct RuntimeCounters {
     pub last_actual_completion_tokens: AtomicU64,
     /// Last estimated prompt tokens (our estimate, for comparison).
     pub last_estimated_prompt_tokens: AtomicU64,
+    /// Per-session prompt-token calibration used for retained Higgs admission.
+    /// The public atomics above remain coarse status telemetry; this map avoids
+    /// letting one chat's tokenizer ratio force another chat into cold prefill.
+    prompt_calibrations: parking_lot::Mutex<std::collections::HashMap<String, PromptCalibration>>,
     /// When true, ThinkingDelta tokens are not sent to delta_tx for visual
     /// rendering. Toggled by `/nothink` and config-level no-think mode.
     pub suppress_thinking_display: AtomicBool,
@@ -214,6 +232,20 @@ pub struct RuntimeCounters {
     /// resident local server cannot keep continuing from a stale KV cache when
     /// the next user prompt happens to be a prefix of the old conversation.
     pub prompt_session_epoch: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+    /// Higgs retained-session id currently associated with each channel
+    /// session. Keeping the concrete id here lets a reset queue it before the
+    /// durable SQLite session id rolls over.
+    active_higgs_session_ids: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+    /// One-shot concrete Higgs retained-session ids to drop after `/clear` or
+    /// model switches. These must not be re-derived from a later SQLite
+    /// session id because clears can roll that id over before the next request.
+    pub pending_higgs_session_drop_ids:
+        parking_lot::Mutex<std::collections::HashMap<String, Vec<u64>>>,
+    /// Per-session local artifact intent for short follow-up edit turns
+    /// ("make it red", "also add a score") after an explicit local artifact
+    /// request. Bounded by turn count, not persisted.
+    local_artifact_intent:
+        parking_lot::Mutex<std::collections::HashMap<String, LocalArtifactIntentState>>,
     /// Number of installed compactions this session (see `record_compaction`).
     pub lcm_compaction_count: AtomicU64,
     /// Cumulative estimated tokens of compacted prefixes before compaction.
@@ -240,6 +272,7 @@ impl RuntimeCounters {
             last_actual_prompt_tokens: AtomicU64::new(0),
             last_actual_completion_tokens: AtomicU64::new(0),
             last_estimated_prompt_tokens: AtomicU64::new(0),
+            prompt_calibrations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             suppress_thinking_display: AtomicBool::new(false),
             suppress_thinking_in_tts: AtomicBool::new(false),
             inference_active: Arc::new(AtomicBool::new(false)),
@@ -254,6 +287,11 @@ impl RuntimeCounters {
             prompt_tool_hashes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_cache_watermark: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_session_epoch: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            active_higgs_session_ids: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            pending_higgs_session_drop_ids: parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            ),
+            local_artifact_intent: parking_lot::Mutex::new(std::collections::HashMap::new()),
             lcm_compaction_count: AtomicU64::new(0),
             lcm_tokens_before: AtomicU64::new(0),
             lcm_tokens_after: AtomicU64::new(0),
@@ -270,8 +308,17 @@ impl RuntimeCounters {
         self.prompt_fingerprints.lock().remove(session_key);
         self.prompt_tool_hashes.lock().remove(session_key);
         self.prompt_cache_watermark.lock().remove(session_key);
+        self.prompt_calibrations.lock().remove(session_key);
+        self.clear_local_artifact_intent(session_key);
 
         let mut epochs = self.prompt_session_epoch.lock();
+        if let Some(drop_id) = self.active_higgs_session_ids.lock().remove(session_key) {
+            let mut pending_drops = self.pending_higgs_session_drop_ids.lock();
+            let drops = pending_drops.entry(session_key.to_string()).or_default();
+            if !drops.contains(&drop_id) {
+                drops.push(drop_id);
+            }
+        }
         let next = epochs
             .get(session_key)
             .copied()
@@ -288,6 +335,147 @@ impl RuntimeCounters {
             .copied()
             .unwrap_or(0)
     }
+
+    /// Clear only the local prompt-cache bookkeeping (fingerprint + watermark)
+    /// for a session, without touching the retained higgs session id or epoch.
+    /// Used when a rewrite happens on a backend that does not support retained
+    /// sessions, or as the local-clear half of [`invalidate_prompt_cache`].
+    pub fn clear_local_prompt_cache(&self, session_key: &str) -> bool {
+        let had_fingerprint = self
+            .prompt_fingerprints
+            .lock()
+            .remove(session_key)
+            .is_some();
+        let had_watermark = self
+            .prompt_cache_watermark
+            .lock()
+            .remove(session_key)
+            .is_some();
+        had_fingerprint || had_watermark
+    }
+
+    /// Consolidated cache invalidation for a sanctioned prompt rewrite (trim,
+    /// compaction). When `rotate` is set (the provider supports the higgs
+    /// retained-session protocol), rotates the retained session — epoch bump +
+    /// queued drop + full bookkeeping clear — so the server cold-starts the
+    /// rewritten prompt. Otherwise clears only the local fingerprint/watermark.
+    /// Returns `true` iff the session was rotated.
+    pub fn invalidate_prompt_cache(&self, session_key: &str, rotate: bool) -> bool {
+        if rotate {
+            self.reset_session_prompt_state(session_key);
+            true
+        } else {
+            self.clear_local_prompt_cache(session_key);
+            false
+        }
+    }
+
+    pub fn record_higgs_session_id(&self, session_key: &str, session_id: u64) {
+        self.active_higgs_session_ids
+            .lock()
+            .insert(session_key.to_string(), session_id);
+    }
+
+    pub fn pending_higgs_session_drop_ids(&self, session_key: &str) -> Vec<u64> {
+        self.pending_higgs_session_drop_ids
+            .lock()
+            .get(session_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn clear_pending_higgs_session_drop_id(&self, session_key: &str, drop_id: u64) -> bool {
+        let mut drops = self.pending_higgs_session_drop_ids.lock();
+        let Some(drop_ids) = drops.get_mut(session_key) else {
+            return false;
+        };
+        let Some(pos) = drop_ids.iter().position(|candidate| *candidate == drop_id) else {
+            return false;
+        };
+        drop_ids.remove(pos);
+        if drop_ids.is_empty() {
+            drops.remove(session_key);
+        }
+        true
+    }
+
+    pub fn clear_pending_higgs_session_drop_ids(
+        &self,
+        session_key: &str,
+        drop_ids_to_clear: &[u64],
+    ) -> usize {
+        drop_ids_to_clear
+            .iter()
+            .filter(|drop_id| self.clear_pending_higgs_session_drop_id(session_key, **drop_id))
+            .count()
+    }
+
+    pub(crate) fn record_prompt_calibration(
+        &self,
+        session_key: &str,
+        estimated_prompt_tokens: u64,
+        actual_prompt_tokens: u64,
+    ) {
+        if estimated_prompt_tokens == 0 || actual_prompt_tokens == 0 {
+            return;
+        }
+        self.prompt_calibrations.lock().insert(
+            session_key.to_string(),
+            PromptCalibration {
+                estimated_prompt_tokens,
+                actual_prompt_tokens,
+            },
+        );
+    }
+
+    pub(crate) fn prompt_calibration(&self, session_key: &str) -> Option<PromptCalibration> {
+        self.prompt_calibrations.lock().get(session_key).copied()
+    }
+
+    pub(crate) fn record_local_artifact_intent(
+        &self,
+        session_key: &str,
+        turn_count: u64,
+        is_rich: bool,
+    ) {
+        self.local_artifact_intent.lock().insert(
+            session_key.to_string(),
+            LocalArtifactIntentState {
+                is_rich,
+                expires_after_turn: turn_count.saturating_add(LOCAL_ARTIFACT_INTENT_TTL_TURNS),
+            },
+        );
+    }
+
+    pub(crate) fn local_artifact_intent_is_rich(
+        &self,
+        session_key: &str,
+        turn_count: u64,
+    ) -> Option<bool> {
+        let mut intents = self.local_artifact_intent.lock();
+        let state = intents.get(session_key).copied()?;
+        if turn_count > state.expires_after_turn {
+            intents.remove(session_key);
+            return None;
+        }
+        Some(state.is_rich)
+    }
+
+    pub(crate) fn clear_local_artifact_intent(&self, session_key: &str) -> bool {
+        self.local_artifact_intent
+            .lock()
+            .remove(session_key)
+            .is_some()
+    }
+}
+
+pub(crate) fn stable_higgs_session_id(session_id: &str, epoch: u64) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in session_id.bytes().chain(epoch.to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 impl RuntimeCounters {
@@ -702,27 +890,26 @@ fn resolve_memory_provider(
             } else {
                 model.to_string()
             };
-            let mem_provider: Arc<dyn LLMProvider> =
-                if let Some(cp) = compaction_provider {
-                    // A managed compaction sidecar is the one endpoint source
-                    // for local memory ops — it wins over an explicit
-                    // `memory.provider`, which would otherwise silently point
-                    // compaction at a different server than the sidecar
-                    // startup/health-check machinery manages.
-                    cp
-                } else if let Some(ref mem_provider_cfg) = memory_config.provider {
-                    crate::providers::factory::from_provider_config_for_model_with_default_base(
-                        mem_provider_cfg,
-                        Some(&mem_model),
-                        provider.get_api_base(),
-                    )
-                } else if let Some(sp) = specialist_provider {
-                    // Reuse trio specialist provider when no managed compactor exists.
-                    sp.clone()
-                } else {
-                    // In local mode, provider is already the local server — use it directly.
-                    provider.clone()
-                };
+            let mem_provider: Arc<dyn LLMProvider> = if let Some(cp) = compaction_provider {
+                // A managed compaction sidecar is the one endpoint source
+                // for local memory ops — it wins over an explicit
+                // `memory.provider`, which would otherwise silently point
+                // compaction at a different server than the sidecar
+                // startup/health-check machinery manages.
+                cp
+            } else if let Some(ref mem_provider_cfg) = memory_config.provider {
+                crate::providers::factory::from_provider_config_for_model_with_default_base(
+                    mem_provider_cfg,
+                    Some(&mem_model),
+                    provider.get_api_base(),
+                )
+            } else if let Some(sp) = specialist_provider {
+                // Reuse trio specialist provider when no managed compactor exists.
+                sp.clone()
+            } else {
+                // In local mode, provider is already the local server — use it directly.
+                provider.clone()
+            };
             (mem_provider, mem_model)
         }
         RuntimeMode::Cloud => {
@@ -975,6 +1162,92 @@ mod tests {
         assert_eq!(counters.get_trio_state(), TrioState::Active);
     }
 
+    /// Epoch rotation is the SOLE cache-invalidation mechanism after a reset:
+    /// it folds into `stable_higgs_session_id`, giving the server a brand-new
+    /// session id (cold start). System-message content is no longer mutated,
+    /// so a compaction/trim no longer re-prefills message 0.
+    #[test]
+    fn test_reset_rotates_higgs_session_id_purely_via_epoch() {
+        let s = "cli:test";
+        assert_ne!(stable_higgs_session_id(s, 0), stable_higgs_session_id(s, 1));
+        assert_ne!(stable_higgs_session_id(s, 1), stable_higgs_session_id(s, 2));
+        // Session identity still dominates epoch: different sessions never
+        // collide even at the same epoch.
+        assert_ne!(
+            stable_higgs_session_id(s, 1),
+            stable_higgs_session_id("cli:other", 1)
+        );
+    }
+
+    /// Consolidated prompt-cache invalidation for a sanctioned rewrite (trim,
+    /// compaction). On a higgs-capable backend the rewrite must ROTATE the
+    /// retained session (epoch bump + queued drop + cleared fingerprint), so the
+    /// server cold-starts the shrunken prompt instead of rejecting it as
+    /// "not_growing" and re-prefilling under the stale session id. On a
+    /// non-higgs backend it clears only the local fingerprint/watermark.
+    /// Both branches are exercised here — this is the logic the trim and
+    /// compaction paths share via `invalidate_prompt_cache_for_rewrite`.
+    #[test]
+    fn test_invalidate_prompt_cache_rotates_when_higgs_capable_clears_otherwise() {
+        let counters =
+            RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let s = "cli:trim";
+
+        // Warm state: an active higgs session, a stored fingerprint, a watermark.
+        counters.record_higgs_session_id(s, 100);
+        let fp = crate::agent::prompt_fingerprint::fingerprint(&[serde_json::json!({
+            "role": "user",
+            "content": "hi",
+        })]);
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(s.to_string(), fp);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(s.to_string(), 7);
+
+        // Higgs-capable rewrite → rotate: epoch bumps, old id is queued for
+        // drop, and the warm fingerprint is cleared (forces a fresh prefix).
+        let rotated = counters.invalidate_prompt_cache(s, true);
+        assert!(rotated, "higgs-capable rewrite must rotate the session");
+        assert_eq!(counters.session_prompt_epoch(s), 1);
+        assert_eq!(counters.pending_higgs_session_drop_ids(s), vec![100]);
+        assert!(
+            !counters.prompt_fingerprints.lock().contains_key(s),
+            "rotation must clear the stale prefix fingerprint"
+        );
+        // Clear the queued drop so the non-rotating branch starts clean.
+        assert!(counters.clear_pending_higgs_session_drop_id(s, 100));
+
+        // Non-higgs rewrite → clear local bookkeeping only: NO epoch bump, NO
+        // drop, the active session id stays live.
+        counters.record_higgs_session_id(s, 200);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(s.to_string(), 9);
+        let rotated = counters.invalidate_prompt_cache(s, false);
+        assert!(!rotated, "non-higgs rewrite must not rotate");
+        assert_eq!(counters.session_prompt_epoch(s), 1, "epoch unchanged");
+        assert!(
+            counters.pending_higgs_session_drop_ids(s).is_empty(),
+            "no drop queued for a non-rotating clear"
+        );
+        assert!(
+            counters
+                .active_higgs_session_ids
+                .lock()
+                .contains_key(s),
+            "active session id must survive a non-rotating clear"
+        );
+        assert!(
+            !counters.prompt_cache_watermark.lock().contains_key(s),
+            "local watermark must be cleared"
+        );
+    }
+
     #[test]
     fn test_reset_session_prompt_state_clears_cache_and_bumps_epoch() {
         let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
@@ -992,13 +1265,127 @@ mod tests {
             .prompt_cache_watermark
             .lock()
             .insert(session.to_string(), 7);
+        counters.record_local_artifact_intent(session, 10, true);
 
+        counters.record_higgs_session_id(session, 10);
         assert_eq!(counters.reset_session_prompt_state(session), 1);
         assert!(!counters.prompt_fingerprints.lock().contains_key(session));
         assert!(!counters.prompt_cache_watermark.lock().contains_key(session));
+        assert_eq!(counters.local_artifact_intent_is_rich(session, 10), None);
         assert_eq!(counters.session_prompt_epoch(session), 1);
+        assert_eq!(counters.pending_higgs_session_drop_ids(session), vec![10]);
+        assert!(counters.clear_pending_higgs_session_drop_id(session, 10));
+        assert!(counters.pending_higgs_session_drop_ids(session).is_empty());
 
+        counters.record_higgs_session_id(session, 11);
         assert_eq!(counters.reset_session_prompt_state(session), 2);
         assert_eq!(counters.session_prompt_epoch(session), 2);
+        assert_eq!(counters.pending_higgs_session_drop_ids(session), vec![11]);
+    }
+
+    #[test]
+    fn test_reset_session_prompt_state_queues_multiple_higgs_drops() {
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let session = "cli:test";
+
+        for (epoch, drop_id) in [10, 11, 12].into_iter().enumerate() {
+            counters.record_higgs_session_id(session, drop_id);
+            assert_eq!(
+                counters.reset_session_prompt_state(session),
+                epoch as u64 + 1
+            );
+        }
+        assert_eq!(
+            counters.pending_higgs_session_drop_ids(session),
+            vec![10, 11, 12]
+        );
+
+        assert_eq!(
+            counters.clear_pending_higgs_session_drop_ids(session, &[10, 12]),
+            2
+        );
+        assert_eq!(counters.pending_higgs_session_drop_ids(session), vec![11]);
+        assert!(!counters.clear_pending_higgs_session_drop_id(session, 10));
+        assert!(counters.clear_pending_higgs_session_drop_id(session, 11));
+        assert!(counters.pending_higgs_session_drop_ids(session).is_empty());
+    }
+
+    #[test]
+    fn test_pending_higgs_drop_keeps_id_from_before_session_rollover() {
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let session_key = "cli:test";
+        let original_session_id = "sqlite-session-before-clear";
+        let rolled_over_session_id = "sqlite-session-after-clear";
+
+        let original_drop_id = stable_higgs_session_id(original_session_id, 0);
+        counters.record_higgs_session_id(session_key, original_drop_id);
+        counters.reset_session_prompt_state(session_key);
+        counters.record_higgs_session_id(
+            session_key,
+            stable_higgs_session_id(rolled_over_session_id, 1),
+        );
+
+        assert_eq!(
+            counters.pending_higgs_session_drop_ids(session_key),
+            vec![original_drop_id]
+        );
+    }
+
+    #[test]
+    fn test_prompt_calibration_is_per_session_and_reset_scoped() {
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+
+        counters.record_prompt_calibration("cli:a", 100, 250);
+        counters.record_prompt_calibration("cli:b", 100, 125);
+
+        assert_eq!(
+            counters.prompt_calibration("cli:a"),
+            Some(PromptCalibration {
+                estimated_prompt_tokens: 100,
+                actual_prompt_tokens: 250,
+            })
+        );
+        assert_eq!(
+            counters.prompt_calibration("cli:b"),
+            Some(PromptCalibration {
+                estimated_prompt_tokens: 100,
+                actual_prompt_tokens: 125,
+            })
+        );
+
+        counters.reset_session_prompt_state("cli:a");
+        assert_eq!(counters.prompt_calibration("cli:a"), None);
+        assert_eq!(
+            counters.prompt_calibration("cli:b"),
+            Some(PromptCalibration {
+                estimated_prompt_tokens: 100,
+                actual_prompt_tokens: 125,
+            })
+        );
+    }
+
+    #[test]
+    fn test_local_artifact_intent_is_bounded_by_turn_count() {
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let session = "cli:test";
+
+        counters.record_local_artifact_intent(session, 10, true);
+        assert_eq!(
+            counters.local_artifact_intent_is_rich(session, 10),
+            Some(true)
+        );
+        assert_eq!(
+            counters.local_artifact_intent_is_rich(session, 14),
+            Some(true)
+        );
+        assert_eq!(counters.local_artifact_intent_is_rich(session, 15), None);
+
+        counters.record_local_artifact_intent(session, 20, false);
+        assert_eq!(
+            counters.local_artifact_intent_is_rich(session, 21),
+            Some(false)
+        );
+        assert!(counters.clear_local_artifact_intent(session));
+        assert_eq!(counters.local_artifact_intent_is_rich(session, 21), None);
     }
 }

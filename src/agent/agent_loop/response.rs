@@ -455,6 +455,7 @@ impl AgentLoopShared {
                 warn!(
                     model = %ctx.core.model,
                     reason,
+                    raw_response = ?response.content.as_deref(),
                     "pathological_local_output_discarded"
                 );
                 if ctx.flow.content_was_streamed {
@@ -835,24 +836,31 @@ impl AgentLoopShared {
     /// content AND no tool calls is not "ok" — it is the signature of a dead
     /// stream (observed: 600s zero-token Higgs stall recorded as ok), and
     /// hiding it makes provider health invisible in metrics.jsonl.
-    fn response_status(response: &LLMResponse) -> &'static str {
+    pub(super) fn response_status(response: &LLMResponse) -> &'static str {
         let no_content = response
             .content
             .as_deref()
             .map_or(true, |c| c.trim().is_empty());
-        if no_content && response.tool_calls.is_empty() {
-            "empty_response"
-        } else if response.tool_calls.is_empty()
-            && response
-                .content
-                .as_deref()
-                .and_then(pathological_local_output_reason)
-                .is_some()
+        if response.is_error() || matches!(response.finish_reason.as_str(), "aborted" | "cancelled")
         {
+            "error"
+        } else if no_content && response.tool_calls.is_empty() {
+            "empty_response"
+        } else if Self::raw_pathological_response(response).is_some() {
             "pathological_response"
         } else {
             "ok"
         }
+    }
+
+    fn raw_pathological_response(response: &LLMResponse) -> Option<&str> {
+        if !response.tool_calls.is_empty() {
+            return None;
+        }
+        response
+            .content
+            .as_deref()
+            .filter(|content| pathological_local_output_reason(content).is_some())
     }
 
     fn emit_token_telemetry(
@@ -862,7 +870,10 @@ impl AgentLoopShared {
         defer_until_tool_execution: bool,
     ) {
         let counters = &self.core_handle.counters;
-        let estimated_prompt = TokenBudget::estimate_tokens(&ctx.messages);
+        let estimated_prompt = ctx
+            .flow
+            .provider_prompt_estimate
+            .unwrap_or_else(|| TokenBudget::estimate_tokens(&ctx.messages));
         let actual_prompt = response.usage.get("prompt_tokens").copied().unwrap_or(-1);
         let actual_completion = response
             .usage
@@ -910,6 +921,11 @@ impl AgentLoopShared {
             counters
                 .last_actual_prompt_tokens
                 .store(actual_prompt as u64, Ordering::Relaxed);
+            counters.record_prompt_calibration(
+                &ctx.session_key,
+                estimated_prompt as u64,
+                actual_prompt as u64,
+            );
             send_prompt_token_count(&ctx.text_delta_tx, actual_prompt as u64);
         }
         if actual_completion > 0 {
@@ -937,7 +953,8 @@ impl AgentLoopShared {
             cache_read_tokens,
             cache_creation_tokens,
             status: Self::response_status(response).into(),
-            error_detail: None,
+            error_detail: response.error_detail().map(str::to_owned),
+            raw_response: Self::raw_pathological_response(response).map(str::to_owned),
             anti_drift_score: None,
             anti_drift_signals: None,
             tool_calls_requested: response.tool_calls.len() as u32,
@@ -983,11 +1000,12 @@ mod tests {
     #[test]
     fn test_response_status_flags_dead_streams() {
         let resp = |content: Option<&str>,
-                    tool_calls: Vec<crate::providers::base::ToolCallRequest>| {
+                    tool_calls: Vec<crate::providers::base::ToolCallRequest>,
+                    finish_reason: &str| {
             LLMResponse {
                 content: content.map(str::to_string),
                 tool_calls,
-                finish_reason: "stop".to_string(),
+                finish_reason: finish_reason.to_string(),
                 usage: std::collections::HashMap::new(),
             }
         };
@@ -999,28 +1017,52 @@ mod tests {
 
         // The 600s zero-token stall signature: nothing at all.
         assert_eq!(
-            AgentLoopShared::response_status(&resp(None, vec![])),
+            AgentLoopShared::response_status(&resp(None, vec![], "stop")),
             "empty_response"
         );
         assert_eq!(
-            AgentLoopShared::response_status(&resp(Some("  \n"), vec![])),
+            AgentLoopShared::response_status(&resp(Some("  \n"), vec![], "stop")),
             "empty_response"
+        );
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(
+                Some("provider stream ended without content"),
+                vec![],
+                "error"
+            )),
+            "error"
+        );
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(None, vec![], "error")),
+            "error"
+        );
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(Some("cancelled"), vec![], "cancelled")),
+            "error"
+        );
+        assert_eq!(
+            AgentLoopShared::response_status(&resp(Some("aborted"), vec![], "aborted")),
+            "error"
         );
         // Legitimate outcomes stay ok.
         assert_eq!(
-            AgentLoopShared::response_status(&resp(Some("hi"), vec![])),
+            AgentLoopShared::response_status(&resp(Some("hi"), vec![], "stop")),
             "ok"
         );
         assert_eq!(
-            AgentLoopShared::response_status(&resp(None, vec![tc])),
+            AgentLoopShared::response_status(&resp(None, vec![tc], "stop")),
             "ok"
         );
         assert_eq!(
-            AgentLoopShared::response_status(&resp(Some("<tool_call>\n<tool_code>"), vec![])),
+            AgentLoopShared::response_status(&resp(
+                Some("<tool_call>\n<tool_code>"),
+                vec![],
+                "stop"
+            )),
             "pathological_response"
         );
         assert_eq!(
-            AgentLoopShared::response_status(&resp(Some(&"!".repeat(180)), vec![])),
+            AgentLoopShared::response_status(&resp(Some(&"!".repeat(180)), vec![], "stop")),
             "pathological_response"
         );
     }
@@ -1041,6 +1083,18 @@ mod tests {
             cloud_kind,
             ResponseKind::PathologicalLocalOutput { .. }
         ));
+    }
+
+    #[test]
+    fn test_raw_pathological_response_capture_preserves_provider_payload() {
+        let raw = "<tool_call>\n<tool_code>\n!!!!!!!!";
+        let resp = make_response(Some(raw), "stop");
+
+        assert_eq!(AgentLoopShared::raw_pathological_response(&resp), Some(raw));
+        assert_eq!(
+            AgentLoopShared::raw_pathological_response(&make_response(Some("healthy"), "stop")),
+            None
+        );
     }
 
     #[test]

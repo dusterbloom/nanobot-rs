@@ -148,6 +148,8 @@ pub struct RecallTool {
     workspace: PathBuf,
     /// Path to sessions.db — enables the deterministic `mode="latest"` route.
     db_path: Option<PathBuf>,
+    /// Concrete session id to exclude from `mode="latest"` results.
+    current_session_id: Option<String>,
 }
 
 impl RecallTool {
@@ -155,12 +157,20 @@ impl RecallTool {
         Self {
             workspace: workspace.to_path_buf(),
             db_path: None,
+            current_session_id: None,
         }
     }
 
     /// Attach the session database used by `mode="latest"`.
     pub fn with_db(mut self, db_path: Option<PathBuf>) -> Self {
         self.db_path = db_path;
+        self
+    }
+
+    /// Bind the current concrete SQLite session so latest recall returns
+    /// previous sessions instead of echoing the active turn as "previous".
+    pub fn with_current_session_id(mut self, session_id: Option<String>) -> Self {
+        self.current_session_id = session_id;
         self
     }
 
@@ -171,7 +181,8 @@ impl RecallTool {
                 .to_string();
         };
         let db = crate::session::db::SessionDb::new(db_path);
-        let tails = db.latest_session_tails("", count).await;
+        let exclude_session_id = self.current_session_id.as_deref().unwrap_or("");
+        let tails = db.latest_session_tails(exclude_session_id, count).await;
         format_latest_sessions(&tails, chrono::Utc::now())
     }
 
@@ -535,6 +546,46 @@ mod tests {
         let result = tool.execute(params).await;
         assert!(result.contains("cli:oneshot-77"), "got: {result}");
         assert!(result.contains("unique latest question"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_recall_latest_excludes_current_session() {
+        use crate::session::db::SessionDb;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let db_path = tmp.path().join("sessions.db");
+        let db = SessionDb::new(&db_path);
+        let previous = db.create_session("cli:previous").await;
+        db.add_messages(
+            &previous.id,
+            &[
+                json!({"role": "user", "content": "real previous question"}),
+                json!({"role": "assistant", "content": "real previous answer"}),
+            ],
+        )
+        .await;
+        let current = db.create_session("cli:current").await;
+        db.add_messages(
+            &current.id,
+            &[
+                json!({"role": "user", "content": "current question should be excluded"}),
+                json!({"role": "assistant", "content": "current answer should be excluded"}),
+            ],
+        )
+        .await;
+
+        let tool = RecallTool::new(tmp.path())
+            .with_db(Some(db_path))
+            .with_current_session_id(Some(current.id));
+        let result = tool
+            .execute(HashMap::from([("mode".to_string(), json!("latest"))]))
+            .await;
+
+        assert!(result.contains("cli:previous"), "got: {result}");
+        assert!(result.contains("real previous question"), "got: {result}");
+        assert!(!result.contains("cli:current"), "got: {result}");
+        assert!(!result.contains("current question"), "got: {result}");
     }
 
     #[test]

@@ -36,6 +36,10 @@ pub struct RequestMetrics {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
+    /// Exact provider content for pathological responses. Healthy payloads are
+    /// omitted to keep the append-only metrics stream compact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_response: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anti_drift_score: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +123,7 @@ mod tests {
             cache_creation_tokens: Some(400),
             status: "ok".into(),
             error_detail: None,
+            raw_response: None,
             anti_drift_score: Some(0.3),
             anti_drift_signals: Some(vec!["filler_heavy".into()]),
             tool_calls_requested: 2,
@@ -133,6 +138,7 @@ mod tests {
         assert_eq!(parsed["elapsed_ms"], 1500);
         assert_eq!(parsed["status"], "ok");
         assert!(parsed.get("error_detail").is_none()); // skip_serializing_if
+        assert!(parsed.get("raw_response").is_none());
         assert!(parsed.get("validation_result").is_none());
         assert_eq!(parsed["anti_drift_score"], 0.3);
         assert_eq!(parsed["ttft_ms"], 420);
@@ -156,6 +162,7 @@ mod tests {
             cache_creation_tokens: None,
             status: "error:reasoning_config_rejected".into(),
             error_detail: Some("reasoning_budget not supported".into()),
+            raw_response: Some("<tool_call>\n<tool_code>".into()),
             anti_drift_score: None,
             anti_drift_signals: None,
             tool_calls_requested: 0,
@@ -168,6 +175,7 @@ mod tests {
 
         assert_eq!(parsed["status"], "error:reasoning_config_rejected");
         assert_eq!(parsed["error_detail"], "reasoning_budget not supported");
+        assert_eq!(parsed["raw_response"], "<tool_call>\n<tool_code>");
         assert_eq!(parsed["role"], "router");
         assert!(parsed.get("ttft_ms").is_none()); // skip_serializing_if None
     }
@@ -224,6 +232,7 @@ mod tests {
             cache_creation_tokens: None,
             status: "ok".into(),
             error_detail: None,
+            raw_response: None,
             anti_drift_score: None,
             anti_drift_signals: None,
             tool_calls_requested: 0,

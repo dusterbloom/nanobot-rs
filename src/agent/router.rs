@@ -1269,6 +1269,108 @@ pub(crate) fn subagent_route_result(subagent_result: &str) -> RouteResult {
     RouteResult::Break(subagent_result.to_string())
 }
 
+fn canonicalize_proxy_execution(mut tc: ToolCallRequest) -> ToolCallRequest {
+    if tc.name != "tool" {
+        return tc;
+    }
+
+    let Some(inner_name) = tc
+        .arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return tc;
+    };
+
+    let mut inner_args: HashMap<String, Value> = HashMap::new();
+    let had_args_object = match tc.arguments.get("args") {
+        Some(Value::Object(map)) => {
+            inner_args.extend(map.iter().map(|(k, v)| (k.clone(), v.clone())));
+            true
+        }
+        Some(Value::Null) | None => false,
+        Some(_) => return tc,
+    };
+
+    for (key, value) in &tc.arguments {
+        if key != "name" && key != "args" {
+            inner_args
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+
+    if !had_args_object && inner_args.is_empty() {
+        return tc;
+    }
+
+    tc.name = inner_name;
+    tc.arguments = inner_args;
+    tc
+}
+
+fn tool_call_key_from_wire(call: &Value) -> Option<(String, String)> {
+    let id = call.get("id")?.as_str()?.to_string();
+    let name = call.pointer("/function/name")?.as_str()?;
+    let raw_args = call.pointer("/function/arguments")?;
+    let args_value = match raw_args {
+        Value::String(s) => serde_json::from_str::<Value>(s).ok()?,
+        Value::Object(_) => raw_args.clone(),
+        _ => return None,
+    };
+    let args = args_value
+        .as_object()?
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<HashMap<String, Value>>();
+    Some((id, ToolGuard::key(name, &args)))
+}
+
+fn current_turn_prior_tool_result_chars(
+    messages: &[Value],
+    turn_start: usize,
+    name: &str,
+    args: &HashMap<String, Value>,
+) -> Option<usize> {
+    let target_key = ToolGuard::key(name, args);
+    let mut call_keys: HashMap<String, String> = HashMap::new();
+    for msg in messages.iter().skip(turn_start.min(messages.len())) {
+        match msg.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) else {
+                    continue;
+                };
+                for call in calls {
+                    if let Some((id, key)) = tool_call_key_from_wire(call) {
+                        call_keys.insert(id, key);
+                    }
+                }
+            }
+            Some("tool") => {
+                if msg.get("ok").and_then(Value::as_bool).is_some_and(|ok| !ok) {
+                    continue;
+                }
+                let Some(call_id) = msg.get("tool_call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if call_keys.get(call_id).map(String::as_str) != Some(target_key.as_str()) {
+                    continue;
+                }
+                let chars = msg
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::chars)
+                    .map(Iterator::count)
+                    .unwrap_or(0);
+                return Some(chars);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Route tool calls through the strict router / toolplan / fallback pipeline.
 ///
 /// Takes the raw tool calls from the LLM response, applies router filtering,
@@ -1535,6 +1637,28 @@ pub(crate) async fn route_tool_calls(
         }
     }
 
+    routed_tool_calls = routed_tool_calls
+        .into_iter()
+        .map(canonicalize_proxy_execution)
+        .collect();
+
+    // Deduplicate identical calls before they reach ToolGuard. A single model
+    // response can contain the same call multiple times; counting those as
+    // separate attempts wastes the duplicate allowance before any result exists.
+    let mut seen_in_batch = std::collections::HashSet::new();
+    let before_dedupe = routed_tool_calls.len();
+    routed_tool_calls.retain(|tc| {
+        let key = crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments);
+        seen_in_batch.insert(key)
+    });
+    if routed_tool_calls.len() < before_dedupe {
+        warn!(
+            before = before_dedupe,
+            after = routed_tool_calls.len(),
+            "deduplicated identical routed tool calls before guard"
+        );
+    }
+
     // Tool guard filtering: split calls into allowed, blocked-with-cache, blocked-without-cache.
     let original_count = routed_tool_calls.len();
     let mut allowed_calls: Vec<ToolCallRequest> = Vec::new();
@@ -1542,6 +1666,21 @@ pub(crate) async fn route_tool_calls(
     let mut blocked_no_result = 0usize;
 
     for tc in routed_tool_calls {
+        if let Some(cached_chars) = current_turn_prior_tool_result_chars(
+            &ctx.messages,
+            ctx.new_start,
+            &tc.name,
+            &tc.arguments,
+        ) {
+            ctx.flow.tool_guard.had_blocked_calls = true;
+            warn!(
+                tool = %tc.name,
+                cached_chars,
+                "duplicate tool call blocked for prior successful result in current turn"
+            );
+            blocked_with_result.push((tc, cached_chars));
+            continue;
+        }
         match ctx.flow.tool_guard.allow(&tc.name, &tc.arguments) {
             Ok(()) => allowed_calls.push(tc),
             Err(e) => {
@@ -1561,7 +1700,7 @@ pub(crate) async fn route_tool_calls(
     // A blocked duplicate still needs a protocol-valid tool result for the
     // assistant call, but replaying the cached bytes grows the hot prompt for
     // no new evidence. Keep the result as a fixed-size receipt.
-    if !blocked_with_result.is_empty() {
+    if !blocked_with_result.is_empty() && allowed_calls.is_empty() {
         let tc_json: Vec<Value> = blocked_with_result
             .iter()
             .map(|(tc, _)| tc.to_openai_json())
@@ -1571,7 +1710,8 @@ pub(crate) async fn route_tool_calls(
             let receipt = format!(
                 "duplicate {} call blocked; cached result from the earlier identical call \
                  was {} chars and is already represented in the conversation. Do not replay \
-                 this broad call; answer from the prior result or request a narrower range/check.",
+                 this broad call; answer from the prior result, or use search_tool_result / \
+                 slice_tool_result when the previous output was stashed and needs filtering.",
                 tc.name, cached_chars
             );
             ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &receipt);
@@ -1588,9 +1728,10 @@ pub(crate) async fn route_tool_calls(
             // round as zero progress so cached receipts cannot livelock the
             // agent loop while also bypassing its iteration budget.
             ctx.flow.round_executed_no_tools = true;
-            // Circuit breaker: after 2 consecutive all-blocked rounds, force a
-            // text response. The LLM is stuck in a loop requesting the same tools.
-            if ctx.flow.consecutive_all_blocked >= 2 {
+            // Cached duplicate receipts already prove the requested result is
+            // present in context. Do not spend another local-model prefill just
+            // to ask the model to notice the receipt; force a final response.
+            if !blocked_with_result.is_empty() || ctx.flow.consecutive_all_blocked >= 2 {
                 warn!(
                     rounds = ctx.flow.consecutive_all_blocked,
                     "tool_loop_circuit_breaker: model stuck requesting blocked tools, forcing response"
@@ -1642,6 +1783,102 @@ mod tests {
         assert_eq!(normalized[0]["prompt"], "fetch weather");
         assert_eq!(normalized[0]["instruction"], "fetch weather");
         assert_eq!(normalized[0]["expected"], "brief forecast");
+    }
+
+    #[test]
+    fn test_canonicalize_proxy_execution_nested_args() {
+        let mut arguments = HashMap::new();
+        arguments.insert("name".to_string(), json!("edit_file"));
+        arguments.insert(
+            "args".to_string(),
+            json!({"path": "a.txt", "old_text": "old", "new_text": "new"}),
+        );
+
+        let tc = canonicalize_proxy_execution(ToolCallRequest {
+            id: "tc_proxy_edit".to_string(),
+            name: "tool".to_string(),
+            arguments,
+        });
+
+        assert_eq!(tc.name, "edit_file");
+        assert_eq!(tc.arguments.get("path"), Some(&json!("a.txt")));
+        assert_eq!(tc.arguments.get("old_text"), Some(&json!("old")));
+    }
+
+    #[test]
+    fn test_canonicalize_proxy_execution_flattened_args() {
+        let mut arguments = HashMap::new();
+        arguments.insert("name".to_string(), json!("recall"));
+        arguments.insert("mode".to_string(), json!("latest"));
+
+        let tc = canonicalize_proxy_execution(ToolCallRequest {
+            id: "tc_proxy_recall".to_string(),
+            name: "tool".to_string(),
+            arguments,
+        });
+
+        assert_eq!(tc.name, "recall");
+        assert_eq!(tc.arguments.get("mode"), Some(&json!("latest")));
+    }
+
+    #[test]
+    fn test_canonicalize_proxy_execution_preserves_inspect() {
+        let mut arguments = HashMap::new();
+        arguments.insert("name".to_string(), json!("session_search"));
+
+        let tc = canonicalize_proxy_execution(ToolCallRequest {
+            id: "tc_proxy_inspect".to_string(),
+            name: "tool".to_string(),
+            arguments,
+        });
+
+        assert_eq!(tc.name, "tool");
+        assert_eq!(tc.arguments.get("name"), Some(&json!("session_search")));
+    }
+
+    #[test]
+    fn current_turn_prior_tool_result_matches_reordered_args() {
+        let messages = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "find compaction"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"limit\":50,\"query\":\"compaction\",\"path\":\"~/Dev/nanobot-rs/src\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_a",
+                "name": "search_files",
+                "ok": true,
+                "content": "Searched 4 file(s) under ~/Dev/nanobot-rs/src"
+            }),
+        ];
+        let mut duplicate_args = HashMap::new();
+        duplicate_args.insert("query".to_string(), json!("compaction"));
+        duplicate_args.insert("path".to_string(), json!("~/Dev/nanobot-rs/src"));
+        duplicate_args.insert("limit".to_string(), json!(50));
+
+        assert_eq!(
+            current_turn_prior_tool_result_chars(&messages, 1, "search_files", &duplicate_args),
+            Some(
+                "Searched 4 file(s) under ~/Dev/nanobot-rs/src"
+                    .chars()
+                    .count()
+            )
+        );
+        assert_eq!(
+            current_turn_prior_tool_result_chars(&messages, 3, "search_files", &duplicate_args),
+            None,
+            "matches are scoped to the current user turn"
+        );
     }
 
     // T10 — SpecialistResponse success field defaults to true

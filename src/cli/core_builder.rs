@@ -281,15 +281,11 @@ pub(super) fn make_local_providers(
             .with_timeout_config(&config.timeouts)
             .with_retry(config.retry.clone())
             .with_sampling_penalties(repetition_penalty, frequency_penalty, presence_penalty)
-            // Disable higgs session_id (cache-resident KV) so every request routes
-            // through higgs's generate_inner path, which consults the radix prefix
-            // cache. The system+tools prefix is byte-identical across requests and
-            // sessions, so radix hits it on every turn after the first-ever cold
-            // prefill — dropping TTFT from ~26s to ~1-2s. The session path
-            // (generate_continued_impl) bypasses radix (store_prefix_cache=false)
-            // and crashes on the hybrid model if enabled, so radix-via-generate_inner
-            // is both faster AND safer.
-            .with_higgs_session_cache(false),
+            // Higgs owns cache-resident continuation. Enable its top-level
+            // `session_id`/`drop_session_id(s)` extensions only for the managed
+            // Higgs backend; LM Studio and cloud-compatible endpoints keep the
+            // OpenAI-compatible request body.
+            .with_higgs_session_cache(is_higgs_backend(&config.agents.defaults.local_backend)),
     );
 
     // Auto-detect context size from the active server; fall back to config default.

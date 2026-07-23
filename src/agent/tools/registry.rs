@@ -2663,13 +2663,18 @@ mod tests {
         registry.register(Box::new(WriteFileTool));
         registry.register(Box::new(WriteFileChunkTool));
 
+        // One byte over the proxy threshold. Reference the constant directly so the
+        // test tracks the real boundary if the threshold is retuned (it was raised to
+        // 256 KiB after repeated failures creating single rich HTML artifacts).
+        let oversized = "x".repeat(ToolRegistry::MAX_PROXIED_WRITE_FILE_BYTES + 1);
+
         let mut params = HashMap::new();
         params.insert("name".to_string(), serde_json::json!("write_file"));
         params.insert(
             "args".to_string(),
             serde_json::json!({
                 "path": file_path,
-                "content": "x".repeat(4097),
+                "content": oversized,
             }),
         );
 

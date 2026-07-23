@@ -6,7 +6,22 @@ use serde_json::Value;
 
 /// Read-only tools that benefit from higher repeat limits.
 const READ_TOOL_LIMIT: u32 = 2;
-const READ_TOOLS: &[&str] = &["read_file", "list_dir", "recall", "read_skill"];
+const READ_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "find_files",
+    "search_files",
+    "recall",
+    "read_skill",
+];
+const READ_CACHE_INVALIDATORS: &[&str] = &[
+    "exec",
+    "write_file",
+    "write_file_chunk",
+    "edit_file",
+    "apply_patch",
+    "remember",
+];
 
 /// Web tools need even higher limits — agents frequently search/fetch many
 /// different URLs or refine queries within one turn.
@@ -43,9 +58,43 @@ impl ToolGuard {
     }
 
     /// Store a tool result keyed by (name, args) so it can be replayed on duplicates.
+    #[cfg(test)]
     pub fn record_result(&mut self, name: &str, args: &HashMap<String, Value>, result: String) {
+        self.record_result_with_status(name, args, result, true);
+    }
+
+    /// Store only successful results while still letting writes invalidate stale reads.
+    pub fn record_result_with_status(
+        &mut self,
+        name: &str,
+        args: &HashMap<String, Value>,
+        result: String,
+        ok: bool,
+    ) {
+        if READ_CACHE_INVALIDATORS.contains(&name) {
+            self.invalidate_read_cache();
+        }
+        if !ok {
+            return;
+        }
         let key = Self::key(name, args);
         self.results.insert(key, result);
+    }
+
+    fn invalidate_read_cache(&mut self) {
+        self.results.retain(|key, _| !Self::is_read_tool_key(key));
+        self.seen.retain(|key, _| !Self::is_read_tool_key(key));
+    }
+
+    fn is_read_tool_key(key: &str) -> bool {
+        let Some((tool, _)) = key.split_once('|') else {
+            return false;
+        };
+        READ_TOOLS.contains(&tool)
+    }
+
+    fn uses_cached_result(name: &str) -> bool {
+        READ_TOOLS.contains(&name) || WEB_TOOLS.contains(&name)
     }
 
     /// Retrieve a previously cached result for the given call signature.
@@ -69,6 +118,13 @@ impl ToolGuard {
 
     pub fn allow(&mut self, name: &str, args: &HashMap<String, Value>) -> Result<(), String> {
         let key = Self::key(name, args);
+        if Self::uses_cached_result(name) && self.results.contains_key(&key) {
+            self.had_blocked_calls = true;
+            return Err(format!(
+                "duplicate tool call blocked for '{}': cached result already exists in this turn",
+                name
+            ));
+        }
         let count = self.seen.entry(key).or_insert(0);
         *count += 1;
         let limit = self
@@ -116,6 +172,10 @@ mod tests {
         let key = ToolGuard::key("read_file", &args);
         g.record_result("read_file", &args, "file contents here".to_string());
         assert_eq!(g.get_cached_result(&key), Some("file contents here"));
+        assert!(
+            g.allow("read_file", &args).is_err(),
+            "cached read-only results should be replayed, not executed again"
+        );
     }
 
     #[test]
@@ -125,6 +185,120 @@ mod tests {
         args.insert("path".to_string(), Value::String("/tmp/bar".to_string()));
         let key = ToolGuard::key("read_file", &args);
         assert_eq!(g.get_cached_result(&key), None);
+    }
+
+    #[test]
+    fn test_tool_guard_failed_result_does_not_cache_read() {
+        let mut g = ToolGuard::new(1);
+        let read_args = args(&[("path", "/tmp/missing.txt")]);
+        let key = ToolGuard::key("read_file", &read_args);
+
+        g.record_result_with_status(
+            "read_file",
+            &read_args,
+            "Error: missing file".to_string(),
+            false,
+        );
+
+        assert_eq!(g.get_cached_result(&key), None);
+        assert!(
+            g.allow("read_file", &read_args).is_ok(),
+            "failed read result must not block a retry"
+        );
+    }
+
+    #[test]
+    fn test_tool_guard_cache_hit_after_web_result() {
+        let mut g = ToolGuard::new(1);
+        let web_args = args(&[("query", "nanobot higgs retained kv")]);
+        let key = ToolGuard::key("web_search", &web_args);
+        g.record_result("web_search", &web_args, "web result".to_string());
+
+        assert_eq!(g.get_cached_result(&key), Some("web result"));
+        assert!(
+            g.allow("web_search", &web_args).is_err(),
+            "cached web results should be replayed, not executed again"
+        );
+    }
+
+    #[test]
+    fn test_tool_guard_write_invalidates_cached_reads() {
+        let mut g = ToolGuard::new(1);
+        let read_args = args(&[("path", "/tmp/a.txt")]);
+        g.record_result("read_file", &read_args, "old".to_string());
+
+        let write_args = args(&[("path", "/tmp/a.txt"), ("content", "new")]);
+        g.record_result("write_file", &write_args, "written".to_string());
+
+        let key = ToolGuard::key("read_file", &read_args);
+        assert_eq!(g.get_cached_result(&key), None);
+        assert!(
+            g.allow("read_file", &read_args).is_ok(),
+            "read after a write should execute again"
+        );
+    }
+
+    #[test]
+    fn test_tool_guard_write_invalidates_cached_file_searches() {
+        let mut g = ToolGuard::new(1);
+        let find_args = args(&[("path", "/tmp"), ("pattern", "*.rs")]);
+        let search_args = args(&[("path", "/tmp"), ("query", "needle")]);
+        g.record_result("find_files", &find_args, "old names".to_string());
+        g.record_result("search_files", &search_args, "old matches".to_string());
+
+        let write_args = args(&[("path", "/tmp/a.rs"), ("content", "needle")]);
+        g.record_result("write_file", &write_args, "written".to_string());
+
+        let find_key = ToolGuard::key("find_files", &find_args);
+        let search_key = ToolGuard::key("search_files", &search_args);
+        assert_eq!(g.get_cached_result(&find_key), None);
+        assert_eq!(g.get_cached_result(&search_key), None);
+        assert!(
+            g.allow("find_files", &find_args).is_ok(),
+            "find_files after a write should execute fresh"
+        );
+        assert!(
+            g.allow("search_files", &search_args).is_ok(),
+            "search_files after a write should execute fresh"
+        );
+    }
+
+    #[test]
+    fn test_tool_guard_memory_write_invalidates_cached_recall() {
+        let mut g = ToolGuard::new(1);
+        let recall_args = args(&[("query", "AGI bonsai")]);
+        assert!(g.allow("recall", &recall_args).is_ok());
+        g.record_result("recall", &recall_args, "old memory".to_string());
+
+        let remember_args = args(&[("fact", "AGI bonsai: updated")]);
+        g.record_result("remember", &remember_args, "Remembered".to_string());
+
+        let key = ToolGuard::key("recall", &recall_args);
+        assert_eq!(g.get_cached_result(&key), None);
+        assert!(
+            g.allow("recall", &recall_args).is_ok(),
+            "recall after a memory write should execute fresh"
+        );
+    }
+
+    #[test]
+    fn test_tool_guard_invalidating_write_resets_read_counter() {
+        let mut g = ToolGuard::new(1);
+        let read_args = args(&[("path", "/tmp/a.txt")]);
+        let edit_args = args(&[("path", "/tmp/a.txt"), ("old", "a"), ("new", "b")]);
+
+        assert!(g.allow("read_file", &read_args).is_ok());
+        g.record_result("read_file", &read_args, "one".to_string());
+        g.record_result("edit_file", &edit_args, "edited".to_string());
+
+        assert!(g.allow("read_file", &read_args).is_ok());
+        g.record_result("read_file", &read_args, "two".to_string());
+        g.record_result("edit_file", &edit_args, "edited again".to_string());
+
+        assert!(
+            g.allow("read_file", &read_args).is_ok(),
+            "read counter must reset each time writes invalidate cached reads"
+        );
     }
 
     #[test]

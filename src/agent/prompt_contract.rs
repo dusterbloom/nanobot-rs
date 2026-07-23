@@ -240,8 +240,7 @@ fn enforce_budget(sections: &mut [SectionEntry], cap: usize) {
                         sections[i].section,
                         old_tokens,
                     );
-                    sections[i].block =
-                        PromptBlock::new(sections[i].block.report_title(), "");
+                    sections[i].block = PromptBlock::new(sections[i].block.report_title(), "");
                     sections[i].actual_tokens = 0;
                     sections[i].included = false;
                     total -= old_tokens;

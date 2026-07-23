@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent::context_hygiene::tool_result_ok;
+
 // ─────────────────────────────────────────────────────────────
 // Core types
 // ─────────────────────────────────────────────────────────────
@@ -198,11 +200,15 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
+            let ok = v
+                .get("ok")
+                .and_then(|ok| ok.as_bool())
+                .unwrap_or_else(|| tool_result_ok(&result));
             Some(Turn::ToolResult {
                 call_id,
                 tool,
                 result,
-                ok: true,
+                ok,
             })
         }
         "system" => {
@@ -488,6 +494,31 @@ mod tests {
         } else {
             panic!("expected tool_result");
         }
+    }
+
+    #[test]
+    fn legacy_tool_result_preserves_explicit_failure_status() {
+        let v = json!({
+            "role": "tool",
+            "tool_call_id": "tc_abc",
+            "name": "list_dir",
+            "ok": false,
+            "content": "Error: Directory not found: /bad/path"
+        });
+        let t = turn_from_legacy(&v).unwrap();
+        assert!(matches!(t, Turn::ToolResult { ok: false, .. }));
+    }
+
+    #[test]
+    fn legacy_tool_result_infers_error_prefix_failure() {
+        let v = json!({
+            "role": "tool",
+            "tool_call_id": "tc_abc",
+            "name": "read_file",
+            "content": "[VERBATIM TOOL OUTPUT — do not paraphrase]\nError: File not found\n[END TOOL OUTPUT]"
+        });
+        let t = turn_from_legacy(&v).unwrap();
+        assert!(matches!(t, Turn::ToolResult { ok: false, .. }));
     }
 
     #[test]

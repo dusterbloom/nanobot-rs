@@ -228,7 +228,7 @@ mod tests {
     }
 
     fn policy() -> SessionPolicy {
-        SessionPolicy { local_only: false }
+        SessionPolicy::default()
     }
 
     // ---- Pattern 1: research + URL → researcher ----
@@ -277,7 +277,10 @@ mod tests {
 
     #[test]
     fn test_latest_news_local_routes_to_spawn() {
-        let local_policy = SessionPolicy { local_only: true };
+        let local_policy = SessionPolicy {
+            local_only: true,
+            ..SessionPolicy::default()
+        };
         let plan = route("get the latest news", &all_tools(), &local_policy);
         assert_eq!(plan.action, ToolPlanAction::Subagent);
         assert_eq!(plan.target, "researcher");

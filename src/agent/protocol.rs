@@ -283,12 +283,21 @@ impl ConversationProtocol for LocalProtocol {
                     tool,
                     call_id,
                     result,
-                    ..
+                    ok,
                 } => {
                     // Tool results become user messages for alternation compliance.
+                    let header = if *ok {
+                        format!("[System: tool succeeded - {}({}) returned]", tool, call_id)
+                    } else {
+                        format!(
+                            "[System: TOOL FAILED - {}({}) did not complete successfully. \
+                             Report this error exactly before trying another path]",
+                            tool, call_id
+                        )
+                    };
                     json!({
                         "role": "user",
-                        "content": format!("[System: tool execution complete — {}({}) returned]:\n{}", tool, call_id, result),
+                        "content": format!("{header}:\n{result}"),
                     })
                 }
                 Turn::Summary { text, .. } => {
@@ -496,10 +505,24 @@ pub fn parse_xml_tool_calls(text: &str) -> Vec<ParsedToolCall> {
 
 /// Strip XML tool call blocks from response content.
 pub fn strip_xml_tool_calls(content: &str) -> String {
-    XML_TOOL_CALL_BLOCK_RE
-        .replace_all(content, "")
-        .trim()
-        .to_string()
+    let mut stripped = String::with_capacity(content.len());
+    let mut last_end = 0usize;
+
+    for block_cap in XML_TOOL_CALL_BLOCK_RE.captures_iter(content) {
+        let Some(block) = block_cap.get(0) else {
+            continue;
+        };
+        let inner = block_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let should_strip = inner.trim().is_empty() || XML_FUNCTION_NAME_RE.is_match(inner);
+
+        if should_strip {
+            stripped.push_str(&content[last_end..block.start()]);
+            last_end = block.end();
+        }
+    }
+
+    stripped.push_str(&content[last_end..]);
+    stripped.trim().to_string()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -913,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn local_textual_replay_formats_tool_result_as_system_completion() {
+    fn local_textual_replay_formats_tool_result_as_success() {
         let wire = LocalProtocol::textual().render("sys", &tool_turns());
         let tool_result = wire
             .iter()
@@ -922,12 +945,33 @@ mod tests {
                     && m["content"]
                         .as_str()
                         .unwrap_or("")
-                        .contains("tool execution complete")
+                        .contains("tool succeeded")
             })
             .and_then(|m| m["content"].as_str())
             .unwrap_or("");
         assert!(tool_result.contains("read_file(tc_1)"));
         assert!(tool_result.contains("data"));
+    }
+
+    #[test]
+    fn local_textual_replay_formats_failed_tool_result_as_failure() {
+        let turns = vec![Turn::ToolResult {
+            call_id: "tc_1".into(),
+            tool: "list_dir".into(),
+            result: "Error: Directory not found: /bad/path".into(),
+            ok: false,
+        }];
+        let wire = LocalProtocol::textual().render("sys", &turns);
+        let tool_result = wire
+            .iter()
+            .find(|m| {
+                m["role"] == "user" && m["content"].as_str().unwrap_or("").contains("TOOL FAILED")
+            })
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or("");
+        assert!(tool_result.contains("list_dir(tc_1)"));
+        assert!(tool_result.contains("Error: Directory not found: /bad/path"));
+        assert!(tool_result.contains("Report this error exactly"));
     }
 
     // ---- is_textual_replay() ----
@@ -1158,7 +1202,10 @@ And also:
             "malformed function tags must not become executable tool names"
         );
         let stripped = strip_xml_tool_calls(text);
-        assert!(!stripped.contains("</function"));
+        assert!(
+            stripped.contains("<tool_call>") && stripped.contains("</function"),
+            "malformed XML must remain visible for pathological-output recovery"
+        );
     }
 
     #[test]
@@ -1174,7 +1221,10 @@ And also:
             "malformed function tags must not capture parameter markup"
         );
         let stripped = strip_xml_tool_calls(text);
-        assert!(!stripped.contains("<parameter=path"));
+        assert!(
+            stripped.contains("<tool_call>") && stripped.contains("<parameter=path"),
+            "malformed XML must remain visible for pathological-output recovery"
+        );
     }
 
     #[test]

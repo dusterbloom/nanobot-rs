@@ -2348,7 +2348,10 @@ impl LLMProvider for StreamingThinkingProvider {
                 usage: std::collections::HashMap::new(),
             },
         ));
-        Ok(crate::providers::base::StreamHandle { rx })
+        Ok(crate::providers::base::StreamHandle {
+            rx,
+            abort_on_drop: None,
+        })
     }
 
     fn get_default_model(&self) -> &str {
@@ -3171,6 +3174,44 @@ async fn test_local_wire_prompt_prefix_stable_across_turns() {
     assert_wire_prefix(&calls[0], &calls[calls.len() - 1]);
 }
 
+#[tokio::test]
+async fn test_local_wire_prompt_prefix_stable_when_second_turn_is_rich_artifact() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![
+            WireRecordingProvider::text_response("Hey! What can I help you with today?"),
+            WireRecordingProvider::text_response("I'll create it."),
+        ],
+    ));
+    let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("artifact-prefix-stability-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("hi", &session_key, "test", "offline")
+        .await;
+    agent_loop
+        .process_direct(
+            "I want you to create a single HTML file version of Pong at ~/Dev/pong . It must be fun, colorful and easy to play",
+            &session_key,
+            "test",
+            "offline",
+        )
+        .await;
+
+    let calls = provider.calls();
+    assert!(
+        calls.len() >= 2,
+        "expected two LLM calls, got {}",
+        calls.len()
+    );
+    assert_wire_prefix(&calls[0], &calls[calls.len() - 1]);
+    let system = calls[calls.len() - 1][0]["content"].as_str().unwrap_or("");
+    assert!(
+        !system.contains("Local Artifact Writer"),
+        "rich artifact turns must not mutate the stable system prompt"
+    );
+}
+
 /// Persisted sessions remain discoverable through recall/resume, but a fresh
 /// local turn must not carry an unrelated previous-session hint in its stable
 /// prompt prefix.
@@ -3374,8 +3415,8 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
     );
     assert_eq!(
         provider.call_count(),
-        4,
-        "two allowed reads followed by two blocked duplicate rounds must force finalization"
+        2,
+        "first read executes; the first cached duplicate must force finalization"
     );
 
     let _ = std::fs::remove_dir_all(&workspace);

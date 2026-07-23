@@ -3,17 +3,20 @@
 //!
 //! Extracted from `agent_loop.rs` as a `#[path]` submodule.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::agent::agent_loop::heuristics::{evaluate_repeated_tool_round, RepeatBreakerAction};
+use crate::agent::agent_loop::heuristics::{
+    adaptive_max_tokens_for_artifact_action, evaluate_repeated_tool_round,
+    local_artifact_action_with_sticky, LocalArtifactAction, RepeatBreakerAction,
+};
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::lcm::{
@@ -38,18 +41,296 @@ use crate::errors::is_retryable_provider_error;
 use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
 
 use crate::agent::agent_core::{
-    append_to_system_prompt, apply_compaction_result, PendingCompaction, RuntimeCounters,
-    SharedCoreHandle, SwappableCore,
+    append_to_system_prompt, apply_compaction_result, stable_higgs_session_id, PendingCompaction,
+    RuntimeCounters, SharedCoreHandle, SwappableCore,
 };
 
-use super::{
-    adaptive_max_tokens, last_user_message, render_via_protocol, should_strip_tools_for_trio,
-};
+use super::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
 
 // `response` is a sibling module declared in `mod.rs`. RetryState is re-exported
 // from there; we just need a local alias for the field type below.
 use super::response::RetryState;
-use crate::turn_stream::{CacheResetReason, CacheStatus, ControlMarker};
+use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, ControlMarker};
+
+const DEFAULT_HIGGS_RETAINED_SESSION_CAP_TOKENS: usize = 24_576;
+const HIGGS_RETAINED_CAP_ENV: &str = "NANOBOT_HIGGS_RETAINED_CAP_TOKENS";
+const DEFAULT_HIGGS_RETAINED_ADMISSION_RATIO: f64 = 0.80;
+const HIGGS_RETAINED_ADMISSION_RATIO_ENV: &str = "NANOBOT_HIGGS_RETAINED_ADMISSION_RATIO";
+const HIGGS_PROMPT_TOKEN_RATIO_CEILING: f64 = 2.50;
+const LOCAL_STREAM_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
+const LOCAL_ARTIFACT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(90);
+const BACKEND_ACTIVITY_HEARTBEAT: Duration = Duration::from_secs(5);
+fn backend_activity_code(phase: BackendActivity) -> u8 {
+    match phase {
+        BackendActivity::WaitingForHeaders => 0,
+        BackendActivity::Prefill => 1,
+        BackendActivity::AwaitingToolPayload => 2,
+        BackendActivity::ToolPayload => 3,
+        BackendActivity::Decoding => 4,
+    }
+}
+
+fn backend_activity_from_code(code: u8) -> BackendActivity {
+    match code {
+        1 => BackendActivity::Prefill,
+        2 => BackendActivity::AwaitingToolPayload,
+        3 => BackendActivity::ToolPayload,
+        4 => BackendActivity::Decoding,
+        _ => BackendActivity::WaitingForHeaders,
+    }
+}
+
+fn send_backend_activity_marker(
+    tx: &UnboundedSender<String>,
+    phase: BackendActivity,
+    idle_ms: u64,
+) {
+    let _ = tx.send(ControlMarker::BackendActivity { phase, idle_ms }.encode());
+}
+
+struct BackendActivityHeartbeat {
+    tx: UnboundedSender<String>,
+    stop: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
+    last_progress_ms: Arc<AtomicU64>,
+    started: Instant,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl BackendActivityHeartbeat {
+    fn start(tx: Option<UnboundedSender<String>>, enabled: bool) -> Option<Self> {
+        if !enabled {
+            return None;
+        }
+        let tx = tx?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let phase = Arc::new(AtomicU8::new(backend_activity_code(
+            BackendActivity::WaitingForHeaders,
+        )));
+        let last_progress_ms = Arc::new(AtomicU64::new(0));
+        let started = Instant::now();
+        send_backend_activity_marker(&tx, BackendActivity::WaitingForHeaders, 0);
+
+        let task_stop = stop.clone();
+        let task_phase = phase.clone();
+        let task_last_progress = last_progress_ms.clone();
+        let task_tx = tx.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(BACKEND_ACTIVITY_HEARTBEAT).await;
+                if task_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let last_ms = task_last_progress.load(Ordering::Relaxed);
+                let idle_ms = elapsed_ms.saturating_sub(last_ms);
+                send_backend_activity_marker(
+                    &task_tx,
+                    backend_activity_from_code(task_phase.load(Ordering::Relaxed)),
+                    idle_ms,
+                );
+            }
+        });
+
+        Some(Self {
+            tx,
+            stop,
+            phase,
+            last_progress_ms,
+            started,
+            task,
+        })
+    }
+
+    fn mark_progress(&self, phase: BackendActivity) {
+        let code = backend_activity_code(phase);
+        let old = self.phase.swap(code, Ordering::Relaxed);
+        self.last_progress_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if old != code {
+            send_backend_activity_marker(&self.tx, phase, 0);
+        }
+    }
+}
+
+impl Drop for BackendActivityHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.abort();
+    }
+}
+
+#[derive(Debug)]
+struct LocalStreamProgress {
+    artifact_tool_payload_timeout: Option<Duration>,
+    artifact_tool_payload_deadline: Option<tokio::time::Instant>,
+    saw_tool_payload: bool,
+}
+
+impl LocalStreamProgress {
+    fn new(artifact_tool_payload_timeout: Option<Duration>) -> Self {
+        Self {
+            artifact_tool_payload_timeout,
+            artifact_tool_payload_deadline: None,
+            saw_tool_payload: false,
+        }
+    }
+
+    fn pending_artifact_tool_payload_deadline(&self) -> Option<tokio::time::Instant> {
+        if self.saw_tool_payload {
+            None
+        } else {
+            self.artifact_tool_payload_deadline
+        }
+    }
+
+    fn on_prefill_progress(
+        &mut self,
+        processed: u64,
+        total: u64,
+        now: tokio::time::Instant,
+    ) -> BackendActivity {
+        if total > 0 && processed >= total {
+            self.on_decode_without_tool_payload(now)
+        } else {
+            BackendActivity::Prefill
+        }
+    }
+
+    fn on_text_or_thinking_delta(&mut self, now: tokio::time::Instant) -> BackendActivity {
+        self.on_decode_without_tool_payload(now)
+    }
+
+    fn on_tool_call_delta(&mut self) -> BackendActivity {
+        self.saw_tool_payload = true;
+        self.artifact_tool_payload_deadline = None;
+        BackendActivity::ToolPayload
+    }
+
+    fn on_decode_without_tool_payload(&mut self, now: tokio::time::Instant) -> BackendActivity {
+        if self.artifact_tool_payload_timeout.is_some() && !self.saw_tool_payload {
+            self.arm_artifact_deadline_once(now);
+            BackendActivity::AwaitingToolPayload
+        } else {
+            BackendActivity::Decoding
+        }
+    }
+
+    fn arm_artifact_deadline_once(&mut self, now: tokio::time::Instant) {
+        if self.artifact_tool_payload_deadline.is_none() {
+            if let Some(timeout) = self.artifact_tool_payload_timeout {
+                self.artifact_tool_payload_deadline = Some(now + timeout);
+            }
+        }
+    }
+}
+
+fn local_artifact_action_for_turn(ctx: &TurnContext) -> Option<LocalArtifactAction> {
+    if !ctx.core.mode().is_local() {
+        return None;
+    }
+    let sticky_action = ctx
+        .counters
+        .local_artifact_intent_is_rich(&ctx.session_key, ctx.turn_count)
+        .map(|is_rich| {
+            if is_rich {
+                LocalArtifactAction::Rich
+            } else {
+                LocalArtifactAction::Simple
+            }
+        });
+    let action = local_artifact_action_with_sticky(&ctx.user_content, sticky_action);
+    if let Some(action) = action {
+        ctx.counters.record_local_artifact_intent(
+            &ctx.session_key,
+            ctx.turn_count,
+            matches!(action, LocalArtifactAction::Rich),
+        );
+    }
+    action
+}
+
+fn local_stream_no_progress_timeout(ctx: &TurnContext) -> Option<Duration> {
+    if !ctx.core.mode().is_local() {
+        return None;
+    }
+    // Evaluate for the intent-recording side effect; the no-progress deadline is
+    // the same for Rich and Simple turns. Only the artifact payload deadline
+    // (local_artifact_tool_payload_timeout) branches on the action.
+    let _ = local_artifact_action_for_turn(ctx);
+    Some(LOCAL_STREAM_NO_PROGRESS_TIMEOUT)
+}
+
+fn local_artifact_tool_payload_timeout(
+    ctx: &TurnContext,
+    tool_defs: Option<&[Value]>,
+) -> Option<Duration> {
+    if !ctx.core.mode().is_local() || tool_defs.map_or(true, |defs| defs.is_empty()) {
+        return None;
+    }
+    matches!(
+        local_artifact_action_for_turn(ctx),
+        Some(LocalArtifactAction::Rich)
+    )
+    .then_some(LOCAL_ARTIFACT_NO_PROGRESS_TIMEOUT)
+}
+
+fn local_no_stream_headers_error(timeout: Duration) -> String {
+    format!(
+        "The local backend produced no stream headers for {}s, so I aborted the turn instead of waiting for the 600s transport timeout.",
+        timeout.as_secs()
+    )
+}
+
+fn local_no_stream_progress_error(timeout: Duration) -> String {
+    format!(
+        "The local backend produced no stream progress for {}s, so I aborted the turn instead of waiting for the 600s transport timeout.",
+        timeout.as_secs()
+    )
+}
+
+fn local_artifact_no_tool_payload_error(timeout: Duration) -> String {
+    format!(
+        "The local backend did not start a tool-call payload for this artifact request within {}s, so I aborted the turn instead of waiting for the 600s transport timeout.",
+        timeout.as_secs()
+    )
+}
+
+fn emit_stream_abort_metrics(ctx: &TurnContext, detail: &str) {
+    crate::agent::metrics::emit(&crate::agent::metrics::RequestMetrics {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        request_id: ctx.request_id.clone(),
+        role: "main".into(),
+        model: ctx.core.model.clone(),
+        provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),
+        elapsed_ms: ctx
+            .flow
+            .llm_call_start
+            .map_or(0, |t| t.elapsed().as_millis() as u64),
+        ttft_ms: ctx.flow.ttft_ms,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
+        status: "error".into(),
+        error_detail: Some(detail.to_string()),
+        raw_response: None,
+        anti_drift_score: None,
+        anti_drift_signals: None,
+        tool_calls_requested: 0,
+        tool_calls_executed: 0,
+        validation_result: None,
+    });
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HiggsRetainedAdmission {
+    estimated_prompt_tokens: usize,
+    calibrated_prompt_tokens: usize,
+    admission_limit_tokens: usize,
+    observed_token_ratio: f64,
+    force_blocking: bool,
+}
 
 fn send_cache_reset_marker(
     tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -61,19 +342,25 @@ fn send_cache_reset_marker(
 }
 
 fn clear_prompt_cache_state(ctx: &TurnContext) -> bool {
-    let had_fingerprint = ctx
-        .counters
-        .prompt_fingerprints
-        .lock()
-        .remove(&ctx.session_key)
-        .is_some();
-    let had_watermark = ctx
-        .counters
-        .prompt_cache_watermark
-        .lock()
-        .remove(&ctx.session_key)
-        .is_some();
-    had_fingerprint || had_watermark
+    ctx.counters.clear_local_prompt_cache(&ctx.session_key)
+}
+
+/// Invalidate prompt-cache state after a sanctioned prompt rewrite (budget
+/// trim, emergency trim, LCM compaction). When the provider supports the higgs
+/// retained-session protocol, the retained session is ROTATED (epoch bump +
+/// queued drop) so the server cold-starts the rewritten prompt instead of
+/// rejecting a shrunken prompt as "not_growing" and re-prefilling under the
+/// stale session id. Otherwise only local bookkeeping is cleared. The system
+/// message is never mutated — rotation alone invalidates the cache.
+fn invalidate_prompt_cache_for_rewrite(
+    ctx: &mut TurnContext,
+    reason: CacheResetReason,
+) -> bool {
+    let rotate = ctx.core.mode().is_local()
+        && ctx.core.provider.supports_higgs_session_cache();
+    ctx.counters.invalidate_prompt_cache(&ctx.session_key, rotate);
+    send_cache_reset_marker(&ctx.text_delta_tx, reason);
+    rotate
 }
 
 fn send_retract_reply_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>) {
@@ -82,21 +369,78 @@ fn send_retract_reply_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<Stri
     }
 }
 
-fn stable_higgs_session_id(session_id: &str, epoch: u64) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in session_id.bytes().chain(epoch.to_le_bytes()) {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// Classify a divergent message for the `prompt_prefix_diverged` WARN: role +
+/// structural kind tags + a truncated content snippet. Names the cache-busting
+/// class (synthetic / cache-replay / lcm-summary / tool-result / persisted) so
+/// the higgs `token_mismatch` cause is identifiable from the log line alone
+/// without a separate message dump.
+///
+/// After the trim/compaction fixes, every sanctioned rewrite clears the prompt
+/// fingerprint, so a `PromptDelta::Diverged` is by definition UNSANCTIONED — a
+/// message whose rendered bytes changed across turns under the same session id.
+/// This digest names which structural kind diverged so the root cause (e.g. a
+/// transient synthetic that was sent but not replayed, or a re-summarized LCM
+/// block) is obvious.
+fn divergent_message_digest(msg: &Value) -> String {
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let snippet: String = content.chars().take(70).collect();
+
+    let mut tags: Vec<&str> = Vec::new();
+    if msg.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false) {
+        tags.push("synthetic");
     }
-    hash
+    if msg
+        .get("_cache_replay")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        tags.push("cache-replay");
+    }
+    if msg
+        .get("_lcm_summary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        tags.push("lcm-summary");
+    }
+    if msg.get("tool_call_id").is_some() {
+        tags.push("tool-result");
+    }
+    if msg.get("_db_id").is_some() {
+        tags.push("persisted");
+    }
+
+    if tags.is_empty() {
+        format!("[{role}] {snippet}")
+    } else {
+        format!("[{role}] ({}) {snippet}", tags.join(","))
+    }
 }
 
-fn attach_higgs_session_marker(messages: &mut [Value], session_id: u64) {
+fn attach_higgs_session_marker(messages: &mut [Value], session_id: u64, drop_session_ids: &[u64]) {
     if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
         first.insert(
             crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD.to_string(),
             json!(session_id),
         );
+        match drop_session_ids {
+            [] => {}
+            [drop_session_id] => {
+                first.insert(
+                    crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD
+                        .to_string(),
+                    json!(drop_session_id),
+                );
+            }
+            drop_session_ids => {
+                first.insert(
+                    crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD
+                        .to_string(),
+                    json!(drop_session_ids),
+                );
+            }
+        }
     }
 }
 
@@ -129,6 +473,141 @@ fn conversation_token_count(messages: &[Value]) -> usize {
     TokenBudget::estimate_tokens(&conversation)
 }
 
+fn advertised_tool_names(tool_defs: &[Value]) -> HashSet<String> {
+    tool_defs
+        .iter()
+        .filter_map(|def| {
+            def.pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn system_token_count(messages: &[Value]) -> usize {
+    let system: Vec<Value> = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .cloned()
+        .collect();
+    TokenBudget::estimate_tokens(&system)
+}
+
+/// Retained-session token cap used for admission pressure. Engaged when the
+/// provider advertises the higgs retained-session protocol
+/// (`supports_higgs_session_cache`, set for any `localBackend=higgs` regardless
+/// of port), or overridden explicitly via `HIGGS_RETAINED_CAP_ENV`. The
+/// capability flag — not a hardcoded port — decides engagement, so a
+/// higgs-nightly server on port 8092 still participates.
+fn higgs_retained_session_cap_tokens(higgs_capable: bool) -> Option<usize> {
+    match std::env::var(HIGGS_RETAINED_CAP_ENV) {
+        Ok(raw) => return raw.trim().parse::<usize>().ok().filter(|cap| *cap > 0),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => return None,
+    }
+
+    higgs_capable.then_some(DEFAULT_HIGGS_RETAINED_SESSION_CAP_TOKENS)
+}
+
+fn higgs_retained_admission_ratio() -> f64 {
+    match std::env::var(HIGGS_RETAINED_ADMISSION_RATIO_ENV) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|ratio| ratio.is_finite() && (0.10..=0.98).contains(ratio))
+            .unwrap_or(DEFAULT_HIGGS_RETAINED_ADMISSION_RATIO),
+        Err(_) => DEFAULT_HIGGS_RETAINED_ADMISSION_RATIO,
+    }
+}
+
+fn calibrated_higgs_prompt_tokens(
+    estimated_prompt_tokens: usize,
+    last_estimated_prompt_tokens: u64,
+    last_actual_prompt_tokens: u64,
+) -> (usize, f64) {
+    if last_estimated_prompt_tokens == 0 || last_actual_prompt_tokens == 0 {
+        return (estimated_prompt_tokens, 1.0);
+    }
+
+    let observed_ratio = (last_actual_prompt_tokens as f64 / last_estimated_prompt_tokens as f64)
+        .clamp(1.0, HIGGS_PROMPT_TOKEN_RATIO_CEILING);
+    (
+        ((estimated_prompt_tokens as f64) * observed_ratio).ceil() as usize,
+        observed_ratio,
+    )
+}
+
+fn higgs_retained_admission(
+    retained_cap_tokens: Option<usize>,
+    messages: &[Value],
+    tool_def_tokens: usize,
+    last_estimated_prompt_tokens: u64,
+    last_actual_prompt_tokens: u64,
+) -> Option<HiggsRetainedAdmission> {
+    let cap = retained_cap_tokens?;
+    if cap == 0 {
+        return None;
+    }
+
+    let estimated_prompt_tokens =
+        TokenBudget::estimate_tokens(messages).saturating_add(tool_def_tokens);
+    let (calibrated_prompt_tokens, observed_token_ratio) = calibrated_higgs_prompt_tokens(
+        estimated_prompt_tokens,
+        last_estimated_prompt_tokens,
+        last_actual_prompt_tokens,
+    );
+    let admission_limit_tokens = ((cap as f64) * higgs_retained_admission_ratio()).floor() as usize;
+
+    Some(HiggsRetainedAdmission {
+        estimated_prompt_tokens,
+        calibrated_prompt_tokens,
+        admission_limit_tokens,
+        observed_token_ratio,
+        force_blocking: calibrated_prompt_tokens >= admission_limit_tokens,
+    })
+}
+
+fn retained_conversation_available(
+    retained_cap_tokens: usize,
+    messages: &[Value],
+    tool_def_tokens: usize,
+) -> usize {
+    retained_cap_tokens
+        .saturating_sub(system_token_count(messages))
+        .saturating_sub(tool_def_tokens)
+}
+
+fn effective_lcm_available_budget(
+    model_available: usize,
+    messages: &[Value],
+    tool_def_tokens: usize,
+    retained_cap_tokens: Option<usize>,
+) -> (usize, Option<usize>) {
+    let Some(retained_cap_tokens) = retained_cap_tokens else {
+        return (model_available, None);
+    };
+    let retained_available =
+        retained_conversation_available(retained_cap_tokens, messages, tool_def_tokens);
+    (
+        model_available.min(retained_available),
+        Some(retained_available),
+    )
+}
+
+fn retained_context_pressure(
+    retained_cap_tokens: Option<usize>,
+    messages: &[Value],
+    tool_def_tokens: usize,
+) -> Option<f32> {
+    let cap = retained_cap_tokens?;
+    if cap == 0 {
+        return None;
+    }
+    let used = TokenBudget::estimate_tokens(messages).saturating_add(tool_def_tokens);
+    Some((used as f32) / (cap as f32))
+}
+
 /// Decide whether to accept the prefix-cache re-prefill cost and install a
 /// pending compaction result rather than deferring it.
 ///
@@ -136,8 +615,9 @@ fn conversation_token_count(messages: &[Value]) -> usize {
 /// `tau_hard` compaction is forced through: the one-time re-prefill of a
 /// compacted context is strictly cheaper than the unbounded growth that
 /// starves compaction until the model hits max tokens and fails.
-fn should_allow_checkpoint(pressure: f32, tau_hard: f64) -> bool {
+fn should_allow_checkpoint(pressure: f32, tau_hard: f64, retained_pressure: Option<f32>) -> bool {
     (pressure as f64) >= tau_hard
+        || retained_pressure.is_some_and(|pressure| (pressure as f64) >= tau_hard)
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +700,13 @@ pub(crate) struct TurnContext {
     pub(crate) rendered_messages: Vec<Value>,
     /// Protocol selected for this turn based on `core.is_local`.
     pub(crate) protocol: Arc<dyn ConversationProtocol>,
+    /// Direct tool names advertised in the current provider request.
+    ///
+    /// The registry intentionally contains more tools than the model sees:
+    /// uncommon tools stay reachable through the `tool` proxy. This snapshot
+    /// lets execution reject stale direct calls without changing the prompt
+    /// head and invalidating local prefix caches.
+    pub(crate) advertised_tool_names: Option<HashSet<String>>,
 
     // --- Tracking ---
     pub(crate) used_tools: std::collections::HashSet<String>,
@@ -381,8 +868,8 @@ pub(crate) struct FlowControl {
     /// was boundary-rejected or duplicate-blocked. Such a round made no progress,
     /// so the main loop does not spend a real iteration on it. Reset at the start
     /// of each iteration. Bounded by construction: the response boundary is
-    /// one-shot (can't re-reject without an intervening successful round) and the
-    /// duplicate circuit breaker forces a text response after 2 all-blocked rounds.
+    /// one-shot (can't re-reject without an intervening successful round) and cached
+    /// duplicate receipts force a text response immediately.
     pub(crate) round_executed_no_tools: bool,
     /// When the LLM call started — set in step_call_llm, read in step_process_response.
     pub(crate) llm_call_start: Option<std::time::Instant>,
@@ -391,6 +878,10 @@ pub(crate) struct FlowControl {
     /// the metric that dominates TTFT. Reset per call; `None` until first token
     /// (or for non-streaming calls).
     pub(crate) ttft_ms: Option<u64>,
+    /// Prompt estimate for the exact provider request, including tool schemas.
+    /// Used to calibrate local retained-session admission against provider
+    /// `prompt_tokens`, which also include the rendered tool block.
+    pub(crate) provider_prompt_estimate: Option<usize>,
     /// Typed retry counters — each failure mode has a named field with its own cap.
     pub(crate) retries: RetryState,
     /// Saved thinking budget to restore after a thinking-off retry iteration.
@@ -1422,8 +1913,17 @@ impl AgentLoopShared {
         // this cache watermark is meant to prevent — UNLESS pressure has crossed
         // `tau_hard`, where deferring any longer guarantees hitting max tokens.
         let state = self.system_state.load_full();
-        let allow_checkpoint =
-            should_allow_checkpoint(state.context_pressure, self.lcm_config.tau_hard);
+        let retained_cap_tokens = if ctx.core.mode().is_local() {
+            higgs_retained_session_cap_tokens(ctx.core.provider.supports_higgs_session_cache())
+        } else {
+            None
+        };
+        let retained_pressure = retained_context_pressure(retained_cap_tokens, &ctx.messages, 0);
+        let allow_checkpoint = should_allow_checkpoint(
+            state.context_pressure,
+            self.lcm_config.tau_hard,
+            retained_pressure,
+        );
         self.install_pending_compaction(ctx, allow_checkpoint).await;
 
         StepResult::Next(IterationPhase::PreCall)
@@ -1511,13 +2011,13 @@ impl AgentLoopShared {
             crate::agent::token_budget::PrefixTrimDisposition::Preserved
         );
         if !prefix_preserved && frozen_prefix > 0 {
-            clear_prompt_cache_state(ctx);
-            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::Trim);
+            let rotated = invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::Trim);
             warn!(
                 session = %ctx.session_key,
                 frozen_prefix,
                 before_messages = ctx.messages.len(),
                 after_messages = trimmed_messages.len(),
+                rotated,
                 "prompt_cache_watermark_invalidated_by_token_trim"
             );
         }
@@ -1615,13 +2115,14 @@ impl AgentLoopShared {
                 crate::agent::token_budget::PrefixTrimDisposition::Preserved
             );
             if !prefix_preserved && frozen_prefix > 0 {
-                clear_prompt_cache_state(ctx);
-                send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::EmergencyTrim);
+                let rotated =
+                    invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::EmergencyTrim);
                 warn!(
                     session = %ctx.session_key,
                     frozen_prefix,
                     before_messages = ctx.messages.len(),
                     after_messages = trimmed_messages.len(),
+                    rotated,
                     "prompt_cache_watermark_invalidated_by_emergency_trim"
                 );
             }
@@ -1654,6 +2155,8 @@ impl AgentLoopShared {
             }
         }
 
+        ctx.advertised_tool_names = Some(advertised_tool_names(&tool_defs));
+
         // Adaptive max_tokens: size the response budget to the task.
         let effective_max_tokens = self.compute_adaptive_max_tokens(ctx);
 
@@ -1668,10 +2171,10 @@ impl AgentLoopShared {
     /// Returns `(active_defs, saved_defs)` where `saved_defs` preserves the
     /// pre-trio-stripping state for router passthrough fallback.
     fn select_tool_definitions(&self, ctx: &mut TurnContext) -> (Vec<Value>, Vec<Value>) {
-        // One production catalog for every runtime mode. Four hot coding tools
-        // are native at turn 1; the long tail stays executable through the
-        // `tool` proxy meta-tool, keeping the cold-prefill tool block small and
-        // the prompt-prefix cache stable.
+        // One production catalog for every runtime mode. Hot coding tools,
+        // including the artifact chunk writer, are native at turn 1; the long
+        // tail stays executable through the `tool` proxy meta-tool, keeping the
+        // cold-prefill tool block small and the prompt-prefix cache stable.
         let mut tool_defs = ctx.tools.get_core_plus_proxy_definitions();
         // Tool-averse models (no tool-calling training, e.g. VibeThinker):
         // the native `tools` parameter confuses or errors their chat
@@ -1822,16 +2325,23 @@ impl AgentLoopShared {
             *guard = Some(pending);
             return false;
         }
+        // `pending` was moved out of the slot; the guard is only needed for the
+        // deferral put-back above. Drop it so the rewrite below can take
+        // `&mut ctx` (invalidate_prompt_cache_for_rewrite) without borrowing it.
+        drop(guard);
 
-        if rewrites_prompt && clear_prompt_cache_state(ctx) {
-            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::LcmCheckpoint);
-            warn!(
-                session = %ctx.session_key,
-                frozen_prefix,
-                compacted_messages = pending.result.messages.len(),
-                watermark = pending.watermark(),
-                "prompt_cache_watermark_invalidated_by_lcm_checkpoint"
-            );
+        if rewrites_prompt {
+            let rotated =
+                invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::LcmCheckpoint);
+            if rotated {
+                warn!(
+                    session = %ctx.session_key,
+                    frozen_prefix,
+                    compacted_messages = pending.result.messages.len(),
+                    watermark = pending.watermark(),
+                    "prompt_cache_watermark_invalidated_by_lcm_checkpoint"
+                );
+            }
         }
 
         debug!(
@@ -1911,15 +2421,48 @@ impl AgentLoopShared {
 
             let budget_core = ctx.core.clone();
             let budget = &budget_core.token_budget;
-            let (mut action, conv_tokens, available, hard_limit, soft_limit) = {
+            let retained_cap_tokens = if ctx.core.mode().is_local() {
+                higgs_retained_session_cap_tokens(ctx.core.provider.supports_higgs_session_cache())
+            } else {
+                None
+            };
+            let prompt_calibration = ctx.counters.prompt_calibration(&ctx.session_key);
+            let last_estimated_prompt_tokens =
+                prompt_calibration.map_or(0, |cal| cal.estimated_prompt_tokens);
+            let last_actual_prompt_tokens =
+                prompt_calibration.map_or(0, |cal| cal.actual_prompt_tokens);
+            let mut retained_admission = higgs_retained_admission(
+                retained_cap_tokens,
+                &ctx.messages,
+                tool_def_tokens,
+                last_estimated_prompt_tokens,
+                last_actual_prompt_tokens,
+            );
+            let (
+                mut action,
+                conv_tokens,
+                available,
+                hard_limit,
+                soft_limit,
+                model_available,
+                retained_available,
+            ) = {
                 let engine = lcm_engine.lock().await;
-                let available = budget.available_budget(tool_def_tokens);
+                let model_available = budget.available_budget(tool_def_tokens);
+                let (available, retained_available) = effective_lcm_available_budget(
+                    model_available,
+                    &ctx.messages,
+                    tool_def_tokens,
+                    retained_cap_tokens,
+                );
                 (
-                    engine.check_thresholds(budget, tool_def_tokens),
+                    engine.check_thresholds_with_available(available),
                     engine.conversation_tokens(),
                     available,
                     (available as f64 * engine.tau_hard()) as usize,
                     (available as f64 * engine.tau_soft()) as usize,
+                    model_available,
+                    retained_available,
                 )
             };
 
@@ -1927,7 +2470,11 @@ impl AgentLoopShared {
             // crossed the hard threshold. At that point foreground inference
             // waits for it and installs its checkpoint before doing anything
             // else. The background job has its own 90-second timeout.
-            let mut raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
+            let mut retained_admission_hard = retained_admission
+                .as_ref()
+                .is_some_and(|admission| admission.force_blocking);
+            let mut raw_hard =
+                conversation_token_count(&ctx.messages) > hard_limit || retained_admission_hard;
             if raw_hard && ctx.compaction.in_flight.load(Ordering::Acquire) {
                 let wait_for_soft_job = async {
                     while ctx.compaction.in_flight.load(Ordering::Acquire) {
@@ -1944,10 +2491,21 @@ impl AgentLoopShared {
             }
             if raw_hard {
                 self.install_pending_compaction(ctx, true).await;
-                raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
+                retained_admission = higgs_retained_admission(
+                    retained_cap_tokens,
+                    &ctx.messages,
+                    tool_def_tokens,
+                    last_estimated_prompt_tokens,
+                    last_actual_prompt_tokens,
+                );
+                retained_admission_hard = retained_admission
+                    .as_ref()
+                    .is_some_and(|admission| admission.force_blocking);
+                raw_hard =
+                    conversation_token_count(&ctx.messages) > hard_limit || retained_admission_hard;
                 action = {
                     let engine = lcm_engine.lock().await;
-                    engine.check_thresholds(budget, tool_def_tokens)
+                    engine.check_thresholds_with_available(available)
                 };
             }
 
@@ -1961,6 +2519,22 @@ impl AgentLoopShared {
                     msg_count = ctx.messages.len(),
                     conv_tokens,
                     available,
+                    model_available,
+                    retained_cap_tokens,
+                    retained_available,
+                    retained_admission_forced = retained_admission_hard,
+                    retained_estimated_prompt_tokens = retained_admission
+                        .map(|admission| admission.estimated_prompt_tokens)
+                        .unwrap_or(0),
+                    retained_calibrated_prompt_tokens = retained_admission
+                        .map(|admission| admission.calibrated_prompt_tokens)
+                        .unwrap_or(0),
+                    retained_admission_limit_tokens = retained_admission
+                        .map(|admission| admission.admission_limit_tokens)
+                        .unwrap_or(0),
+                    retained_observed_token_ratio = retained_admission
+                        .map(|admission| admission.observed_token_ratio)
+                        .unwrap_or(1.0),
                     hard_limit,
                     soft_limit,
                     "lcm_compaction_triggered"
@@ -2015,6 +2589,9 @@ impl AgentLoopShared {
                     msg_count = ctx.messages.len(),
                     conv_tokens,
                     available,
+                    model_available,
+                    retained_cap_tokens,
+                    retained_available,
                     hard_limit,
                     soft_limit,
                     "lcm_compaction_triggered"
@@ -2102,12 +2679,11 @@ impl AgentLoopShared {
                 }
             })
             .is_ok();
-        let user_text = ctx
-            .messages
-            .last()
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+        // Size the response from the actual user request, not from the latest
+        // raw message. After a tool call the latest raw message is often a tool
+        // result folded through the local protocol, which can wrongly trigger
+        // long-form budgets on every post-tool continuation.
+        let user_text = ctx.user_content.as_str();
         // Count recent tool calls: if tool-heavy, use smaller budget.
         let recent_tool_calls = ctx
             .messages
@@ -2124,12 +2700,14 @@ impl AgentLoopShared {
                 None
             }
         };
-        adaptive_max_tokens(
+        let local_artifact_action = local_artifact_action_for_turn(ctx);
+        adaptive_max_tokens_for_artifact_action(
             base,
             had_long,
             user_text,
             recent_tool_calls,
             ctx.core.mode().is_local(),
+            local_artifact_action,
             thinking_budget,
             &ctx.core.adaptive_tokens,
         )
@@ -2225,6 +2803,7 @@ impl AgentLoopShared {
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
         let prompt_total_estimate =
             TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens);
+        ctx.flow.provider_prompt_estimate = Some(prompt_total_estimate);
         {
             let store = counters.prompt_fingerprints.lock();
             let prompt_delta = prompt_fingerprint::compare(store.get(&ctx.session_key), &prompt_fp);
@@ -2253,17 +2832,16 @@ impl AgentLoopShared {
                     // be visible in the log without RUST_LOG=info. Self-suppresses
                     // once the cause is fixed (the AppendOnly branch stays debug).
                     //
-                    // `role_snippet` names the mutated message so the cache-busting
-                    // field is identifiable without a separate dump: e.g. a tool
-                    // result being re-compacted, or a provenance notice shifting.
-                    let role_snippet = messages_for_llm
+                    // After the trim/compaction rotation fixes, every sanctioned
+                    // rewrite clears the prompt fingerprint and returns
+                    // `PromptDelta::First`; reaching this `Diverged` branch means
+                    // the divergence is UNSANCTIONED — a message whose rendered
+                    // bytes changed across turns under the same higgs session id
+                    // (the `token_mismatch` class). `divergent_message_digest`
+                    // names the structural kind so the root cause is obvious.
+                    let digest = messages_for_llm
                         .get(first_divergent_msg)
-                        .map(|m| {
-                            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-                            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                            let snippet: String = content.chars().take(70).collect();
-                            format!("[{role}] {snippet}")
-                        })
+                        .map(divergent_message_digest)
                         .unwrap_or_else(|| "(out of range)".to_string());
                     tracing::warn!(
                         session = %ctx.session_key,
@@ -2271,8 +2849,8 @@ impl AgentLoopShared {
                         prev_msgs,
                         new_msgs,
                         prefill_estimate,
-                        %role_snippet,
-                        "prompt_prefix_diverged — server re-prefills past this point"
+                        digest = %digest,
+                        "prompt_prefix_diverged — unsanctioned token_mismatch class; server re-prefills past this point"
                     );
                     ControlMarker::CacheStatus(CacheStatus::Diverged {
                         at: first_divergent_msg,
@@ -2336,12 +2914,17 @@ impl AgentLoopShared {
             "prefix_diag_timing"
         );
 
+        let mut pending_higgs_drop = Vec::new();
+        let mut higgs_session_marker = None;
         if ctx.core.mode().is_local() && ctx.core.provider.get_api_base().is_some() {
             let provider_session_id = stable_higgs_session_id(
                 &ctx.session_id,
                 counters.session_prompt_epoch(&ctx.session_key),
             );
-            attach_higgs_session_marker(&mut messages_for_llm, provider_session_id);
+            higgs_session_marker = Some(provider_session_id);
+            counters.record_higgs_session_id(&ctx.session_key, provider_session_id);
+            pending_higgs_drop = counters.pending_higgs_session_drop_ids(&ctx.session_key);
+            attach_higgs_session_marker(&mut messages_for_llm, provider_session_id, &[]);
         }
 
         let request_hash = crate::agent::prompt_fingerprint::hash_provider_request(
@@ -2355,7 +2938,7 @@ impl AgentLoopShared {
             == ProviderRequestAdmission::ForceCheckpoint
         {
             clear_prompt_cache_state(ctx);
-            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::LcmCheckpoint);
+            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::StalledProviderRequest);
             ctx.messages
                 .push(crate::agent::markers::scaffold_user(
                     "[system] Context checkpoint: the latest tool round did not change the provider request. Re-read the newest tool result and continue from it."
@@ -2376,6 +2959,17 @@ impl AgentLoopShared {
         ctx.flow.llm_call_start = Some(std::time::Instant::now());
         ctx.flow.ttft_ms = None;
 
+        if let Some(provider_session_id) = higgs_session_marker {
+            let drop_session_ids = pending_higgs_drop.iter().copied().collect::<Vec<_>>();
+            attach_higgs_session_marker(
+                &mut messages_for_llm,
+                provider_session_id,
+                &drop_session_ids,
+            );
+        }
+
+        let no_progress_timeout = local_stream_no_progress_timeout(ctx);
+        let artifact_tool_payload_timeout = local_artifact_tool_payload_timeout(ctx, tool_defs_opt);
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas to the REPL/voice renderer as
             // they arrive so the answer streams live — tokens appear as they are
@@ -2383,27 +2977,51 @@ impl AgentLoopShared {
             // pre-tool prose ("let me check…") streams as visible progress; tool
             // parameters and output never reach this channel (they are emitted as
             // ToolEvents and rendered separately).
-            let mut stream = match ctx
-                .core
-                .provider
-                .chat_stream(
-                    &messages_for_llm,
-                    tool_defs_opt,
-                    Some(&ctx.core.model),
-                    max_tokens,
-                    ctx.core.temperature,
-                    thinking_budget,
-                    None,
-                )
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    return Self::handle_llm_error(e, ctx, counters, "llm_stream_call").await;
+            let backend_activity = BackendActivityHeartbeat::start(
+                Some(delta_tx.clone()),
+                no_progress_timeout.is_some(),
+            );
+            let stream_call = ctx.core.provider.chat_stream(
+                &messages_for_llm,
+                tool_defs_opt,
+                Some(&ctx.core.model),
+                max_tokens,
+                ctx.core.temperature,
+                thinking_budget,
+                None,
+            );
+            let mut stream = if let Some(timeout) = no_progress_timeout {
+                match tokio::time::timeout(timeout, stream_call).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        return Self::handle_llm_error(e, ctx, counters, "llm_stream_call").await;
+                    }
+                    Err(_) => {
+                        counters.mark_inference_finished();
+                        let detail = local_no_stream_headers_error(timeout);
+                        error!(
+                            model = %ctx.core.model,
+                            timeout_secs = timeout.as_secs(),
+                            "llm_stream_headers_timeout"
+                        );
+                        emit_stream_abort_metrics(ctx, &detail);
+                        return StepResult::Done(IterationOutcome::Error(detail));
+                    }
+                }
+            } else {
+                match stream_call.await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Self::handle_llm_error(e, ctx, counters, "llm_stream_call").await;
+                    }
                 }
             };
+            if let Some(activity) = backend_activity.as_ref() {
+                activity.mark_progress(BackendActivity::Prefill);
+            }
 
             let mut streamed_response = None;
+            let mut stream_progress = LocalStreamProgress::new(artifact_tool_payload_timeout);
             let mut in_thinking = false;
             let suppress_thinking_display =
                 counters.suppress_thinking_display.load(Ordering::Relaxed);
@@ -2414,6 +3032,8 @@ impl AgentLoopShared {
                 !suppress_thinking_display && (thinking_enabled || hidden_reasoning_enabled);
             let mut xml_filter = XmlToolCallFilter::new();
             loop {
+                let pending_artifact_tool_payload_deadline =
+                    stream_progress.pending_artifact_tool_payload_deadline();
                 tokio::select! {
                     biased;
                     _ = async {
@@ -2428,9 +3048,52 @@ impl AgentLoopShared {
                         drop(stream);
                         break;
                     }
+                    _ = async {
+                        if let Some(timeout) = no_progress_timeout {
+                            tokio::time::sleep(timeout).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        counters.mark_inference_finished();
+                        let timeout = no_progress_timeout.expect("timeout branch is disabled when None");
+                        let detail = local_no_stream_progress_error(timeout);
+                        error!(
+                            model = %ctx.core.model,
+                            timeout_secs = timeout.as_secs(),
+                            "llm_stream_no_progress_timeout"
+                        );
+                        drop(stream);
+                        emit_stream_abort_metrics(ctx, &detail);
+                        return StepResult::Done(IterationOutcome::Error(detail));
+                    }
+                    _ = async {
+                        if let Some(deadline) = pending_artifact_tool_payload_deadline {
+                            tokio::time::sleep_until(deadline).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        counters.mark_inference_finished();
+                        let timeout = artifact_tool_payload_timeout.expect("artifact deadline branch is disabled when None");
+                        let detail = local_artifact_no_tool_payload_error(timeout);
+                        error!(
+                            model = %ctx.core.model,
+                            timeout_secs = timeout.as_secs(),
+                            "llm_artifact_tool_payload_timeout"
+                        );
+                        drop(stream);
+                        emit_stream_abort_metrics(ctx, &detail);
+                        return StepResult::Done(IterationOutcome::Error(detail));
+                    }
                     chunk = stream.rx.recv() => {
                         match chunk {
                             Some(StreamChunk::ThinkingDelta(delta)) => {
+                                if let Some(activity) = backend_activity.as_ref() {
+                                    let phase = stream_progress
+                                        .on_text_or_thinking_delta(tokio::time::Instant::now());
+                                    activity.mark_progress(phase);
+                                }
                                 // First token (even a hidden thinking token) marks end of prefill.
                                 ctx.flow.mark_first_token();
                                 if !display_thinking {
@@ -2444,6 +3107,11 @@ impl AgentLoopShared {
                                 let _ = delta_tx.send(delta);
                             }
                             Some(StreamChunk::TextDelta(delta)) => {
+                                if let Some(activity) = backend_activity.as_ref() {
+                                    let phase = stream_progress
+                                        .on_text_or_thinking_delta(tokio::time::Instant::now());
+                                    activity.mark_progress(phase);
+                                }
                                 ctx.flow.mark_first_token();
                                 if in_thinking {
                                     in_thinking = false;
@@ -2458,6 +3126,10 @@ impl AgentLoopShared {
                                 }
                             }
                             Some(StreamChunk::ToolCallDelta) => {
+                                let phase = stream_progress.on_tool_call_delta();
+                                if let Some(activity) = backend_activity.as_ref() {
+                                    activity.mark_progress(phase);
+                                }
                                 // Pure tool-call responses have no text/thinking
                                 // deltas — the first tool-call fragment marks
                                 // end of prefill for TTFT.
@@ -2466,12 +3138,23 @@ impl AgentLoopShared {
                             Some(StreamChunk::PrefillProgress { processed, total }) => {
                                 // Prefill still running — not a token, so no
                                 // mark_first_token. Forward to the REPL spinner
-                                // as a control marker.
+                                // as a control marker. Send it before the
+                                // backend phase update so completed-prefill
+                                // progress cannot overwrite the post-prefill
+                                // tool-payload status in the TUI.
                                 let _ =
                                     delta_tx.send(
                                         ControlMarker::PrefillProgress { processed, total }
                                             .encode(),
                                     );
+                                if let Some(activity) = backend_activity.as_ref() {
+                                    let phase = stream_progress.on_prefill_progress(
+                                        processed,
+                                        total,
+                                        tokio::time::Instant::now(),
+                                    );
+                                    activity.mark_progress(phase);
+                                }
                             }
                             Some(StreamChunk::Done(resp)) => {
                                 if in_thinking {
@@ -2493,9 +3176,17 @@ impl AgentLoopShared {
                     // Stream ended without Done — either cancelled or genuine error.
                     if ctx.is_cancelled() {
                         // Cancelled mid-stream — exit cleanly.
+                        emit_stream_abort_metrics(
+                            ctx,
+                            "The stream was cancelled before the backend returned a final response.",
+                        );
                         return StepResult::Done(IterationOutcome::Finished(String::new()));
                     }
                     error!("LLM stream ended without Done");
+                    emit_stream_abort_metrics(
+                        ctx,
+                        "The LLM stream ended without a final response.",
+                    );
                     return StepResult::Done(IterationOutcome::Error(
                         "I encountered a streaming error.".to_string(),
                     ));
@@ -2524,20 +3215,27 @@ impl AgentLoopShared {
             }
         };
 
+        if !pending_higgs_drop.is_empty() {
+            counters.clear_pending_higgs_session_drop_ids(&ctx.session_key, &pending_higgs_drop);
+        }
+
         // Inference complete — allow watchdog health checks again.
         counters.mark_inference_finished();
 
-        // Only successful provider calls prove that the server accepted this
-        // prompt. Failed/cancelled calls must not seed the local cache model, or
-        // the next long-context turn may preserve a prefix that never warmed.
-        counters
-            .prompt_fingerprints
-            .lock()
-            .insert(ctx.session_key.clone(), prompt_fp);
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .insert(ctx.session_key.clone(), ctx.messages.len());
+        // Only valid completed provider calls seed Nanobot's local prompt-cache
+        // model. A 600s zero-token stall can arrive as `finish_reason=stop`,
+        // so share the metrics classifier instead of keying only on
+        // `finish_reason=error`.
+        if Self::response_status(&response) == "ok" {
+            counters
+                .prompt_fingerprints
+                .lock()
+                .insert(ctx.session_key.clone(), prompt_fp);
+            counters
+                .prompt_cache_watermark
+                .lock()
+                .insert(ctx.session_key.clone(), ctx.messages.len());
+        }
 
         // Tier-2 forced-tool recovery: if a local model botched a tool call
         // (intent prose / hallucinated syntax / empty block) instead of emitting
@@ -2782,6 +3480,7 @@ impl AgentLoopShared {
             && !boundary_blocks_batch
             && !delegation_reuses_main_model;
 
+        let tool_entries_before = ctx.turn_tool_entries.len();
         if should_delegate {
             if crate::agent::tool_engine::execute_tools_delegated(
                 ctx,
@@ -2818,7 +3517,6 @@ impl AgentLoopShared {
         }
 
         // Inline path (default, unchanged): execute tools directly.
-        let tool_entries_before = ctx.turn_tool_entries.len();
         crate::agent::tool_engine::execute_tools_inline(ctx, &routed_tool_calls, &response).await;
         let executed = ctx
             .turn_tool_entries
@@ -2893,8 +3591,81 @@ impl AgentLoopShared {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_response_boundary, proactive_grounding_preserves_prefix_cache, ResponseBoundary,
+        advance_response_boundary, attach_higgs_session_marker,
+        divergent_message_digest, proactive_grounding_preserves_prefix_cache,
+        ResponseBoundary,
     };
+    use crate::agent::agent_core::{stable_higgs_session_id, RuntimeCounters};
+    use crate::config::schema::CircuitBreakerConfig;
+    use serde_json::json;
+
+    /// The divergence diagnostic must name the divergent message's STRUCTURAL
+    /// kind, not just its role, so the cache-busting class is identifiable from
+    /// the WARN line alone (this is how we pinpoint the higgs `token_mismatch`
+    /// cause without guessing). Every sanctioned rewrite clears the fingerprint
+    /// → `PromptDelta::First`, so a `Diverged` is by definition unsanctioned.
+    #[test]
+    fn test_divergent_message_digest_classifies_structural_kind() {
+        // Plain persisted user turn.
+        let plain = json!({"role": "user", "content": "what is 2+2", "_db_id": 7});
+        assert_eq!(
+            divergent_message_digest(&plain),
+            "[user] (persisted) what is 2+2"
+        );
+
+        // Transient synthetic user (the prime suspect: sent but not replayed).
+        let synthetic = json!({"role": "user", "content": "grounding nudge", "_synthetic": true});
+        assert_eq!(
+            divergent_message_digest(&synthetic),
+            "[user] (synthetic) grounding nudge"
+        );
+
+        // Cache-replay scaffold (persisted synthetic).
+        let scaffold = json!({
+            "role": "user",
+            "content": "[system] checkpoint",
+            "_synthetic": true,
+            "_cache_replay": true,
+            "_db_id": 9,
+        });
+        assert_eq!(
+            divergent_message_digest(&scaffold),
+            "[user] (synthetic,cache-replay,persisted) [system] checkpoint"
+        );
+
+        // Tool result (rendered role may differ from raw — a render-instability
+        // suspect).
+        let tool_result = json!({
+            "role": "tool",
+            "tool_call_id": "tc_1",
+            "name": "read_file",
+            "content": "file body",
+        });
+        assert_eq!(
+            divergent_message_digest(&tool_result),
+            "[tool] (tool-result) file body"
+        );
+
+        // LCM summary (engine-owned view, renders as user; re-summarization
+        // suspect).
+        let summary = json!({"role": "user", "content": "prior turns...", "_lcm_summary": true});
+        assert_eq!(
+            divergent_message_digest(&summary),
+            "[user] (lcm-summary) prior turns..."
+        );
+
+        // Long content is truncated to a readable snippet.
+        let long = json!({"role": "assistant", "content": "x".repeat(120)});
+        let digest = divergent_message_digest(&long);
+        assert!(
+            digest.starts_with("[assistant] "),
+            "no kind tag for a plain assistant: {digest}"
+        );
+        assert!(
+            digest.matches('x').count() <= 70,
+            "snippet must be truncated: {digest}"
+        );
+    }
 
     /// The response boundary is one-shot: Pending → Armed (with nudge) → Off.
     /// Schema never changes; a model that insists on exec gets exactly one
@@ -2911,6 +3682,34 @@ mod tests {
         // Off is stable regardless of config.
         assert_eq!(advance_response_boundary(Off, true), (Off, false));
         assert_eq!(advance_response_boundary(Off, false), (Off, false));
+    }
+
+    #[test]
+    fn test_higgs_marker_sends_drop_id_queued_before_session_rollover() {
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let session_key = "cli:test";
+        let original_drop_id = stable_higgs_session_id("sqlite-session-before-clear", 0);
+        let current_session_id = stable_higgs_session_id("sqlite-session-after-clear", 1);
+
+        counters.record_higgs_session_id(session_key, original_drop_id);
+        counters.reset_session_prompt_state(session_key);
+        counters.record_higgs_session_id(session_key, current_session_id);
+
+        let mut messages = vec![json!({"role": "system", "content": "system"})];
+        attach_higgs_session_marker(
+            &mut messages,
+            current_session_id,
+            &counters.pending_higgs_session_drop_ids(session_key),
+        );
+
+        assert_eq!(
+            messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(current_session_id)
+        );
+        assert_eq!(
+            messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
+            json!(original_drop_id)
+        );
     }
 
     // Pure decision helpers — one per `is_local` read site. Each mirrors the
@@ -3259,9 +4058,12 @@ mod forced_recovery_tests {
 #[cfg(test)]
 mod cache_pressure_tests {
     use super::{
+        effective_lcm_available_budget, higgs_retained_admission, retained_context_pressure,
         should_allow_checkpoint, should_inject_heartbeat_grounding, ProviderRequestAdmission,
         ProviderRequestState,
     };
+    use crate::agent::token_budget::TokenBudget;
+    use serde_json::json;
 
     #[test]
     fn identical_provider_request_after_tool_progress_forces_checkpoint() {
@@ -3307,20 +4109,158 @@ mod cache_pressure_tests {
 
     #[test]
     fn checkpoint_deferred_below_tau_hard() {
-        assert!(!should_allow_checkpoint(0.50, 0.85));
-        assert!(!should_allow_checkpoint(0.84, 0.85));
+        assert!(!should_allow_checkpoint(0.50, 0.85, None));
+        assert!(!should_allow_checkpoint(0.84, 0.85, None));
     }
 
     #[test]
     fn checkpoint_forced_at_tau_hard_boundary() {
         // Exactly tau_hard: accept the re-prefill to break the grow-forever
         // deadlock where warm-cache deferral starves compaction entirely.
-        assert!(should_allow_checkpoint(0.85, 0.85));
+        assert!(should_allow_checkpoint(0.85, 0.85, None));
     }
 
     #[test]
     fn checkpoint_forced_above_tau_hard() {
-        assert!(should_allow_checkpoint(0.90, 0.85));
-        assert!(should_allow_checkpoint(1.00, 0.85));
+        assert!(should_allow_checkpoint(0.90, 0.85, None));
+        assert!(should_allow_checkpoint(1.00, 0.85, None));
+    }
+
+    #[test]
+    fn checkpoint_forced_by_retained_pressure_before_model_pressure() {
+        assert!(should_allow_checkpoint(0.40, 0.85, Some(0.86)));
+        assert!(!should_allow_checkpoint(0.40, 0.85, Some(0.84)));
+    }
+
+    #[test]
+    fn lcm_available_budget_is_capped_by_retained_prompt_budget() {
+        let messages = vec![
+            json!({"role": "system", "content": "system ".repeat(40)}),
+            json!({"role": "user", "content": "history ".repeat(80)}),
+        ];
+        let model_available = 30_000;
+        let retained_cap = 500;
+        let tool_def_tokens = 50;
+        let (available, retained_available) = effective_lcm_available_budget(
+            model_available,
+            &messages,
+            tool_def_tokens,
+            Some(retained_cap),
+        );
+
+        let retained_available =
+            retained_available.expect("retained budget should be reported when cap is present");
+        assert_eq!(available, retained_available);
+        assert!(available < model_available);
+        assert!(available <= retained_cap - tool_def_tokens);
+    }
+
+    #[test]
+    fn retained_pressure_counts_full_prompt_plus_tool_defs() {
+        let messages = vec![
+            json!({"role": "system", "content": "system ".repeat(20)}),
+            json!({"role": "user", "content": "history ".repeat(20)}),
+        ];
+        let pressure =
+            retained_context_pressure(Some(256), &messages, 32).expect("retained pressure");
+        assert!(pressure > 0.0);
+        assert!(
+            retained_context_pressure(None, &messages, 32).is_none(),
+            "no retained cap means no retained pressure"
+        );
+    }
+
+    #[test]
+    fn higgs_admission_uses_actual_prompt_ratio_before_retained_cap() {
+        let messages = vec![
+            json!({"role": "system", "content": "system ".repeat(80)}),
+            json!({"role": "user", "content": "history ".repeat(800)}),
+        ];
+        let tool_def_tokens = 64;
+        let estimated = TokenBudget::estimate_tokens(&messages) + tool_def_tokens;
+        let cap = estimated * 2;
+
+        let uncalibrated =
+            higgs_retained_admission(Some(cap), &messages, tool_def_tokens, 0, 0).unwrap();
+        assert!(
+            !uncalibrated.force_blocking,
+            "estimate-only prompt should remain below the 80% admission margin"
+        );
+
+        let calibrated = higgs_retained_admission(
+            Some(cap),
+            &messages,
+            tool_def_tokens,
+            estimated as u64,
+            (estimated * 2) as u64,
+        )
+        .unwrap();
+        assert!(calibrated.force_blocking);
+        assert_eq!(calibrated.calibrated_prompt_tokens, estimated * 2);
+        assert!(calibrated.admission_limit_tokens < calibrated.calibrated_prompt_tokens);
+    }
+
+    #[test]
+    fn higgs_admission_ignores_missing_retained_cap() {
+        let messages = vec![json!({"role": "user", "content": "history ".repeat(20)})];
+        assert!(higgs_retained_admission(None, &messages, 0, 100, 200).is_none());
+    }
+}
+
+#[cfg(test)]
+mod stream_progress_tests {
+    use super::{BackendActivity, LocalStreamProgress};
+    use std::time::Duration;
+
+    #[test]
+    fn artifact_payload_deadline_arms_after_prefill_completion() {
+        let timeout = Duration::from_secs(90);
+        let start = tokio::time::Instant::now();
+        let mut progress = LocalStreamProgress::new(Some(timeout));
+
+        assert_eq!(progress.pending_artifact_tool_payload_deadline(), None);
+        assert_eq!(
+            progress.on_prefill_progress(40, 100, start),
+            BackendActivity::Prefill
+        );
+        assert_eq!(progress.pending_artifact_tool_payload_deadline(), None);
+
+        let done_at = start + Duration::from_secs(2);
+        assert_eq!(
+            progress.on_prefill_progress(100, 100, done_at),
+            BackendActivity::AwaitingToolPayload
+        );
+        assert_eq!(
+            progress.pending_artifact_tool_payload_deadline(),
+            Some(done_at + timeout)
+        );
+    }
+
+    #[test]
+    fn tool_payload_delta_clears_artifact_deadline() {
+        let timeout = Duration::from_secs(90);
+        let start = tokio::time::Instant::now();
+        let mut progress = LocalStreamProgress::new(Some(timeout));
+
+        progress.on_prefill_progress(100, 100, start);
+        assert!(progress.pending_artifact_tool_payload_deadline().is_some());
+        assert_eq!(progress.on_tool_call_delta(), BackendActivity::ToolPayload);
+        assert_eq!(progress.pending_artifact_tool_payload_deadline(), None);
+    }
+
+    #[test]
+    fn text_delta_on_artifact_arms_payload_deadline_without_prefill_progress() {
+        let timeout = Duration::from_secs(90);
+        let start = tokio::time::Instant::now();
+        let mut progress = LocalStreamProgress::new(Some(timeout));
+
+        assert_eq!(
+            progress.on_text_or_thinking_delta(start),
+            BackendActivity::AwaitingToolPayload
+        );
+        assert_eq!(
+            progress.pending_artifact_tool_payload_deadline(),
+            Some(start + timeout)
+        );
     }
 }

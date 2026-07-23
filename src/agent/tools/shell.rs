@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::Duration;
 
 use std::sync::LazyLock;
@@ -306,7 +307,8 @@ impl ExecTool {
     /// so that callers may pass paths like `~/Dev/nanobot-rs`. This reuses the
     /// shared [`crate::utils::helpers::expand_tilde`] used by the filesystem
     /// and config layers, keeping path-expansion logic in a single place.
-    fn resolve_cwd(&self, params: &HashMap<String, serde_json::Value>) -> String {        let raw = params
+    fn resolve_cwd(&self, params: &HashMap<String, serde_json::Value>) -> String {
+        let raw = params
             .get("working_dir")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -341,6 +343,28 @@ impl ExecTool {
             )
         }
     }
+
+    fn format_output(stdout: &str, stderr: &str, status: &ExitStatus) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !stdout.is_empty() {
+            parts.push(stdout.to_string());
+        }
+        if !stderr.trim().is_empty() {
+            parts.push(format!("STDERR:\n{}", stderr));
+        }
+
+        if status.success() {
+            if parts.is_empty() {
+                "(no output)".to_string()
+            } else {
+                parts.join("\n")
+            }
+        } else {
+            let code = status.code().unwrap_or(-1);
+            parts.push(format!("Exit code: {}", code));
+            format!("Error: Command failed\n{}", parts.join("\n"))
+        }
+    }
 }
 
 #[async_trait]
@@ -354,6 +378,7 @@ impl Tool for ExecTool {
          Safe: ls, pwd, cat, grep, find, python, cargo, git, echo, curl.\n\
          Blocked: rm -rf, sudo, eval, shred (destructive commands are rejected).\n\
          Prefer read_file over cat, list_dir over ls when available.\n\
+         Prefer write_file for generated file content and edit_file for targeted file edits.\n\
          Bulk edits (\u{2265}3 files): use `ambr 'old' 'new'` for codebase-wide replace,\n\
          or `fd -e rs | xargs sd 'old' 'new'` for a typed subset.\n\
          Don't loop edit_file across many files when one pipeline does it."
@@ -405,28 +430,9 @@ impl Tool for ExecTool {
 
             match output {
                 Ok(output) => {
-                    let mut parts: Vec<String> = Vec::new();
-
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    if !stdout.is_empty() {
-                        parts.push(stdout.to_string());
-                    }
-
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stderr.trim().is_empty() {
-                        parts.push(format!("STDERR:\n{}", stderr));
-                    }
-
-                    if !output.status.success() {
-                        let code = output.status.code().unwrap_or(-1);
-                        parts.push(format!("\nExit code: {}", code));
-                    }
-
-                    if parts.is_empty() {
-                        "(no output)".to_string()
-                    } else {
-                        parts.join("\n")
-                    }
+                    Self::format_output(&stdout, &stderr, &output.status)
                 }
                 Err(e) => self.spawn_error_hint(&e, &cwd),
             }
@@ -562,24 +568,9 @@ impl Tool for ExecTool {
 
             let status = child.wait().await;
 
-            let mut parts: Vec<String> = Vec::new();
-            if !stdout_buf.is_empty() {
-                parts.push(stdout_buf);
-            }
-            if !stderr_buf.trim().is_empty() {
-                parts.push(format!("STDERR:\n{}", stderr_buf));
-            }
-            if let Ok(s) = &status {
-                if !s.success() {
-                    let code = s.code().unwrap_or(-1);
-                    parts.push(format!("\nExit code: {}", code));
-                }
-            }
-
-            if parts.is_empty() {
-                "(no output)".to_string()
-            } else {
-                parts.join("\n")
+            match status {
+                Ok(status) => Self::format_output(&stdout_buf, &stderr_buf, &status),
+                Err(e) => self.spawn_error_hint(&e, &cwd),
             }
         })
         .await;
@@ -669,6 +660,38 @@ mod tests {
             desc.contains("sd"),
             "exec description should mention sd, got: {desc}"
         );
+    }
+
+    #[test]
+    fn test_description_prefers_file_tools_for_file_content() {
+        let tool = make_exec_tool(false);
+        let desc = tool.description();
+        assert!(
+            desc.contains("write_file"),
+            "exec description should route generated file content to write_file: {desc}"
+        );
+        assert!(
+            desc.contains("edit_file"),
+            "exec description should route file edits to edit_file: {desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nonzero_exit_is_structured_failure() {
+        let tool = make_exec_tool(false);
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("printf nope >&2; exit 7".to_string()),
+        );
+
+        let result = tool.execute_with_result(params).await;
+        assert!(
+            !result.ok,
+            "non-zero shell exit must be a failed tool result"
+        );
+        assert!(result.data.starts_with("Error:"), "{:?}", result.data);
+        assert!(result.data.contains("Exit code: 7"), "{:?}", result.data);
     }
 
     // -----------------------------------------------------------------------

@@ -20,13 +20,16 @@ use crate::providers::base::{LLMResponse, ToolCallRequest};
 use std::sync::Arc;
 
 use super::agent_loop::{ResponseBoundary, TurnContext};
-use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
+use crate::agent::context_hygiene::{tool_result_ok, TOOL_RESULT_REPLAY_MAX_BYTES};
 use crate::agent::tools::base::ToolConcurrency;
 
 const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
 /// Bound native multi-tool fan-out. Four concurrent reads/fetches keep local
 /// resource use predictable while still collapsing the dominant serial waits.
 const MAX_PARALLEL_TOOL_CALLS: usize = 4;
+/// Minimum room for a compact receipt with a recall handle. Below this, the
+/// prompt may save a few bytes while losing the exact retrieval path.
+const MIN_BATCH_TOOL_RESULT_CAP_CHARS: usize = 320;
 
 /// Per-tool token threshold above which a raw tool result is replaced by a
 /// summary. Enumerative tools (`exec`, `list_dir`, `web_search`, `read_file`)
@@ -54,20 +57,40 @@ fn inline_hot_prompt_result_cap(ctx: &TurnContext) -> usize {
     effective_tool_result_cap(ctx.core.max_tool_result_chars)
 }
 
-/// Stash a result before any lossy prompt shaping. SQLite is the sole source
-/// of truth, keyed by concrete session id plus tool-call id. Small results do
-/// not need a second copy because their full body remains in message history.
-async fn stash_oversized_tool_result(
+fn inline_hot_prompt_result_cap_from_effective(cap: usize, result_count: usize) -> usize {
+    if result_count <= 1 {
+        return cap;
+    }
+
+    // Multi-tool rounds are the latency cliff: per-result caps stack into an
+    // uncached suffix. Share one replay-sized budget across the batch so Higgs
+    // stays on the retained continuation path.
+    let batch_cap = cap.min(TOOL_RESULT_REPLAY_MAX_BYTES).max(1);
+    (batch_cap / result_count.max(1))
+        .max(MIN_BATCH_TOOL_RESULT_CAP_CHARS)
+        .min(cap)
+        .max(1)
+}
+
+fn inline_hot_prompt_result_cap_for_ctx_batch(ctx: &TurnContext, result_count: usize) -> usize {
+    inline_hot_prompt_result_cap_from_effective(inline_hot_prompt_result_cap(ctx), result_count)
+}
+
+/// Stash raw output before prompt shaping. Multi-result batches force this so
+/// even medium reads can be reduced to receipts without losing exact recall.
+async fn stash_tool_result_for_prompt_shaping(
     sessions: &crate::session::SessionDb,
     session_id: &str,
     tool_call_id: &str,
     tool_name: &str,
     data: &str,
     cap: usize,
+    force: bool,
 ) -> bool {
-    if tool_name == "recall_tool_result"
-        || (data.chars().count() <= cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES)
-    {
+    if tool_name == "recall_tool_result" {
+        return false;
+    }
+    if !force && data.chars().count() <= cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES {
         return false;
     }
     sessions
@@ -131,10 +154,24 @@ fn build_tool_result_preview(
     let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
     let header = format!(
         "[truncated: {tool_name}({source}) returned {total_chars} chars (~{estimated_tokens} tokens); \
-         head+tail shown — call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output]\n"
+         head+tail shown — call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output, \
+         or search_tool_result/slice_tool_result to query it without loading the whole body]\n"
+    );
+    let compact_header = format!(
+        "[truncated: {tool_name} returned {total_chars} chars (~{estimated_tokens} tokens); \
+         call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output; \
+         search_tool_result/slice_tool_result can query it]\n"
     );
     let footer = "\n[...]\n";
+    let header = if header.chars().count() + footer.chars().count() + 80 <= cap {
+        header
+    } else {
+        compact_header
+    };
     let fixed_chars = header.chars().count() + footer.chars().count();
+    if fixed_chars >= cap {
+        return header;
+    }
     let preview_budget = cap.saturating_sub(fixed_chars).max(200);
     let head_chars = preview_budget * 2 / 3;
     let tail_chars = preview_budget.saturating_sub(head_chars);
@@ -163,10 +200,9 @@ fn digest_tool_result(
     cap: usize,
     tool_call_id: &str,
 ) -> String {
-    // A recalled output IS the verbatim body the model explicitly asked for —
-    // never re-digest it (would re-truncate into another preview and loop the
-    // model back to recall_tool_result forever). It enters context raw. If the
-    // body is very large that's a deliberate spend the model chose.
+    // A recalled output IS the verbatim body the model explicitly asked for.
+    // Keep it raw for this live turn only; session reload renders a compact
+    // digest/reference so the one-time recall cannot balloon every later turn.
     if tool_name == "recall_tool_result" {
         return data.to_string();
     }
@@ -244,7 +280,10 @@ pub(crate) fn delegation_reuses_main_local_model(
 
 /// Side-effect tools that arm (and are rejected by) the response boundary.
 pub(crate) fn is_side_effect_tool(name: &str) -> bool {
-    matches!(name, "exec" | "write_file")
+    matches!(
+        name,
+        "exec" | "write_file" | "write_file_chunk" | "edit_file" | "apply_patch"
+    )
 }
 
 /// Tools whose result must be consumed and reported before another call of
@@ -257,11 +296,11 @@ pub(crate) fn requires_result_report(name: &str) -> bool {
 
 /// Decide whether to arm the response boundary after a tool-execution round.
 ///
-/// Behavioral, not positional: arm ONLY when a side-effect tool (exec/write_file)
+/// Behavioral, not positional: arm ONLY when a side-effect/write tool
 /// actually ran AND the assistant produced no text report. A model that narrates
 /// each step is not fabricating results, so it must not be throttled. Arming
 /// blindly after every side-effect call (the prior behavior) rejected ~1/3 of
-/// legitimate consecutive exec/write_file calls. `executed_tools` must contain
+/// legitimate consecutive write/exec calls. `executed_tools` must contain
 /// only the tools that actually executed — never boundary-rejected calls — so a
 /// rejected call cannot re-arm the boundary.
 fn should_arm_boundary(assistant_content: Option<&str>, executed_tools: &[&str]) -> bool {
@@ -508,6 +547,9 @@ pub(crate) async fn execute_tools_delegated(
 
     // Add tool results from the runner to the main context.
     let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
+    let routed_result_cap =
+        inline_hot_prompt_result_cap_for_ctx_batch(ctx, routed_tool_calls.len());
+    let force_routed_stash = routed_tool_calls.len() > 1;
 
     for tc in routed_tool_calls {
         let full_data = run_result
@@ -520,7 +562,7 @@ pub(crate) async fn execute_tools_delegated(
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
         let threshold = summary_threshold_tokens(&tc.name);
-        let cap = inline_hot_prompt_result_cap(ctx);
+        let cap = routed_result_cap;
         let injected_raw = if let Some(ref summary) = run_result.summary {
             // Summary exists from scratch-pad analysis.
             if full_tokens > threshold {
@@ -552,13 +594,14 @@ pub(crate) async fn execute_tools_delegated(
         // lossless recall — digesting `injected_raw` directly would store the
         // summary instead of the original. Then preview injected_raw and add a
         // recall pointer when the raw was stashed.
-        let stashed_raw = stash_oversized_tool_result(
+        let stashed_raw = stash_tool_result_for_prompt_shaping(
             &ctx.core.sessions,
             &ctx.session_id,
             &tc.id,
             &tc.name,
             full_data,
             cap,
+            force_routed_stash,
         )
         .await;
         let mut injected = if must_preserve_unstashed_raw(full_data, cap, stashed_raw) {
@@ -573,19 +616,30 @@ pub(crate) async fn execute_tools_delegated(
             ));
         }
 
+        let ok = tool_result_ok(full_data);
         if ctx.core.provenance_config.enabled {
-            ContextBuilder::add_tool_result_immutable(
+            ContextBuilder::add_tool_result_immutable_with_status(
                 &mut ctx.messages,
                 &tc.id,
                 &tc.name,
                 &injected,
+                ok,
             );
         } else {
-            ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &injected);
+            ContextBuilder::add_tool_result_with_status(
+                &mut ctx.messages,
+                &tc.id,
+                &tc.name,
+                &injected,
+                ok,
+            );
         }
-        ctx.flow
-            .tool_guard
-            .record_result(&tc.name, &tc.arguments, injected.clone());
+        ctx.flow.tool_guard.record_result_with_status(
+            &tc.name,
+            &tc.arguments,
+            injected.clone(),
+            ok,
+        );
         ctx.used_tools.insert(tc.name.clone());
         ctx.persist_pending_protocol_messages().await;
     }
@@ -914,7 +968,12 @@ async fn execute_tool_calls_ordered(
 ///
 /// This function must run sequentially (one result at a time) because it
 /// mutates `ctx`.
-async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
+async fn inject_tool_result(
+    ctx: &mut TurnContext,
+    r: &SingleToolResult,
+    prompt_cap: usize,
+    force_stash_raw: bool,
+) {
     // For web_fetch/web_search: unwrap the JSON envelope so the model
     // sees clean article text rather than a JSON metadata summary.
     let result_data = if r.tool_name == "web_fetch" || r.tool_name == "web_search" {
@@ -925,11 +984,10 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
 
     // Gate tool result through context budget.
     let threshold = summary_threshold_tokens(&r.tool_name);
-    let cap = inline_hot_prompt_result_cap(ctx);
-    // A recalled output is the verbatim body the model explicitly requested —
-    // never re-summarize or re-truncate it (would loop back to another preview).
-    // Handle it before the specialist/digest branches. Still charge its tokens
-    // to the content budget so subsequent admits this batch see true usage.
+    let cap = prompt_cap.max(1);
+    // A recalled output is the verbatim body the model explicitly requested.
+    // It is raw only inside this active turn; persisted replay is compacted by
+    // session filters. Still charge its tokens so this batch sees true usage.
     let data = if r.tool_name == "recall_tool_result" {
         ctx.content_gate
             .budget
@@ -941,13 +999,14 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
         // Specialist path: stash the RAW (pre-specialist) output for lossless
         // recall — without this, recall would return the specialist's summary
         // instead of the original. Then summarize and preview the summary.
-        let stashed_raw = stash_oversized_tool_result(
+        let stashed_raw = stash_tool_result_for_prompt_shaping(
             &ctx.core.sessions,
             &ctx.session_id,
             &r.tool_id,
             &r.tool_name,
             &result_data,
             cap,
+            force_stash_raw,
         )
         .await;
         let summarized = ctx
@@ -975,13 +1034,14 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
         }
         preview
     } else {
-        let stashed_raw = stash_oversized_tool_result(
+        let stashed_raw = stash_tool_result_for_prompt_shaping(
             &ctx.core.sessions,
             &ctx.session_id,
             &r.tool_id,
             &r.tool_name,
             &result_data,
             cap,
+            force_stash_raw,
         )
         .await;
         if must_preserve_unstashed_raw(&result_data, cap, stashed_raw) {
@@ -997,19 +1057,29 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
     };
 
     if ctx.core.provenance_config.enabled {
-        ContextBuilder::add_tool_result_immutable(
+        ContextBuilder::add_tool_result_immutable_with_status(
             &mut ctx.messages,
             &r.tool_id,
             &r.tool_name,
             &data,
+            r.result.ok,
         );
     } else {
-        ContextBuilder::add_tool_result(&mut ctx.messages, &r.tool_id, &r.tool_name, &data);
+        ContextBuilder::add_tool_result_with_status(
+            &mut ctx.messages,
+            &r.tool_id,
+            &r.tool_name,
+            &data,
+            r.result.ok,
+        );
     }
     ctx.persist_pending_protocol_messages().await;
-    ctx.flow
-        .tool_guard
-        .record_result(&r.tool_name, &r.arguments, data.clone());
+    ctx.flow.tool_guard.record_result_with_status(
+        &r.tool_name,
+        &r.arguments,
+        data.clone(),
+        r.result.ok,
+    );
 
     // Emit CallEnd.
     if let Some(ref tx) = ctx.tool_event_tx {
@@ -1118,9 +1188,21 @@ fn inject_boundary_rejection(ctx: &mut TurnContext, tc: &ToolCallRequest) {
         ),
     };
     if ctx.core.provenance_config.enabled {
-        ContextBuilder::add_tool_result_immutable(&mut ctx.messages, &tc.id, &tc.name, &msg);
+        ContextBuilder::add_tool_result_immutable_with_status(
+            &mut ctx.messages,
+            &tc.id,
+            &tc.name,
+            &msg,
+            false,
+        );
     } else {
-        ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &msg);
+        ContextBuilder::add_tool_result_with_status(
+            &mut ctx.messages,
+            &tc.id,
+            &tc.name,
+            &msg,
+            false,
+        );
     }
     // The model attempted a tool but was prevented — suppress
     // ClaimedButNotExecuted validation for this turn.
@@ -1212,8 +1294,10 @@ pub(crate) async fn execute_tools_inline(
         taints,
     )
     .await;
+    let result_cap = inline_hot_prompt_result_cap_for_ctx_batch(ctx, ordered_results.len());
+    let force_stash_raw = ordered_results.len() > 1;
     for result in &ordered_results {
-        inject_tool_result(ctx, result).await;
+        inject_tool_result(ctx, result, result_cap, force_stash_raw).await;
     }
 
     // Behavioral response-boundary arming. `parallel`/`sequential` hold only the
@@ -1450,13 +1534,14 @@ mod tests {
         let cap = 120;
 
         // The missing session makes SQLite reject the foreign-keyed result.
-        let stashed = stash_oversized_tool_result(
+        let stashed = stash_tool_result_for_prompt_shaping(
             &sessions,
             "missing-session",
             "call_failed",
             "read_file",
             &data,
             cap,
+            false,
         )
         .await;
         let injected = if must_preserve_unstashed_raw(&data, cap, stashed) {
@@ -1483,13 +1568,14 @@ mod tests {
         );
         let cap = 120;
 
-        let stashed = stash_oversized_tool_result(
+        let stashed = stash_tool_result_for_prompt_shaping(
             &sessions,
             &session.id,
             "call_stored",
             "read_file",
             &data,
             cap,
+            false,
         )
         .await;
         let injected = if must_preserve_unstashed_raw(&data, cap, stashed) {
@@ -1523,13 +1609,14 @@ mod tests {
         assert!(data.len() > TOOL_RESULT_REPLAY_MAX_BYTES);
         assert!(data.chars().count() < 10_000);
 
-        let stashed = stash_oversized_tool_result(
+        let stashed = stash_tool_result_for_prompt_shaping(
             &sessions,
             &session.id,
             "call_replay_cap",
             "read_file",
             &data,
             10_000,
+            false,
         )
         .await;
         let injected = if must_preserve_unstashed_raw(&data, 10_000, stashed) {
@@ -1582,6 +1669,42 @@ mod tests {
         // Points the model at the recall tool with the right id.
         assert!(out.contains("recall_tool_result"));
         assert!(out.contains("call_42"));
+    }
+
+    #[test]
+    fn batch_tool_result_cap_is_shared_across_parallel_reads() {
+        let mut args = HashMap::new();
+        args.insert("path".to_string(), serde_json::json!("src/lib.rs"));
+        let data = format!(
+            "{}MIDDLE_SECRET{}",
+            "head line\n".repeat(450),
+            "tail line\n".repeat(450)
+        );
+        let per_result_cap =
+            inline_hot_prompt_result_cap_from_effective(effective_tool_result_cap(10_000), 3);
+
+        let outputs: Vec<String> = (0..3)
+            .map(|idx| {
+                digest_tool_result(
+                    "read_file",
+                    &args,
+                    &data,
+                    per_result_cap,
+                    &format!("call_{idx}"),
+                )
+            })
+            .collect();
+        let total_chars: usize = outputs.iter().map(|out| out.chars().count()).sum();
+
+        assert!(
+            total_chars <= TOOL_RESULT_REPLAY_MAX_BYTES,
+            "batch prompt payload must stay under one replay budget, got {total_chars}"
+        );
+        for (idx, out) in outputs.iter().enumerate() {
+            assert!(out.contains("recall_tool_result"));
+            assert!(out.contains(&format!("call_{idx}")));
+            assert!(!out.contains("MIDDLE_SECRET"));
+        }
     }
 
     #[test]
@@ -1671,17 +1794,18 @@ mod tests {
     #[test]
     fn test_should_arm_boundary_behavioral_matrix() {
         // The response boundary is BEHAVIORAL: it arms only when a side-effect
-        // tool (exec/write_file) actually ran AND the assistant produced no text
+        // tool (exec/write/edit_file) actually ran AND the assistant produced no text
         // report. This is the whole point of the fix — a model that narrates its
         // work must not be throttled.
 
         // ran side-effect + no report -> ARM (force a report next call)
         assert!(should_arm_boundary(None, &["exec"]));
         assert!(should_arm_boundary(Some(""), &["write_file"]));
+        assert!(should_arm_boundary(None, &["edit_file"]));
         assert!(should_arm_boundary(Some("  \n\t "), &["exec", "read_file"]));
 
         // ran side-effect + reported -> do NOT arm (the regression being fixed:
-        // narrated consecutive exec/write_file chains were being rejected ~1/3
+        // narrated consecutive exec/write/edit chains were being rejected ~1/3
         // of the time)
         assert!(!should_arm_boundary(
             Some("Running wc -l to size the files."),
@@ -1690,6 +1814,10 @@ mod tests {
         assert!(!should_arm_boundary(
             Some("Writing the summary now."),
             &["write_file"]
+        ));
+        assert!(!should_arm_boundary(
+            Some("Updating the file now."),
+            &["edit_file"]
         ));
 
         // ordinary read tools do not arm
