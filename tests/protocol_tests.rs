@@ -468,14 +468,15 @@ fn local_assistant_preserves_tool_calls_for_lm_studio() {
         has_tool_calls,
         "local assistant should preserve tool_calls for LM Studio compatibility"
     );
-    // Tool results are still converted to user messages
-    let tool_result_as_user = wire.iter().any(|m| {
-        m["role"] == "user"
-            && m["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("tool execution complete")
-    });
+    // Tool results are still converted to user messages carrying the payload.
+    // Assert the invariant, not the header wording, which is free to change.
+    assert!(
+        !wire.iter().any(|m| m["role"] == "tool"),
+        "LocalProtocol must never emit role:tool"
+    );
+    let tool_result_as_user = wire
+        .iter()
+        .any(|m| m["role"] == "user" && m["content"].as_str().unwrap_or("").contains("data"));
     assert!(
         tool_result_as_user,
         "tool results should be converted to user messages"

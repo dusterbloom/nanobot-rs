@@ -25,17 +25,85 @@ fn ingest(engine: &mut LcmEngine, id: usize, role: &str, content: &str) {
     assert_eq!(engine.ingest(msg(id, role, content)), Some(id));
 }
 
+/// 24 lexically distinct subjects. Fixtures must not repeat the same phrasing
+/// every turn: `has_repetition_loop` rejects a summary whose 8-word windows
+/// recur, so a conversation of near-identical messages is uncompactable by
+/// design — an artifact of the fixture, not of the engine.
+const SUBJECTS: [&str; 24] = [
+    "ownership transfer across thread boundaries",
+    "borrow checker diagnostics for nested closures",
+    "lifetime elision inside trait objects",
+    "pinning self-referential async state machines",
+    "drop order for struct fields",
+    "interior mutability through RefCell guards",
+    "atomic ordering on weakly consistent hardware",
+    "monomorphisation cost of generic dispatch",
+    "zero copy parsing with byte slices",
+    "arena allocation for graph structures",
+    "trait coherence and orphan rules",
+    "const evaluation limits in array sizes",
+    "unsafe abstractions upholding aliasing invariants",
+    "panic unwinding versus abort strategies",
+    "cargo feature unification surprises",
+    "procedural macro hygiene pitfalls",
+    "iterator fusion and lazy adapters",
+    "error conversion chains with thiserror",
+    "async cancellation safety in select branches",
+    "tokio task budgeting under load",
+    "SIMD autovectorisation of hot loops",
+    "profile guided optimisation workflows",
+    "binary size reduction via panic immediate abort",
+    "cross compilation toolchain sysroots",
+];
+
+/// A user turn about a distinct subject. Boilerplate is kept under eight words
+/// so the extractive mock summary — which echoes user turns — never produces a
+/// repeated 8-word window.
+fn user_turn(i: usize) -> String {
+    format!("Question {i}: {}?", SUBJECTS[i % SUBJECTS.len()])
+}
+
+/// The matching assistant turn, deliberately longer than the user turn so the
+/// extractive mock summary is smaller than the block it replaces.
+fn assistant_turn(i: usize) -> String {
+    format!(
+        "Answer {i}: {} hinges on rules the compiler enforces statically. \
+         The worked example below walks through the failing case, the error the \
+         compiler reports, the minimal edit that satisfies it, and the runtime \
+         consequence of getting it wrong in a larger program.",
+        SUBJECTS[i % SUBJECTS.len()]
+    )
+}
+
 // ─────────────────────────────────────────────────────────────
 // Mock LLM for testing
 // ─────────────────────────────────────────────────────────────
 
 struct MockSummarizer;
 
+/// Extractive stand-in for a real summarizer: keep the user turns, drop the
+/// (longer) assistant turns. `summarize_text` enforces a fidelity gate — every
+/// source message's rare "topic anchor" words must survive — so a canned
+/// sentence is always rejected. Keeping the user lines verbatim satisfies the
+/// gate while still shrinking the block, which is what the engine asserts on.
+fn extractive_summary(compaction_request: &str) -> String {
+    let body = compaction_request
+        .split_once("[SOURCE_BEGIN]")
+        .and_then(|(_, rest)| rest.split_once("[SOURCE_END]"))
+        .map(|(src, _)| src)
+        .unwrap_or(compaction_request);
+    body.lines()
+        .filter_map(|line| line.strip_prefix("user: "))
+        .map(|line| format!("- {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[async_trait]
 impl LLMProvider for MockSummarizer {
     async fn chat(
         &self,
-        _messages: &[serde_json::Value],
+        messages: &[serde_json::Value],
         _tools: Option<&[serde_json::Value]>,
         _model: Option<&str>,
         _max_tokens: u32,
@@ -43,8 +111,13 @@ impl LLMProvider for MockSummarizer {
         _thinking_budget: Option<u32>,
         _top_p: Option<f64>,
     ) -> anyhow::Result<LLMResponse> {
+        let request = messages
+            .last()
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
         Ok(LLMResponse {
-            content: Some("User discussed Rust ownership and borrowing concepts.".to_string()),
+            content: Some(extractive_summary(request)),
             tool_calls: vec![],
             finish_reason: "stop".to_string(),
             usage: std::collections::HashMap::new(),
@@ -98,28 +171,8 @@ async fn test_compaction_creates_summary_node() {
 
     ingest(&mut engine, 1, "system", "System");
     for i in 0..10 {
-        ingest(
-            &mut engine,
-            2 + 2 * i,
-            "user",
-            &format!(
-                "Tell me about Rust ownership, borrowing, and lifetimes in detail. Turn {}. \
-                 I need a comprehensive explanation with examples and edge cases.",
-                i
-            ),
-        );
-        ingest(
-            &mut engine,
-            3 + 2 * i,
-            "assistant",
-            &format!(
-                "Rust ownership is a memory safety feature. Each value has exactly one owner. \
-                 When the owner goes out of scope, the value is dropped. Borrowing allows \
-                 temporary references. Lifetimes annotate how long references are valid. \
-                 This is turn {} of our conversation about memory management in Rust.",
-                i
-            ),
-        );
+        ingest(&mut engine, 2 + 2 * i, "user", &user_turn(i));
+        ingest(&mut engine, 3 + 2 * i, "assistant", &assistant_turn(i));
     }
 
     let budget = TokenBudget::new(4096, 2048);
@@ -156,21 +209,9 @@ async fn test_second_compaction_summarizes_after_first_summary() {
     ingest(&mut engine, 1, "system", "System");
     // Realistic-sized messages so the conversation exceeds the protect budget
     // and the block clears the MIN_COMPACTION_TOKENS floor.
-    let body =
-        "the quick brown fox jumps over the lazy dog while the model prefills tokens ".repeat(5);
     for i in 0..20 {
-        ingest(
-            &mut engine,
-            2 + 2 * i,
-            "user",
-            &format!("Message {}: {}", i, body),
-        );
-        ingest(
-            &mut engine,
-            3 + 2 * i,
-            "assistant",
-            &format!("Response {}: {}", i, body),
-        );
+        ingest(&mut engine, 2 + 2 * i, "user", &user_turn(i));
+        ingest(&mut engine, 3 + 2 * i, "assistant", &assistant_turn(i));
     }
 
     let budget = TokenBudget::new(4096, 2048);
