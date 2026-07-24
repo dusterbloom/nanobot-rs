@@ -11,178 +11,13 @@ use crate::agent::toolplan::{ToolPlan, ToolPlanAction};
 /// `has_tool()` so missing tools cause graceful fallthrough.
 pub fn route(user_text: &str, available_tools: &[String], policy: &SessionPolicy) -> ToolPlan {
     let lower = user_text.to_lowercase();
-    let has_tool = |name: &str| available_tools.iter().any(|t| t == name);
-    let has_url = lower.contains("http://") || lower.contains("https://");
 
-    // 1. research/summarize + URL → spawn researcher
-    //    Must precede plain URL to avoid web_fetch stealing research requests.
-    if has_url
-        && [
-            "research",
-            "report",
-            "summarize",
-            "summarise",
-            "analyze",
-            "analyse",
-        ]
-        .iter()
-        .any(|kw| lower.contains(kw))
-        && has_tool("spawn")
-    {
-        return ToolPlan {
-            action: ToolPlanAction::Subagent,
-            target: "researcher".to_string(),
-            args: json!({ "task": user_text }),
-            confidence: 0.5,
-            idempotency_key: "fallback:spawn_researcher".to_string(),
-        };
+    for rule in FALLBACK_RULES {
+        if rule.matches(&lower, available_tools, policy) {
+            return rule.plan(user_text, &lower);
+        }
     }
 
-    // 2. Plain URL / hacker news → web_fetch
-    if (has_url || lower.contains("hacker news")) && has_tool("web_fetch") {
-        let url = if lower.contains("hacker news") || lower.contains("hackernews") {
-            "https://news.ycombinator.com/".to_string()
-        } else {
-            user_text
-                .split_whitespace()
-                .find(|w| w.starts_with("http://") || w.starts_with("https://"))
-                .unwrap_or("https://example.com")
-                .to_string()
-        };
-        return ToolPlan {
-            action: ToolPlanAction::Tool,
-            target: "web_fetch".to_string(),
-            args: json!({ "url": url }),
-            confidence: 0.4,
-            idempotency_key: "fallback:web_fetch".to_string(),
-        };
-    }
-
-    // 3. "latest news" + local → spawn researcher
-    if lower.contains("latest news")
-        && has_tool("spawn")
-        && (lower.contains("local") || policy.local_only)
-    {
-        return ToolPlan {
-            action: ToolPlanAction::Subagent,
-            target: "researcher".to_string(),
-            args: json!({
-                "task": "Fetch latest news and summarize key points",
-            }),
-            confidence: 0.4,
-            idempotency_key: "fallback:spawn_local_news".to_string(),
-        };
-    }
-
-    // 4. read/show/cat + path → read_file
-    if has_path_like(&lower)
-        && ["read ", "show ", "cat ", "display ", "open "]
-            .iter()
-            .any(|kw| lower.contains(kw))
-        && has_tool("read_file")
-    {
-        return ToolPlan {
-            action: ToolPlanAction::Tool,
-            target: "read_file".to_string(),
-            args: json!({ "instruction": user_text }),
-            confidence: 0.5,
-            idempotency_key: "fallback:read_file".to_string(),
-        };
-    }
-
-    // 5. write/create + path → write_file
-    if has_path_like(&lower)
-        && (lower.starts_with("write ")
-            || lower.contains("write a new")
-            || lower.contains("create a file")
-            || lower.contains("save to "))
-        && has_tool("write_file")
-    {
-        return ToolPlan {
-            action: ToolPlanAction::Tool,
-            target: "write_file".to_string(),
-            args: json!({ "instruction": user_text }),
-            confidence: 0.4,
-            idempotency_key: "fallback:write_file".to_string(),
-        };
-    }
-
-    // 6. edit/modify + path → edit_file
-    if has_path_like(&lower)
-        && ["edit ", "modify ", "change ", "fix "]
-            .iter()
-            .any(|kw| lower.contains(kw))
-        && has_tool("edit_file")
-    {
-        return ToolPlan {
-            action: ToolPlanAction::Tool,
-            target: "edit_file".to_string(),
-            args: json!({ "instruction": user_text }),
-            confidence: 0.4,
-            idempotency_key: "fallback:edit_file".to_string(),
-        };
-    }
-
-    // 7. list/ls/directory → list_dir
-    if (lower.contains("list ") || lower.contains("ls ") || lower.starts_with("what files"))
-        && has_tool("list_dir")
-    {
-        return ToolPlan {
-            action: ToolPlanAction::Tool,
-            target: "list_dir".to_string(),
-            args: json!({ "path": user_text }),
-            confidence: 0.4,
-            idempotency_key: "fallback:list_dir".to_string(),
-        };
-    }
-
-    // 8. run/execute/cargo/npm/git → exec
-    if (["run ", "execute "].iter().any(|kw| lower.starts_with(kw))
-        || [
-            "run the ",
-            "execute the ",
-            "build the ",
-            "compile the ",
-            "run my ",
-        ]
-        .iter()
-        .any(|v| lower.contains(v))
-        || ["cargo ", "npm ", "git ", "make ", "python "]
-            .iter()
-            .any(|cmd| lower.starts_with(cmd)))
-        && has_tool("exec")
-    {
-        return ToolPlan {
-            action: ToolPlanAction::Tool,
-            target: "exec".to_string(),
-            args: json!({ "command": user_text }),
-            confidence: 0.3,
-            idempotency_key: "fallback:exec".to_string(),
-        };
-    }
-
-    // 9. search/look up (no path) → web_search
-    if [
-        "search for ",
-        "search about ",
-        "look up ",
-        "find out about ",
-        "google ",
-    ]
-    .iter()
-    .any(|kw| lower.contains(kw))
-        && has_tool("web_search")
-    {
-        return ToolPlan {
-            action: ToolPlanAction::Tool,
-            target: "web_search".to_string(),
-            args: json!({ "query": user_text }),
-            confidence: 0.4,
-            idempotency_key: "fallback:web_search".to_string(),
-        };
-    }
-
-    // 10. default → ask_user
     ToolPlan {
         action: ToolPlanAction::AskUser,
         target: "clarify".to_string(),
@@ -190,6 +25,140 @@ pub fn route(user_text: &str, available_tools: &[String], policy: &SessionPolicy
         confidence: 0.2,
         idempotency_key: "fallback:ask_user".to_string(),
     }
+}
+
+#[derive(Clone, Copy)]
+struct FallbackRule(
+    &'static str,
+    Select,
+    KeywordMatcher,
+    ExtraPredicate,
+    &'static str,
+    f64,
+);
+
+#[rustfmt::skip]
+const FALLBACK_RULES: &[FallbackRule] = &[
+    // Must precede plain URL to avoid web_fetch stealing research requests.
+    FallbackRule("spawn_researcher", Select::Subagent("researcher", ArgsKind::Task), KeywordMatcher::ContainsAny(&["research", "report", "summarize", "summarise", "analyze", "analyse"]), ExtraPredicate::ContainsUrl, "spawn", 0.5),
+    FallbackRule("web_fetch", Select::Tool("web_fetch", ArgsKind::Url), KeywordMatcher::None, ExtraPredicate::UrlOrHackerNews, "web_fetch", 0.4),
+    FallbackRule("spawn_local_news", Select::Subagent("researcher", ArgsKind::LocalNewsTask), KeywordMatcher::ContainsAny(&["latest news"]), ExtraPredicate::LocalNews, "spawn", 0.4),
+    FallbackRule("read_file", Select::Tool("read_file", ArgsKind::Instruction), KeywordMatcher::ContainsAny(&["read ", "show ", "cat ", "display ", "open "]), ExtraPredicate::ContainsPath, "read_file", 0.5),
+    FallbackRule("write_file", Select::Tool("write_file", ArgsKind::Instruction), KeywordMatcher::Mixed(&["write a new", "create a file", "save to "], &["write "]), ExtraPredicate::ContainsPath, "write_file", 0.4),
+    FallbackRule("edit_file", Select::Tool("edit_file", ArgsKind::Instruction), KeywordMatcher::ContainsAny(&["edit ", "modify ", "change ", "fix "]), ExtraPredicate::ContainsPath, "edit_file", 0.4),
+    FallbackRule("list_dir", Select::Tool("list_dir", ArgsKind::Path), KeywordMatcher::Mixed(&["list ", "ls "], &["what files"]), ExtraPredicate::None, "list_dir", 0.4),
+    FallbackRule("exec", Select::Tool("exec", ArgsKind::Command), KeywordMatcher::Mixed(&["run the ", "execute the ", "build the ", "compile the ", "run my "], &["run ", "execute ", "cargo ", "npm ", "git ", "make ", "python "]), ExtraPredicate::None, "exec", 0.3),
+    FallbackRule("web_search", Select::Tool("web_search", ArgsKind::Query), KeywordMatcher::ContainsAny(&["search for ", "search about ", "look up ", "find out about ", "google "]), ExtraPredicate::None, "web_search", 0.4),
+];
+
+impl FallbackRule {
+    fn matches(&self, lower: &str, available_tools: &[String], policy: &SessionPolicy) -> bool {
+        available_tools.iter().any(|tool| tool == self.4)
+            && self.2.matches(lower)
+            && self.3.matches(lower, policy)
+    }
+
+    fn plan(&self, user_text: &str, lower: &str) -> ToolPlan {
+        let (action, target, args) = match self.1 {
+            Select::Subagent(target, args) => (ToolPlanAction::Subagent, target, args),
+            Select::Tool(target, args) => (ToolPlanAction::Tool, target, args),
+        };
+        ToolPlan {
+            action,
+            target: target.to_string(),
+            args: args.to_json(user_text, lower),
+            confidence: self.5,
+            idempotency_key: format!("fallback:{}", self.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Select {
+    Subagent(&'static str, ArgsKind),
+    Tool(&'static str, ArgsKind),
+}
+
+#[derive(Clone, Copy)]
+enum ArgsKind {
+    Command,
+    Instruction,
+    LocalNewsTask,
+    Path,
+    Query,
+    Task,
+    Url,
+}
+
+impl ArgsKind {
+    fn to_json(self, user_text: &str, lower: &str) -> serde_json::Value {
+        match self {
+            Self::Command => json!({ "command": user_text }),
+            Self::Instruction => json!({ "instruction": user_text }),
+            Self::LocalNewsTask => json!({ "task": "Fetch latest news and summarize key points" }),
+            Self::Path => json!({ "path": user_text }),
+            Self::Query => json!({ "query": user_text }),
+            Self::Task => json!({ "task": user_text }),
+            Self::Url => json!({ "url": web_fetch_url(user_text, lower) }),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KeywordMatcher {
+    ContainsAny(&'static [&'static str]),
+    Mixed(&'static [&'static str], &'static [&'static str]),
+    None,
+}
+
+impl KeywordMatcher {
+    fn matches(self, lower: &str) -> bool {
+        match self {
+            Self::ContainsAny(terms) => terms.iter().any(|term| lower.contains(term)),
+            Self::Mixed(contains, starts) => {
+                contains.iter().any(|term| lower.contains(term))
+                    || starts.iter().any(|term| lower.starts_with(term))
+            }
+            Self::None => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExtraPredicate {
+    ContainsPath,
+    ContainsUrl,
+    LocalNews,
+    None,
+    UrlOrHackerNews,
+}
+
+impl ExtraPredicate {
+    fn matches(self, lower: &str, policy: &SessionPolicy) -> bool {
+        match self {
+            Self::ContainsPath => has_path_like(lower),
+            Self::ContainsUrl => has_url(lower),
+            Self::LocalNews => lower.contains("local") || policy.local_only,
+            Self::None => true,
+            Self::UrlOrHackerNews => has_url(lower) || lower.contains("hacker news"),
+        }
+    }
+}
+
+fn has_url(lower: &str) -> bool {
+    lower.contains("http://") || lower.contains("https://")
+}
+
+fn web_fetch_url(user_text: &str, lower: &str) -> String {
+    if lower.contains("hacker news") || lower.contains("hackernews") {
+        return "https://news.ycombinator.com/".to_string();
+    }
+
+    user_text
+        .split_whitespace()
+        .find(|word| word.starts_with("http://") || word.starts_with("https://"))
+        .unwrap_or("https://example.com")
+        .to_string()
 }
 
 /// Heuristic: does the lowercased text look like it contains a file path?
