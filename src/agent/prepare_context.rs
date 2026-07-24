@@ -232,14 +232,14 @@ impl AgentLoopShared {
         let session_policy = {
             let mut map = self.session_policies.lock().await;
             let entry = map.entry(session_key.clone()).or_default();
-            if core.tool_delegation_config.strict_local_only {
+            if core.tool_delegation_config.strict_local_only() {
                 entry.local_only = true;
             }
             policy::update_from_user_text(entry, &msg.content);
             entry.clone()
         };
         let strict_local_only =
-            core.tool_delegation_config.strict_local_only || session_policy.local_only;
+            core.tool_delegation_config.strict_local_only() || session_policy.local_only;
 
         tracing::debug!(
             "Processing message{} from {} on {}: {}",

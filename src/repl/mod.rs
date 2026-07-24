@@ -1980,8 +1980,8 @@ pub(crate) fn cmd_agent(
         // can handle tools directly. Must happen BEFORE build_core_handle so the core
         // gets the updated tool_delegation_config.
         if lms_features
-            && config.tool_delegation.strict_no_tools_main
-            && config.tool_delegation.strict_router_schema
+            && config.tool_delegation.strict_no_tools_main()
+            && config.tool_delegation.strict_router_schema()
         {
             let router_available = if srv.lms_managed || has_remote_local {
                 // For both managed (started by nanobot) and remote LM Studio,
@@ -2008,15 +2008,14 @@ pub(crate) fn cmd_agent(
 
             if !router_available {
                 info!("trio_downgrade: router not available, clearing strict flags");
-                config.tool_delegation.strict_no_tools_main = false;
-                config.tool_delegation.strict_router_schema = false;
+                config.tool_delegation.clear_strict_router();
             }
         }
 
         info!(
             delegation_mode = ?config.tool_delegation.mode,
-            strict_no_tools_main = config.tool_delegation.strict_no_tools_main,
-            strict_router_schema = config.tool_delegation.strict_router_schema,
+            strict_no_tools_main = config.tool_delegation.strict_no_tools_main(),
+            strict_router_schema = config.tool_delegation.strict_router_schema(),
             is_local,
             "delegation_config_at_core_build"
         );

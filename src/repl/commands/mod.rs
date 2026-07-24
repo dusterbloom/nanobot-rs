@@ -1061,7 +1061,6 @@ impl ReplContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::DelegationMode;
 
     #[test]
     fn test_normalize_alias_all_aliases() {
@@ -1255,13 +1254,13 @@ mod tests {
         trio_enable(&mut cfg);
 
         assert!(cfg.trio.enabled);
-        assert_eq!(cfg.tool_delegation.mode, DelegationMode::Trio);
+        assert!(cfg.tool_delegation.mode.is_trio());
         assert!(
             cfg.tool_delegation.enabled,
             "delegation must stay on for trio"
         );
-        assert!(cfg.tool_delegation.strict_no_tools_main);
-        assert!(cfg.tool_delegation.strict_router_schema);
+        assert!(cfg.tool_delegation.strict_no_tools_main());
+        assert!(cfg.tool_delegation.strict_router_schema());
         assert!(cfg.tool_delegation.role_scoped_context_packs);
     }
 
@@ -1274,10 +1273,10 @@ mod tests {
         trio_disable(&mut cfg);
 
         assert!(!cfg.trio.enabled);
-        assert_eq!(cfg.tool_delegation.mode, DelegationMode::Inline);
+        assert!(cfg.tool_delegation.mode.is_inline());
         assert!(!cfg.tool_delegation.enabled, "inline disables delegation");
-        assert!(!cfg.tool_delegation.strict_no_tools_main);
-        assert!(!cfg.tool_delegation.strict_router_schema);
+        assert!(!cfg.tool_delegation.strict_no_tools_main());
+        assert!(!cfg.tool_delegation.strict_router_schema());
         assert!(!cfg.tool_delegation.role_scoped_context_packs);
     }
 
@@ -1290,8 +1289,8 @@ mod tests {
         trio_enable(&mut cfg);
 
         assert!(cfg.trio.enabled);
-        assert_eq!(cfg.tool_delegation.mode, DelegationMode::Trio);
-        assert!(cfg.tool_delegation.strict_no_tools_main);
+        assert!(cfg.tool_delegation.mode.is_trio());
+        assert!(cfg.tool_delegation.strict_no_tools_main());
     }
 
     #[test]
@@ -1302,8 +1301,8 @@ mod tests {
         trio_disable(&mut cfg);
 
         assert!(!cfg.trio.enabled);
-        assert_eq!(cfg.tool_delegation.mode, DelegationMode::Inline);
-        assert!(!cfg.tool_delegation.strict_no_tools_main);
+        assert!(cfg.tool_delegation.mode.is_inline());
+        assert!(!cfg.tool_delegation.strict_no_tools_main());
     }
 
     #[test]
@@ -1405,9 +1404,7 @@ mod tests {
         live.trio.enabled = true;
         live.trio.router_model = "qwen3-1.7b".to_string();
         live.trio.specialist_model = "ministral-3-8b".to_string();
-        live.tool_delegation.mode = DelegationMode::Trio;
-        live.tool_delegation.strict_no_tools_main = true;
-        live.tool_delegation.strict_router_schema = true;
+        live.tool_delegation.mode = DelegationMode::trio();
         live.tool_delegation.role_scoped_context_packs = true;
 
         let mut disk = Config::default();
@@ -1416,9 +1413,9 @@ mod tests {
         assert!(disk.trio.enabled);
         assert_eq!(disk.trio.router_model, "qwen3-1.7b");
         assert_eq!(disk.trio.specialist_model, "ministral-3-8b");
-        assert_eq!(disk.tool_delegation.mode, DelegationMode::Trio);
-        assert!(disk.tool_delegation.strict_no_tools_main);
-        assert!(disk.tool_delegation.strict_router_schema);
+        assert!(disk.tool_delegation.mode.is_trio());
+        assert!(disk.tool_delegation.strict_no_tools_main());
+        assert!(disk.tool_delegation.strict_router_schema());
         assert!(disk.tool_delegation.role_scoped_context_packs);
     }
 
@@ -1455,15 +1452,15 @@ mod tests {
 
         trio_enable(&mut cfg);
         assert!(cfg.trio.enabled);
-        assert!(cfg.tool_delegation.strict_no_tools_main);
+        assert!(cfg.tool_delegation.strict_no_tools_main());
 
         trio_disable(&mut cfg);
         assert!(!cfg.trio.enabled);
-        assert!(!cfg.tool_delegation.strict_no_tools_main);
+        assert!(!cfg.tool_delegation.strict_no_tools_main());
 
         trio_enable(&mut cfg);
         assert!(cfg.trio.enabled);
-        assert!(cfg.tool_delegation.strict_no_tools_main);
+        assert!(cfg.tool_delegation.strict_no_tools_main());
         assert_eq!(
             cfg.trio.router_model, "qwen3-1.7b",
             "models survive roundtrip"
@@ -1654,7 +1651,7 @@ mod tests {
             "ministral-3-8b",
             false,
             false,
-            &DelegationMode::Delegated,
+            &DelegationMode::delegated(),
         ));
     }
 
@@ -1667,7 +1664,7 @@ mod tests {
             "ministral-3-8b",
             false,
             false,
-            &DelegationMode::Delegated,
+            &DelegationMode::delegated(),
         ));
     }
 
@@ -1680,7 +1677,7 @@ mod tests {
             "ministral-3-8b",
             false,
             false,
-            &DelegationMode::Delegated,
+            &DelegationMode::delegated(),
         ));
     }
 
@@ -1693,7 +1690,7 @@ mod tests {
             "",
             false,
             false,
-            &DelegationMode::Delegated,
+            &DelegationMode::delegated(),
         ));
     }
 
@@ -1706,7 +1703,7 @@ mod tests {
             "ministral-3-8b",
             false,
             false,
-            &DelegationMode::Trio,
+            &DelegationMode::trio(),
         ));
     }
 
@@ -1720,7 +1717,7 @@ mod tests {
             "ministral-3-8b",
             false,
             false,
-            &DelegationMode::Inline,
+            &DelegationMode::inline(),
         ));
     }
 
@@ -1733,7 +1730,7 @@ mod tests {
             "",
             false,
             false,
-            &DelegationMode::Delegated,
+            &DelegationMode::delegated(),
         ));
     }
 
@@ -1747,7 +1744,7 @@ mod tests {
             "",
             true,
             true,
-            &DelegationMode::Delegated,
+            &DelegationMode::delegated(),
         ));
         // Neither GGUF nor endpoints → should NOT activate
         assert!(!should_auto_activate_trio(
@@ -1756,7 +1753,7 @@ mod tests {
             "",
             false,
             false,
-            &DelegationMode::Delegated,
+            &DelegationMode::delegated(),
         ));
         // GGUF models (no endpoint) → still activates (existing behavior preserved)
         assert!(should_auto_activate_trio(
@@ -1765,7 +1762,7 @@ mod tests {
             "spec.gguf",
             false,
             false,
-            &DelegationMode::Delegated,
+            &DelegationMode::delegated(),
         ));
     }
 
@@ -1899,14 +1896,14 @@ mod tests {
             &config.trio.specialist_model,
             false,
             false,
-            &DelegationMode::Delegated,
+            &DelegationMode::delegated(),
         ));
 
         // Step 4: trio_enable activates without warning
         let needs_warning = trio_enable(&mut config);
         assert!(!needs_warning);
         assert!(config.trio.enabled);
-        assert_eq!(config.tool_delegation.mode, DelegationMode::Trio);
+        assert!(config.tool_delegation.mode.is_trio());
     }
 
     #[test]

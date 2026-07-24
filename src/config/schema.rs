@@ -1431,22 +1431,194 @@ fn default_td_max_tokens() -> u32 {
     1024
 }
 
-/// High-level delegation mode that sets sensible defaults for the strict flags.
+/// High-level delegation mode with its strict routing policy attached.
 ///
 /// Use this instead of configuring individual `strict_*` booleans:
 /// - **Inline**: Main model calls tools directly (no delegation).
 /// - **Delegated**: Tools delegated to a cheaper tool runner model.
 /// - **Trio**: Strict separation — main=conversation, router=dispatch, specialist=execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationMode {
     /// Main model calls tools directly (delegation disabled).
-    Inline,
+    Inline(DelegationStrictPolicy),
     /// Tools delegated to tool runner model (default).
+    Delegated(DelegationStrictPolicy),
+    /// Strict trio: main=orchestrator, router=dispatch, specialist=tools.
+    Trio(DelegationStrictPolicy),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegationStrictPolicy {
+    strict_no_tools_main: bool,
+    strict_router_schema: bool,
+    strict_local_only: bool,
+    strict_toolplan_validation: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum DelegationModeName {
+    Inline,
     #[default]
     Delegated,
-    /// Strict trio: main=orchestrator, router=dispatch, specialist=tools.
     Trio,
+}
+
+#[derive(Default)]
+struct LegacyStrictPolicy {
+    strict_no_tools_main: Option<bool>,
+    strict_router_schema: Option<bool>,
+    strict_local_only: Option<bool>,
+    strict_toolplan_validation: Option<bool>,
+}
+
+impl Default for DelegationMode {
+    fn default() -> Self {
+        Self::delegated()
+    }
+}
+
+impl Serialize for DelegationMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.name().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DelegationMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match DelegationModeName::deserialize(deserializer)? {
+            DelegationModeName::Inline => Self::inline(),
+            DelegationModeName::Delegated => Self::delegated(),
+            DelegationModeName::Trio => Self::trio(),
+        })
+    }
+}
+
+impl DelegationMode {
+    pub const fn inline() -> Self {
+        Self::Inline(DelegationStrictPolicy::inline())
+    }
+
+    pub const fn delegated() -> Self {
+        Self::Delegated(DelegationStrictPolicy::delegated())
+    }
+
+    pub const fn trio() -> Self {
+        Self::Trio(DelegationStrictPolicy::trio())
+    }
+
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline(_))
+    }
+
+    pub fn is_delegated(&self) -> bool {
+        matches!(self, Self::Delegated(_))
+    }
+
+    pub fn is_trio(&self) -> bool {
+        matches!(self, Self::Trio(_))
+    }
+
+    pub fn strict_no_tools_main(&self) -> bool {
+        self.strict_policy().strict_no_tools_main
+    }
+
+    pub fn strict_router_schema(&self) -> bool {
+        self.strict_policy().strict_router_schema
+    }
+
+    pub fn strict_local_only(&self) -> bool {
+        self.strict_policy().strict_local_only
+    }
+
+    pub fn strict_toolplan_validation(&self) -> bool {
+        self.strict_policy().strict_toolplan_validation
+    }
+
+    fn name(&self) -> DelegationModeName {
+        match self {
+            Self::Inline(_) => DelegationModeName::Inline,
+            Self::Delegated(_) => DelegationModeName::Delegated,
+            Self::Trio(_) => DelegationModeName::Trio,
+        }
+    }
+
+    fn strict_policy(&self) -> DelegationStrictPolicy {
+        match *self {
+            Self::Inline(policy) | Self::Delegated(policy) | Self::Trio(policy) => policy,
+        }
+    }
+
+    fn with_legacy_strict(self, legacy: LegacyStrictPolicy) -> Self {
+        let policy = self.strict_policy().with_legacy(legacy);
+        match self {
+            Self::Inline(_) => Self::Inline(policy),
+            Self::Delegated(_) => Self::Delegated(policy),
+            Self::Trio(_) => Self::Trio(policy),
+        }
+    }
+
+    fn without_strict_router(self) -> Self {
+        let policy = self.strict_policy().without_strict_router();
+        match self {
+            Self::Inline(_) => Self::Inline(policy),
+            Self::Delegated(_) => Self::Delegated(policy),
+            Self::Trio(_) => Self::Trio(policy),
+        }
+    }
+}
+
+impl DelegationStrictPolicy {
+    const fn inline() -> Self {
+        Self {
+            strict_no_tools_main: false,
+            strict_router_schema: false,
+            strict_local_only: false,
+            strict_toolplan_validation: true,
+        }
+    }
+
+    const fn delegated() -> Self {
+        Self::inline()
+    }
+
+    const fn trio() -> Self {
+        Self {
+            strict_no_tools_main: true,
+            strict_router_schema: true,
+            strict_local_only: false,
+            strict_toolplan_validation: true,
+        }
+    }
+
+    fn with_legacy(self, legacy: LegacyStrictPolicy) -> Self {
+        Self {
+            strict_no_tools_main: legacy
+                .strict_no_tools_main
+                .unwrap_or(self.strict_no_tools_main),
+            strict_router_schema: legacy
+                .strict_router_schema
+                .unwrap_or(self.strict_router_schema),
+            strict_local_only: legacy.strict_local_only.unwrap_or(self.strict_local_only),
+            strict_toolplan_validation: legacy
+                .strict_toolplan_validation
+                .unwrap_or(self.strict_toolplan_validation),
+        }
+    }
+
+    fn without_strict_router(self) -> Self {
+        Self {
+            strict_no_tools_main: false,
+            strict_router_schema: false,
+            ..self
+        }
+    }
 }
 
 /// Configuration for delegating tool execution loops to a cheaper model.
@@ -1454,10 +1626,10 @@ pub enum DelegationMode {
 /// When enabled, tool calls from the main LLM are handed off to a lightweight
 /// model that executes the tools and interprets their results, conserving the
 /// main model's context window for reasoning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDelegationConfig {
-    /// High-level mode (overrides strict_* flags when set).
+    /// High-level mode and strict routing policy.
     /// Defaults to `Delegated`. Set to `trio` for strict separation or
     /// `inline` to disable delegation entirely.
     #[serde(default)]
@@ -1510,26 +1682,9 @@ pub struct ToolDelegationConfig {
     #[serde(default)]
     pub default_subagent_model: String,
 
-    /// When true, reject direct tool calls emitted by the main model.
-    /// The main model is forced into conversation/orchestration-only behavior.
-    #[serde(default)]
-    pub strict_no_tools_main: bool,
-
-    /// When true, require router outputs to match strict JSON schema.
-    #[serde(default)]
-    pub strict_router_schema: bool,
-
     /// When true, build and use role-scoped context packs per turn.
     #[serde(default)]
     pub role_scoped_context_packs: bool,
-
-    /// When true, force all subagents/tools to local-only model choices.
-    #[serde(default)]
-    pub strict_local_only: bool,
-
-    /// When true, validate normalized ToolPlan before any tool execution.
-    #[serde(default = "default_true")]
-    pub strict_toolplan_validation: bool,
 
     /// When true, use deterministic fallback routing when router output is invalid.
     #[serde(default = "default_true")]
@@ -1580,11 +1735,7 @@ impl Default for ToolDelegationConfig {
             auto_local: true,
             cost_budget: default_td_cost_budget(),
             default_subagent_model: String::new(),
-            strict_no_tools_main: false,
-            strict_router_schema: false,
             role_scoped_context_packs: false,
-            strict_local_only: false,
-            strict_toolplan_validation: true,
             deterministic_router_fallback: true,
             max_same_tool_call_per_turn: default_td_max_same_tool_call(),
             subagent: SubagentTuning::default(),
@@ -1594,31 +1745,136 @@ impl Default for ToolDelegationConfig {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ToolDelegationConfigWire {
+    mode: DelegationMode,
+    enabled: bool,
+    model: String,
+    provider: Option<ProviderConfig>,
+    max_iterations: u32,
+    max_tokens: u32,
+    slim_results: bool,
+    max_result_preview_chars: usize,
+    auto_local: bool,
+    cost_budget: f64,
+    default_subagent_model: String,
+    strict_no_tools_main: Option<bool>,
+    strict_router_schema: Option<bool>,
+    role_scoped_context_packs: bool,
+    strict_local_only: Option<bool>,
+    strict_toolplan_validation: Option<bool>,
+    deterministic_router_fallback: bool,
+    max_same_tool_call_per_turn: u32,
+    subagent: SubagentTuning,
+    router_tuning: RouterTuningConfig,
+    specialist_synthesis: bool,
+}
+
+impl Default for ToolDelegationConfigWire {
+    fn default() -> Self {
+        let default = ToolDelegationConfig::default();
+        Self {
+            mode: default.mode,
+            enabled: default.enabled,
+            model: default.model,
+            provider: default.provider,
+            max_iterations: default.max_iterations,
+            max_tokens: default.max_tokens,
+            slim_results: default.slim_results,
+            max_result_preview_chars: default.max_result_preview_chars,
+            auto_local: default.auto_local,
+            cost_budget: default.cost_budget,
+            default_subagent_model: default.default_subagent_model,
+            strict_no_tools_main: None,
+            strict_router_schema: None,
+            role_scoped_context_packs: default.role_scoped_context_packs,
+            strict_local_only: None,
+            strict_toolplan_validation: None,
+            deterministic_router_fallback: default.deterministic_router_fallback,
+            max_same_tool_call_per_turn: default.max_same_tool_call_per_turn,
+            subagent: default.subagent,
+            router_tuning: default.router_tuning,
+            specialist_synthesis: default.specialist_synthesis,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolDelegationConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ToolDelegationConfigWire::deserialize(deserializer)?;
+        let mode = wire.mode.with_legacy_strict(LegacyStrictPolicy {
+            strict_no_tools_main: wire.strict_no_tools_main,
+            strict_router_schema: wire.strict_router_schema,
+            strict_local_only: wire.strict_local_only,
+            strict_toolplan_validation: wire.strict_toolplan_validation,
+        });
+
+        Ok(Self {
+            mode,
+            enabled: wire.enabled,
+            model: wire.model,
+            provider: wire.provider,
+            max_iterations: wire.max_iterations,
+            max_tokens: wire.max_tokens,
+            slim_results: wire.slim_results,
+            max_result_preview_chars: wire.max_result_preview_chars,
+            auto_local: wire.auto_local,
+            cost_budget: wire.cost_budget,
+            default_subagent_model: wire.default_subagent_model,
+            role_scoped_context_packs: wire.role_scoped_context_packs,
+            deterministic_router_fallback: wire.deterministic_router_fallback,
+            max_same_tool_call_per_turn: wire.max_same_tool_call_per_turn,
+            subagent: wire.subagent,
+            router_tuning: wire.router_tuning,
+            specialist_synthesis: wire.specialist_synthesis,
+        })
+    }
+}
+
 impl ToolDelegationConfig {
     /// Apply the high-level `mode` to the individual strict flags.
     ///
     /// Call after deserialization to ensure the mode takes effect.
-    /// Individual flag overrides in the JSON are clobbered by mode.
+    /// The strict policy itself lives inside `mode`; this only aligns the
+    /// non-strict runtime switches that still derive from the preset.
     pub fn apply_mode(&mut self) {
         match self.mode {
-            DelegationMode::Inline => {
+            DelegationMode::Inline(_) => {
                 self.enabled = false;
-                self.strict_no_tools_main = false;
-                self.strict_router_schema = false;
                 self.role_scoped_context_packs = false;
             }
-            DelegationMode::Delegated => {
+            DelegationMode::Delegated(_) => {
                 self.enabled = true;
-                self.strict_no_tools_main = false;
-                self.strict_router_schema = false;
             }
-            DelegationMode::Trio => {
+            DelegationMode::Trio(_) => {
                 self.enabled = true;
-                self.strict_no_tools_main = true;
-                self.strict_router_schema = true;
                 self.role_scoped_context_packs = true;
             }
         }
+    }
+
+    pub fn strict_no_tools_main(&self) -> bool {
+        self.mode.strict_policy().strict_no_tools_main
+    }
+
+    pub fn strict_router_schema(&self) -> bool {
+        self.mode.strict_policy().strict_router_schema
+    }
+
+    pub fn strict_local_only(&self) -> bool {
+        self.mode.strict_policy().strict_local_only
+    }
+
+    pub fn strict_toolplan_validation(&self) -> bool {
+        self.mode.strict_policy().strict_toolplan_validation
+    }
+
+    pub fn clear_strict_router(&mut self) {
+        self.mode = self.mode.without_strict_router();
     }
 }
 
@@ -2353,11 +2609,11 @@ mod tests {
         assert!(td.slim_results);
         assert_eq!(td.max_result_preview_chars, 200);
         assert!(td.auto_local);
-        assert!(!td.strict_no_tools_main);
-        assert!(!td.strict_router_schema);
+        assert!(!td.strict_no_tools_main());
+        assert!(!td.strict_router_schema());
         assert!(!td.role_scoped_context_packs);
-        assert!(!td.strict_local_only);
-        assert!(td.strict_toolplan_validation);
+        assert!(!td.strict_local_only());
+        assert!(td.strict_toolplan_validation());
         assert!(td.deterministic_router_fallback);
         assert_eq!(td.max_same_tool_call_per_turn, 3);
     }
@@ -2378,15 +2634,11 @@ mod tests {
             auto_local: true,
             cost_budget: 0.01,
             default_subagent_model: String::new(),
-            strict_no_tools_main: true,
-            strict_router_schema: true,
             role_scoped_context_packs: true,
-            strict_local_only: true,
-            strict_toolplan_validation: true,
             deterministic_router_fallback: true,
             max_same_tool_call_per_turn: 1,
             specialist_synthesis: true,
-            mode: DelegationMode::Trio,
+            mode: DelegationMode::trio(),
             subagent: SubagentTuning::default(),
             router_tuning: RouterTuningConfig::default(),
         };
@@ -2397,13 +2649,33 @@ mod tests {
         assert_eq!(td2.max_iterations, 10);
         assert_eq!(td2.max_tokens, 2048);
         assert!(td2.provider.is_some());
-        assert!(td2.strict_no_tools_main);
-        assert!(td2.strict_router_schema);
+        assert!(td2.strict_no_tools_main());
+        assert!(td2.strict_router_schema());
         assert!(td2.role_scoped_context_packs);
-        assert!(td2.strict_local_only);
-        assert!(td2.strict_toolplan_validation);
+        assert!(!td2.strict_local_only());
+        assert!(td2.strict_toolplan_validation());
         assert!(td2.deterministic_router_fallback);
         assert_eq!(td2.max_same_tool_call_per_turn, 1);
+    }
+
+    #[test]
+    fn test_tool_delegation_old_shape_strict_flags_deserialize() {
+        let json = r#"{
+            "enabled": true,
+            "mode": "delegated",
+            "strictNoToolsMain": true,
+            "strictRouterSchema": true,
+            "strictLocalOnly": true,
+            "strictToolplanValidation": false
+        }"#;
+        let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
+
+        assert!(td.enabled);
+        assert!(td.mode.is_delegated());
+        assert!(td.strict_no_tools_main());
+        assert!(td.strict_router_schema());
+        assert!(td.strict_local_only());
+        assert!(!td.strict_toolplan_validation());
     }
 
     #[test]

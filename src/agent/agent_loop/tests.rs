@@ -1203,7 +1203,7 @@ fn build_trio_e2e_harness(
     let workspace = tempfile::tempdir().unwrap().keep();
 
     let mut td = ToolDelegationConfig {
-        mode: crate::config::schema::DelegationMode::Trio,
+        mode: crate::config::schema::DelegationMode::trio(),
         ..Default::default()
     };
     td.apply_mode();
@@ -1665,7 +1665,7 @@ async fn test_trio_e2e_router_unreachable() {
 
     let workspace = tempfile::tempdir().unwrap().keep();
     let mut td = ToolDelegationConfig {
-        mode: DelegationMode::Trio,
+        mode: DelegationMode::trio(),
         ..Default::default()
     };
     td.apply_mode();
@@ -1783,7 +1783,7 @@ async fn test_trio_e2e_specialist_unreachable() {
 
     let workspace = tempfile::tempdir().unwrap().keep();
     let mut td = ToolDelegationConfig {
-        mode: DelegationMode::Trio,
+        mode: DelegationMode::trio(),
         ..Default::default()
     };
     td.apply_mode();
@@ -2421,10 +2421,10 @@ fn build_trio_offline_harness(
     let workspace = tempfile::tempdir().unwrap().keep();
 
     let mut td = ToolDelegationConfig {
-        mode: crate::config::schema::DelegationMode::Trio,
+        mode: crate::config::schema::DelegationMode::trio(),
         ..Default::default()
     };
-    td.apply_mode(); // sets strict_no_tools_main = true, strict_router_schema = true
+    td.apply_mode(); // trio mode carries strict_no_tools_main + strict_router_schema
 
     let router_model = router.get_default_model().to_string();
     let specialist_model = specialist.get_default_model().to_string();
@@ -4477,7 +4477,7 @@ async fn test_trio_offline_e2e_health_gate() {
     // Build harness manually so we can wire in the health registry.
     let workspace = tempfile::tempdir().unwrap().keep();
     let mut td = ToolDelegationConfig {
-        mode: crate::config::schema::DelegationMode::Trio,
+        mode: crate::config::schema::DelegationMode::trio(),
         ..Default::default()
     };
     td.apply_mode();

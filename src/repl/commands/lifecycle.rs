@@ -1513,8 +1513,8 @@ impl ReplContext {
 
             // When trio strict mode is on but router model is unavailable,
             // disable strict flags so the single model can handle tools directly.
-            if self.config.tool_delegation.strict_no_tools_main
-                && self.config.tool_delegation.strict_router_schema
+            if self.config.tool_delegation.strict_no_tools_main()
+                && self.config.tool_delegation.strict_router_schema()
             {
                 let router_available = if self.srv.lms_managed {
                     let lms_port = self.config.agents.defaults.lms_port;
@@ -1524,8 +1524,7 @@ impl ReplContext {
                     !self.config.trio.router_model.is_empty()
                 };
                 if !router_available {
-                    self.config.tool_delegation.strict_no_tools_main = false;
-                    self.config.tool_delegation.strict_router_schema = false;
+                    self.config.tool_delegation.clear_strict_router();
                 }
             }
 

@@ -862,14 +862,14 @@ pub(crate) async fn router_preflight(
 ) -> PreflightResult {
     // migrated from swappable().is_local — phase 09-03
     if !(ctx.core.mode().is_local()
-        && ctx.core.tool_delegation_config.strict_no_tools_main
-        && ctx.core.tool_delegation_config.strict_router_schema
+        && ctx.core.tool_delegation_config.strict_no_tools_main()
+        && ctx.core.tool_delegation_config.strict_router_schema()
         && !ctx.flow.router_preflight_done)
     {
         if ctx.core.mode().is_local() && !ctx.flow.router_preflight_done {
             debug!(
-                strict_no_tools_main = ctx.core.tool_delegation_config.strict_no_tools_main,
-                strict_router_schema = ctx.core.tool_delegation_config.strict_router_schema,
+                strict_no_tools_main = ctx.core.tool_delegation_config.strict_no_tools_main(),
+                strict_router_schema = ctx.core.tool_delegation_config.strict_router_schema(),
                 "router_preflight_skipped"
             );
         }
@@ -1385,7 +1385,7 @@ pub(crate) async fn route_tool_calls(
     let mut selected_plan: Option<toolplan::ToolPlan> = None;
     let available_tools = ctx.tools.tool_names();
 
-    if ctx.core.tool_delegation_config.strict_router_schema {
+    if ctx.core.tool_delegation_config.strict_router_schema() {
         let task_state = format!(
             "Main content: {}\nCandidate tool calls: {}",
             response_content.unwrap_or("(empty)"),
@@ -1474,7 +1474,7 @@ pub(crate) async fn route_tool_calls(
             }
             Err(e) => {
                 warn!("router decision normalization failed: {}", e);
-                if ctx.core.tool_delegation_config.strict_toolplan_validation
+                if ctx.core.tool_delegation_config.strict_toolplan_validation()
                     && ctx
                         .core
                         .tool_delegation_config
@@ -1492,10 +1492,7 @@ pub(crate) async fn route_tool_calls(
 
     // migrated from swappable().is_local — phase 09-03
     if ctx.core.mode().is_local()
-        && role_policy::should_block_main_tool_calls(
-            ctx.core.tool_delegation_config.strict_no_tools_main,
-            true,
-        )
+        && role_policy::should_block_main_tool_calls(&ctx.core.tool_delegation_config.mode, true)
         && !router_decision_valid
     {
         if ctx
@@ -1524,7 +1521,7 @@ pub(crate) async fn route_tool_calls(
     }
 
     if let Some(plan) = selected_plan {
-        if ctx.core.tool_delegation_config.strict_toolplan_validation {
+        if ctx.core.tool_delegation_config.strict_toolplan_validation() {
             if let Err(e) = plan.validate() {
                 if ctx
                     .core

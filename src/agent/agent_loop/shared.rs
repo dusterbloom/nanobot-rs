@@ -1466,7 +1466,7 @@ impl AgentLoopShared {
     /// drives the inner state machine through `IterationPhase` steps.
     #[instrument(name = "agent_loop", skip(self, ctx), fields(
         session = %ctx.session_key,
-        mode = if ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main { "trio" } else { "inline" },
+        mode = if ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main() { "trio" } else { "inline" },
         model = %ctx.core.model,
         streaming = ctx.streaming,
     ))]
@@ -1940,7 +1940,7 @@ impl AgentLoopShared {
     /// emergency trim, and router preflight.
     #[instrument(name = "step_pre_call", skip(self, ctx), fields(
         iteration,
-        trio_mode = ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main,
+        trio_mode = ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main(),
         boundary = ?ctx.flow.boundary,
         msg_count = ctx.messages.len(),
     ))]
@@ -2208,7 +2208,7 @@ impl AgentLoopShared {
         // the router preflight returns Passthrough (router said "respond") — in
         // that case the main model must have tools as fallback.
         let saved_tool_defs = tool_defs.clone();
-        if ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main {
+        if ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main() {
             // Hard separation (local trio only): main model is conversation/orchestration only.
             // Cloud providers handle tools natively and must never have them stripped.
             // BUT: if trio routing is degraded, keep tools so main model can still act.
@@ -2231,7 +2231,7 @@ impl AgentLoopShared {
                 .is_available(&cb_key);
             if should_strip_tools_for_trio(
                 ctx.core.mode().is_local(),
-                ctx.core.tool_delegation_config.strict_no_tools_main,
+                ctx.core.tool_delegation_config.strict_no_tools_main(),
                 router_probe_healthy,
                 cb_available,
             ) {

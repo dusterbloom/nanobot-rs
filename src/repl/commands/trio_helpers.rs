@@ -6,7 +6,7 @@ pub(crate) fn trio_enable(cfg: &mut crate::config::schema::Config) -> bool {
 
     let needs_warning = cfg.trio.router_model.is_empty() || cfg.trio.specialist_model.is_empty();
     cfg.trio.enabled = true;
-    cfg.tool_delegation.mode = DelegationMode::Trio;
+    cfg.tool_delegation.mode = DelegationMode::trio();
     cfg.tool_delegation.apply_mode();
     needs_warning
 }
@@ -77,13 +77,11 @@ pub(crate) fn should_auto_activate_trio(
     has_specialist_endpoint: bool,
     current_mode: &crate::config::schema::DelegationMode,
 ) -> bool {
-    use crate::config::schema::DelegationMode;
-
     let has_router = !router_model.is_empty() || has_router_endpoint;
     let has_specialist = !specialist_model.is_empty() || has_specialist_endpoint;
     // Only auto-activate from the default Delegated mode.
     // If the user explicitly set Inline or Trio, respect their choice.
-    is_local && has_router && has_specialist && *current_mode == DelegationMode::Delegated
+    is_local && has_router && has_specialist && current_mode.is_delegated()
 }
 
 /// Disable trio mode on a Config, switching to inline (single model).
@@ -91,7 +89,7 @@ pub(crate) fn trio_disable(cfg: &mut crate::config::schema::Config) {
     use crate::config::schema::DelegationMode;
 
     cfg.trio.enabled = false;
-    cfg.tool_delegation.mode = DelegationMode::Inline;
+    cfg.tool_delegation.mode = DelegationMode::inline();
     cfg.tool_delegation.apply_mode();
 }
 
@@ -116,8 +114,6 @@ pub(crate) fn persist_trio_fields(
 ) {
     disk.trio = live.trio.clone();
     disk.tool_delegation.mode = live.tool_delegation.mode;
-    disk.tool_delegation.strict_no_tools_main = live.tool_delegation.strict_no_tools_main;
-    disk.tool_delegation.strict_router_schema = live.tool_delegation.strict_router_schema;
     disk.tool_delegation.role_scoped_context_packs = live.tool_delegation.role_scoped_context_packs;
     disk.agents.defaults.local_max_context_tokens = live.agents.defaults.local_max_context_tokens;
 }

@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::schema::DelegationMode;
+
 fn default_true_specialist() -> bool {
     true
 }
@@ -93,8 +95,8 @@ pub struct RouterDecision {
 }
 
 /// Decide whether direct tool use by the main model should be blocked.
-pub fn should_block_main_tool_calls(strict_no_tools_main: bool, has_tool_calls: bool) -> bool {
-    strict_no_tools_main && has_tool_calls
+pub fn should_block_main_tool_calls(mode: &DelegationMode, has_tool_calls: bool) -> bool {
+    mode.strict_no_tools_main() && has_tool_calls
 }
 
 /// Parse and validate strict router decision JSON.
@@ -284,9 +286,15 @@ mod tests {
 
     #[test]
     fn test_should_block_main_tool_calls() {
-        assert!(should_block_main_tool_calls(true, true));
-        assert!(!should_block_main_tool_calls(false, true));
-        assert!(!should_block_main_tool_calls(true, false));
+        assert!(should_block_main_tool_calls(&DelegationMode::trio(), true));
+        assert!(!should_block_main_tool_calls(
+            &DelegationMode::delegated(),
+            true
+        ));
+        assert!(!should_block_main_tool_calls(
+            &DelegationMode::trio(),
+            false
+        ));
     }
 
     #[test]
