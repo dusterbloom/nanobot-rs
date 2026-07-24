@@ -1189,8 +1189,7 @@ mod tests {
     /// compaction paths share via `invalidate_prompt_cache_for_rewrite`.
     #[test]
     fn test_invalidate_prompt_cache_rotates_when_higgs_capable_clears_otherwise() {
-        let counters =
-            RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
         let s = "cli:trim";
 
         // Warm state: an active higgs session, a stored fingerprint, a watermark.
@@ -1236,10 +1235,7 @@ mod tests {
             "no drop queued for a non-rotating clear"
         );
         assert!(
-            counters
-                .active_higgs_session_ids
-                .lock()
-                .contains_key(s),
+            counters.active_higgs_session_ids.lock().contains_key(s),
             "active session id must survive a non-rotating clear"
         );
         assert!(

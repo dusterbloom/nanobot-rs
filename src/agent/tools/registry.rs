@@ -820,12 +820,7 @@ impl ToolRegistry {
         // Slim parameter descriptions (pi-style leanness); keep the discovery
         // hooks' param descriptions so the model knows how to call them without
         // a proxy round-trip.
-        const KEEP_PARAM_DESCRIPTIONS: &[&str] = &[
-            "read_file",
-            "read_skill",
-            "recall",
-            "remember",
-        ];
+        const KEEP_PARAM_DESCRIPTIONS: &[&str] = &["read_file", "read_skill", "recall", "remember"];
         for def in &mut defs {
             Self::remove_local_hot_model_hazards(def);
             let name = def
@@ -1039,10 +1034,7 @@ impl ToolRegistry {
         };
         if tool_name.is_empty() {
             let names = self.available_tool_names();
-            return ToolExecutionResult::success(format!(
-                "Available tools: {}",
-                names.join(", ")
-            ));
+            return ToolExecutionResult::success(format!("Available tools: {}", names.join(", ")));
         }
 
         let mut args_for_dispatch = params.get("args").cloned();
@@ -1231,7 +1223,10 @@ mod tests {
         );
         assert!(names.contains(&"tool"), "missing proxy: {names:?}");
         for expected in ["read_file", "edit_file", "exec", "recall"] {
-            assert!(names.contains(&expected), "cloud missing {expected}: {names:?}");
+            assert!(
+                names.contains(&expected),
+                "cloud missing {expected}: {names:?}"
+            );
         }
         // The proxy must teach all three modes and name starter tools.
         let proxy_desc = defs
@@ -2707,7 +2702,10 @@ mod tests {
         registry.register(Box::new(MockTool::new("read_file")));
 
         let result = registry.execute("tool", HashMap::new()).await;
-        assert!(result.ok, "Missing name should return success with tool list");
+        assert!(
+            result.ok,
+            "Missing name should return success with tool list"
+        );
         assert!(
             result.data.contains("read_file"),
             "Should list available tools: {}",

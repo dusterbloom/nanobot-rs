@@ -352,13 +352,10 @@ fn clear_prompt_cache_state(ctx: &TurnContext) -> bool {
 /// rejecting a shrunken prompt as "not_growing" and re-prefilling under the
 /// stale session id. Otherwise only local bookkeeping is cleared. The system
 /// message is never mutated — rotation alone invalidates the cache.
-fn invalidate_prompt_cache_for_rewrite(
-    ctx: &mut TurnContext,
-    reason: CacheResetReason,
-) -> bool {
-    let rotate = ctx.core.mode().is_local()
-        && ctx.core.provider.supports_higgs_session_cache();
-    ctx.counters.invalidate_prompt_cache(&ctx.session_key, rotate);
+fn invalidate_prompt_cache_for_rewrite(ctx: &mut TurnContext, reason: CacheResetReason) -> bool {
+    let rotate = ctx.core.mode().is_local() && ctx.core.provider.supports_higgs_session_cache();
+    ctx.counters
+        .invalidate_prompt_cache(&ctx.session_key, rotate);
     send_cache_reset_marker(&ctx.text_delta_tx, reason);
     rotate
 }
@@ -387,7 +384,11 @@ fn divergent_message_digest(msg: &Value) -> String {
     let snippet: String = content.chars().take(70).collect();
 
     let mut tags: Vec<&str> = Vec::new();
-    if msg.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if msg
+        .get("_synthetic")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         tags.push("synthetic");
     }
     if msg
@@ -2336,8 +2337,7 @@ impl AgentLoopShared {
         drop(guard);
 
         if rewrites_prompt {
-            let rotated =
-                invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::LcmCheckpoint);
+            let rotated = invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::LcmCheckpoint);
             if rotated {
                 warn!(
                     session = %ctx.session_key,
@@ -3596,9 +3596,8 @@ impl AgentLoopShared {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_response_boundary, attach_higgs_session_marker,
-        divergent_message_digest, proactive_grounding_preserves_prefix_cache,
-        ResponseBoundary,
+        advance_response_boundary, attach_higgs_session_marker, divergent_message_digest,
+        proactive_grounding_preserves_prefix_cache, ResponseBoundary,
     };
     use crate::agent::agent_core::{stable_higgs_session_id, RuntimeCounters};
     use crate::config::schema::CircuitBreakerConfig;

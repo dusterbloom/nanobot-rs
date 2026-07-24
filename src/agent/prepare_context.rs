@@ -694,10 +694,7 @@ mod tests {
     #[test]
     fn test_no_epoch_marker_in_prompt_content() {
         let baseline = json!({"role": "system", "content": "STATIC"});
-        let rendered = vec![
-            baseline.clone(),
-            json!({"role": "user", "content": "hi"}),
-        ];
+        let rendered = vec![baseline.clone(), json!({"role": "user", "content": "hi"})];
 
         // Simulate the rendered output after a reset: nothing appends an epoch
         // marker. If anyone reintroduces `[session-reset-epoch:N]` anywhere in

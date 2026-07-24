@@ -2013,12 +2013,25 @@ mod tests {
         );
 
         // (c) starter tools named for discoverability
-        for tool in ["read_file", "read_skill", "recall", "remember", "edit_file", "exec"] {
-            assert!(identity.contains(tool), "missing starter tool {tool}: {identity}");
+        for tool in [
+            "read_file",
+            "read_skill",
+            "recall",
+            "remember",
+            "edit_file",
+            "exec",
+        ] {
+            assert!(
+                identity.contains(tool),
+                "missing starter tool {tool}: {identity}"
+            );
         }
 
         // (d) error discipline
-        assert!(identity.contains("quote the exact tool message"), "{identity}");
+        assert!(
+            identity.contains("quote the exact tool message"),
+            "{identity}"
+        );
         assert!(identity.contains("never invent causes"), "{identity}");
 
         // (e) persona files
@@ -2039,9 +2052,21 @@ mod tests {
         // model name, the assembled local system prompt stays small. The ceiling
         // accommodates path interpolation + long model filenames.
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("AGENTS.md"), "# Workflow\n\ncoding rules...".repeat(20)).unwrap();
-        fs::write(tmp.path().join("SOUL.md"), "# Soul\n\npersona lines...".repeat(5)).unwrap();
-        fs::write(tmp.path().join("USER.md"), "# User\n\npreferences...".repeat(5)).unwrap();
+        fs::write(
+            tmp.path().join("AGENTS.md"),
+            "# Workflow\n\ncoding rules...".repeat(20),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("SOUL.md"),
+            "# Soul\n\npersona lines...".repeat(5),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("USER.md"),
+            "# User\n\npreferences...".repeat(5),
+        )
+        .unwrap();
         let mut cb = ContextBuilder::new_lite(tmp.path());
         cb.set_lite_mode(4_096);
         // Simulate a realistic local model name — the longest the prompt will see.
