@@ -1389,19 +1389,63 @@ pub(crate) async fn switch_runtime_model(
     };
 
     // 1. Unload every currently-loaded model that isn't the one we're loading.
-    //    This frees GPU memory so the new weights don't OOM. Best-effort: a
-    //    failed unload is logged in the result note path, not fatal (the load
-    //    may still succeed if there's headroom).
+    //    This frees GPU memory so the new weights don't OOM. A failed unload is
+    //    collected (not silently discarded) so the 409 the user would otherwise
+    //    get is replaced with a clear "couldn't unload X: reason" message.
     let loaded = list_available_served_models_at(api_base, api_key).await;
     let unload_url = models_url_from_base(api_base);
+    let mut unload_errors: Vec<String> = Vec::new();
     for id in &loaded {
         if name.eq_ignore_ascii_case(id) {
             continue;
         }
-        let _ = auth(client.delete(format!("{unload_url}/{}", url_encode_model_id(id))))
+        let resp = auth(client.delete(format!("{unload_url}/{}", url_encode_model_id(id))))
             .timeout(std::time::Duration::from_secs(60))
             .send()
             .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                unload_errors.push(format!(
+                    "{id} (HTTP {status}): {}",
+                    body.trim().chars().take(200).collect::<String>()
+                ));
+            }
+            Err(e) => {
+                unload_errors.push(format!("{id}: {e}"));
+            }
+        }
+    }
+
+    // Poll until the old models are actually gone. higgs's DELETE may return
+    // 200 before GPU memory is freed; the load POST will 409 if the old model
+    // is still resident. Give it up to 15 seconds.
+    if !unload_errors.is_empty() {
+        // Unload failed — poll anyway in case higgs is still processing.
+        for _ in 0..15 {
+            let still_loaded = list_available_served_models_at(api_base, api_key).await;
+            if still_loaded.iter().all(|id| name.eq_ignore_ascii_case(id)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        // If old models are STILL loaded after polling, fail now with a clear
+        // message instead of letting the POST hit an opaque 409.
+        let still_loaded = list_available_served_models_at(api_base, api_key).await;
+        let blocking: Vec<&str> = still_loaded
+            .iter()
+            .filter(|id| !name.eq_ignore_ascii_case(id))
+            .map(|s| s.as_str())
+            .collect();
+        if !blocking.is_empty() {
+            return Err(format!(
+                "couldn't unload {}: {}",
+                blocking.join(", "),
+                unload_errors.join("; ")
+            ));
+        }
     }
 
     // 2. Load the requested model. Body mirrors a higgs [[models]] entry.
