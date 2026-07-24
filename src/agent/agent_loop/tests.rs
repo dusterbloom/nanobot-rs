@@ -3422,6 +3422,100 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+fn stale_read_write_context_parts(
+    path: &str,
+) -> (
+    Vec<Value>,
+    std::collections::HashMap<String, Value>,
+    crate::agent::tool_guard::ToolGuard,
+) {
+    let mut read_args = std::collections::HashMap::new();
+    read_args.insert("path".to_string(), json!(path));
+    let mut write_args = std::collections::HashMap::new();
+    write_args.insert("path".to_string(), json!(path));
+    write_args.insert("content".to_string(), json!("new\n"));
+    let read_call = crate::providers::base::ToolCallRequest {
+        id: "tc_read_old".to_string(),
+        name: "read_file".to_string(),
+        arguments: read_args.clone(),
+    };
+    let write_call = crate::providers::base::ToolCallRequest {
+        id: "tc_write_new".to_string(),
+        name: "write_file".to_string(),
+        arguments: write_args.clone(),
+    };
+
+    let mut guard = crate::agent::tool_guard::ToolGuard::new(1);
+    assert!(guard.allow("read_file", &read_args).is_ok());
+    guard.record_result_with_status("read_file", &read_args, "old\n".to_string(), true);
+    assert!(guard.allow("write_file", &write_args).is_ok());
+    guard.record_result_with_status("write_file", &write_args, "written".to_string(), true);
+    assert_eq!(
+        guard.get_cached_result(&crate::agent::tool_guard::ToolGuard::key(
+            "read_file",
+            &read_args
+        )),
+        None
+    );
+
+    (
+        vec![
+            json!({"role": "user", "content": "read, write, re-read"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [read_call.to_openai_json()]}),
+            json!({"role": "tool", "tool_call_id": "tc_read_old", "name": "read_file", "ok": true, "content": "old\n"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [write_call.to_openai_json()]}),
+            json!({"role": "tool", "tool_call_id": "tc_write_new", "name": "write_file", "ok": true, "content": "written"}),
+        ],
+        read_args,
+        guard,
+    )
+}
+
+#[tokio::test]
+async fn test_read_after_write_same_turn_is_not_blocked_by_stale_receipt() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![WireRecordingProvider::text_response("unused")],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let msg = InboundMessage::new("test", "user", "offline", "read, write, re-read");
+    let mut ctx = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+
+    let (messages, read_args, guard) = stale_read_write_context_parts("/tmp/same-turn.txt");
+    ctx.messages = messages;
+    ctx.new_start = 0;
+    ctx.flow.tool_guard = guard;
+
+    let result = crate::agent::router::route_tool_calls(
+        &mut ctx,
+        Some(""),
+        vec![crate::providers::base::ToolCallRequest {
+            id: "tc_read_new".to_string(),
+            name: "read_file".to_string(),
+            arguments: read_args,
+        }],
+    )
+    .await;
+
+    match result {
+        crate::agent::router::RouteResult::Execute(calls) => {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].id, "tc_read_new");
+        }
+        crate::agent::router::RouteResult::Break(text) => {
+            panic!("post-write read was blocked: {text}")
+        }
+        crate::agent::router::RouteResult::Continue => panic!("post-write read should execute"),
+    }
+    assert!(!ctx.flow.tool_guard.had_blocked_calls);
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 /// Regression (prod, session cli:oneshot, bonsai-27b): a turn that runs a
 /// side-effect tool (exec) arms the response boundary, which injects a
 /// synthetic `scaffold_user` nudge into the conversation. That nudge is

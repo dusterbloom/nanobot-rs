@@ -1310,67 +1310,6 @@ fn canonicalize_proxy_execution(mut tc: ToolCallRequest) -> ToolCallRequest {
     tc
 }
 
-fn tool_call_key_from_wire(call: &Value) -> Option<(String, String)> {
-    let id = call.get("id")?.as_str()?.to_string();
-    let name = call.pointer("/function/name")?.as_str()?;
-    let raw_args = call.pointer("/function/arguments")?;
-    let args_value = match raw_args {
-        Value::String(s) => serde_json::from_str::<Value>(s).ok()?,
-        Value::Object(_) => raw_args.clone(),
-        _ => return None,
-    };
-    let args = args_value
-        .as_object()?
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect::<HashMap<String, Value>>();
-    Some((id, ToolGuard::key(name, &args)))
-}
-
-fn current_turn_prior_tool_result_chars(
-    messages: &[Value],
-    turn_start: usize,
-    name: &str,
-    args: &HashMap<String, Value>,
-) -> Option<usize> {
-    let target_key = ToolGuard::key(name, args);
-    let mut call_keys: HashMap<String, String> = HashMap::new();
-    for msg in messages.iter().skip(turn_start.min(messages.len())) {
-        match msg.get("role").and_then(Value::as_str) {
-            Some("assistant") => {
-                let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) else {
-                    continue;
-                };
-                for call in calls {
-                    if let Some((id, key)) = tool_call_key_from_wire(call) {
-                        call_keys.insert(id, key);
-                    }
-                }
-            }
-            Some("tool") => {
-                if msg.get("ok").and_then(Value::as_bool).is_some_and(|ok| !ok) {
-                    continue;
-                }
-                let Some(call_id) = msg.get("tool_call_id").and_then(Value::as_str) else {
-                    continue;
-                };
-                if call_keys.get(call_id).map(String::as_str) != Some(target_key.as_str()) {
-                    continue;
-                }
-                let chars = msg
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::chars)
-                    .map(Iterator::count)
-                    .unwrap_or(0);
-                return Some(chars);
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Route tool calls through the strict router / toolplan / fallback pipeline.
 ///
 /// Takes the raw tool calls from the LLM response, applies router filtering,
@@ -1663,21 +1602,6 @@ pub(crate) async fn route_tool_calls(
     let mut blocked_no_result = 0usize;
 
     for tc in routed_tool_calls {
-        if let Some(cached_chars) = current_turn_prior_tool_result_chars(
-            &ctx.messages,
-            ctx.new_start,
-            &tc.name,
-            &tc.arguments,
-        ) {
-            ctx.flow.tool_guard.had_blocked_calls = true;
-            warn!(
-                tool = %tc.name,
-                cached_chars,
-                "duplicate tool call blocked for prior successful result in current turn"
-            );
-            blocked_with_result.push((tc, cached_chars));
-            continue;
-        }
         match ctx.flow.tool_guard.allow(&tc.name, &tc.arguments) {
             Ok(()) => allowed_calls.push(tc),
             Err(e) => {
@@ -1834,47 +1758,35 @@ mod tests {
     }
 
     #[test]
-    fn current_turn_prior_tool_result_matches_reordered_args() {
-        let messages = vec![
-            json!({"role": "system", "content": "s"}),
-            json!({"role": "user", "content": "find compaction"}),
-            json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": "call_a",
-                    "type": "function",
-                    "function": {
-                        "name": "search_files",
-                        "arguments": "{\"limit\":50,\"query\":\"compaction\",\"path\":\"~/Dev/nanobot-rs/src\"}"
-                    }
-                }]
-            }),
-            json!({
-                "role": "tool",
-                "tool_call_id": "call_a",
-                "name": "search_files",
-                "ok": true,
-                "content": "Searched 4 file(s) under ~/Dev/nanobot-rs/src"
-            }),
-        ];
+    fn tool_guard_cached_result_matches_reordered_args() {
+        let mut first_args = HashMap::new();
+        first_args.insert("limit".to_string(), json!(50));
+        first_args.insert("query".to_string(), json!("compaction"));
+        first_args.insert("path".to_string(), json!("~/Dev/nanobot-rs/src"));
+
         let mut duplicate_args = HashMap::new();
         duplicate_args.insert("query".to_string(), json!("compaction"));
         duplicate_args.insert("path".to_string(), json!("~/Dev/nanobot-rs/src"));
         duplicate_args.insert("limit".to_string(), json!(50));
+        let result = "Searched 4 file(s) under ~/Dev/nanobot-rs/src";
 
+        let mut guard = ToolGuard::new(1);
+        guard.record_result("search_files", &first_args, result.to_string());
+        let key = ToolGuard::key("search_files", &duplicate_args);
         assert_eq!(
-            current_turn_prior_tool_result_chars(&messages, 1, "search_files", &duplicate_args),
-            Some(
-                "Searched 4 file(s) under ~/Dev/nanobot-rs/src"
-                    .chars()
-                    .count()
-            )
+            guard
+                .get_cached_result(&key)
+                .map(str::chars)
+                .map(Iterator::count),
+            Some(result.chars().count())
         );
+        assert!(guard.allow("search_files", &duplicate_args).is_err());
+
+        let fresh_guard = ToolGuard::new(1);
         assert_eq!(
-            current_turn_prior_tool_result_chars(&messages, 3, "search_files", &duplicate_args),
+            fresh_guard.get_cached_result(&key),
             None,
-            "matches are scoped to the current user turn"
+            "ToolGuard lifetime scopes duplicate cache to one turn"
         );
     }
 
