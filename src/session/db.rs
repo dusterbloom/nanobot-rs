@@ -1239,6 +1239,18 @@ impl SessionDb {
             .collect()
     }
 
+    /// Split a query string into tokens without filtering by length or stopwords.
+    /// Used for interactive prefix search where single characters and common words matter.
+    fn prefix_query_terms(raw: &str) -> Vec<String> {
+        let mut terms: Vec<String> = raw
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|t| t.to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        terms.dedup();
+        terms
+    }
+
     /// Turn a (possibly verbose, natural-language) search string into two FTS5 MATCH
     /// expressions: an AND of the significant content keywords (precise) and an OR of
     /// the same keywords (high recall). FTS operators ("or"/"and"/"not") and common
@@ -1369,6 +1381,25 @@ impl SessionDb {
             }
         }
         Vec::new()
+    }
+
+    /// Incremental prefix search for the interactive session picker.
+    ///
+    /// Unlike [`search_messages`], which strips a natural-language sentence
+    /// down to content keywords for agent recall, this matches what a human
+    /// is typing: every token is a prefix, single characters count, and no
+    /// stopword list can swallow the query.
+    pub async fn search_messages_prefix(&self, query: &str, limit: usize) -> Vec<SearchResult> {
+        let terms = Self::prefix_query_terms(query);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        // Build an FTS5 MATCH expression ANDing tokens as prefixes:
+        // each token becomes "tok"* (double-quoted token immediately followed by asterisk).
+        let quoted: Vec<String> = terms.iter().map(|t| format!("\"{}\"*", t)).collect();
+        let match_expr = quoted.join(" ");
+        let conn = self.conn.lock().await;
+        Self::run_match(&conn, &match_expr, None, limit)
     }
 
     /// Run a single FTS5 MATCH expression (optionally filtered by session-key prefix)
@@ -2736,6 +2767,45 @@ mod tests {
         db.rebuild_fts_index().await;
         let results = db.search_messages("Rebuild", 10, None).await;
         assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_prefix_query_terms_keeps_short_and_stopword_tokens() {
+        // Prefix search keeps single characters and stopword tokens,
+        // deliberately differing from recall_keywords.
+        let terms = SessionDb::prefix_query_terms("a session");
+        assert_eq!(terms, vec!["a", "session"]);
+
+        // In contrast, recall_keywords strips both the single "a" (length < 2)
+        // and "session" (it's a stopword), leaving nothing.
+        let recall_terms = SessionDb::recall_keywords("a session");
+        assert!(recall_terms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_messages_prefix_matches_partial_word() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:prefix").await;
+        db.add_messages(
+            &meta.id,
+            &[json!({"role": "user", "content": "This is a session about debugging"})],
+        )
+        .await;
+
+        // Prefix search should match "sess" as a prefix of "session",
+        // even though "session" is a stopword that recall_keywords filters out.
+        let prefix_results = db.search_messages_prefix("sess", 10).await;
+        assert!(
+            !prefix_results.is_empty(),
+            "prefix search for 'sess' should match 'session'"
+        );
+
+        // The existing search_messages should return empty because "session" is filtered.
+        let recall_results = db.search_messages("sess", 10, None).await;
+        assert!(
+            recall_results.is_empty(),
+            "recall search for 'sess' should not match (stopword)"
+        );
     }
 
     // -----------------------------------------------------------------------

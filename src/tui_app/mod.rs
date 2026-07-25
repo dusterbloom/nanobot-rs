@@ -648,7 +648,8 @@ async fn load_session_rows(ctx: &ReplContext, query: &str) -> Vec<SessionRow> {
     }
 
     let mut rows = Vec::new();
-    for result in core.sessions.search_messages(query, 80, None).await {
+    // First, search by message content using prefix matching.
+    for result in core.sessions.search_messages_prefix(query, 80).await {
         if rows
             .iter()
             .any(|row: &SessionRow| row.session_id == result.session_id)
@@ -664,7 +665,32 @@ async fn load_session_rows(ctx: &ReplContext, query: &str) -> Vec<SessionRow> {
             preview: None,
         });
         if rows.len() >= 50 {
-            break;
+            return rows;
+        }
+    }
+
+    // Also include sessions whose session_key contains the query as a case-insensitive substring.
+    let query_lower = query.to_lowercase();
+    for meta in core.sessions.list_sessions(None, 50).await {
+        if !meta.session_key.to_lowercase().contains(&query_lower) {
+            continue;
+        }
+        if rows
+            .iter()
+            .any(|row: &SessionRow| row.session_id == meta.id)
+        {
+            continue;
+        }
+        rows.push(SessionRow {
+            session_id: meta.id,
+            session_key: meta.session_key,
+            updated_at: format_session_time(meta.updated_at),
+            message_count: meta.message_count,
+            snippet: String::new(),
+            preview: None,
+        });
+        if rows.len() >= 50 {
+            return rows;
         }
     }
     rows

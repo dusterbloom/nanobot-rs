@@ -289,6 +289,8 @@ struct SessionPicker {
     rows: Vec<SessionRow>,
     selected: usize,
     query: String,
+    /// Index of the row that has been previewed; used to detect second Enter for resume.
+    previewed: Option<usize>,
 }
 
 /// A currently running background item shown in the `/jobs` overlay.
@@ -653,6 +655,7 @@ impl App {
             rows,
             selected: 0,
             query,
+            previewed: None,
         });
     }
 
@@ -661,6 +664,7 @@ impl App {
         if let Some(p) = self.session_picker.as_mut() {
             p.rows = rows;
             p.selected = p.selected.min(p.rows.len().saturating_sub(1));
+            p.previewed = None;
         }
     }
 
@@ -745,12 +749,14 @@ impl App {
             }
             KeyCode::Up => {
                 p.selected = p.selected.saturating_sub(1);
+                p.previewed = None;
                 Action::Continue
             }
             KeyCode::Down => {
                 if p.selected + 1 < p.rows.len() {
                     p.selected += 1;
                 }
+                p.previewed = None;
                 Action::Continue
             }
             KeyCode::Backspace => {
@@ -769,7 +775,18 @@ impl App {
                         self.session_picker = None;
                         Action::ResumeSession(pick)
                     }
-                    (false, Some(pick)) => Action::PreviewSession(pick),
+                    (false, Some(pick)) => {
+                        // Two-step Enter: first press previews, second press on same row resumes.
+                        if p.previewed == Some(p.selected) {
+                            // Already previewed this row, so resume it now.
+                            self.session_picker = None;
+                            Action::ResumeSession(pick)
+                        } else {
+                            // First time seeing this row, preview it and arm for resume.
+                            p.previewed = Some(p.selected);
+                            Action::PreviewSession(pick)
+                        }
+                    }
                 }
             }
             _ => Action::Continue,
@@ -3054,7 +3071,7 @@ fn render_session_picker(f: &mut Frame, area: Rect, p: &SessionPicker) {
     let preview_rows = preview
         .map(|text| text.lines().count().min(8) + 1)
         .unwrap_or(0);
-    let list_h = inner_h.saturating_sub(preview_rows).max(1);
+    let list_h = inner_h.saturating_sub(1 + preview_rows).max(1); // +1 for hint line
     let start = p.selected.saturating_sub(list_h.saturating_sub(1));
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
@@ -3068,6 +3085,10 @@ fn render_session_picker(f: &mut Frame, area: Rect, p: &SessionPicker) {
             style(OK_COLOR, false),
         ),
     ]));
+    lines.push(Line::from(Span::styled(
+        "  enter preview · enter again resume · esc close",
+        dim(),
+    )));
     if p.rows.is_empty() {
         lines.push(Line::from(Span::styled("  no matching sessions", dim())));
     } else {
@@ -5690,6 +5711,98 @@ mod tests {
         ))) {
             Action::ResumeSession(pick) => assert_eq!(pick.session_key, "cli:alpha"),
             _ => panic!("Ctrl+Enter should resume the selected session"),
+        }
+    }
+
+    #[test]
+    fn session_picker_second_enter_resumes_without_ctrl() {
+        let mut app = App::new();
+        app.open_session_picker(
+            vec![
+                SessionRow {
+                    session_id: "s1".into(),
+                    session_key: "cli:alpha".into(),
+                    updated_at: "2026-06-19 12:00".into(),
+                    message_count: 3,
+                    snippet: "native sessions".into(),
+                    preview: None,
+                },
+                SessionRow {
+                    session_id: "s2".into(),
+                    session_key: "cli:beta".into(),
+                    updated_at: "2026-06-19 11:00".into(),
+                    message_count: 5,
+                    snippet: "another session".into(),
+                    preview: None,
+                },
+            ],
+            String::new(),
+        );
+
+        // First Enter on row 0: preview
+        match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            Action::PreviewSession(pick) => assert_eq!(pick.session_id, "s1"),
+            _ => panic!("first Enter should preview row 0"),
+        }
+        app.set_session_preview("s1", "user: hello\nassistant: hi".into());
+
+        // Second Enter on same row: resume
+        match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            Action::ResumeSession(pick) => assert_eq!(pick.session_key, "cli:alpha"),
+            _ => panic!("second Enter on same row should resume"),
+        }
+
+        // Guard: after first Enter, pressing Down then Enter should preview (not resume)
+        app.open_session_picker(
+            vec![
+                SessionRow {
+                    session_id: "s1".into(),
+                    session_key: "cli:alpha".into(),
+                    updated_at: "2026-06-19 12:00".into(),
+                    message_count: 3,
+                    snippet: "native sessions".into(),
+                    preview: None,
+                },
+                SessionRow {
+                    session_id: "s2".into(),
+                    session_key: "cli:beta".into(),
+                    updated_at: "2026-06-19 11:00".into(),
+                    message_count: 5,
+                    snippet: "another session".into(),
+                    preview: None,
+                },
+            ],
+            String::new(),
+        );
+
+        // First Enter on row 0: preview
+        match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            Action::PreviewSession(pick) => assert_eq!(pick.session_id, "s1"),
+            _ => panic!("first Enter on row 0 should preview"),
+        }
+
+        // Move down to row 1
+        match app.on_idle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))) {
+            Action::Continue => {}
+            _ => panic!("Down should return Continue"),
+        }
+
+        // Enter on new row 1: should preview (not resume, because preview state was reset)
+        match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            Action::PreviewSession(pick) => assert_eq!(pick.session_id, "s2"),
+            _ => panic!("Enter on row 1 after Down should preview, not resume"),
         }
     }
 
