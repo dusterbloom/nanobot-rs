@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
+use tracing::warn;
 
 use super::base::{
     PermissionLevel, Tool, ToolConcurrency, ToolExecutionContext, ToolExecutionResult,
@@ -1015,31 +1016,49 @@ impl ToolRegistry {
     /// Result for a proxy call that carries no usable tool name.
     ///
     /// A bare `tool({})` is the documented discovery path and must stay a
-    /// success — failing it made models think the proxy was broken. But
-    /// `tool({"url": ...})` means the model forgot `name`; answering that with
-    /// the catalog reads as "it worked", so the model loops on the same
-    /// mistake instead of correcting it.
+    /// success — failing it made models think the proxy was broken. Anything
+    /// else means the model forgot `name`; answering that with the catalog
+    /// reads as "it worked", so the model loops on the same mistake instead
+    /// of correcting it. Carrying `args` counts as intent just as much as a
+    /// flattened `url` does.
     fn missing_name_result(
         &self,
         params: &HashMap<String, serde_json::Value>,
     ) -> ToolExecutionResult {
-        let mut stray: Vec<&str> = params
-            .keys()
-            .map(String::as_str)
-            .filter(|k| *k != "name" && *k != "args")
+        let mut sent: Vec<&str> = params
+            .iter()
+            .filter(|(k, v)| k.as_str() != "name" && !Self::is_blank_param(v))
+            .map(|(k, _)| k.as_str())
             .collect();
         let names = self.available_tool_names();
-        if stray.is_empty() {
+        if sent.is_empty() {
             return ToolExecutionResult::success(format!("Available tools: {}", names.join(", ")));
         }
-        stray.sort_unstable();
+        sent.sort_unstable();
+        warn!(
+            params = %serde_json::to_string(params).unwrap_or_default(),
+            "proxy_call_missing_name"
+        );
         ToolExecutionResult::failure(format!(
             "Error: 'name' is required. You sent parameters {{{}}} with no tool name. \
              Call tool with {{\"name\":\"TOOLNAME\",\"args\":{{...}}}} — omit name only to list tools. \
              Available: {}",
-            stray.join(", "),
+            sent.join(", "),
             names.join(", ")
         ))
+    }
+
+    /// A parameter that carries no information: null, empty string, empty
+    /// object, or empty array. Models emit these as filler around a call they
+    /// meant to make, so they must not be mistaken for real intent.
+    fn is_blank_param(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Null => true,
+            serde_json::Value::String(s) => s.trim().is_empty(),
+            serde_json::Value::Object(m) => m.is_empty(),
+            serde_json::Value::Array(a) => a.is_empty(),
+            _ => false,
+        }
     }
 
     /// Handle a proxy call: inspect (no args) or dispatch (with args).
@@ -2782,6 +2801,37 @@ mod tests {
         assert!(
             result.data.contains("web_fetch"),
             "Should include web_fetch in tool list: {}",
+            result.data
+        );
+
+        // Case 3: `args` present but no name. Observed in production — the model
+        // sends {"args": {"url": "..."}}, and answering with the catalog reads as
+        // success, so it repeats the same malformed call instead of correcting it.
+        let mut params = HashMap::new();
+        params.insert(
+            "args".to_string(),
+            serde_json::json!({"url": "https://example.com"}),
+        );
+        let result = registry.execute("tool", params).await;
+        assert!(
+            !result.ok,
+            "args without name must fail, not return the catalog: {}",
+            result.data
+        );
+        assert!(
+            result.data.contains("'name' is required"),
+            "{}",
+            result.data
+        );
+
+        // Case 4: blank filler around an otherwise bare call is still discovery.
+        let mut params = HashMap::new();
+        params.insert("args".to_string(), serde_json::json!({}));
+        params.insert("name".to_string(), serde_json::Value::Null);
+        let result = registry.execute("tool", params).await;
+        assert!(
+            result.ok && result.data.contains("Available tools:"),
+            "empty args/null name is a bare discovery call: {}",
             result.data
         );
     }
