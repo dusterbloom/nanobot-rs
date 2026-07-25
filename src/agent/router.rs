@@ -1289,6 +1289,16 @@ fn canonicalize_proxy_execution(mut tc: ToolCallRequest) -> ToolCallRequest {
             inner_args.extend(map.iter().map(|(k, v)| (k.clone(), v.clone())));
             true
         }
+        // Local models sometimes double-encode nested JSON as a string. Without
+        // this arm the model's arguments are discarded and it sees an opaque
+        // "'args' must be a JSON object" error it cannot act on.
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Object(map)) => {
+                inner_args.extend(map);
+                true
+            }
+            _ => false,
+        },
         Some(Value::Null) | None => false,
         Some(_) => return tc,
     };
@@ -1755,6 +1765,22 @@ mod tests {
 
         assert_eq!(tc.name, "tool");
         assert_eq!(tc.arguments.get("name"), Some(&json!("session_search")));
+    }
+
+    #[test]
+    fn test_canonicalize_proxy_args_as_json_string() {
+        let mut arguments = HashMap::new();
+        arguments.insert("name".to_string(), json!("web_search"));
+        arguments.insert("args".to_string(), json!(r#"{"query":"news"}"#));
+
+        let tc = canonicalize_proxy_execution(ToolCallRequest {
+            id: "tc_proxy_web_search".to_string(),
+            name: "tool".to_string(),
+            arguments,
+        });
+
+        assert_eq!(tc.name, "web_search");
+        assert_eq!(tc.arguments.get("query"), Some(&json!("news")));
     }
 
     #[test]

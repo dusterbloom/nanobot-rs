@@ -1012,6 +1012,36 @@ impl ToolRegistry {
         })]
     }
 
+    /// Result for a proxy call that carries no usable tool name.
+    ///
+    /// A bare `tool({})` is the documented discovery path and must stay a
+    /// success — failing it made models think the proxy was broken. But
+    /// `tool({"url": ...})` means the model forgot `name`; answering that with
+    /// the catalog reads as "it worked", so the model loops on the same
+    /// mistake instead of correcting it.
+    fn missing_name_result(
+        &self,
+        params: &HashMap<String, serde_json::Value>,
+    ) -> ToolExecutionResult {
+        let mut stray: Vec<&str> = params
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "name" && *k != "args")
+            .collect();
+        let names = self.available_tool_names();
+        if stray.is_empty() {
+            return ToolExecutionResult::success(format!("Available tools: {}", names.join(", ")));
+        }
+        stray.sort_unstable();
+        ToolExecutionResult::failure(format!(
+            "Error: 'name' is required. You sent parameters {{{}}} with no tool name. \
+             Call tool with {{\"name\":\"TOOLNAME\",\"args\":{{...}}}} — omit name only to list tools. \
+             Available: {}",
+            stray.join(", "),
+            names.join(", ")
+        ))
+    }
+
     /// Handle a proxy call: inspect (no args) or dispatch (with args).
     /// `ctx` is passed through to the dispatched tool when present.
     async fn execute_proxy(
@@ -1021,20 +1051,10 @@ impl ToolRegistry {
     ) -> ToolExecutionResult {
         let tool_name = match params.get("name").and_then(|v| v.as_str()) {
             Some(n) => n.trim().to_string(),
-            None => {
-                // No name → list mode (success, not error). The prompt teaches
-                // this as the discovery path; returning a failure here would
-                // make the model think the proxy is broken (the bonsai bug).
-                let names = self.available_tool_names();
-                return ToolExecutionResult::success(format!(
-                    "Available tools: {}",
-                    names.join(", ")
-                ));
-            }
+            None => return self.missing_name_result(&params),
         };
         if tool_name.is_empty() {
-            let names = self.available_tool_names();
-            return ToolExecutionResult::success(format!("Available tools: {}", names.join(", ")));
+            return self.missing_name_result(&params);
         }
 
         let mut args_for_dispatch = params.get("args").cloned();
@@ -2709,6 +2729,59 @@ mod tests {
         assert!(
             result.data.contains("read_file"),
             "Should list available tools: {}",
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_proxy_missing_name_with_args_is_actionable_error() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("web_fetch")));
+        registry.register(Box::new(MockTool::new("read_file")));
+
+        // Case 1: No name but WITH other parameters → should be FAILURE (not success catalog).
+        // This is the bug fix: model likely forgot to pass name, sending {"url": "..."}
+        // instead of {"name": "web_fetch", "args": {"url": "..."}}.
+        let mut params = HashMap::new();
+        params.insert("url".to_string(), serde_json::json!("https://example.com"));
+
+        let result = registry.execute("tool", params).await;
+        assert!(
+            !result.ok,
+            "Missing name with stray params should be FAILURE, not success catalog: {}",
+            result.data
+        );
+        assert!(
+            result.data.contains("'name' is required"),
+            "Error should mention name is required: {}",
+            result.data
+        );
+        assert!(
+            result.data.contains("url"),
+            "Error should mention the stray parameter sent: {}",
+            result.data
+        );
+        assert!(
+            result.data.contains("web_fetch"),
+            "Error should list available tools including web_fetch: {}",
+            result.data
+        );
+
+        // Case 2: Empty params (genuine discovery) → should still be SUCCESS with catalog.
+        // This is the regression guard: the documented discovery path must work.
+        let result = registry.execute("tool", HashMap::new()).await;
+        assert!(
+            result.ok,
+            "Empty params should return success with tool list (discovery path)"
+        );
+        assert!(
+            result.data.contains("Available tools:"),
+            "Should list available tools: {}",
+            result.data
+        );
+        assert!(
+            result.data.contains("web_fetch"),
+            "Should include web_fetch in tool list: {}",
             result.data
         );
     }

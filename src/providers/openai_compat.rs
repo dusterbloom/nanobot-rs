@@ -1345,6 +1345,25 @@ fn inject_cache_control(
     (msgs, cached_tools)
 }
 
+/// Parse tool-call `arguments` into a param map.
+///
+/// Local models sometimes double-encode the payload: the JSON string
+/// decodes to another JSON string rather than an object. Unwrap one extra
+/// layer before giving up, otherwise the arguments are silently lost.
+fn parse_tool_arguments(s: &str) -> Result<HashMap<String, serde_json::Value>, String> {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(serde_json::Value::Object(map)) => Ok(map.into_iter().collect()),
+        Ok(serde_json::Value::String(inner)) => {
+            match serde_json::from_str::<serde_json::Value>(&inner) {
+                Ok(serde_json::Value::Object(map)) => Ok(map.into_iter().collect()),
+                _ => Err("double-encoded arguments did not decode to an object".to_string()),
+            }
+        }
+        Ok(_) => Err("arguments did not decode to an object".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Parse the OpenAI-compatible JSON response into an `LLMResponse`.
 fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
     let choices = data
@@ -1472,7 +1491,7 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
 
             let arguments: HashMap<String, serde_json::Value> =
                 if let Some(s) = arguments_raw.as_str() {
-                    match serde_json::from_str(s) {
+                    match parse_tool_arguments(s) {
                         Ok(map) => map,
                         Err(e) => {
                             warn!(
@@ -1640,7 +1659,7 @@ async fn parse_sse_stream(
                         continue;
                     }
                     let arguments: HashMap<String, serde_json::Value> =
-                        match serde_json::from_str(&args_str) {
+                        match parse_tool_arguments(&args_str) {
                             Ok(map) => map,
                             Err(e) => {
                                 warn!(
@@ -1857,7 +1876,7 @@ async fn parse_sse_stream(
             );
             continue;
         }
-        let arguments: HashMap<String, serde_json::Value> = match serde_json::from_str(&args_str) {
+        let arguments: HashMap<String, serde_json::Value> = match parse_tool_arguments(&args_str) {
             Ok(map) => map,
             Err(e) => {
                 warn!(
@@ -2664,6 +2683,46 @@ mod tests {
             tc.arguments.get("raw").and_then(|v| v.as_str()),
             Some("this is not json")
         );
+    }
+
+    #[test]
+    fn test_parse_response_double_encoded_arguments() {
+        // Local models sometimes double-encode: `arguments` is a JSON string
+        // that decodes to another JSON *string* rather than to an object.
+        // Build that payload the same way the wire does, so the test cannot
+        // silently degrade into the ordinary single-encoded case.
+        let double_encoded = serde_json::to_string(r#"{"query": "news"}"#).unwrap();
+        assert!(
+            serde_json::from_str::<HashMap<String, serde_json::Value>>(&double_encoded).is_err(),
+            "payload must not be plain single-encoded args"
+        );
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_news",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": double_encoded
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        assert_eq!(resp.tool_calls.len(), 1);
+        let tc = &resp.tool_calls[0];
+        assert_eq!(tc.name, "search");
+        // Verify the parameter was correctly unwrapped.
+        assert_eq!(
+            tc.arguments.get("query").and_then(|v| v.as_str()),
+            Some("news")
+        );
+        // Verify "raw" key is NOT present (not a fallback case).
+        assert!(tc.arguments.get("raw").is_none());
     }
 
     #[test]
