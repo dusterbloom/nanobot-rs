@@ -536,14 +536,25 @@ pub(crate) fn higgs_keepalive_secs(
     }
 }
 
+fn higgs_keepalive_request_body(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "."}],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "stream": false,
+        "cache_mode": "bypass",
+    })
+}
+
 /// Keep a local Higgs model resident by sending a 1-token completion whenever
 /// the REPL is idle.
 ///
 /// Why: an idle gap lets the OS evict the 35B's weights, so the next real turn
 /// pays a multi-second cold reload (observed 37–67 s TTFT vs ~3 s warm). A tiny
 /// periodic inference touches the weights so they stay hot, and surfaces a
-/// crash early via a WARN. The 1-token prompt cannot evict the user's cached
-/// prefix from Higgs's radix cache (it's a separate, negligible branch).
+/// crash early via a WARN. The request explicitly bypasses Higgs's prefix
+/// cache so it cannot create or evict user cache entries.
 ///
 /// Skips a tick while a real request is in flight (`inference_active`) — that
 /// request is already keeping the model warm.
@@ -558,13 +569,7 @@ fn spawn_higgs_keepalive(
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": model,
-            "messages": [{"role": "user", "content": "."}],
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "stream": false,
-        });
+        let body = higgs_keepalive_request_body(&model);
         loop {
             tokio::time::sleep(Duration::from_secs(interval_s)).await;
             if stop.load(Ordering::Relaxed) {
@@ -3160,5 +3165,12 @@ mod tests {
             higgs_keepalive_secs("lms", "http://127.0.0.1:8000/v1", None),
             None
         );
+    }
+
+    #[test]
+    fn test_keepalive_request_bypasses_prefix_cache() {
+        let body = higgs_keepalive_request_body("qwen36-35b");
+        assert_eq!(body["cache_mode"], "bypass");
+        assert_eq!(body["max_tokens"], 1);
     }
 }

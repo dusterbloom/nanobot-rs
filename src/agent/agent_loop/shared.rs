@@ -4,9 +4,9 @@
 //! Extracted from `agent_loop.rs` as a `#[path]` submodule.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
@@ -14,14 +14,10 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::agent::agent_loop::heuristics::{
-    adaptive_max_tokens_for_artifact_action, evaluate_repeated_tool_round,
-    local_artifact_action_with_sticky, LocalArtifactAction, RepeatBreakerAction,
+    adaptive_max_tokens_for_artifact_action, evaluate_repeated_tool_round, RepeatBreakerAction,
 };
 use crate::agent::audit::{AuditLog, ToolEvent};
-use crate::agent::compaction::ContextCompactor;
-use crate::agent::lcm::{
-    CompactionAction, CompactionFailureMode, LcmCompactionState, LcmConfig, LcmEngine,
-};
+use crate::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
 use crate::agent::policy;
 use crate::agent::prefix_guard;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
@@ -41,8 +37,8 @@ use crate::errors::is_retryable_provider_error;
 use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
 
 use crate::agent::agent_core::{
-    append_to_system_prompt, apply_compaction_result, stable_higgs_session_id, PendingCompaction,
-    RuntimeCounters, SharedCoreHandle, SwappableCore,
+    append_to_system_prompt, apply_compaction_result, stable_higgs_session_id, RuntimeCounters,
+    SharedCoreHandle, SwappableCore,
 };
 
 use super::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
@@ -52,574 +48,25 @@ use super::{last_user_message, render_via_protocol, should_strip_tools_for_trio}
 use super::response::RetryState;
 use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, ControlMarker};
 
-const DEFAULT_HIGGS_RETAINED_SESSION_CAP_TOKENS: usize = 24_576;
-const HIGGS_RETAINED_CAP_ENV: &str = "NANOBOT_HIGGS_RETAINED_CAP_TOKENS";
-const DEFAULT_HIGGS_RETAINED_ADMISSION_RATIO: f64 = 0.80;
-const HIGGS_RETAINED_ADMISSION_RATIO_ENV: &str = "NANOBOT_HIGGS_RETAINED_ADMISSION_RATIO";
-const HIGGS_PROMPT_TOKEN_RATIO_CEILING: f64 = 2.50;
-const LOCAL_STREAM_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
-const LOCAL_ARTIFACT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(90);
-const BACKEND_ACTIVITY_HEARTBEAT: Duration = Duration::from_secs(5);
-fn backend_activity_code(phase: BackendActivity) -> u8 {
-    match phase {
-        BackendActivity::WaitingForHeaders => 0,
-        BackendActivity::Prefill => 1,
-        BackendActivity::AwaitingToolPayload => 2,
-        BackendActivity::ToolPayload => 3,
-        BackendActivity::Decoding => 4,
-    }
-}
+use super::budget::{
+    advertised_tool_names, attach_higgs_session_marker, clear_prompt_cache_state,
+    conversation_token_count, divergent_message_digest, effective_lcm_available_budget,
+    higgs_retained_admission, higgs_retained_session_cap_tokens,
+    invalidate_prompt_cache_for_rewrite, proactive_grounding_preserves_prefix_cache,
+    retained_context_pressure, send_cache_reset_marker, send_retract_reply_marker,
+    should_allow_checkpoint, should_inject_heartbeat_grounding,
+};
+use super::compaction::execute_lcm_compaction;
+use super::local_stream::{
+    emit_stream_abort_metrics, local_artifact_action_for_turn, local_no_stream_headers_error,
+    local_no_stream_progress_error, local_stream_no_progress_timeout, BackendActivityHeartbeat,
+    LocalStreamProgress,
+};
 
-fn backend_activity_from_code(code: u8) -> BackendActivity {
-    match code {
-        1 => BackendActivity::Prefill,
-        2 => BackendActivity::AwaitingToolPayload,
-        3 => BackendActivity::ToolPayload,
-        4 => BackendActivity::Decoding,
-        _ => BackendActivity::WaitingForHeaders,
-    }
-}
-
-fn send_backend_activity_marker(
-    tx: &UnboundedSender<String>,
-    phase: BackendActivity,
-    idle_ms: u64,
-) {
-    let _ = tx.send(ControlMarker::BackendActivity { phase, idle_ms }.encode());
-}
-
-struct BackendActivityHeartbeat {
-    tx: UnboundedSender<String>,
-    stop: Arc<AtomicBool>,
-    phase: Arc<AtomicU8>,
-    last_progress_ms: Arc<AtomicU64>,
-    started: Instant,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl BackendActivityHeartbeat {
-    fn start(tx: Option<UnboundedSender<String>>, enabled: bool) -> Option<Self> {
-        if !enabled {
-            return None;
-        }
-        let tx = tx?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let phase = Arc::new(AtomicU8::new(backend_activity_code(
-            BackendActivity::WaitingForHeaders,
-        )));
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let started = Instant::now();
-        send_backend_activity_marker(&tx, BackendActivity::WaitingForHeaders, 0);
-
-        let task_stop = stop.clone();
-        let task_phase = phase.clone();
-        let task_last_progress = last_progress_ms.clone();
-        let task_tx = tx.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(BACKEND_ACTIVITY_HEARTBEAT).await;
-                if task_stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                let last_ms = task_last_progress.load(Ordering::Relaxed);
-                let idle_ms = elapsed_ms.saturating_sub(last_ms);
-                send_backend_activity_marker(
-                    &task_tx,
-                    backend_activity_from_code(task_phase.load(Ordering::Relaxed)),
-                    idle_ms,
-                );
-            }
-        });
-
-        Some(Self {
-            tx,
-            stop,
-            phase,
-            last_progress_ms,
-            started,
-            task,
-        })
-    }
-
-    fn mark_progress(&self, phase: BackendActivity) {
-        let code = backend_activity_code(phase);
-        let old = self.phase.swap(code, Ordering::Relaxed);
-        self.last_progress_ms
-            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
-        if old != code {
-            send_backend_activity_marker(&self.tx, phase, 0);
-        }
-    }
-}
-
-impl Drop for BackendActivityHeartbeat {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        self.task.abort();
-    }
-}
-
-#[derive(Debug)]
-struct LocalStreamProgress {
-    artifact_tool_payload_timeout: Option<Duration>,
-    artifact_tool_payload_deadline: Option<tokio::time::Instant>,
-    saw_tool_payload: bool,
-}
-
-impl LocalStreamProgress {
-    fn new(artifact_tool_payload_timeout: Option<Duration>) -> Self {
-        Self {
-            artifact_tool_payload_timeout,
-            artifact_tool_payload_deadline: None,
-            saw_tool_payload: false,
-        }
-    }
-
-    fn pending_artifact_tool_payload_deadline(&self) -> Option<tokio::time::Instant> {
-        if self.saw_tool_payload {
-            None
-        } else {
-            self.artifact_tool_payload_deadline
-        }
-    }
-
-    fn on_prefill_progress(
-        &mut self,
-        processed: u64,
-        total: u64,
-        now: tokio::time::Instant,
-    ) -> BackendActivity {
-        if total > 0 && processed >= total {
-            self.on_decode_without_tool_payload(now)
-        } else {
-            BackendActivity::Prefill
-        }
-    }
-
-    fn on_text_or_thinking_delta(&mut self, now: tokio::time::Instant) -> BackendActivity {
-        self.on_decode_without_tool_payload(now)
-    }
-
-    fn on_tool_call_delta(&mut self) -> BackendActivity {
-        self.saw_tool_payload = true;
-        self.artifact_tool_payload_deadline = None;
-        BackendActivity::ToolPayload
-    }
-
-    fn on_decode_without_tool_payload(&mut self, now: tokio::time::Instant) -> BackendActivity {
-        if self.artifact_tool_payload_timeout.is_some() && !self.saw_tool_payload {
-            self.arm_artifact_deadline_once(now);
-            BackendActivity::AwaitingToolPayload
-        } else {
-            BackendActivity::Decoding
-        }
-    }
-
-    fn arm_artifact_deadline_once(&mut self, now: tokio::time::Instant) {
-        if self.artifact_tool_payload_deadline.is_none() {
-            if let Some(timeout) = self.artifact_tool_payload_timeout {
-                self.artifact_tool_payload_deadline = Some(now + timeout);
-            }
-        }
-    }
-}
-
-fn local_artifact_action_for_turn(ctx: &TurnContext) -> Option<LocalArtifactAction> {
-    if !ctx.core.mode().is_local() {
-        return None;
-    }
-    let sticky_action = ctx
-        .counters
-        .local_artifact_intent_is_rich(&ctx.session_key, ctx.turn_count)
-        .map(|is_rich| {
-            if is_rich {
-                LocalArtifactAction::Rich
-            } else {
-                LocalArtifactAction::Simple
-            }
-        });
-    let action = local_artifact_action_with_sticky(&ctx.user_content, sticky_action);
-    if let Some(action) = action {
-        ctx.counters.record_local_artifact_intent(
-            &ctx.session_key,
-            ctx.turn_count,
-            matches!(action, LocalArtifactAction::Rich),
-        );
-    }
-    action
-}
-
-fn local_stream_no_progress_timeout(ctx: &TurnContext) -> Option<Duration> {
-    if !ctx.core.mode().is_local() {
-        return None;
-    }
-    // Evaluate for the intent-recording side effect; the no-progress deadline is
-    // the same for Rich and Simple turns. Only the artifact payload deadline
-    // (local_artifact_tool_payload_timeout) branches on the action.
-    let _ = local_artifact_action_for_turn(ctx);
-    Some(LOCAL_STREAM_NO_PROGRESS_TIMEOUT)
-}
-
-fn local_artifact_tool_payload_timeout(
-    ctx: &TurnContext,
-    tool_defs: Option<&[Value]>,
-) -> Option<Duration> {
-    if !ctx.core.mode().is_local() || tool_defs.map_or(true, |defs| defs.is_empty()) {
-        return None;
-    }
-    matches!(
-        local_artifact_action_for_turn(ctx),
-        Some(LocalArtifactAction::Rich)
-    )
-    .then_some(LOCAL_ARTIFACT_NO_PROGRESS_TIMEOUT)
-}
-
-fn local_no_stream_headers_error(timeout: Duration) -> String {
-    format!(
-        "The local backend produced no stream headers for {}s, so I aborted the turn instead of waiting for the 600s transport timeout.",
-        timeout.as_secs()
-    )
-}
-
-fn local_no_stream_progress_error(timeout: Duration) -> String {
-    format!(
-        "The local backend produced no stream progress for {}s, so I aborted the turn instead of waiting for the 600s transport timeout.",
-        timeout.as_secs()
-    )
-}
-
-fn local_artifact_no_tool_payload_error(timeout: Duration) -> String {
-    format!(
-        "The local backend did not start a tool-call payload for this artifact request within {}s, so I aborted the turn instead of waiting for the 600s transport timeout.",
-        timeout.as_secs()
-    )
-}
-
-fn emit_stream_abort_metrics(ctx: &TurnContext, detail: &str) {
-    crate::agent::metrics::emit(&crate::agent::metrics::RequestMetrics {
-        timestamp: chrono::Local::now().to_rfc3339(),
-        request_id: ctx.request_id.clone(),
-        role: "main".into(),
-        model: ctx.core.model.clone(),
-        provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),
-        elapsed_ms: ctx
-            .flow
-            .llm_call_start
-            .map_or(0, |t| t.elapsed().as_millis() as u64),
-        ttft_ms: ctx.flow.ttft_ms,
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        cache_read_tokens: None,
-        cache_creation_tokens: None,
-        status: "error".into(),
-        error_detail: Some(detail.to_string()),
-        raw_response: None,
-        anti_drift_score: None,
-        anti_drift_signals: None,
-        tool_calls_requested: 0,
-        tool_calls_executed: 0,
-        validation_result: None,
-    });
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HiggsRetainedAdmission {
-    estimated_prompt_tokens: usize,
-    calibrated_prompt_tokens: usize,
-    admission_limit_tokens: usize,
-    observed_token_ratio: f64,
-    force_blocking: bool,
-}
-
-fn send_cache_reset_marker(
-    tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    reason: CacheResetReason,
-) {
-    if let Some(tx) = tx {
-        let _ = tx.send(ControlMarker::CacheStatus(CacheStatus::Reset { reason }).encode());
-    }
-}
-
-fn clear_prompt_cache_state(ctx: &TurnContext) -> bool {
-    ctx.counters.clear_local_prompt_cache(&ctx.session_key)
-}
-
-/// Invalidate prompt-cache state after a sanctioned prompt rewrite (budget
-/// trim, emergency trim, LCM compaction). When the provider supports the higgs
-/// retained-session protocol, the retained session is ROTATED (epoch bump +
-/// queued drop) so the server cold-starts the rewritten prompt instead of
-/// rejecting a shrunken prompt as "not_growing" and re-prefilling under the
-/// stale session id. Otherwise only local bookkeeping is cleared. The system
-/// message is never mutated — rotation alone invalidates the cache.
-fn invalidate_prompt_cache_for_rewrite(ctx: &mut TurnContext, reason: CacheResetReason) -> bool {
-    let rotate = ctx.core.mode().is_local() && ctx.core.provider.supports_higgs_session_cache();
-    ctx.counters
-        .invalidate_prompt_cache(&ctx.session_key, rotate);
-    send_cache_reset_marker(&ctx.text_delta_tx, reason);
-    rotate
-}
-
-fn send_retract_reply_marker(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>) {
-    if let Some(tx) = tx {
-        let _ = tx.send(ControlMarker::RetractReply.encode());
-    }
-}
-
-/// Classify a divergent message for the `prompt_prefix_diverged` WARN: role +
-/// structural kind tags + a truncated content snippet. Names the cache-busting
-/// class (synthetic / cache-replay / lcm-summary / tool-result / persisted) so
-/// the higgs `token_mismatch` cause is identifiable from the log line alone
-/// without a separate message dump.
-///
-/// After the trim/compaction fixes, every sanctioned rewrite clears the prompt
-/// fingerprint, so a `PromptDelta::Diverged` is by definition UNSANCTIONED — a
-/// message whose rendered bytes changed across turns under the same session id.
-/// This digest names which structural kind diverged so the root cause (e.g. a
-/// transient synthetic that was sent but not replayed, or a re-summarized LCM
-/// block) is obvious.
-fn divergent_message_digest(msg: &Value) -> String {
-    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-    let snippet: String = content.chars().take(70).collect();
-
-    let mut tags: Vec<&str> = Vec::new();
-    if msg
-        .get("_synthetic")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        tags.push("synthetic");
-    }
-    if msg
-        .get("_cache_replay")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        tags.push("cache-replay");
-    }
-    if msg
-        .get("_lcm_summary")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        tags.push("lcm-summary");
-    }
-    if msg.get("tool_call_id").is_some() {
-        tags.push("tool-result");
-    }
-    if msg.get("_db_id").is_some() {
-        tags.push("persisted");
-    }
-
-    if tags.is_empty() {
-        format!("[{role}] {snippet}")
-    } else {
-        format!("[{role}] ({}) {snippet}", tags.join(","))
-    }
-}
-
-fn attach_higgs_session_marker(messages: &mut [Value], session_id: u64, drop_session_ids: &[u64]) {
-    if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
-        first.insert(
-            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD.to_string(),
-            json!(session_id),
-        );
-        match drop_session_ids {
-            [] => {}
-            [drop_session_id] => {
-                first.insert(
-                    crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD
-                        .to_string(),
-                    json!(drop_session_id),
-                );
-            }
-            drop_session_ids => {
-                first.insert(
-                    crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD
-                        .to_string(),
-                    json!(drop_session_ids),
-                );
-            }
-        }
-    }
-}
-
-fn proactive_grounding_preserves_prefix_cache(is_local: bool) -> bool {
-    !is_local
-}
-
-/// Decide whether to inject a heartbeat `[grounding]` message this iteration.
-///
-/// Pure policy: combines the existing cadence/pressure rule (`should_ground`)
-/// with the prefix-cache preservation rule (`proactive_grounding_preserves_prefix_cache`).
-/// Local models skip heartbeat grounding because every synthetic user turn
-/// diverges the warm prefix cache.
-fn should_inject_heartbeat_grounding(
-    iteration: u32,
-    interval: u32,
-    pressure: f32,
-    is_local: bool,
-) -> bool {
-    system_state::should_ground(iteration, interval, pressure)
-        && proactive_grounding_preserves_prefix_cache(is_local)
-}
-
-fn conversation_token_count(messages: &[Value]) -> usize {
-    let conversation: Vec<Value> = messages
-        .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
-        .cloned()
-        .collect();
-    TokenBudget::estimate_tokens(&conversation)
-}
-
-fn advertised_tool_names(tool_defs: &[Value]) -> HashSet<String> {
-    tool_defs
-        .iter()
-        .filter_map(|def| {
-            def.pointer("/function/name")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect()
-}
-
-fn system_token_count(messages: &[Value]) -> usize {
-    let system: Vec<Value> = messages
-        .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
-        .cloned()
-        .collect();
-    TokenBudget::estimate_tokens(&system)
-}
-
-/// Retained-session token cap used for admission pressure. Engaged when the
-/// provider advertises the higgs retained-session protocol
-/// (`supports_higgs_session_cache`, set for any `localBackend=higgs` regardless
-/// of port), or overridden explicitly via `HIGGS_RETAINED_CAP_ENV`. The
-/// capability flag — not a hardcoded port — decides engagement, so a
-/// higgs-nightly server on port 8092 still participates.
-fn higgs_retained_session_cap_tokens(higgs_capable: bool) -> Option<usize> {
-    match std::env::var(HIGGS_RETAINED_CAP_ENV) {
-        Ok(raw) => return raw.trim().parse::<usize>().ok().filter(|cap| *cap > 0),
-        Err(std::env::VarError::NotPresent) => {}
-        Err(std::env::VarError::NotUnicode(_)) => return None,
-    }
-
-    higgs_capable.then_some(DEFAULT_HIGGS_RETAINED_SESSION_CAP_TOKENS)
-}
-
-fn higgs_retained_admission_ratio() -> f64 {
-    match std::env::var(HIGGS_RETAINED_ADMISSION_RATIO_ENV) {
-        Ok(raw) => raw
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|ratio| ratio.is_finite() && (0.10..=0.98).contains(ratio))
-            .unwrap_or(DEFAULT_HIGGS_RETAINED_ADMISSION_RATIO),
-        Err(_) => DEFAULT_HIGGS_RETAINED_ADMISSION_RATIO,
-    }
-}
-
-fn calibrated_higgs_prompt_tokens(
-    estimated_prompt_tokens: usize,
-    last_estimated_prompt_tokens: u64,
-    last_actual_prompt_tokens: u64,
-) -> (usize, f64) {
-    if last_estimated_prompt_tokens == 0 || last_actual_prompt_tokens == 0 {
-        return (estimated_prompt_tokens, 1.0);
-    }
-
-    let observed_ratio = (last_actual_prompt_tokens as f64 / last_estimated_prompt_tokens as f64)
-        .clamp(1.0, HIGGS_PROMPT_TOKEN_RATIO_CEILING);
-    (
-        ((estimated_prompt_tokens as f64) * observed_ratio).ceil() as usize,
-        observed_ratio,
-    )
-}
-
-fn higgs_retained_admission(
-    retained_cap_tokens: Option<usize>,
-    messages: &[Value],
-    tool_def_tokens: usize,
-    last_estimated_prompt_tokens: u64,
-    last_actual_prompt_tokens: u64,
-) -> Option<HiggsRetainedAdmission> {
-    let cap = retained_cap_tokens?;
-    if cap == 0 {
-        return None;
-    }
-
-    let estimated_prompt_tokens =
-        TokenBudget::estimate_tokens(messages).saturating_add(tool_def_tokens);
-    let (calibrated_prompt_tokens, observed_token_ratio) = calibrated_higgs_prompt_tokens(
-        estimated_prompt_tokens,
-        last_estimated_prompt_tokens,
-        last_actual_prompt_tokens,
-    );
-    let admission_limit_tokens = ((cap as f64) * higgs_retained_admission_ratio()).floor() as usize;
-
-    Some(HiggsRetainedAdmission {
-        estimated_prompt_tokens,
-        calibrated_prompt_tokens,
-        admission_limit_tokens,
-        observed_token_ratio,
-        force_blocking: calibrated_prompt_tokens >= admission_limit_tokens,
-    })
-}
-
-fn retained_conversation_available(
-    retained_cap_tokens: usize,
-    messages: &[Value],
-    tool_def_tokens: usize,
-) -> usize {
-    retained_cap_tokens
-        .saturating_sub(system_token_count(messages))
-        .saturating_sub(tool_def_tokens)
-}
-
-fn effective_lcm_available_budget(
-    model_available: usize,
-    messages: &[Value],
-    tool_def_tokens: usize,
-    retained_cap_tokens: Option<usize>,
-) -> (usize, Option<usize>) {
-    let Some(retained_cap_tokens) = retained_cap_tokens else {
-        return (model_available, None);
-    };
-    let retained_available =
-        retained_conversation_available(retained_cap_tokens, messages, tool_def_tokens);
-    (
-        model_available.min(retained_available),
-        Some(retained_available),
-    )
-}
-
-fn retained_context_pressure(
-    retained_cap_tokens: Option<usize>,
-    messages: &[Value],
-    tool_def_tokens: usize,
-) -> Option<f32> {
-    let cap = retained_cap_tokens?;
-    if cap == 0 {
-        return None;
-    }
-    let used = TokenBudget::estimate_tokens(messages).saturating_add(tool_def_tokens);
-    Some((used as f32) / (cap as f32))
-}
-
-/// Decide whether to accept the prefix-cache re-prefill cost and install a
-/// pending compaction result rather than deferring it.
-///
-/// Below `tau_hard` the cache-warm deferral is honoured. At or above
-/// `tau_hard` compaction is forced through: the one-time re-prefill of a
-/// compacted context is strictly cheaper than the unbounded growth that
-/// starves compaction until the model hits max tokens and fails.
-fn should_allow_checkpoint(pressure: f32, tau_hard: f64, retained_pressure: Option<f32>) -> bool {
-    (pressure as f64) >= tau_hard
-        || retained_pressure.is_some_and(|pressure| (pressure as f64) >= tau_hard)
-}
+// `CompactionHandle` moved to the `compaction` submodule; re-exported here so
+// the `agent_loop::CompactionHandle` path used by `prepare_context.rs` keeps
+// working.
+pub(crate) use super::compaction::CompactionHandle;
 
 // ---------------------------------------------------------------------------
 // Per-instance state (different per agent)
@@ -952,259 +399,9 @@ impl TurnContext {
     }
 }
 
-/// Shared handles for background compaction coordination.
-pub(crate) struct CompactionHandle {
-    pub(crate) slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>>,
-    pub(crate) in_flight: Arc<AtomicBool>,
-}
-
-#[derive(Clone, Copy)]
-enum CompactionSidecarAttempt {
-    /// Try to acquire a lease from the managed compaction sidecar, if one is
-    /// configured, before compacting.
-    Acquire,
-    /// Don't attempt a sidecar acquire this round (e.g. a prior attempt in
-    /// the same blocking pass already timed out) — go straight to the main
-    /// provider so the retry isn't spent waiting on an unresponsive sidecar
-    /// again.
-    Skip,
-}
-
-/// Build a compactor bound directly to the main provider/model, bypassing a
-/// managed compaction sidecar that is unreachable (or was never configured
-/// for a fresh attempt). Reuses the sidecar-tuned context-window budget so
-/// summarization chunking stays unchanged; only the endpoint and served
-/// model differ. Never `None` — this is what keeps compaction from silently
-/// degrading to truncation when the sidecar is down.
-fn main_provider_compactor(core: &SwappableCore) -> ContextCompactor {
-    ContextCompactor::new(
-        core.provider.clone(),
-        core.model.clone(),
-        core.compactor.context_size(),
-    )
-}
-
-/// Cancellation-safe ownership of one tentative LCM mutation. Unless SQLite
-/// commit explicitly succeeds, dropping the future restores the prior DAG and
-/// active window before releasing the per-session engine lock.
-struct LcmCompactionMutation<'a> {
-    engine: &'a mut LcmEngine,
-    rollback: Option<LcmCompactionState>,
-}
-
-impl<'a> LcmCompactionMutation<'a> {
-    fn new(engine: &'a mut LcmEngine) -> Self {
-        Self {
-            rollback: Some(engine.compaction_state()),
-            engine,
-        }
-    }
-
-    fn engine(&self) -> &LcmEngine {
-        self.engine
-    }
-
-    fn engine_mut(&mut self) -> &mut LcmEngine {
-        self.engine
-    }
-
-    fn commit(&mut self) {
-        self.rollback = None;
-    }
-}
-
-impl Drop for LcmCompactionMutation<'_> {
-    fn drop(&mut self) {
-        if let Some(state) = self.rollback.take() {
-            self.engine.restore_compaction_state(state);
-        }
-    }
-}
-
-const COMPACTION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(75);
-const COMPACTION_RUN_TIMEOUT: Duration = Duration::from_secs(150);
-const COMPACTION_SOFT_DRAIN_TIMEOUT: Duration = Duration::from_secs(155);
-
-/// Execute one LCM compaction and persist its lossless summary metadata.
-/// The caller decides whether to await this future (hard pressure) or spawn it
-/// (soft pressure); keeping the operation itself shared prevents the two paths
-/// from drifting.
-async fn execute_lcm_compaction(
-    core: Arc<SwappableCore>,
-    session_id: String,
-    lcm: Arc<tokio::sync::Mutex<LcmEngine>>,
-    messages: Vec<Value>,
-    session_turn: u64,
-    failure_mode: CompactionFailureMode,
-    sidecar_attempt: CompactionSidecarAttempt,
-) -> Option<PendingCompaction> {
-    let (lease, resolved_compactor): (_, ContextCompactor) = match sidecar_attempt {
-        CompactionSidecarAttempt::Acquire => match core.compaction_manager.as_ref() {
-            Some(manager) => {
-                match tokio::time::timeout(COMPACTION_ACQUIRE_TIMEOUT, manager.acquire()).await {
-                    Ok(Ok(lease)) => {
-                        let compactor = core.compactor.for_model(lease.served_model().to_string());
-                        (Some(lease), compactor)
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            %error,
-                            ?failure_mode,
-                            model = %core.model,
-                            "compaction sidecar unavailable — compacting with main model"
-                        );
-                        (None, main_provider_compactor(&core))
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            timeout_secs = COMPACTION_ACQUIRE_TIMEOUT.as_secs(),
-                            ?failure_mode,
-                            model = %core.model,
-                            "compaction sidecar unavailable — compacting with main model"
-                        );
-                        (None, main_provider_compactor(&core))
-                    }
-                }
-            }
-            // No managed sidecar configured at all — the core's base
-            // compactor already resolves to the right endpoint (explicit
-            // memory.provider / specialist / main provider).
-            None => (None, core.compactor.clone()),
-        },
-        // Already timed out once this round; don't re-attempt a sidecar
-        // acquire that just failed — go straight to the main provider.
-        CompactionSidecarAttempt::Skip => (None, main_provider_compactor(&core)),
-    };
-
-    // Keep the engine locked through SQLite commit. A failed checkpoint rolls
-    // back the DAG/active window before any other task can observe or extend
-    // the non-durable state.
-    let mut engine = lcm.lock().await;
-    let mut mutation = LcmCompactionMutation::new(&mut engine);
-    let summary_turn = mutation
-        .engine_mut()
-        .compact(
-            Some(&resolved_compactor),
-            &core.token_budget,
-            0,
-            failure_mode,
-        )
-        .await;
-    let compacted_conversation = mutation.engine().active_context();
-    let summary_node = summary_turn.as_ref().and_then(|turn| {
-        let crate::agent::turn::Turn::Summary {
-            text,
-            source_ids,
-            level,
-        } = turn
-        else {
-            return None;
-        };
-        let node = mutation.engine().dag().newest()?;
-        let node_id = node.id;
-        let child_ids = node.child_summaries.clone();
-        Some((
-            node_id,
-            source_ids.clone(),
-            child_ids,
-            text.clone(),
-            TokenBudget::estimate_str_tokens(text),
-            *level,
-        ))
-    });
-
-    // LCM stores only durable conversation rows. Reattach the complete
-    // non-durable prompt prefix (system + optional developer) and any
-    // same-snapshot ephemeral tail so installing the checkpoint cannot erase
-    // instructions or scaffolding that the engine intentionally did not ingest.
-    let prompt_prefix_len = messages
-        .iter()
-        .take_while(|message| {
-            matches!(
-                message.get("role").and_then(Value::as_str),
-                Some("system" | "developer")
-            )
-        })
-        .count();
-    let ephemeral_tail = messages[prompt_prefix_len..]
-        .iter()
-        .filter(|message| {
-            message.get("_db_id").is_none()
-                && !message
-                    .get("_lcm_summary")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-        })
-        .cloned();
-    let mut compacted_messages =
-        Vec::with_capacity(prompt_prefix_len + compacted_conversation.len() + messages.len());
-    compacted_messages.extend_from_slice(&messages[..prompt_prefix_len]);
-    compacted_messages.extend(compacted_conversation);
-    compacted_messages.extend(ephemeral_tail);
-
-    // A failed/no-op soft compaction must preserve the active array byte for
-    // byte. Length alone is invalid here because the LCM context deliberately
-    // omits system/developer messages.
-    let reduced =
-        TokenBudget::estimate_tokens(&compacted_messages) < TokenBudget::estimate_tokens(&messages);
-    let pending = (summary_turn.is_some() && reduced).then(|| PendingCompaction {
-        result: crate::agent::compaction::CompactionResult {
-            messages: compacted_messages,
-        },
-        snapshot: messages,
-    });
-
-    // Summary nodes, rather than synthetic message rows, persist the DAG. The
-    // summary and working-memory snapshot commit together before this function
-    // returns the in-memory checkpoint: foreground inference must never install
-    // an LCM state that cannot be reconstructed after restart.
-    let compacted = summary_turn.is_some();
-    let checkpoint_persisted =
-        if let (Some((node_id, source_ids, child_ids, text, tokens, level)), true) =
-            (summary_node, pending.is_some())
-        {
-            let working_memory = core.memory_enabled.then_some((text.as_str(), session_turn));
-            match core
-                .sessions
-                .save_compaction_checkpoint(
-                    &session_id,
-                    node_id,
-                    &source_ids,
-                    &child_ids,
-                    &text,
-                    tokens,
-                    level,
-                    working_memory,
-                )
-                .await
-            {
-                Ok(()) => true,
-                Err(error) => {
-                    warn!(%error, %session_id, node_id, "lcm checkpoint persistence failed");
-                    false
-                }
-            }
-        } else {
-            !compacted
-        };
-    if checkpoint_persisted {
-        mutation.commit();
-    }
-    drop(mutation);
-    drop(engine);
-    // Drop is the cancellation-safe release path; it schedules last-lease
-    // shutdown without delaying foreground checkpoint installation.
-    drop(lease);
-    if checkpoint_persisted {
-        pending
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod lcm_checkpoint_tests {
-    use super::LcmCompactionMutation;
+    use crate::agent::agent_loop::compaction::LcmCompactionMutation;
     use crate::agent::compaction::ContextCompactor;
     use crate::agent::lcm::{CompactionFailureMode, LcmConfig, LcmEngine};
     use crate::agent::token_budget::TokenBudget;
@@ -2172,16 +1369,12 @@ impl AgentLoopShared {
     /// Returns `(active_defs, saved_defs)` where `saved_defs` preserves the
     /// pre-trio-stripping state for router passthrough fallback.
     fn select_tool_definitions(&self, ctx: &mut TurnContext) -> (Vec<Value>, Vec<Value>) {
-        // Local: pure proxy (~230 tok) — every tool reached via `tool` gateway.
-        // Cloud: core+proxy (~1900 tok) — 12 hot native schemas + proxy tail.
-        // The branch is unavoidable: local needs the lean surface to cut prefill,
-        // cloud needs native schemas because the capability gate filters by tool
-        // name and `tool` is not in any capability allowlist.
-        let mut tool_defs = if ctx.core.mode().is_local() {
-            ctx.tools.get_lean_definitions()
-        } else {
-            ctx.tools.get_core_plus_proxy_definitions()
-        };
+        // One protocol for local and cloud: hot tools have native schemas and
+        // the proxy exposes the long tail. Bonsai otherwise mixes the proxy
+        // envelope with native calls (for example exec(args={command: ...})).
+        // The larger schema prefix is stable and retained by local backends;
+        // paying it once is cheaper than repeated malformed generations.
+        let mut tool_defs = ctx.tools.get_core_plus_proxy_definitions();
         // Tool-averse models (no tool-calling training, e.g. VibeThinker):
         // the native `tools` parameter confuses or errors their chat
         // templates, and nothing else would teach them the textual syntax the
@@ -2474,7 +1667,9 @@ impl AgentLoopShared {
             // A soft job may finish after the raw foreground context has
             // crossed the hard threshold. At that point foreground inference
             // waits for it and installs its checkpoint before doing anything
-            // else. The background job has its own 90-second timeout.
+            // else. Each model request has a sliding inactivity deadline, so
+            // the whole multi-request compaction must not have a wall clock
+            // timeout that can cancel otherwise healthy progress.
             let mut retained_admission_hard = retained_admission
                 .as_ref()
                 .is_some_and(|admission| admission.force_blocking);
@@ -2486,13 +1681,7 @@ impl AgentLoopShared {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 };
-                if tokio::time::timeout(COMPACTION_SOFT_DRAIN_TIMEOUT, wait_for_soft_job)
-                    .await
-                    .is_err()
-                {
-                    warn!("LCM soft compaction did not clear after its timeout");
-                    ctx.compaction.in_flight.store(false, Ordering::Release);
-                }
+                wait_for_soft_job.await;
             }
             if raw_hard {
                 self.install_pending_compaction(ctx, true).await;
@@ -2556,33 +1745,15 @@ impl AgentLoopShared {
                     .get_session(&session_id)
                     .await
                     .map_or(0, |session| session.message_count as u64);
-                let first_attempt = execute_lcm_compaction(
-                    core.clone(),
-                    session_id.clone(),
+                let pending = execute_lcm_compaction(
+                    core,
+                    session_id,
                     lcm_engine.clone(),
-                    messages.clone(),
+                    messages,
                     session_turn,
                     CompactionFailureMode::Deterministic,
-                    CompactionSidecarAttempt::Acquire,
-                );
-                let pending = match tokio::time::timeout(COMPACTION_RUN_TIMEOUT, first_attempt)
-                    .await
-                {
-                    Ok(pending) => pending,
-                    Err(_) => {
-                        warn!("LCM blocking compaction timed out; retrying against the main model directly (no sidecar re-acquire)");
-                        execute_lcm_compaction(
-                            core,
-                            session_id,
-                            lcm_engine.clone(),
-                            messages,
-                            session_turn,
-                            CompactionFailureMode::Deterministic,
-                            CompactionSidecarAttempt::Skip,
-                        )
-                        .await
-                    }
-                };
+                )
+                .await;
                 if let Some(pending) = pending {
                     *ctx.compaction.slot.lock().await = Some(pending);
                 }
@@ -2620,17 +1791,11 @@ impl AgentLoopShared {
                     ctx.messages.clone(),
                     session_turn,
                     CompactionFailureMode::PreserveContext,
-                    CompactionSidecarAttempt::Acquire,
                 );
                 in_flight.store(true, Ordering::Release);
                 tokio::spawn(async move {
-                    match tokio::time::timeout(COMPACTION_RUN_TIMEOUT, task).await {
-                        Ok(Some(pending)) => *slot.lock().await = Some(pending),
-                        Ok(None) => {}
-                        Err(_) => warn!(
-                            timeout_secs = COMPACTION_RUN_TIMEOUT.as_secs(),
-                            "LCM soft compaction timed out"
-                        ),
+                    if let Some(pending) = task.await {
+                        *slot.lock().await = Some(pending);
                     }
                     in_flight.store(false, Ordering::Release);
                 });
@@ -2974,7 +2139,6 @@ impl AgentLoopShared {
         }
 
         let no_progress_timeout = local_stream_no_progress_timeout(ctx);
-        let artifact_tool_payload_timeout = local_artifact_tool_payload_timeout(ctx, tool_defs_opt);
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas to the REPL/voice renderer as
             // they arrive so the answer streams live — tokens appear as they are
@@ -3026,7 +2190,7 @@ impl AgentLoopShared {
             }
 
             let mut streamed_response = None;
-            let mut stream_progress = LocalStreamProgress::new(artifact_tool_payload_timeout);
+            let mut stream_progress = LocalStreamProgress::new();
             let mut in_thinking = false;
             let suppress_thinking_display =
                 counters.suppress_thinking_display.load(Ordering::Relaxed);
@@ -3037,8 +2201,6 @@ impl AgentLoopShared {
                 !suppress_thinking_display && (thinking_enabled || hidden_reasoning_enabled);
             let mut xml_filter = XmlToolCallFilter::new();
             loop {
-                let pending_artifact_tool_payload_deadline =
-                    stream_progress.pending_artifact_tool_payload_deadline();
                 tokio::select! {
                     biased;
                     _ = async {
@@ -3072,31 +2234,17 @@ impl AgentLoopShared {
                         emit_stream_abort_metrics(ctx, &detail);
                         return StepResult::Done(IterationOutcome::Error(detail));
                     }
-                    _ = async {
-                        if let Some(deadline) = pending_artifact_tool_payload_deadline {
-                            tokio::time::sleep_until(deadline).await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    } => {
-                        counters.mark_inference_finished();
-                        let timeout = artifact_tool_payload_timeout.expect("artifact deadline branch is disabled when None");
-                        let detail = local_artifact_no_tool_payload_error(timeout);
-                        error!(
-                            model = %ctx.core.model,
-                            timeout_secs = timeout.as_secs(),
-                            "llm_artifact_tool_payload_timeout"
-                        );
-                        drop(stream);
-                        emit_stream_abort_metrics(ctx, &detail);
-                        return StepResult::Done(IterationOutcome::Error(detail));
-                    }
                     chunk = stream.rx.recv() => {
                         match chunk {
+                            Some(StreamChunk::TransportProgress) => {
+                                // Receiving this branch restarts the per-loop
+                                // no-progress sleep. It proves transport
+                                // liveness only: do not mark TTFT, decoding, or
+                                // artifact tool-payload progress.
+                            }
                             Some(StreamChunk::ThinkingDelta(delta)) => {
                                 if let Some(activity) = backend_activity.as_ref() {
-                                    let phase = stream_progress
-                                        .on_text_or_thinking_delta(tokio::time::Instant::now());
+                                    let phase = stream_progress.on_text_or_thinking_delta();
                                     activity.mark_progress(phase);
                                 }
                                 // First token (even a hidden thinking token) marks end of prefill.
@@ -3113,8 +2261,7 @@ impl AgentLoopShared {
                             }
                             Some(StreamChunk::TextDelta(delta)) => {
                                 if let Some(activity) = backend_activity.as_ref() {
-                                    let phase = stream_progress
-                                        .on_text_or_thinking_delta(tokio::time::Instant::now());
+                                    let phase = stream_progress.on_text_or_thinking_delta();
                                     activity.mark_progress(phase);
                                 }
                                 ctx.flow.mark_first_token();
@@ -3153,11 +2300,8 @@ impl AgentLoopShared {
                                             .encode(),
                                     );
                                 if let Some(activity) = backend_activity.as_ref() {
-                                    let phase = stream_progress.on_prefill_progress(
-                                        processed,
-                                        total,
-                                        tokio::time::Instant::now(),
-                                    );
+                                    let phase =
+                                        stream_progress.on_prefill_progress(processed, total);
                                     activity.mark_progress(phase);
                                 }
                             }
@@ -4208,63 +3352,5 @@ mod cache_pressure_tests {
     fn higgs_admission_ignores_missing_retained_cap() {
         let messages = vec![json!({"role": "user", "content": "history ".repeat(20)})];
         assert!(higgs_retained_admission(None, &messages, 0, 100, 200).is_none());
-    }
-}
-
-#[cfg(test)]
-mod stream_progress_tests {
-    use super::{BackendActivity, LocalStreamProgress};
-    use std::time::Duration;
-
-    #[test]
-    fn artifact_payload_deadline_arms_after_prefill_completion() {
-        let timeout = Duration::from_secs(90);
-        let start = tokio::time::Instant::now();
-        let mut progress = LocalStreamProgress::new(Some(timeout));
-
-        assert_eq!(progress.pending_artifact_tool_payload_deadline(), None);
-        assert_eq!(
-            progress.on_prefill_progress(40, 100, start),
-            BackendActivity::Prefill
-        );
-        assert_eq!(progress.pending_artifact_tool_payload_deadline(), None);
-
-        let done_at = start + Duration::from_secs(2);
-        assert_eq!(
-            progress.on_prefill_progress(100, 100, done_at),
-            BackendActivity::AwaitingToolPayload
-        );
-        assert_eq!(
-            progress.pending_artifact_tool_payload_deadline(),
-            Some(done_at + timeout)
-        );
-    }
-
-    #[test]
-    fn tool_payload_delta_clears_artifact_deadline() {
-        let timeout = Duration::from_secs(90);
-        let start = tokio::time::Instant::now();
-        let mut progress = LocalStreamProgress::new(Some(timeout));
-
-        progress.on_prefill_progress(100, 100, start);
-        assert!(progress.pending_artifact_tool_payload_deadline().is_some());
-        assert_eq!(progress.on_tool_call_delta(), BackendActivity::ToolPayload);
-        assert_eq!(progress.pending_artifact_tool_payload_deadline(), None);
-    }
-
-    #[test]
-    fn text_delta_on_artifact_arms_payload_deadline_without_prefill_progress() {
-        let timeout = Duration::from_secs(90);
-        let start = tokio::time::Instant::now();
-        let mut progress = LocalStreamProgress::new(Some(timeout));
-
-        assert_eq!(
-            progress.on_text_or_thinking_delta(start),
-            BackendActivity::AwaitingToolPayload
-        );
-        assert_eq!(
-            progress.pending_artifact_tool_payload_deadline(),
-            Some(start + timeout)
-        );
     }
 }

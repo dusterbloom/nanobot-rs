@@ -41,7 +41,10 @@ pub(crate) use crate::agent::agent_core::{
 // Submodules
 // ---------------------------------------------------------------------------
 
+mod budget;
+mod compaction;
 mod heuristics;
+mod local_stream;
 mod response;
 mod shared;
 

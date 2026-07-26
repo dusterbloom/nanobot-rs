@@ -1251,12 +1251,10 @@ impl ContextBuilder {
         let memory_path = format!("{workspace_path}/memory/MEMORY.md");
 
         // Genuinely divergent pieces: intro/model line, extra rules, tail sections.
-        // Pure-proxy identity: zero native tools, zero inlined catalog. Every
-        // tool — files, skills, memory, shell — is reached via the `tool`
-        // proxy. The model lists tools with `tool({})`, inspects with
-        // `tool({"name":"X"})`, invokes with `tool({"name":"X","args":{...}})`.
-        // This keeps the system prompt + tool surface combined under ~410
-        // tokens, cutting first-turn prefill to ~5s on low-power hardware.
+        // Local and cloud share one core-plus-proxy protocol: hot tools have
+        // native schemas, while the long tail is reached through `tool`.
+        // Keeping that distinction explicit prevents hybrid calls such as
+        // `exec({"args": {"command": ...}})`.
         let (intro, home_line, extra_rules, tail) = if local {
             let model_line = if self.model_name.is_empty() {
                 "local".to_string()
@@ -1265,15 +1263,16 @@ impl ContextBuilder {
             };
             (
                 format!(
-                    "You are nanobot, a Rust AI assistant for Peppi.\n\
+                    "You are nanobot.\n\
                      Model: {model_line}. Cwd: {cwd}. Workspace: {workspace_path}.\n\n\
-                     All tools run via the `tool` proxy — omit name to list, \
-                     {{\"name\":\"X\"}} to inspect, {{\"name\":\"X\",\"args\":{{...}}}} to invoke. \
-                     Starter tools: read_file, read_skill, recall, remember, edit_file, exec. \
-                     Inspect a tool before first use to learn its args. On error, quote the \
-                     exact tool message; never invent causes, paths, or outputs.\n\n\
-                     Persona: AGENTS.md, SOUL.md, USER.md at workspace root — \
-                     read_file them to learn your identity, rules, and user prefs."
+                     Core tools are native: call with schema args; never wrap native args. \
+                     Other tools use the `tool` proxy: omit name to list; \
+                     {{\"name\":\"X\"}} inspect; {{\"name\":\"X\",\"args\":{{...}}}} invoke. \
+                     Discover with read_skill and recall. Errors: quote the exact tool message; \
+                     never invent causes. Never simulate \
+                     or fake tool results. edit_file args are path, old_text, new_text; never \
+                     content. Do not copy read_file line prefixes into arguments.\n\n\
+                     Persona: AGENTS.md, SOUL.md, USER.md; read_file as needed."
                 ),
                 String::new(),
                 String::new(),
@@ -1981,10 +1980,9 @@ mod tests {
     }
 
     #[test]
-    fn test_local_identity_is_proxy_only() {
-        // Pure-proxy identity: zero native tools advertised, everything via the
-        // `tool` proxy. Must name starter tools for discoverability and teach
-        // the three proxy modes (list / inspect / invoke).
+    fn test_local_identity_teaches_core_plus_proxy_contract() {
+        // Hot tools are native and take direct schema arguments. The proxy is
+        // reserved for the long tail and still teaches list / inspect / invoke.
         let (_tmp, cb) = make_context();
         let identity = cb._get_identity(true);
         let workspace_str = ContextBuilder::display_path(
@@ -1999,7 +1997,13 @@ mod tests {
         assert!(identity.contains("Workspace:"), "{identity}");
         assert!(identity.contains(&workspace_str), "{identity}");
 
-        // (b) proxy is the only gateway — three modes
+        // (b) one unambiguous native/proxy contract
+        assert!(identity.contains("Core tools are native"), "{identity}");
+        assert!(identity.contains("never wrap native args"), "{identity}");
+        assert!(
+            identity.contains("Other tools use the `tool` proxy"),
+            "{identity}"
+        );
         assert!(identity.contains("`tool` proxy"), "{identity}");
         assert!(identity.contains("omit name to list"), "{identity}");
         assert!(identity.contains(r#"{"name":"X"}"#), "{identity}");
@@ -2007,43 +2011,33 @@ mod tests {
             identity.contains(r#"{"name":"X","args":{...}}"#),
             "{identity}"
         );
-        assert!(
-            identity.contains("Inspect a tool before first use"),
-            "{identity}"
-        );
 
-        // (c) starter tools named for discoverability
-        for tool in [
-            "read_file",
-            "read_skill",
-            "recall",
-            "remember",
-            "edit_file",
-            "exec",
-        ] {
-            assert!(
-                identity.contains(tool),
-                "missing starter tool {tool}: {identity}"
-            );
-        }
-
-        // (d) error discipline
+        // (c) error discipline
         assert!(
             identity.contains("quote the exact tool message"),
             "{identity}"
         );
         assert!(identity.contains("never invent causes"), "{identity}");
+        assert!(
+            identity.contains("Never simulate or fake tool results"),
+            "{identity}"
+        );
+        assert!(
+            identity.contains("edit_file args are path, old_text, new_text; never content"),
+            "{identity}"
+        );
+        assert!(
+            identity.contains("Do not copy read_file line prefixes"),
+            "{identity}"
+        );
 
-        // (e) persona files
+        // (d) persona files
         assert!(identity.contains("AGENTS.md"), "{identity}");
         assert!(identity.contains("SOUL.md"), "{identity}");
         assert!(identity.contains("USER.md"), "{identity}");
 
-        // Must NOT advertise native-tool syntax or the non-existent list_skills.
+        // Must not advertise the non-existent list_skills.
         assert!(!identity.contains("list_skills"), "{identity}");
-        assert!(!identity.contains("Native tools:"), "{identity}");
-        assert!(!identity.contains("read_file(path)"), "{identity}");
-        assert!(!identity.contains("Tool map:"), "{identity}");
     }
 
     #[test]

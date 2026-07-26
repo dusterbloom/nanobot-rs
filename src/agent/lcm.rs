@@ -1128,10 +1128,9 @@ async fn escalated_summary(
         return Ok(None);
     };
 
-    // Level 1: Preserve details. A transport/fidelity-gate error here is
-    // recoverable — Level 2's more constrained prompt gets a chance before
-    // giving up. A babble/degenerate result is NOT recoverable: reject
-    // immediately, no retry ladder.
+    // Level 1: Preserve details. Only a completed but insufficient summary may
+    // escalate. A transport or fidelity-gate error is indeterminate and must
+    // not launch another generation behind work the backend may still own.
     match compactor
         .summarize_for_lcm(messages, "preserve_details")
         .await
@@ -1162,7 +1161,7 @@ async fn escalated_summary(
             }
         }
         Err(error) => {
-            debug!(%error, "LCM escalation: Level 1 summarization call failed, escalating");
+            return Err(error);
         }
     }
 
@@ -1468,6 +1467,7 @@ mod tests {
     use super::*;
     use crate::agent::tools::base::Tool;
     use crate::providers::base::{LLMProvider, LLMResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// Mock LLM that returns a short summary — short enough that Level 1
@@ -1520,6 +1520,59 @@ mod tests {
         fn get_default_model(&self) -> &str {
             "mock-failing"
         }
+    }
+
+    struct CountingFailingMock {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for CountingFailingMock {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("indeterminate transport timeout"))
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock-counting-failing"
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_failure_does_not_launch_level_two_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let compactor = ContextCompactor::new(
+            Arc::new(CountingFailingMock {
+                calls: calls.clone(),
+            }),
+            "mock".to_string(),
+            4096,
+        );
+        let messages = vec![
+            json!({"role": "user", "content": "Preserve this compaction source."}),
+            json!({"role": "assistant", "content": "Preserve this response too."}),
+        ];
+
+        let error = escalated_summary(&messages, 64, Some(&compactor))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("indeterminate transport timeout"), "{error}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an indeterminate generation must not be retried"
+        );
     }
 
     /// Mock LLM that reflects real input content back as short bullets

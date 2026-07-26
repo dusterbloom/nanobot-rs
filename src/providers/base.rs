@@ -69,6 +69,9 @@ impl LLMResponse {
 /// A chunk from an SSE streaming response.
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
+    /// Transport-level liveness without semantic model progress, such as an
+    /// SSE comment heartbeat sent while a local backend request is queued.
+    TransportProgress,
     /// Incremental text content from the LLM.
     TextDelta(String),
     /// Incremental thinking/reasoning content (extended thinking).

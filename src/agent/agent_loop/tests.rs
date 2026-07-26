@@ -1109,42 +1109,6 @@ async fn test_real_lcm_e2e_compact_and_expand() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
-#[tokio::test]
-async fn test_compaction_timeout_resets_in_flight() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    let in_flight = Arc::new(AtomicBool::new(false));
-
-    // Simulate: set in_flight before spawning compaction
-    in_flight.store(true, Ordering::SeqCst);
-    assert!(in_flight.load(Ordering::SeqCst));
-
-    let flag = in_flight.clone();
-    let handle = tokio::spawn(async move {
-        let timeout_result = tokio::time::timeout(
-            Duration::from_millis(100), // Short timeout for test
-            async {
-                // Simulate a hanging compaction endpoint
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            },
-        )
-        .await;
-        assert!(timeout_result.is_err(), "should have timed out");
-        flag.store(false, Ordering::SeqCst); // Must always execute
-    });
-
-    // Wait for the spawned task to complete
-    handle.await.unwrap();
-
-    // The critical assertion: in_flight must be reset even after timeout
-    assert!(
-        !in_flight.load(Ordering::SeqCst),
-        "in_flight must reset to false after timeout"
-    );
-}
-
 // -----------------------------------------------------------------------
 // Trio E2E test harness
 //

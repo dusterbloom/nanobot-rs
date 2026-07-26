@@ -19,6 +19,13 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 use super::base::{PermissionLevel, Tool, ToolConcurrency};
+use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
+
+/// Leave room below the replay ceiling for wrappers while retaining a useful
+/// direct-file page. Crossing the ceiling stashes an otherwise contiguous
+/// source window and replaces its native `lines=` continuation with a generic
+/// artifact lookup, which costs both a tool round and prompt space.
+const READ_FILE_REPLAY_SAFE_BYTES: usize = TOOL_RESULT_REPLAY_MAX_BYTES - 400;
 
 /// Extract a required string parameter, returning an error string on missing.
 fn require_param<'a>(
@@ -75,7 +82,7 @@ impl ReadFileTool {
     pub fn new(char_budget: usize) -> Self {
         // Floor so an absurdly small cap still renders at least a few lines.
         Self {
-            char_budget: char_budget.max(512),
+            char_budget: char_budget.clamp(512, READ_FILE_REPLAY_SAFE_BYTES),
         }
     }
 }
@@ -1536,19 +1543,21 @@ fn render_range(
     let lines: Vec<&str> = content.lines().collect();
     let end = end.min(total);
 
-    // Bound the window to COMPLETE lines within the read char-budget. A file is
+    // Bound the window to COMPLETE lines within the read byte budget. A file is
     // randomly accessible, so the model is best served by a contiguous, whole
     // window plus the exact next range to read — never a head+tail cut that
     // destroys the middle and forces a `recall_tool_result` round-trip.
     // Always render at least one line. The reserve covers the "# path (lines…)"
     // header, the VERBATIM wrapper, and the next-chunk marker so the total
     // stays under the cap and `digest_tool_result` never fires its `"[...]"`.
-    let budget = char_budget.saturating_sub(path.len().saturating_add(240));
+    let budget = char_budget.saturating_sub(path.len().saturating_add(320));
     let mut eff_end = start;
     let mut cost: usize = 0;
     for i in start..=end {
-        // Rendered width: "{:>4}: " (6) + line content + "\n" (1).
-        let line_cost = 7 + lines[i - 1].chars().count();
+        // Use bytes, not Unicode scalar count: the replay guard is byte-based,
+        // and a Unicode-heavy source must not cross it after this renderer has
+        // declared the page safe.
+        let line_cost = format!("{:>4}: ", i).len() + lines[i - 1].len() + 1;
         if i > start && cost + line_cost > budget {
             break;
         }
@@ -1576,7 +1585,9 @@ fn render_range(
         let chunk_len = end.saturating_sub(start).saturating_add(1).max(1);
         let next_end = (end + chunk_len).min(total);
         out.push_str(&format!(
-            "\n[{} more lines — read the next chunk with lines=\"{}:{}\"]",
+            "\n[{} more lines — only if the task needs later lines, continue with lines=\"{}:{}\"; \
+             use read_file with the same path; do not use slice_tool_result or \
+             search_tool_result because this result is not stashed]",
             total - end,
             end + 1,
             next_end
@@ -1824,8 +1835,18 @@ mod tests {
             "read_file must never head+tail-truncate"
         );
         assert!(
-            result.contains("more lines — read the next chunk"),
+            result.contains("more lines — only if the task needs later lines"),
             "must tell the model the next range: {result}"
+        );
+        assert!(
+            result.contains(
+                "use read_file with the same path; do not use slice_tool_result or search_tool_result"
+            ),
+            "continuation must distinguish direct file paging from stashed artifacts: {result}"
+        );
+        assert!(
+            result.contains("only if the task needs later lines"),
+            "paging must not compel an unnecessary whole-file read: {result}"
         );
         // Budget-bounded: never reaches line 1000 (each line renders ~13 chars,
         // budget allows ~500). The first line is always present.
@@ -1838,6 +1859,61 @@ mod tests {
             result.chars().count() <= 7_600,
             "output must stay under budget+slack, got {}",
             result.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_respects_replay_safe_cap_when_configured_higher() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("replay-boundary.txt");
+        let content = (1..=2_000)
+            .map(|i| format!("line {i}: {}", "x".repeat(40)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        // The user-facing 10K result limit must not create a 8K replay-cap
+        // cliff: direct source-file pagination is cheaper and clearer than
+        // stashing an otherwise complete window.
+        let tool = ReadFileTool::new(10_000);
+        let result = tool
+            .execute(make_params(&[("path", file_path.to_str().unwrap())]))
+            .await;
+
+        assert!(
+            result.len() < crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES,
+            "read_file must fit under the replay cap, got {} bytes",
+            result.len()
+        );
+        assert!(
+            result.contains("more lines — only if the task needs later lines"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_replay_safe_cap_counts_utf8_bytes() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("utf8-replay-boundary.txt");
+        let content = (1..=500)
+            .map(|i| format!("line {i}: {}", "界".repeat(30)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let tool = ReadFileTool::new(10_000);
+        let result = tool
+            .execute(make_params(&[("path", file_path.to_str().unwrap())]))
+            .await;
+
+        assert!(
+            result.len() < crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES,
+            "read_file must use bytes for the replay ceiling, got {} bytes",
+            result.len()
+        );
+        assert!(
+            result.contains("more lines — only if the task needs later lines"),
+            "{result}"
         );
     }
 
@@ -1865,7 +1941,7 @@ mod tests {
         assert!(result.contains("  40: line 40"), "{result}");
         assert!(!result.contains(" 41: line 41"), "{result}");
         assert!(
-            result.contains("more lines — read the next chunk"),
+            result.contains("more lines — only if the task needs later lines"),
             "must point at the next range"
         );
     }
@@ -2057,7 +2133,7 @@ mod tests {
         );
         assert!(out.contains("of 5000)"), "header reports the true total");
         assert!(
-            out.contains("more lines — read the next chunk"),
+            out.contains("more lines — only if the task needs later lines"),
             "must point at the next range"
         );
         assert!(out.contains("   1:"), "range starts at line 1");
@@ -2094,7 +2170,7 @@ mod tests {
             out.chars().count()
         );
         assert!(
-            out.contains("more lines — read the next chunk"),
+            out.contains("more lines — only if the task needs later lines"),
             "must still point at the next range"
         );
         assert!(out.contains("   1:"), "range starts at line 1");

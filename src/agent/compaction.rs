@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use anyhow::Result;
 use regex::Regex;
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::agent::token_budget::TokenBudget;
-use crate::providers::base::LLMProvider;
+use crate::providers::base::{LLMProvider, LLMResponse, StreamChunk};
 
 /// More aggressive LCM compression used at level two.
 const SUMMARIZE_PROMPT_ADVANCED: &str = "\
@@ -105,6 +106,7 @@ static MODEL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 const MAX_MERGE_ROUNDS: usize = 6;
+const COMPACTION_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Result of a compaction attempt.
 pub struct CompactionResult {
@@ -178,6 +180,56 @@ impl ContextCompactor {
         // exactly the literals the fidelity gate is meant to protect.
         let reserved = 800 + self.summary_max_tokens as usize + 300;
         self.compaction_context_size.saturating_sub(reserved)
+    }
+
+    /// Collect a streamed summary while treating every received SSE item as
+    /// transport progress. The timeout is deliberately per read: a slow model
+    /// may run for many minutes as long as it continues sending tokens,
+    /// prefill updates, or heartbeat comments.
+    async fn stream_summary_response(
+        &self,
+        messages: &[Value],
+        idle_timeout: Duration,
+    ) -> Result<LLMResponse> {
+        let stream_call = self.provider.chat_stream(
+            messages,
+            None,
+            Some(&self.model),
+            self.summary_max_tokens,
+            0.3,
+            None,
+            None,
+        );
+        let mut stream = tokio::time::timeout(idle_timeout, stream_call)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Summarization stream was inactive for {}s while waiting for headers",
+                    idle_timeout.as_secs_f64()
+                )
+            })??;
+
+        loop {
+            let chunk = tokio::time::timeout(idle_timeout, stream.rx.recv())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Summarization stream was inactive for {}s",
+                        idle_timeout.as_secs_f64()
+                    )
+                })?;
+            match chunk {
+                Some(StreamChunk::Done(response)) => return Ok(response),
+                Some(
+                    StreamChunk::TransportProgress
+                    | StreamChunk::TextDelta(_)
+                    | StreamChunk::ThinkingDelta(_)
+                    | StreamChunk::ToolCallDelta
+                    | StreamChunk::PrefillProgress { .. },
+                ) => {}
+                None => anyhow::bail!("Summarization stream ended without a final response"),
+            }
+        }
     }
 
     /// Summarize messages for LCM escalation levels.
@@ -300,16 +352,7 @@ impl ContextCompactor {
         ];
 
         let response = self
-            .provider
-            .chat(
-                &summary_messages,
-                None,
-                Some(&self.model),
-                self.summary_max_tokens,
-                0.3, // low temperature for factual summaries
-                None,
-                None,
-            )
+            .stream_summary_response(&summary_messages, COMPACTION_STREAM_IDLE_TIMEOUT)
             .await?;
 
         if let Some(detail) = response.error_detail() {
@@ -811,9 +854,10 @@ fn split_summary_ranges_by_budget(summaries: &[String], max_tokens: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::base::{LLMProvider, LLMResponse};
+    use crate::providers::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle};
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     struct MockProvider {
         response: String,
@@ -830,6 +874,65 @@ mod tests {
     struct FinishReasonProvider {
         response: String,
         finish_reason: String,
+    }
+
+    struct ProgressStreamProvider {
+        heartbeat_interval: Duration,
+        heartbeat_count: usize,
+        final_delay: Duration,
+    }
+
+    #[async_trait]
+    impl LLMProvider for ProgressStreamProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> Result<LLMResponse> {
+            anyhow::bail!("buffered chat must not be used for compaction")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> Result<StreamHandle> {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let heartbeat_interval = self.heartbeat_interval;
+            let heartbeat_count = self.heartbeat_count;
+            let final_delay = self.final_delay;
+            let task = tokio::spawn(async move {
+                for _ in 0..heartbeat_count {
+                    tokio::time::sleep(heartbeat_interval).await;
+                    let _ = tx.send(StreamChunk::TransportProgress);
+                }
+                tokio::time::sleep(final_delay).await;
+                let _ = tx.send(StreamChunk::Done(LLMResponse {
+                    content: Some("- Compaction completed.".to_string()),
+                    tool_calls: vec![],
+                    finish_reason: "stop".to_string(),
+                    usage: HashMap::new(),
+                }));
+            });
+            Ok(StreamHandle {
+                rx,
+                abort_on_drop: Some(task),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "progress-stream"
+        }
     }
 
     #[async_trait]
@@ -922,6 +1025,43 @@ mod tests {
 
         let result = compactor.summarize_text(&big_input, SUMMARIZE_PROMPT).await;
         assert_eq!(result.unwrap(), "- Truncated summary.");
+    }
+
+    #[tokio::test]
+    async fn compaction_stream_progress_resets_inactivity_deadline() {
+        let provider = Arc::new(ProgressStreamProvider {
+            heartbeat_interval: Duration::from_millis(20),
+            heartbeat_count: 4,
+            final_delay: Duration::from_millis(20),
+        });
+        let compactor = ContextCompactor::new(provider, "test".into(), 4096);
+        let started = tokio::time::Instant::now();
+
+        let response = compactor
+            .stream_summary_response(&[], Duration::from_millis(35))
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() > Duration::from_millis(35));
+        assert_eq!(response.content.as_deref(), Some("- Compaction completed."));
+    }
+
+    #[tokio::test]
+    async fn compaction_stream_times_out_only_after_real_inactivity() {
+        let provider = Arc::new(ProgressStreamProvider {
+            heartbeat_interval: Duration::from_millis(5),
+            heartbeat_count: 1,
+            final_delay: Duration::from_millis(80),
+        });
+        let compactor = ContextCompactor::new(provider, "test".into(), 4096);
+
+        let error = compactor
+            .stream_summary_response(&[], Duration::from_millis(30))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("inactive"), "{error}");
     }
 
     #[tokio::test]

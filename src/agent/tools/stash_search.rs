@@ -119,6 +119,70 @@ fn bounded(s: String) -> String {
     t
 }
 
+/// Render one self-contained, line-aligned artifact page. The continuation is
+/// derived from the last COMPLETE source line that made it into the bounded
+/// page; applying [`bounded`] afterwards would advertise rows the model never
+/// saw and make them unreachable.
+fn render_slice_page(
+    lines: &[(usize, &str)],
+    artifact_tool_call_id: &str,
+    start: usize,
+    end: usize,
+) -> String {
+    let total = lines.len();
+    let clamped_start = start.max(1);
+    let clamped_end = end
+        .max(clamped_start)
+        .min(clamped_start.saturating_add(MAX_SLICE_LINES.saturating_sub(1)));
+
+    let header = |last_line: usize| {
+        let page_status = if last_line < total {
+            format!("next_start={}", last_line + 1)
+        } else {
+            "end of result".to_string()
+        };
+        format!(
+            "[artifact_tool_call_id={artifact_tool_call_id}; stashed lines {clamped_start}-{last_line} of {total}; {page_status}; \
+             use artifact_tool_call_id for follow-up search_tool_result/slice_tool_result calls; never use this slice call's ID]\n"
+        )
+    };
+
+    if clamped_start > total {
+        return format!(
+            "[artifact_tool_call_id={artifact_tool_call_id}; lines {clamped_start}-{clamped_end} are out of range (file has {total} lines); \
+             use artifact_tool_call_id for follow-up search_tool_result/slice_tool_result calls; never use this slice call's ID]"
+        );
+    }
+
+    let mut rows = Vec::new();
+    let mut last_line = None;
+    for (line_no, text) in lines {
+        if *line_no < clamped_start {
+            continue;
+        }
+        if *line_no > clamped_end {
+            break;
+        }
+        let row = format!("{}:{}", line_no, text);
+        let mut candidate_rows = rows.clone();
+        candidate_rows.push(row);
+        let candidate = format!("{}{}", header(*line_no), candidate_rows.join("\n"));
+        if candidate.chars().count() > MAX_OUTPUT_CHARS {
+            break;
+        }
+        rows = candidate_rows;
+        last_line = Some(*line_no);
+    }
+
+    match last_line {
+        Some(last_line) => format!("{}{}", header(last_line), rows.join("\n")),
+        None => format!(
+            "[artifact_tool_call_id={artifact_tool_call_id}; stashed line {clamped_start} exceeds the {MAX_OUTPUT_CHARS}-character page limit; \
+             next_start={clamped_start}; use artifact_tool_call_id for follow-up search_tool_result/slice_tool_result calls; never use this slice call's ID]"
+        ),
+    }
+}
+
 // ===========================================================================
 // Tool 1: SearchToolResultTool
 // ===========================================================================
@@ -273,7 +337,8 @@ impl Tool for SliceToolResultTool {
         "Extract a specific line range from a stashed (truncated) tool result \
          without loading the full body. Use after search_tool_result to read \
          a region in detail, or when you know the exact line numbers. \
-         Pass the tool_call_id from the [truncated: ...] preview block."
+         Pass the tool_call_id from the [truncated: ...] preview block. \
+         The response reports next_start when more lines remain."
     }
 
     fn parameters(&self) -> Value {
@@ -313,36 +378,12 @@ impl Tool for SliceToolResultTool {
             .unwrap_or(start as u64 + DEFAULT_SLICE_SPAN as u64) as usize;
 
         let result = query_stashed_lines(&self.db_path, &self.session_id, id, |lines| {
-            let total = lines.len();
-            let clamped_start = start.max(1);
-            let clamped_end = end.max(clamped_start).min(clamped_start + MAX_SLICE_LINES);
-
-            let mut out = String::new();
-            for (line_no, text) in lines {
-                if *line_no < clamped_start {
-                    continue;
-                }
-                if *line_no > clamped_end {
-                    break;
-                }
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(&format!("{}:{}", line_no, text));
-            }
-            if out.is_empty() {
-                format!(
-                    "Lines {}-{} are out of range (file has {} lines).",
-                    clamped_start, clamped_end, total
-                )
-            } else {
-                out
-            }
+            render_slice_page(lines, id, start, end)
         })
         .await;
 
         match result {
-            Some(s) => bounded(s),
+            Some(s) => s,
             None => SearchToolResultTool::not_found(id), // reuse the message
         }
     }
@@ -451,6 +492,101 @@ mod tests {
         assert!(out.contains("10:data"));
         assert!(out.contains("12:data"));
         assert!(!out.contains("13:data"));
+    }
+
+    #[tokio::test]
+    async fn slice_reports_continuation_position() {
+        let (_dir, db_path, sid) = make_db().await;
+        let body: Vec<&str> = (1..=100).map(|_| "data").collect();
+        seed(&db_path, &sid, "call_page", &body.join("\n")).await;
+
+        let tool = SliceToolResultTool::with_db(db_path, sid);
+        let first_page = tool
+            .execute(HashMap::from([
+                ("tool_call_id".to_string(), json!("call_page")),
+                ("start".to_string(), json!(10)),
+            ]))
+            .await;
+        assert!(
+            first_page.starts_with(
+                "[artifact_tool_call_id=call_page; stashed lines 10-60 of 100; next_start=61;"
+            ),
+            "slice must tell the model how to request the next page: {first_page}"
+        );
+
+        let last_page = tool
+            .execute(HashMap::from([
+                ("tool_call_id".to_string(), json!("call_page")),
+                ("start".to_string(), json!(90)),
+            ]))
+            .await;
+        assert!(
+            last_page.starts_with(
+                "[artifact_tool_call_id=call_page; stashed lines 90-100 of 100; end of result;"
+            ),
+            "slice must tell the model that paging is complete: {last_page}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slice_repeats_immutable_artifact_id_for_follow_up_calls() {
+        let (_dir, db_path, sid) = make_db().await;
+        seed(&db_path, &sid, "artifact_read_7", "alpha\nbeta\ngamma").await;
+
+        let tool = SliceToolResultTool::with_db(db_path, sid);
+        let out = tool
+            .execute(HashMap::from([
+                ("tool_call_id".to_string(), json!("artifact_read_7")),
+                ("start".to_string(), json!(2)),
+            ]))
+            .await;
+
+        assert!(
+            out.starts_with("[artifact_tool_call_id=artifact_read_7; "),
+            "every page must repeat the immutable source artifact id: {out}"
+        );
+        assert!(
+            out.contains("never use this slice call's ID"),
+            "the receipt must prevent a model from chaining through a transient slice call id: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slice_wide_lines_never_advertises_unemitted_next_start() {
+        let (_dir, db_path, sid) = make_db().await;
+        let body = (1..=100)
+            .map(|line| format!("{line}-{}", "x".repeat(180)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        seed(&db_path, &sid, "wide_artifact", &body).await;
+
+        let tool = SliceToolResultTool::with_db(db_path, sid);
+        let out = tool
+            .execute(HashMap::from([
+                ("tool_call_id".to_string(), json!("wide_artifact")),
+                ("start".to_string(), json!(1)),
+                ("end".to_string(), json!(100)),
+            ]))
+            .await;
+
+        assert!(out.chars().count() <= MAX_OUTPUT_CHARS);
+        let next_start = out
+            .split("next_start=")
+            .nth(1)
+            .and_then(|tail| tail.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .expect("wide page must expose a continuation position");
+        let last_emitted = out
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter_map(|(line_no, _)| line_no.parse::<usize>().ok())
+            .last()
+            .expect("wide page must contain at least one whole source row");
+        assert_eq!(
+            next_start,
+            last_emitted + 1,
+            "next_start must follow the final row actually emitted: {out}"
+        );
     }
 
     #[tokio::test]

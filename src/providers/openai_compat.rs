@@ -62,6 +62,15 @@ pub(crate) const NANOBOT_HIGGS_SESSION_ID_FIELD: &str = "_nanobot_higgs_session_
 pub(crate) const NANOBOT_HIGGS_DROP_SESSION_ID_FIELD: &str = "_nanobot_higgs_drop_session_id";
 pub(crate) const NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: &str = "_nanobot_higgs_drop_session_ids";
 
+fn build_http_client(timeout_secs: u64) -> Client {
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    Client::builder()
+        .connect_timeout(timeout)
+        .read_timeout(timeout)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 fn is_valid_tool_call_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -142,14 +151,10 @@ impl OpenAICompatProvider {
             OPENROUTER_API_BASE.to_string()
         };
 
-        // 120s timeout prevents a non-responsive local server (e.g. LM Studio's
-        // /api/v1/chat endpoint) from hanging forever. Cloud providers rarely
-        // approach this limit; local inference can be slow but should complete
-        // within two minutes for the token budgets used here.
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        // Bound connection establishment and inactivity between response reads.
+        // The read timeout is sliding, so SSE heartbeat bytes keep a healthy
+        // queued/local generation alive without imposing an absolute deadline.
+        let client = build_http_client(120);
 
         Self {
             api_key: api_key.to_string(),
@@ -198,14 +203,11 @@ impl OpenAICompatProvider {
         self
     }
 
-    /// Override the HTTP client timeout.
+    /// Override the HTTP connect and read-inactivity timeouts.
     ///
-    /// Replaces the default 120s timeout with the given value.
+    /// Replaces the default 120s sliding timeout with the given value.
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
-        self.client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        self.client = build_http_client(timeout_secs);
         self
     }
 
@@ -1221,11 +1223,6 @@ impl LLMProvider for OpenAICompatProvider {
                     .post(&url)
                     .header("Authorization", format!("Bearer {}", api_key))
                     .header("Content-Type", "application/json")
-                    // Override the client's 120s total timeout for streaming.
-                    // Streaming responses can legitimately run for minutes
-                    // (e.g. long generation under GPU contention from training).
-                    // The SSE chunk reader has its own idle detection.
-                    .timeout(std::time::Duration::from_secs(600))
                     .json(&body)
                     .send()
                     .await
@@ -1598,6 +1595,15 @@ async fn parse_sse_stream(
             line_buffer = line_buffer[newline_pos + 1..].to_string();
 
             if line.is_empty() {
+                continue;
+            }
+
+            // SSE comments are transport heartbeats. Higgs emits `:` while a
+            // request is queued or generating; preserve that liveness signal
+            // so the agent watchdog does not cancel a healthy queued request.
+            // This is deliberately not text, TTFT, or prefill progress.
+            if line.starts_with(':') {
+                let _ = tx.send(StreamChunk::TransportProgress);
                 continue;
             }
 
@@ -3455,6 +3461,141 @@ mod tests {
             .iter()
             .map(|l| Ok(bytes::Bytes::from(format!("{}\n", l))))
             .collect()
+    }
+
+    async fn spawn_timed_sse_server(
+        frames: Vec<(std::time::Duration, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock SSE server");
+        let address = listener.local_addr().expect("mock SSE server address");
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept SSE request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.expect("read SSE request");
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Connection: close\r\n\
+                      \r\n",
+                )
+                .await
+                .expect("write SSE headers");
+            socket.flush().await.expect("flush SSE headers");
+
+            for (delay, frame) in frames {
+                tokio::time::sleep(delay).await;
+                if socket.write_all(frame.as_bytes()).await.is_err() {
+                    return;
+                }
+                if socket.flush().await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        (format!("http://{address}/v1"), task)
+    }
+
+    #[tokio::test]
+    async fn test_stream_read_timeout_slides_on_heartbeats_and_bounds_inactivity() {
+        use std::time::{Duration, Instant};
+
+        let (heartbeat_base, heartbeat_server) = spawn_timed_sse_server(vec![
+            (Duration::from_millis(400), ":\n\n"),
+            (Duration::from_millis(400), ":\n\n"),
+            (Duration::from_millis(400), ":\n\n"),
+            (
+                Duration::from_millis(400),
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ready\"},\"index\":0}]}\n\n\
+                 data: [DONE]\n\n",
+            ),
+        ])
+        .await;
+        let heartbeat_provider =
+            OpenAICompatProvider::new("local", Some(&heartbeat_base), Some("mock")).with_timeout(1);
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let heartbeat_started = Instant::now();
+        let mut heartbeat_stream = heartbeat_provider
+            .chat_stream(&messages, None, None, 16, 0.0, None, None)
+            .await
+            .expect("heartbeat stream starts");
+        let heartbeat_response = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let Some(StreamChunk::Done(response)) = heartbeat_stream.rx.recv().await {
+                    break response;
+                }
+            }
+        })
+        .await
+        .expect("heartbeat stream completes");
+        assert!(
+            heartbeat_started.elapsed() > Duration::from_secs(1),
+            "heartbeats must allow total wall time to exceed the read timeout"
+        );
+        assert_eq!(heartbeat_response.finish_reason, "stop");
+        assert_eq!(heartbeat_response.content.as_deref(), Some("ready"));
+        heartbeat_server.await.expect("heartbeat server task");
+
+        let (idle_base, idle_server) = spawn_timed_sse_server(vec![(
+            Duration::from_millis(1_500),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"too late\"},\"index\":0}]}\n\n\
+             data: [DONE]\n\n",
+        )])
+        .await;
+        let idle_provider =
+            OpenAICompatProvider::new("local", Some(&idle_base), Some("mock")).with_timeout(1);
+        let mut idle_stream = idle_provider
+            .chat_stream(&messages, None, None, 16, 0.0, None, None)
+            .await
+            .expect("idle stream starts");
+        let idle_response = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(StreamChunk::Done(response)) = idle_stream.rx.recv().await {
+                    break response;
+                }
+            }
+        })
+        .await
+        .expect("idle stream must end at the inactivity timeout");
+        assert_eq!(idle_response.finish_reason, "error");
+        idle_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_sse_heartbeat_emits_transport_progress() {
+        let chunks = sse_bytes(&[
+            ":",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ready\"},\"index\":0}]}",
+            "data: [DONE]",
+        ]);
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx).await;
+
+        let mut saw_transport_progress = false;
+        while let Ok(chunk) = rx.try_recv() {
+            if matches!(chunk, StreamChunk::TransportProgress) {
+                saw_transport_progress = true;
+            }
+        }
+        assert!(
+            saw_transport_progress,
+            "an SSE comment heartbeat must keep the local stream watchdog alive"
+        );
     }
 
     #[tokio::test]
