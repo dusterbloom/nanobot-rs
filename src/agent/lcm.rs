@@ -2895,6 +2895,155 @@ mod tests {
     // Run: cargo test test_bench_lcm_compaction_models -- --ignored --nocapture
     // -----------------------------------------------------------------------
 
+    async fn load_real_benchmark_sessions(
+        db_path: &std::path::Path,
+        session_ids: &[String],
+    ) -> Vec<(String, Vec<Value>)> {
+        let db = crate::session::SessionDb::new(db_path);
+        let mut sessions = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let messages = db.get_all_messages(session_id).await;
+            if !messages.is_empty() {
+                sessions.push((session_id.clone(), messages));
+            }
+        }
+        sessions
+    }
+
+    #[tokio::test]
+    async fn real_session_benchmark_loader_uses_persisted_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("sessions.db");
+        let db = crate::session::SessionDb::new(&db_path);
+        let session = db.create_session("benchmark-fixture").await;
+        db.add_messages(
+            &session.id,
+            &[
+                json!({"role": "system", "content": "hidden bootstrap"}),
+                json!({
+                    "role": "user",
+                    "content": "synthetic reminder",
+                    "_synthetic": true
+                }),
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"index.html\"}"
+                        }
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "write_file",
+                    "content": "wrote complete asteroids game"
+                }),
+                json!({"role": "user", "content": "real Asteroids acceptance"}),
+            ],
+        )
+        .await;
+
+        let loaded =
+            load_real_benchmark_sessions(&db_path, std::slice::from_ref(&session.id)).await;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, session.id);
+        assert_eq!(loaded[0].1.len(), 5);
+        assert_eq!(
+            loaded[0].1[4].get("content").and_then(Value::as_str),
+            Some("real Asteroids acceptance")
+        );
+        assert!(loaded[0]
+            .1
+            .iter()
+            .all(|message| message.to_string().contains("Rust ownership") == false));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real sessions DB and OpenAI-compatible sidecar"]
+    async fn test_bench_lcm_real_sessions() {
+        use crate::providers::openai_compat::OpenAICompatProvider;
+        use std::time::Instant;
+
+        let db_path = std::env::var("NANOBOT_LCM_BENCH_SESSIONS_DB")
+            .expect("NANOBOT_LCM_BENCH_SESSIONS_DB is required");
+        let session_ids = std::env::var("NANOBOT_LCM_BENCH_SESSION_IDS")
+            .expect("NANOBOT_LCM_BENCH_SESSION_IDS is required")
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            !session_ids.is_empty(),
+            "NANOBOT_LCM_BENCH_SESSION_IDS must contain at least one id"
+        );
+        let api_base = std::env::var("NANOBOT_LCM_BENCH_BASE")
+            .unwrap_or_else(|_| "http://127.0.0.1:9001/v1".to_string());
+        let model = std::env::var("NANOBOT_LCM_BENCH_MODELS")
+            .unwrap_or_else(|_| "Qwen3.5-2B-MLX-8bit".to_string())
+            .split(',')
+            .next()
+            .unwrap()
+            .trim()
+            .to_string();
+        let max_context = std::env::var("NANOBOT_LCM_BENCH_MAX_CONTEXT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(262_144);
+        let sessions =
+            load_real_benchmark_sessions(std::path::Path::new(&db_path), &session_ids).await;
+        assert_eq!(
+            sessions.len(),
+            session_ids.len(),
+            "every requested session must exist and contain messages"
+        );
+
+        let provider: Arc<dyn crate::providers::base::LLMProvider> = Arc::new(
+            OpenAICompatProvider::new("local", Some(&api_base), Some(&model)),
+        );
+        let compactor = ContextCompactor::new(provider, model.clone(), max_context);
+
+        for (session_id, messages) in sessions {
+            let transcript = crate::agent::compaction::build_transcript(&messages);
+            let transcript_tokens = TokenBudget::estimate_str_tokens(&transcript);
+            let required_context =
+                compactor.required_context_for_lcm(&messages, "preserve_details");
+            eprintln!("\n{}", "=".repeat(80));
+            eprintln!("SESSION: {session_id}");
+            eprintln!("MODEL: {model}");
+            eprintln!(
+                "CONTEXT: transcript={transcript_tokens} required={required_context} max={max_context}"
+            );
+            eprintln!("--- SEMANTIC TRANSCRIPT ---\n{transcript}\n--- END TRANSCRIPT ---");
+
+            let started = Instant::now();
+            let result = compactor
+                .summarize_for_lcm(&messages, "preserve_details")
+                .await;
+            let elapsed = started.elapsed().as_millis();
+            match result {
+                Ok(summary) => {
+                    let output_tokens = TokenBudget::estimate_str_tokens(&summary);
+                    eprintln!(
+                        "--- RAW SUMMARY ---\n{summary}\n--- END SUMMARY ---\n\
+                         finish_reason=stop output_tokens={output_tokens} latency_ms={elapsed}"
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "--- SUMMARY ERROR ---\n{error:#}\n--- END ERROR ---\nlatency_ms={elapsed}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires LM Studio with multiple models loaded"]
     async fn test_bench_lcm_compaction_models() {

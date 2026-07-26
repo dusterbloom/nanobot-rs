@@ -387,6 +387,7 @@ const COMPACTION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs
 struct CompactionSidecarSpec {
     port: u16,
     dir: String,
+    /// Model maximum from MLX config.json, used only as request admission.
     context_size: usize,
     allow_spawn: bool,
 }
@@ -418,6 +419,32 @@ fn compaction_manager_registry(
         std::sync::Mutex<HashMap<CompactionSidecarSpec, Weak<CompactionSidecarManager>>>,
     > = OnceLock::new();
     REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn mlx_model_max_context(model_dir: &Path) -> Result<usize, String> {
+    let config_path = model_dir.join("config.json");
+    let bytes = fs::read(&config_path)
+        .map_err(|error| format!("failed to read {}: {error}", config_path.display()))?;
+    let config: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to parse {}: {error}", config_path.display()))?;
+    let max_context = config
+        .get("text_config")
+        .and_then(|text| text.get("max_position_embeddings"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            config
+                .get("max_position_embeddings")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0)
+        .ok_or_else(|| {
+            format!(
+                "{} has no positive max_position_embeddings",
+                config_path.display()
+            )
+        })?;
+    Ok(max_context)
 }
 
 /// The single owner of the on-demand compaction Higgs process.
@@ -555,11 +582,21 @@ impl CompactionSidecarManager {
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())?
             .to_string();
+        let context_size = mlx_model_max_context(Path::new(&dir)).unwrap_or_else(|error| {
+            let fallback = config.agents.defaults.local_max_context_tokens;
+            tracing::warn!(
+                %error,
+                fallback,
+                model_dir = %dir,
+                "compaction model context discovery failed; using main local context ceiling"
+            );
+            fallback
+        });
 
         let spec = CompactionSidecarSpec {
             port,
             dir,
-            context_size: config.lcm.compaction_context_size,
+            context_size,
             allow_spawn: config.agents.defaults.local_autostart
                 == crate::config::schema::LocalAutostart::Higgs,
         };
@@ -1779,12 +1816,55 @@ mod tests {
         (port, task)
     }
 
+    fn config_with_compaction_model(
+        model_config: &str,
+    ) -> (tempfile::TempDir, crate::config::schema::Config) {
+        let model_dir = tempfile::tempdir().unwrap();
+        std::fs::write(model_dir.path().join("config.json"), model_config).unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "lcm": {
+                "compactionPort": 8001,
+                "compactionModelDir": model_dir.path(),
+                "compactionContextSize": 4096
+            }
+        }))
+        .unwrap();
+        (model_dir, config)
+    }
+
+    #[test]
+    fn compaction_manager_discovers_nested_model_context_ceiling() {
+        let (_model_dir, config) =
+            config_with_compaction_model(r#"{"text_config":{"max_position_embeddings":262144}}"#);
+
+        let manager = CompactionSidecarManager::from_config(&config).unwrap();
+
+        assert_eq!(manager.context_size(), 262_144);
+    }
+
+    #[test]
+    fn compaction_manager_discovers_root_model_context_ceiling() {
+        let (_model_dir, config) =
+            config_with_compaction_model(r#"{"max_position_embeddings":32768}"#);
+
+        let manager = CompactionSidecarManager::from_config(&config).unwrap();
+
+        assert_eq!(manager.context_size(), 32_768);
+    }
+
     #[test]
     fn compaction_manager_uses_canonical_config_and_model_hint() {
+        let root = tempfile::tempdir().unwrap();
+        let model_dir = root.path().join("Bonsai-1.7B-mlx-1bit");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("config.json"),
+            r#"{"max_position_embeddings":8192}"#,
+        )
+        .unwrap();
         let mut config = crate::config::schema::Config::default();
         config.lcm.compaction_port = Some(8001);
-        config.lcm.compaction_model_dir = Some("/models/Bonsai-1.7B-mlx-1bit".to_string());
-        config.lcm.compaction_context_size = 8192;
+        config.lcm.compaction_model_dir = Some(model_dir.to_string_lossy().into_owned());
 
         let manager = CompactionSidecarManager::from_config(&config).unwrap();
         assert_eq!(manager.base_url(), "http://127.0.0.1:8001/v1");

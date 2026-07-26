@@ -2024,10 +2024,6 @@ fn default_lcm_deterministic_target() -> usize {
     512
 }
 
-fn default_lcm_compaction_context_size() -> usize {
-    4096
-}
-
 /// Configuration for Lossless Context Management.
 ///
 /// LCM replaces destructive compaction with a dual-state memory:
@@ -2055,10 +2051,6 @@ pub struct LcmSchemaConfig {
     /// Local port for the on-demand Higgs compaction sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_port: Option<u16>,
-    /// Context window size of the compaction model in tokens (default: 4096).
-    /// Used by the compactor attached to the managed sidecar.
-    #[serde(default = "default_lcm_compaction_context_size")]
-    pub compaction_context_size: usize,
 }
 
 impl Default for LcmSchemaConfig {
@@ -2069,7 +2061,6 @@ impl Default for LcmSchemaConfig {
             deterministic_target: default_lcm_deterministic_target(),
             compaction_model_dir: None,
             compaction_port: None,
-            compaction_context_size: default_lcm_compaction_context_size(),
         }
     }
 }
@@ -3114,7 +3105,6 @@ mod tests {
         assert_eq!(lcm.deterministic_target, 512);
         assert!(lcm.compaction_model_dir.is_none());
         assert!(lcm.compaction_port.is_none());
-        assert_eq!(lcm.compaction_context_size, 4096);
     }
 
     #[test]
@@ -3198,7 +3188,11 @@ mod tests {
             Some("/models/qwen3-0.6b")
         );
         assert_eq!(cfg.lcm.compaction_port, Some(8092));
-        assert_eq!(cfg.lcm.compaction_context_size, 2048);
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !serialized.contains("compactionContextSize"),
+            "obsolete fixed context setting must not remain active"
+        );
     }
 
     #[test]
