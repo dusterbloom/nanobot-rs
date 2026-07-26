@@ -683,6 +683,7 @@ impl ToolRegistry {
         // the full body). See stash_search.rs.
         "search_tool_result",
         "slice_tool_result",
+        "todo",
         // The system prompt instructs the model to expand LCM summaries; the
         // schema must be advertised or local models fall back to guessing
         // (observed: recall_tool_result with invented ids).
@@ -710,6 +711,7 @@ impl ToolRegistry {
         "recall_tool_result",
         "search_tool_result",
         "slice_tool_result",
+        "todo",
     ];
 
     /// Internal Lean-catalog builder: condense every available schema before
@@ -971,9 +973,11 @@ impl ToolRegistry {
              Provide {{\"name\":\"NAME\"}} to inspect that tool's full parameter \
              schema, or {{\"name\":\"NAME\",\"args\":{{\"arg\":\"value\"}}}} to invoke it. \
              Starter tools: read_file, read_skill (no args lists skills), recall \
-             (memory search), remember, edit_file, exec, write_file. \
-             For large files, repeat write_file with pieces of 4096 characters or less: \
-             state=more for non-final pieces, then state=complete for the final piece. \
+             (memory search), remember, todo (plan multi-step artifact work), edit_file, \
+             exec, write_file. A complete write_file call may contain the whole file. \
+             For voluntary staged writes, keep state=more pieces to 4096 characters or \
+             less; state=complete publishes the final piece. After publication, validate \
+             the artifact before claiming completion. \
              Full catalog: {}.",
             hints.join(", ")
         );
@@ -1109,12 +1113,16 @@ impl ToolRegistry {
                 };
                 if tool_name == "write_file"
                     && inner_params
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .is_some_and(|state| state.trim().eq_ignore_ascii_case("more"))
+                    && inner_params
                         .get("content")
                         .and_then(Value::as_str)
                         .is_some_and(|content| content.chars().count() > MAX_WRITE_FILE_PIECE_CHARS)
                 {
                     return ToolExecutionResult::failure(format!(
-                        "write_file content exceeds the {}-character proxy limit; retry write_file with the same path in pieces of 4096 characters or less, using state=\"more\" for non-final pieces and state=\"complete\" for the final piece",
+                        "write_file state=\"more\" content exceeds the {}-character staged-piece limit; retry with 4096 characters or less, or send the full artifact with state=\"complete\"",
                         MAX_WRITE_FILE_PIECE_CHARS
                     ));
                 }
@@ -1223,26 +1231,27 @@ mod tests {
         );
     }
 
-    /// Core-plus-proxy surface: 12 hot native schemas + the `tool` proxy for
+    /// Core-plus-proxy surface: 13 hot native schemas + the `tool` proxy for
     /// the CLOUD path. Local uses lean (proxy-only) via select_tool_definitions.
     #[test]
     fn test_core_plus_proxy_surface() {
         let ws = tempfile::tempdir().unwrap();
         let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
         register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        reg.register(Box::new(crate::agent::tools::TodoTool::new(ws.path())));
         let defs = reg.get_core_plus_proxy_definitions();
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        // 12 hot native tools + 1 proxy = 13 total for cloud.
+        // 13 hot native tools + 1 proxy = 14 total for cloud.
         assert_eq!(
             names.len(),
-            13,
-            "cloud core+proxy must be 12 native + 1 proxy, got {names:?}"
+            14,
+            "cloud core+proxy must be 13 native + 1 proxy, got {names:?}"
         );
         assert!(names.contains(&"tool"), "missing proxy: {names:?}");
-        for expected in ["read_file", "edit_file", "exec", "recall"] {
+        for expected in ["read_file", "edit_file", "exec", "recall", "todo"] {
             assert!(
                 names.contains(&expected),
                 "cloud missing {expected}: {names:?}"
@@ -1253,10 +1262,9 @@ mod tests {
             .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("write_file"))
             .and_then(|d| d.pointer("/function/parameters/properties/content"))
             .expect("write_file content schema");
-        assert_eq!(
-            write_content.get("maxLength").and_then(|v| v.as_u64()),
-            Some(MAX_WRITE_FILE_PIECE_CHARS as u64),
-            "advertised write_file content must bound each generated piece"
+        assert!(
+            write_content.get("maxLength").is_none(),
+            "complete writes must not inherit the voluntary staged-piece limit"
         );
         // The proxy must teach all three modes and name starter tools.
         let proxy_desc = defs
@@ -1266,6 +1274,8 @@ mod tests {
             .unwrap_or("");
         assert!(proxy_desc.contains("Omit name to list"), "{proxy_desc}");
         assert!(proxy_desc.contains("read_file"), "{proxy_desc}");
+        assert!(proxy_desc.contains("todo"), "{proxy_desc}");
+        assert!(proxy_desc.contains("validate"), "{proxy_desc}");
     }
 
     #[test]
@@ -2603,7 +2613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_rejects_large_write_file_payload_with_transactional_guidance() {
+    async fn test_proxy_accepts_large_complete_write_file_payload() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("artifact.html");
         let mut registry = ToolRegistry::new();
@@ -2613,8 +2623,6 @@ mod tests {
             MAX_WRITE_FILE_PIECE_CHARS, 4096,
             "local models must use the same bounded piece size the writer stages"
         );
-        // One byte over the local proxy threshold. Direct/cloud native calls
-        // remain unlimited for backward compatibility.
         let oversized = "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1);
 
         let mut params = HashMap::new();
@@ -2624,22 +2632,44 @@ mod tests {
             serde_json::json!({
                 "path": file_path,
                 "content": oversized,
+                "state": "complete",
             }),
         );
 
         let result = registry.execute("tool", params).await;
 
-        assert!(!result.ok, "large proxied write_file must be rejected");
+        assert!(result.ok, "large complete proxy write failed: {result:?}");
         assert!(
-            result.data.contains("write_file") && result.data.contains("state=\"more\""),
-            "rejection must explain bounded transactional writes: {}",
+            result.data.contains("Validate the published artifact"),
+            "publication must require validation: {}",
             result.data
         );
-        assert!(!result.data.contains("write_file_chunk"), "{}", result.data);
-        assert!(
-            !file_path.exists(),
-            "rejected large payload must not reach write_file"
+        assert_eq!(std::fs::metadata(file_path).unwrap().len(), 4097);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_rejects_only_large_more_write_file_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("artifact.html");
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WriteFileTool::default()));
+
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("write_file"));
+        params.insert(
+            "args".to_string(),
+            serde_json::json!({
+                "path": file_path,
+                "content": "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1),
+                "state": "more",
+            }),
         );
+
+        let result = registry.execute("tool", params).await;
+
+        assert!(!result.ok, "oversized state=more must be rejected");
+        assert!(result.data.contains("state=\"more\""), "{}", result.data);
+        assert!(!file_path.exists());
     }
 
     #[tokio::test]

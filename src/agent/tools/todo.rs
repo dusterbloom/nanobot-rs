@@ -79,11 +79,11 @@ impl Tool for TodoTool {
     }
 
     fn description(&self) -> &str {
-        "Working-memory scratchpad for tracking what you're doing across tool \
-         calls. Use `action: add` to pin a task before starting it, `list` to \
-         see what's pending, `complete` to mark done by id, and `clear` to \
-         wipe the list. Persists to {workspace}/TODO.json so it survives \
-         between turns."
+        "Working-memory scratchpad for multi-step artifact work. Before starting, \
+         use `action: add` for a short plan; use `list` to recover progress across \
+         tool calls. After publishing, validate the artifact, fix any errors, then \
+         use `complete` to mark the item done by id. Use `clear` to wipe the list. \
+         Persists to {workspace}/TODO.json between turns."
     }
 
     fn parameters(&self) -> Value {
@@ -283,5 +283,15 @@ mod tests {
         let variants = schema["properties"]["action"]["enum"].as_array().unwrap();
         let names: Vec<&str> = variants.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(names, vec!["add", "list", "complete", "clear"]);
+    }
+
+    #[test]
+    fn test_description_teaches_artifact_plan_and_validation_workflow() {
+        let tool = TodoTool::new(Path::new("/tmp"));
+        let description = tool.description().to_ascii_lowercase();
+        assert!(description.contains("multi-step artifact"), "{description}");
+        assert!(description.contains("before"), "{description}");
+        assert!(description.contains("validate"), "{description}");
+        assert!(description.contains("complete"), "{description}");
     }
 }

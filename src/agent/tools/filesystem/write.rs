@@ -134,9 +134,6 @@ impl WriteFileTool {
             return "Error: 'state' must be one of: more, complete, append".to_string();
         }
         let piece_chars = content.chars().count();
-        if tool_call_id.is_some() && piece_chars > MAX_WRITE_FILE_PIECE_CHARS {
-            return oversized_piece_error(piece_chars);
-        }
 
         let target_path = expand_write_path(path);
         if let Some(parent) = target_path.parent() {
@@ -188,7 +185,7 @@ impl WriteFileTool {
                     staged.total_bytes
                 );
             }
-            if piece_chars > MAX_WRITE_FILE_PIECE_CHARS {
+            if state == "more" && piece_chars > MAX_WRITE_FILE_PIECE_CHARS {
                 return oversized_piece_error(piece_chars);
             }
 
@@ -239,7 +236,7 @@ impl WriteFileTool {
                     },
                 );
             }
-            return format!("Successfully wrote {total_bytes} bytes to {path}");
+            return published_receipt("wrote", total_bytes, total_bytes, path);
         }
 
         if state == "more" {
@@ -283,12 +280,7 @@ impl WriteFileTool {
                             },
                         );
                     }
-                    format!(
-                        "Successfully appended {} bytes to {}; total={} bytes",
-                        content.len(),
-                        path,
-                        total_bytes
-                    )
+                    published_receipt("appended", content.len() as u64, total_bytes, path)
                 }
                 Err(e) => write_error(path, e),
             };
@@ -307,7 +299,7 @@ impl WriteFileTool {
                         },
                     );
                 }
-                format!("Successfully wrote {} bytes to {}", content.len(), path)
+                published_receipt("wrote", content.len() as u64, content.len() as u64, path)
             }
             Err(e) => write_error(path, e),
         }
@@ -321,7 +313,7 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "Write a file atomically; content MUST be 4096 characters or less per call. For larger replacements, call write_file repeatedly on the same path with state=more for non-final pieces and state=complete for the final piece; use state=append to add a small suffix, omit state for a smaller complete file, and never send offsets, hashes, IDs, or temporary paths."
+        "Write a file atomically. A state=complete call may contain the whole file at any size. For voluntary multi-call writes, keep each non-final state=more piece to 4096 characters or less; the final state=complete piece may be any size. Use state=append to add content, omit state for a complete one-call write, and never send offsets, hashes, IDs, or temporary paths. After publication, validate the artifact before claiming completion."
     }
 
     fn permission(&self) -> PermissionLevel {
@@ -338,8 +330,7 @@ impl Tool for WriteFileTool {
                 },
                 "content": {
                     "type": "string",
-                    "maxLength": MAX_WRITE_FILE_PIECE_CHARS,
-                    "description": "One content piece, at most 4096 characters"
+                    "description": "Content to publish. Only voluntary state=more pieces are limited to 4096 characters; state=complete may be any size."
                 },
                 "state": {
                     "type": "string",
@@ -392,6 +383,15 @@ async fn atomic_append(target_path: &Path, content: &str) -> std::io::Result<u64
 fn staged_receipt(path: &str, wrote: usize, total: u64) -> String {
     format!(
         "Staged {wrote} bytes for {path}; total={total}. Continue with write_file(path, content, state=\"more\"), or send the final piece with state=\"complete\"."
+    )
+}
+
+fn published_receipt(action: &str, wrote: u64, total: u64, path: &str) -> String {
+    let total_suffix = (wrote != total)
+        .then(|| format!("; total={total} bytes"))
+        .unwrap_or_default();
+    format!(
+        "Successfully {action} {wrote} bytes to {path}{total_suffix}. Validate the published artifact before claiming completion."
     )
 }
 
@@ -552,12 +552,21 @@ mod tests {
         let schema = tool.parameters();
         let description = tool.description();
 
-        assert!(description.contains("MUST be 4096 characters or less"));
-        assert!(description.contains("For larger replacements"));
+        assert!(description.contains("complete"));
+        assert!(description.contains("any size"));
+        assert!(description.contains("4096 characters or less"));
         assert!(description.contains("state=more"));
         assert!(description.contains("state=complete"));
         assert!(description.contains("never send offsets"));
         assert!(description.contains("hashes"));
+        assert!(
+            schema.pointer("/properties/content/maxLength").is_none(),
+            "the 4096 advisory applies only to state=more"
+        );
+        assert!(schema["properties"]["content"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("state=more"));
         assert_eq!(
             schema.pointer("/properties/state/enum"),
             Some(&serde_json::json!(["more", "complete", "append"]))
@@ -607,6 +616,7 @@ mod tests {
             ]))
             .await;
         assert!(final_result.starts_with("Successfully wrote 28 bytes"));
+        assert!(final_result.contains("Validate the published artifact"));
         assert_eq!(
             std::fs::read_to_string(&file_path).unwrap(),
             "<html><body>ok</body></html>"
@@ -632,7 +642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_model_write_rejects_oversized_complete_call_without_touching_target() {
+    async fn test_model_write_accepts_oversized_complete_call_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("artifact.html");
         std::fs::write(&file_path, "old").unwrap();
@@ -644,19 +654,64 @@ mod tests {
             tool_call_id: "call-oversized".to_string(),
         };
 
+        let content = "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1);
         let result = tool
             .execute_with_context(
                 make_params(&[
                     ("path", file_path.to_str().unwrap()),
-                    ("content", &"x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1)),
+                    ("content", &content),
+                    ("state", "complete"),
                 ]),
                 &ctx,
             )
             .await;
 
-        assert!(result.starts_with("Error:"), "{result}");
-        assert!(result.contains("4097 characters"), "{result}");
-        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "old");
+        assert!(
+            result.starts_with("Successfully wrote 4097 bytes"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Validate the published artifact"),
+            "{result}"
+        );
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_complete_piece_publishes_existing_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("artifact.html");
+        std::fs::write(&file_path, "old").unwrap();
+        let tool = WriteFileTool::default();
+        let prefix = "<html>";
+        let final_piece = "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1);
+
+        let staged = tool
+            .execute(make_params(&[
+                ("path", file_path.to_str().unwrap()),
+                ("content", prefix),
+                ("state", "more"),
+            ]))
+            .await;
+        assert!(staged.starts_with("Staged"), "{staged}");
+
+        let result = tool
+            .execute(make_params(&[
+                ("path", file_path.to_str().unwrap()),
+                ("content", &final_piece),
+                ("state", "complete"),
+            ]))
+            .await;
+
+        assert!(result.starts_with("Successfully wrote"), "{result}");
+        assert!(
+            result.contains("Validate the published artifact"),
+            "{result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            format!("{prefix}{final_piece}")
+        );
     }
 
     #[tokio::test]
