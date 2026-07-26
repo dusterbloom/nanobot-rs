@@ -1609,7 +1609,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         let passthrough = raw.clone();
 
         let mut store = ContextStore::new();
-        let (_var_name, context_store_view) = store.store(raw.clone());
+        let (var_name, context_store_view) = store.store(raw.clone());
 
         // 50 token budget → raw (≈575 tokens) will not fit → briefing path.
         let mut gate = ContentGate::new(50, 0.2);
@@ -1620,7 +1620,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         assert!(passthrough.contains("Bank of England"));
         assert!(!context_store_view.contains("Bank of England"));
         assert!(context_store_view.contains("chars"));
-        assert!(context_store_view.contains("output_0"));
+        assert!(context_store_view.contains(&var_name));
         assert!(!gate_view.contains("Bank of England"));
         assert!(gate_view.contains("JSON Summary") || gate_view.contains("Content Summary"));
     }

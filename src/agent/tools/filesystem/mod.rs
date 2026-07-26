@@ -6,7 +6,8 @@
 
 mod write;
 
-pub use write::{WriteFileChunkTool, WriteFileTool};
+pub use write::WriteFileTool;
+pub(crate) use write::MAX_WRITE_FILE_PIECE_CHARS;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -345,6 +346,10 @@ impl Tool for EditFileTool {
                     .to_string()
             }
         };
+        if old_text == new_text {
+            return "Error: old_text and new_text are identical; no change was made. Provide different replacement text, or call write_file with state=append to add a suffix."
+                .to_string();
+        }
 
         if !content.contains(old_text) {
             return diagnose_missing_old_text(&content, old_text);
@@ -2201,6 +2206,26 @@ mod tests {
 
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "Hello Rust! This is a test.");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_rejects_identical_old_and_new_text() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("no_op.txt");
+        std::fs::write(&file_path, "unchanged").unwrap();
+
+        let result = EditFileTool
+            .execute(make_params(&[
+                ("path", file_path.to_str().unwrap()),
+                ("old_text", "unchanged"),
+                ("new_text", "unchanged"),
+            ]))
+            .await;
+
+        assert!(result.starts_with("Error:"), "{result}");
+        assert!(result.contains("identical"), "{result}");
+        assert!(result.contains("state=append"), "{result}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "unchanged");
     }
 
     #[tokio::test]

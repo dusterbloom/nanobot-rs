@@ -147,6 +147,7 @@ pub(super) async fn execute_lcm_compaction(
         let node = mutation.engine().dag().newest()?;
         let node_id = node.id;
         let child_ids = node.child_summaries.clone();
+        let manifest = node.manifest.clone();
         Some((
             node_id,
             source_ids.clone(),
@@ -154,6 +155,7 @@ pub(super) async fn execute_lcm_compaction(
             text.clone(),
             TokenBudget::estimate_str_tokens(text),
             *level,
+            manifest,
         ))
     });
 
@@ -204,7 +206,7 @@ pub(super) async fn execute_lcm_compaction(
     // an LCM state that cannot be reconstructed after restart.
     let compacted = summary_turn.is_some();
     let checkpoint_persisted =
-        if let (Some((node_id, source_ids, child_ids, text, tokens, level)), true) =
+        if let (Some((node_id, source_ids, child_ids, text, tokens, level, manifest)), true) =
             (summary_node, pending.is_some())
         {
             let working_memory = core.memory_enabled.then_some((text.as_str(), session_turn));
@@ -218,6 +220,7 @@ pub(super) async fn execute_lcm_compaction(
                     &text,
                     tokens,
                     level,
+                    &manifest,
                     working_memory,
                 )
                 .await

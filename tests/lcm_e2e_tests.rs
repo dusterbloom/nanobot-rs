@@ -507,6 +507,7 @@ fn test_rebuild_from_db_nodes_preserves_summaries() {
         "Summary of first exchange".to_string(),
         10usize,
         1u8,
+        nanobot::agent::lcm::SummaryManifest::default(),
         "db_id".to_string(),
     )];
 

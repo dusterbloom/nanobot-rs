@@ -83,6 +83,41 @@ impl Tool for CountingTool {
     }
 }
 
+#[tokio::test]
+async fn retry_path_preserves_identity_across_transactional_write_pieces() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("delegated.txt");
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(crate::agent::tools::WriteFileTool::default()));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+
+    for (index, (content, state)) in [
+        ("first-", "more"),
+        ("second-", "more"),
+        ("done", "complete"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = execute_with_retry(
+            &tools,
+            "write_file",
+            &format!("call_{index}"),
+            HashMap::from([
+                ("path".to_string(), json!(path)),
+                ("content".to_string(), json!(content)),
+                ("state".to_string(), json!(state)),
+            ]),
+            Some(&cancellation),
+            0,
+        )
+        .await;
+        assert!(result.ok, "{:?}", result.error);
+    }
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "first-second-done");
+}
+
 fn make_tool_calls(names: &[&str]) -> Vec<ToolCallRequest> {
     names
         .iter()
@@ -839,7 +874,7 @@ async fn test_large_result_injects_metadata() {
         .unwrap();
     let content = user_msg["content"].as_str().unwrap();
     assert!(
-        content.contains("output_0"),
+        content.contains("output_c38c2bf3055c516a"),
         "Scratch pad state should contain variable metadata, got: {}",
         content
     );
@@ -897,7 +932,7 @@ async fn test_small_result_injects_directly() {
     let content = user_msg["content"].as_str().unwrap();
     // Even small results are stored as variables in ContextStore.
     assert!(
-        content.contains("output_0"),
+        content.contains("output_77cf12060d47183e"),
         "Scratch pad state should contain variable info, got: {}",
         content
     );
@@ -1424,7 +1459,7 @@ async fn test_ctx_summarize_depth_guard() {
     store.store("Some content to summarize.".to_string());
 
     let result = context_store::execute_ctx_summarize(
-        &store,
+        &mut store,
         "output_0",
         "Summarize this",
         &provider,
@@ -1451,10 +1486,10 @@ async fn test_ctx_summarize_missing_variable() {
     // ctx_summarize with a nonexistent variable should return an error
     // without calling the provider.
     let provider: Arc<dyn LLMProvider> = Arc::new(MockProvider::new(vec![]));
-    let store = context_store::ContextStore::new(); // empty store
+    let mut store = context_store::ContextStore::new(); // empty store
 
     let result = context_store::execute_ctx_summarize(
-        &store,
+        &mut store,
         "nonexistent_var",
         "Summarize this",
         &provider,
@@ -2042,25 +2077,25 @@ fn test_build_analysis_state_empty_store() {
 #[test]
 fn test_build_analysis_state_with_variables() {
     let mut store = context_store::ContextStore::new();
-    store.store("hello world".to_string());
-    store.store("x".repeat(500));
+    let (short_name, _) = store.store("hello world".to_string());
+    let (long_name, _) = store.store("x".repeat(500));
 
     let state = build_analysis_state(&store);
     assert!(
-        state.contains("output_0"),
+        state.contains(&short_name),
         "State should contain variable name"
     );
     assert!(
         state.contains("11 chars"),
-        "State should contain char count for output_0"
+        "State should contain char count for {short_name}"
     );
     assert!(
-        state.contains("output_1"),
+        state.contains(&long_name),
         "State should contain second variable"
     );
     assert!(
         state.contains("500 chars"),
-        "State should contain char count for output_1"
+        "State should contain char count for {long_name}"
     );
 }
 
@@ -2092,7 +2127,7 @@ fn test_build_analysis_state_with_memory() {
 #[test]
 fn test_build_analysis_state_with_both() {
     let mut store = context_store::ContextStore::new();
-    store.store("some data".to_string());
+    let (variable_name, _) = store.store("some data".to_string());
     store.mem_store("finding", "important result".to_string());
 
     let state = build_analysis_state(&store);
@@ -2104,7 +2139,7 @@ fn test_build_analysis_state_with_both() {
         state.contains("Findings so far:"),
         "Should have findings section"
     );
-    assert!(state.contains("output_0"), "Should contain variable");
+    assert!(state.contains(&variable_name), "Should contain variable");
     assert!(state.contains("important result"), "Should contain finding");
 }
 

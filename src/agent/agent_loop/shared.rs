@@ -1173,7 +1173,9 @@ impl AgentLoopShared {
             ctx.messages
                 .push(crate::agent::markers::scaffold_user(format!(
                     "[system] Report what the previous tool results showed before \
-                 running more tools.{budget_note}"
+                 running more tools. If you created or changed an artifact, do not \
+                 claim completion until you validate it with an appropriate tool \
+                 and fix any errors.{budget_note}"
                 )));
         }
 

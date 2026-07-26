@@ -11,12 +11,12 @@ use tracing::warn;
 use super::base::{
     PermissionLevel, Tool, ToolConcurrency, ToolExecutionContext, ToolExecutionResult,
 };
+use super::filesystem::MAX_WRITE_FILE_PIECE_CHARS;
 use super::{
     ApplyPatchTool, BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, FileInfoTool,
     FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool,
     RememberTool, SearchContextTool, SearchFilesTool, SessionSearchTool, SystemInfoTool,
-    ToolStatusTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileChunkTool,
-    WriteFileTool,
+    ToolStatusTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileTool,
 };
 use crate::config::schema::CodeExecutionConfig;
 
@@ -90,8 +90,6 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    const MAX_PROXIED_WRITE_FILE_BYTES: usize = 262144;
-
     /// Normalize model-emitted tool names/params into canonical tool contract.
     ///
     /// This keeps small/local models focused by repairing common drift:
@@ -279,12 +277,7 @@ impl ToolRegistry {
     /// after this.
     pub fn register_standard_tools(&mut self, config: &ToolConfig) {
         let should_include = |name: &str| -> bool {
-            if config.read_only
-                && matches!(
-                    name,
-                    "write_file" | "write_file_chunk" | "edit_file" | "apply_patch"
-                )
-            {
+            if config.read_only && matches!(name, "write_file" | "edit_file" | "apply_patch") {
                 return false;
             }
             if let Some(ref filter) = config.tools_filter {
@@ -300,10 +293,7 @@ impl ToolRegistry {
             self.register(Box::new(FilePreviewTool));
         }
         if should_include("write_file") {
-            self.register(Box::new(WriteFileTool));
-        }
-        if should_include("write_file_chunk") {
-            self.register(Box::new(WriteFileChunkTool));
+            self.register(Box::new(WriteFileTool::default()));
         }
         if should_include("edit_file") {
             self.register(Box::new(EditFileTool));
@@ -712,7 +702,7 @@ impl ToolRegistry {
         "list_dir",
         "find_files",
         "search_files",
-        "write_file_chunk",
+        "write_file",
         "edit_file",
         "exec",
         "recall",
@@ -867,17 +857,6 @@ impl ToolRegistry {
                     *required = serde_json::json!(["path", "old_text", "new_text"]);
                 }
             }
-            "write_file_chunk" => {
-                if let Some(props) = def
-                    .pointer_mut("/function/parameters/properties")
-                    .and_then(|v| v.as_object_mut())
-                {
-                    // The hot path needs offset sequencing. Final hash checking
-                    // remains available through proxy inspect without charging
-                    // every local cold prefill for optional verification text.
-                    props.remove("final_sha256");
-                }
-            }
             _ => {}
         }
     }
@@ -992,7 +971,9 @@ impl ToolRegistry {
              Provide {{\"name\":\"NAME\"}} to inspect that tool's full parameter \
              schema, or {{\"name\":\"NAME\",\"args\":{{\"arg\":\"value\"}}}} to invoke it. \
              Starter tools: read_file, read_skill (no args lists skills), recall \
-             (memory search), remember, edit_file, exec, write_file_chunk. \
+             (memory search), remember, edit_file, exec, write_file. \
+             For large files, repeat write_file with pieces of 4096 characters or less: \
+             state=more for non-final pieces, then state=complete for the final piece. \
              Full catalog: {}.",
             hints.join(", ")
         );
@@ -1130,11 +1111,11 @@ impl ToolRegistry {
                     && inner_params
                         .get("content")
                         .and_then(Value::as_str)
-                        .is_some_and(|content| content.len() > Self::MAX_PROXIED_WRITE_FILE_BYTES)
+                        .is_some_and(|content| content.chars().count() > MAX_WRITE_FILE_PIECE_CHARS)
                 {
                     return ToolExecutionResult::failure(format!(
-                        "write_file content exceeds the {}-byte proxy limit; use write_file_chunk with mode=start, append, then finish",
-                        Self::MAX_PROXIED_WRITE_FILE_BYTES
+                        "write_file content exceeds the {}-character proxy limit; retry write_file with the same path in pieces of 4096 characters or less, using state=\"more\" for non-final pieces and state=\"complete\" for the final piece",
+                        MAX_WRITE_FILE_PIECE_CHARS
                     ));
                 }
                 self.execute_inner(&tool_name, inner_params, ctx).await
@@ -1267,6 +1248,16 @@ mod tests {
                 "cloud missing {expected}: {names:?}"
             );
         }
+        let write_content = defs
+            .iter()
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("write_file"))
+            .and_then(|d| d.pointer("/function/parameters/properties/content"))
+            .expect("write_file content schema");
+        assert_eq!(
+            write_content.get("maxLength").and_then(|v| v.as_u64()),
+            Some(MAX_WRITE_FILE_PIECE_CHARS as u64),
+            "advertised write_file content must bound each generated piece"
+        );
         // The proxy must teach all three modes and name starter tools.
         let proxy_desc = defs
             .iter()
@@ -1297,12 +1288,12 @@ mod tests {
             .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
             .unwrap_or("");
         assert!(
-            proxy_desc.contains("write_file_chunk"),
-            "proxy must keep chunk writer reachable: {proxy_desc}"
+            !proxy_desc.contains("write_file_chunk"),
+            "proxy must expose one file-writing path: {proxy_desc}"
         );
         assert!(
             proxy_desc.contains("write_file"),
-            "proxy must keep full write_file reachable: {proxy_desc}"
+            "proxy must keep transactional write_file reachable: {proxy_desc}"
         );
     }
 
@@ -2052,6 +2043,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_standard_registry_exposes_one_file_writer() {
+        let registry =
+            ToolRegistry::with_standard_tools(&ToolConfig::new(std::path::Path::new(".")));
+
+        assert!(registry.has("write_file"));
+        assert!(
+            !registry.has("write_file_chunk"),
+            "write_file must own both complete and staged writes"
+        );
+    }
+
     /// The internal condensed builder starts from every registered tool before
     /// the Lean production subset is selected.
     #[test]
@@ -2600,17 +2603,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_rejects_large_write_file_payload_and_routes_to_chunk_writer() {
+    async fn test_proxy_rejects_large_write_file_payload_with_transactional_guidance() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("artifact.html");
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(WriteFileTool));
-        registry.register(Box::new(WriteFileChunkTool));
+        registry.register(Box::new(WriteFileTool::default()));
 
-        // One byte over the proxy threshold. Reference the constant directly so the
-        // test tracks the real boundary if the threshold is retuned (it was raised to
-        // 256 KiB after repeated failures creating single rich HTML artifacts).
-        let oversized = "x".repeat(ToolRegistry::MAX_PROXIED_WRITE_FILE_BYTES + 1);
+        assert_eq!(
+            MAX_WRITE_FILE_PIECE_CHARS, 4096,
+            "local models must use the same bounded piece size the writer stages"
+        );
+        // One byte over the local proxy threshold. Direct/cloud native calls
+        // remain unlimited for backward compatibility.
+        let oversized = "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1);
 
         let mut params = HashMap::new();
         params.insert("name".to_string(), serde_json::json!("write_file"));
@@ -2626,10 +2631,11 @@ mod tests {
 
         assert!(!result.ok, "large proxied write_file must be rejected");
         assert!(
-            result.data.contains("write_file_chunk"),
-            "rejection must route the model to the bounded writer: {}",
+            result.data.contains("write_file") && result.data.contains("state=\"more\""),
+            "rejection must explain bounded transactional writes: {}",
             result.data
         );
+        assert!(!result.data.contains("write_file_chunk"), "{}", result.data);
         assert!(
             !file_path.exists(),
             "rejected large payload must not reach write_file"
@@ -2641,7 +2647,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("direct.txt");
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(WriteFileTool));
+        registry.register(Box::new(WriteFileTool::default()));
 
         let mut params = HashMap::new();
         params.insert("path".to_string(), serde_json::json!(file_path));

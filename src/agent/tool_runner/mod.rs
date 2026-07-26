@@ -423,6 +423,7 @@ async fn analyze_via_scratch_pad(
                     let result = execute_with_retry(
                         tools,
                         &tc.name,
+                        &tc.id,
                         tc.arguments.clone(),
                         config.cancellation_token.as_ref(),
                         TOOL_MAX_RETRIES,
@@ -712,7 +713,7 @@ pub async fn run_tool_loop(
                     variable, instruction, config.depth
                 );
                 let result = context_store::execute_ctx_summarize(
-                    &context_store,
+                    &mut context_store,
                     variable,
                     instruction,
                     &config.provider,
@@ -972,6 +973,7 @@ pub async fn run_tool_loop(
                 let result = execute_with_retry(
                     tools,
                     &tc.name,
+                    &tc.id,
                     tc.arguments.clone(),
                     config.cancellation_token.as_ref(),
                     TOOL_MAX_RETRIES,
@@ -1159,6 +1161,7 @@ fn normalize_tool_call_id(counter: usize) -> String {
 async fn execute_with_retry(
     tools: &ToolRegistry,
     name: &str,
+    tool_call_id: &str,
     arguments: HashMap<String, serde_json::Value>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
     max_retries: u32,
@@ -1167,19 +1170,18 @@ async fn execute_with_retry(
 
     let mut attempts = 0u32;
     loop {
-        let result = if let Some(token) = cancel {
-            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-            let ctx = ToolExecutionContext {
-                event_tx,
-                cancellation_token: token.child_token(),
-                tool_call_id: String::new(),
-            };
-            tools
-                .execute_with_context(name, arguments.clone(), &ctx)
-                .await
-        } else {
-            tools.execute(name, arguments.clone()).await
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(event_rx);
+        let ctx = ToolExecutionContext {
+            event_tx,
+            cancellation_token: cancel
+                .map(|token| token.child_token())
+                .unwrap_or_else(tokio_util::sync::CancellationToken::new),
+            tool_call_id: tool_call_id.to_string(),
         };
+        let result = tools
+            .execute_with_context(name, arguments.clone(), &ctx)
+            .await;
 
         attempts += 1;
 

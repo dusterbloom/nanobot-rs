@@ -34,7 +34,7 @@ pub use email::{CheckInboxTool, SendEmailTool};
 pub use file_preview::FilePreviewTool;
 pub use filesystem::{
     EditFileTool, FileInfoTool, FindFilesTool, ListDirTool, ReadFileTool, SearchFilesTool,
-    WorkspaceDiffTool, WriteFileChunkTool, WriteFileTool,
+    WorkspaceDiffTool, WriteFileTool,
 };
 pub use message::{MessageTool, SendCallback};
 pub use read_skill::ReadSkillTool;

@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use crate::agent::lcm::SummaryManifest;
+
 use super::filters::filter_history;
 
 // ---------------------------------------------------------------------------
@@ -96,6 +98,7 @@ CREATE TABLE IF NOT EXISTS summary_nodes (
     level         INTEGER NOT NULL,
     created_at    TEXT NOT NULL,
     id_kind       TEXT,
+    manifest_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (session_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_summary_nodes_session ON summary_nodes(session_id);
@@ -343,6 +346,10 @@ impl SessionDb {
         // the messages rowid). The error on already-migrated DBs (duplicate
         // column) is expected and ignored.
         let _ = conn.execute("ALTER TABLE summary_nodes ADD COLUMN id_kind TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE summary_nodes ADD COLUMN manifest_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
 
         // Pre-migration rows (id_kind absent) carry POSITIONAL source_ids
         // that cannot be resolved against the db-id-keyed LCM store. Purge
@@ -385,11 +392,14 @@ impl SessionDb {
                      level INTEGER NOT NULL,
                      created_at TEXT NOT NULL,
                      id_kind TEXT,
+                     manifest_json TEXT NOT NULL DEFAULT '{}',
                      PRIMARY KEY (session_id, id)
                  );
                  INSERT INTO summary_nodes_v2
-                     (id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind)
-                 SELECT id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind
+                     (id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind,
+                      manifest_json)
+                 SELECT id, session_id, source_ids, child_ids, text, tokens, level, created_at,
+                        id_kind, COALESCE(manifest_json, '{}')
                  FROM summary_nodes;
                  DROP TABLE summary_nodes;
                  ALTER TABLE summary_nodes_v2 RENAME TO summary_nodes;
@@ -1484,10 +1494,11 @@ impl SessionDb {
         text: &str,
         tokens: usize,
         level: u8,
+        manifest: &SummaryManifest,
     ) {
         let conn = self.conn.lock().await;
         if let Err(e) = save_summary_node_locked(
-            &conn, session_id, node_id, source_ids, child_ids, text, tokens, level,
+            &conn, session_id, node_id, source_ids, child_ids, text, tokens, level, manifest,
         ) {
             warn!(
                 "Failed to save summary node {} for session {}: {}",
@@ -1507,12 +1518,13 @@ impl SessionDb {
         text: &str,
         tokens: usize,
         level: u8,
+        manifest: &SummaryManifest,
         working_memory: Option<(&str, u64)>,
     ) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction()?;
         save_summary_node_locked(
-            &tx, session_id, node_id, source_ids, child_ids, text, tokens, level,
+            &tx, session_id, node_id, source_ids, child_ids, text, tokens, level, manifest,
         )?;
         if let Some((content, turn)) = working_memory {
             let updated = upsert_working_memory_locked(&tx, session_id, content, "active", turn)?;
@@ -1533,17 +1545,26 @@ impl SessionDb {
     /// Load all summary nodes for a session, ordered by ID.
     ///
     /// Returns a vec of (node_id, source_ids, child_ids, text, tokens, level,
-    /// id_kind). `id_kind` is always `"db_id"`: source_ids are stable messages
-    /// rowids. Pre-migration rows with positional source_ids are purged once
-    /// when the DB is opened (see `SessionDb::new`); the WHERE clause keeps
-    /// the invariant local.
+    /// manifest, id_kind). `id_kind` is always `"db_id"`: source_ids are stable
+    /// messages rowids. Pre-migration rows with positional source_ids are
+    /// purged once when the DB is opened (see `SessionDb::new`); the WHERE
+    /// clause keeps the invariant local.
     pub async fn load_summary_nodes(
         &self,
         session_id: &str,
-    ) -> Vec<(usize, Vec<usize>, Vec<usize>, String, usize, u8, String)> {
+    ) -> Vec<(
+        usize,
+        Vec<usize>,
+        Vec<usize>,
+        String,
+        usize,
+        u8,
+        SummaryManifest,
+        String,
+    )> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
-            "SELECT id, source_ids, child_ids, text, tokens, level, id_kind \
+            "SELECT id, source_ids, child_ids, text, tokens, level, manifest_json, id_kind \
              FROM summary_nodes WHERE session_id = ?1 AND id_kind = 'db_id' \
              ORDER BY id ASC",
         ) {
@@ -1561,19 +1582,33 @@ impl SessionDb {
             let text: String = row.get(3)?;
             let tokens: i64 = row.get(4)?;
             let level: i64 = row.get(5)?;
-            let id_kind: String = row.get(6)?;
-            Ok((id, source_str, child_str, text, tokens, level, id_kind))
+            let manifest_json: Option<String> = row.get(6)?;
+            let id_kind: String = row.get(7)?;
+            Ok((
+                id,
+                source_str,
+                child_str,
+                text,
+                tokens,
+                level,
+                manifest_json,
+                id_kind,
+            ))
         });
 
         match rows {
             Ok(r) => r
                 .flatten()
                 .map(
-                    |(id, source_str, child_str, text, tokens, level, id_kind)| {
+                    |(id, source_str, child_str, text, tokens, level, manifest_json, id_kind)| {
                         let source_ids: Vec<usize> =
                             serde_json::from_str(&source_str).unwrap_or_default();
                         let child_ids: Vec<usize> =
                             serde_json::from_str(&child_str).unwrap_or_default();
+                        let manifest = manifest_json
+                            .as_deref()
+                            .and_then(|json| serde_json::from_str(json).ok())
+                            .unwrap_or_default();
                         (
                             id as usize,
                             source_ids,
@@ -1581,6 +1616,7 @@ impl SessionDb {
                             text,
                             tokens as usize,
                             level as u8,
+                            manifest,
                             id_kind,
                         )
                     },
@@ -1733,20 +1769,24 @@ fn save_summary_node_locked(
     text: &str,
     tokens: usize,
     level: u8,
+    manifest: &SummaryManifest,
 ) -> rusqlite::Result<()> {
     let source_json = serde_json::to_string(source_ids).unwrap_or_else(|_| "[]".to_string());
     let child_json = serde_json::to_string(child_ids).unwrap_or_else(|_| "[]".to_string());
+    let manifest_json = serde_json::to_string(manifest).unwrap_or_else(|_| "{}".to_string());
     let now = Utc::now().to_rfc3339();
     // `db_id` means source ids are stable messages rowids. Older positional
     // nodes lack the marker and are deliberately skipped during reconstruction.
     conn.execute(
         "INSERT INTO summary_nodes \
-         (id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'db_id') \
+         (id, session_id, source_ids, child_ids, text, tokens, level, created_at, id_kind, \
+          manifest_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'db_id', ?9) \
          ON CONFLICT(session_id, id) DO UPDATE SET \
          source_ids = excluded.source_ids, child_ids = excluded.child_ids, \
          text = excluded.text, tokens = excluded.tokens, level = excluded.level, \
-         created_at = excluded.created_at, id_kind = excluded.id_kind",
+         created_at = excluded.created_at, id_kind = excluded.id_kind, \
+         manifest_json = excluded.manifest_json",
         params![
             node_id as i64,
             session_id,
@@ -1756,6 +1796,7 @@ fn save_summary_node_locked(
             tokens as i64,
             level as i64,
             now,
+            manifest_json,
         ],
     )?;
     Ok(())
@@ -2086,6 +2127,7 @@ fn reconstruct_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::lcm::ManifestItem;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -2908,6 +2950,13 @@ mod tests {
     async fn test_dag_persistence_roundtrip() {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:dag_test").await;
+        let manifest = SummaryManifest {
+            open_loops: vec![ManifestItem {
+                text: "Verify restart behavior".to_string(),
+                sources: vec![2, 4],
+            }],
+            ..SummaryManifest::default()
+        };
 
         // Save two summary nodes.
         db.save_summary_node(
@@ -2918,6 +2967,7 @@ mod tests {
             "Summary of greeting exchange.",
             15,
             1,
+            &manifest,
         )
         .await;
 
@@ -2929,6 +2979,7 @@ mod tests {
             "Summary of technical discussion.",
             12,
             2,
+            &SummaryManifest::default(),
         )
         .await;
 
@@ -2936,21 +2987,23 @@ mod tests {
         let nodes = db.load_summary_nodes(&meta.id).await;
         assert_eq!(nodes.len(), 2);
 
-        let (id0, src0, child0, text0, tokens0, level0, kind0) = &nodes[0];
+        let (id0, src0, child0, text0, tokens0, level0, manifest0, kind0) = &nodes[0];
         assert_eq!(*id0, 0);
         assert_eq!(*src0, vec![1, 2, 3, 4]);
         assert!(child0.is_empty());
         assert_eq!(text0, "Summary of greeting exchange.");
         assert_eq!(*tokens0, 15);
         assert_eq!(*level0, 1);
+        assert_eq!(manifest0, &manifest);
         assert_eq!(kind0, "db_id", "save_summary_node must tag id_kind");
 
-        let (id1, src1, _child1, text1, tokens1, level1, _kind1) = &nodes[1];
+        let (id1, src1, _child1, text1, tokens1, level1, manifest1, _kind1) = &nodes[1];
         assert_eq!(*id1, 1);
         assert_eq!(*src1, vec![5, 6, 7]);
         assert_eq!(text1, "Summary of technical discussion.");
         assert_eq!(*tokens1, 12);
         assert_eq!(*level1, 2);
+        assert_eq!(manifest1, &SummaryManifest::default());
     }
 
     /// Pre-migration summary_nodes rows (id_kind NULL or non-"db_id") carry
@@ -2963,8 +3016,17 @@ mod tests {
         let meta = {
             let db = SessionDb::new(&db_path);
             let meta = db.create_session("cli:legacy_purge").await;
-            db.save_summary_node(&meta.id, 0, &[1, 2], &[], "modern", 3, 1)
-                .await;
+            db.save_summary_node(
+                &meta.id,
+                0,
+                &[1, 2],
+                &[],
+                "modern",
+                3,
+                1,
+                &SummaryManifest::default(),
+            )
+            .await;
             // Mimic a pre-migration DB: raw rows with NULL and stale id_kind.
             let conn = db.conn.lock().await;
             conn.execute(
@@ -3012,10 +3074,28 @@ mod tests {
         let first = db.create_session("cli:dag-first").await;
         let second = db.create_session("cli:dag-second").await;
 
-        db.save_summary_node(&first.id, 0, &[11], &[], "first", 1, 1)
-            .await;
-        db.save_summary_node(&second.id, 0, &[22], &[], "second", 1, 1)
-            .await;
+        db.save_summary_node(
+            &first.id,
+            0,
+            &[11],
+            &[],
+            "first",
+            1,
+            1,
+            &SummaryManifest::default(),
+        )
+        .await;
+        db.save_summary_node(
+            &second.id,
+            0,
+            &[22],
+            &[],
+            "second",
+            1,
+            1,
+            &SummaryManifest::default(),
+        )
+        .await;
 
         let first_nodes = db.load_summary_nodes(&first.id).await;
         let second_nodes = db.load_summary_nodes(&second.id).await;
@@ -3134,10 +3214,28 @@ mod tests {
         let meta = db.create_session("cli:upsert").await;
 
         // Save, then overwrite with updated text.
-        db.save_summary_node(&meta.id, 0, &[1, 2], &[], "Original.", 5, 1)
-            .await;
-        db.save_summary_node(&meta.id, 0, &[1, 2], &[], "Updated.", 6, 1)
-            .await;
+        db.save_summary_node(
+            &meta.id,
+            0,
+            &[1, 2],
+            &[],
+            "Original.",
+            5,
+            1,
+            &SummaryManifest::default(),
+        )
+        .await;
+        db.save_summary_node(
+            &meta.id,
+            0,
+            &[1, 2],
+            &[],
+            "Updated.",
+            6,
+            1,
+            &SummaryManifest::default(),
+        )
+        .await;
 
         let nodes = db.load_summary_nodes(&meta.id).await;
         assert_eq!(nodes.len(), 1);
@@ -3233,6 +3331,7 @@ mod tests {
             "durable summary",
             4,
             2,
+            &SummaryManifest::default(),
             Some(("durable summary", 17)),
         )
         .await
@@ -3259,6 +3358,7 @@ mod tests {
                 "must roll back",
                 3,
                 1,
+                &SummaryManifest::default(),
                 Some(("must roll back", 1)),
             )
             .await
@@ -3291,8 +3391,17 @@ mod tests {
             db.store_tool_result(&session_id, "call_1", "read_file", "raw body")
                 .await
         );
-        db.save_summary_node(&session_id, 901, &[1], &[], "summary", 2, 1)
-            .await;
+        db.save_summary_node(
+            &session_id,
+            901,
+            &[1],
+            &[],
+            "summary",
+            2,
+            1,
+            &SummaryManifest::default(),
+        )
+        .await;
         assert!(db
             .save_working_memory(&session_id, "working", "completed", 1)
             .await

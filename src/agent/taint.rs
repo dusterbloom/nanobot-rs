@@ -40,7 +40,6 @@ impl TaintState {
         let mut sensitive_tools = HashSet::new();
         sensitive_tools.insert("exec".to_string());
         sensitive_tools.insert("write_file".to_string());
-        sensitive_tools.insert("write_file_chunk".to_string());
         sensitive_tools.insert("create_file".to_string());
         sensitive_tools.insert("patch_file".to_string());
 

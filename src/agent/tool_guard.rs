@@ -14,14 +14,8 @@ const READ_TOOLS: &[&str] = &[
     "recall",
     "read_skill",
 ];
-const READ_CACHE_INVALIDATORS: &[&str] = &[
-    "exec",
-    "write_file",
-    "write_file_chunk",
-    "edit_file",
-    "apply_patch",
-    "remember",
-];
+const READ_CACHE_INVALIDATORS: &[&str] =
+    &["exec", "write_file", "edit_file", "apply_patch", "remember"];
 
 /// Web tools need even higher limits — agents frequently search/fetch many
 /// different URLs or refine queries within one turn.

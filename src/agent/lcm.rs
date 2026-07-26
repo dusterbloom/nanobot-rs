@@ -43,6 +43,115 @@ use crate::config::schema::LcmSchemaConfig;
 /// on the next turn, after persistence.
 pub type MessageId = usize;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ManifestItem {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub sources: Vec<MessageId>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SummaryManifest {
+    #[serde(default)]
+    pub open_loops: Vec<ManifestItem>,
+    #[serde(default)]
+    pub failed_approaches: Vec<ManifestItem>,
+    #[serde(default)]
+    pub decisions: Vec<ManifestItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestCategory {
+    OpenLoop,
+    FailedApproach,
+    Decision,
+}
+
+impl SummaryManifest {
+    pub fn merge(parts: &[&SummaryManifest]) -> Self {
+        let mut merged: Vec<(ManifestCategory, ManifestItem)> = Vec::new();
+        for part in parts {
+            for (category, items) in [
+                (ManifestCategory::OpenLoop, &part.open_loops),
+                (ManifestCategory::FailedApproach, &part.failed_approaches),
+                (ManifestCategory::Decision, &part.decisions),
+            ] {
+                for item in items {
+                    let key = normalized_manifest_text(&item.text);
+                    if let Some((existing_category, existing)) = merged
+                        .iter_mut()
+                        .find(|(_, existing)| normalized_manifest_text(&existing.text) == key)
+                    {
+                        *existing_category = category;
+                        existing.sources.extend(item.sources.iter().copied());
+                        existing.sources.sort_unstable();
+                        existing.sources.dedup();
+                        continue;
+                    }
+
+                    let mut item = item.clone();
+                    item.sources.sort_unstable();
+                    item.sources.dedup();
+                    merged.push((category, item));
+                }
+            }
+        }
+
+        let mut manifest = Self::default();
+        for (category, item) in merged {
+            match category {
+                ManifestCategory::OpenLoop => manifest.open_loops.push(item),
+                ManifestCategory::FailedApproach => manifest.failed_approaches.push(item),
+                ManifestCategory::Decision => manifest.decisions.push(item),
+            }
+        }
+        manifest
+    }
+}
+
+fn normalized_manifest_text(text: &str) -> String {
+    text.trim().to_lowercase()
+}
+
+fn extract_summary_manifest(reply: String) -> (String, SummaryManifest) {
+    const JSON_FENCE: &str = "```json";
+    const MANIFEST_KEYS: [&str; 3] = ["\"open_loops\"", "\"failed_approaches\"", "\"decisions\""];
+
+    let Some(fence_start) = reply.rfind(JSON_FENCE) else {
+        return (reply, SummaryManifest::default());
+    };
+    let json_start = fence_start + JSON_FENCE.len();
+    let Some(fence_end_offset) = reply[json_start..].find("```") else {
+        let json = &reply[json_start..];
+        if !MANIFEST_KEYS.iter().all(|key| json.contains(key)) {
+            return (reply, SummaryManifest::default());
+        }
+        debug!("LCM: summary manifest JSON fence was not closed; using empty manifest");
+        return (
+            reply[..fence_start].trim_end().to_string(),
+            SummaryManifest::default(),
+        );
+    };
+    let fence_end = json_start + fence_end_offset;
+    let json = &reply[json_start..fence_end];
+    if !reply[fence_end + 3..].trim().is_empty()
+        || !MANIFEST_KEYS.iter().all(|key| json.contains(key))
+    {
+        return (reply, SummaryManifest::default());
+    }
+
+    let prose = reply[..fence_start].trim_end().to_string();
+    let manifest = match serde_json::from_str::<SummaryManifest>(json) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            debug!(%error, "LCM: failed to parse summary manifest JSON; using empty manifest");
+            SummaryManifest::default()
+        }
+    };
+    (prose, manifest)
+}
+
 /// A summary node in the DAG.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryNode {
@@ -54,6 +163,9 @@ pub struct SummaryNode {
     pub child_summaries: Vec<usize>,
     /// The summary text.
     pub text: String,
+    /// Structured state that survives repeated summary merges.
+    #[serde(default)]
+    pub manifest: SummaryManifest,
     /// Estimated token count of the summary.
     pub tokens: usize,
     /// Escalation level that produced this summary (1, 2, or 3).
@@ -126,6 +238,7 @@ impl SummaryDag {
         source_ids: Vec<MessageId>,
         child_summaries: Vec<usize>,
         text: String,
+        manifest: SummaryManifest,
         level: u8,
     ) -> &SummaryNode {
         let tokens = TokenBudget::estimate_str_tokens(&text);
@@ -136,6 +249,7 @@ impl SummaryDag {
             source_ids,
             child_summaries,
             text,
+            manifest,
             tokens,
             level,
         });
@@ -524,7 +638,9 @@ impl LcmEngine {
         // LLM calls (chunk + merge rounds), each competing for GPU time with
         // the main model. Deterministic truncation is instant and sufficient.
         const MAX_COMPACTION_BLOCK_MESSAGES: usize = 80;
-        let (summary_text, level) = if block_messages.len() > MAX_COMPACTION_BLOCK_MESSAGES {
+        let (summary_text, fresh_manifest, level) = if block_messages.len()
+            > MAX_COMPACTION_BLOCK_MESSAGES
+        {
             if failure_mode == CompactionFailureMode::PreserveContext {
                 debug!(
                     "LCM: soft block too large ({} msgs > {}), preserving active context",
@@ -541,7 +657,7 @@ impl LcmEngine {
             );
             let truncated =
                 deterministic_truncate(&block_messages, self.config.deterministic_target);
-            (truncated, 3)
+            (truncated, SummaryManifest::default(), 3)
         } else {
             // Escalating LLM summarization (Algorithm 3, levels 1-2). There is
             // no deterministic-truncation fallback here: a missing compactor,
@@ -565,6 +681,14 @@ impl LcmEngine {
             }
         };
 
+        let child_manifests: Vec<SummaryManifest> = merged_node_ids
+            .iter()
+            .filter_map(|node_id| self.dag.get(*node_id))
+            .map(|node| node.manifest.clone())
+            .collect();
+        let mut manifest_parts: Vec<&SummaryManifest> = child_manifests.iter().collect();
+        manifest_parts.push(&fresh_manifest);
+        let manifest = SummaryManifest::merge(&manifest_parts);
         let summary_tokens = TokenBudget::estimate_str_tokens(&summary_text);
 
         // Only accept if summary is smaller than original.
@@ -592,6 +716,7 @@ impl LcmEngine {
             source_ids.clone(),
             merged_node_ids.clone(),
             summary_text.clone(),
+            manifest,
             level,
         );
         let node_id = node.id;
@@ -928,7 +1053,16 @@ impl LcmEngine {
     /// always `"db_id"`).
     pub fn rebuild_from_db_nodes(
         raw_messages: &[Value],
-        nodes: &[(usize, Vec<usize>, Vec<usize>, String, usize, u8, String)],
+        nodes: &[(
+            usize,
+            Vec<usize>,
+            Vec<usize>,
+            String,
+            usize,
+            u8,
+            SummaryManifest,
+            String,
+        )],
         config: LcmConfig,
     ) -> Self {
         let mut engine = Self::new(config);
@@ -982,8 +1116,8 @@ impl LcmEngine {
         // as a child.
         let valid_ids: std::collections::HashSet<usize> = nodes
             .iter()
-            .filter(|(_, source_ids, _, _, _, _, _)| node_is_current(source_ids))
-            .map(|(id, _, _, _, _, _, _)| *id)
+            .filter(|(_, source_ids, _, _, _, _, _, _)| node_is_current(source_ids))
+            .map(|(id, _, _, _, _, _, _, _)| *id)
             .collect();
 
         // Nodes merged into a newer summary are retired from the active DAG.
@@ -992,8 +1126,8 @@ impl LcmEngine {
         // dangling IDs cannot suppress unrelated roots.
         let subsumed: std::collections::HashSet<usize> = nodes
             .iter()
-            .filter(|(_, source_ids, _, _, _, _, _)| node_is_current(source_ids))
-            .flat_map(|(_, _, child_ids, _, _, _, _)| child_ids.iter().copied())
+            .filter(|(_, source_ids, _, _, _, _, _, _)| node_is_current(source_ids))
+            .flat_map(|(_, _, child_ids, _, _, _, _, _)| child_ids.iter().copied())
             .filter(|child_id| valid_ids.contains(child_id))
             .collect();
 
@@ -1002,7 +1136,7 @@ impl LcmEngine {
         // that still exists in SQLite.
         engine.dag.next_id = nodes
             .iter()
-            .map(|(id, _, _, _, _, _, _)| *id)
+            .map(|(id, _, _, _, _, _, _, _)| *id)
             .max()
             .map_or(0, |id| id.saturating_add(1));
 
@@ -1013,7 +1147,7 @@ impl LcmEngine {
         // child reference targets a retired (absent) node, so the reconstructed
         // in-memory graph cannot contain a cycle.
         let mut restored_ids = std::collections::HashSet::new();
-        for (id, source_ids, child_ids, text, tokens, level, _id_kind) in nodes {
+        for (id, source_ids, child_ids, text, tokens, level, manifest, _id_kind) in nodes {
             if !node_is_current(source_ids) {
                 debug!(
                     node_id = id,
@@ -1040,6 +1174,7 @@ impl LcmEngine {
                 source_ids: source_ids.clone(),
                 child_summaries: child_ids.clone(),
                 text: text.clone(),
+                manifest: manifest.clone(),
                 tokens: *tokens,
                 level: *level,
             });
@@ -1109,18 +1244,18 @@ pub enum CompactionFailureMode {
 
 /// Escalated summarization: tries increasingly aggressive LLM strategies.
 ///
-/// Returns `Ok(Some((summary_text, escalation_level)))` on success, `Ok(None)`
-/// when there is no compactor to summarize with or every level produced
-/// output that failed the acceptance checks, and `Err` when the LLM call
-/// itself failed or the output scored as babble/degenerate — both fatal to
-/// this compaction attempt, with no retry ladder. There is no deterministic-
+/// Returns `Ok(Some((summary_text, manifest, escalation_level)))` on success,
+/// `Ok(None)` when there is no compactor to summarize with or every level
+/// produced output that failed the acceptance checks, and `Err` when the LLM
+/// call itself failed or the output scored as babble/degenerate — both fatal
+/// to this compaction attempt, with no retry ladder. There is no deterministic
 /// truncation fallback: any failure here leaves the context uncompacted this
 /// round rather than silently degrading it.
 async fn escalated_summary(
     messages: &[Value],
     _target_tokens: usize,
     compactor: Option<&ContextCompactor>,
-) -> Result<Option<(String, u8)>> {
+) -> Result<Option<(String, SummaryManifest, u8)>> {
     let original_tokens = TokenBudget::estimate_tokens(messages);
 
     let Some(compactor) = compactor else {
@@ -1135,29 +1270,10 @@ async fn escalated_summary(
         .summarize_for_lcm(messages, "preserve_details")
         .await
     {
-        Ok(summary) => {
-            if let Some(score) = anti_drift::score_summary_babble(&summary) {
-                warn!(
-                    score,
-                    "LCM escalation: Level 1 summary scored as babble, rejecting"
-                );
-                anyhow::bail!("LCM summary rejected as babble (score={:.2})", score);
-            }
-            let tokens = TokenBudget::estimate_str_tokens(&summary);
-            if tokens < original_tokens && !contains_refusal_pattern(&summary) {
-                debug!(
-                    "LCM escalation: Level 1 succeeded ({} -> {} tokens)",
-                    original_tokens, tokens
-                );
-                return Ok(Some((summary, 1)));
-            }
-            if contains_refusal_pattern(&summary) {
-                debug!("LCM escalation: Level 1 contained refusal pattern, escalating");
-            } else {
-                debug!(
-                    "LCM escalation: Level 1 failed (output {} >= input {})",
-                    tokens, original_tokens
-                );
+        Ok(reply) => {
+            let (summary, manifest) = extract_summary_manifest(reply);
+            if summary_is_acceptable(&summary, original_tokens, 1)? {
+                return Ok(Some((summary, manifest, 1)));
             }
         }
         Err(error) => {
@@ -1168,33 +1284,48 @@ async fn escalated_summary(
     // Level 2: Bullet points, more aggressive compression. This is the last
     // level — an error here has nowhere left to escalate to, so it
     // propagates as the caller-visible failure for this compaction attempt.
-    let summary = compactor
+    let reply = compactor
         .summarize_for_lcm(messages, "bullet_points")
         .await?;
-    if let Some(score) = anti_drift::score_summary_babble(&summary) {
+    let (summary, manifest) = extract_summary_manifest(reply);
+    if summary_is_acceptable(&summary, original_tokens, 2)? {
+        return Ok(Some((summary, manifest, 2)));
+    }
+    Ok(None)
+}
+
+fn summary_is_acceptable(summary: &str, original_tokens: usize, level: u8) -> Result<bool> {
+    if summary.trim().is_empty() {
+        debug!(
+            "LCM escalation: Level {} had no prose after manifest extraction",
+            level
+        );
+        return Ok(false);
+    }
+    if let Some(score) = anti_drift::score_summary_babble(summary) {
         warn!(
             score,
-            "LCM escalation: Level 2 summary scored as babble, rejecting"
+            "LCM escalation: Level {} summary scored as babble, rejecting", level
         );
         anyhow::bail!("LCM summary rejected as babble (score={:.2})", score);
     }
-    let tokens = TokenBudget::estimate_str_tokens(&summary);
-    if tokens < original_tokens && !contains_refusal_pattern(&summary) {
-        debug!(
-            "LCM escalation: Level 2 succeeded ({} -> {} tokens)",
-            original_tokens, tokens
-        );
-        return Ok(Some((summary, 2)));
+    if contains_refusal_pattern(summary) {
+        debug!("LCM escalation: Level {} contained refusal pattern", level);
+        return Ok(false);
     }
-    if contains_refusal_pattern(&summary) {
-        debug!("LCM escalation: Level 2 contained refusal pattern, leaving context uncompacted");
-    } else {
+    let tokens = TokenBudget::estimate_str_tokens(summary);
+    if tokens >= original_tokens {
         debug!(
-            "LCM escalation: Level 2 failed (output {} >= input {}), leaving context uncompacted",
-            tokens, original_tokens
+            "LCM escalation: Level {} failed (output {} >= input {})",
+            level, tokens, original_tokens
         );
+        return Ok(false);
     }
-    Ok(None)
+    debug!(
+        "LCM escalation: Level {} succeeded ({} -> {} tokens)",
+        level, original_tokens, tokens
+    );
+    Ok(true)
 }
 
 /// Deterministic truncation: extract key facts without any LLM call.
@@ -1705,12 +1836,82 @@ mod tests {
     }
 
     #[test]
+    fn manifest_merge_unions_open_loops_and_deduplicates_sources() {
+        let first = SummaryManifest {
+            open_loops: vec![
+                ManifestItem {
+                    text: "Ship the release".to_string(),
+                    sources: vec![3, 1],
+                },
+                ManifestItem {
+                    text: "Write the changelog".to_string(),
+                    sources: vec![4],
+                },
+            ],
+            ..SummaryManifest::default()
+        };
+        let second = SummaryManifest {
+            open_loops: vec![ManifestItem {
+                text: "  ship THE release  ".to_string(),
+                sources: vec![2, 3],
+            }],
+            ..SummaryManifest::default()
+        };
+
+        let merged = SummaryManifest::merge(&[&first, &second]);
+
+        assert_eq!(
+            merged.open_loops,
+            vec![
+                ManifestItem {
+                    text: "Ship the release".to_string(),
+                    sources: vec![1, 2, 3],
+                },
+                ManifestItem {
+                    text: "Write the changelog".to_string(),
+                    sources: vec![4],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_merge_moves_later_category_to_decisions() {
+        let earlier = SummaryManifest {
+            open_loops: vec![ManifestItem {
+                text: "Use SQLite for persistence".to_string(),
+                sources: vec![7],
+            }],
+            ..SummaryManifest::default()
+        };
+        let later = SummaryManifest {
+            decisions: vec![ManifestItem {
+                text: " use sqlite FOR persistence ".to_string(),
+                sources: vec![9],
+            }],
+            ..SummaryManifest::default()
+        };
+
+        let merged = SummaryManifest::merge(&[&earlier, &later]);
+
+        assert!(merged.open_loops.is_empty());
+        assert_eq!(
+            merged.decisions,
+            vec![ManifestItem {
+                text: "Use SQLite for persistence".to_string(),
+                sources: vec![7, 9],
+            }]
+        );
+    }
+
+    #[test]
     fn test_summary_dag_create_and_retrieve() {
         let mut dag = SummaryDag::new();
         dag.create_node(
             vec![0, 1, 2],
             vec![],
             "Summary of first 3 messages.".to_string(),
+            SummaryManifest::default(),
             1,
         );
         assert_eq!(dag.len(), 1);
@@ -1722,8 +1923,20 @@ mod tests {
     #[test]
     fn test_summary_dag_all_source_ids() {
         let mut dag = SummaryDag::new();
-        dag.create_node(vec![0, 1, 2], vec![], "First batch.".to_string(), 1);
-        dag.create_node(vec![3, 4, 5], vec![], "Second batch.".to_string(), 1);
+        dag.create_node(
+            vec![0, 1, 2],
+            vec![],
+            "First batch.".to_string(),
+            SummaryManifest::default(),
+            1,
+        );
+        dag.create_node(
+            vec![3, 4, 5],
+            vec![],
+            "Second batch.".to_string(),
+            SummaryManifest::default(),
+            1,
+        );
         let ids = dag.all_source_ids(0);
         assert_eq!(ids, vec![0, 1, 2]);
     }
@@ -3321,6 +3534,7 @@ mod tests {
             "Summary of assistant messages.".to_string(),
             10usize,
             1u8,
+            SummaryManifest::default(),
             "db_id".to_string(),
         )];
 
@@ -3395,6 +3609,7 @@ mod tests {
             vec![2, 3, 4, 5],
             vec![],
             "Discussion about Rust ownership, borrowing, and lifetimes.".to_string(),
+            SummaryManifest::default(),
             1,
         );
         let node_id = node.id;
@@ -3492,6 +3707,7 @@ mod tests {
             source_ids.clone(),
             vec![],
             "Summary of first 10 messages.".to_string(),
+            SummaryManifest::default(),
             1,
         );
         let node_id = node.id;
@@ -3549,6 +3765,7 @@ mod tests {
             vec![2, 3],
             vec![],
             "Discussion about Rust ownership.".to_string(),
+            SummaryManifest::default(),
             1,
         );
         let node_id = node.id;
@@ -3604,6 +3821,7 @@ mod tests {
             "Greeting exchange.".to_string(), // text
             10usize,                          // tokens
             1u8,                              // level
+            SummaryManifest::default(),       // manifest
             "db_id".to_string(),              // id_kind
         )];
 
@@ -3662,6 +3880,7 @@ mod tests {
                 "old summary".to_string(),
                 4,
                 1,
+                SummaryManifest::default(),
                 "db_id".to_string(),
             ),
             (
@@ -3671,6 +3890,7 @@ mod tests {
                 "new summary".to_string(),
                 4,
                 1,
+                SummaryManifest::default(),
                 "db_id".to_string(),
             ),
         ];
@@ -3723,8 +3943,13 @@ mod tests {
             let _ = live.ingest(m.clone());
         }
         // ...and compacted ids 6,7 into a summary persisted with those ids.
-        live.dag
-            .create_node(vec![6, 7], vec![], "Summary of 6-7.".to_string(), 1);
+        live.dag.create_node(
+            vec![6, 7],
+            vec![],
+            "Summary of 6-7.".to_string(),
+            SummaryManifest::default(),
+            1,
+        );
         // Even before restart, the live engine resolves by db id, not window
         // position (positionally, "6" would have been out of range or wrong).
         let live_expanded = live.expand(&[6, 7]);
@@ -3740,6 +3965,7 @@ mod tests {
             "Summary of 6-7.".to_string(),
             5usize,
             1u8,
+            SummaryManifest::default(),
             "db_id".to_string(),
         )];
         let engine = LcmEngine::rebuild_from_db_nodes(&full, &nodes, LcmConfig::default());
@@ -3771,7 +3997,16 @@ mod tests {
     fn rebuild_skips_subsumed_summary_nodes() {
         // Node 0 = an old summary (subsumed). Node 1 = the merged summary whose
         // child_ids = [0]. No raw messages needed for this DAG-only check.
-        let nodes: Vec<(usize, Vec<usize>, Vec<usize>, String, usize, u8, String)> = vec![
+        let nodes: Vec<(
+            usize,
+            Vec<usize>,
+            Vec<usize>,
+            String,
+            usize,
+            u8,
+            SummaryManifest,
+            String,
+        )> = vec![
             (
                 0,
                 vec![1, 2, 3],
@@ -3779,6 +4014,7 @@ mod tests {
                 "old summary".to_string(),
                 10,
                 1,
+                SummaryManifest::default(),
                 "db_id".to_string(),
             ),
             (
@@ -3788,6 +4024,7 @@ mod tests {
                 "merged summary".to_string(),
                 15,
                 1,
+                SummaryManifest::default(),
                 "db_id".to_string(),
             ),
         ];
@@ -3825,6 +4062,7 @@ mod tests {
                 "retired child".to_string(),
                 4usize,
                 1u8,
+                SummaryManifest::default(),
                 "db_id".to_string(),
             ),
             (
@@ -3834,6 +4072,7 @@ mod tests {
                 "sparse merged root".to_string(),
                 6usize,
                 1u8,
+                SummaryManifest::default(),
                 "db_id".to_string(),
             ),
         ];
@@ -3861,9 +4100,13 @@ mod tests {
         assert_eq!(expanded[0].1["content"], "ORIGINAL_10");
         assert_eq!(expanded[2].1["content"], "ORIGINAL_12");
 
-        let next = engine
-            .dag
-            .create_node(vec![13, 14], vec![17], "new live root".to_string(), 1);
+        let next = engine.dag.create_node(
+            vec![13, 14],
+            vec![17],
+            "new live root".to_string(),
+            SummaryManifest::default(),
+            1,
+        );
         assert_eq!(next.id, 18, "new nodes must not reuse persisted sparse IDs");
         assert_eq!(engine.dag.newest().map(|node| node.id), Some(18));
     }
@@ -3879,6 +4122,7 @@ mod tests {
                 "cycle a".to_string(),
                 2usize,
                 1u8,
+                SummaryManifest::default(),
                 "db_id".to_string(),
             ),
             (
@@ -3888,6 +4132,7 @@ mod tests {
                 "cycle b".to_string(),
                 2usize,
                 1u8,
+                SummaryManifest::default(),
                 "db_id".to_string(),
             ),
         ];
@@ -4012,6 +4257,7 @@ mod tests {
             "a summary".to_string(),
             10usize,
             1u8,
+            SummaryManifest::default(),
             "db_id".to_string(),
         )];
 

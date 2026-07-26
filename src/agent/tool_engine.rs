@@ -280,10 +280,7 @@ pub(crate) fn delegation_reuses_main_local_model(
 
 /// Side-effect tools that arm (and are rejected by) the response boundary.
 pub(crate) fn is_side_effect_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "exec" | "write_file" | "write_file_chunk" | "edit_file" | "apply_patch"
-    )
+    matches!(name, "exec" | "write_file" | "edit_file" | "apply_patch")
 }
 
 /// Tools whose result must be consumed and reported before another call of
@@ -759,6 +756,22 @@ struct SingleToolResult {
     duration_ms: u64,
 }
 
+fn completed_reportable_tool(result: &SingleToolResult) -> Option<&str> {
+    if !result.result.ok || !requires_result_report(&result.tool_name) {
+        return None;
+    }
+    if result.tool_name == "write_file"
+        && result
+            .arguments
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state.trim().eq_ignore_ascii_case("more"))
+    {
+        return None;
+    }
+    Some(&result.tool_name)
+}
+
 /// Execute one tool call: emit CallStart, run heartbeat, call the tool,
 /// stop heartbeat, return `SingleToolResult`.
 ///
@@ -848,22 +861,27 @@ async fn execute_single_tool(
         };
 
         let execution = async {
-            if let Some(ref tx) = tool_event_tx {
-                use crate::agent::tools::base::ToolExecutionContext;
-                let exec_ctx = ToolExecutionContext {
-                    event_tx: tx.clone(),
-                    cancellation_token: cancellation_token
-                        .as_ref()
-                        .map(|t| t.child_token())
-                        .unwrap_or_else(tokio_util::sync::CancellationToken::new),
-                    tool_call_id: tc.id.clone(),
-                };
-                tools
-                    .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
-                    .await
-            } else {
-                tools.execute(&tc.name, tc.arguments.clone()).await
-            }
+            use crate::agent::tools::base::ToolExecutionContext;
+
+            // Tool-call identity is part of the execution contract, not a UI
+            // concern. A closed channel keeps headless calls event-free while
+            // still carrying the provider ID needed for idempotent mutations.
+            let event_tx = tool_event_tx.as_ref().cloned().unwrap_or_else(|| {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                drop(rx);
+                tx
+            });
+            let exec_ctx = ToolExecutionContext {
+                event_tx,
+                cancellation_token: cancellation_token
+                    .as_ref()
+                    .map(|t| t.child_token())
+                    .unwrap_or_else(tokio_util::sync::CancellationToken::new),
+                tool_call_id: tc.id.clone(),
+            };
+            tools
+                .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
+                .await
         };
         let result = if let Some(token) = cancellation_token {
             tokio::select! {
@@ -1305,10 +1323,11 @@ pub(crate) async fn execute_tools_inline(
     // Failed side-effect calls (timeouts, errors) don't arm either: there is no
     // result to report, so retrying is the model's legitimate next move — the
     // duplicate-call guard still bounds runaway retries.
+    // A staged write has not changed its target and must be allowed to receive
+    // the next piece. Only the final/one-call write arms the report boundary.
     let executed: Vec<&str> = ordered_results
         .iter()
-        .filter(|result| result.result.ok)
-        .map(|result| result.tool_name.as_str())
+        .filter_map(completed_reportable_tool)
         .collect();
 
     // No tool actually ran this round — every call was boundary-rejected. The
@@ -1836,6 +1855,67 @@ mod tests {
             Some("I found the requested preference."),
             &["recall"]
         ));
+    }
+
+    #[test]
+    fn staged_write_does_not_arm_boundary_until_publish() {
+        let result = |state: Option<&str>| {
+            let mut arguments = HashMap::new();
+            if let Some(state) = state {
+                arguments.insert("state".to_string(), json!(state));
+            }
+            SingleToolResult {
+                tool_name: "write_file".to_string(),
+                tool_id: "call_write".to_string(),
+                arguments,
+                result: crate::agent::tools::base::ToolExecutionResult::success("ok".to_string()),
+                duration_ms: 0,
+            }
+        };
+
+        assert_eq!(completed_reportable_tool(&result(Some("more"))), None);
+        assert_eq!(completed_reportable_tool(&result(Some(" MORE "))), None);
+        assert_eq!(completed_reportable_tool(&result(Some("MoRe"))), None);
+        assert_eq!(
+            completed_reportable_tool(&result(Some("complete"))),
+            Some("write_file")
+        );
+        assert_eq!(completed_reportable_tool(&result(None)), Some("write_file"));
+    }
+
+    #[tokio::test]
+    async fn inline_write_redelivery_is_idempotent_without_event_subscriber() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.txt");
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(crate::agent::tools::WriteFileTool::default()));
+
+        let staged = ToolCallRequest {
+            id: "call_piece_1".to_string(),
+            name: "write_file".to_string(),
+            arguments: HashMap::from([
+                ("path".to_string(), json!(path)),
+                ("content".to_string(), json!("once-")),
+                ("state".to_string(), json!("more")),
+            ]),
+        };
+        for _ in 0..2 {
+            let result = execute_single_tool(&staged, &registry, &None, &None, 60, None).await;
+            assert!(result.result.ok, "{:?}", result.result.error);
+        }
+
+        let final_piece = ToolCallRequest {
+            id: "call_piece_2".to_string(),
+            name: "write_file".to_string(),
+            arguments: HashMap::from([
+                ("path".to_string(), json!(path)),
+                ("content".to_string(), json!("done")),
+                ("state".to_string(), json!("complete")),
+            ]),
+        };
+        let result = execute_single_tool(&final_piece, &registry, &None, &None, 60, None).await;
+        assert!(result.result.ok, "{:?}", result.result.error);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "once-done");
     }
 
     #[test]

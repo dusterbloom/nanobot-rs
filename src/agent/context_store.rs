@@ -5,9 +5,13 @@
 //! via micro-tools: `ctx_slice`, `ctx_grep`, `ctx_length`.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::providers::base::LLMProvider;
 
@@ -22,28 +26,50 @@ pub const MICRO_TOOLS: &[&str] = &[
     "set_phase",
 ];
 
+/// Hex chars of the content hash used as both the blob filename and the handle
+/// suffix. 64 bits: collision-free in practice, and it keeps handle -> path
+/// derivable so no on-disk index is needed.
+const HANDLE_HASH_LEN: usize = 16;
+
 /// Stores full tool outputs as named variables for micro-tool inspection.
+///
+/// Content is spilled to `dir` as `<hash>` files so handles survive a restart;
+/// `variables` is a read cache populated on store and on read-through.
 pub struct ContextStore {
     variables: HashMap<String, String>,
-    counter: usize,
+    dir: PathBuf,
     memory: HashMap<String, String>,
 }
 
 impl ContextStore {
     pub fn new() -> Self {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        Self::new_at(home.join(".nanobot").join("blobs"))
+    }
+
+    pub fn new_at(dir: PathBuf) -> Self {
         Self {
             variables: HashMap::new(),
-            counter: 0,
+            dir,
             memory: HashMap::new(),
         }
     }
 
+    /// Path a handle's content is spilled to. `None` for anything that is not
+    /// one of our content-addressed handles.
+    fn blob_path(&self, name: &str) -> Option<PathBuf> {
+        let hash = name.strip_prefix("output_")?;
+        let is_hash = hash.len() == HANDLE_HASH_LEN && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        is_hash.then(|| self.dir.join(hash))
+    }
+
     /// Store data as a named variable. Returns `(name, metadata)`.
     ///
-    /// Metadata is a compact string: `"Variable 'output_0': 45230 chars. Preview: <first 150>..."`
+    /// Metadata is compact: `"Variable 'output_a1b2c3d4e5f60718': 45230 chars. Preview: ..."`
     pub fn store(&mut self, data: String) -> (String, String) {
-        let name = format!("output_{}", self.counter);
-        self.counter += 1;
+        let digest = format!("{:x}", Sha256::digest(data.as_bytes()));
+        let hash = &digest[..HANDLE_HASH_LEN];
+        let name = format!("output_{hash}");
 
         let preview: String = data.chars().take(150).collect();
         let ellipsis = if data.chars().count() > 150 {
@@ -59,18 +85,53 @@ impl ContextStore {
             ellipsis
         );
 
+        // Spill to disk so the handle still resolves after a restart. A write
+        // failure only costs durability: the value stays live in `variables`.
+        let path = self.dir.join(hash);
+        if !path.exists() {
+            if let Err(error) =
+                fs::create_dir_all(&self.dir).and_then(|()| fs::write(&path, data.as_bytes()))
+            {
+                warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to persist ContextStore blob"
+                );
+            }
+        }
+
         self.variables.insert(name.clone(), data);
         (name, metadata)
     }
 
-    /// Get the full content of a variable.
-    pub fn get(&self, name: &str) -> Option<&str> {
-        self.variables.get(name).map(|s| s.as_str())
+    /// Get the full content of a variable, reading through to the blob dir for
+    /// handles stored by an earlier process.
+    pub fn get(&mut self, name: &str) -> Option<&str> {
+        if !self.variables.contains_key(name) {
+            let path = self.blob_path(name)?;
+            match fs::read_to_string(&path) {
+                Ok(data) => {
+                    self.variables.insert(name.to_string(), data);
+                }
+                Err(error) => {
+                    // Missing blob is the ordinary "unknown handle" case.
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        warn!(
+                            path = %path.display(),
+                            %error,
+                            "failed to read ContextStore blob"
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+        self.variables.get(name).map(|data| data.as_str())
     }
 
     /// Char-based substring, capped at 2000 chars.
-    pub fn slice(&self, name: &str, start: usize, end: usize) -> Option<String> {
-        let data = self.variables.get(name)?;
+    pub fn slice(&mut self, name: &str, start: usize, end: usize) -> Option<String> {
+        let data = self.get(name)?;
         let char_count = data.chars().count();
         let clamped_start = start.min(char_count);
         let clamped_end = end.min(char_count).max(clamped_start);
@@ -85,8 +146,8 @@ impl ContextStore {
     }
 
     /// Matching lines with line numbers, max 20 lines / 2000 chars.
-    pub fn grep(&self, name: &str, pattern: &str) -> Option<String> {
-        let data = self.variables.get(name)?;
+    pub fn grep(&mut self, name: &str, pattern: &str) -> Option<String> {
+        let data = self.get(name)?;
         let pattern_lower = pattern.to_lowercase();
         let mut matches = Vec::new();
         let mut total_chars = 0;
@@ -110,8 +171,8 @@ impl ContextStore {
     }
 
     /// Char count of a variable.
-    pub fn length(&self, name: &str) -> Option<usize> {
-        self.variables.get(name).map(|s| s.chars().count())
+    pub fn length(&mut self, name: &str) -> Option<usize> {
+        self.get(name).map(|data| data.chars().count())
     }
 
     /// Store a key-value pair in working memory.
@@ -178,7 +239,7 @@ pub fn micro_tool_definitions() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "variable": {"type": "string", "description": "Variable name (e.g. 'output_0')"},
+                        "variable": {"type": "string", "description": "Variable name (e.g. 'output_a1b2c3d4e5f60718')"},
                         "start": {"type": "integer", "description": "Start character index (0-based)"},
                         "end": {"type": "integer", "description": "End character index (exclusive)"}
                     },
@@ -194,7 +255,7 @@ pub fn micro_tool_definitions() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "variable": {"type": "string", "description": "Variable name (e.g. 'output_0')"},
+                        "variable": {"type": "string", "description": "Variable name (e.g. 'output_a1b2c3d4e5f60718')"},
                         "pattern": {"type": "string", "description": "Text pattern to search for (case-insensitive)"}
                     },
                     "required": ["variable", "pattern"]
@@ -209,7 +270,7 @@ pub fn micro_tool_definitions() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "variable": {"type": "string", "description": "Variable name (e.g. 'output_0')"}
+                        "variable": {"type": "string", "description": "Variable name (e.g. 'output_a1b2c3d4e5f60718')"}
                     },
                     "required": ["variable"]
                 }
@@ -223,7 +284,7 @@ pub fn micro_tool_definitions() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "variable": {"type": "string", "description": "Variable name (e.g. 'output_0')"},
+                        "variable": {"type": "string", "description": "Variable name (e.g. 'output_a1b2c3d4e5f60718')"},
                         "instruction": {"type": "string", "description": "What to extract or summarize (e.g. 'List all function names')"}
                     },
                     "required": ["variable", "instruction"]
@@ -348,7 +409,7 @@ fn sync_micro_tool_definitions() -> Vec<Value> {
 /// Creates a sub-ContextStore with the variable's content, gives the model
 /// only sync micro-tools (slice/grep/length), and returns its text summary.
 pub async fn execute_ctx_summarize(
-    store: &ContextStore,
+    store: &mut ContextStore,
     variable: &str,
     instruction: &str,
     provider: &Arc<dyn LLMProvider>,
@@ -473,25 +534,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_stored_output_survives_restart() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let content = "durable tool output".to_string();
+        let handle = {
+            let mut store = ContextStore::new_at(tempdir.path().to_path_buf());
+            store.store(content.clone()).0
+        };
+
+        let mut store = ContextStore::new_at(tempdir.path().to_path_buf());
+        assert_eq!(store.get(&handle), Some(content.as_str()));
+    }
+
+    #[test]
     fn test_store_auto_naming() {
         let mut store = ContextStore::new();
         let (name0, _) = store.store("hello".to_string());
         let (name1, _) = store.store("world".to_string());
-        assert_eq!(name0, "output_0");
-        assert_eq!(name1, "output_1");
+        assert_eq!(name0, "output_2cf24dba5fb0a30e");
+        assert_eq!(name1, "output_486ea46224d1bb4f");
     }
 
     #[test]
     fn test_store_metadata_compact() {
         let mut store = ContextStore::new();
         let data = "x".repeat(45230);
-        let (_, metadata) = store.store(data);
+        let (name, metadata) = store.store(data);
         assert!(
             metadata.len() < 250,
             "Metadata should be compact, got {} chars",
             metadata.len()
         );
-        assert!(metadata.contains("output_0"));
+        assert!(metadata.contains(&name));
         assert!(metadata.contains("45230 chars"));
         assert!(metadata.contains("Preview:"));
     }
@@ -499,47 +573,47 @@ mod tests {
     #[test]
     fn test_get_existing() {
         let mut store = ContextStore::new();
-        store.store("hello world".to_string());
-        assert_eq!(store.get("output_0"), Some("hello world"));
+        let (name, _) = store.store("hello world".to_string());
+        assert_eq!(store.get(&name), Some("hello world"));
     }
 
     #[test]
     fn test_get_missing() {
-        let store = ContextStore::new();
+        let mut store = ContextStore::new();
         assert_eq!(store.get("nonexistent"), None);
     }
 
     #[test]
     fn test_slice_basic() {
         let mut store = ContextStore::new();
-        store.store("hello world".to_string());
-        assert_eq!(store.slice("output_0", 0, 5), Some("hello".to_string()));
-        assert_eq!(store.slice("output_0", 6, 11), Some("world".to_string()));
+        let (name, _) = store.store("hello world".to_string());
+        assert_eq!(store.slice(&name, 0, 5), Some("hello".to_string()));
+        assert_eq!(store.slice(&name, 6, 11), Some("world".to_string()));
     }
 
     #[test]
     fn test_slice_clamping() {
         let mut store = ContextStore::new();
-        store.store("hello".to_string());
+        let (name, _) = store.store("hello".to_string());
         // Out-of-bounds end should be clamped
-        assert_eq!(store.slice("output_0", 0, 100), Some("hello".to_string()));
+        assert_eq!(store.slice(&name, 0, 100), Some("hello".to_string()));
         // Start beyond end
-        assert_eq!(store.slice("output_0", 100, 200), Some("".to_string()));
+        assert_eq!(store.slice(&name, 100, 200), Some("".to_string()));
     }
 
     #[test]
     fn test_slice_max_2000() {
         let mut store = ContextStore::new();
-        store.store("x".repeat(5000));
-        let result = store.slice("output_0", 0, 5000).unwrap();
+        let (name, _) = store.store("x".repeat(5000));
+        let result = store.slice(&name, 0, 5000).unwrap();
         assert_eq!(result.len(), 2000, "Slice should be capped at 2000 chars");
     }
 
     #[test]
     fn test_grep_matching() {
         let mut store = ContextStore::new();
-        store.store("line one\nline two\nline three\nfoo bar".to_string());
-        let result = store.grep("output_0", "line").unwrap();
+        let (name, _) = store.store("line one\nline two\nline three\nfoo bar".to_string());
+        let result = store.grep(&name, "line").unwrap();
         assert!(result.contains("1:line one"));
         assert!(result.contains("2:line two"));
         assert!(result.contains("3:line three"));
@@ -549,9 +623,9 @@ mod tests {
     #[test]
     fn test_grep_no_match() {
         let mut store = ContextStore::new();
-        store.store("hello world".to_string());
+        let (name, _) = store.store("hello world".to_string());
         assert_eq!(
-            store.grep("output_0", "zzz"),
+            store.grep(&name, "zzz"),
             Some("No matching lines.".to_string())
         );
     }
@@ -563,8 +637,8 @@ mod tests {
             .map(|i| format!("match line {}", i))
             .collect::<Vec<_>>()
             .join("\n");
-        store.store(data);
-        let result = store.grep("output_0", "match").unwrap();
+        let (name, _) = store.store(data);
+        let result = store.grep(&name, "match").unwrap();
         let line_count = result.lines().count();
         assert!(
             line_count <= 20,
@@ -578,19 +652,19 @@ mod tests {
         let mut store = ContextStore::new();
         // Unicode: each emoji is 1 char but multiple bytes
         // "héllo 🌍" = h é l l o <space> 🌍 = 7 chars
-        store.store("héllo 🌍".to_string());
-        let len = store.length("output_0").unwrap();
+        let (name, _) = store.store("héllo 🌍".to_string());
+        let len = store.length(&name).unwrap();
         assert_eq!(len, 7, "Length should count chars, not bytes");
     }
 
     #[test]
     fn test_execute_micro_tool_dispatch() {
         let mut store = ContextStore::new();
-        store.store("hello world".to_string());
+        let (name, _) = store.store("hello world".to_string());
 
         // ctx_length
         let mut args = HashMap::new();
-        args.insert("variable".to_string(), json!("output_0"));
+        args.insert("variable".to_string(), json!(name));
         let result = execute_micro_tool(&mut store, "ctx_length", &args);
         assert_eq!(result, "11");
 
@@ -735,26 +809,26 @@ mod tests {
     #[test]
     fn test_variable_metadata_returns_sorted_entries() {
         let mut store = ContextStore::new();
-        store.store("short".to_string());
-        store.store("x".repeat(200));
+        let (short_name, _) = store.store("short".to_string());
+        let (long_name, _) = store.store("x".repeat(200));
 
         let meta = store.variable_metadata();
         assert_eq!(meta.len(), 2);
+        assert!(meta.windows(2).all(|entries| entries[0].0 <= entries[1].0));
 
-        // Sorted by name: output_0 before output_1
-        assert_eq!(meta[0].0, "output_0");
-        assert_eq!(meta[0].1, 5); // "short" = 5 chars
-        assert_eq!(meta[0].2, "short"); // preview, no ellipsis
+        let short = meta.iter().find(|entry| entry.0 == short_name).unwrap();
+        assert_eq!(short.1, 5); // "short" = 5 chars
+        assert_eq!(short.2, "short"); // preview, no ellipsis
 
-        assert_eq!(meta[1].0, "output_1");
-        assert_eq!(meta[1].1, 200);
+        let long = meta.iter().find(|entry| entry.0 == long_name).unwrap();
+        assert_eq!(long.1, 200);
         // Preview is first 100 chars + "..."
         assert!(
-            meta[1].2.ends_with("..."),
+            long.2.ends_with("..."),
             "Long preview should have ellipsis: {}",
-            meta[1].2
+            long.2
         );
-        assert_eq!(meta[1].2.len(), 103); // 100 x's + "..."
+        assert_eq!(long.2.len(), 103); // 100 x's + "..."
     }
 
     #[test]
