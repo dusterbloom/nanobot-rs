@@ -435,14 +435,13 @@ mod lcm_checkpoint_tests {
                 .rev()
                 .find_map(|m| m.get("content").and_then(|c| c.as_str()))
                 .unwrap_or("");
-            let source = request
-                .split("[SOURCE_BEGIN]\n")
-                .nth(1)
-                .and_then(|s| s.split("\n[SOURCE_END]").next())
-                .unwrap_or(request);
-            let heads: Vec<String> = source
+            let heads: Vec<String> = request
                 .lines()
-                .filter(|line| !line.trim().is_empty())
+                .filter(|line| {
+                    ["user: ", "assistant: ", "tool: "]
+                        .iter()
+                        .any(|role| line.starts_with(role))
+                })
                 .map(|line| {
                     line.split_whitespace()
                         .take(3)
