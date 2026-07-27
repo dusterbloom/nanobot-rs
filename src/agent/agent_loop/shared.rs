@@ -18,6 +18,7 @@ use crate::agent::agent_loop::heuristics::{
 };
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
+use crate::agent::lease::{Lease, DEFAULT_MAX_LEASES_PER_TURN, DEFAULT_TOOLS_PER_LEASE};
 use crate::agent::policy;
 use crate::agent::prefix_guard;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
@@ -321,6 +322,14 @@ pub(crate) struct FlowControl {
     /// one-shot (can't re-reject without an intervening successful round) and cached
     /// duplicate receipts force a text response immediately.
     pub(crate) round_executed_no_tools: bool,
+    /// Per-turn tool lease. Caps the total tool calls per turn at
+    /// `lease_size * (1 + max_renewals)`; on exhaustion `step_pre_call`
+    /// strips tool definitions from the request so the model cannot
+    /// emit more tool calls and must produce a final text answer. This
+    /// is the structural prevention for the 2026-07-27 13-call loop
+    /// (session 20260727_161730_6e61a0). See
+    /// `docs/superpowers/specs/2026-07-27-tool-leases-design.md`.
+    pub(crate) lease: Lease,
     /// When the LLM call started — set in step_call_llm, read in step_process_response.
     pub(crate) llm_call_start: Option<std::time::Instant>,
     /// Time to first token (ms) for the current LLM call: elapsed from
@@ -1183,6 +1192,20 @@ impl AgentLoopShared {
 
         // Select and filter tool definitions for this turn.
         let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx);
+        // Tool lease: when the per-turn budget is exhausted, strip tool
+        // definitions entirely so the model cannot emit more tool calls
+        // and must produce a final text answer. This is the structural
+        // prevention for the 2026-07-27 13-call loop (session
+        // 20260727_161730_6e61a0). See
+        // `docs/superpowers/specs/2026-07-27-tool-leases-design.md`.
+        if ctx.flow.lease.is_exhausted() && !tool_defs.is_empty() {
+            tracing::info!(
+                session = %ctx.session_key,
+                lease_size = ?ctx.flow.lease.iterations_used(),
+                "tool_lease_exhausted_stripping_tool_defs"
+            );
+            tool_defs.clear();
+        }
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
         } else {
@@ -2568,6 +2591,36 @@ impl AgentLoopShared {
                     }
                 }
                 tc
+            })
+            .collect();
+
+        // Record each tool call against the per-turn lease. The lease
+        // caps total calls per turn at `lease_size * (1 + max_renewals)`
+        // and the consecutive-same-coarse-family cap blocks loops like
+        // 4×`exec grep` in a row. Blocked calls are dropped here; the
+        // model sees the empty result and either switches family or
+        // emits a final answer.
+        let lease_cap = ctx.flow.lease.coarse_family_cap();
+        let routed_tool_calls: Vec<_> = routed_tool_calls
+            .into_iter()
+            .filter_map(|tc| {
+                let result = ctx
+                    .flow
+                    .lease
+                    .record_tool_call_in_family(&tc.name, &tc.arguments);
+                if result.allowed {
+                    Some(tc)
+                } else {
+                    let reason = result.reason.unwrap_or("lease_blocked");
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        tool = %tc.name,
+                        reason,
+                        cap = lease_cap,
+                        "tool_lease_blocked_call"
+                    );
+                    None
+                }
             })
             .collect();
 

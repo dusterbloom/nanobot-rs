@@ -610,6 +610,10 @@ impl AgentLoopShared {
                 content_was_streamed: false,
                 consecutive_all_blocked: 0,
                 round_executed_no_tools: false,
+                lease: crate::agent::lease::Lease::new(
+                    crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,
+                    crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN,
+                ),
                 llm_call_start: None,
                 ttft_ms: None,
                 provider_prompt_estimate: None,

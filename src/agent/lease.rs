@@ -272,6 +272,13 @@ impl Lease {
         self.renewals_used
     }
 
+    /// Coarse-family cap (consecutive same-family calls allowed within
+    /// a lease). Exposed for logging/receipts — modification is via
+    /// `new()` defaults only for now.
+    pub fn coarse_family_cap(&self) -> u32 {
+        self.coarse_family_cap
+    }
+
     /// Try to renew the lease with a model-emitted checkpoint. The
     /// checkpoint must contain `findings:`, `next:`, and `will:` (any
     /// case). Returns `RenewalResult::accepted()` and resets the
