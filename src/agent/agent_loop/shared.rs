@@ -1814,7 +1814,27 @@ impl AgentLoopShared {
                 let mut engine = lcm_engine.lock().await;
                 if !engine.dag().is_empty() {
                     let expand_t0 = std::time::Instant::now();
-                    let appended = engine.auto_expand(&ctx.core.token_budget, tool_def_tokens);
+                    // Stamp the current turn so freshly-created summaries
+                    // become eligible for auto_expand only after
+                    // FRESH_SUMMARY_COOLDOWN_TURNS. Without this, a summary
+                    // created by compaction at turn N can be reinjected at
+                    // turn N+1, undoing the compaction (live failure
+                    // 2026-07-27 12:13:06 saw +12463 tokens reinjected 24s
+                    // after a successful 12463→1398 compaction).
+                    let current_turn = ctx
+                        .core
+                        .sessions
+                        .get_session(&ctx.session_id)
+                        .await
+                        .map_or(0, |session| session.message_count as u64);
+                    engine.set_current_turn(current_turn);
+                    // wire_tokens = actual rendered prompt size. Counting the
+                    // wire (not the engine's internal active) is what stops
+                    // reinjection from pushing the prompt past τ_hard and
+                    // blowing the Higgs retained-session cap.
+                    let wire_tokens = TokenBudget::estimate_tokens(&ctx.rendered_messages);
+                    let appended =
+                        engine.auto_expand(&ctx.core.token_budget, tool_def_tokens, wire_tokens);
                     tracing::info!(
                         target: "turn_timing",
                         auto_expand_ms = expand_t0.elapsed().as_millis() as u64,

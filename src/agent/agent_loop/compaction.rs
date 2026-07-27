@@ -125,6 +125,11 @@ pub(super) async fn execute_lcm_compaction(
     // back the DAG/active window before any other task can observe or extend
     // the non-durable state.
     let mut engine = lcm.lock().await;
+    // Stamp the session turn so the new summary node records its creation
+    // turn. auto_expand's fresh-summary cooldown uses this to prevent the
+    // just-compacted originals from being reinjected on the very next turn
+    // (live failure 2026-07-27 12:13:06).
+    engine.set_current_turn(session_turn);
     let mut mutation = LcmCompactionMutation::new(&mut engine);
     let summary_turn = mutation
         .engine_mut()

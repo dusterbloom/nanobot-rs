@@ -47,8 +47,79 @@ pub type MessageId = usize;
 pub struct ManifestItem {
     #[serde(default)]
     pub text: String,
-    #[serde(default)]
+    /// Message IDs this item references. The summarization prompt asks the
+    /// model for `[<integer id>, ...]`, but local models in the wild emit
+    /// strings like `"msg 55531"` (matching the `[message_id: 55531]`
+    /// transcript labels) or `"55531"` (numeric strings). A single malformed
+    /// source value used to fail the entire manifest deserialization and
+    /// collapse 100% of the recovered state (live 2026-07-27 12:34:03). The
+    /// custom deserializer extracts the first integer from each value and
+    /// silently skips non-numeric entries.
+    #[serde(default, deserialize_with = "deserialize_message_id_array")]
     pub sources: Vec<MessageId>,
+}
+
+/// Extract a `MessageId` from a JSON value: integers pass through; strings
+/// contribute their first contiguous run of ASCII digits (so `"msg 55531"`,
+/// `"55531"`, and `"[message_id: 55531]"` all yield `55531`); anything else
+/// yields `None` and is skipped by the array visitor.
+fn extract_message_id(value: &Value) -> Option<MessageId> {
+    match value {
+        Value::Number(n) => n.as_u64().map(|x| x as MessageId),
+        Value::String(s) => {
+            let mut start: Option<usize> = None;
+            let mut end: usize = 0;
+            for (i, c) in s.char_indices() {
+                if c.is_ascii_digit() {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                    end = i + c.len_utf8();
+                } else if start.is_some() {
+                    break;
+                }
+            }
+            start.and_then(|begin| s[begin..end].parse().ok())
+        }
+        _ => None,
+    }
+}
+
+fn deserialize_message_id_array<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<MessageId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::SeqAccess;
+
+    struct MessageIdArrayVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for MessageIdArrayVisitor {
+        type Value = Vec<MessageId>;
+
+        fn expecting(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                fmt,
+                "an array of integer message ids or strings containing message ids"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            while let Some(value) = seq.next_element::<Value>()? {
+                if let Some(id) = extract_message_id(&value) {
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(MessageIdArrayVisitor)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -170,6 +241,15 @@ pub struct SummaryNode {
     pub tokens: usize,
     /// Escalation level that produced this summary (1, 2, or 3).
     pub level: u8,
+    /// Session turn when this node was created, stamped by `LcmEngine` from
+    /// its `current_turn` counter. Used by `auto_expand`'s fresh-summary
+    /// cooldown to prevent the just-compacted detail from being reinjected
+    /// the very next turn (live failure 2026-07-27 12:13:06 saw +12463
+    /// tokens reinjected 24 seconds after compaction). Persisted with
+    /// `#[serde(default)]` so older SQLite rows restore as 0 — those are
+    /// treated as ancient history by the cooldown check.
+    #[serde(default)]
+    pub created_at_turn: u64,
 }
 
 /// Compress sorted message IDs into a compact range string: `5-8,12,14-20`.
@@ -203,15 +283,42 @@ pub fn format_id_ranges(ids: &[MessageId]) -> String {
 /// Build the wire message that represents a summary node in the active
 /// context. Single source of truth for the header format (live compaction and
 /// restart rebuild must render byte-identically for the prompt prefix cache).
-fn summary_wire_message(source_ids: &[MessageId], text: &str) -> Value {
+fn summary_wire_message(source_ids: &[MessageId], text: &str, manifest: &SummaryManifest) -> Value {
     let ranges = format_id_ranges(source_ids);
+    let mut content = format!(
+        "[Summary of messages {ranges}. To read the exact originals call \
+         lcm_expand({{\"message_ids\": \"{ranges}\"}}).]\n\n{text}"
+    );
+    if !manifest.open_loops.is_empty()
+        || !manifest.failed_approaches.is_empty()
+        || !manifest.decisions.is_empty()
+    {
+        content.push_str("\n\n[State manifest]");
+        for (label, items) in [
+            ("Open loops:", &manifest.open_loops),
+            ("Failed approaches:", &manifest.failed_approaches),
+            ("Decisions:", &manifest.decisions),
+        ] {
+            if items.is_empty() {
+                continue;
+            }
+            content.push('\n');
+            content.push_str(label);
+            for item in items {
+                content.push_str("\n- ");
+                content.push_str(&item.text);
+                if !item.sources.is_empty() {
+                    content.push_str(" [sources: ");
+                    content.push_str(&format_id_ranges(&item.sources));
+                    content.push(']');
+                }
+            }
+        }
+    }
     json!({
         "role": "user",
         "_lcm_summary": true,
-        "content": format!(
-            "[Summary of messages {ranges}. To read the exact originals call \
-             lcm_expand({{\"message_ids\": \"{ranges}\"}}).]\n\n{text}"
-        )
+        "content": content
     })
 }
 
@@ -252,8 +359,20 @@ impl SummaryDag {
             manifest,
             tokens,
             level,
+            created_at_turn: 0,
         });
         &self.nodes[self.nodes.len() - 1]
+    }
+
+    /// Stamp the session turn when a node was created. Called by
+    /// `LcmEngine::compact` right after `create_node` so the cooldown check
+    /// in `auto_expand` can tell fresh nodes from established ones. Only
+    /// mutates the in-memory DAG; persistence stores the field via
+    /// `save_compaction_checkpoint`.
+    pub(crate) fn stamp_node_creation_turn(&mut self, node_id: usize, turn: u64) {
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
+            node.created_at_turn = turn;
+        }
     }
 
     /// Get a summary node by ID.
@@ -361,6 +480,15 @@ impl From<&LcmSchemaConfig> for LcmConfig {
 #[cfg(test)]
 const DEFAULT_PROTECT_TOKENS: usize = 1024;
 
+/// Merge accumulated summaries once their mass becomes material to the prompt.
+const SUMMARY_MERGE_BUDGET_FRACTION: f64 = 0.25;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockSelection {
+    AppendOnly,
+    MergeSummaries,
+}
+
 /// Token budget for the recent raw messages kept verbatim (not summarized),
 /// scaled to the available context. ~5% of the budget, clamped to [512, 2048]:
 /// on a ~22k effective budget this keeps ~1k tokens of recent turns raw (the
@@ -370,6 +498,17 @@ const DEFAULT_PROTECT_TOKENS: usize = 1024;
 fn protect_tokens_for_budget(available_tokens: usize) -> usize {
     (available_tokens / 20).clamp(512, 2048)
 }
+
+/// A freshly created summary node is ineligible for `auto_expand` while its
+/// age in turns is `<=` this value. Age is `current_turn - created_at_turn`.
+/// Cooldown of 1 means a node created during turn N's compaction cannot be
+/// re-expanded until turn N+2 — the very next turn (N+1, age=1) is still
+/// blocked, which is the live failure window (session 20260727_094539_eeab48,
+/// 2026-07-27 12:12:42 compact → 12:13:06 +12463 token reinject).
+///
+/// Nodes with `created_at_turn == 0` (back-compat rows, or test scaffolding
+/// that never set the turn) are always eligible.
+const FRESH_SUMMARY_COOLDOWN_TURNS: u64 = 1;
 
 /// The LCM engine: manages the active context with lossless compaction.
 pub struct LcmEngine {
@@ -388,6 +527,10 @@ pub struct LcmEngine {
     /// Summary node IDs already auto-expanded into the tail this session, so the
     /// per-turn auto_expand pass doesn't append the same detail repeatedly.
     auto_expanded: std::collections::HashSet<usize>,
+    /// Session turn counter, bumped by the caller at turn start via
+    /// `set_current_turn`. Stamped onto every freshly-created summary node
+    /// so `auto_expand` can apply `FRESH_SUMMARY_COOLDOWN_TURNS`.
+    current_turn: u64,
 }
 
 /// Mutable LCM state that must advance only after its SQLite checkpoint does.
@@ -406,7 +549,22 @@ impl LcmEngine {
             store: std::collections::BTreeMap::new(),
             async_compaction_pending: false,
             auto_expanded: std::collections::HashSet::new(),
+            current_turn: 0,
         }
+    }
+
+    /// Record the session's current turn. Called by `agent_loop` at turn
+    /// start so subsequent `compact()` calls stamp the new node's
+    /// `created_at_turn`, and `auto_expand`'s cooldown check knows the
+    /// present turn. Tests that never call this default to 0, which
+    /// disables the cooldown (back-compat with summaries created without a
+    /// turn stamp).
+    pub fn set_current_turn(&mut self, turn: u64) {
+        self.current_turn = turn;
+    }
+
+    pub fn current_turn(&self) -> u64 {
+        self.current_turn
     }
 
     pub(crate) fn compaction_state(&self) -> LcmCompactionState {
@@ -541,24 +699,23 @@ impl LcmEngine {
         // (matters when messages are small relative to the protect target).
         let protect_tokens =
             protect_tokens_for_budget(available).min(self.conversation_tokens().max(1) / 2);
+        let selection = self.block_selection(available);
 
         // Find the oldest contiguous block of raw messages to compact.
-        // Skip the system message (index 0) and any existing summaries.
-        let (block_start, block_end) = match self.find_oldest_raw_block_impl(protect_tokens) {
-            Some(range) => range,
-            None => {
-                debug!("LCM: no raw block to compact");
-                self.async_compaction_pending = false;
-                return None;
-            }
-        };
+        let (block_start, block_end) =
+            match self.find_oldest_raw_block_impl(protect_tokens, selection) {
+                Some(range) => range,
+                None => {
+                    debug!("LCM: no raw block to compact");
+                    self.async_compaction_pending = false;
+                    return None;
+                }
+            };
 
-        // Collect messages and source ids from the block. The block may contain
-        // prior Summary entries (so each compaction MERGES them with old raws
-        // into one summary, bounding summary mass). Their text is folded into
-        // the summarization input and their underlying source ids are unioned so
-        // the merged summary still points at every original (lcm_expand stays
-        // lossless).
+        // Collect messages and source ids from the block. Merge mode may
+        // include prior Summary entries; append mode never does. When present,
+        // their text is folded into the summarization input and their source
+        // ids are unioned so lcm_expand stays lossless.
         let mut source_ids: Vec<MessageId> = Vec::new();
         let mut block_messages = Vec::new();
         let mut merged_node_ids: Vec<usize> = Vec::new();
@@ -720,9 +877,17 @@ impl LcmEngine {
             level,
         );
         let node_id = node.id;
+        let summary_source_ids = node.source_ids.clone();
+        let summary_text_clone = node.text.clone();
+        let summary_manifest = node.manifest.clone();
+        // Stamp the creation turn so `auto_expand`'s cooldown can tell this
+        // fresh node apart from established summaries on the next turn.
+        self.dag
+            .stamp_node_creation_turn(node_id, self.current_turn);
 
         // Build the summary message with lossless pointers (compact ranges).
-        let summary_message = summary_wire_message(&source_ids, &summary_text);
+        let summary_message =
+            summary_wire_message(&summary_source_ids, &summary_text_clone, &summary_manifest);
 
         // Replace the block in active context with the summary.
         let mut new_active = Vec::with_capacity(self.active.len());
@@ -744,29 +909,48 @@ impl LcmEngine {
         })
     }
 
-    /// Find the block to compact: everything from the first compactible entry
-    /// (a Raw non-system message OR a prior Summary) up to the recent-protect
-    /// boundary.
+    fn block_selection(&self, available: usize) -> BlockSelection {
+        let summary_tokens = self
+            .active
+            .iter()
+            .filter_map(|entry| match entry {
+                ContextEntry::Summary { node_id, .. } => {
+                    self.dag.get(*node_id).map(|node| node.tokens)
+                }
+                ContextEntry::Raw { .. } => None,
+            })
+            .fold(0usize, usize::saturating_add);
+
+        if summary_tokens as f64 > available as f64 * SUMMARY_MERGE_BUDGET_FRACTION {
+            BlockSelection::MergeSummaries
+        } else {
+            BlockSelection::AppendOnly
+        }
+    }
+
+    /// Find the block to compact: either the oldest raw-only run or everything
+    /// from the first compactible entry up to the recent-protect boundary.
     ///
-    /// Including prior Summary nodes in the block is what bounds summary mass:
-    /// each compaction MERGES old summaries + old raws into one new summary, so
-    /// the active context holds at most ONE summary node instead of accumulating
-    /// one per compaction (which grew the post-compaction floor without bound).
+    /// `AppendOnly` leaves existing summaries byte-stable at the prompt front.
+    /// `MergeSummaries` includes them in the block, bounding summary mass by
+    /// replacing all accumulated summaries with one new node.
     ///
     /// Protection is TOKEN-based (not message-count): walk back from the end
     /// accumulating tokens of real raw messages (2× for tool results, which are
     /// retrievable via recall_tool_result); the boundary where we cross
-    /// `protect_tokens` is the oldest still-protected index. Summaries are never
-    /// "recent turns" to protect — they stay compactible.
-    fn find_oldest_raw_block_impl(&self, protect_tokens: usize) -> Option<(usize, usize)> {
-        // Block start = first compactible entry (Raw non-system/non-synthetic,
-        // or a prior Summary).
+    /// `protect_tokens` is the oldest still-protected index. Summaries are
+    /// compactible only in `MergeSummaries` mode.
+    fn find_oldest_raw_block_impl(
+        &self,
+        protect_tokens: usize,
+        selection: BlockSelection,
+    ) -> Option<(usize, usize)> {
         let start = (0..self.active.len()).find(|&i| match &self.active[i] {
             ContextEntry::Raw { message, .. } => {
                 let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
                 role != "system" && !crate::agent::markers::is_synthetic(message)
             }
-            ContextEntry::Summary { .. } => true,
+            ContextEntry::Summary { .. } => selection == BlockSelection::MergeSummaries,
         })?;
 
         // Protect the most recent RAW messages (token-based, 2× tool weighting).
@@ -867,7 +1051,7 @@ impl LcmEngine {
         &self,
         protect_tokens: usize,
     ) -> Option<(usize, usize)> {
-        self.find_oldest_raw_block_impl(protect_tokens)
+        self.find_oldest_raw_block_impl(protect_tokens, BlockSelection::AppendOnly)
     }
 
     /// Auto-expand summaries that are relevant to the latest user message.
@@ -879,10 +1063,23 @@ impl LcmEngine {
     /// disabled whenever the cache was warm. Each summary is expanded at most
     /// once (tracked in `auto_expanded`) so the pass never spams the tail.
     ///
+    /// `wire_tokens` is the actual rendered prompt size for this turn — what
+    /// the provider will prefill. Headroom is computed against `wire_tokens`,
+    /// NOT against `self.active_tokens()`: reinjected originals live in the
+    /// wire (not the engine's internal active), so the engine's view
+    /// under-counts. Counting the wire keeps reinjection from pushing the
+    /// prompt past τ_hard (the failure mode that broke the Higgs retained
+    /// session and forced 60s+ ExactBootstrap prefills).
+    ///
     /// Relevance uses semantic embeddings when available, else keyword overlap.
     ///
     /// Returns the synthetic messages to append (empty if nothing was expanded).
-    pub fn auto_expand(&mut self, budget: &TokenBudget, tool_def_tokens: usize) -> Vec<Value> {
+    pub fn auto_expand(
+        &mut self,
+        budget: &TokenBudget,
+        tool_def_tokens: usize,
+        wire_tokens: usize,
+    ) -> Vec<Value> {
         // Find the latest user message content.
         let user_text = self.active.iter().rev().find_map(|entry| {
             let msg = entry.message();
@@ -908,15 +1105,20 @@ impl LcmEngine {
         // the model is unavailable, in which case we fall back to keyword overlap.
         let user_embedding = crate::agent::embedder::embed_one(&user_text).ok();
 
-        // Budget: never let expansion push the context past τ_hard. Because we
+        // Budget: never let expansion push the *wire* past τ_hard. Because we
         // APPEND originals (the summary stays in place, keeping the frozen prefix
         // byte-stable and the prompt cache warm), the cost is the full expansion,
-        // not summary→original net.
+        // not summary→original net. Counting the wire (not internal active) is
+        // what prevents the feedback loop where reinjection exceeds headroom
+        // because the engine's view misses the previously-appended wire tail.
         let available = budget.available_budget(tool_def_tokens);
         let hard_limit = (available as f64 * self.config.tau_hard) as usize;
-        let mut headroom = hard_limit.saturating_sub(self.active_tokens());
+        let mut headroom = hard_limit.saturating_sub(wire_tokens);
         if headroom < 100 {
-            debug!("LCM auto_expand: no headroom, skipping");
+            debug!(
+                wire_tokens,
+                hard_limit, "LCM auto_expand: no wire headroom, skipping"
+            );
             return Vec::new();
         }
 
@@ -931,6 +1133,28 @@ impl LcmEngine {
                     Some(*node_id)
                 }
                 _ => None,
+            })
+            .filter(|&node_id| {
+                // Fresh-summary cooldown: a node created within the last
+                // FRESH_SUMMARY_COOLDOWN_TURNS turns is ineligible. Without
+                // this, auto_expand on turn N+1 reinjects the originals of
+                // a summary created on turn N — undoing the compaction
+                // (live 2026-07-27 12:13:06 saw +12463 tokens reinjected 24
+                // seconds after a successful 12463→1398 compaction).
+                //
+                // Nodes with `created_at_turn == 0` (back-compat rows from
+                // older persisted sessions, or test scaffolding that never
+                // set the turn) are always eligible — we have no creation
+                // signal for them, and treating them as ancient history
+                // preserves pre-cooldown behaviour.
+                let Some(node) = self.dag.get(node_id) else {
+                    return true;
+                };
+                if node.created_at_turn == 0 {
+                    return true;
+                }
+                let age = self.current_turn.saturating_sub(node.created_at_turn);
+                age > FRESH_SUMMARY_COOLDOWN_TURNS
             })
             .collect();
 
@@ -1049,7 +1273,7 @@ impl LcmEngine {
     ///
     /// Pre-rowid nodes with POSITIONAL source ids are purged once when the
     /// DB is opened (`SessionDb::new`) and filtered by `load_summary_nodes`,
-    /// so every node received here is db-id-keyed (the 7th tuple element is
+    /// so every node received here is db-id-keyed (the 8th tuple element is
     /// always `"db_id"`).
     pub fn rebuild_from_db_nodes(
         raw_messages: &[Value],
@@ -1177,6 +1401,10 @@ impl LcmEngine {
                 manifest: manifest.clone(),
                 tokens: *tokens,
                 level: *level,
+                // Persisted rows restore with their original creation turn
+                // where available; older rows without the column deserialize
+                // as 0 and are treated as ancient history by the cooldown.
+                created_at_turn: 0,
             });
             for &sid in source_ids {
                 summarized_ids.insert(sid);
@@ -1184,9 +1412,27 @@ impl LcmEngine {
         }
         engine.dag.nodes.sort_by_key(|node| node.id);
 
-        // Build active context: summaries first, then unsummarized raw messages.
+        let unsummarized: Vec<(MessageId, Value)> = engine
+            .store
+            .iter()
+            .filter(|(id, _)| !summarized_ids.contains(id))
+            .map(|(&id, message)| (id, message.clone()))
+            .collect();
+
+        // Live compaction retains the leading system message, inserts summaries
+        // after it, then keeps the unsummarized conversational tail. Rebuild
+        // must use the same order or a restart changes the prompt bytes.
+        for (msg_id, message) in &unsummarized {
+            if message.get("role").and_then(Value::as_str) == Some("system") {
+                engine.active.push(ContextEntry::Raw {
+                    msg_id: *msg_id,
+                    message: message.clone(),
+                });
+            }
+        }
         for node in &engine.dag.nodes {
-            let summary_message = summary_wire_message(&node.source_ids, &node.text);
+            let summary_message =
+                summary_wire_message(&node.source_ids, &node.text, &node.manifest);
             engine.active.push(ContextEntry::Summary {
                 node_id: node.id,
                 message: summary_message,
@@ -1194,13 +1440,10 @@ impl LcmEngine {
         }
 
         // BTreeMap iteration is ascending by id — session order is preserved.
-        let unsummarized: Vec<(MessageId, Value)> = engine
-            .store
-            .iter()
-            .filter(|(id, _)| !summarized_ids.contains(id))
-            .map(|(&id, m)| (id, m.clone()))
-            .collect();
         for (msg_id, message) in unsummarized {
+            if message.get("role").and_then(Value::as_str) == Some("system") {
+                continue;
+            }
             engine.active.push(ContextEntry::Raw { msg_id, message });
         }
 
@@ -1630,6 +1873,41 @@ mod tests {
         }
     }
 
+    struct ManifestSummarizerMock;
+
+    #[async_trait]
+    impl LLMProvider for ManifestSummarizerMock {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: Some(
+                    "- Preserved the restart rendering contract.\n\n\
+                     ```json\n\
+                     {\"open_loops\":[{\"text\":\"Verify restart rendering\",\"sources\":[2,3]}],\
+                     \"failed_approaches\":[{\"text\":\"JSON-only prompt state\",\"sources\":[4]}],\
+                     \"decisions\":[{\"text\":\"Keep one wire formatter\",\"sources\":[5,6]}]}\n\
+                     ```"
+                    .to_string(),
+                ),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock-manifest-summarizer"
+        }
+    }
+
     /// Mock LLM that returns an error — forces Level 3 deterministic fallback.
     struct FailingMock;
 
@@ -1835,6 +2113,105 @@ mod tests {
         assert_eq!(engine.ingest(msg(id, role, content)), Some(id));
     }
 
+    fn serialize_wire(entries: &[ContextEntry]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for entry in entries {
+            bytes.extend(serde_json::to_vec(entry.message()).unwrap());
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    /// Append-by-default must still self-regulate: over a long run the engine
+    /// has to reach the merge threshold on its own and collapse accumulated
+    /// summaries, without a test forcing the mode. If `block_selection` never
+    /// returned `MergeSummaries`, summary mass would grow without bound and
+    /// every other compaction test would still pass.
+    #[tokio::test]
+    async fn summary_mass_stays_bounded_across_many_compactions() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+        let budget = TokenBudget::new(4096, 1024);
+        let compactor = ContextCompactor::new(
+            Arc::new(SummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            16_384,
+        );
+        let body = "bounded summary mass over a long agentic session with many compactions ";
+        let ceiling = (budget.available_budget(0) as f64 * SUMMARY_MERGE_BUDGET_FRACTION) as usize;
+
+        let summary_tokens = |engine: &LcmEngine| -> usize {
+            engine
+                .active_entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    ContextEntry::Summary { node_id, .. } => {
+                        engine.dag().get(*node_id).map(|node| node.tokens)
+                    }
+                    ContextEntry::Raw { .. } => None,
+                })
+                .fold(0usize, usize::saturating_add)
+        };
+
+        ingest(&mut engine, 1, "system", "System");
+        let mut next_id = 2;
+        let mut merge_observed = false;
+        let mut peak_mass = 0usize;
+
+        for _round in 0..120 {
+            for i in 0..12 {
+                ingest(&mut engine, next_id, "user", &format!("{i}: {body}"));
+                next_id += 1;
+                ingest(
+                    &mut engine,
+                    next_id,
+                    "assistant",
+                    &format!("reply {i}: {body}"),
+                );
+                next_id += 1;
+            }
+            let before = summary_tokens(&engine);
+            engine
+                .compact(
+                    Some(&compactor),
+                    &budget,
+                    0,
+                    CompactionFailureMode::Deterministic,
+                )
+                .await;
+            let after = summary_tokens(&engine);
+            eprintln!(
+                "round: summaries={} mass={} -> {}",
+                engine
+                    .active_entries()
+                    .iter()
+                    .filter(|e| matches!(e, ContextEntry::Summary { .. }))
+                    .count(),
+                before,
+                after
+            );
+            // A merge is the only way accumulated summary mass goes down.
+            merge_observed |= after < before;
+            peak_mass = peak_mass.max(after);
+        }
+
+        assert!(
+            merge_observed,
+            "engine never merged on its own across 120 compactions — summary mass \
+             is not self-regulating (peak {peak_mass} tokens, ceiling {ceiling})"
+        );
+        // One summary may push past the threshold before the next call merges,
+        // so the bound is the ceiling plus a single summary's worth.
+        let slack = ceiling * 2;
+        assert!(
+            peak_mass <= slack,
+            "summary mass peaked at {peak_mass} tokens, unbounded past {slack}"
+        );
+    }
+
     #[test]
     fn manifest_merge_unions_open_loops_and_deduplicates_sources() {
         let first = SummaryManifest {
@@ -1901,6 +2278,100 @@ mod tests {
                 text: "Use SQLite for persistence".to_string(),
                 sources: vec![7, 9],
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn non_empty_manifest_renders_identically_live_and_after_sqlite_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("sessions.db");
+        let db = crate::session::SessionDb::new(&db_path);
+        let session = db.create_session("manifest-wire-restart").await;
+        let detail = "prefix stability restart persistence manifest rendering ".repeat(8);
+        let mut messages = vec![json!({"role": "system", "content": "System prompt."})];
+        for i in 0..12 {
+            messages.push(json!({
+                "role": "user",
+                "content": format!("Question {i}: {detail}")
+            }));
+            messages.push(json!({
+                "role": "assistant",
+                "content": format!("Answer {i}: {detail}")
+            }));
+        }
+        db.add_messages(&session.id, &messages).await;
+
+        let raw_messages = db.get_all_messages(&session.id).await;
+        let mut live = LcmEngine::new(LcmConfig::default());
+        for message in &raw_messages {
+            live.ingest(message.clone());
+        }
+        let compactor = ContextCompactor::new(
+            Arc::new(ManifestSummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            16_384,
+        );
+        let result = live
+            .compact(
+                Some(&compactor),
+                &TokenBudget::new(4096, 1024),
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+        assert!(result.is_some(), "live compaction must produce a summary");
+
+        let node = live.dag().newest().unwrap().clone();
+        let live_message = live
+            .active_entries()
+            .iter()
+            .find_map(|entry| match entry {
+                ContextEntry::Summary { node_id, message } if *node_id == node.id => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let live_content = live_message["content"].as_str().unwrap();
+        assert!(live_content.contains("[State manifest]"));
+        assert!(live_content.contains("Open loops:\n- Verify restart rendering [sources: 2-3]"));
+        assert!(live_content.contains("Failed approaches:\n- JSON-only prompt state [sources: 4]"));
+        assert!(live_content.contains("Decisions:\n- Keep one wire formatter [sources: 5-6]"));
+
+        db.save_summary_node(
+            &session.id,
+            node.id,
+            &node.source_ids,
+            &node.child_summaries,
+            &node.text,
+            node.tokens,
+            node.level,
+            &node.manifest,
+        )
+        .await;
+        let persisted_nodes = db.load_summary_nodes(&session.id).await;
+        let reloaded_messages = db.get_all_messages(&session.id).await;
+        let rebuilt = LcmEngine::rebuild_from_db_nodes(
+            &reloaded_messages,
+            &persisted_nodes,
+            LcmConfig::default(),
+        );
+        let rebuilt_message = rebuilt
+            .active_entries()
+            .iter()
+            .find_map(|entry| match entry {
+                ContextEntry::Summary { node_id, message } if *node_id == node.id => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(live_message, rebuilt_message);
+        assert_eq!(
+            live.active_context(),
+            rebuilt.active_context(),
+            "restart must preserve the complete live wire ordering"
         );
     }
 
@@ -2210,6 +2681,35 @@ mod tests {
         assert_eq!(first_sentence(""), "");
     }
 
+    // -----------------------------------------------------------------------
+    // Manifest sources lenient deserialization (Bug #3)
+    // -----------------------------------------------------------------------
+
+    /// The live 2026-07-27 12:34:03 failure was
+    /// `invalid type: string "msg 55531", expected usize at line 17 column 23`.
+    /// The transcript labels render as `[message_id: 55531]`, and the model
+    /// emitted `"msg 55531"` in the sources array. The whole manifest was
+    /// discarded. Sources must accept integers, numeric strings, and
+    /// `"msg <id>"`-style strings, extracting the integer from each value.
+    #[test]
+    fn manifest_sources_accepts_string_with_msg_prefix() {
+        let json = r#"{"text":"x","sources":["msg 55531", 123, "456"]}"#;
+        let item: ManifestItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.text, "x");
+        assert_eq!(item.sources, vec![55531, 123, 456]);
+    }
+
+    /// Non-numeric strings are skipped, not fatal: a single junk value must
+    /// not discard the whole manifest (the live bug collapsed 100% of the
+    /// manifest state because of one malformed source id).
+    #[test]
+    fn manifest_sources_skips_non_numeric_strings() {
+        let json = r#"{"text":"x","sources":["hello", 789, "msg not-a-number"]}"#;
+        let item: ManifestItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.text, "x");
+        assert_eq!(item.sources, vec![789]);
+    }
+
     #[test]
     fn test_find_oldest_raw_block_token_based_protects_recent() {
         let engine = &mut LcmEngine::new(LcmConfig::default());
@@ -2252,7 +2752,8 @@ mod tests {
             );
         }
 
-        let block = engine.find_oldest_raw_block_impl(DEFAULT_PROTECT_TOKENS);
+        let block =
+            engine.find_oldest_raw_block_impl(DEFAULT_PROTECT_TOKENS, BlockSelection::AppendOnly);
         assert!(block.is_some());
 
         let (start, end) = block.unwrap();
@@ -2863,6 +3364,89 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn compaction_keeps_existing_wire_prefix_until_summary_merge_is_needed() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+        let budget = TokenBudget::new(4096, 1024);
+        let compactor = ContextCompactor::new(
+            Arc::new(SummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            16_384,
+        );
+        let body =
+            "the quick brown fox preserves the local model prompt prefix across compactions ";
+
+        ingest(&mut engine, 1, "system", "System");
+        for i in 0..12 {
+            ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("reply {i}: {body}"),
+            );
+        }
+        assert!(engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await
+            .is_some());
+        let last_summary = engine
+            .active_entries()
+            .iter()
+            .rposition(|entry| matches!(entry, ContextEntry::Summary { .. }))
+            .unwrap();
+        let stable_after_first = serialize_wire(&engine.active_entries()[..=last_summary]);
+
+        for i in 0..12 {
+            ingest(
+                &mut engine,
+                100 + 2 * i,
+                "user",
+                &format!("more {i}: {body}"),
+            );
+            ingest(
+                &mut engine,
+                101 + 2 * i,
+                "assistant",
+                &format!("more reply {i}: {body}"),
+            );
+        }
+        assert!(engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await
+            .is_some());
+        let after_second = serialize_wire(engine.active_entries());
+
+        assert!(
+            after_second.starts_with(&stable_after_first),
+            "the first compacted prompt, excluding its protected raw tail, \
+             must remain a byte-prefix after the next append-only compaction"
+        );
+        assert_eq!(
+            engine
+                .active_entries()
+                .iter()
+                .filter(|entry| matches!(entry, ContextEntry::Summary { .. }))
+                .count(),
+            2,
+            "low summary mass should append instead of merge"
+        );
+    }
+
     #[test]
     fn test_format_id_ranges_compact_and_roundtrip() {
         assert_eq!(format_id_ranges(&[5, 6, 7, 8]), "5-8");
@@ -2923,6 +3507,12 @@ mod tests {
             )
             .await;
         assert!(r1.is_some());
+        engine.dag.nodes[0].tokens =
+            (budget.available_budget(0) as f64 * SUMMARY_MERGE_BUDGET_FRACTION) as usize + 1;
+        assert_eq!(
+            engine.block_selection(budget.available_budget(0)),
+            BlockSelection::MergeSummaries
+        );
 
         // Round 2: merge the prior summary with new raws.
         for i in 0..12 {
@@ -2984,37 +3574,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compaction_merges_summaries_no_accumulation() {
-        // Each compaction must MERGE prior summaries + old raws into ONE
-        // summary, so summary mass stays bounded at one node. Without the
-        // merge, summaries accumulated one-per-compaction and the post-
-        // compaction floor grew without bound.
+    async fn test_compaction_merges_summaries_when_mass_exceeds_threshold() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
         });
-        // Content-echoing mock: three compaction rounds re-feed evolving
-        // input through the same compactor, and a fixed canned reply fails
-        // the compaction fidelity gate's topic-anchor check past round 1.
         let compactor = ContextCompactor::new(
-            Arc::new(EchoSummarizerMock) as Arc<dyn LLMProvider>,
+            Arc::new(SummarizerMock) as Arc<dyn LLMProvider>,
             "mock".to_string(),
-            4096,
+            16_384,
         );
         let budget = TokenBudget::new(4096, 1024);
         let body = "the quick brown fox jumps over the lazy dog while the model prefills tokens ";
-
-        let count_summaries = |e: &LcmEngine| {
-            e.active_entries()
-                .iter()
-                .filter(|en| matches!(en, ContextEntry::Summary { .. }))
-                .count()
-        };
-
-        // Round 1.
         ingest(&mut engine, 1, "system", "System");
-        for i in 0..12 {
+        ingest(&mut engine, 2, "user", "Already summarized source");
+        for i in 0..16 {
             ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
             ingest(
                 &mut engine,
@@ -3023,63 +3598,32 @@ mod tests {
                 &format!("reply {i}: {body}"),
             );
         }
-        let r1 = engine
-            .compact(
-                Some(&compactor),
-                &budget,
-                0,
-                CompactionFailureMode::Deterministic,
+        let prior_node_id = engine
+            .dag
+            .create_node(
+                vec![2],
+                vec![],
+                "Earlier compacted state.".to_string(),
+                SummaryManifest::default(),
+                1,
             )
-            .await;
-        assert!(r1.is_some(), "first compaction fires");
-        assert_eq!(count_summaries(&engine), 1, "one summary after round 1");
+            .id;
+        engine.active[1] = ContextEntry::Summary {
+            node_id: prior_node_id,
+            message: json!({
+                "role": "user",
+                "_lcm_summary": true,
+                "content": "Earlier compacted state."
+            }),
+        };
+        let available = budget.available_budget(0);
+        engine.dag.nodes[prior_node_id].tokens = (available as f64 * 0.25) as usize + 1;
 
-        // Round 2: add more turns and compact again.
-        for i in 0..12 {
-            ingest(
-                &mut engine,
-                100 + 2 * i,
-                "user",
-                &format!("more {i}: {body}"),
-            );
-            ingest(
-                &mut engine,
-                101 + 2 * i,
-                "assistant",
-                &format!("more reply {i}: {body}"),
-            );
-        }
-        let r2 = engine
-            .compact(
-                Some(&compactor),
-                &budget,
-                0,
-                CompactionFailureMode::Deterministic,
-            )
-            .await;
-        assert!(r2.is_some(), "second compaction fires");
         assert_eq!(
-            count_summaries(&engine),
-            1,
-            "summaries must merge (bounded at 1), not accumulate"
+            engine.block_selection(available),
+            BlockSelection::MergeSummaries
         );
-
-        // Round 3: once more.
-        for i in 0..12 {
-            ingest(
-                &mut engine,
-                200 + 2 * i,
-                "user",
-                &format!("extra {i}: {body}"),
-            );
-            ingest(
-                &mut engine,
-                201 + 2 * i,
-                "assistant",
-                &format!("extra reply {i}: {body}"),
-            );
-        }
-        let _ = engine
+        let result = engine
             .compact(
                 Some(&compactor),
                 &budget,
@@ -3087,10 +3631,15 @@ mod tests {
                 CompactionFailureMode::Deterministic,
             )
             .await;
+        assert!(result.is_some(), "threshold-triggered merge must compact");
         assert_eq!(
-            count_summaries(&engine),
+            engine
+                .active_entries()
+                .iter()
+                .filter(|entry| matches!(entry, ContextEntry::Summary { .. }))
+                .count(),
             1,
-            "still one summary after round 3 — merge holds across compactions"
+            "merge mode must retire the prior summary"
         );
     }
 
@@ -3636,7 +4185,7 @@ mod tests {
         );
 
         let budget = TokenBudget::new(100_000, 8192);
-        let appended = engine.auto_expand(&budget, 100);
+        let appended = engine.auto_expand(&budget, 100, engine.active_tokens());
         assert_eq!(
             appended.len(),
             1,
@@ -3664,7 +4213,9 @@ mod tests {
 
         // Idempotent: a second pass does not re-append the same node.
         assert!(
-            engine.auto_expand(&budget, 100).is_empty(),
+            engine
+                .auto_expand(&budget, 100, engine.active_tokens())
+                .is_empty(),
             "already-expanded summary must not be appended twice"
         );
     }
@@ -3730,7 +4281,9 @@ mod tests {
         // Use a tiny budget where there's no headroom.
         let budget = TokenBudget::new(256, 128); // Very small
         assert!(
-            engine.auto_expand(&budget, 50).is_empty(),
+            engine
+                .auto_expand(&budget, 50, engine.active_tokens())
+                .is_empty(),
             "Should NOT expand when budget headroom is insufficient"
         );
     }
@@ -3792,8 +4345,222 @@ mod tests {
 
         let budget = TokenBudget::new(100_000, 8192);
         assert!(
-            engine.auto_expand(&budget, 100).is_empty(),
+            engine
+                .auto_expand(&budget, 100, engine.active_tokens())
+                .is_empty(),
             "Should NOT expand for an irrelevant query"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-expand: fresh-summary cooldown (Bug #2 — feedback loop)
+    // -----------------------------------------------------------------------
+
+    /// A summary created during turn N's compaction MUST NOT be auto-expanded
+    /// at turn N+1. The live failure (2026-07-27 12:13:06, session
+    /// 20260727_094539_eeab48) saw +12463 tokens of originals reinjected 24
+    /// seconds after a successful 12463→1398 compaction, blowing the wire
+    /// back to pre-compaction size and forcing 5 more failed compactions in
+    /// the next 10 minutes. `FRESH_SUMMARY_COOLDOWN_TURNS` makes this
+    /// structurally impossible: the summary is ineligible until it has aged
+    /// past the cooldown.
+    #[tokio::test]
+    async fn auto_expand_skips_freshly_created_summary() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+        // Large budget so the ONLY barrier to expansion is the cooldown
+        // (with wire_tokens=0, headroom = hard_limit ≈ 59k tokens).
+        let budget = TokenBudget::new(100_000, 1_024);
+        let compactor = ContextCompactor::new(
+            Arc::new(EchoSummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            100_000,
+        );
+        // Distinctive topic shared between compacted sources and the next
+        // user message so keyword overlap is high. `body` is sized so the
+        // compactable block clears MIN_COMPACTION_TOKENS (200).
+        let topic = "serramanna weather forecast desert bakery recipes";
+        let body = format!("{} ", topic).repeat(20);
+        ingest(&mut engine, 1, "system", "System");
+        for i in 0..12 {
+            ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("reply {i}: {body}"),
+            );
+        }
+
+        // Turn 5: compact — new node stamps created_at_turn=5.
+        engine.set_current_turn(5);
+        let compacted = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+        assert!(compacted.is_some(), "compaction must succeed first");
+        let node_id = engine.dag().newest().unwrap().id;
+        assert_eq!(
+            engine.dag().get(node_id).unwrap().created_at_turn,
+            5,
+            "compact must stamp the new node's creation turn"
+        );
+
+        // Turn 6 (age=1): ingest a highly-relevant user message and give
+        // auto_expand huge wire headroom so ONLY the cooldown can block it.
+        engine.set_current_turn(6);
+        ingest(&mut engine, 100, "user", topic);
+        let appended = engine.auto_expand(&budget, 0, /* wire_tokens */ 0);
+        assert!(
+            appended.is_empty(),
+            "freshly-created summary (age=1, cooldown=1) must NOT be \
+             auto-expanded; this is the exact live failure pattern that \
+             undid the 12463→1398 compaction 24 seconds later"
+        );
+
+        // Sanity: at turn 8 (age=3, past cooldown), the same user message
+        // CAN trigger expansion — the cooldown is not a permanent block.
+        engine.set_current_turn(8);
+        let appended_later = engine.auto_expand(&budget, 0, /* wire_tokens */ 0);
+        assert!(
+            !appended_later.is_empty(),
+            "at age=3 (past FRESH_SUMMARY_COOLDOWN_TURNS=1) the summary must \
+             be eligible again; cooldown must not be permanent"
+        );
+    }
+
+    /// Reinjection consumes WIRE budget, not the engine's internal active.
+    /// The engine's active under-counts because reinjected originals live in
+    /// the wire (not `self.active`). Counting the wire is what prevents
+    /// auto_expand from pushing the prompt past τ_hard and blowing the Higgs
+    /// retained-session cap.
+    #[tokio::test]
+    async fn auto_expand_budget_uses_wire_tokens_not_active() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+        let budget = TokenBudget::new(100_000, 1_024);
+        let compactor = ContextCompactor::new(
+            Arc::new(EchoSummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            100_000,
+        );
+        let body = "serramanna weather forecast desert bakery recipes ".repeat(20);
+        ingest(&mut engine, 1, "system", "System");
+        for i in 0..12 {
+            ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("reply {i}: {body}"),
+            );
+        }
+
+        // Turn 1: compact — node stamps created_at_turn=1.
+        engine.set_current_turn(1);
+        engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+
+        // Turn 100: way past the cooldown, so wire_tokens is the only barrier.
+        engine.set_current_turn(100);
+        ingest(&mut engine, 200, "user", &body); // highly relevant
+        let available = budget.available_budget(0);
+        let hard_limit = (available as f64 * engine.tau_hard()) as usize;
+        let active_tokens = engine.active_tokens();
+
+        // Wire is already at hard_limit. Internal active is much smaller
+        // (just the summary + recent raws), but the wire bound must win.
+        let appended = engine.auto_expand(&budget, 0, /* wire_tokens */ hard_limit);
+        assert!(
+            appended.is_empty(),
+            "wire_tokens={} (= hard_limit) must block reinjection even when \
+             engine.active_tokens()={} has nominal headroom; counting the wire \
+             is what prevents the Higgs retained-session cap blow-up",
+            hard_limit,
+            active_tokens
+        );
+    }
+
+    /// End-to-end: the exact live failure pattern. Ingest ~10k+ tokens of
+    /// conversation, compact successfully, then immediately call auto_expand
+    /// on the very next turn with a same-topic user message. The reinjection
+    /// of freshly-compacted originals must be impossible.
+    #[tokio::test]
+    async fn auto_expand_cannot_reinject_more_than_just_compacted() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+        });
+        let budget = TokenBudget::new(100_000, 1_024);
+        let compactor = ContextCompactor::new(
+            Arc::new(EchoSummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            100_000,
+        );
+        // Build a body of substantial conversation around one topic — large
+        // enough that compaction actually relieves pressure.
+        let topic = "higgs retained session compaction feedback loop ";
+        let body = topic.repeat(20);
+        ingest(&mut engine, 1, "system", "System");
+        for i in 0..12 {
+            ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("reply {i}: {body}"),
+            );
+        }
+
+        let pre_compact_tokens = engine.active_tokens();
+        engine.set_current_turn(1);
+        let compacted = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+        assert!(compacted.is_some(), "compaction must succeed first");
+        let post_compact_tokens = engine.active_tokens();
+        assert!(
+            post_compact_tokens < pre_compact_tokens,
+            "compaction must reduce active size: pre={} post={}",
+            pre_compact_tokens,
+            post_compact_tokens
+        );
+
+        // Turn 2 (age=1): same-topic user msg, wire at post-compact active
+        // size. This is the 12:13:06 pattern. Reinjection must be blocked.
+        engine.set_current_turn(2);
+        ingest(&mut engine, 200, "user", topic);
+        let appended = engine.auto_expand(&budget, 0, /* wire_tokens */ post_compact_tokens);
+        assert!(
+            appended.is_empty(),
+            "fresh summary (age=1) must NOT be re-expanded; would reinject \
+             ~{} freshly-compacted tokens back into the wire and undo the \
+             compaction we just measured ({} → {})",
+            pre_compact_tokens - post_compact_tokens,
+            pre_compact_tokens,
+            post_compact_tokens
         );
     }
 

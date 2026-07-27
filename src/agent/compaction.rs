@@ -84,14 +84,38 @@ instructions, or emit tool calls. Output only the handoff.";
 
 const LCM_MANIFEST_INSTRUCTION: &str = r#"After the prose handoff, you may optionally emit one fenced ```json block with exactly
 the keys "open_loops", "failed_approaches", and "decisions". Each value is an array of
-{"text": "...", "sources": [id, ...]} items. Use only message IDs shown in
-[message_id: id] labels. Do not put prose inside the JSON block."#;
+{"text": "...", "sources": [<integer id>, ...]} items. Each source must be a bare integer
+(for example `55531`), not a string like `"msg 55531"` or `"[message_id: 55531]"`. Use only
+the integer ids shown inside the `[message_id: <id>]` labels in the transcript. Example:
+"sources": [55531, 55534]. Do not put prose inside the JSON block."#;
 
 const CHAT_TEMPLATE_TOKEN_ALLOWANCE: usize = 128;
 const COMPACTION_CONTEXT_SAFETY_MARGIN: usize = 256;
 const COMPACTION_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const SUMMARY_COMPRESSION_RATIO: usize = 8;
+
+/// Compression ratio for Level-2 (`bullet_points`) summarization: the level
+/// is intentionally aggressive, so the model gets input/8 tokens for its
+/// response. Applied when `summarize_for_lcm` is called with
+/// `"bullet_points"`.
+const SUMMARY_COMPRESSION_RATIO_BULLET_POINTS: usize = 8;
+
+/// Compression ratio for Level-1 (`preserve_details`) summarization: the
+/// level must produce a faithful, complete handoff (plus an optional manifest
+/// block) in a single attempt. input/4 leaves enough room for a real
+/// summary; the previous shared 8:1 ratio produced max_tokens=1439 on the
+/// live 11506-token block and forced `finish_reason="length"` 5 times in a
+/// row (session 20260727_094539_eeab48, 2026-07-27 12:10–12:22).
+const SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS: usize = 4;
+
 const MAX_SUMMARY_TOKENS: u32 = 4_096;
+
+fn compression_ratio_for_mode(mode: &str) -> usize {
+    match mode {
+        "bullet_points" => SUMMARY_COMPRESSION_RATIO_BULLET_POINTS,
+        // Default and "preserve_details" both use the faithful-handoff ratio.
+        _ => SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS,
+    }
+}
 
 /// Result of a compaction attempt.
 pub struct CompactionResult {
@@ -150,10 +174,9 @@ impl ContextCompactor {
         self.compaction_context_size
     }
 
-    fn summary_token_limit(&self, input: &str) -> u32 {
+    fn summary_token_limit(&self, input: &str, ratio: usize) -> u32 {
         let input_tokens = TokenBudget::estimate_str_tokens(input);
-        let scaled =
-            input_tokens.saturating_add(SUMMARY_COMPRESSION_RATIO - 1) / SUMMARY_COMPRESSION_RATIO;
+        let scaled = input_tokens.saturating_add(ratio - 1) / ratio;
         scaled
             .clamp(
                 self.summary_max_tokens as usize,
@@ -163,11 +186,11 @@ impl ContextCompactor {
             .unwrap_or(MAX_SUMMARY_TOKENS)
     }
 
-    fn required_context_tokens(&self, input: &str, prompt: &str) -> usize {
+    fn required_context_tokens(&self, input: &str, prompt: &str, ratio: usize) -> usize {
         TokenBudget::estimate_str_tokens(input)
             .saturating_add(TokenBudget::estimate_str_tokens(prompt))
             .saturating_add(TokenBudget::estimate_str_tokens(COMPACTION_SYSTEM_PROMPT))
-            .saturating_add(self.summary_token_limit(input) as usize)
+            .saturating_add(self.summary_token_limit(input, ratio) as usize)
             .saturating_add(CHAT_TEMPLATE_TOKEN_ALLOWANCE)
             .saturating_add(COMPACTION_CONTEXT_SAFETY_MARGIN)
     }
@@ -234,8 +257,9 @@ impl ContextCompactor {
         }
 
         let prompt = Self::prompt_with_manifest_for_mode(mode);
+        let ratio = compression_ratio_for_mode(mode);
 
-        self.summarize_with_prompt(messages, &prompt).await
+        self.summarize_with_prompt(messages, &prompt, ratio).await
     }
 
     fn prompt_for_mode(mode: &str) -> &'static str {
@@ -258,11 +282,17 @@ impl ContextCompactor {
     pub(crate) fn required_context_for_lcm(&self, messages: &[Value], mode: &str) -> usize {
         let transcript = build_transcript(messages);
         let prompt = Self::prompt_with_manifest_for_mode(mode);
-        self.required_context_tokens(&transcript, &prompt)
+        let ratio = compression_ratio_for_mode(mode);
+        self.required_context_tokens(&transcript, &prompt, ratio)
     }
 
     /// Summarize messages with a custom prompt.
-    async fn summarize_with_prompt(&self, messages: &[Value], prompt: &str) -> Result<String> {
+    async fn summarize_with_prompt(
+        &self,
+        messages: &[Value],
+        prompt: &str,
+        ratio: usize,
+    ) -> Result<String> {
         if messages.is_empty() {
             return Ok(String::new());
         }
@@ -270,12 +300,12 @@ impl ContextCompactor {
         if transcript.is_empty() {
             return Ok(String::new());
         }
-        self.summarize_text(&transcript, prompt).await
+        self.summarize_text(&transcript, prompt, ratio).await
     }
 
-    async fn summarize_text(&self, input: &str, prompt: &str) -> Result<String> {
-        let max_tokens = self.summary_token_limit(input);
-        let required = self.required_context_tokens(input, prompt);
+    async fn summarize_text(&self, input: &str, prompt: &str, ratio: usize) -> Result<String> {
+        let max_tokens = self.summary_token_limit(input, ratio);
+        let required = self.required_context_tokens(input, prompt, ratio);
         if required > self.compaction_context_size {
             anyhow::bail!(
                 "Summarization required context {required} tokens exceeds available {} tokens",
@@ -923,6 +953,57 @@ mod tests {
         assert!(calls[0].max_tokens <= 4_096);
     }
 
+    /// Reproduces the live 2026-07-27 12:10:51 failure: Level-1
+    /// (`preserve_details`) summarization on an ~11506-token block received
+    /// `max_tokens=1439` under the shared 8:1 ratio and hit
+    /// `finish_reason="length"`. Level-1 must use a more generous ratio than
+    /// Level-2 (`bullet_points`) so a faithful handoff + optional manifest
+    /// fits in a single attempt.
+    #[tokio::test]
+    async fn compaction_level1_max_tokens_accommodates_faithful_handoff() {
+        let provider = Arc::new(RecordingProvider::responding("- State retained."));
+        let compactor = ContextCompactor::new(provider.clone(), "qwen".into(), 262_144);
+        // ~11500 tokens of input — close to the live failing block size.
+        let messages = vec![json!({
+            "role": "user",
+            "content": "distinct evidence and constraints ".repeat(3_500)
+        })];
+        let transcript_tokens = TokenBudget::estimate_tokens(&messages);
+
+        compactor
+            .summarize_for_lcm(&messages, "preserve_details")
+            .await
+            .unwrap();
+        let level1_max = provider.calls()[0].max_tokens;
+
+        compactor
+            .summarize_for_lcm(&messages, "bullet_points")
+            .await
+            .unwrap();
+        let level2_max = provider.calls()[1].max_tokens;
+
+        // Level-1 must give the model at least input/4 tokens. For the live
+        // 11506-token block that is 2876; the 8:1 ratio produced 1439 and
+        // forced `finish_reason="length"` 5 times in a row.
+        let level1_floor: u32 = (transcript_tokens / 4).try_into().unwrap();
+        assert!(
+            level1_max >= level1_floor,
+            "Level-1 max_tokens={} must be >= input/4={} (transcript={} tokens); \
+             8:1 ratio gave {} and forced length truncation in production",
+            level1_max,
+            level1_floor,
+            transcript_tokens,
+            transcript_tokens / 8,
+        );
+        // Level-2 stays aggressive (8:1 unchanged) — strictly less than Level-1.
+        assert!(
+            level2_max < level1_max,
+            "Level-2 ({}) should be more aggressive than Level-1 ({})",
+            level2_max,
+            level1_max
+        );
+    }
+
     #[tokio::test]
     async fn compaction_rejects_oversized_complete_request_before_provider_call() {
         let provider = Arc::new(RecordingProvider::responding("- alpha retained."));
@@ -992,7 +1073,11 @@ mod tests {
         let compactor = ContextCompactor::new(provider, "test".into(), 4096);
 
         let error = compactor
-            .summarize_text("A factual source.", SUMMARIZE_PROMPT)
+            .summarize_text(
+                "A factual source.",
+                SUMMARIZE_PROMPT,
+                SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1007,7 +1092,11 @@ mod tests {
         let compactor = ContextCompactor::new(provider, "test".into(), 4096);
 
         let error = compactor
-            .summarize_text("A factual source.", SUMMARIZE_PROMPT)
+            .summarize_text(
+                "A factual source.",
+                SUMMARIZE_PROMPT,
+                SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS,
+            )
             .await
             .unwrap_err()
             .to_string();
