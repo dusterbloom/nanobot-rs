@@ -365,6 +365,13 @@ pub(crate) struct FlowControl {
     pub(crate) consecutive_repeat_rounds: u32,
     /// True once we've already nudged about a repeating tool call; the next
     /// repeat forces a stop instead of nudging again.
+    /// Consecutive rounds where ALL tool calls were blocked by the lease.
+    /// After 2, tool_defs are stripped for the next iteration — one cache
+    /// miss, but the model then physically cannot emit tool calls and must
+    /// produce a text answer. Without this, a small model that ignores
+    /// the lease receipt keeps trying indefinitely, burning iterations
+    /// and churning the cache with unique-UUID receipts.
+    pub(crate) consecutive_lease_blocks: u32,
     pub(crate) repeat_nudged: bool,
 }
 
@@ -1193,15 +1200,24 @@ impl AgentLoopShared {
 
         // Select and filter tool definitions for this turn.
         //
-        // Tool-lease enforcement happens at execution time, not here.
-        // Stripping `tool_defs` would change the tool-block hash and bust
-        // the prefix cache (chat template renders tools at the prompt
-        // head → ~60s re-prefill on Higgs per cache miss). Instead, the
-        // lease records each call in `step_execute_tools` and either
-        // executes it or injects a "lease exhausted — renew or answer"
-        // receipt. Tool-block bytes stay byte-stable across the entire
-        // turn.
+        // Tool-lease enforcement happens at execution time (cache-safe).
+        // But after 2 consecutive rounds where ALL calls were blocked by
+        // the lease, we strip tool_defs entirely — a small model that
+        // ignores the "lease exhausted" receipt keeps trying tools
+        // indefinitely, burning iterations and churning the cache with
+        // unique-UUID receipts. One cache miss here stops the churn and
+        // forces a text answer. The counter resets as soon as any tool
+        // succeeds (renewal, new lease, etc.).
         let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx);
+        const LEASE_BLOCKS_BEFORE_STRIP: u32 = 2;
+        if ctx.flow.consecutive_lease_blocks >= LEASE_BLOCKS_BEFORE_STRIP && !tool_defs.is_empty() {
+            tracing::info!(
+                session = %ctx.session_key,
+                consecutive_blocks = ctx.flow.consecutive_lease_blocks,
+                "tool_lease_stripping_after_blocks — model ignored receipts, forcing text-only iteration"
+            );
+            tool_defs.clear();
+        }
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
         } else {
@@ -2723,6 +2739,12 @@ impl AgentLoopShared {
             // iteration (matches the response_boundary pattern).
             ctx.flow.round_executed_no_tools = true;
             ctx.flow.tool_guard.had_blocked_calls = true;
+            // Track consecutive lease-only-blocked rounds. After 2,
+            // step_pre_call strips tool_defs to force a text answer.
+            ctx.flow.consecutive_lease_blocks = ctx.flow.consecutive_lease_blocks.saturating_add(1);
+        } else if !routed_tool_calls.is_empty() {
+            // At least one tool ran — reset the consecutive-block counter.
+            ctx.flow.consecutive_lease_blocks = 0;
         }
         // Snapshot the dispatched tool-call keys for the repeated-call breaker.
         let dispatched_keys: Vec<String> = routed_tool_calls
