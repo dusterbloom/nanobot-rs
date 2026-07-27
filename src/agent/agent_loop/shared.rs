@@ -2094,6 +2094,44 @@ impl AgentLoopShared {
                         .get(first_divergent_msg)
                         .map(divergent_message_digest)
                         .unwrap_or_else(|| "(out of range)".to_string());
+                    // Diagnostic: dump the full rendered content of the
+                    // divergent message and its neighbors so the exact
+                    // byte change is visible in the log.
+                    let prev_fp = store.get(&ctx.session_key);
+                    if let Some(prev_fp) = prev_fp {
+                        let prev_hash = prev_fp.msg_hash_at(first_divergent_msg);
+                        let new_hash = messages_for_llm
+                            .get(first_divergent_msg)
+                            .map(prompt_fingerprint::hash_value);
+                        tracing::warn!(
+                            session = %ctx.session_key,
+                            at_msg = first_divergent_msg,
+                            prev_msgs,
+                            new_msgs,
+                            prev_hash = ?prev_hash,
+                            new_hash = ?new_hash,
+                            "divergence_hash_comparison"
+                        );
+                    }
+                    let dump_msg = |idx: usize, label: &str| {
+                        if let Some(m) = messages_for_llm.get(idx) {
+                            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                            let content = m
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("(non-string)");
+                            tracing::warn!(
+                                session = %ctx.session_key,
+                                idx, label, role,
+                                content_len = content.len(),
+                                content_preview = %content.chars().take(200).collect::<String>(),
+                                "divergence_context_dump"
+                            );
+                        }
+                    };
+                    dump_msg(first_divergent_msg.saturating_sub(1), "prev_msg");
+                    dump_msg(first_divergent_msg, "divergent_msg");
+                    dump_msg(first_divergent_msg + 1, "next_msg");
                     // Coarse class for the TUI footer. Extracted from the
                     // divergent message's tags so the user sees
                     /// `cache reset · lcm summary @ msg N` instead of the

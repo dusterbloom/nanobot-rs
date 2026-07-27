@@ -23,6 +23,15 @@ pub struct PromptFingerprint {
     msg_hashes: Vec<u64>,
 }
 
+impl PromptFingerprint {
+    /// Hash at a given message index. Exposed for diagnostic logging
+    /// at divergence points (shared.rs dumps prev vs new hash to
+    /// pinpoint which message's rendered bytes changed).
+    pub fn msg_hash_at(&self, idx: usize) -> Option<u64> {
+        self.msg_hashes.get(idx).copied()
+    }
+}
+
 /// How this call's prompt relates to the previous call's in the same session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptDelta {
@@ -39,7 +48,7 @@ pub enum PromptDelta {
     },
 }
 
-fn hash_value(v: &Value) -> u64 {
+pub fn hash_value(v: &Value) -> u64 {
     let mut h = DefaultHasher::new();
     // Serialized form is what reaches the server; hash exactly that.
     v.to_string().hash(&mut h);
