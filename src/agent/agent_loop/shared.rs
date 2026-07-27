@@ -17,6 +17,7 @@ use crate::agent::agent_loop::heuristics::{
     adaptive_max_tokens_for_artifact_action, evaluate_repeated_tool_round, RepeatBreakerAction,
 };
 use crate::agent::audit::{AuditLog, ToolEvent};
+use crate::agent::context::ContextBuilder;
 use crate::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
 use crate::agent::lease::{Lease, DEFAULT_MAX_LEASES_PER_TURN, DEFAULT_TOOLS_PER_LEASE};
 use crate::agent::policy;
@@ -1191,21 +1192,16 @@ impl AgentLoopShared {
         }
 
         // Select and filter tool definitions for this turn.
+        //
+        // Tool-lease enforcement happens at execution time, not here.
+        // Stripping `tool_defs` would change the tool-block hash and bust
+        // the prefix cache (chat template renders tools at the prompt
+        // head → ~60s re-prefill on Higgs per cache miss). Instead, the
+        // lease records each call in `step_execute_tools` and either
+        // executes it or injects a "lease exhausted — renew or answer"
+        // receipt. Tool-block bytes stay byte-stable across the entire
+        // turn.
         let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx);
-        // Tool lease: when the per-turn budget is exhausted, strip tool
-        // definitions entirely so the model cannot emit more tool calls
-        // and must produce a final text answer. This is the structural
-        // prevention for the 2026-07-27 13-call loop (session
-        // 20260727_161730_6e61a0). See
-        // `docs/superpowers/specs/2026-07-27-tool-leases-design.md`.
-        if ctx.flow.lease.is_exhausted() && !tool_defs.is_empty() {
-            tracing::info!(
-                session = %ctx.session_key,
-                lease_size = ?ctx.flow.lease.iterations_used(),
-                "tool_lease_exhausted_stripping_tool_defs"
-            );
-            tool_defs.clear();
-        }
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
         } else {
@@ -2594,36 +2590,79 @@ impl AgentLoopShared {
             })
             .collect();
 
-        // Record each tool call against the per-turn lease. The lease
-        // caps total calls per turn at `lease_size * (1 + max_renewals)`
-        // and the consecutive-same-coarse-family cap blocks loops like
-        // 4×`exec grep` in a row. Blocked calls are dropped here; the
-        // model sees the empty result and either switches family or
-        // emits a final answer.
+        // Tool-lease enforcement. Each call is recorded against the
+        // per-turn lease; calls that exceed the lease budget OR the
+        // consecutive-same-coarse-family cap are NOT executed — they
+        // get a rejection receipt in their tool_call_id slot (preserves
+        // the wire contract) and the model sees a clear renewal prompt.
+        //
+        // Cache-safe by design: tool_defs are NOT modified, so the
+        // tool-block hash stays byte-stable across the entire turn and
+        // the prefix cache hits on every iteration.
         let lease_cap = ctx.flow.lease.coarse_family_cap();
-        let routed_tool_calls: Vec<_> = routed_tool_calls
-            .into_iter()
-            .filter_map(|tc| {
-                let result = ctx
-                    .flow
-                    .lease
-                    .record_tool_call_in_family(&tc.name, &tc.arguments);
-                if result.allowed {
-                    Some(tc)
-                } else {
-                    let reason = result.reason.unwrap_or("lease_blocked");
-                    tracing::info!(
-                        session = %ctx.session_key,
-                        tool = %tc.name,
-                        reason,
-                        cap = lease_cap,
-                        "tool_lease_blocked_call"
-                    );
-                    None
-                }
-            })
-            .collect();
-
+        let mut allowed_calls: Vec<_> = Vec::with_capacity(routed_tool_calls.len());
+        let mut blocked_calls: Vec<(String, String, &'static str)> = Vec::new();
+        for tc in routed_tool_calls {
+            // `lease.record_tool_call_in_family` checks both the
+            // per-lease cap and the consecutive-same-family cap. We do
+            // NOT pre-check `is_exhausted` separately — record_* does
+            // the right thing and returns `lease_exhausted` as the
+            // reason when the budget is gone.
+            let result = ctx
+                .flow
+                .lease
+                .record_tool_call_in_family(&tc.name, &tc.arguments);
+            if result.allowed {
+                allowed_calls.push(tc);
+            } else {
+                let reason = result.reason.unwrap_or("lease_blocked");
+                let name = tc.name.clone();
+                let id = tc.id.clone();
+                blocked_calls.push((name, id, reason));
+            }
+        }
+        // Inject rejection receipts for blocked calls. Each receipt
+        // carries the tool_call_id the model emitted, so the wire's
+        // assistant-tool_calls → tool-results pairing stays intact.
+        for (name, id, reason) in &blocked_calls {
+            tracing::info!(
+                session = %ctx.session_key,
+                tool = %name,
+                reason,
+                cap = lease_cap,
+                "tool_lease_blocked_call"
+            );
+            let msg = if *reason == "coarse_family_cap" {
+                format!(
+                    "lease cap: {name} was not executed — you have hit the \
+                     consecutive same-family limit ({lease_cap} calls). Switch \
+                     to a different tool/command family, or write a renewal \
+                     checkpoint (findings:/next:/will:) to continue."
+                )
+            } else {
+                format!(
+                    "lease exhausted: {name} was not executed — your per-turn \
+                     tool budget is used up. Write a renewal checkpoint \
+                     (findings:/next:/will:) to continue with more tools, or \
+                     write your final answer."
+                )
+            };
+            ContextBuilder::add_tool_result_immutable_with_status(
+                &mut ctx.messages,
+                id,
+                name,
+                &msg,
+                false,
+            );
+        }
+        let routed_tool_calls = allowed_calls;
+        if routed_tool_calls.is_empty() && !blocked_calls.is_empty() {
+            // Every call this round was blocked by the lease — flag it
+            // so the loop machinery doesn't count this as a real
+            // iteration (matches the response_boundary pattern).
+            ctx.flow.round_executed_no_tools = true;
+            ctx.flow.tool_guard.had_blocked_calls = true;
+        }
         // Snapshot the dispatched tool-call keys for the repeated-call breaker.
         let dispatched_keys: Vec<String> = routed_tool_calls
             .iter()
