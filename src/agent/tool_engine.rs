@@ -612,6 +612,13 @@ pub(crate) async fn execute_tools_delegated(
                 tc.id
             ));
         }
+        // Prepend the per-lease progress signal so the model can see
+        // remaining budget inline (B3 of the lease design — visible,
+        // deterministic, helps the model self-regulate instead of being
+        // interrupted). Recorded calls already incremented the counter,
+        // so this describes the call that produced this result.
+        let lease_signal = ctx.flow.lease.progress_signal();
+        injected = format!("{lease_signal}\n{injected}");
 
         let ok = tool_result_ok(full_data);
         if ctx.core.provenance_config.enabled {

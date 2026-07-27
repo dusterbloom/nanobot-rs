@@ -272,6 +272,12 @@ impl Lease {
         self.renewals_used
     }
 
+    /// Configured per-lease tool budget. Exposed so the renewal nudge
+    /// can tell the model exactly how many calls it has after renewal.
+    pub fn lease_size(&self) -> u32 {
+        self.lease_size
+    }
+
     /// Coarse-family cap (consecutive same-family calls allowed within
     /// a lease). Exposed for logging/receipts — modification is via
     /// `new()` defaults only for now.
@@ -315,12 +321,12 @@ impl Lease {
 
     /// Format the progress signal for inclusion in tool results.
     ///
-    /// `L = max_renewals - renewals_used` (future leases still
-    /// obtainable this turn). The call index `N` is one ahead of
-    /// `iterations_used` because the signal is shown BEFORE the call
-    /// executes — "you are about to make call N of M".
+    /// `L = max_renewals - renewals_used` (future leases still obtainable
+    /// this turn). The call index `N` is `iterations_used` — the call that
+    /// just executed (record_tool_call* was already called by the time
+    /// tool_engine adds the result). For the first call this is 1, etc.
     pub fn progress_signal(&self) -> String {
-        let current_call = self.iterations_used + 1;
+        let current_call = self.iterations_used;
         let leases_remaining = self.max_renewals.saturating_sub(self.renewals_used);
         format!(
             "[Tool call {} of {} this lease — {} leases remaining]",
@@ -604,11 +610,13 @@ mod tests {
     /// `[Tool call N of M this lease — L leases remaining]`. The model
     /// uses this to self-regulate instead of being interrupted.
     /// `L = max_renewals - renewals_used` (number of future leases still
-    /// obtainable this turn).
+    /// obtainable this turn). `N = iterations_used` — the call that just
+    /// ran (record_tool_call* was called before the result is formatted).
     #[test]
     fn lease_progress_signal_format() {
         let mut lease = Lease::new(5, 3);
-        // Call 1 of 5 in lease 1; 3 future leases obtainable.
+        // First call records, then signal describes that call.
+        lease.record_tool_call();
         let s1 = lease.progress_signal();
         assert!(s1.contains("Tool call 1 of 5"), "got: {s1}");
         assert!(s1.contains("3 leases remaining"), "got: {s1}");
@@ -619,11 +627,13 @@ mod tests {
         assert!(s2.contains("3 leases remaining"), "got: {s2}");
 
         // Renew — now in lease 2; 2 future leases obtainable.
-        for _ in 0..4 {
+        for _ in 0..3 {
             lease.record_tool_call();
         }
         assert!(lease.is_exhausted());
         lease.try_renew("Findings: x.\nNext: y.\nWill: z.");
+        // After renewal, the next call records as call 1 of the new lease.
+        lease.record_tool_call();
         let s_after = lease.progress_signal();
         assert!(
             s_after.contains("Tool call 1 of 5"),

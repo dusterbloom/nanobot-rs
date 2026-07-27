@@ -437,6 +437,62 @@ impl AgentLoopShared {
             }
 
             ResponseKind::Text(content) => {
+                // Tool-lease renewal: when the lease was exhausted (tools
+                // stripped on the previous step_pre_call) and the model
+                // emitted a structured checkpoint (findings + next + will),
+                // renew the lease and continue with tools restored. The
+                // checkpoint text is left in the conversation so the user
+                // can see what the model committed to.
+                //
+                // Renewal is the only "synthetic injection" the lease
+                // design needs: it confirms to the model that tools are
+                // back, then loops back to step_pre_call where tool_defs
+                // are recomputed (no longer exhausted). No hidden state.
+                if ctx.flow.lease.is_exhausted() && !content.is_empty() {
+                    let renewal = ctx.flow.lease.try_renew(&content);
+                    if renewal.is_valid() {
+                        tracing::info!(
+                            session = %ctx.session_key,
+                            renewals_used = ctx.flow.lease.renewals_used(),
+                            "tool_lease_renewed"
+                        );
+                        // Nudge the model so it knows tools are available
+                        // again. Without this, a small local model may
+                        // emit another text answer instead of tool calls
+                        // even though tool_defs are back on the next call.
+                        ctx.messages
+                            .push(crate::agent::markers::scaffold_user(format!(
+                                "[Lease renewed — {} more tool calls available. \
+                                 Proceed with the plan from your checkpoint.]",
+                                ctx.flow.lease.lease_size()
+                            )));
+                        return StepResult::Next(IterationPhase::PreCall);
+                    } else if !renewal.missing_field().is_empty()
+                        && renewal.missing_field() != "out_of_leases"
+                    {
+                        // Renewal attempted but missing a field. Tell the
+                        // model exactly what's missing so the next attempt
+                        // can succeed — narrow, deterministic, visible.
+                        tracing::info!(
+                            session = %ctx.session_key,
+                            missing = renewal.missing_field(),
+                            "tool_lease_renewal_rejected"
+                        );
+                        ctx.messages
+                            .push(crate::agent::markers::scaffold_user(format!(
+                                "[Lease renewal rejected — your checkpoint is missing \
+                                 '{}'. Either include all of findings:/next:/will: to \
+                                 renew, or write your final answer.]",
+                                renewal.missing_field()
+                            )));
+                        return StepResult::Next(IterationPhase::PreCall);
+                    }
+                    // out_of_leases: fall through to finish the turn.
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        "tool_lease_renewal_out_of_leases"
+                    );
+                }
                 if !ctx.flow.content_was_streamed {
                     send_delta(&ctx.text_delta_tx, &content);
                     ctx.flow.content_was_streamed = true;
