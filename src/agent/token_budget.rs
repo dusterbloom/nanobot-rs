@@ -98,6 +98,12 @@ fn digest_old_tool_results(msgs: &mut Vec<Value>) {
                 if let Some(digest) =
                     shrink_tool_body(content, ToolBodyPolicy::Digest { preview_len: 200 })
                 {
+                    tracing::debug!(
+                        target: "cache_hygiene",
+                        idx,
+                        content_len = content.len(),
+                        "trim_tool_bodies_replaced_with_digest — tool-result bytes mutate mid-session"
+                    );
                     msgs[idx]["content"] = Value::String(digest);
                 }
             }

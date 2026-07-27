@@ -360,6 +360,12 @@ pub(crate) enum CacheStatus {
         at: usize,
         prev: usize,
         messages: usize,
+        /// Coarse class of the divergent message — extracted from
+        /// `divergent_message_digest` tags. Lets the TUI show
+        /// `cache reset · lcm summary @ msg N` instead of the generic
+        /// `cache reset · msg N`. Static strings only (no allocation)
+        /// so the enum stays `Copy`.
+        class: &'static str,
     },
     Reset {
         reason: CacheResetReason,
@@ -408,9 +414,12 @@ impl ControlMarker {
                 CacheStatus::AppendOnly { added, messages } => {
                     format!("\x00cache:append:{added}:{messages}")
                 }
-                CacheStatus::Diverged { at, prev, messages } => {
-                    format!("\x00cache:diverged:{at}:{prev}:{messages}")
-                }
+                CacheStatus::Diverged {
+                    at,
+                    prev,
+                    messages,
+                    class,
+                } => format!("\x00cache:diverged:{at}:{prev}:{messages}:{class}"),
                 CacheStatus::Reset { reason } => {
                     format!("\x00cache:reset:{}", reason.as_wire())
                 }
@@ -464,11 +473,32 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
                 added: parts.next()?.parse().ok()?,
                 messages: parts.next()?.parse().ok()?,
             })),
-            "diverged" => Some(ControlMarker::CacheStatus(CacheStatus::Diverged {
-                at: parts.next()?.parse().ok()?,
-                prev: parts.next()?.parse().ok()?,
-                messages: parts.next()?.parse().ok()?,
-            })),
+            "diverged" => {
+                let at: usize = parts.next()?.parse().ok()?;
+                let prev: usize = parts.next()?.parse().ok()?;
+                let messages: usize = parts.next()?.parse().ok()?;
+                // Map the wire class string back to a known
+                // `&'static str`. Back-compat: missing/unknown
+                // classes fall back to empty string (the TUI renders
+                // the legacy "msg N" form).
+                let class: &'static str = match parts.next().unwrap_or("") {
+                    "lcm summary" => "lcm summary",
+                    "tool result" => "tool result",
+                    "synthetic" => "synthetic",
+                    "cache-replay" => "cache-replay",
+                    "assistant" => "assistant",
+                    "user" => "user",
+                    "system" => "system",
+                    "message" => "message",
+                    _ => "",
+                };
+                Some(ControlMarker::CacheStatus(CacheStatus::Diverged {
+                    at,
+                    prev,
+                    messages,
+                    class,
+                }))
+            }
             "reset" => {
                 let reason = match parts.next()? {
                     "trim" => CacheResetReason::Trim,
@@ -560,6 +590,7 @@ mod tests {
                 at: 2,
                 prev: 140,
                 messages: 209,
+                class: "assistant",
             }),
             ControlMarker::CacheStatus(CacheStatus::Reset {
                 reason: CacheResetReason::Trim,

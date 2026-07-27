@@ -299,6 +299,13 @@ fn truncate_old_assistant_messages(messages: &mut Vec<Value>, keep_last_n: usize
         if has_tool_calls {
             if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
                 if !content.is_empty() {
+                    tracing::warn!(
+                        target: "cache_hygiene",
+                        role = "assistant",
+                        has_tool_calls = true,
+                        content_len = content.len(),
+                        "hygiene_truncated_assistant_with_tool_calls — bytes mutate mid-session, busts prompt prefix cache"
+                    );
                     message["content"] = Value::String(TRUNCATED_ASSISTANT_PLACEHOLDER.to_string());
                 }
             }
@@ -308,6 +315,13 @@ fn truncate_old_assistant_messages(messages: &mut Vec<Value>, keep_last_n: usize
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
             if !content.is_empty() {
+                tracing::warn!(
+                    target: "cache_hygiene",
+                    role = "assistant",
+                    has_tool_calls = false,
+                    content_len = content.len(),
+                    "hygiene_truncated_assistant_text — bytes mutate mid-session, busts prompt prefix cache"
+                );
                 message["content"] = Value::String(TRUNCATED_ASSISTANT_PLACEHOLDER.to_string());
             }
         }

@@ -1551,17 +1551,40 @@ impl AgentLoopShared {
         // `&mut ctx` (invalidate_prompt_cache_for_rewrite) without borrowing it.
         drop(guard);
 
-        if rewrites_prompt {
-            let rotated = invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::LcmCheckpoint);
-            if rotated {
-                warn!(
-                    session = %ctx.session_key,
-                    frozen_prefix,
-                    compacted_messages = pending.result.messages.len(),
-                    watermark = pending.watermark(),
-                    "prompt_cache_watermark_invalidated_by_lcm_checkpoint"
-                );
-            }
+        // Always clear the prompt fingerprint/watermark before
+        // `apply_compaction_result` rewrites the wire. The old gate
+        // (`if rewrites_prompt`) compared the compaction RESULT to the
+        // SNAPSHOT — but `apply_compaction_result` rewrites the LIVE
+        // wire against the snapshot, which can diverge from the result
+        // comparison when the wire grew between trigger and install.
+        // The result: compaction installs without firing
+        // `prompt_cache_watermark_invalidated_by_lcm_checkpoint`, and
+        // the next iteration's fingerprint check sees the rewritten
+        // prefix as an unsanctioned `Diverged` (cache reset, ~60s
+        // re-prefill on Higgs). Clearing unconditionally is safe —
+        // worst case the fingerprint was already cleared and this is a
+        // no-op; the next call recomputes it as `First` instead of
+        // `AppendOnly` (a one-time cheap re-prefill, not an unsanctioned
+        // divergence).
+        let rotated = invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::LcmCheckpoint);
+        if rotated {
+            warn!(
+                session = %ctx.session_key,
+                frozen_prefix,
+                compacted_messages = pending.result.messages.len(),
+                watermark = pending.watermark(),
+                "prompt_cache_watermark_invalidated_by_lcm_checkpoint"
+            );
+        } else {
+            // Even without Higgs session rotation, the local fingerprint
+            // clear happened. Log at INFO so this path is visible in the
+            // daemon log without WARN filtering.
+            info!(
+                session = %ctx.session_key,
+                compacted_messages = pending.result.messages.len(),
+                watermark = pending.watermark(),
+                "prompt_cache_cleared_for_lcm_checkpoint_no_rotation"
+            );
         }
 
         debug!(
@@ -2055,12 +2078,49 @@ impl AgentLoopShared {
                         .get(first_divergent_msg)
                         .map(divergent_message_digest)
                         .unwrap_or_else(|| "(out of range)".to_string());
+                    // Coarse class for the TUI footer. Extracted from the
+                    // divergent message's tags so the user sees
+                    /// `cache reset · lcm summary @ msg N` instead of the
+                    /// generic `cache reset · msg N`. Static strings only.
+                    let divergent_msg = messages_for_llm.get(first_divergent_msg);
+                    let class: &'static str = divergent_msg
+                        .map(|m| {
+                            if m.get("_lcm_summary")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                "lcm summary"
+                            } else if m.get("tool_call_id").is_some() {
+                                "tool result"
+                            } else if m
+                                .get("_synthetic")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                "synthetic"
+                            } else if m
+                                .get("_cache_replay")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                "cache-replay"
+                            } else {
+                                match m.get("role").and_then(|r| r.as_str()).unwrap_or("message") {
+                                    "assistant" => "assistant",
+                                    "user" => "user",
+                                    "system" => "system",
+                                    _ => "message",
+                                }
+                            }
+                        })
+                        .unwrap_or("unknown");
                     tracing::warn!(
                         session = %ctx.session_key,
                         at_msg = first_divergent_msg,
                         prev_msgs,
                         new_msgs,
                         prefill_estimate,
+                        class = %class,
                         digest = %digest,
                         "prompt_prefix_diverged — unsanctioned token_mismatch class; server re-prefills past this point"
                     );
@@ -2068,6 +2128,7 @@ impl AgentLoopShared {
                         at: first_divergent_msg,
                         prev: prev_msgs,
                         messages: new_msgs,
+                        class,
                     })
                     .encode()
                 }

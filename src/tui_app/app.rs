@@ -2550,7 +2550,13 @@ fn cache_status_label(status: CacheStatus) -> (String, Color) {
                 (format!("cache warm · +{} msg", added), pal().accent2)
             }
         }
-        CacheStatus::Diverged { at, .. } => (format!("cache reset · msg {}", at), WARN_COLOR),
+        CacheStatus::Diverged { at, class, .. } => {
+            if class.is_empty() {
+                (format!("cache reset · msg {}", at), WARN_COLOR)
+            } else {
+                (format!("cache reset · {class} @ msg {at}"), WARN_COLOR)
+            }
+        }
         CacheStatus::Reset { reason } => match reason {
             CacheResetReason::Trim => ("cache reset · trim".to_string(), WARN_COLOR),
             CacheResetReason::EmergencyTrim => {
