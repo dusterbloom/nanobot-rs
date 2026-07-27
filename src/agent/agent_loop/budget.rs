@@ -293,10 +293,15 @@ pub(super) fn effective_lcm_available_budget(
     };
     let retained_available =
         retained_conversation_available(retained_cap_tokens, messages, tool_def_tokens);
-    (
-        model_available.min(retained_available),
-        Some(retained_available),
-    )
+    // LCM thresholds use the MODEL's full context budget, NOT the
+    // retained-session cap. The retained cap (24K on default higgs
+    // config) was clamping LCM to compact at 12K conversation tokens
+    // even on 120K-context models — suffocating legitimate long
+    // sessions. The retained-admission check (separate, at shared.rs)
+    // still forces blocking compaction when the retained session is
+    // under pressure, so the safety net is preserved. Cold-prefills
+    // above the retained cap are the accepted tradeoff.
+    (model_available, Some(retained_available))
 }
 
 pub(super) fn retained_context_pressure(

@@ -12,22 +12,25 @@
 
 use serde_json::Value;
 
-/// Default per-lease tool budget. Tuned so a typical lookup-and-answer
-/// turn completes in one lease (read file → answer), but multi-step
-/// exploration must checkpoint to continue.
-pub const DEFAULT_TOOLS_PER_LEASE: u32 = 5;
+/// Default per-lease tool budget. Tuned for coding tasks where the
+/// model needs to read multiple files, run searches, and exec commands
+/// in one turn. 12 is enough for a typical "explore 3-4 files +
+/// summarize" workflow without hitting the cap. The original 5 was
+/// too tight and suffocated legitimate exploration on 120K-context
+/// models.
+pub const DEFAULT_TOOLS_PER_LEASE: u32 = 12;
 
-/// Default cap on lease renewals per turn. Three leases × five tools =
-/// 15 tool calls per turn at maximum, each renewal gated by a validated
-/// checkpoint. Real work almost never exceeds two leases; the cap exists
-/// to bound a model that learns to emit minimal checkpoints.
+/// Default cap on lease renewals per turn. Three leases × twelve tools
+/// = 36 tool calls per turn at maximum, each renewal gated by a
+/// validated checkpoint.
 pub const DEFAULT_MAX_LEASES_PER_TURN: u32 = 3;
 
 /// Default cap on consecutive same-coarse-family tool calls within a
-/// lease. Three calls to `exec:grep` is fine; the fourth is blocked with
-/// a receipt. The model must switch family or checkpoint. This is the
-/// direct prevention for the live `13 × exec:grep` failure.
-pub const DEFAULT_COARSE_FAMILY_CAP: u32 = 3;
+/// lease. Six calls to `exec:grep` is fine; the seventh is blocked.
+/// The original 3 was too tight for legitimate file exploration
+/// (reading 4+ files in a row). 6 prevents the 13-call loop while
+/// allowing reasonable exploration.
+pub const DEFAULT_COARSE_FAMILY_CAP: u32 = 6;
 
 /// Read-only exec commands (by leading word). Writes and unknown
 /// commands are treated as their own family — `exec:write` or
@@ -579,21 +582,24 @@ mod tests {
     /// Within a lease, the coarse-family cap blocks the 4th consecutive
     /// same-family call. A different family is still allowed.
     #[test]
-    fn coarse_family_cap_blocks_fourth_consecutive_grep() {
-        let mut lease = Lease::new(5, 2);
+    fn coarse_family_cap_blocks_excessive_consecutive_grep() {
+        let mut lease = Lease::new(20, 2);
         let grep_args = args(&[("command", "grep pattern path")]);
         let find_args = args(&[("command", "find . -name x")]);
 
-        // Three consecutive `readonly_search` calls are allowed.
-        assert!(lease.record_tool_call_in_family("exec", &grep_args).allowed);
-        assert!(lease.record_tool_call_in_family("exec", &grep_args).allowed);
-        assert!(lease.record_tool_call_in_family("exec", &grep_args).allowed);
+        // Six consecutive `exec:grep` calls are allowed (cap = 6).
+        for _ in 0..6 {
+            assert!(
+                lease.record_tool_call_in_family("exec", &grep_args).allowed,
+                "calls within cap must be allowed"
+            );
+        }
 
-        // The 4th same-family call is blocked.
+        // The 7th same-family call is blocked.
         let blocked = lease.record_tool_call_in_family("exec", &grep_args);
         assert!(
             !blocked.allowed,
-            "4th consecutive readonly_search must be blocked by the cap"
+            "7th consecutive exec:grep must be blocked by the cap"
         );
         assert_eq!(
             blocked.reason,

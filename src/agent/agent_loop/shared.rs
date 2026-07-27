@@ -3517,13 +3517,18 @@ mod cache_pressure_tests {
     }
 
     #[test]
-    fn lcm_available_budget_is_capped_by_retained_prompt_budget() {
+    fn lcm_available_budget_uses_model_context_not_retained_cap() {
+        // LCM thresholds use the MODEL's full context budget (not the
+        // retained-session cap). The retained cap is tracked separately
+        // for admission decisions but does NOT clamp LCM. This lets a
+        // 120K-context model use its full context for conversation
+        // without LCM compacting at 12K (50% of the old 24K retained cap).
         let messages = vec![
             json!({"role": "system", "content": "system ".repeat(40)}),
             json!({"role": "user", "content": "history ".repeat(80)}),
         ];
-        let model_available = 30_000;
-        let retained_cap = 500;
+        let model_available = 120_000;
+        let retained_cap = 24_576;
         let tool_def_tokens = 50;
         let (available, retained_available) = effective_lcm_available_budget(
             model_available,
@@ -3532,11 +3537,19 @@ mod cache_pressure_tests {
             Some(retained_cap),
         );
 
-        let retained_available =
+        // LCM gets the model's full budget.
+        assert_eq!(
+            available, model_available,
+            "LCM available must use model context, not retained cap"
+        );
+        // Retained budget is tracked separately (for admission).
+        let retained =
             retained_available.expect("retained budget should be reported when cap is present");
-        assert_eq!(available, retained_available);
-        assert!(available < model_available);
-        assert!(available <= retained_cap - tool_def_tokens);
+        assert!(
+            retained < model_available,
+            "retained budget is smaller than model context"
+        );
+        assert!(retained <= retained_cap);
     }
 
     #[test]
