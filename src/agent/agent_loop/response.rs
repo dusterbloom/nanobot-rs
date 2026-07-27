@@ -1377,13 +1377,14 @@ mod tests {
         let protocol = LocalProtocol::native();
         let rendered = super::prepare_rescue_messages(&raw, &protocol);
 
-        // No message should have role "tool" or "developer" after rendering.
+        // After rendering, the local protocol now emits role:tool for
+        // tool results in NativeToolCalls mode (the chat template
+        // handles it natively). All roles are valid.
         for msg in &rendered {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
             assert!(
-                role == "system" || role == "user" || role == "assistant",
-                "rescue messages contain invalid role '{}' that local templates reject",
-                role,
+                role == "system" || role == "user" || role == "assistant" || role == "tool",
+                "rescue messages contain unexpected role '{role}'",
             );
         }
         // Must end with user (the rescue prompt).

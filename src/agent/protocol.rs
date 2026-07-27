@@ -284,22 +284,47 @@ impl ConversationProtocol for LocalProtocol {
                     call_id,
                     result,
                     ok,
-                } => {
-                    // Tool results become user messages for alternation compliance.
-                    let header = if *ok {
-                        format!("[System: tool succeeded - {}({}) returned]", tool, call_id)
-                    } else {
-                        format!(
-                            "[System: TOOL FAILED - {}({}) did not complete successfully. \
-                             Report this error exactly before trying another path]",
-                            tool, call_id
-                        )
-                    };
-                    json!({
-                        "role": "user",
-                        "content": format!("{header}:\n{result}"),
-                    })
-                }
+                } => match self.replay_mode {
+                    LocalReplayMode::NativeToolCalls => {
+                        // Native OpenAI format: role:tool with
+                        // tool_call_id + name + content. No
+                        // [System: tool succeeded...] wrapper — the
+                        // chat template handles tool messages natively
+                        // via <|im_start|>tool. This keeps tool-result
+                        // bytes deterministic (no UUID in a header
+                        // string) and avoids the user-role conversion
+                        // that caused repair_role_alternation to insert
+                        // dynamic separators between consecutive
+                        // results (the prefix-cache divergence root
+                        // cause, 2026-07-27).
+                        json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "name": tool,
+                            "content": result,
+                        })
+                    }
+                    LocalReplayMode::TextualReplay => {
+                        // Textual models have no native tool_calls —
+                        // render as user messages with the [System: ...]
+                        // header so the model can correlate results to
+                        // calls by position and tool name.
+                        let header = if *ok {
+                            format!("[System: tool succeeded - {}({}) returned]", tool, call_id)
+                        } else {
+                            format!(
+                                "[System: TOOL FAILED - {}({}) did not complete \
+                                 successfully. Report this error exactly before \
+                                 trying another path]",
+                                tool, call_id
+                            )
+                        };
+                        json!({
+                            "role": "user",
+                            "content": format!("{header}:\n{result}"),
+                        })
+                    }
+                },
                 Turn::Summary { text, .. } => {
                     // Summaries render as user context blocks (local models may not follow
                     // assistant-role summaries reliably).
@@ -702,7 +727,12 @@ fn repair_role_alternation(messages: Vec<Value>) -> Vec<Value> {
         if let Some(last) = out.last() {
             let last_role = last["role"].as_str().unwrap_or("");
             let role = msg["role"].as_str().unwrap_or("");
-            if last_role == role && role != "system" {
+            // Consecutive tool messages are valid in the OpenAI format
+            // (parallel tool results from one assistant turn). Inserting
+            // a user separator between them would mutate the rendered
+            // prefix on every new tool result — the exact cache-busting
+            // pattern observed 2026-07-27.
+            if last_role == role && role != "system" && role != "tool" {
                 let sep = if role == "user" { "assistant" } else { "user" };
                 out.push(json!({"role": sep, "content": ""}));
             }
@@ -765,8 +795,24 @@ mod tests {
     }
 
     #[test]
-    fn local_no_tool_role() {
+    fn native_mode_uses_tool_role() {
+        // NativeToolCalls mode (default for local with higgs) now
+        // renders tool results as role:tool — the OpenAI-native format
+        // the chat template handles via <|im_start|>tool. This replaced
+        // the old role:user conversion that caused prefix-cache
+        // instability (2026-07-27).
         let wire = LocalProtocol::default().render("sys", &tool_turns());
+        assert!(
+            wire.iter().any(|m| m["role"] == "tool"),
+            "NativeToolCalls mode must include role:tool messages"
+        );
+    }
+
+    #[test]
+    fn textual_mode_has_no_tool_role() {
+        // TextualReplay mode still converts tool results to role:user
+        // because there are no native tool_calls to pair with.
+        let wire = LocalProtocol::textual().render("sys", &tool_turns());
         assert!(wire.iter().all(|m| m["role"] != "tool"));
     }
 
@@ -972,6 +1018,148 @@ mod tests {
         assert!(tool_result.contains("list_dir(tc_1)"));
         assert!(tool_result.contains("Error: Directory not found: /bad/path"));
         assert!(tool_result.contains("Report this error exactly"));
+    }
+
+    // -----------------------------------------------------------------
+    // NativeToolCalls mode: tool results use role:"tool" (not role:"user")
+    //
+    // The old code converted ALL tool results to role:"user" with a
+    // [System: tool succeeded - tool(call_id) returned] header. This
+    // broke prefix-cache stability: (1) the unique call_id UUID made
+    // every receipt hash differently, (2) consecutive tool results
+    // became consecutive user messages → repair_role_alternation
+    // inserted dynamic separators → position shifts on append.
+    //
+    // NativeToolCalls mode now emits the OpenAI-native tool format.
+    // TextualReplay mode is unchanged (it still needs user-role
+    // rendering because there's no native tool_calls to pair with).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn native_tool_calls_renders_tool_result_as_role_tool() {
+        let wire = LocalProtocol::native().render("sys", &tool_turns());
+        let tool_msg = wire
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("NativeToolCalls mode must render tool results as role:tool");
+        assert_eq!(
+            tool_msg["tool_call_id"], "tc_1",
+            "tool message must carry tool_call_id for API compliance"
+        );
+        assert_eq!(
+            tool_msg["name"], "read_file",
+            "tool message must carry the tool name"
+        );
+        assert_eq!(
+            tool_msg["content"], "data",
+            "tool message content is the raw result, no wrapper"
+        );
+    }
+
+    #[test]
+    fn native_tool_calls_no_user_header_wrapper() {
+        let wire = LocalProtocol::native().render("sys", &tool_turns());
+        let has_system_header = wire.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("[System: tool succeeded")
+        });
+        assert!(
+            !has_system_header,
+            "NativeToolCalls mode must NOT wrap tool results in [System: tool succeeded...] user messages"
+        );
+    }
+
+    #[test]
+    fn native_tool_calls_consecutive_results_no_separator() {
+        // Two parallel tool results from one assistant turn — the
+        // OpenAI format allows consecutive role:"tool" messages.
+        // repair_role_alternation must NOT insert user separators
+        // between them.
+        let turns = vec![
+            Turn::Assistant {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "tc_1".into(),
+                        tool: "read_file".into(),
+                        args: json!({"path": "a"}),
+                    },
+                    ToolCall {
+                        id: "tc_2".into(),
+                        tool: "read_file".into(),
+                        args: json!({"path": "b"}),
+                    },
+                ],
+            },
+            Turn::ToolResult {
+                call_id: "tc_1".into(),
+                tool: "read_file".into(),
+                result: "content_a".into(),
+                ok: true,
+            },
+            Turn::ToolResult {
+                call_id: "tc_2".into(),
+                tool: "read_file".into(),
+                result: "content_b".into(),
+                ok: true,
+            },
+        ];
+        let wire = LocalProtocol::native().render("sys", &turns);
+        // Collect roles to check alternation pattern.
+        let roles: Vec<&str> = wire
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or(""))
+            .collect();
+        // There must be NO empty-user separator between consecutive
+        // tool messages.
+        let has_empty_user_between_tools = roles
+            .windows(3)
+            .any(|w| w[0] == "tool" && w[1] == "user" && w[2] == "tool");
+        assert!(
+            !has_empty_user_between_tools,
+            "consecutive tool results must not get a user separator; roles: {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn textual_replay_still_renders_tool_result_as_user() {
+        // TextualReplay mode is UNCHANGED — it still converts tool
+        // results to role:"user" with the [System: ...] header because
+        // there are no native tool_calls to pair with.
+        let wire = LocalProtocol::textual().render("sys", &tool_turns());
+        let has_user_tool_result = wire.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("tool succeeded")
+        });
+        assert!(
+            has_user_tool_result,
+            "TextualReplay mode must still render tool results as user messages"
+        );
+    }
+
+    #[test]
+    fn native_tool_calls_failed_result_no_success_header() {
+        let turns = vec![Turn::ToolResult {
+            call_id: "tc_1".into(),
+            tool: "exec".into(),
+            result: "Error: command failed".into(),
+            ok: false,
+        }];
+        let wire = LocalProtocol::native().render("sys", &turns);
+        let tool_msg = wire
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("failed tool results must also use role:tool");
+        assert_eq!(
+            tool_msg["content"], "Error: command failed",
+            "failed tool result content is the raw error, no wrapper"
+        );
     }
 
     // ---- is_textual_replay() ----
