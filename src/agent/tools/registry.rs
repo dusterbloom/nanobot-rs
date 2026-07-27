@@ -990,8 +990,18 @@ impl ToolRegistry {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Tool name (omit to list all)" },
-                        "args": { "type": "object", "description": "Tool arguments (omit to inspect schema)" }
+                        // The proxy selector and argument envelope are named
+                        // `tool_name`/`tool_args` rather than `name`/`args`.
+                        // The old names overloaded with inner-tool params
+                        // (e.g. `read_skill` has its own `name`), causing
+                        // small local models to collapse everything into
+                        // `args` and omit the top-level selector. Live
+                        // failure 2026-07-27 17:21 (session
+                        // 20260727_173522_263450) showed this 3× in a row.
+                        // Back-compat: the dispatcher still accepts the
+                        // legacy `name`/`args` keys for in-flight sessions.
+                        "tool_name": { "type": "string", "description": "Name of the tool to invoke (omit to list all available tools)" },
+                        "tool_args": { "type": "object", "description": "Arguments object for the tool named above (omit to inspect its schema)" }
                     }
                 }
             }
@@ -1010,9 +1020,17 @@ impl ToolRegistry {
         &self,
         params: &HashMap<String, serde_json::Value>,
     ) -> ToolExecutionResult {
+        // Only `tool_name`/`name` (the selector) is filtered out as a pure
+        // control key. `tool_args`/`args` is intentionally KEPT — its
+        // presence means the model was trying to invoke a tool (intent),
+        // not just discover them. Answering "args without selector" with
+        // the success-catalog reads as "it worked", so the model loops on
+        // the same malformed call instead of correcting it.
         let mut sent: Vec<&str> = params
             .iter()
-            .filter(|(k, v)| k.as_str() != "name" && !Self::is_blank_param(v))
+            .filter(|(k, v)| {
+                !matches!(k.as_str(), "tool_name" | "name") && !Self::is_blank_param(v)
+            })
             .map(|(k, _)| k.as_str())
             .collect();
         let names = self.available_tool_names();
@@ -1025,8 +1043,8 @@ impl ToolRegistry {
             "proxy_call_missing_name"
         );
         ToolExecutionResult::failure(format!(
-            "Error: 'name' is required. You sent parameters {{{}}} with no tool name. \
-             Call tool with {{\"name\":\"TOOLNAME\",\"args\":{{...}}}} — omit name only to list tools. \
+            "Error: 'tool_name' is required. You sent parameters {{{}}} with no tool selector. \
+             Call tool with {{\"tool_name\":\"TOOLNAME\",\"tool_args\":{{...}}}} — omit tool_name only to list tools. \
              Available: {}",
             sent.join(", "),
             names.join(", ")
@@ -1053,22 +1071,36 @@ impl ToolRegistry {
         params: HashMap<String, serde_json::Value>,
         ctx: Option<&ToolExecutionContext>,
     ) -> ToolExecutionResult {
-        let tool_name = match params.get("name").and_then(|v| v.as_str()) {
-            Some(n) => n.trim().to_string(),
-            None => return self.missing_name_result(&params),
+        // `tool_name` is the documented key; `name` is back-compat for
+        // in-flight sessions whose persisted calls predate the rename.
+        // Order matters: prefer the new key when both are present.
+        let tool_name = params
+            .get("tool_name")
+            .or_else(|| params.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string());
+        let tool_name = match tool_name {
+            Some(n) if !n.is_empty() => n,
+            _ => return self.missing_name_result(&params),
         };
-        if tool_name.is_empty() {
-            return self.missing_name_result(&params);
-        }
 
-        let mut args_for_dispatch = params.get("args").cloned();
+        // Same back-compat for the argument envelope: `tool_args` first,
+        // then `args`.
+        let mut args_for_dispatch = params
+            .get("tool_args")
+            .or_else(|| params.get("args"))
+            .cloned();
         if args_for_dispatch
             .as_ref()
             .is_none_or(|v| matches!(v, serde_json::Value::Null))
         {
+            // Flattened-form fallback: callers (often small models) put
+            // the inner tool's args directly at the proxy level, not
+            // nested under `tool_args`/`args`. Collect everything that
+            // isn't a proxy-control key (in either naming scheme).
             let extras: serde_json::Map<String, serde_json::Value> = params
                 .iter()
-                .filter(|(k, _)| k.as_str() != "name" && k.as_str() != "args")
+                .filter(|(k, _)| !matches!(k.as_str(), "tool_name" | "tool_args" | "name" | "args"))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             args_for_dispatch = self.flattened_proxy_args_for_dispatch(&tool_name, extras);
@@ -2515,8 +2547,14 @@ mod tests {
         );
 
         let props = &defs[0]["function"]["parameters"]["properties"];
-        assert!(props.get("name").is_some(), "Must have 'name' param");
-        assert!(props.get("args").is_some(), "Must have 'args' param");
+        assert!(
+            props.get("tool_name").is_some(),
+            "Must have 'tool_name' param"
+        );
+        assert!(
+            props.get("tool_args").is_some(),
+            "Must have 'tool_args' param"
+        );
     }
 
     #[test]
@@ -2609,6 +2647,120 @@ mod tests {
             result.data.contains("hello"),
             "Should contain dispatched tool output: {}",
             result.data
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Proxy parameter rename (2026-07-27) — `name`/`args` →
+    // `tool_name`/`tool_args`. The old names overloaded with inner
+    // tool params (e.g. `read_skill` has its own `name`), causing
+    // small local models to collapse everything into `args` and omit
+    // the top-level tool name. See live failure 2026-07-27 17:21
+    // (session 20260727_173522_263450).
+    // -----------------------------------------------------------------
+
+    /// The proxy schema MUST advertise `tool_name` (not `name`) as the
+    /// parameter that selects the inner tool. The old `name` parameter
+    /// is reserved for the inner tool's own use (e.g. `read_skill(name)`).
+    #[test]
+    fn proxy_schema_uses_tool_name_not_name() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("mock_tool")));
+        let defs = registry.get_proxy_definition();
+        let params = defs[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("proxy parameters must be an object");
+        assert!(
+            params.contains_key("tool_name"),
+            "proxy schema must advertise `tool_name` (not `name`), got keys: {:?}",
+            params.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            params.contains_key("tool_args"),
+            "proxy schema must advertise `tool_args` (not `args`), got keys: {:?}",
+            params.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !params.contains_key("name"),
+            "proxy schema must NOT advertise `name` at the proxy level — that name belongs to inner tools"
+        );
+    }
+
+    /// Calling `tool({tool_name: "X", tool_args: {...}})` MUST dispatch
+    /// the inner tool correctly. This is the corrected shape that small
+    /// local models can produce reliably (no nested-`name` ambiguity).
+    #[tokio::test]
+    async fn proxy_dispatch_via_tool_name_tool_args() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("mock_tool")));
+
+        let mut params = HashMap::new();
+        params.insert("tool_name".to_string(), serde_json::json!("mock_tool"));
+        params.insert(
+            "tool_args".to_string(),
+            serde_json::json!({"value": "via_tool_name"}),
+        );
+
+        let result = registry.execute("tool", params).await;
+        assert!(
+            result.ok,
+            "dispatch via tool_name/tool_args must succeed: {:?}",
+            result.error
+        );
+        assert!(
+            result.data.contains("via_tool_name"),
+            "should contain dispatched tool output: {}",
+            result.data
+        );
+    }
+
+    /// Back-compat: old persisted calls may still arrive with `name`/`args`.
+    /// The proxy must accept them — a hard rename would break in-flight
+    /// sessions and tests with old fixtures. Old form continues to work;
+    /// new form is the documented preferred shape.
+    #[tokio::test]
+    async fn proxy_dispatch_legacy_name_args_still_accepted() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("mock_tool")));
+
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("mock_tool"));
+        params.insert("args".to_string(), serde_json::json!({"value": "legacy"}));
+
+        let result = registry.execute("tool", params).await;
+        assert!(
+            result.ok,
+            "legacy name/args must still be accepted for back-compat: {:?}",
+            result.error
+        );
+        assert!(result.data.contains("legacy"));
+    }
+
+    /// The model emitting flattened args with no tool selector MUST produce
+    /// an error message that names `tool_name` as the missing field, not
+    /// the old `name`. The error message is the model's primary correction
+    /// signal — it must reference the new schema's parameter name.
+    #[tokio::test]
+    async fn proxy_missing_name_error_references_tool_name() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("mock_tool")));
+
+        // Flattened-form: caller put inner-tool args directly at the proxy
+        // level (no `tool_name`, no `args` envelope). The proxy can't
+        // dispatch without knowing which tool — and the corrective error
+        // must reference `tool_name` so the model knows what to add.
+        let mut params = HashMap::new();
+        params.insert("url".to_string(), serde_json::json!("https://example.com"));
+
+        let result = registry.execute("tool", params).await;
+        assert!(
+            !result.ok,
+            "flattened-form without tool selector must fail (not silently succeed)"
+        );
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("tool_name"),
+            "error must reference `tool_name` (the new parameter), got: {err}"
         );
     }
 
@@ -2795,20 +2947,20 @@ mod tests {
         registry.register(Box::new(MockTool::new("read_file")));
 
         // Case 1: No name but WITH other parameters → should be FAILURE (not success catalog).
-        // This is the bug fix: model likely forgot to pass name, sending {"url": "..."}
-        // instead of {"name": "web_fetch", "args": {"url": "..."}}.
+        // This is the bug fix: model likely forgot to pass tool_name, sending
+        // {"url": "..."} instead of {"tool_name": "web_fetch", "tool_args": {"url": "..."}}.
         let mut params = HashMap::new();
         params.insert("url".to_string(), serde_json::json!("https://example.com"));
 
         let result = registry.execute("tool", params).await;
         assert!(
             !result.ok,
-            "Missing name with stray params should be FAILURE, not success catalog: {}",
+            "Missing tool_name with stray params should be FAILURE, not success catalog: {}",
             result.data
         );
         assert!(
-            result.data.contains("'name' is required"),
-            "Error should mention name is required: {}",
+            result.data.contains("'tool_name' is required"),
+            "Error should mention tool_name is required: {}",
             result.data
         );
         assert!(
@@ -2851,11 +3003,11 @@ mod tests {
         let result = registry.execute("tool", params).await;
         assert!(
             !result.ok,
-            "args without name must fail, not return the catalog: {}",
+            "args without tool_name must fail, not return the catalog: {}",
             result.data
         );
         assert!(
-            result.data.contains("'name' is required"),
+            result.data.contains("'tool_name' is required"),
             "{}",
             result.data
         );
