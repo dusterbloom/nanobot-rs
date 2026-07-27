@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tracing::debug;
 
 use crate::agent::token_budget::TokenBudget;
 use crate::providers::base::{LLMProvider, LLMResponse, StreamChunk};
@@ -328,7 +329,7 @@ impl ContextCompactor {
             }),
         ];
 
-        let response = self
+        let mut response = self
             .stream_summary_response(
                 &summary_messages,
                 COMPACTION_STREAM_IDLE_TIMEOUT,
@@ -339,7 +340,60 @@ impl ContextCompactor {
         if let Some(detail) = response.error_detail() {
             anyhow::bail!("Summarization provider error: {}", detail);
         }
-        if response.finish_reason != "stop" {
+
+        // Retry-on-length: when the model hits max_tokens before finishing,
+        // retry once with 2× the budget (capped at MAX_SUMMARY_TOKENS).
+        // Per codex review (2026-07-27): "length" is a completed,
+        // unambiguous provider response — not the transport uncertainty
+        // that the no-retry rule guards against. The model just needs
+        // more room. Discard the partial and regenerate from the
+        // complete source so the summary is coherent end-to-end.
+        //
+        // User's principle: "I rather wait but not have broken summaries
+        // that defeat the purpose of durability."
+        if response.finish_reason == "length" {
+            let retry_max = (max_tokens.saturating_mul(2)).min(MAX_SUMMARY_TOKENS);
+            let retry_required = TokenBudget::estimate_str_tokens(input)
+                .saturating_add(TokenBudget::estimate_str_tokens(prompt))
+                .saturating_add(TokenBudget::estimate_str_tokens(COMPACTION_SYSTEM_PROMPT))
+                .saturating_add(retry_max as usize)
+                .saturating_add(CHAT_TEMPLATE_TOKEN_ALLOWANCE)
+                .saturating_add(COMPACTION_CONTEXT_SAFETY_MARGIN);
+            if retry_required > self.compaction_context_size {
+                anyhow::bail!(
+                    "Summarization retry with {retry_max} max_tokens would require \
+                     {retry_required} context tokens (available {}); cannot retry",
+                    self.compaction_context_size
+                );
+            }
+            debug!(
+                first_max = max_tokens,
+                retry_max, "Summarization hit finish_reason=length, retrying with 2× budget"
+            );
+            response = self
+                .stream_summary_response(
+                    &summary_messages,
+                    COMPACTION_STREAM_IDLE_TIMEOUT,
+                    retry_max,
+                )
+                .await?;
+            if let Some(detail) = response.error_detail() {
+                anyhow::bail!("Summarization retry provider error: {}", detail);
+            }
+            if response.finish_reason == "length" {
+                anyhow::bail!(
+                    "Summarization retry also ended with finish_reason=length \
+                     (max_tokens={retry_max}); summary still incomplete — leaving \
+                     context uncompacted rather than persisting a truncated summary"
+                );
+            }
+            if response.finish_reason != "stop" {
+                anyhow::bail!(
+                    "Summarization retry ended with unsafe finish reason: {}",
+                    response.finish_reason
+                );
+            }
+        } else if response.finish_reason != "stop" {
             anyhow::bail!(
                 "Summarization ended with unsafe finish reason: {}",
                 response.finish_reason
@@ -727,6 +781,45 @@ mod tests {
         }
     }
 
+    /// Provider that returns different responses on consecutive calls.
+    /// Used to test retry-on-length: first call returns "length",
+    /// second call returns "stop" with the full summary.
+    struct SequentialProvider {
+        responses: std::sync::Mutex<std::collections::VecDeque<LLMResponse>>,
+    }
+
+    impl SequentialProvider {
+        fn new(responses: Vec<LLMResponse>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for SequentialProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> Result<LLMResponse> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no more responses"))
+        }
+
+        fn get_default_model(&self) -> &str {
+            "sequential"
+        }
+    }
+
     #[async_trait]
     impl LLMProvider for MockProvider {
         async fn chat(
@@ -1065,23 +1158,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_summarize_text_rejects_length_finish_reason() {
-        let provider = Arc::new(FinishReasonProvider {
-            response: "Partial summary".to_string(),
-            finish_reason: "length".to_string(),
-        });
+    async fn test_summarize_text_retries_on_length_then_succeeds() {
+        // finish_reason: "length" on first call → retry with 2× max_tokens
+        // → second call returns "stop" with the full summary.
+        // Per codex review: retry once, discard partial, regenerate.
+        let provider = Arc::new(SequentialProvider::new(vec![
+            LLMResponse {
+                content: Some("Partial summary that got cut".to_string()),
+                tool_calls: vec![],
+                finish_reason: "length".to_string(),
+                usage: HashMap::new(),
+            },
+            LLMResponse {
+                content: Some("Complete summary with all key facts preserved".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: HashMap::new(),
+            },
+        ]));
+        let compactor = ContextCompactor::new(provider, "test".into(), 4096);
+
+        let result = compactor
+            .summarize_text(
+                &"A factual source. ".repeat(200),
+                SUMMARIZE_PROMPT,
+                SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "retry should succeed when second call finishes: {:?}",
+            result.err()
+        );
+        let text = result.unwrap();
+        assert!(
+            text.contains("Complete summary"),
+            "should return the RETRY's output (not the partial), got: {text}"
+        );
+        assert!(
+            !text.contains("Partial summary"),
+            "should NOT contain the discarded first-attempt output"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_summarize_text_fails_when_retry_also_truncates() {
+        // Both calls return "length" → bail. Don't accept a doubly-
+        // truncated summary — the user's principle: "I rather wait
+        // but not have broken summaries that defeat the purpose of
+        // durability."
+        let provider = Arc::new(SequentialProvider::new(vec![
+            LLMResponse {
+                content: Some("Partial A".to_string()),
+                tool_calls: vec![],
+                finish_reason: "length".to_string(),
+                usage: HashMap::new(),
+            },
+            LLMResponse {
+                content: Some("Partial B".to_string()),
+                tool_calls: vec![],
+                finish_reason: "length".to_string(),
+                usage: HashMap::new(),
+            },
+        ]));
         let compactor = ContextCompactor::new(provider, "test".into(), 4096);
 
         let error = compactor
             .summarize_text(
-                "A factual source.",
+                &"A factual source. ".repeat(200),
                 SUMMARIZE_PROMPT,
                 SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS,
             )
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("finish reason"), "{error}");
+        assert!(
+            error.contains("length") || error.contains("truncat"),
+            "error should mention the retry also truncated: {error}"
+        );
     }
 
     #[tokio::test]

@@ -2134,8 +2134,8 @@ impl AgentLoopShared {
                     dump_msg(first_divergent_msg + 1, "next_msg");
                     // Coarse class for the TUI footer. Extracted from the
                     // divergent message's tags so the user sees
-                    /// `cache reset · lcm summary @ msg N` instead of the
-                    /// generic `cache reset · msg N`. Static strings only.
+                    // `cache reset · lcm summary @ msg N` instead of the
+                    // generic `cache reset · msg N`. Static strings only.
                     let divergent_msg = messages_for_llm.get(first_divergent_msg);
                     let class: &'static str = divergent_msg
                         .map(|m| {
