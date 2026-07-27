@@ -16,6 +16,7 @@ use crate::agent::lcm::{CompactionFailureMode, LcmCompactionState, LcmEngine};
 use crate::agent::token_budget::TokenBudget;
 
 /// Shared handles for background compaction coordination.
+#[derive(Clone)]
 pub(crate) struct CompactionHandle {
     pub(crate) slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>>,
     pub(crate) in_flight: Arc<AtomicBool>,

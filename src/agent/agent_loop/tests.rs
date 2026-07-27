@@ -3031,6 +3031,187 @@ async fn soft_lcm_sidecar_failure_preserves_foreground_context() {
 }
 
 #[tokio::test]
+async fn concrete_session_reuses_compaction_checkpoint_handle() {
+    let provider = MockLLM::named("local-compaction-checkpoint-handle-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let session_key = format!("compaction-checkpoint-handle-{}", uuid::Uuid::new_v4());
+    let mut msg = InboundMessage::new("test", "user", "offline", "first");
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key));
+
+    let first = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    msg.content = "second".to_string();
+    let second = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+
+    assert_eq!(first.session_id, second.session_id);
+    assert!(
+        Arc::ptr_eq(&first.compaction.slot, &second.compaction.slot),
+        "the pending checkpoint must remain visible across turns in one concrete session"
+    );
+    assert!(
+        Arc::ptr_eq(&first.compaction.in_flight, &second.compaction.in_flight),
+        "the in-flight barrier must remain visible across turns in one concrete session"
+    );
+}
+
+#[tokio::test]
+async fn idle_rollover_does_not_reuse_compaction_checkpoint_handle() {
+    let provider = MockLLM::named("local-compaction-checkpoint-rollover-test");
+    let memory_config = MemoryConfig {
+        session_complete_after_secs: 1,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_memory(
+        provider,
+        "local-compaction-checkpoint-rollover-test",
+        4096,
+        LcmSchemaConfig::default(),
+        memory_config,
+    );
+    let session_key = format!("compaction-checkpoint-rollover-{}", uuid::Uuid::new_v4());
+    let mut msg = InboundMessage::new("test", "user", "offline", "first");
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key));
+
+    let first = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+    msg.content = "second".to_string();
+    let second = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+
+    assert_ne!(first.session_id, second.session_id);
+    assert!(!Arc::ptr_eq(
+        &first.compaction.slot,
+        &second.compaction.slot
+    ));
+    assert!(!Arc::ptr_eq(
+        &first.compaction.in_flight,
+        &second.compaction.in_flight
+    ));
+}
+
+#[tokio::test]
+async fn in_flight_compaction_checkpoint_hides_unpublished_dag() {
+    let provider = MockLLM::named("local-compaction-checkpoint-visibility-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let session_key = format!("compaction-checkpoint-visibility-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    core.sessions
+        .add_message(
+            &session.id,
+            &json!({"role": "user", "content": "raw-source-marker"}),
+        )
+        .await;
+    core.sessions
+        .add_message(
+            &session.id,
+            &json!({"role": "assistant", "content": "raw-source-answer"}),
+        )
+        .await;
+
+    let mut msg = InboundMessage::new("test", "user", "offline", "first");
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key));
+    let first = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+
+    let raw = core.sessions.get_all_messages(&session.id).await;
+    let source_ids = raw
+        .iter()
+        .map(|message| message["_db_id"].as_u64().unwrap() as usize)
+        .collect::<Vec<_>>();
+    let nodes = vec![(
+        0,
+        source_ids,
+        Vec::new(),
+        "checkpoint-summary-marker".to_string(),
+        3,
+        1,
+        crate::agent::lcm::SummaryManifest::default(),
+        "db_id".to_string(),
+    )];
+    let rebuilt = crate::agent::lcm::LcmEngine::rebuild_from_db_nodes(
+        &raw,
+        &nodes,
+        crate::agent::lcm::LcmConfig::default(),
+    );
+    let engine = agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .unwrap();
+    *engine.lock().await = rebuilt;
+
+    first
+        .compaction
+        .in_flight
+        .store(true, std::sync::atomic::Ordering::Release);
+    msg.content = "second".to_string();
+    let second = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    first
+        .compaction
+        .in_flight
+        .store(false, std::sync::atomic::Ordering::Release);
+
+    let assembled = serde_json::to_string(&second.messages).unwrap();
+    assert!(
+        assembled.contains("raw-source-marker"),
+        "raw history remains authoritative until the checkpoint is published"
+    );
+    assert!(
+        !assembled.contains("checkpoint-summary-marker"),
+        "an in-flight DAG mutation must not become prompt-visible before checkpoint publication"
+    );
+
+    let snapshot = second.messages[..second.new_start].to_vec();
+    *first.compaction.slot.lock().await = Some(crate::agent::agent_core::PendingCompaction {
+        result: crate::agent::compaction::CompactionResult {
+            messages: vec![json!({
+                "role": "assistant",
+                "content": "checkpoint-summary-marker"
+            })],
+        },
+        snapshot,
+    });
+    msg.content = "third".to_string();
+    let third = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    *first.compaction.slot.lock().await = None;
+
+    let assembled = serde_json::to_string(&third.messages).unwrap();
+    assert!(
+        assembled.contains("raw-source-marker"),
+        "raw history remains authoritative while the checkpoint is pending"
+    );
+    assert!(
+        !assembled.contains("checkpoint-summary-marker"),
+        "a pending DAG rewrite must not become prompt-visible before checkpoint installation"
+    );
+}
+
+#[tokio::test]
 async fn idle_rollover_uses_a_new_session_scoped_lcm_engine() {
     let provider = Arc::new(WireRecordingProvider::new(
         "local-idle-lcm-test",

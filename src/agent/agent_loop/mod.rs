@@ -173,6 +173,7 @@ impl AgentLoop {
             session_policies: Arc::new(Mutex::new(HashMap::new())),
             continuity_notes: Arc::new(Mutex::new(HashMap::new())),
             lcm_engines: Arc::new(Mutex::new(HashMap::new())),
+            compaction_handles: Arc::new(Mutex::new(HashMap::new())),
             lcm_config,
             health_registry,
             #[cfg(feature = "cluster")]

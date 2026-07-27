@@ -35,7 +35,7 @@ fail-closed.
 - Produces: unchanged `Option<Vec<RenderedMessageSegment<'_>>>`, with literal
   end markers retained inside `text_without_end`.
 
-- [ ] **Step 1: Add the failing user-content and adjacent-marker tests**
+- [x] **Step 1: Add the failing user-content and adjacent-marker tests**
 
 ```rust
 #[test]
@@ -65,7 +65,7 @@ fn boundary_delta_uses_second_of_adjacent_im_end_markers() {
 }
 ```
 
-- [ ] **Step 2: Add the failing appended-tool-result test**
+- [x] **Step 2: Add the failing appended-tool-result test**
 
 ```rust
 #[test]
@@ -86,7 +86,7 @@ fn boundary_delta_accepts_literal_im_end_in_new_tool_result() {
 }
 ```
 
-- [ ] **Step 3: Run the focused release test and confirm RED**
+- [x] **Step 3: Run the focused release test and confirm RED**
 
 Run:
 
@@ -97,7 +97,7 @@ cargo test --release -p higgs-engine --lib boundary_delta -- --nocapture
 Expected: the three new literal-delimiter tests fail because the first
 `<|im_end|>` is selected.
 
-- [ ] **Step 4: Implement the minimal frame-aware parser**
+- [x] **Step 4: Implement the minimal frame-aware parser**
 
 Inside `rendered_message_segments`, compute the next start/EOF frame boundary
 and replace the first-closer lookup with:
@@ -123,7 +123,7 @@ When `structural_end` is absent, return a partial final segment only if
 `next_start.is_none()`; otherwise return `None`. Retain the existing
 `RenderedMessageSegment` fields and message compatibility rules.
 
-- [ ] **Step 5: Run focused tests and the release build**
+- [x] **Step 5: Run focused tests and the release build**
 
 ```bash
 cargo test --release -p higgs-engine --lib boundary_delta -- --nocapture
@@ -132,7 +132,7 @@ cargo build --release -p higgs
 
 Expected: all boundary tests pass and the Higgs release binary builds.
 
-- [ ] **Step 6: Reproduce the two-turn cache case**
+- [x] **Step 6: Reproduce the two-turn cache case**
 
 Restart the inspectable `higgs-nightly` tmux session with the rebuilt release
 binary, send a first turn containing a literal `<|im_end|>`, then append one

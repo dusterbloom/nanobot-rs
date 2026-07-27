@@ -97,6 +97,8 @@ pub(crate) struct AgentLoopShared {
     pub(crate) continuity_notes: Arc<Mutex<HashMap<String, Option<String>>>>,
     /// Per-session LCM engines for lossless context management.
     pub(crate) lcm_engines: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<LcmEngine>>>>>,
+    /// Per-concrete-session checkpoint state shared across agent turns.
+    pub(crate) compaction_handles: Arc<Mutex<HashMap<String, CompactionHandle>>>,
     /// LCM configuration.
     pub(crate) lcm_config: LcmSchemaConfig,
     /// Health probes for foreground/router/specialist providers. The managed

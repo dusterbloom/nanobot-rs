@@ -40,7 +40,7 @@ existing LCM engine and Higgs cache rotation.
 - Produces: a cloned `CompactionHandle` shared by every `TurnContext` for that
   concrete session.
 
-- [ ] **Step 1: Write the failing handle-reuse test**
+- [x] **Step 1: Write the failing handle-reuse test**
 
 Add a Tokio test using the existing local inline harness. Prepare two contexts
 with the same `session_key` and assert:
@@ -56,7 +56,7 @@ assert!(Arc::ptr_eq(&first.compaction.slot, &second.compaction.slot));
 Then create an idle-rollover harness and assert the new concrete session does
 not share either `Arc` with the expired session.
 
-- [ ] **Step 2: Run the focused release test and confirm RED**
+- [x] **Step 2: Run the focused release test and confirm RED**
 
 ```bash
 cargo test --release --lib compaction_handle -- --nocapture
@@ -64,7 +64,7 @@ cargo test --release --lib compaction_handle -- --nocapture
 
 Expected: same-session contexts currently hold different Arcs.
 
-- [ ] **Step 3: Add the session handle map**
+- [x] **Step 3: Add the session handle map**
 
 Make the existing handle cloneable:
 
@@ -86,7 +86,7 @@ Initialize it beside `lcm_engines` in `AgentLoop::new`. In `prepare_context`,
 after resolving `session_id`, retrieve or insert one handle and clone it into
 the returned `TurnContext`. Remove the two per-turn Arc allocations.
 
-- [ ] **Step 4: Run the focused handle tests**
+- [x] **Step 4: Run the focused handle tests**
 
 ```bash
 cargo test --release --lib compaction_handle -- --nocapture
@@ -106,7 +106,7 @@ Expected: reuse and idle-rollover isolation tests pass.
 - Produces: raw history while a rewrite is unpublished; otherwise the engine's
   durable active context.
 
-- [ ] **Step 1: Write the failing in-flight adoption test**
+- [x] **Step 1: Write the failing in-flight adoption test**
 
 Use the harness to persist identifiable raw messages and obtain the
 session-scoped engine. Mutate the engine so `active_context()` contains an LCM
@@ -119,13 +119,13 @@ handle.in_flight.store(true, Ordering::Release);
 Prepare the next turn and assert the messages contain the raw marker and do not
 contain the summary wire marker.
 
-- [ ] **Step 2: Write the failing pending-checkpoint adoption test**
+- [x] **Step 2: Write the failing pending-checkpoint adoption test**
 
 Put a `PendingCompaction` into `handle.slot`, prepare another turn, and assert
 the same raw-history property. The pending snapshot must match the raw message
 prefix so the test represents an installable checkpoint.
 
-- [ ] **Step 3: Run the focused release tests and confirm RED**
+- [x] **Step 3: Run the focused release tests and confirm RED**
 
 ```bash
 cargo test --release --lib dag_adoption -- --nocapture
@@ -134,7 +134,7 @@ cargo test --release --lib dag_adoption -- --nocapture
 Expected: preparation currently adopts `engine.active_context()` despite the
 shared rewrite state.
 
-- [ ] **Step 4: Gate active-context adoption**
+- [x] **Step 4: Gate active-context adoption**
 
 After idempotently ingesting raw history and while holding the engine lock,
 compute:
@@ -151,7 +151,7 @@ Return raw `history` when `engine.dag().is_empty()` or
 so either the background task still reports in-flight or has already published
 its pending slot.
 
-- [ ] **Step 5: Run the focused adoption tests**
+- [x] **Step 5: Run the focused adoption tests**
 
 ```bash
 cargo test --release --lib dag_adoption -- --nocapture

@@ -270,6 +270,16 @@ impl AgentLoopShared {
             .get_or_resume_with_idle(&session_key, core.session_complete_after_secs)
             .await;
         let session_id = session_meta.id.clone();
+        let compaction = {
+            let mut handles = self.compaction_handles.lock().await;
+            handles
+                .entry(session_id.clone())
+                .or_insert_with(|| CompactionHandle {
+                    slot: Arc::new(tokio::sync::Mutex::new(None)),
+                    in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                })
+                .clone()
+        };
         if tools.contains("recall") {
             tools.register(Box::new(
                 crate::agent::tools::RecallTool::new(&core.workspace)
@@ -370,7 +380,14 @@ impl AgentLoopShared {
                 for msg in &history {
                     engine.ingest(msg.clone());
                 }
-                if engine.dag().is_empty() {
+                // The background compactor mutates the shared DAG before it
+                // publishes the checkpoint that rotates Higgs's session ID.
+                // Keep raw SQLite history authoritative across that window;
+                // the existing checkpoint installer is the sole publication
+                // point for both the prompt rewrite and cache rotation.
+                let rewrite_unpublished = compaction.in_flight.load(Ordering::Acquire)
+                    || compaction.slot.lock().await.is_some();
+                if engine.dag().is_empty() || rewrite_unpublished {
                     history
                 } else {
                     engine
@@ -508,12 +525,6 @@ impl AgentLoopShared {
             last["_turn"] = json!(turn_count);
         }
 
-        // Background compaction state.
-        let compaction_slot: Arc<
-            tokio::sync::Mutex<Option<crate::agent::agent_core::PendingCompaction>>,
-        > = Arc::new(tokio::sync::Mutex::new(None));
-        let compaction_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
         // Context gate: budget-aware content sizing for this turn.
         let mut content_gate = ContentGate::new(core.token_budget.max_context(), 0.20);
         // Pre-consume the tokens already used by system prompt + history.
@@ -588,10 +599,7 @@ impl AgentLoopShared {
             turn_tool_entries: Vec::new(),
             iterations_used: 0,
             turn_start: std::time::Instant::now(),
-            compaction: CompactionHandle {
-                slot: compaction_slot,
-                in_flight: compaction_in_flight,
-            },
+            compaction,
             content_gate,
             counters: self.core_handle.counters.clone(),
             flow: FlowControl {
