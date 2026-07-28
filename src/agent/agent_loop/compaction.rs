@@ -1,17 +1,15 @@
-//! LCM compaction execution: sidecar lease acquisition, cancellation-safe
-//! engine mutation, and checkpoint persistence.
+//! LCM compaction execution: cancellation-safe engine mutation and checkpoint
+//! persistence through the foreground provider/model.
 //!
 //! Extracted verbatim from `shared.rs`.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::Value;
 use tracing::warn;
 
 use crate::agent::agent_core::{PendingCompaction, SwappableCore};
-use crate::agent::compaction::ContextCompactor;
 use crate::agent::lcm::{CompactionFailureMode, LcmCompactionState, LcmEngine};
 use crate::agent::token_budget::TokenBudget;
 
@@ -20,20 +18,6 @@ use crate::agent::token_budget::TokenBudget;
 pub(crate) struct CompactionHandle {
     pub(crate) slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>>,
     pub(crate) in_flight: Arc<AtomicBool>,
-}
-
-/// Build a compactor bound directly to the main provider/model, bypassing a
-/// managed compaction sidecar that is unreachable (or was never configured
-/// for a fresh attempt). Reuses the sidecar-tuned context-window budget so
-/// summarization chunking stays unchanged; only the endpoint and served
-/// model differ. Never `None` — this is what keeps compaction from silently
-/// degrading to truncation when the sidecar is down.
-fn main_provider_compactor(core: &SwappableCore) -> ContextCompactor {
-    ContextCompactor::new(
-        core.provider.clone(),
-        core.model.clone(),
-        core.compactor.context_size(),
-    )
 }
 
 /// Cancellation-safe ownership of one tentative LCM mutation. Unless SQLite
@@ -73,8 +57,6 @@ impl Drop for LcmCompactionMutation<'_> {
     }
 }
 
-const COMPACTION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(75);
-
 /// Execute one LCM compaction and persist its lossless summary metadata.
 /// The caller decides whether to await this future (hard pressure) or spawn it
 /// (soft pressure); keeping the operation itself shared prevents the two paths
@@ -87,40 +69,6 @@ pub(super) async fn execute_lcm_compaction(
     session_turn: u64,
     failure_mode: CompactionFailureMode,
 ) -> Option<PendingCompaction> {
-    let (lease, resolved_compactor): (_, ContextCompactor) = match core.compaction_manager.as_ref()
-    {
-        Some(manager) => {
-            match tokio::time::timeout(COMPACTION_ACQUIRE_TIMEOUT, manager.acquire()).await {
-                Ok(Ok(lease)) => {
-                    let compactor = core.compactor.for_model(lease.served_model().to_string());
-                    (Some(lease), compactor)
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        %error,
-                        ?failure_mode,
-                        model = %core.model,
-                        "compaction sidecar unavailable — compacting with main model"
-                    );
-                    (None, main_provider_compactor(&core))
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        timeout_secs = COMPACTION_ACQUIRE_TIMEOUT.as_secs(),
-                        ?failure_mode,
-                        model = %core.model,
-                        "compaction sidecar unavailable — compacting with main model"
-                    );
-                    (None, main_provider_compactor(&core))
-                }
-            }
-        }
-        // No managed sidecar configured at all — the core's base
-        // compactor already resolves to the right endpoint (explicit
-        // memory.provider / specialist / main provider).
-        None => (None, core.compactor.clone()),
-    };
-
     // Keep the engine locked through SQLite commit. A failed checkpoint rolls
     // back the DAG/active window before any other task can observe or extend
     // the non-durable state.
@@ -133,12 +81,7 @@ pub(super) async fn execute_lcm_compaction(
     let mut mutation = LcmCompactionMutation::new(&mut engine);
     let summary_turn = mutation
         .engine_mut()
-        .compact(
-            Some(&resolved_compactor),
-            &core.token_budget,
-            0,
-            failure_mode,
-        )
+        .compact(Some(&core.compactor), &core.token_budget, 0, failure_mode)
         .await;
     let compacted_conversation = mutation.engine().active_context();
     let summary_node = summary_turn.as_ref().and_then(|turn| {
@@ -245,9 +188,6 @@ pub(super) async fn execute_lcm_compaction(
     }
     drop(mutation);
     drop(engine);
-    // Drop is the cancellation-safe release path; it schedules last-lease
-    // shutdown without delaying foreground checkpoint installation.
-    drop(lease);
     if checkpoint_persisted {
         pending
     } else {

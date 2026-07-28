@@ -98,9 +98,8 @@ impl Reflector {
         Self::should_reflect_sessions(&self.sessions, self.threshold_tokens).await
     }
 
-    /// Check reflection pressure without constructing a model-bound reflector.
-    /// This keeps the on-demand sidecar unloaded when there is no completed
-    /// working memory to process.
+    /// Check reflection pressure without constructing a model-bound reflector
+    /// or making a provider call.
     pub async fn should_reflect_sessions(sessions: &Arc<SessionDb>, threshold: usize) -> bool {
         let wm = WorkingMemoryStore::new(sessions.clone());
         let wm_tokens = match wm.total_tokens_by_status(SessionStatus::Completed).await {

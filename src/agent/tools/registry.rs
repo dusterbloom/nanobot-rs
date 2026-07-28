@@ -89,6 +89,24 @@ pub struct ToolRegistry {
     hooks: Option<crate::config::schema::HooksConfig>,
 }
 
+/// Fully decoded meaning of the compact `tool` proxy envelope.
+///
+/// This is the only place that knows the current and legacy wire keys. Both
+/// routing and execution project from this value, so a call cannot execute as
+/// one tool while being guarded, cached, or persisted as another.
+enum ProxyCall {
+    Catalog,
+    Inspect {
+        tool_name: String,
+    },
+    Dispatch {
+        tool_name: String,
+        arguments: HashMap<String, Value>,
+    },
+    MissingSelector,
+    InvalidArguments,
+}
+
 impl ToolRegistry {
     /// Normalize model-emitted tool names/params into canonical tool contract.
     ///
@@ -311,10 +329,7 @@ impl ToolRegistry {
             self.register(Box::new(SearchFilesTool));
         }
         if should_include("search_context") {
-            self.register(Box::new(SearchContextTool::new(
-                config.workspace.clone(),
-                config.db_path.clone(),
-            )));
+            self.register(Box::new(SearchContextTool::new(config.workspace.clone())));
         }
         if should_include("file_info") {
             self.register(Box::new(FileInfoTool));
@@ -363,9 +378,7 @@ impl ToolRegistry {
             self.register(Box::new(BrowserTool::new(config.max_tool_result_chars)));
         }
         if should_include("recall") {
-            self.register(Box::new(
-                RecallTool::new(&config.workspace).with_db(config.db_path.clone()),
-            ));
+            self.register(Box::new(RecallTool::new(&config.workspace)));
         }
         if should_include("remember") {
             self.register(Box::new(RememberTool::new(config.workspace.clone())));
@@ -707,6 +720,7 @@ impl ToolRegistry {
         "edit_file",
         "exec",
         "recall",
+        "session_search",
         "remember",
         "recall_tool_result",
         "search_tool_result",
@@ -813,7 +827,13 @@ impl ToolRegistry {
         // Slim parameter descriptions (pi-style leanness); keep the discovery
         // hooks' param descriptions so the model knows how to call them without
         // a proxy round-trip.
-        const KEEP_PARAM_DESCRIPTIONS: &[&str] = &["read_file", "read_skill", "recall", "remember"];
+        const KEEP_PARAM_DESCRIPTIONS: &[&str] = &[
+            "read_file",
+            "read_skill",
+            "recall",
+            "session_search",
+            "remember",
+        ];
         for def in &mut defs {
             Self::remove_local_hot_model_hazards(def);
             let name = def
@@ -1026,13 +1046,7 @@ impl ToolRegistry {
         // not just discover them. Answering "args without selector" with
         // the success-catalog reads as "it worked", so the model loops on
         // the same malformed call instead of correcting it.
-        let mut sent: Vec<&str> = params
-            .iter()
-            .filter(|(k, v)| {
-                !matches!(k.as_str(), "tool_name" | "name") && !Self::is_blank_param(v)
-            })
-            .map(|(k, _)| k.as_str())
-            .collect();
+        let mut sent = Self::proxy_intent_keys(params);
         let names = self.available_tool_names();
         if sent.is_empty() {
             return ToolExecutionResult::success(format!("Available tools: {}", names.join(", ")));
@@ -1064,6 +1078,98 @@ impl ToolRegistry {
         }
     }
 
+    fn proxy_intent_keys(params: &HashMap<String, Value>) -> Vec<&str> {
+        params
+            .iter()
+            .filter(|(key, value)| {
+                !matches!(key.as_str(), "tool_name" | "name") && !Self::is_blank_param(value)
+            })
+            .map(|(key, _)| key.as_str())
+            .collect()
+    }
+
+    /// Decode the compact proxy envelope once at its wire boundary.
+    ///
+    /// Current keys win when both forms are present. A JSON string containing
+    /// an object is accepted because local models sometimes double-encode the
+    /// argument envelope. Flattened arguments are dispatched only when every
+    /// key belongs to the selected tool; otherwise the call remains an inspect.
+    fn resolve_proxy_call(&self, params: &HashMap<String, Value>) -> ProxyCall {
+        let tool_name = params
+            .get("tool_name")
+            .or_else(|| params.get("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        let Some(tool_name) = tool_name else {
+            return if Self::proxy_intent_keys(params).is_empty() {
+                ProxyCall::Catalog
+            } else {
+                ProxyCall::MissingSelector
+            };
+        };
+
+        let envelope = params.get("tool_args").or_else(|| params.get("args"));
+        match envelope {
+            Some(Value::Object(map)) => {
+                return ProxyCall::Dispatch {
+                    tool_name,
+                    arguments: map
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                };
+            }
+            Some(Value::String(encoded)) => {
+                return match serde_json::from_str::<Value>(encoded) {
+                    Ok(Value::Object(map)) => ProxyCall::Dispatch {
+                        tool_name,
+                        arguments: map.into_iter().collect(),
+                    },
+                    _ => ProxyCall::InvalidArguments,
+                };
+            }
+            Some(Value::Null) | None => {}
+            Some(_) => return ProxyCall::InvalidArguments,
+        }
+
+        let extras: serde_json::Map<String, Value> = params
+            .iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "tool_name" | "tool_args" | "name" | "args"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        match self.flattened_proxy_args_for_dispatch(&tool_name, extras) {
+            Some(Value::Object(map)) => ProxyCall::Dispatch {
+                tool_name,
+                arguments: map.into_iter().collect(),
+            },
+            _ => ProxyCall::Inspect { tool_name },
+        }
+    }
+
+    /// Project a tool call into its semantic execution identity.
+    ///
+    /// `None` means a proxy catalog, inspect, or malformed call and instructs
+    /// routing to preserve the outer `tool` call so execution can return its
+    /// normal catalog/schema/error response.
+    pub(crate) fn canonical_proxy_dispatch(
+        &self,
+        outer_name: &str,
+        params: &HashMap<String, Value>,
+    ) -> Option<(String, HashMap<String, Value>)> {
+        if outer_name != "tool" {
+            return Some((outer_name.to_string(), params.clone()));
+        }
+        match self.resolve_proxy_call(params) {
+            ProxyCall::Dispatch {
+                tool_name,
+                arguments,
+            } => Some((tool_name, arguments)),
+            _ => None,
+        }
+    }
+
     /// Handle a proxy call: inspect (no args) or dispatch (with args).
     /// `ctx` is passed through to the dispatched tool when present.
     async fn execute_proxy(
@@ -1071,43 +1177,12 @@ impl ToolRegistry {
         params: HashMap<String, serde_json::Value>,
         ctx: Option<&ToolExecutionContext>,
     ) -> ToolExecutionResult {
-        // `tool_name` is the documented key; `name` is back-compat for
-        // in-flight sessions whose persisted calls predate the rename.
-        // Order matters: prefer the new key when both are present.
-        let tool_name = params
-            .get("tool_name")
-            .or_else(|| params.get("name"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string());
-        let tool_name = match tool_name {
-            Some(n) if !n.is_empty() => n,
-            _ => return self.missing_name_result(&params),
-        };
-
-        // Same back-compat for the argument envelope: `tool_args` first,
-        // then `args`.
-        let mut args_for_dispatch = params
-            .get("tool_args")
-            .or_else(|| params.get("args"))
-            .cloned();
-        if args_for_dispatch
-            .as_ref()
-            .is_none_or(|v| matches!(v, serde_json::Value::Null))
-        {
-            // Flattened-form fallback: callers (often small models) put
-            // the inner tool's args directly at the proxy level, not
-            // nested under `tool_args`/`args`. Collect everything that
-            // isn't a proxy-control key (in either naming scheme).
-            let extras: serde_json::Map<String, serde_json::Value> = params
-                .iter()
-                .filter(|(k, _)| !matches!(k.as_str(), "tool_name" | "tool_args" | "name" | "args"))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            args_for_dispatch = self.flattened_proxy_args_for_dispatch(&tool_name, extras);
-        }
-
-        match args_for_dispatch.as_ref() {
-            None | Some(serde_json::Value::Null) => {
+        match self.resolve_proxy_call(&params) {
+            ProxyCall::Catalog | ProxyCall::MissingSelector => self.missing_name_result(&params),
+            ProxyCall::InvalidArguments => {
+                ToolExecutionResult::failure("'args' must be a JSON object".to_string())
+            }
+            ProxyCall::Inspect { tool_name } => {
                 // Inspect mode: return tool's full schema
                 match self.tools.get(&tool_name) {
                     Some(tool) if tool.is_available() => {
@@ -1130,19 +1205,12 @@ impl ToolRegistry {
                     }
                 }
             }
-            Some(args_val) => {
+            ProxyCall::Dispatch {
+                tool_name,
+                arguments: inner_params,
+            } => {
                 // Dispatch mode: extract args and call the real tool.
                 // Call execute_inner directly to avoid recursion through execute().
-                let inner_params: HashMap<String, serde_json::Value> = match args_val {
-                    serde_json::Value::Object(map) => {
-                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                    }
-                    _ => {
-                        return ToolExecutionResult::failure(
-                            "'args' must be a JSON object".to_string(),
-                        );
-                    }
-                };
                 if tool_name == "write_file"
                     && inner_params
                         .get("state")
@@ -1224,7 +1292,9 @@ mod tests {
     fn test_local_tool_surface_token_budget() {
         use crate::agent::token_budget::TokenBudget;
         let ws = tempfile::tempdir().unwrap();
-        let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        let mut config = ToolConfig::new(ws.path());
+        config.db_path = Some(ws.path().join("sessions.db"));
+        let mut reg = ToolRegistry::with_standard_tools(&config);
         register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
         let count = reg.get_local_definitions().len();
         let full = TokenBudget::estimate_tool_def_tokens(&reg.get_definitions());
@@ -1263,12 +1333,14 @@ mod tests {
         );
     }
 
-    /// Core-plus-proxy surface: 13 hot native schemas + the `tool` proxy for
+    /// Core-plus-proxy surface: 14 hot native schemas + the `tool` proxy for
     /// the CLOUD path. Local uses lean (proxy-only) via select_tool_definitions.
     #[test]
     fn test_core_plus_proxy_surface() {
         let ws = tempfile::tempdir().unwrap();
-        let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
+        let mut config = ToolConfig::new(ws.path());
+        config.db_path = Some(ws.path().join("sessions.db"));
+        let mut reg = ToolRegistry::with_standard_tools(&config);
         register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
         reg.register(Box::new(crate::agent::tools::TodoTool::new(ws.path())));
         let defs = reg.get_core_plus_proxy_definitions();
@@ -1276,14 +1348,21 @@ mod tests {
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        // 13 hot native tools + 1 proxy = 14 total for cloud.
+        // 14 hot native tools + 1 proxy = 15 total for cloud.
         assert_eq!(
             names.len(),
-            14,
-            "cloud core+proxy must be 13 native + 1 proxy, got {names:?}"
+            15,
+            "cloud core+proxy must be 14 native + 1 proxy, got {names:?}"
         );
         assert!(names.contains(&"tool"), "missing proxy: {names:?}");
-        for expected in ["read_file", "edit_file", "exec", "recall", "todo"] {
+        for expected in [
+            "read_file",
+            "edit_file",
+            "exec",
+            "recall",
+            "session_search",
+            "todo",
+        ] {
             assert!(
                 names.contains(&expected),
                 "cloud missing {expected}: {names:?}"

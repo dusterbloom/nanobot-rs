@@ -343,13 +343,14 @@ fn local_renders_system_as_first_message() {
 
 #[test]
 fn local_renders_tool_result_as_user_message() {
-    let protocol = LocalProtocol::default();
+    // Textual replay mode folds tool results into user messages.
+    let protocol = LocalProtocol::textual();
     let wire = protocol.render("sys", &make_tool_calling_turns());
     // Last non-appended message before possible continuation
     let tool_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "tool").collect();
     assert!(
         tool_msgs.is_empty(),
-        "local protocol must never emit role:tool"
+        "textual local protocol must never emit role:tool"
     );
     // The tool result should appear as a user message
     let user_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "user").collect();
@@ -364,11 +365,12 @@ fn local_renders_tool_result_as_user_message() {
 
 #[test]
 fn local_no_tool_role_in_any_message() {
-    let protocol = LocalProtocol::default();
+    // Textual replay mode never emits role:tool.
+    let protocol = LocalProtocol::textual();
     let wire = protocol.render("sys", &make_multi_tool_turns());
     assert!(
         wire.iter().all(|m| m["role"] != "tool"),
-        "local protocol must never emit role:tool"
+        "textual local protocol must never emit role:tool"
     );
 }
 
@@ -392,7 +394,10 @@ fn local_always_ends_with_user() {
 
 #[test]
 fn local_tool_calling_sequence_ends_with_user() {
-    let protocol = LocalProtocol::default();
+    // Textual replay mode: tool results are folded into user messages, so
+    // the sequence naturally ends with user. (Native mode ends with the
+    // tool result and lets the chat template handle tool → assistant.)
+    let protocol = LocalProtocol::textual();
     let wire = protocol.render("sys", &make_tool_calling_turns());
     assert_eq!(wire.last().unwrap()["role"], "user");
 }
@@ -436,7 +441,9 @@ fn local_no_mid_thread_system_messages() {
 
 #[test]
 fn local_assistant_preserves_tool_calls_for_lm_studio() {
-    let protocol = LocalProtocol::default();
+    // Native mode preserves tool_calls on the assistant and emits role:tool
+    // for tool results (LM Studio native tool calling).
+    let protocol = LocalProtocol::native();
     // Turn: assistant with tool_calls → tool_calls field is preserved for LM Studio
     let turns = vec![
         Turn::User {
@@ -468,18 +475,19 @@ fn local_assistant_preserves_tool_calls_for_lm_studio() {
         has_tool_calls,
         "local assistant should preserve tool_calls for LM Studio compatibility"
     );
-    // Tool results are still converted to user messages carrying the payload.
-    // Assert the invariant, not the header wording, which is free to change.
+    // Native mode emits role:tool for tool results — the chat template
+    // handles the tool → assistant transition.
     assert!(
-        !wire.iter().any(|m| m["role"] == "tool"),
-        "LocalProtocol must never emit role:tool"
+        wire.iter().any(|m| m["role"] == "tool"),
+        "native LocalProtocol must emit role:tool for tool results"
     );
-    let tool_result_as_user = wire
+    let tool_result_payload = wire
         .iter()
-        .any(|m| m["role"] == "user" && m["content"].as_str().unwrap_or("").contains("data"));
+        .filter(|m| m["role"] == "tool")
+        .any(|m| m["content"].as_str().unwrap_or("").contains("data"));
     assert!(
-        tool_result_as_user,
-        "tool results should be converted to user messages"
+        tool_result_payload,
+        "tool result payload must be carried on the role:tool message"
     );
 }
 

@@ -171,15 +171,19 @@ fn cloud_tool_call_ids_unique_within_one_assistant() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Invariant 3: local mode — last message MUST be role=user
+// Invariant 3: local mode — last message after tool results is role=tool
 // ─────────────────────────────────────────────────────────────
 //
-// LM Studio / llama.cpp jinja templates require the final message to be a
-// user turn. Any drift here breaks every local-mode conversation. See
-// CLAUDE.md ("Local LLM Protocol Constraints").
+// Native tool-calling chat templates (Qwen3, Llama3, etc.) handle the
+// `tool → assistant` transition natively. The `Continue.` sentinel is
+// appended only when the render ends with an assistant turn (mirrors
+// CloudProtocol at protocol.rs:161). The prior "must end with user" rule
+// was buggy — see commit 74da9e6 (LocalProtocol sentinel fix) which removed
+// the spurious sentinel after `role:tool` that was causing every observed
+// prompt_prefix_diverged in 2026-07-27/28 logs.
 
 #[test]
-fn local_last_message_is_user_after_tool_results() {
+fn local_last_message_after_tool_results_is_tool() {
     let turns = vec![
         user("list files"),
         assistant_with_calls(None, vec![("tc_1", "ls", json!({"path": "."}))]),
@@ -191,8 +195,8 @@ fn local_last_message_is_user_after_tool_results() {
         .expect("rendered messages must be non-empty");
     assert_eq!(
         role(last),
-        "user",
-        "local protocol last message must be role=user; got: {:?}",
+        "tool",
+        "native local protocol ends with the tool result; chat templates handle tool → assistant. Got: {:?}",
         last
     );
 }

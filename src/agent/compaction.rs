@@ -124,7 +124,7 @@ pub struct CompactionResult {
     pub messages: Vec<Value>,
 }
 
-/// Summarizes LCM chunks through the currently acquired compaction endpoint.
+/// Summarizes LCM chunks through the foreground provider and model.
 #[derive(Clone)]
 pub struct ContextCompactor {
     provider: Arc<dyn LLMProvider>,
@@ -154,25 +154,9 @@ impl ContextCompactor {
         }
     }
 
-    /// Clone the compactor for the literal model id reported by an acquired
-    /// sidecar. The provider endpoint and tuning remain identical.
-    pub fn for_model(&self, model: String) -> Self {
-        Self {
-            provider: self.provider.clone(),
-            model,
-            summary_max_tokens: self.summary_max_tokens,
-            compaction_context_size: self.compaction_context_size,
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn model(&self) -> &str {
         &self.model
-    }
-
-    /// Maximum request context accepted by this compaction model.
-    pub(crate) fn context_size(&self) -> usize {
-        self.compaction_context_size
     }
 
     fn summary_token_limit(&self, input: &str, ratio: usize) -> u32 {

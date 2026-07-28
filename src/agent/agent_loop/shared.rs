@@ -52,11 +52,9 @@ use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, Control
 
 use super::budget::{
     advertised_tool_names, attach_higgs_session_marker, clear_prompt_cache_state,
-    conversation_token_count, divergent_message_digest, effective_lcm_available_budget,
-    higgs_retained_admission, higgs_retained_session_cap_tokens,
-    invalidate_prompt_cache_for_rewrite, proactive_grounding_preserves_prefix_cache,
-    retained_context_pressure, send_cache_reset_marker, send_retract_reply_marker,
-    should_allow_checkpoint, should_inject_heartbeat_grounding,
+    conversation_token_count, divergent_message_digest, invalidate_prompt_cache_for_rewrite,
+    proactive_grounding_preserves_prefix_cache, send_cache_reset_marker, send_compaction_marker,
+    send_retract_reply_marker, should_allow_checkpoint, should_inject_heartbeat_grounding,
 };
 use super::compaction::execute_lcm_compaction;
 use super::local_stream::{
@@ -103,8 +101,7 @@ pub(crate) struct AgentLoopShared {
     pub(crate) compaction_handles: Arc<Mutex<HashMap<String, CompactionHandle>>>,
     /// LCM configuration.
     pub(crate) lcm_config: LcmSchemaConfig,
-    /// Health probes for foreground/router/specialist providers. The managed
-    /// LCM sidecar uses its own lease health and retry backoff.
+    /// Health probes for foreground/router/specialist providers.
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     /// Cluster router for distributed inference (feature-gated).
     #[cfg(feature = "cluster")]
@@ -339,8 +336,7 @@ pub(crate) struct FlowControl {
     /// (or for non-streaming calls).
     pub(crate) ttft_ms: Option<u64>,
     /// Prompt estimate for the exact provider request, including tool schemas.
-    /// Used to calibrate local retained-session admission against provider
-    /// `prompt_tokens`, which also include the rendered tool block.
+    /// Compared with provider-reported `prompt_tokens` in turn telemetry.
     pub(crate) provider_prompt_estimate: Option<usize>,
     /// Typed retry counters — each failure mode has a named field with its own cap.
     pub(crate) retries: RetryState,
@@ -757,9 +753,11 @@ impl AgentLoopShared {
                         // Cache-replay tagged: a step instruction sent live must
                         // replay byte-identical on reload or the warm prefix
                         // diverges and Higgs re-prefills.
-                        ctx.messages.push(crate::agent::markers::scaffold_user(
-                            format!("[Current objective] {}", instruction),
-                        ));
+                        ctx.messages
+                            .push(crate::agent::markers::scaffold_user(format!(
+                                "[Current objective] {}",
+                                instruction
+                            )));
                     }
                 }
             }
@@ -1126,17 +1124,8 @@ impl AgentLoopShared {
         // this cache watermark is meant to prevent — UNLESS pressure has crossed
         // `tau_hard`, where deferring any longer guarantees hitting max tokens.
         let state = self.system_state.load_full();
-        let retained_cap_tokens = if ctx.core.mode().is_local() {
-            higgs_retained_session_cap_tokens(ctx.core.provider.supports_higgs_session_cache())
-        } else {
-            None
-        };
-        let retained_pressure = retained_context_pressure(retained_cap_tokens, &ctx.messages, 0);
-        let allow_checkpoint = should_allow_checkpoint(
-            state.context_pressure,
-            self.lcm_config.tau_hard,
-            retained_pressure,
-        );
+        let allow_checkpoint =
+            should_allow_checkpoint(state.context_pressure, self.lcm_config.tau_hard);
         self.install_pending_compaction(ctx, allow_checkpoint).await;
 
         StepResult::Next(IterationPhase::PreCall)
@@ -1517,7 +1506,7 @@ impl AgentLoopShared {
 
     /// Install a finished compaction result only when it cannot invalidate a
     /// warm cached prefix, or when the caller already made an explicit
-    /// checkpoint/reset. Otherwise leave the result pending as sidecar LCM state.
+    /// checkpoint/reset. Otherwise leave the background result pending.
     async fn install_pending_compaction(
         &self,
         ctx: &mut TurnContext,
@@ -1677,48 +1666,15 @@ impl AgentLoopShared {
 
             let budget_core = ctx.core.clone();
             let budget = &budget_core.token_budget;
-            let retained_cap_tokens = if ctx.core.mode().is_local() {
-                higgs_retained_session_cap_tokens(ctx.core.provider.supports_higgs_session_cache())
-            } else {
-                None
-            };
-            let prompt_calibration = ctx.counters.prompt_calibration(&ctx.session_key);
-            let last_estimated_prompt_tokens =
-                prompt_calibration.map_or(0, |cal| cal.estimated_prompt_tokens);
-            let last_actual_prompt_tokens =
-                prompt_calibration.map_or(0, |cal| cal.actual_prompt_tokens);
-            let mut retained_admission = higgs_retained_admission(
-                retained_cap_tokens,
-                &ctx.messages,
-                tool_def_tokens,
-                last_estimated_prompt_tokens,
-                last_actual_prompt_tokens,
-            );
-            let (
-                mut action,
-                conv_tokens,
-                available,
-                hard_limit,
-                soft_limit,
-                model_available,
-                retained_available,
-            ) = {
+            let (mut action, conv_tokens, available, hard_limit, soft_limit) = {
                 let engine = lcm_engine.lock().await;
-                let model_available = budget.available_budget(tool_def_tokens);
-                let (available, retained_available) = effective_lcm_available_budget(
-                    model_available,
-                    &ctx.messages,
-                    tool_def_tokens,
-                    retained_cap_tokens,
-                );
+                let available = budget.available_budget(tool_def_tokens);
                 (
                     engine.check_thresholds_with_available(available),
                     engine.conversation_tokens(),
                     available,
                     (available as f64 * engine.tau_hard()) as usize,
                     (available as f64 * engine.tau_soft()) as usize,
-                    model_available,
-                    retained_available,
                 )
             };
 
@@ -1728,11 +1684,7 @@ impl AgentLoopShared {
             // else. Each model request has a sliding inactivity deadline, so
             // the whole multi-request compaction must not have a wall clock
             // timeout that can cancel otherwise healthy progress.
-            let mut retained_admission_hard = retained_admission
-                .as_ref()
-                .is_some_and(|admission| admission.force_blocking);
-            let mut raw_hard =
-                conversation_token_count(&ctx.messages) > hard_limit || retained_admission_hard;
+            let mut raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
             if raw_hard && ctx.compaction.in_flight.load(Ordering::Acquire) {
                 let wait_for_soft_job = async {
                     while ctx.compaction.in_flight.load(Ordering::Acquire) {
@@ -1743,18 +1695,7 @@ impl AgentLoopShared {
             }
             if raw_hard {
                 self.install_pending_compaction(ctx, true).await;
-                retained_admission = higgs_retained_admission(
-                    retained_cap_tokens,
-                    &ctx.messages,
-                    tool_def_tokens,
-                    last_estimated_prompt_tokens,
-                    last_actual_prompt_tokens,
-                );
-                retained_admission_hard = retained_admission
-                    .as_ref()
-                    .is_some_and(|admission| admission.force_blocking);
-                raw_hard =
-                    conversation_token_count(&ctx.messages) > hard_limit || retained_admission_hard;
+                raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
                 action = {
                     let engine = lcm_engine.lock().await;
                     engine.check_thresholds_with_available(available)
@@ -1771,22 +1712,6 @@ impl AgentLoopShared {
                     msg_count = ctx.messages.len(),
                     conv_tokens,
                     available,
-                    model_available,
-                    retained_cap_tokens,
-                    retained_available,
-                    retained_admission_forced = retained_admission_hard,
-                    retained_estimated_prompt_tokens = retained_admission
-                        .map(|admission| admission.estimated_prompt_tokens)
-                        .unwrap_or(0),
-                    retained_calibrated_prompt_tokens = retained_admission
-                        .map(|admission| admission.calibrated_prompt_tokens)
-                        .unwrap_or(0),
-                    retained_admission_limit_tokens = retained_admission
-                        .map(|admission| admission.admission_limit_tokens)
-                        .unwrap_or(0),
-                    retained_observed_token_ratio = retained_admission
-                        .map(|admission| admission.observed_token_ratio)
-                        .unwrap_or(1.0),
                     hard_limit,
                     soft_limit,
                     "lcm_compaction_triggered"
@@ -1803,6 +1728,15 @@ impl AgentLoopShared {
                     .get_session(&session_id)
                     .await
                     .map_or(0, |session| session.message_count as u64);
+                // Signal the TUI before the await: this compaction will block
+                // the turn for ~30-90s (spawn compactor + summarize + install).
+                // Without this marker the user sees a silent freeze.
+                send_compaction_marker(
+                    &ctx.text_delta_tx,
+                    crate::turn_stream::CompactionStatus::Started {
+                        messages: ctx.messages.len() as u32,
+                    },
+                );
                 let pending = execute_lcm_compaction(
                     core,
                     session_id,
@@ -1817,15 +1751,19 @@ impl AgentLoopShared {
                 }
                 ctx.compaction.in_flight.store(false, Ordering::Release);
                 self.install_pending_compaction(ctx, true).await;
+                // Clear the compaction indicator. The next event (prefill,
+                // cache reset, etc.) replaces the Activity row, but in case
+                // the turn finishes here we don't want a stuck "compacting".
+                send_compaction_marker(
+                    &ctx.text_delta_tx,
+                    crate::turn_stream::CompactionStatus::Finished,
+                );
             } else if action == CompactionAction::Async && !has_pending && !in_flight {
                 tracing::info!(
                     compaction_type = "lcm_async",
                     msg_count = ctx.messages.len(),
                     conv_tokens,
                     available,
-                    model_available,
-                    retained_cap_tokens,
-                    retained_available,
                     hard_limit,
                     soft_limit,
                     "lcm_compaction_triggered"
@@ -1885,8 +1823,8 @@ impl AgentLoopShared {
                     engine.set_current_turn(current_turn);
                     // wire_tokens = actual rendered prompt size. Counting the
                     // wire (not the engine's internal active) is what stops
-                    // reinjection from pushing the prompt past τ_hard and
-                    // blowing the Higgs retained-session cap.
+                    // reinjection from pushing the prompt past the active
+                    // model's τ_hard context threshold.
                     let wire_tokens = TokenBudget::estimate_tokens(&ctx.rendered_messages);
                     let appended =
                         engine.auto_expand(&ctx.core.token_budget, tool_def_tokens, wire_tokens);
@@ -3439,12 +3377,9 @@ mod forced_recovery_tests {
 #[cfg(test)]
 mod cache_pressure_tests {
     use super::{
-        effective_lcm_available_budget, higgs_retained_admission, retained_context_pressure,
         should_allow_checkpoint, should_inject_heartbeat_grounding, ProviderRequestAdmission,
         ProviderRequestState,
     };
-    use crate::agent::token_budget::TokenBudget;
-    use serde_json::json;
 
     #[test]
     fn identical_provider_request_after_tool_progress_forces_checkpoint() {
@@ -3490,113 +3425,25 @@ mod cache_pressure_tests {
 
     #[test]
     fn checkpoint_deferred_below_tau_hard() {
-        assert!(!should_allow_checkpoint(0.50, 0.85, None));
-        assert!(!should_allow_checkpoint(0.84, 0.85, None));
+        assert!(!should_allow_checkpoint(0.50, 0.85));
+        assert!(!should_allow_checkpoint(0.84, 0.85));
     }
 
     #[test]
     fn checkpoint_forced_at_tau_hard_boundary() {
         // Exactly tau_hard: accept the re-prefill to break the grow-forever
         // deadlock where warm-cache deferral starves compaction entirely.
-        assert!(should_allow_checkpoint(0.85, 0.85, None));
+        assert!(should_allow_checkpoint(0.85, 0.85));
     }
 
     #[test]
     fn checkpoint_forced_above_tau_hard() {
-        assert!(should_allow_checkpoint(0.90, 0.85, None));
-        assert!(should_allow_checkpoint(1.00, 0.85, None));
+        assert!(should_allow_checkpoint(0.90, 0.85));
+        assert!(should_allow_checkpoint(1.00, 0.85));
     }
 
     #[test]
-    fn checkpoint_forced_by_retained_pressure_before_model_pressure() {
-        assert!(should_allow_checkpoint(0.40, 0.85, Some(0.86)));
-        assert!(!should_allow_checkpoint(0.40, 0.85, Some(0.84)));
-    }
-
-    #[test]
-    fn lcm_available_budget_uses_model_context_not_retained_cap() {
-        // LCM thresholds use the MODEL's full context budget (not the
-        // retained-session cap). The retained cap is tracked separately
-        // for admission decisions but does NOT clamp LCM. This lets a
-        // 120K-context model use its full context for conversation
-        // without LCM compacting at 12K (50% of the old 24K retained cap).
-        let messages = vec![
-            json!({"role": "system", "content": "system ".repeat(40)}),
-            json!({"role": "user", "content": "history ".repeat(80)}),
-        ];
-        let model_available = 120_000;
-        let retained_cap = 24_576;
-        let tool_def_tokens = 50;
-        let (available, retained_available) = effective_lcm_available_budget(
-            model_available,
-            &messages,
-            tool_def_tokens,
-            Some(retained_cap),
-        );
-
-        // LCM gets the model's full budget.
-        assert_eq!(
-            available, model_available,
-            "LCM available must use model context, not retained cap"
-        );
-        // Retained budget is tracked separately (for admission).
-        let retained =
-            retained_available.expect("retained budget should be reported when cap is present");
-        assert!(
-            retained < model_available,
-            "retained budget is smaller than model context"
-        );
-        assert!(retained <= retained_cap);
-    }
-
-    #[test]
-    fn retained_pressure_counts_full_prompt_plus_tool_defs() {
-        let messages = vec![
-            json!({"role": "system", "content": "system ".repeat(20)}),
-            json!({"role": "user", "content": "history ".repeat(20)}),
-        ];
-        let pressure =
-            retained_context_pressure(Some(256), &messages, 32).expect("retained pressure");
-        assert!(pressure > 0.0);
-        assert!(
-            retained_context_pressure(None, &messages, 32).is_none(),
-            "no retained cap means no retained pressure"
-        );
-    }
-
-    #[test]
-    fn higgs_admission_uses_actual_prompt_ratio_before_retained_cap() {
-        let messages = vec![
-            json!({"role": "system", "content": "system ".repeat(80)}),
-            json!({"role": "user", "content": "history ".repeat(800)}),
-        ];
-        let tool_def_tokens = 64;
-        let estimated = TokenBudget::estimate_tokens(&messages) + tool_def_tokens;
-        let cap = estimated * 2;
-
-        let uncalibrated =
-            higgs_retained_admission(Some(cap), &messages, tool_def_tokens, 0, 0).unwrap();
-        assert!(
-            !uncalibrated.force_blocking,
-            "estimate-only prompt should remain below the 80% admission margin"
-        );
-
-        let calibrated = higgs_retained_admission(
-            Some(cap),
-            &messages,
-            tool_def_tokens,
-            estimated as u64,
-            (estimated * 2) as u64,
-        )
-        .unwrap();
-        assert!(calibrated.force_blocking);
-        assert_eq!(calibrated.calibrated_prompt_tokens, estimated * 2);
-        assert!(calibrated.admission_limit_tokens < calibrated.calibrated_prompt_tokens);
-    }
-
-    #[test]
-    fn higgs_admission_ignores_missing_retained_cap() {
-        let messages = vec![json!({"role": "user", "content": "history ".repeat(20)})];
-        assert!(higgs_retained_admission(None, &messages, 0, 100, 200).is_none());
+    fn checkpoint_is_not_forced_before_model_context_pressure() {
+        assert!(!should_allow_checkpoint(0.40, 0.85));
     }
 }

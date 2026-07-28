@@ -1125,7 +1125,10 @@ pub(crate) async fn router_preflight(
                     append_router_decision_trace(&trace);
                 }
                 ctx.messages
-                    .push(crate::agent::markers::scaffold_user(format!("[tool-guard] {}", e)));
+                    .push(crate::agent::markers::scaffold_user(format!(
+                        "[tool-guard] {}",
+                        e
+                    )));
                 return PreflightResult::Continue;
             }
             let tr = ctx.tools.execute(&decision.target, params_map).await;
@@ -1145,11 +1148,12 @@ pub(crate) async fn router_preflight(
             // Cache-replay tagged: tool evidence sent to the model must survive
             // session reload byte-identical, or the next turn's prompt prefix
             // diverges and the server re-prefills everything.
-            ctx.messages.push(crate::agent::markers::scaffold_user(format!(
-                "[router:tool:{}] The tool returned the following data. \
+            ctx.messages
+                .push(crate::agent::markers::scaffold_user(format!(
+                    "[router:tool:{}] The tool returned the following data. \
                  Summarize it concisely for the user:\n\n{}",
-                decision.target, truncated
-            )));
+                    decision.target, truncated
+                )));
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some(decision.target.clone());
             ctx.used_tools.insert(decision.target.clone());
             tool_preflight_result(&decision.target, &truncated, None)
@@ -1201,7 +1205,10 @@ pub(crate) async fn router_preflight(
                     append_router_decision_trace(&trace);
                 }
                 ctx.messages
-                    .push(crate::agent::markers::scaffold_user(format!("[tool-guard] {}", e)));
+                    .push(crate::agent::markers::scaffold_user(format!(
+                        "[tool-guard] {}",
+                        e
+                    )));
                 return PreflightResult::Continue;
             }
 
@@ -1222,11 +1229,12 @@ pub(crate) async fn router_preflight(
             );
             // Cache-replay tagged: pipeline evidence sent live must replay
             // byte-identical on reload (warm-prefix contract).
-            ctx.messages.push(crate::agent::markers::scaffold_user(format!(
-                "[router:pipeline] Pipeline execution result. \
+            ctx.messages
+                .push(crate::agent::markers::scaffold_user(format!(
+                    "[router:pipeline] Pipeline execution result. \
                  Summarize the completed steps and outcome for the user:\n\n{}",
-                truncated
-            )));
+                    truncated
+                )));
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some("spawn:pipeline".to_string());
             ctx.used_tools.insert("spawn".to_string());
             PreflightResult::Continue
@@ -1267,54 +1275,15 @@ pub(crate) fn subagent_route_result(subagent_result: &str) -> RouteResult {
     RouteResult::Break(subagent_result.to_string())
 }
 
-fn canonicalize_proxy_execution(mut tc: ToolCallRequest) -> ToolCallRequest {
-    if tc.name != "tool" {
-        return tc;
-    }
-
-    let Some(inner_name) = tc
-        .arguments
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
+fn canonicalize_proxy_execution(
+    registry: &ToolRegistry,
+    mut tc: ToolCallRequest,
+) -> ToolCallRequest {
+    let Some((name, arguments)) = registry.canonical_proxy_dispatch(&tc.name, &tc.arguments) else {
         return tc;
     };
-
-    let mut inner_args: HashMap<String, Value> = HashMap::new();
-    let had_args_object = match tc.arguments.get("args") {
-        Some(Value::Object(map)) => {
-            inner_args.extend(map.iter().map(|(k, v)| (k.clone(), v.clone())));
-            true
-        }
-        // Local models sometimes double-encode nested JSON as a string. Without
-        // this arm the model's arguments are discarded and it sees an opaque
-        // "'args' must be a JSON object" error it cannot act on.
-        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
-            Ok(Value::Object(map)) => {
-                inner_args.extend(map);
-                true
-            }
-            _ => false,
-        },
-        Some(Value::Null) | None => false,
-        Some(_) => return tc,
-    };
-
-    for (key, value) in &tc.arguments {
-        if key != "name" && key != "args" {
-            inner_args
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
-        }
-    }
-
-    if !had_args_object && inner_args.is_empty() {
-        return tc;
-    }
-
-    tc.name = inner_name;
-    tc.arguments = inner_args;
+    tc.name = name;
+    tc.arguments = arguments;
     tc
 }
 
@@ -1586,7 +1555,7 @@ pub(crate) async fn route_tool_calls(
 
     routed_tool_calls = routed_tool_calls
         .into_iter()
-        .map(canonicalize_proxy_execution)
+        .map(|tc| canonicalize_proxy_execution(&ctx.tools, tc))
         .collect();
 
     // Deduplicate identical calls before they reach ToolGuard. A single model
@@ -1719,6 +1688,7 @@ mod tests {
 
     #[test]
     fn test_canonicalize_proxy_execution_nested_args() {
+        let registry = ToolRegistry::new();
         let mut arguments = HashMap::new();
         arguments.insert("name".to_string(), json!("edit_file"));
         arguments.insert(
@@ -1726,11 +1696,14 @@ mod tests {
             json!({"path": "a.txt", "old_text": "old", "new_text": "new"}),
         );
 
-        let tc = canonicalize_proxy_execution(ToolCallRequest {
-            id: "tc_proxy_edit".to_string(),
-            name: "tool".to_string(),
-            arguments,
-        });
+        let tc = canonicalize_proxy_execution(
+            &registry,
+            ToolCallRequest {
+                id: "tc_proxy_edit".to_string(),
+                name: "tool".to_string(),
+                arguments,
+            },
+        );
 
         assert_eq!(tc.name, "edit_file");
         assert_eq!(tc.arguments.get("path"), Some(&json!("a.txt")));
@@ -1738,16 +1711,44 @@ mod tests {
     }
 
     #[test]
+    fn test_canonicalize_proxy_execution_current_envelope() {
+        let registry = ToolRegistry::new();
+        let tc = canonicalize_proxy_execution(
+            &registry,
+            ToolCallRequest {
+                id: "tc_proxy_web".to_string(),
+                name: "tool".to_string(),
+                arguments: HashMap::from([
+                    ("tool_name".to_string(), json!("web_fetch")),
+                    (
+                        "tool_args".to_string(),
+                        json!({"url": "https://example.com"}),
+                    ),
+                ]),
+            },
+        );
+
+        assert_eq!(tc.name, "web_fetch");
+        assert_eq!(tc.arguments.get("url"), Some(&json!("https://example.com")));
+    }
+
+    #[test]
     fn test_canonicalize_proxy_execution_flattened_args() {
+        let registry = ToolRegistry::with_standard_tools(
+            &crate::agent::tools::registry::ToolConfig::new(std::path::Path::new(".")),
+        );
         let mut arguments = HashMap::new();
         arguments.insert("name".to_string(), json!("recall"));
         arguments.insert("mode".to_string(), json!("latest"));
 
-        let tc = canonicalize_proxy_execution(ToolCallRequest {
-            id: "tc_proxy_recall".to_string(),
-            name: "tool".to_string(),
-            arguments,
-        });
+        let tc = canonicalize_proxy_execution(
+            &registry,
+            ToolCallRequest {
+                id: "tc_proxy_recall".to_string(),
+                name: "tool".to_string(),
+                arguments,
+            },
+        );
 
         assert_eq!(tc.name, "recall");
         assert_eq!(tc.arguments.get("mode"), Some(&json!("latest")));
@@ -1755,14 +1756,18 @@ mod tests {
 
     #[test]
     fn test_canonicalize_proxy_execution_preserves_inspect() {
+        let registry = ToolRegistry::new();
         let mut arguments = HashMap::new();
         arguments.insert("name".to_string(), json!("session_search"));
 
-        let tc = canonicalize_proxy_execution(ToolCallRequest {
-            id: "tc_proxy_inspect".to_string(),
-            name: "tool".to_string(),
-            arguments,
-        });
+        let tc = canonicalize_proxy_execution(
+            &registry,
+            ToolCallRequest {
+                id: "tc_proxy_inspect".to_string(),
+                name: "tool".to_string(),
+                arguments,
+            },
+        );
 
         assert_eq!(tc.name, "tool");
         assert_eq!(tc.arguments.get("name"), Some(&json!("session_search")));
@@ -1770,15 +1775,19 @@ mod tests {
 
     #[test]
     fn test_canonicalize_proxy_args_as_json_string() {
+        let registry = ToolRegistry::new();
         let mut arguments = HashMap::new();
         arguments.insert("name".to_string(), json!("web_search"));
         arguments.insert("args".to_string(), json!(r#"{"query":"news"}"#));
 
-        let tc = canonicalize_proxy_execution(ToolCallRequest {
-            id: "tc_proxy_web_search".to_string(),
-            name: "tool".to_string(),
-            arguments,
-        });
+        let tc = canonicalize_proxy_execution(
+            &registry,
+            ToolCallRequest {
+                id: "tc_proxy_web_search".to_string(),
+                name: "tool".to_string(),
+                arguments,
+            },
+        );
 
         assert_eq!(tc.name, "web_search");
         assert_eq!(tc.arguments.get("query"), Some(&json!("news")));

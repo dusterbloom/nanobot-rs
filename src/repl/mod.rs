@@ -605,9 +605,7 @@ fn spawn_higgs_keepalive(
 ///
 /// Adopts the id the server *actually serves* (via `GET /v1/models`) so a stale
 /// config hint can't make every warm-keep ping 404 — e.g. `lmsMainModel:
-/// "qwen36-35b"` against a Higgs that loaded `Qwen3.6-35B-A3B-4bit`, or
-/// `lcm.compactionModelDir: "/models/bonsai-1.7b"` against a served id such as
-/// `Bonsai-1.7B-mlx-1bit`. Falls
+/// "qwen36-35b"` against a Higgs that loaded `Qwen3.6-35B-A3B-4bit`. Falls
 /// back to `hint` when the server can't be queried (still loading, or not
 /// OpenAI-compatible) so we never send an empty model field.
 async fn resolve_keepalive_model(api_base: &str, api_key: &str, hint: &str) -> String {
@@ -995,6 +993,7 @@ async fn stream_and_render_inner(
                                     }
                                     ControlMarker::BackendActivity { .. } => {}
                                     ControlMarker::CacheStatus(_) => {}
+                                    ControlMarker::Compaction(_) => {}
                                 }
                             } else {
                                 prefill.clear();
@@ -2660,7 +2659,6 @@ pub(crate) fn cmd_agent(
             // just-finished session are eligible for distillation into MEMORY.md.
             {
                 let core = ctx.core_handle.swappable();
-                let exit_compaction_manager = core.compaction_manager.clone();
                 if core.memory_enabled {
                     match complete_current_working_memory_for_exit(
                         &core.sessions,
@@ -2679,58 +2677,33 @@ pub(crate) fn cmd_agent(
                     }
 
                     if Reflector::should_reflect_sessions(&core.sessions, 0).await {
-                        if let Some(compaction_manager) = core.compaction_manager.clone() {
-                            info!("Exit: reflecting on accumulated working memory...");
-                            let reflection_manager = compaction_manager.clone();
-                            let reflection = async move {
-                                let lease = match reflection_manager.acquire().await {
-                                    Ok(lease) => lease,
-                                    Err(error) => {
-                                        warn!(%error, "exit_reflection_sidecar_unavailable");
-                                        return;
-                                    }
-                                };
-                                let reflector = Reflector::new(
-                                    core.memory_provider.clone(),
-                                    lease.served_model().to_string(),
-                                    &core.workspace,
-                                    0,
-                                    core.sessions.clone(),
-                                );
-                                let res = reflector.reflect().await;
-                                lease.release().await;
-                                match res {
-                                    Ok(()) => info!("Exit reflection complete — MEMORY.md updated"),
-                                    Err(e) => warn!("Exit reflection failed: {}", e),
-                                }
-                            };
-                            // Wait up to 20s for reflection (sidecar spawn ~1s + the
-                            // summarization call); don't block exit indefinitely.
-                            if tokio::time::timeout(
-                                std::time::Duration::from_secs(20),
-                                reflection,
-                            )
+                        info!("Exit: reflecting on accumulated working memory...");
+                        let reflection = async move {
+                            let reflector = Reflector::new(
+                                core.memory_provider.clone(),
+                                core.memory_model.clone(),
+                                &core.workspace,
+                                0,
+                                core.sessions.clone(),
+                            );
+                            match reflector.reflect().await {
+                                Ok(()) => info!("Exit reflection complete — MEMORY.md updated"),
+                                Err(e) => warn!("Exit reflection failed: {}", e),
+                            }
+                        };
+                        // Reflection is best-effort during shutdown; don't block
+                        // process exit indefinitely on a provider call.
+                        if tokio::time::timeout(std::time::Duration::from_secs(20), reflection)
                             .await
                             .is_err()
-                            {
-                                warn!("Exit reflection timed out");
-                            }
-                        } else {
-                            warn!("Exit reflection skipped: no managed compaction sidecar");
+                        {
+                            warn!("Exit reflection timed out");
                         }
                     }
                 }
-
-                // Reflection may be disabled or have no rows while a soft LCM
-                // task still owns a lease. Always settle an owned sidecar before
-                // dropping the runtime; external servers are ownership-safe.
-                if let Some(compaction_manager) = exit_compaction_manager {
-                    compaction_manager.shutdown_owned().await;
-                }
             }
 
-            // Safety net for managed children unrelated to the compaction
-            // lease, which was synchronously settled above.
+            // Safety net for managed child processes.
             crate::agent::pid_file::cleanup_stale_pids();
             crate::agent::pid_file::release_agent_singleton();
 

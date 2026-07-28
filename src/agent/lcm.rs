@@ -3651,8 +3651,8 @@ mod tests {
     //
     // Requires an OpenAI-compatible endpoint at NANOBOT_LCM_BENCH_BASE with
     // every comma-separated NANOBOT_LCM_BENCH_MODELS id available. This lets
-    // the release check compare the foreground model and compaction sidecar
-    // with identical input, budget, prompt, and measurement code.
+    // the release check compare candidate foreground models with identical
+    // input, budget, prompt, and measurement code.
     //
     // Run: cargo test test_bench_lcm_compaction_models -- --ignored --nocapture
     // -----------------------------------------------------------------------
@@ -3727,7 +3727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a real sessions DB and OpenAI-compatible sidecar"]
+    #[ignore = "requires a real sessions DB and OpenAI-compatible endpoint"]
     async fn test_bench_lcm_real_sessions() {
         use crate::providers::openai_compat::OpenAICompatProvider;
         use std::time::Instant;

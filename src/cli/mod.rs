@@ -318,14 +318,12 @@ mod tests {
     }
 
     #[test]
-    fn managed_compaction_sidecar_overrides_legacy_memory_provider() {
+    fn configured_memory_provider_is_reflection_only() {
         let mut cfg = Config::default();
-        cfg.lcm.compaction_port = Some(28009);
-        cfg.lcm.compaction_model_dir = Some("/models/managed-compactor".to_string());
-        cfg.memory.model = "legacy-memory-model".to_string();
+        cfg.memory.model = "reflection-model".to_string();
         cfg.memory.provider = Some(crate::config::schema::ProviderConfig {
-            api_key: "legacy-key".to_string(),
-            api_base: Some("https://legacy-memory.example/v1".to_string()),
+            api_key: "reflection-key".to_string(),
+            api_base: Some("https://reflection.example/v1".to_string()),
         });
 
         let handle = build_core_handle(
@@ -338,15 +336,12 @@ mod tests {
         );
         let core = handle.swappable();
 
-        assert!(core.compaction_manager.is_some());
         assert_eq!(
             core.memory_provider.get_api_base(),
-            Some("http://127.0.0.1:28009/v1")
+            Some("https://reflection.example/v1")
         );
-        assert_eq!(
-            core.memory_provider.get_default_model(),
-            "managed-compactor"
-        );
+        assert_eq!(core.memory_model, "reflection-model");
+        assert_eq!(core.compactor.model(), "local:Qwen3-8B");
     }
 
     #[test]
@@ -727,7 +722,6 @@ pub(crate) async fn run_gateway_async(
     let health_registry = Arc::new(crate::heartbeat::health::build_registry(&config));
 
     let lcm_config = config.lcm.clone();
-    let shutdown_core_handle = core_handle.clone();
     let mut agent_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
@@ -872,12 +866,6 @@ pub(crate) async fn run_gateway_async(
     heartbeat.stop().await;
     channel_manager.stop_all().await;
 
-    // Join owned sidecar cleanup before the runtime exits. The manager tracks
-    // process ownership, so an externally started Higgs server is never stopped.
-    if let Some(manager) = shutdown_core_handle.swappable().compaction_manager.clone() {
-        manager.shutdown_owned().await;
-    }
-
     // Safety net: kill any managed child processes whose Drop may not
     // have fired (e.g. Arc still held elsewhere).
     crate::agent::pid_file::cleanup_stale_pids();
@@ -899,26 +887,14 @@ fn build_cron_reflect_hook(core_handle: SharedCoreHandle) -> crate::cron::execut
             {
                 return;
             }
-            let Some(manager) = core.compaction_manager.as_ref() else {
-                tracing::warn!("Cron reflect skipped: no managed compaction sidecar");
-                return;
-            };
-            let lease = match manager.acquire().await {
-                Ok(lease) => lease,
-                Err(error) => {
-                    tracing::warn!(%error, "Cron reflect: compaction sidecar unavailable");
-                    return;
-                }
-            };
             let reflector = crate::agent::reflector::Reflector::new(
                 core.memory_provider.clone(),
-                lease.served_model().to_string(),
+                core.memory_model.clone(),
                 &core.workspace,
                 0,
                 core.sessions.clone(),
             );
             let result = reflector.reflect().await;
-            lease.release().await;
             match result {
                 Ok(()) => tracing::info!("Cron reflect: memory distillation complete"),
                 Err(e) => tracing::warn!("Cron reflect failed: {}", e),

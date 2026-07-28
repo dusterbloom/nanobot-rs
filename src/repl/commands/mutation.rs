@@ -192,26 +192,14 @@ impl ReplContext {
             return;
         }
         println!("\n  Reflecting on accumulated sessions...");
-        let Some(manager) = core.compaction_manager.as_ref() else {
-            println!("  Reflection skipped: no managed compaction sidecar configured.\n");
-            return;
-        };
-        let lease = match manager.acquire().await {
-            Ok(lease) => lease,
-            Err(error) => {
-                println!("  Reflection skipped: compaction sidecar unavailable: {error}\n");
-                return;
-            }
-        };
         let reflector = crate::agent::reflector::Reflector::new(
             core.memory_provider.clone(),
-            lease.served_model().to_string(),
+            core.memory_model.clone(),
             &core.workspace,
             0,
             core.sessions.clone(),
         );
         let result = reflector.reflect().await;
-        lease.release().await;
         match result {
             Ok(()) => println!("  Learned. MEMORY.md updated.\n"),
             Err(e) => println!("  Reflection failed: {}\n", e),

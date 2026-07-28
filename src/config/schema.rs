@@ -301,14 +301,6 @@ pub struct AgentDefaults {
     /// Port for the managed Higgs server (default: 8091).
     #[serde(default = "default_higgs_port")]
     pub higgs_port: u16,
-    /// Legacy alias for `lcm.compactionPort` (accepted for one release).
-    /// New configuration must use the canonical LCM field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub higgs_compaction_port: Option<u16>,
-    /// Legacy alias for `lcm.compactionModelDir` (accepted for one release).
-    /// New configuration must use the canonical LCM field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub higgs_compaction_model_dir: Option<String>,
     /// Path to MLX model directory (containing .safetensors + tokenizer.json).
     /// Default: ~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -520,8 +512,6 @@ impl Default for AgentDefaults {
             local_autostart: LocalAutostart::default(),
             lms_port: default_lms_port(),
             higgs_port: default_higgs_port(),
-            higgs_compaction_port: None,
-            higgs_compaction_model_dir: None,
             local_backend: default_local_backend(),
             mlx_model_dir: None,
             higgs_draft_model: None,
@@ -2044,13 +2034,6 @@ pub struct LcmSchemaConfig {
     /// Target tokens for Level 3 deterministic truncation (default: 512).
     #[serde(default = "default_lcm_deterministic_target")]
     pub deterministic_target: usize,
-    /// Local MLX model directory used to start the on-demand Higgs compaction
-    /// sidecar. Requests use the literal served id resolved from Higgs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction_model_dir: Option<String>,
-    /// Local port for the on-demand Higgs compaction sidecar.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction_port: Option<u16>,
 }
 
 impl Default for LcmSchemaConfig {
@@ -2059,8 +2042,6 @@ impl Default for LcmSchemaConfig {
             tau_soft: default_lcm_tau_soft(),
             tau_hard: default_lcm_tau_hard(),
             deterministic_target: default_lcm_deterministic_target(),
-            compaction_model_dir: None,
-            compaction_port: None,
         }
     }
 }
@@ -3103,8 +3084,6 @@ mod tests {
         assert!((lcm.tau_soft - 0.5).abs() < f64::EPSILON);
         assert!((lcm.tau_hard - 0.85).abs() < f64::EPSILON);
         assert_eq!(lcm.deterministic_target, 512);
-        assert!(lcm.compaction_model_dir.is_none());
-        assert!(lcm.compaction_port.is_none());
     }
 
     #[test]
@@ -3118,29 +3097,6 @@ mod tests {
         assert!((lcm2.tau_soft - 0.6).abs() < f64::EPSILON);
         assert!((lcm2.tau_hard - 0.9).abs() < f64::EPSILON);
         assert_eq!(lcm2.deterministic_target, 256);
-    }
-
-    #[test]
-    fn test_lcm_managed_compactor_fields() {
-        let json = r#"{"compactionModelDir":"/models/qwen3-0.6b","compactionPort":8092}"#;
-        let lcm: LcmSchemaConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(lcm.compaction_port, Some(8092));
-        assert_eq!(
-            lcm.compaction_model_dir.as_deref(),
-            Some("/models/qwen3-0.6b")
-        );
-    }
-
-    #[test]
-    fn test_legacy_lcm_enabled_field_is_ignored() {
-        let json =
-            r#"{"enabled":false,"compactionModelDir":"/models/qwen3-0.6b","compactionPort":8092}"#;
-        let lcm: LcmSchemaConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(lcm.compaction_port, Some(8092));
-        assert_eq!(
-            lcm.compaction_model_dir.as_deref(),
-            Some("/models/qwen3-0.6b")
-        );
     }
 
     #[test]
@@ -3174,24 +3130,29 @@ mod tests {
     }
 
     #[test]
-    fn test_lcm_managed_compaction_config() {
+    fn test_obsolete_lcm_sidecar_config_is_ignored() {
         let json = r#"{
             "lcm": {
                 "compactionModelDir": "/models/qwen3-0.6b",
                 "compactionPort": 8092,
                 "compactionContextSize": 2048
+            },
+            "agents": {
+                "defaults": {
+                    "higgsCompactionModelDir": "/models/legacy",
+                    "higgsCompactionPort": 8093
+                }
             }
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            cfg.lcm.compaction_model_dir.as_deref(),
-            Some("/models/qwen3-0.6b")
-        );
-        assert_eq!(cfg.lcm.compaction_port, Some(8092));
         let serialized = serde_json::to_string(&cfg).unwrap();
         assert!(
-            !serialized.contains("compactionContextSize"),
-            "obsolete fixed context setting must not remain active"
+            !serialized.contains("compactionModelDir")
+                && !serialized.contains("compactionPort")
+                && !serialized.contains("higgsCompactionModelDir")
+                && !serialized.contains("higgsCompactionPort")
+                && !serialized.contains("compactionContextSize"),
+            "obsolete sidecar settings must be accepted as inert input and never serialized"
         );
     }
 

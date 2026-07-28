@@ -48,6 +48,7 @@ fn write_isolated_config(home: &Path, local_api_base: &str, local_model: &str) {
     cfg.agents.defaults.workspace = workspace.to_string_lossy().to_string();
     cfg.agents.defaults.local_api_base = local_api_base.to_string();
     cfg.agents.defaults.local_model = local_model.to_string();
+    cfg.agents.defaults.local_autostart = nanobot::config::schema::LocalAutostart::Off;
     cfg.agents.defaults.skip_jit_gate = true;
 
     let cfg_path = nanobot_dir.join("config.json");
@@ -185,6 +186,11 @@ fn agent_local_single_turn_smoke() {
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("<<NANOBOT_DONE>>"),
+        "hidden turn attestation leaked into CLI output: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 
     let session_path = expected_sessions_db(home);
     assert!(
@@ -200,6 +206,15 @@ fn agent_local_single_turn_smoke() {
     assert!(session_turns
         .iter()
         .any(|m| m.get("role") == Some(&Value::String("assistant".to_string()))));
+    assert!(
+        session_turns.iter().all(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_none_or(|content| !content.contains("<<NANOBOT_DONE>>"))
+        }),
+        "hidden turn attestation leaked into persisted session: {session_turns:?}"
+    );
 
     let logs_dir = home.join(".nanobot").join("logs");
     assert!(

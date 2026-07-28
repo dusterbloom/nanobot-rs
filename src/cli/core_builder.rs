@@ -140,50 +140,14 @@ pub(super) fn local_base_url(config: &Config, fallback_port: &str) -> String {
     }
 }
 
-/// Resolved local providers for all roles (main, compaction, delegation, specialist).
+/// Resolved local providers for the foreground, delegation, and specialist roles.
 pub(super) struct LocalProviders {
     pub main: Arc<dyn LLMProvider>,
     /// Real model identity used for capabilities, prompt policy, UI, and snapshots.
     pub semantic_model_id: String,
-    pub compaction: Option<Arc<dyn LLMProvider>>,
-    pub compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
     pub delegation: Option<Arc<dyn LLMProvider>>,
     pub specialist: Option<Arc<dyn LLMProvider>>,
     pub max_context_tokens: usize,
-}
-
-/// Construct the provider and lifecycle owner as one unit so every consumer
-/// uses the exact endpoint/model identity the manager starts.
-fn make_managed_compaction_provider(
-    config: &Config,
-) -> (
-    Option<Arc<dyn LLMProvider>>,
-    Option<Arc<crate::higgs::CompactionSidecarManager>>,
-) {
-    let (repetition_penalty, frequency_penalty, presence_penalty) = (
-        config.agents.defaults.repetition_penalty,
-        config.agents.defaults.frequency_penalty,
-        config.agents.defaults.presence_penalty,
-    );
-
-    let manager = crate::higgs::CompactionSidecarManager::from_config(config);
-    let provider = manager.as_ref().map(|manager| -> Arc<dyn LLMProvider> {
-        factory::create_openai_compat(
-            factory::ProviderSpec::local_with_key(
-                &manager.base_url(),
-                Some(manager.model_hint()),
-                &config.agents.defaults.local_api_key,
-            )
-            .with_timeout_config(&config.timeouts)
-            .with_retry(config.retry.clone())
-            .with_sampling_penalties(
-                repetition_penalty,
-                frequency_penalty,
-                presence_penalty,
-            ),
-        )
-    });
-    (provider, manager)
 }
 
 fn shared_local_role_model<'a>(configured_role_model: &'a str, main_model_id: &'a str) -> &'a str {
@@ -308,11 +272,6 @@ pub(super) fn make_local_providers(
     let max_context_tokens =
         max_context_tokens.min(config.agents.defaults.local_max_context_tokens);
 
-    // The managed compactor is one typed unit: lifecycle owner, endpoint, and
-    // the literal model id Higgs serves. Building them together prevents the
-    // provider from drifting to the main endpoint or a stale model alias.
-    let (compaction, compaction_manager) = make_managed_compaction_provider(config);
-
     // Helper: create a provider for a trio role with endpoint resolution.
     let make_role_provider = |role_name: &str,
                               endpoint: &Option<crate::config::schema::ModelEndpoint>,
@@ -408,26 +367,10 @@ pub(super) fn make_local_providers(
     LocalProviders {
         main,
         semantic_model_id,
-        compaction,
-        compaction_manager,
         delegation,
         specialist,
         max_context_tokens,
     }
-}
-
-/// Bind memory/LCM work to the same managed sidecar identity and context size.
-/// Canonical `lcm.*` configuration owns this route. The legacy explicit memory
-/// provider must not bypass the managed lease endpoint or its served model id.
-fn normalize_memory_model_for_sidecar(
-    mut memory: crate::config::schema::MemoryConfig,
-    manager: Option<&Arc<crate::higgs::CompactionSidecarManager>>,
-) -> crate::config::schema::MemoryConfig {
-    if let Some(manager) = manager {
-        memory.model = manager.model_hint().to_string();
-        memory.provider = None;
-    }
-    memory
 }
 
 /// Build a `SwappableCoreConfig` from shared config + per-call overrides.
@@ -440,8 +383,6 @@ fn core_config_from(
     model: String,
     max_context_tokens: usize,
     is_local: bool,
-    compaction: Option<Arc<dyn LLMProvider>>,
-    compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
     delegation: Option<Arc<dyn LLMProvider>>,
     specialist: Option<Arc<dyn LLMProvider>>,
 ) -> SwappableCoreConfig {
@@ -477,14 +418,9 @@ fn core_config_from(
         search_max_results: config.tools.web.search.max_results,
         exec_timeout: config.tools.exec_.timeout,
         restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
-        memory_config: normalize_memory_model_for_sidecar(
-            config.memory.clone(),
-            compaction_manager.as_ref(),
-        ),
+        memory_config: config.memory.clone(),
         is_local,
         lane,
-        compaction_provider: compaction,
-        compaction_manager,
         tool_delegation: config.tool_delegation.clone(),
         provenance: config.provenance.clone(),
         max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
@@ -510,7 +446,7 @@ pub(crate) fn build_core_handle(
     specialist_port: Option<&str>,
     is_local: bool,
 ) -> SharedCoreHandle {
-    let (provider, model, max_context_tokens, cp, cm, dp, sp) = if is_local {
+    let (provider, model, max_context_tokens, dp, sp) = if is_local {
         let lp = make_local_providers(
             config,
             local_port,
@@ -522,29 +458,12 @@ pub(crate) fn build_core_handle(
         // Use lp.max_context_tokens directly — model_context_size would override
         // the memory-safe cap with .max(131072) for Qwen3.6, breaking compaction.
         let ctx = lp.max_context_tokens;
-        (
-            lp.main,
-            model,
-            ctx,
-            lp.compaction,
-            lp.compaction_manager,
-            lp.delegation,
-            lp.specialist,
-        )
+        (lp.main, model, ctx, lp.delegation, lp.specialist)
     } else {
         let provider = create_provider(config);
         let model = config.agents.defaults.model.clone();
         let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
-        let (compaction, compaction_manager) = make_managed_compaction_provider(config);
-        (
-            provider,
-            model,
-            ctx,
-            compaction,
-            compaction_manager,
-            None,
-            None,
-        )
+        (provider, model, ctx, None, None)
     };
 
     let core = build_swappable_core(core_config_from(
@@ -553,8 +472,6 @@ pub(crate) fn build_core_handle(
         model,
         max_context_tokens,
         is_local,
-        cp,
-        cm,
         dp,
         sp,
     ));
@@ -567,7 +484,6 @@ pub(crate) fn build_core_handle(
             .suppress_thinking_display
             .store(true, Ordering::Relaxed);
     }
-    // Attach lazy auxiliary server (spawns on first delegation/compaction/memory use).
     AgentHandle::new(core, Arc::new(counters))
 }
 
@@ -583,7 +499,7 @@ pub(crate) fn rebuild_core(
     specialist_port: Option<&str>,
     is_local: bool,
 ) {
-    let (provider, model, max_context_tokens, cp, cm, dp, sp) = if is_local {
+    let (provider, model, max_context_tokens, dp, sp) = if is_local {
         let lp = make_local_providers(
             config,
             local_port,
@@ -594,29 +510,12 @@ pub(crate) fn rebuild_core(
         let model = format!("local:{}", lp.semantic_model_id);
         // Use lp.max_context_tokens directly (same fix as build_core_handle).
         let ctx = lp.max_context_tokens;
-        (
-            lp.main,
-            model,
-            ctx,
-            lp.compaction,
-            lp.compaction_manager,
-            lp.delegation,
-            lp.specialist,
-        )
+        (lp.main, model, ctx, lp.delegation, lp.specialist)
     } else {
         let provider = create_provider(config);
         let model = config.agents.defaults.model.clone();
         let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
-        let (compaction, compaction_manager) = make_managed_compaction_provider(config);
-        (
-            provider,
-            model,
-            ctx,
-            compaction,
-            compaction_manager,
-            None,
-            None,
-        )
+        (provider, model, ctx, None, None)
     };
 
     let new_core = build_swappable_core(core_config_from(
@@ -625,8 +524,6 @@ pub(crate) fn rebuild_core(
         model,
         max_context_tokens,
         is_local,
-        cp,
-        cm,
         dp,
         sp,
     ));

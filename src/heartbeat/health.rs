@@ -566,16 +566,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_registry_does_not_probe_on_demand_compactor() {
-        let mut config = crate::config::schema::Config::default();
-        config.tools.web.search.searxng_url = String::new();
-        config.lcm.compaction_port = Some(8092);
-        config.lcm.compaction_model_dir = Some("/models/bonsai".to_string());
-        let reg = build_registry(&config);
-        assert_eq!(reg.probe_count(), 0);
-    }
-
-    #[test]
     fn test_summary_line_no_probes() {
         let reg = HealthRegistry::new();
         assert_eq!(reg.summary_line(), "no probes");

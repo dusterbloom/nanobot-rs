@@ -184,8 +184,21 @@ pub struct SearchResult {
     pub rank: f64,
 }
 
+/// SQL-level constraints applied before FTS rank ordering and limiting.
+///
+/// Generic internal search intentionally keeps its historical all-message
+/// behavior. Agent-facing conversation discovery uses the canonical scope so
+/// active-turn echoes, tool payloads, and injected scaffolding cannot outrank
+/// the actual past conversation.
+#[derive(Debug, Clone, Copy, Default)]
+struct MessageSearchScope<'a> {
+    session_key_prefix: Option<&'a str>,
+    exclude_session_id: Option<&'a str>,
+    canonical_conversation_only: bool,
+}
+
 /// The final user/assistant exchange of a past session, used for
-/// cross-session continuity (prompt injection and `recall mode=latest`).
+/// cross-session continuity and latest-session discovery.
 #[derive(Debug, Clone)]
 pub struct SessionTail {
     pub session_id: String,
@@ -1375,6 +1388,51 @@ impl SessionDb {
         session_key_filter: Option<&str>,
     ) -> Vec<SearchResult> {
         let conn = self.conn.lock().await;
+        Self::run_recall_search(
+            &conn,
+            query,
+            limit,
+            MessageSearchScope {
+                session_key_prefix: session_key_filter,
+                ..MessageSearchScope::default()
+            },
+        )
+    }
+
+    /// Search canonical past conversation messages for agent-facing retrieval.
+    ///
+    /// Filtering happens inside SQL before FTS ranking and `LIMIT`: only real
+    /// user/assistant rows from non-active sessions may compete for a result.
+    /// This prevents a short query echo, tool payload, or synthetic replay
+    /// scaffold from displacing the longer source message the agent needs.
+    pub async fn search_conversation_messages(
+        &self,
+        query: &str,
+        limit: usize,
+        session_key_filter: Option<&str>,
+        exclude_session_id: Option<&str>,
+    ) -> Vec<SearchResult> {
+        let conn = self.conn.lock().await;
+        Self::run_recall_search(
+            &conn,
+            query,
+            limit,
+            MessageSearchScope {
+                session_key_prefix: session_key_filter,
+                exclude_session_id,
+                canonical_conversation_only: true,
+            },
+        )
+    }
+
+    /// Normalize a natural-language query once, try precise AND semantics
+    /// first, then fall back to OR for recall. Scope is shared by both passes.
+    fn run_recall_search(
+        conn: &rusqlite::Connection,
+        query: &str,
+        limit: usize,
+        scope: MessageSearchScope<'_>,
+    ) -> Vec<SearchResult> {
         // FTS5 defaults to implicit AND between terms, so a verbose natural-language
         // query ("Diary of two threads story future session share first time I wrote
         // it...") requires every noise word to co-occur in one message and matches
@@ -1385,7 +1443,7 @@ impl SessionDb {
             return Vec::new();
         }
         for match_expr in [&and_q, &or_q] {
-            let results = Self::run_match(&conn, match_expr, session_key_filter, limit);
+            let results = Self::run_match(conn, match_expr, scope, limit);
             if !results.is_empty() {
                 return results;
             }
@@ -1409,51 +1467,40 @@ impl SessionDb {
         let quoted: Vec<String> = terms.iter().map(|t| format!("\"{}\"*", t)).collect();
         let match_expr = quoted.join(" ");
         let conn = self.conn.lock().await;
-        Self::run_match(&conn, &match_expr, None, limit)
+        Self::run_match(&conn, &match_expr, MessageSearchScope::default(), limit)
     }
 
-    /// Run a single FTS5 MATCH expression (optionally filtered by session-key prefix)
-    /// and return the ranked results.
+    /// Run one FTS5 MATCH expression with SQL-level scope constraints.
     fn run_match(
         conn: &rusqlite::Connection,
         match_expr: &str,
-        key_filter: Option<&str>,
+        scope: MessageSearchScope<'_>,
         limit: usize,
     ) -> Vec<SearchResult> {
-        let (sql, params): (String, Vec<rusqlite::types::Value>) = if let Some(kf) = key_filter {
-            (
-                "SELECT m.session_id, s.session_key, m.role,
-                        CAST(m.content AS TEXT), m.timestamp,
-                        snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snip, rank
-                 FROM messages_fts
-                 JOIN messages m ON m.id = messages_fts.rowid
-                 JOIN sessions s ON s.id = m.session_id
-                 WHERE messages_fts MATCH ?1 AND s.session_key LIKE ?2
-                 ORDER BY rank LIMIT ?3"
-                    .to_string(),
-                vec![
-                    rusqlite::types::Value::Text(match_expr.to_string()),
-                    rusqlite::types::Value::Text(format!("{}%", kf)),
-                    rusqlite::types::Value::Integer(limit as i64),
-                ],
-            )
-        } else {
-            (
-                "SELECT m.session_id, s.session_key, m.role,
-                        CAST(m.content AS TEXT), m.timestamp,
-                        snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snip, rank
-                 FROM messages_fts
-                 JOIN messages m ON m.id = messages_fts.rowid
-                 JOIN sessions s ON s.id = m.session_id
-                 WHERE messages_fts MATCH ?1
-                 ORDER BY rank LIMIT ?2"
-                    .to_string(),
-                vec![
-                    rusqlite::types::Value::Text(match_expr.to_string()),
-                    rusqlite::types::Value::Integer(limit as i64),
-                ],
-            )
-        };
+        let mut sql = "SELECT m.session_id, s.session_key, m.role,
+                              CAST(m.content AS TEXT), m.timestamp,
+                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snip, rank
+                       FROM messages_fts
+                       JOIN messages m ON m.id = messages_fts.rowid
+                       JOIN sessions s ON s.id = m.session_id
+                       WHERE messages_fts MATCH ?"
+            .to_string();
+        let mut params = vec![rusqlite::types::Value::Text(match_expr.to_string())];
+
+        if let Some(key_prefix) = scope.session_key_prefix {
+            sql.push_str(" AND s.session_key LIKE ?");
+            params.push(rusqlite::types::Value::Text(format!("{key_prefix}%")));
+        }
+        if let Some(session_id) = scope.exclude_session_id.filter(|id| !id.is_empty()) {
+            sql.push_str(" AND m.session_id != ?");
+            params.push(rusqlite::types::Value::Text(session_id.to_string()));
+        }
+        if scope.canonical_conversation_only {
+            sql.push_str(" AND m.role IN ('user', 'assistant') AND m.synthetic = 0");
+        }
+        sql.push_str(" ORDER BY rank LIMIT ?");
+        params.push(rusqlite::types::Value::Integer(limit as i64));
+
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
@@ -2794,6 +2841,54 @@ mod tests {
         let results = db.search_messages("Rust", 10, Some("cli:")).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_key, "cli:default");
+    }
+
+    #[tokio::test]
+    async fn test_conversation_search_filters_noise_before_rank_limit() {
+        let (db, _dir) = make_db();
+        let past = db.create_session("cli:past").await;
+        let current = db.create_session("cli:current").await;
+
+        db.add_messages(
+            &past.id,
+            &[
+                json!({
+                    "role": "user",
+                    "content": "Canonical source explains zephyrattestation with the complete design."
+                }),
+                json!({
+                    "role": "user",
+                    "content": "zephyrattestation",
+                    "_synthetic": true
+                }),
+                json!({
+                    "role": "tool",
+                    "content": "zephyrattestation"
+                }),
+            ],
+        )
+        .await;
+        db.add_messages(
+            &current.id,
+            &[
+                json!({"role": "user", "content": "zephyrattestation"}),
+                json!({"role": "tool", "content": "zephyrattestation"}),
+            ],
+        )
+        .await;
+
+        let results = db
+            .search_conversation_messages("zephyrattestation", 1, Some("cli:"), Some(&current.id))
+            .await;
+
+        assert_eq!(results.len(), 1, "filters must run before LIMIT");
+        assert_eq!(results[0].session_id, past.id);
+        assert_eq!(results[0].role, "user");
+        assert!(
+            results[0].content.contains("Canonical source explains"),
+            "short synthetic/tool/active echoes must not outrank the source: {:?}",
+            results
+        );
     }
 
     #[tokio::test]

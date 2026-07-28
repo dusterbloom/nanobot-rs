@@ -180,15 +180,16 @@ pub(crate) fn classify_response(
         return ResponseKind::EmptyFinal;
     }
 
-    // Non-empty text, no tool calls — check for truncation.
-    let is_truncated = response.finish_reason == "length"
-        || (response.finish_reason == "stop" && super::appears_incomplete(content));
+    // A provider length stop is transport truncation even if a marker-like
+    // suffix survived. Continue/retry it before considering finality.
+    let is_truncated = response.finish_reason == "length";
     if is_truncated && retries.continuations < 10 {
         // Only classify as Truncated if there's room to continue.
         // (Actual cap is checked in the handler via core.max_continuations.)
         return ResponseKind::Truncated(content.to_string());
     }
 
+    // Plain non-empty text with no tool calls is the final answer.
     ResponseKind::Text(content.to_string())
 }
 
@@ -526,8 +527,13 @@ impl AgentLoopShared {
 
             ResponseKind::Truncated(partial) => {
                 let full = self.handle_truncated(ctx, &response, partial).await;
-                send_finish_reason(&ctx.text_delta_tx, "stop");
-                StepResult::Done(IterationOutcome::Finished(full))
+                match full.trim() {
+                    "" => StepResult::Done(IterationOutcome::Finished(String::new())),
+                    _ => {
+                        send_finish_reason(&ctx.text_delta_tx, "stop");
+                        StepResult::Done(IterationOutcome::Finished(full))
+                    }
+                }
             }
 
             ResponseKind::EmptyAfterThink => {
@@ -796,7 +802,9 @@ impl AgentLoopShared {
                         break;
                     }
                     prev_norm = normalize_for_repeat(&continuation);
-                    send_delta(&ctx.text_delta_tx, &continuation);
+                    if !continuation.is_empty() {
+                        send_delta(&ctx.text_delta_tx, &continuation);
+                    }
                     accumulated.push_str(&continuation);
                     finish_reason = cont_response.finish_reason;
                 }
@@ -977,11 +985,6 @@ impl AgentLoopShared {
             counters
                 .last_actual_prompt_tokens
                 .store(actual_prompt as u64, Ordering::Relaxed);
-            counters.record_prompt_calibration(
-                &ctx.session_key,
-                estimated_prompt as u64,
-                actual_prompt as u64,
-            );
             send_prompt_token_count(&ctx.text_delta_tx, actual_prompt as u64);
         }
         if actual_completion > 0 {
@@ -1220,10 +1223,13 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_plain_text() {
+    fn plain_text_is_final_answer() {
         let resp = make_response(Some("The answer is 42."), "stop");
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
-        assert!(matches!(kind, ResponseKind::Text(ref s) if s == "The answer is 42."));
+        assert!(
+            matches!(kind, ResponseKind::Text(ref s) if s == "The answer is 42."),
+            "plain non-empty text with no tool calls terminates the turn"
+        );
     }
 
     #[test]
@@ -1300,10 +1306,10 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_textual_replay_skips_validation() {
+    fn textual_replay_accepts_plain_text_as_final() {
         let resp = make_response(Some("Let me check that file for you."), "stop");
         let kind = classify_response(&resp, false, true, false, &default_retries(), false);
-        // In textual replay mode, "let me check" should NOT trigger validation error.
+        // Textual replay skips tool-intent validation; plain text is the final answer.
         assert!(matches!(kind, ResponseKind::Text(_)));
     }
 
@@ -1322,9 +1328,12 @@ mod tests {
 
     #[test]
     fn test_classify_text_with_stop_and_complete() {
-        let resp = make_response(Some("All done. Here is your answer."), "stop");
+        let resp = make_response(
+            Some("All done. Here is your answer."),
+            "stop",
+        );
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
-        assert!(matches!(kind, ResponseKind::Text(_)));
+        assert!(matches!(kind, ResponseKind::Text(ref s) if s == "All done. Here is your answer."));
     }
 
     #[test]

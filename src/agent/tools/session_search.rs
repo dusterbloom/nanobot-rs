@@ -21,11 +21,44 @@ const SESSION_DUMP_MAX_CHARS: usize = 16000;
 /// Tool that searches past session conversations via FTS5.
 pub struct SessionSearchTool {
     db_path: PathBuf,
+    /// Concrete active session to exclude from past-conversation discovery.
+    current_session_id: Option<String>,
 }
 
 impl SessionSearchTool {
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path }
+        Self {
+            db_path,
+            current_session_id: None,
+        }
+    }
+
+    /// Bind the active concrete SQLite session. Explicit session dumps remain
+    /// addressable, while discovery modes cannot echo the turn in progress.
+    pub fn with_current_session_id(mut self, session_id: Option<String>) -> Self {
+        self.current_session_id = session_id;
+        self
+    }
+
+    /// Deterministically list recent completed conversation tails without FTS.
+    async fn latest_sessions(&self, count: usize) -> String {
+        let db = SessionDb::new(&self.db_path);
+        let exclude_session_id = self.current_session_id.as_deref().unwrap_or("");
+        let tails = db.latest_session_tails(exclude_session_id, count).await;
+        if tails.is_empty() {
+            return "No previous sessions found in the session database.".to_string();
+        }
+        let now = chrono::Utc::now();
+        tails
+            .iter()
+            .map(|tail| {
+                format!(
+                    "- {}",
+                    crate::agent::continuity::format_continuity_line(tail, now)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Resolve a session key to a single session id (exact match preferred,
@@ -280,10 +313,12 @@ impl Tool for SessionSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search and read PAST conversations stored in sessions.db.\n\
+        "Search sessions.db conversations. \
+         Use search/latest, then session/in_session/extract.\n\
          WORKFLOW (follow exactly):\n\
-         1) mode='search' (default): keyword FTS5 over ALL past sessions. Each result prints its 'Session key' \
+         1) mode='search' (default): keyword FTS5 over canonical messages in past sessions. Each result prints its 'Session key' \
  (e.g. '20260717_224429_33c9c0') AND the exact next call to read that session.\n\
+         Use mode='latest' (no query needed) to list recent past sessions with their last exchange.\n\
          2) MANDATORY NEXT STEP: take a Session key from the results and call \
  mode='session', session=KEY to dump the ENTIRE transcript of that session (this is how you retrieve the full \
  story / long content — search only shows short snippets).\n\
@@ -310,8 +345,9 @@ impl Tool for SessionSearchTool {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["search", "session", "in_session", "extract"],
+                    "enum": ["search", "latest", "session", "in_session", "extract"],
                     "description": "search = keyword FTS5 over all past sessions (default); \
+        latest = list recent past sessions deterministically without a query; \
         session = dump the full transcript of one session by key; \
         in_session = search WITHIN one session by keyword, returning matching messages with their [msg N] ids; \
         extract = pull specific messages from one session by their ids."
@@ -327,6 +363,10 @@ impl Tool for SessionSearchTool {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum results to return (search mode). Default: 10."
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of recent sessions to return in latest mode. Default: 3, maximum: 10."
                 },
                 "channel": {
                     "type": "string",
@@ -344,10 +384,23 @@ impl Tool for SessionSearchTool {
             .unwrap_or("search");
 
         match mode {
+            "latest" => {
+                let count = params
+                    .get("count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3)
+                    .clamp(1, 10) as usize;
+                return self.latest_sessions(count).await;
+            }
             "session" => return self.dump_session(&params).await,
             "in_session" => return self.search_in_session(&params).await,
             "extract" => return self.extract_session(&params).await,
-            _ => {}
+            "search" => {}
+            other => {
+                return format!(
+                    "Error: unsupported session_search mode '{other}'. Use search, latest, session, in_session, or extract."
+                )
+            }
         }
 
         let query = match params.get("query").and_then(|v| v.as_str()) {
@@ -365,7 +418,14 @@ impl Tool for SessionSearchTool {
             .map(|s| s.to_string());
 
         let db = SessionDb::new(&self.db_path);
-        let results = db.search_messages(&query, limit, channel.as_deref()).await;
+        let results = db
+            .search_conversation_messages(
+                &query,
+                limit,
+                channel.as_deref(),
+                self.current_session_id.as_deref(),
+            )
+            .await;
 
         if results.is_empty() {
             return format!("No results found for '{}'.", query);
@@ -437,7 +497,12 @@ mod tests {
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["query"].is_object());
         assert!(params["properties"]["limit"].is_object());
+        assert!(params["properties"]["count"].is_object());
         assert!(params["properties"]["channel"].is_object());
+        assert!(params["properties"]["mode"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("latest")));
         let required = params["required"].as_array().unwrap();
         // `query` is optional now: search mode needs it, but session mode uses
         // `session` instead. Neither is globally required.
@@ -470,6 +535,21 @@ mod tests {
             result.contains("Error"),
             "Missing query must return Error: {}",
             result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_mode_returns_error() {
+        let (_tmp, tool) = make_tool();
+        let result = tool
+            .execute(HashMap::from([
+                ("mode".to_string(), json!("semantic")),
+                ("query".to_string(), json!("anything")),
+            ]))
+            .await;
+        assert!(
+            result.contains("unsupported session_search mode"),
+            "{result}"
         );
     }
 
@@ -572,6 +652,83 @@ mod tests {
             "Expected 2 results with limit=2, got: {}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn test_latest_mode_belongs_to_session_search_and_excludes_current() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions.db");
+        let db = SessionDb::new(&db_path);
+        let previous = db.create_session("cli:previous").await;
+        db.add_messages(
+            &previous.id,
+            &[
+                json!({"role": "user", "content": "previous canonical question"}),
+                json!({"role": "assistant", "content": "previous canonical answer"}),
+            ],
+        )
+        .await;
+        let current = db.create_session("cli:current").await;
+        db.add_messages(
+            &current.id,
+            &[
+                json!({"role": "user", "content": "active question"}),
+                json!({"role": "assistant", "content": "active answer"}),
+            ],
+        )
+        .await;
+
+        let tool =
+            SessionSearchTool::new(db_path).with_current_session_id(Some(current.id.clone()));
+        let result = tool
+            .execute(HashMap::from([
+                ("mode".to_string(), json!("latest")),
+                ("count".to_string(), json!(3)),
+            ]))
+            .await;
+
+        assert!(result.contains("cli:previous"), "got: {result}");
+        assert!(
+            result.contains("previous canonical question"),
+            "got: {result}"
+        );
+        assert!(!result.contains("cli:current"), "got: {result}");
+        assert!(!result.contains("active question"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_search_mode_excludes_current_session_before_limit() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions.db");
+        let db = SessionDb::new(&db_path);
+        let past = db.create_session("cli:past").await;
+        db.add_messages(
+            &past.id,
+            &[json!({
+                "role": "assistant",
+                "content": "The historical quasarledger source has the complete answer."
+            })],
+        )
+        .await;
+        let current = db.create_session("cli:current").await;
+        db.add_messages(
+            &current.id,
+            &[json!({"role": "user", "content": "quasarledger"})],
+        )
+        .await;
+
+        let tool =
+            SessionSearchTool::new(db_path).with_current_session_id(Some(current.id.clone()));
+        let result = tool
+            .execute(HashMap::from([
+                ("query".to_string(), json!("quasarledger")),
+                ("limit".to_string(), json!(1)),
+            ]))
+            .await;
+
+        assert!(result.contains("cli:past"), "got: {result}");
+        assert!(result.contains("historical"), "got: {result}");
+        assert!(!result.contains("cli:current"), "got: {result}");
     }
 
     #[tokio::test]

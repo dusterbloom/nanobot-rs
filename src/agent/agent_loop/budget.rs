@@ -1,5 +1,5 @@
-//! Prompt-cache invalidation markers, token accounting, and higgs
-//! retained-session admission / compaction-pressure policy.
+//! Prompt-cache invalidation markers, token accounting, and compaction
+//! checkpoint policy.
 //!
 //! Extracted verbatim from `shared.rs`.
 
@@ -13,27 +13,24 @@ use crate::turn_stream::{CacheResetReason, CacheStatus, ControlMarker};
 
 use super::shared::TurnContext;
 
-const DEFAULT_HIGGS_RETAINED_SESSION_CAP_TOKENS: usize = 24_576;
-const HIGGS_RETAINED_CAP_ENV: &str = "NANOBOT_HIGGS_RETAINED_CAP_TOKENS";
-const DEFAULT_HIGGS_RETAINED_ADMISSION_RATIO: f64 = 0.80;
-const HIGGS_RETAINED_ADMISSION_RATIO_ENV: &str = "NANOBOT_HIGGS_RETAINED_ADMISSION_RATIO";
-const HIGGS_PROMPT_TOKEN_RATIO_CEILING: f64 = 2.50;
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct HiggsRetainedAdmission {
-    pub(super) estimated_prompt_tokens: usize,
-    pub(super) calibrated_prompt_tokens: usize,
-    pub(super) admission_limit_tokens: usize,
-    pub(super) observed_token_ratio: f64,
-    pub(super) force_blocking: bool,
-}
-
 pub(super) fn send_cache_reset_marker(
     tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
     reason: CacheResetReason,
 ) {
     if let Some(tx) = tx {
         let _ = tx.send(ControlMarker::CacheStatus(CacheStatus::Reset { reason }).encode());
+    }
+}
+
+/// Emit a compaction lifecycle marker so the TUI can render a live progress
+/// indicator instead of a silent freeze. See `CompactionStatus` for the
+/// state machine.
+pub(super) fn send_compaction_marker(
+    tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    status: crate::turn_stream::CompactionStatus,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(ControlMarker::Compaction(status).encode());
     }
 }
 
@@ -188,135 +185,6 @@ pub(super) fn advertised_tool_names(tool_defs: &[Value]) -> HashSet<String> {
         .collect()
 }
 
-fn system_token_count(messages: &[Value]) -> usize {
-    let system: Vec<Value> = messages
-        .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
-        .cloned()
-        .collect();
-    TokenBudget::estimate_tokens(&system)
-}
-
-/// Retained-session token cap used for admission pressure. Engaged when the
-/// provider advertises the higgs retained-session protocol
-/// (`supports_higgs_session_cache`, set for any `localBackend=higgs` regardless
-/// of port), or overridden explicitly via `HIGGS_RETAINED_CAP_ENV`. The
-/// capability flag — not a hardcoded port — decides engagement, so a
-/// higgs-nightly server on port 8092 still participates.
-pub(super) fn higgs_retained_session_cap_tokens(higgs_capable: bool) -> Option<usize> {
-    match std::env::var(HIGGS_RETAINED_CAP_ENV) {
-        Ok(raw) => return raw.trim().parse::<usize>().ok().filter(|cap| *cap > 0),
-        Err(std::env::VarError::NotPresent) => {}
-        Err(std::env::VarError::NotUnicode(_)) => return None,
-    }
-
-    higgs_capable.then_some(DEFAULT_HIGGS_RETAINED_SESSION_CAP_TOKENS)
-}
-
-fn higgs_retained_admission_ratio() -> f64 {
-    match std::env::var(HIGGS_RETAINED_ADMISSION_RATIO_ENV) {
-        Ok(raw) => raw
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|ratio| ratio.is_finite() && (0.10..=0.98).contains(ratio))
-            .unwrap_or(DEFAULT_HIGGS_RETAINED_ADMISSION_RATIO),
-        Err(_) => DEFAULT_HIGGS_RETAINED_ADMISSION_RATIO,
-    }
-}
-
-fn calibrated_higgs_prompt_tokens(
-    estimated_prompt_tokens: usize,
-    last_estimated_prompt_tokens: u64,
-    last_actual_prompt_tokens: u64,
-) -> (usize, f64) {
-    if last_estimated_prompt_tokens == 0 || last_actual_prompt_tokens == 0 {
-        return (estimated_prompt_tokens, 1.0);
-    }
-
-    let observed_ratio = (last_actual_prompt_tokens as f64 / last_estimated_prompt_tokens as f64)
-        .clamp(1.0, HIGGS_PROMPT_TOKEN_RATIO_CEILING);
-    (
-        ((estimated_prompt_tokens as f64) * observed_ratio).ceil() as usize,
-        observed_ratio,
-    )
-}
-
-pub(super) fn higgs_retained_admission(
-    retained_cap_tokens: Option<usize>,
-    messages: &[Value],
-    tool_def_tokens: usize,
-    last_estimated_prompt_tokens: u64,
-    last_actual_prompt_tokens: u64,
-) -> Option<HiggsRetainedAdmission> {
-    let cap = retained_cap_tokens?;
-    if cap == 0 {
-        return None;
-    }
-
-    let estimated_prompt_tokens =
-        TokenBudget::estimate_tokens(messages).saturating_add(tool_def_tokens);
-    let (calibrated_prompt_tokens, observed_token_ratio) = calibrated_higgs_prompt_tokens(
-        estimated_prompt_tokens,
-        last_estimated_prompt_tokens,
-        last_actual_prompt_tokens,
-    );
-    let admission_limit_tokens = ((cap as f64) * higgs_retained_admission_ratio()).floor() as usize;
-
-    Some(HiggsRetainedAdmission {
-        estimated_prompt_tokens,
-        calibrated_prompt_tokens,
-        admission_limit_tokens,
-        observed_token_ratio,
-        force_blocking: calibrated_prompt_tokens >= admission_limit_tokens,
-    })
-}
-
-fn retained_conversation_available(
-    retained_cap_tokens: usize,
-    messages: &[Value],
-    tool_def_tokens: usize,
-) -> usize {
-    retained_cap_tokens
-        .saturating_sub(system_token_count(messages))
-        .saturating_sub(tool_def_tokens)
-}
-
-pub(super) fn effective_lcm_available_budget(
-    model_available: usize,
-    messages: &[Value],
-    tool_def_tokens: usize,
-    retained_cap_tokens: Option<usize>,
-) -> (usize, Option<usize>) {
-    let Some(retained_cap_tokens) = retained_cap_tokens else {
-        return (model_available, None);
-    };
-    let retained_available =
-        retained_conversation_available(retained_cap_tokens, messages, tool_def_tokens);
-    // LCM thresholds use the MODEL's full context budget, NOT the
-    // retained-session cap. The retained cap (24K on default higgs
-    // config) was clamping LCM to compact at 12K conversation tokens
-    // even on 120K-context models — suffocating legitimate long
-    // sessions. The retained-admission check (separate, at shared.rs)
-    // still forces blocking compaction when the retained session is
-    // under pressure, so the safety net is preserved. Cold-prefills
-    // above the retained cap are the accepted tradeoff.
-    (model_available, Some(retained_available))
-}
-
-pub(super) fn retained_context_pressure(
-    retained_cap_tokens: Option<usize>,
-    messages: &[Value],
-    tool_def_tokens: usize,
-) -> Option<f32> {
-    let cap = retained_cap_tokens?;
-    if cap == 0 {
-        return None;
-    }
-    let used = TokenBudget::estimate_tokens(messages).saturating_add(tool_def_tokens);
-    Some((used as f32) / (cap as f32))
-}
-
 /// Decide whether to accept the prefix-cache re-prefill cost and install a
 /// pending compaction result rather than deferring it.
 ///
@@ -324,11 +192,6 @@ pub(super) fn retained_context_pressure(
 /// `tau_hard` compaction is forced through: the one-time re-prefill of a
 /// compacted context is strictly cheaper than the unbounded growth that
 /// starves compaction until the model hits max tokens and fails.
-pub(super) fn should_allow_checkpoint(
-    pressure: f32,
-    tau_hard: f64,
-    retained_pressure: Option<f32>,
-) -> bool {
+pub(super) fn should_allow_checkpoint(pressure: f32, tau_hard: f64) -> bool {
     (pressure as f64) >= tau_hard
-        || retained_pressure.is_some_and(|pressure| (pressure as f64) >= tau_hard)
 }

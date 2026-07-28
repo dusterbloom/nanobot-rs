@@ -1272,14 +1272,14 @@ impl ContextBuilder {
                 format!(
                     "You are nanobot.\n\
                      Model: {model_line}. Cwd: {cwd}. Workspace: {workspace_path}.\n\n\
-                     Core tools are native: call with schema args; never wrap native args. \
+                     Core tools are native; never wrap native args. \
                      Other tools use the `tool` proxy: omit name to list; \
                      {{\"name\":\"X\"}} inspect; {{\"name\":\"X\",\"args\":{{...}}}} invoke. \
-                     Discover with read_skill and recall. Errors: quote the exact tool message; \
-                     never invent causes. Never simulate \
-                     or fake tool results. edit_file args are path, old_text, new_text; never \
-                     content. Do not copy read_file line prefixes into arguments.\n\n\
-                     Persona: AGENTS.md, SOUL.md, USER.md; read_file as needed."
+                     Skills: read_skill; curated facts: recall; past conversations: session_search. \
+                     Quote exact tool errors; never invent causes or tool results. \
+                     edit_file uses path, old_text, new_text—not content. \
+                     Never pass read_file line prefixes as args. \
+                     Persona: AGENTS.md, SOUL.md, USER.md."
                 ),
                 String::new(),
                 String::new(),
@@ -1322,7 +1322,8 @@ impl ContextBuilder {
                     "## Memory\n\
                      Working Memory is injected automatically (session state). \
                      Long-term facts: {memory_path}.\n\
-                     Use `recall` to search all memory (sessions, facts, archives).\n\n\
+                     Use `recall` for curated facts and indexed knowledge. Use \
+                     `session_search` for raw past conversations and recent sessions.\n\n\
                      If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your \
                      approach — it takes precedence."
                 ),
@@ -2018,23 +2019,24 @@ mod tests {
             identity.contains(r#"{"name":"X","args":{...}}"#),
             "{identity}"
         );
+        assert!(identity.contains("curated facts: recall"), "{identity}");
+        assert!(
+            identity.contains("past conversations: session_search"),
+            "{identity}"
+        );
 
         // (c) error discipline
+        assert!(identity.contains("Quote exact tool errors"), "{identity}");
         assert!(
-            identity.contains("quote the exact tool message"),
-            "{identity}"
-        );
-        assert!(identity.contains("never invent causes"), "{identity}");
-        assert!(
-            identity.contains("Never simulate or fake tool results"),
+            identity.contains("never invent causes or tool results"),
             "{identity}"
         );
         assert!(
-            identity.contains("edit_file args are path, old_text, new_text; never content"),
+            identity.contains("edit_file uses path, old_text, new_text—not content"),
             "{identity}"
         );
         assert!(
-            identity.contains("Do not copy read_file line prefixes"),
+            identity.contains("Never pass read_file line prefixes as args"),
             "{identity}"
         );
 
@@ -2045,6 +2047,21 @@ mod tests {
 
         // Must not advertise the non-existent list_skills.
         assert!(!identity.contains("list_skills"), "{identity}");
+    }
+
+    #[test]
+    fn test_cloud_identity_separates_curated_memory_from_session_history() {
+        let (_tmp, cb) = make_context();
+        let identity = cb._get_identity(false);
+
+        assert!(
+            identity.contains("`recall` for curated facts and indexed knowledge"),
+            "{identity}"
+        );
+        assert!(
+            identity.contains("`session_search` for raw past conversations"),
+            "{identity}"
+        );
     }
 
     #[test]

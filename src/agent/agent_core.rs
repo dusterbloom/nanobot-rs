@@ -34,12 +34,6 @@ struct LocalArtifactIntentState {
     expires_after_turn: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PromptCalibration {
-    pub(crate) estimated_prompt_tokens: u64,
-    pub(crate) actual_prompt_tokens: u64,
-}
-
 // ---------------------------------------------------------------------------
 // Shared core (identical across all agents, swappable on /local toggle)
 // ---------------------------------------------------------------------------
@@ -60,9 +54,6 @@ pub struct SwappableCore {
     pub sessions: Arc<SessionDb>,
     pub token_budget: TokenBudget,
     pub compactor: ContextCompactor,
-    /// Shared owner for the optional on-demand Higgs compaction model. The
-    /// provider, model id, and lifecycle manager swap atomically with the core.
-    pub compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
     pub working_memory: WorkingMemoryStore,
     pub working_memory_budget: usize,
     pub brave_api_key: Option<String>,
@@ -74,7 +65,11 @@ pub struct SwappableCore {
     pub exec_timeout: u64,
     pub restrict_to_workspace: bool,
     pub memory_enabled: bool,
+    /// Provider/model used only for durable-memory reflection. LCM compaction
+    /// always follows `provider` + `model`, so context policy cannot drift
+    /// onto a second model with a different context window.
     pub memory_provider: Arc<dyn LLMProvider>,
+    pub memory_model: String,
     pub reflection_threshold: usize,
     /// Typed runtime descriptor. Single source of truth for "is this a local
     /// backend?" via `mode().is_local()`. The legacy `is_local: bool` field was
@@ -185,10 +180,6 @@ pub struct RuntimeCounters {
     pub last_actual_completion_tokens: AtomicU64,
     /// Last estimated prompt tokens (our estimate, for comparison).
     pub last_estimated_prompt_tokens: AtomicU64,
-    /// Per-session prompt-token calibration used for retained Higgs admission.
-    /// The public atomics above remain coarse status telemetry; this map avoids
-    /// letting one chat's tokenizer ratio force another chat into cold prefill.
-    prompt_calibrations: parking_lot::Mutex<std::collections::HashMap<String, PromptCalibration>>,
     /// When true, ThinkingDelta tokens are not sent to delta_tx for visual
     /// rendering. Toggled by `/nothink` and config-level no-think mode.
     pub suppress_thinking_display: AtomicBool,
@@ -272,7 +263,6 @@ impl RuntimeCounters {
             last_actual_prompt_tokens: AtomicU64::new(0),
             last_actual_completion_tokens: AtomicU64::new(0),
             last_estimated_prompt_tokens: AtomicU64::new(0),
-            prompt_calibrations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             suppress_thinking_display: AtomicBool::new(false),
             suppress_thinking_in_tts: AtomicBool::new(false),
             inference_active: Arc::new(AtomicBool::new(false)),
@@ -308,7 +298,6 @@ impl RuntimeCounters {
         self.prompt_fingerprints.lock().remove(session_key);
         self.prompt_tool_hashes.lock().remove(session_key);
         self.prompt_cache_watermark.lock().remove(session_key);
-        self.prompt_calibrations.lock().remove(session_key);
         self.clear_local_artifact_intent(session_key);
 
         let mut epochs = self.prompt_session_epoch.lock();
@@ -408,28 +397,6 @@ impl RuntimeCounters {
             .iter()
             .filter(|drop_id| self.clear_pending_higgs_session_drop_id(session_key, **drop_id))
             .count()
-    }
-
-    pub(crate) fn record_prompt_calibration(
-        &self,
-        session_key: &str,
-        estimated_prompt_tokens: u64,
-        actual_prompt_tokens: u64,
-    ) {
-        if estimated_prompt_tokens == 0 || actual_prompt_tokens == 0 {
-            return;
-        }
-        self.prompt_calibrations.lock().insert(
-            session_key.to_string(),
-            PromptCalibration {
-                estimated_prompt_tokens,
-                actual_prompt_tokens,
-            },
-        );
-    }
-
-    pub(crate) fn prompt_calibration(&self, session_key: &str) -> Option<PromptCalibration> {
-        self.prompt_calibrations.lock().get(session_key).copied()
     }
 
     pub(crate) fn record_local_artifact_intent(
@@ -591,8 +558,6 @@ pub struct SwappableCoreConfig {
     pub memory_config: MemoryConfig,
     pub is_local: bool,
     pub lane: Lane,
-    pub compaction_provider: Option<Arc<dyn LLMProvider>>,
-    pub compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
     pub tool_delegation: ToolDelegationConfig,
     pub provenance: ProvenanceConfig,
     pub max_tool_result_chars: usize,
@@ -642,8 +607,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_config,
         is_local,
         lane,
-        compaction_provider,
-        compaction_manager,
         tool_delegation,
         provenance,
         max_tool_result_chars,
@@ -717,7 +680,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         &model,
         &provider,
         specialist_provider.as_ref(),
-        compaction_provider,
     );
 
     // Branch 4 (Wave 2): response-reserve cap is derived from the runtime mode.
@@ -725,18 +687,12 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     // window so conversation + tool defs still fit.
     let effective_reserve = mode.reserve_cap(max_tokens as usize, max_context_tokens);
     let token_budget = TokenBudget::new(max_context_tokens, effective_reserve);
-    let compaction_ctx_size = compaction_manager
-        .as_ref()
-        .map_or(max_context_tokens, |manager| manager.context_size());
-    let compactor = ContextCompactor::new(
-        memory_provider.clone(),
-        memory_model.clone(),
-        compaction_ctx_size,
-    );
+    let compactor = ContextCompactor::new(provider.clone(), model.clone(), max_context_tokens);
     debug!(
+        model = %model,
         memory_model = %memory_model,
-        compaction_ctx_size = compaction_ctx_size,
-        "agent_core: compactor initialized"
+        max_context_tokens,
+        "agent_core: main-model compactor initialized"
     );
     let working_memory = WorkingMemoryStore::new(sessions.clone());
 
@@ -799,7 +755,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         sessions,
         token_budget,
         compactor,
-        compaction_manager,
         working_memory,
         // Scale working memory like other budgets. If the user left it at
         // the default (600), apply proportional scaling; otherwise respect their override.
@@ -817,6 +772,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         restrict_to_workspace,
         memory_enabled: memory_config.enabled,
         memory_provider,
+        memory_model,
         reflection_threshold: memory_config.reflection_threshold,
         mode,
         lane,
@@ -859,64 +815,52 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
 /// Extracted from `build_swappable_core` in Wave 2 (09-02). Dispatch is
 /// driven by [`RuntimeMode`] via exhaustive `match` (G5 BRANCH → TYPE).
 ///
-/// Priority after core-builder normalization:
-///  1. Managed LCM compaction provider, when configured. Canonical `lcm.*`
-///     clears the legacy explicit memory route before this function runs.
-///  2. Explicit `memory.model` / `memory.provider` when no manager exists.
-///  3. Cloud default: "haiku" (cheap, fast summarisation) when the main
+/// Priority:
+///  1. Explicit `memory.model` / `memory.provider`.
+///  2. Cloud default: "haiku" (cheap, fast summarisation) when the main
 ///     provider is Anthropic native or OpenRouter; otherwise the main model.
-///  4. Local default: trio specialist (if available) → main provider.
+///  3. Local default: trio specialist (if available) → main provider.
+///
+/// This selection is reflection-only. LCM is constructed directly from the
+/// foreground provider/model and therefore cannot acquire a second context
+/// ceiling or endpoint.
 fn resolve_memory_provider(
     mode: &RuntimeMode,
     memory_config: &MemoryConfig,
     model: &str,
     provider: &Arc<dyn LLMProvider>,
     specialist_provider: Option<&Arc<dyn LLMProvider>>,
-    compaction_provider: Option<Arc<dyn LLMProvider>>,
 ) -> (Arc<dyn LLMProvider>, String) {
     match mode {
         RuntimeMode::Local { .. } => {
             let mem_model = if !memory_config.model.is_empty() {
-                // Explicit memory providers use their configured model id.
-                // Managed Higgs sidecars take the next branch, whose provider
-                // is bound to the literal id resolved from `/v1/models`.
                 memory_config.model.clone()
-            } else if let Some(ref cp) = compaction_provider {
-                // The managed sidecar owns compaction and reflection when it is
-                // configured; its real served id must ride with its provider.
-                cp.get_default_model().to_string()
+            } else if memory_config.provider.is_some() {
+                model.to_string()
             } else if let Some(sp) = specialist_provider {
                 sp.get_default_model().to_string()
             } else {
                 model.to_string()
             };
-            let mem_provider: Arc<dyn LLMProvider> = if let Some(cp) = compaction_provider {
-                // A managed compaction sidecar is the one endpoint source
-                // for local memory ops — it wins over an explicit
-                // `memory.provider`, which would otherwise silently point
-                // compaction at a different server than the sidecar
-                // startup/health-check machinery manages.
-                cp
-            } else if let Some(ref mem_provider_cfg) = memory_config.provider {
-                crate::providers::factory::from_provider_config_for_model_with_default_base(
-                    mem_provider_cfg,
-                    Some(&mem_model),
-                    provider.get_api_base(),
-                )
-            } else if let Some(sp) = specialist_provider {
-                // Reuse trio specialist provider when no managed compactor exists.
-                sp.clone()
-            } else {
-                // In local mode, provider is already the local server — use it directly.
-                provider.clone()
-            };
+            let mem_provider: Arc<dyn LLMProvider> =
+                if let Some(ref mem_provider_cfg) = memory_config.provider {
+                    crate::providers::factory::from_provider_config_for_model_with_default_base(
+                        mem_provider_cfg,
+                        Some(&mem_model),
+                        provider.get_api_base(),
+                    )
+                } else if memory_config.model.is_empty() {
+                    specialist_provider
+                        .cloned()
+                        .unwrap_or_else(|| provider.clone())
+                } else {
+                    provider.clone()
+                };
             (mem_provider, mem_model)
         }
         RuntimeMode::Cloud => {
             let mem_model = if !memory_config.model.is_empty() {
                 memory_config.model.clone()
-            } else if let Some(ref cp) = compaction_provider {
-                cp.get_default_model().to_string()
             } else if provider.get_api_base().is_none()
                 || provider
                     .get_api_base()
@@ -933,8 +877,6 @@ fn resolve_memory_provider(
                         mem_provider_cfg,
                         Some(&mem_model),
                     )
-                } else if let Some(cp) = compaction_provider {
-                    cp
                 } else {
                     provider.clone()
                 };
@@ -1324,39 +1266,6 @@ mod tests {
         assert_eq!(
             counters.pending_higgs_session_drop_ids(session_key),
             vec![original_drop_id]
-        );
-    }
-
-    #[test]
-    fn test_prompt_calibration_is_per_session_and_reset_scoped() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
-
-        counters.record_prompt_calibration("cli:a", 100, 250);
-        counters.record_prompt_calibration("cli:b", 100, 125);
-
-        assert_eq!(
-            counters.prompt_calibration("cli:a"),
-            Some(PromptCalibration {
-                estimated_prompt_tokens: 100,
-                actual_prompt_tokens: 250,
-            })
-        );
-        assert_eq!(
-            counters.prompt_calibration("cli:b"),
-            Some(PromptCalibration {
-                estimated_prompt_tokens: 100,
-                actual_prompt_tokens: 125,
-            })
-        );
-
-        counters.reset_session_prompt_state("cli:a");
-        assert_eq!(counters.prompt_calibration("cli:a"), None);
-        assert_eq!(
-            counters.prompt_calibration("cli:b"),
-            Some(PromptCalibration {
-                estimated_prompt_tokens: 100,
-                actual_prompt_tokens: 125,
-            })
         );
     }
 

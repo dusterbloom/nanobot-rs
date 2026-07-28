@@ -35,7 +35,7 @@ use crate::agent::audit::ToolEvent;
 use crate::repl::commands::ModelEntry;
 use crate::repl::{parse_control_marker, CacheResetReason, CacheStatus, ControlMarker};
 use crate::session::db::SessionSnapshot;
-use crate::turn_stream::BackendActivity;
+use crate::turn_stream::{BackendActivity, CompactionStatus};
 
 const BRAND: &str = "\u{259e}"; // ▞  the nanobot wordmark glyph
 const DOT: &str = "\u{2022}"; //   •  status / user marker
@@ -385,6 +385,11 @@ enum ActivityPhase {
     AwaitingToolPayload,
     ToolPayload,
     Decoding,
+    /// LCM compaction is running. `messages` is the active-context size being
+    /// summarized; `started` lets the render compute a compaction-specific
+    /// elapsed (independent of the turn-wide elapsed, which may have been
+    /// running for many seconds of normal flow before compaction triggered).
+    Compacting { messages: u32, started: Instant },
 }
 
 /// One chronological entry in the transcript.
@@ -987,6 +992,11 @@ impl App {
                 }
             }
             Some(ControlMarker::CacheStatus(status)) => self.upsert_activity_cache(status),
+            Some(ControlMarker::Compaction(status)) => {
+                if self.streaming {
+                    self.upsert_compaction(status);
+                }
+            }
             Some(ControlMarker::BackendActivity { phase, idle_ms }) => {
                 if self.streaming {
                     self.upsert_backend_activity(phase, idle_ms);
@@ -1196,6 +1206,63 @@ impl App {
                 backend_idle_ms: None,
                 cache: None,
             });
+        }
+    }
+
+    /// Handle a compaction lifecycle marker. `Started` swaps the live Activity
+    /// cell to `Compacting` (resetting the timer so the user sees "compacting
+    /// · 0.4s" rather than a turn-wide elapsed that hid the trigger).`
+    /// `Finished` pops the Activity row — the next LLM event (prefill, cache
+    /// reset, etc.) replaces it; if the turn ends first, the row vanishes.
+    fn upsert_compaction(&mut self, status: CompactionStatus) {
+        match status {
+            CompactionStatus::Started { messages } => {
+                let phase = ActivityPhase::Compacting {
+                    messages,
+                    started: Instant::now(),
+                };
+                let (rate, rate_estimated) = self.activity_prefill_rate();
+                if let Some(Cell::Activity {
+                    phase: p,
+                    prefill: pf,
+                    prefill_estimate,
+                    prefill_tps,
+                    prefill_tps_estimated,
+                    backend_idle_ms,
+                    ..
+                }) = self.transcript.last_mut()
+                {
+                    *p = phase;
+                    *pf = None;
+                    *prefill_estimate = None;
+                    *prefill_tps = rate;
+                    *prefill_tps_estimated = rate_estimated;
+                    *backend_idle_ms = None;
+                } else {
+                    self.transcript.push(Cell::Activity {
+                        phase,
+                        prefill: None,
+                        prefill_estimate: None,
+                        prefill_tps: rate,
+                        prefill_tps_estimated: rate_estimated,
+                        backend_idle_ms: None,
+                        cache: None,
+                    });
+                }
+            }
+            CompactionStatus::Finished => {
+                // Drop the Activity row so a stale "compacting" can't linger
+                // if the turn ends without another event replacing it.
+                if matches!(
+                    self.transcript.last(),
+                    Some(Cell::Activity {
+                        phase: ActivityPhase::Compacting { .. },
+                        ..
+                    })
+                ) {
+                    self.transcript.pop();
+                }
+            }
         }
     }
 
@@ -3344,6 +3411,42 @@ fn cell_lines_with_reply_mark(
                     segs.push(("decoding".to_string(), dim_color(pal().accent)));
                     push_backend_idle(&mut segs, *backend_idle_ms);
                     segs.push((format!(" · {:.1}s", elapsed_s), dim()));
+                }
+                ActivityPhase::Compacting { messages, started } => {
+                    // Braille spinner: 10 frames at ~8fps, smoother than the
+                    // 4-frame quadrant used elsewhere. Reads universally as
+                    // "in progress" and the rotation rate signals activity.
+                    const FRAMES: [&str; 10] =
+                        ["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}",
+                         "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
+                    let compaction_elapsed = started.elapsed().as_secs_f32();
+                    let frame = FRAMES[((compaction_elapsed * 8.0) as usize) % 10];
+                    // Override the default quadrant spinner with our Braille frame.
+                    segs[1] = (frame.to_string(), style(pal().accent, true));
+                    segs.push((
+                        format!("compacting {messages} messages"),
+                        style(WARN_COLOR, true),
+                    ));
+                    // Animated 5-dot comet: one bright dot cycles across a row
+                    // of 5 dim dots. Cheap, calm, alive — matches the footer
+                    // shimmer philosophy of "one moving element".
+                    let dot_pos = (compaction_elapsed * 2.0) as usize % 5;
+                    let dots: String = (0..5)
+                        .map(|i| {
+                            if i == dot_pos { '\u{25cf}' } // ● bright
+                            else { '\u{00b7}' } // · dim
+                        })
+                        .collect();
+                    segs.push((" ".to_string(), Style::default()));
+                    // Bright dot accent-colored; dim dots dim.
+                    for (i, ch) in dots.chars().enumerate() {
+                        if i == dot_pos {
+                            segs.push((ch.to_string(), style(pal().accent, true)));
+                        } else {
+                            segs.push((ch.to_string(), dim()));
+                        }
+                    }
+                    segs.push((format!("  {:.1}s", compaction_elapsed), dim()));
                 }
             }
             vec![segs]

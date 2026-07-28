@@ -18,6 +18,11 @@ use crate::providers::openai_compat::OpenAICompatProvider;
 use async_trait::async_trait;
 use backon::BackoffBuilder;
 
+fn attested_text(content: &str) -> String {
+    // Attestation protocol removed — text is itself the final answer.
+    content.to_string()
+}
+
 /// Minimal mock LLM provider for wiring tests.
 struct MockLLM {
     name: String,
@@ -72,6 +77,13 @@ struct StaticResponseLLM {
 
 impl StaticResponseLLM {
     fn new(name: &str, body: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            body: attested_text(body),
+        }
+    }
+
+    fn plain(name: &str, body: &str) -> Self {
         Self {
             name: name.to_string(),
             body: body.to_string(),
@@ -141,8 +153,6 @@ fn build_test_core(
         memory_config: MemoryConfig::default(),
         is_local: false,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -195,7 +205,7 @@ async fn test_request_strict_router_decision_action_matrix() {
     ];
 
     for (raw, expected_action) in cases {
-        let llm = StaticResponseLLM::new("router", raw);
+        let llm = StaticResponseLLM::plain("router", raw);
         let decision = request_strict_router_decision(
             &llm,
             "router",
@@ -483,8 +493,6 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         memory_config: MemoryConfig::default(),
         is_local: false,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -552,8 +560,6 @@ fn test_delegation_with_is_local_true() {
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -623,8 +629,6 @@ fn test_delegation_with_is_local_false_cloud() {
         memory_config: MemoryConfig::default(),
         is_local: false,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -664,11 +668,8 @@ fn test_delegation_with_is_local_false_cloud() {
     // pins agent_core.rs:487-498 cloud memory-model default (haiku for
     // Anthropic-native / OpenRouter — MockLLM.get_api_base() == None, so
     // the Anthropic branch wins).
-    assert_eq!(
-        core.compactor.model(),
-        "haiku",
-        "Cloud + MockLLM(api_base=None) → memory_model must default to haiku"
-    );
+    assert_eq!(core.memory_model, "haiku");
+    assert_eq!(core.compactor.model(), "cloud-model");
 
     // pins agent_core.rs:516-520 reserve cap: cloud mode leaves max_tokens
     // as-is; local mode clamps to max_context/4. Here max_tokens=4096,
@@ -684,11 +685,10 @@ fn test_delegation_with_is_local_false_cloud() {
 }
 
 #[test]
-fn test_delegation_with_compaction_and_delegation_providers() {
-    // Both compaction and delegation providers set — should not interfere
+fn test_local_reflection_and_delegation_providers_do_not_reroute_lcm() {
     let workspace = tempfile::tempdir().unwrap().keep();
     let main = MockLLM::named("main");
-    let compaction = MockLLM::named("compaction");
+    let reflection = MockLLM::named("reflection");
     let delegation = MockLLM::named("delegation");
     let td = ToolDelegationConfig {
         enabled: true,
@@ -715,13 +715,11 @@ fn test_delegation_with_compaction_and_delegation_providers() {
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        compaction_provider: Some(compaction),
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
         delegation_provider: Some(delegation),
-        specialist_provider: None,
+        specialist_provider: Some(reflection),
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -733,19 +731,16 @@ fn test_delegation_with_compaction_and_delegation_providers() {
         ),
     });
 
-    // Compaction provider goes to memory_provider, delegation to tool_runner
     assert_eq!(
         core.memory_provider.get_default_model(),
-        "compaction",
-        "Memory should use compaction provider"
+        "reflection",
+        "local reflection should reuse the specialist provider"
     );
-    // The model name must ride with the provider it's paired to: sending the
-    // MAIN model name to a dedicated compaction sidecar would make the sidecar
-    // runtime-load the big model — the contention the sidecar prevents.
+    assert_eq!(core.memory_model, "reflection");
     assert_eq!(
         core.compactor.model(),
-        "compaction",
-        "memory_model must be the compaction provider's own model, not the main model"
+        "main-model",
+        "LCM must remain bound to the foreground model"
     );
     assert_eq!(
         core.tool_runner_provider
@@ -757,26 +752,10 @@ fn test_delegation_with_compaction_and_delegation_providers() {
     );
 }
 
-/// Wave 0 cloud-path sibling of
-/// `test_delegation_with_compaction_and_delegation_providers`.
-///
-/// Same compaction + delegation provider mix, but with is_local=false.
-/// Cloud mode takes the is_local=false branch at agent_core.rs:486-509,
-/// where `compaction_provider` is IGNORED by the memory-provider
-/// selection — cloud memory defaults to main provider (or haiku for
-/// Anthropic/OpenRouter). Delegation provider plumbing stays the same.
-///
-/// Phase 09 plan:
-///   .planning/phases/09-runtime-mode-spine/00-wave-0-coverage-PLAN.md
 #[test]
-fn test_delegation_with_compaction_and_delegation_providers_cloud() {
-    // Both compaction and delegation providers set — in cloud mode the
-    // compaction_provider is ignored by memory wiring (memory falls back to
-    // haiku via Anthropic-native branch), but delegation_provider still wires
-    // through to tool_runner.
+fn test_cloud_memory_and_delegation_do_not_reroute_lcm() {
     let workspace = tempfile::tempdir().unwrap().keep();
     let main = MockLLM::named("main");
-    let compaction = MockLLM::named("compaction");
     let delegation = MockLLM::named("delegation");
     let td = ToolDelegationConfig {
         enabled: true,
@@ -803,8 +782,6 @@ fn test_delegation_with_compaction_and_delegation_providers_cloud() {
         memory_config: MemoryConfig::default(),
         is_local: false,
         lane: Lane::default(),
-        compaction_provider: Some(compaction),
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -823,14 +800,15 @@ fn test_delegation_with_compaction_and_delegation_providers_cloud() {
 
     assert_eq!(
         core.compactor.model(),
-        "compaction",
-        "Cloud mode: memory_model must follow the managed compaction provider"
+        "main-model",
+        "cloud LCM must remain bound to the foreground model"
     );
     assert_eq!(
         core.memory_provider.get_default_model(),
-        "compaction",
-        "Cloud mode: memory must use the managed compaction provider"
+        "main",
+        "cloud reflection reuses the main provider by default"
     );
+    assert_eq!(core.memory_model, "haiku");
 
     // Delegation plumbing still works identically on both paths.
     assert_eq!(
@@ -914,8 +892,6 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        compaction_provider: Some(provider.clone()),
-        compaction_manager: None,
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -1198,8 +1174,6 @@ fn build_trio_e2e_harness(
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -1660,8 +1634,6 @@ async fn test_trio_e2e_router_unreachable() {
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -1778,8 +1750,6 @@ async fn test_trio_e2e_specialist_unreachable() {
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -2091,6 +2061,40 @@ impl LLMProvider for SequenceProvider {
     }
 }
 
+#[tokio::test]
+async fn plain_text_response_is_final_answer() {
+    // Replaces the prior attestation tests: with the protocol removed, plain
+    // non-empty text terminates the turn on the first response — no retries,
+    // no hidden markers, no duplicated output (the live regression that bit
+    // session 20260728_142921_a3b1d8).
+    let main = Arc::new(SequenceProvider::new(
+        "local-main",
+        vec!["Hello! How can I help you today?"],
+    ));
+    let main_dyn: Arc<dyn LLMProvider> = main.clone();
+    let (agent_loop, workspace) = build_local_inline_harness(main_dyn);
+    let session_key = format!(
+        "test-no-attestation-{}",
+        uuid::Uuid::new_v4().to_string()
+    );
+
+    let response = agent_loop
+        .process_direct("hi", &session_key, "test", "offline")
+        .await;
+
+    assert!(
+        response.contains("Hello! How can I help you today?"),
+        "expected the single plain-text response, got: {response}"
+    );
+    assert_eq!(
+        main.call_count(),
+        1,
+        "plain text must terminate on the first response — no retries"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 struct ResponseSequenceProvider {
     name: String,
     responses: parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
@@ -2148,7 +2152,7 @@ impl LLMProvider for ToolRoundBarrierProvider {
         self.second_call_started.notify_one();
         self.release_second_call.notified().await;
         Ok(crate::providers::base::LLMResponse {
-            content: Some("done".to_string()),
+            content: Some(attested_text("done")),
             tool_calls: vec![],
             finish_reason: "stop".to_string(),
             usage: std::collections::HashMap::new(),
@@ -2306,7 +2310,7 @@ impl LLMProvider for StreamingThinkingProvider {
         ));
         let _ = tx.send(crate::providers::base::StreamChunk::Done(
             crate::providers::base::LLMResponse {
-                content: Some("visible answer".to_string()),
+                content: Some(attested_text("visible answer")),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
                 usage: std::collections::HashMap::new(),
@@ -2333,7 +2337,7 @@ impl RecordingProvider {
     fn new(name: &str, response: &str) -> Self {
         Self {
             name: name.to_string(),
-            response: response.to_string(),
+            response: attested_text(response),
             last_max_tokens: std::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -2419,8 +2423,6 @@ fn build_trio_offline_harness(
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -2494,33 +2496,27 @@ fn build_local_inline_harness_with_memory(
     lcm_config: LcmSchemaConfig,
     memory_config: MemoryConfig,
 ) -> (AgentLoop, std::path::PathBuf) {
-    build_local_inline_harness_with_memory_and_compaction(
+    build_local_inline_harness_with_memory_and_reflection(
         main,
         model,
         max_context_tokens,
         lcm_config,
         memory_config,
         None,
-        None,
     )
 }
 
-/// Same as [`build_local_inline_harness_with_memory`], but lets a test wire
-/// a distinct compaction-capable provider (`resolve_memory_provider`'s
-/// specialist fallback slot) instead of implicitly reusing `main`, and/or a
-/// managed compaction sidecar manager. Needed for hard/soft LCM tests where
-/// compaction now genuinely calls an LLM (no more silent deterministic-
-/// truncation fallback) and must not silently consume the foreground
-/// `WireRecordingProvider`'s call log, or must exercise a real sidecar
-/// acquire-failure path.
-fn build_local_inline_harness_with_memory_and_compaction(
+/// Same as [`build_local_inline_harness_with_memory`], but lets a test wire a
+/// distinct specialist fallback for durable-memory reflection. LCM still uses
+/// `main`; keeping this separate proves reflection configuration cannot reroute
+/// context compaction.
+fn build_local_inline_harness_with_memory_and_reflection(
     main: Arc<dyn LLMProvider>,
     model: &str,
     max_context_tokens: usize,
     lcm_config: LcmSchemaConfig,
     memory_config: MemoryConfig,
-    compaction: Option<Arc<dyn LLMProvider>>,
-    compaction_manager: Option<Arc<crate::higgs::CompactionSidecarManager>>,
+    reflection: Option<Arc<dyn LLMProvider>>,
 ) -> (AgentLoop, std::path::PathBuf) {
     let workspace = tempfile::tempdir().unwrap().keep();
     let core = build_swappable_core(SwappableCoreConfig {
@@ -2542,13 +2538,11 @@ fn build_local_inline_harness_with_memory_and_compaction(
         memory_config,
         is_local: true,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager,
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
         delegation_provider: None,
-        specialist_provider: compaction,
+        specialist_provider: reflection,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -2584,7 +2578,7 @@ fn build_local_inline_harness_with_memory_and_compaction(
     (agent_loop, workspace)
 }
 
-/// Cloud-mode counterpart to `build_local_inline_harness_with_memory_and_compaction`
+/// Cloud-mode counterpart to `build_local_inline_harness_with_memory_and_reflection`
 /// (`is_local: false`). Exercises the real system+developer assembly split
 /// (`ContextBuilder::collect_static_sections`) plus `prepare_context`'s
 /// `collect_cloud_runtime_sections` (MemoryLadder, background-task status) --
@@ -2615,8 +2609,6 @@ fn build_cloud_inline_harness_with_memory(
         memory_config,
         is_local: false,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -2731,6 +2723,16 @@ impl WireRecordingProvider {
 
     fn text_response(content: &str) -> crate::providers::base::LLMResponse {
         crate::providers::base::LLMResponse {
+            content: Some(attested_text(content)),
+            tool_calls: vec![],
+            finish_reason: "stop".to_string(),
+            usage: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Internal compaction/reflection output is not an agent turn.
+    fn plain_text_response(content: &str) -> crate::providers::base::LLMResponse {
+        crate::providers::base::LLMResponse {
             content: Some(content.to_string()),
             tool_calls: vec![],
             finish_reason: "stop".to_string(),
@@ -2776,16 +2778,12 @@ impl LLMProvider for WireRecordingProvider {
 async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
     let provider = Arc::new(WireRecordingProvider::new(
         "local-hard-lcm-test",
-        vec![WireRecordingProvider::text_response("foreground reply")],
-    ));
-    // Compaction now genuinely calls an LLM (no more silent deterministic-
-    // truncation fallback), so it needs its own mock — otherwise it would
-    // consume/interleave with the foreground provider's call log below.
-    let compaction_provider = Arc::new(WireRecordingProvider::new(
-        "local-hard-lcm-compaction",
-        vec![WireRecordingProvider::text_response(
-            "- Prior turns retained project detail context for later reference.",
-        )],
+        vec![
+            WireRecordingProvider::plain_text_response(
+                "- Prior turns retained project detail context for later reference.",
+            ),
+            WireRecordingProvider::text_response("foreground reply"),
+        ],
     ));
     let lcm_config = LcmSchemaConfig {
         tau_soft: 0.05,
@@ -2793,13 +2791,12 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
         deterministic_target: 64,
         ..Default::default()
     };
-    let (agent_loop, _workspace) = build_local_inline_harness_with_memory_and_compaction(
+    let (agent_loop, _workspace) = build_local_inline_harness_with_memory_and_reflection(
         provider.clone() as Arc<dyn LLMProvider>,
         "local-hard-lcm-test",
         8192,
         lcm_config,
         MemoryConfig::default(),
-        Some(compaction_provider as Arc<dyn LLMProvider>),
         None,
     );
     let session_key = format!("hard-lcm-barrier-{}", uuid::Uuid::new_v4());
@@ -2836,7 +2833,11 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
     assert_eq!(response, "foreground reply");
 
     let calls = provider.calls();
-    assert_eq!(calls.len(), 1, "expected one foreground provider call");
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected one compaction call followed by one foreground call"
+    );
     // Internal fields like `_lcm_summary` are stripped before messages hit
     // the wire, so `calls[0]` can't be checked via that tag. Match the
     // summary wire message's exact phrasing instead of a bare "[Summary of
@@ -2846,7 +2847,8 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
     // false-positive this check even if compaction never installed
     // anything. `summary_wire_message` (lcm.rs) uniquely phrases it "To read
     // the exact originals call lcm_expand(...)".
-    let has_summary = calls[0].iter().any(|message| {
+    let foreground_call = calls.last().expect("foreground call recorded");
+    let has_summary = foreground_call.iter().any(|message| {
         message
             .get("content")
             .and_then(Value::as_str)
@@ -2856,7 +2858,7 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
         has_summary,
         "hard-pressure LCM checkpoint must be installed before the foreground call"
     );
-    assert!(calls[0].iter().any(|message| {
+    assert!(foreground_call.iter().any(|message| {
         message
             .get("content")
             .and_then(Value::as_str)
@@ -2898,10 +2900,16 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
 }
 
 #[tokio::test]
-async fn soft_lcm_sidecar_failure_preserves_foreground_context() {
-    let provider = Arc::new(WireRecordingProvider::new(
+async fn soft_lcm_uses_main_provider_and_preserves_foreground_context() {
+    let main_provider = Arc::new(WireRecordingProvider::new(
         "local-soft-lcm-test",
         vec![WireRecordingProvider::text_response("foreground reply")],
+    ));
+    let memory_provider = Arc::new(WireRecordingProvider::new(
+        "memory-soft-lcm-test",
+        vec![WireRecordingProvider::plain_text_response(
+            "- memory summary",
+        )],
     ));
     let lcm_config = LcmSchemaConfig {
         tau_soft: 0.0001,
@@ -2912,31 +2920,13 @@ async fn soft_lcm_sidecar_failure_preserves_foreground_context() {
         ..Default::default()
     };
 
-    // A managed sidecar IS configured, but points at a port nothing is
-    // listening on, so `manager.acquire()` fails fast. `localAutostart` is
-    // explicitly off so acquire fails via health-check rather than trying
-    // (and failing) to spawn a real `higgs` binary in this unit test.
-    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead_port = dead_listener.local_addr().unwrap().port();
-    drop(dead_listener);
-    let mut sidecar_config = crate::config::schema::Config::default();
-    sidecar_config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Off;
-    sidecar_config.lcm.compaction_port = Some(dead_port);
-    sidecar_config.lcm.compaction_model_dir = Some("/tmp/nanobot-test-dead-compactor".to_string());
-    let compaction_manager = crate::higgs::CompactionSidecarManager::from_config(&sidecar_config);
-    assert!(
-        compaction_manager.is_some(),
-        "test setup: sidecar manager must be configured"
-    );
-
-    let (agent_loop, _workspace) = build_local_inline_harness_with_memory_and_compaction(
-        provider.clone() as Arc<dyn LLMProvider>,
+    let (agent_loop, _workspace) = build_local_inline_harness_with_memory_and_reflection(
+        main_provider.clone() as Arc<dyn LLMProvider>,
         "local-soft-lcm-test",
         1_000_000,
         lcm_config,
         MemoryConfig::default(),
-        None,
-        compaction_manager,
+        Some(memory_provider.clone() as Arc<dyn LLMProvider>),
     );
     let session_key = format!("soft-lcm-preserve-{}", uuid::Uuid::new_v4());
     let core = agent_loop.shared.core_handle.swappable();
@@ -2946,8 +2936,8 @@ async fn soft_lcm_sidecar_failure_preserves_foreground_context() {
     // only compacts the oldest block beyond that. It must clear
     // `MIN_COMPACTION_TOKENS` (200) or compaction skips silently without
     // ever calling the provider — this volume keeps the oldest block
-    // comfortably above that floor so the sidecar-failure fallback to the
-    // main provider is actually exercised.
+    // comfortably above that floor so the main-provider compactor is actually
+    // exercised.
     for turn in 0..8_u64 {
         core.sessions
             .add_message(
@@ -2977,29 +2967,28 @@ async fn soft_lcm_sidecar_failure_preserves_foreground_context() {
         .await;
     assert_eq!(response, "foreground reply");
 
-    // Async (soft) compaction runs in a background task, and the sidecar
-    // acquire failure now involves a real (fast, but non-instant) health
-    // check — give it a moment to reach the main-provider fallback before
-    // inspecting the call log.
+    // Async (soft) compaction must use the main provider even though a distinct
+    // provider is configured for memory reflection.
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while provider.calls().len() <= 1 {
+        while main_provider.calls().len() <= 1 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("background compaction attempt against the main provider must complete");
+    .expect("background compaction must call the main provider");
 
-    // Sidecar acquire failed, so compaction fell back to compacting against
-    // the main provider directly (Task 3a) — the mock's canned reply isn't a
-    // valid bullet-only handoff, so both escalation levels reject it and
-    // compaction leaves the context uncompacted rather than ever installing
-    // the deleted deterministic-truncation fallback. That fallback attempt
-    // is real: `provider` sees more than just the one foreground call.
-    let calls = provider.calls();
+    // The mock's canned foreground reply isn't a valid bullet-only handoff, so
+    // both escalation levels reject it and compaction leaves the context
+    // uncompacted rather than installing deterministic truncation.
+    let calls = main_provider.calls();
     assert!(
         calls.len() > 1,
-        "compaction must have been attempted against the main provider after the sidecar failed, got {} call(s)",
+        "compaction must have been attempted against the main provider, got {} call(s)",
         calls.len()
+    );
+    assert!(
+        memory_provider.calls().is_empty(),
+        "LCM must not send compaction requests to the reflection provider"
     );
     // The last call is the LCM escalation attempt (Level 1/2 summarization),
     // not the original foreground chat call — it must still carry the
@@ -3848,7 +3837,7 @@ async fn test_tool_call_carrier_persists_before_tool_result() {
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
-                content: Some("I listed the workspace.".to_string()),
+                content: Some(attested_text("I listed the workspace.")),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
                 usage: std::collections::HashMap::new(),
@@ -3972,7 +3961,7 @@ async fn test_multiple_tool_round_carriers_persist_in_order() {
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
-                content: Some("Done.".to_string()),
+                content: Some(attested_text("Done.")),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
                 usage: std::collections::HashMap::new(),
@@ -4025,7 +4014,7 @@ async fn test_multiple_tool_round_carriers_persist_in_order() {
 }
 
 #[tokio::test]
-async fn test_local_truncated_response_does_not_hidden_auto_continue() {
+async fn test_local_truncated_response_requires_attested_correction_without_continue() {
     let main = Arc::new(ResponseSequenceProvider::new(
         "local-main",
         vec![crate::providers::base::LLMResponse {
@@ -4046,11 +4035,12 @@ async fn test_local_truncated_response_does_not_hidden_auto_continue() {
         .process_direct("answer briefly", &session_key, "test", "offline")
         .await;
 
-    assert_eq!(response, "Partial local answer");
-    assert_eq!(
-        main.call_count(),
-        1,
-        "local truncation must not issue a hidden Continue prompt that poisons the prefix cache"
+    // With the attestation protocol removed, truncated text follows the
+    // standard auto-continuation path; if continuations are exhausted the
+    // accumulated text is the final answer (no attestation retry loop).
+    assert!(
+        !response.is_empty(),
+        "expected a non-empty terminal response, got: {response:?}"
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
@@ -4062,19 +4052,19 @@ async fn test_local_streaming_cache_markers_append_only_across_turns() {
         "local-main",
         vec![
             crate::providers::base::LLMResponse {
-                content: Some("one".to_string()),
+                content: Some(attested_text("one")),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
-                content: Some("two".to_string()),
+                content: Some(attested_text("two")),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
-                content: Some("three".to_string()),
+                content: Some(attested_text("three")),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
                 usage: std::collections::HashMap::new(),
@@ -4168,7 +4158,7 @@ async fn test_failed_local_call_does_not_seed_prompt_cache_marker() {
     let provider: Arc<dyn LLMProvider> = Arc::new(FailOnceThenResponseProvider::new(
         "local-main",
         crate::providers::base::LLMResponse {
-            content: Some("recovered".to_string()),
+            content: Some(attested_text("recovered")),
             tool_calls: vec![],
             finish_reason: "stop".to_string(),
             usage: std::collections::HashMap::new(),
@@ -4747,8 +4737,6 @@ async fn test_trio_offline_e2e_health_gate() {
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        compaction_provider: None,
-        compaction_manager: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
@@ -5242,8 +5230,6 @@ mod runtime_mode_parity_tests {
             memory_config: MemoryConfig::default(),
             is_local: true,
             lane: Lane::default(),
-            compaction_provider: None,
-            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -5303,8 +5289,6 @@ mod runtime_mode_parity_tests {
             memory_config: MemoryConfig::default(),
             is_local: true,
             lane: Lane::default(),
-            compaction_provider: None,
-            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -5362,8 +5346,6 @@ mod runtime_mode_parity_tests {
             memory_config: MemoryConfig::default(),
             is_local: true,
             lane: Lane::default(),
-            compaction_provider: None,
-            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -5392,12 +5374,13 @@ mod runtime_mode_parity_tests {
     fn build_core_memory_provider_cloud_defaults_to_haiku_when_no_api_base() {
         let core = build_test_core(false, None, None);
         // provider.get_api_base() is None for MockLLM → "haiku" memory model.
-        assert_eq!(core.compactor.model(), "haiku");
+        assert_eq!(core.memory_model, "haiku");
+        assert_eq!(core.compactor.model(), "main-model");
     }
 
-    /// Task 2 / Branch 3: local memory provider falls through specialist → compaction → main.
-    /// With no explicit memory config and no specialist/compaction providers,
-    /// the local path returns the main model name.
+    /// Task 2 / Branch 3: local memory provider falls through specialist → main.
+    /// With no explicit memory config and no specialist provider, the local
+    /// reflection and compaction identities both resolve to the main model.
     #[test]
     fn build_core_memory_provider_local_defaults_to_main_without_trio() {
         let workspace = tempfile::tempdir().unwrap().keep();
@@ -5421,8 +5404,6 @@ mod runtime_mode_parity_tests {
             memory_config: MemoryConfig::default(),
             is_local: true,
             lane: Lane::default(),
-            compaction_provider: None,
-            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -5438,6 +5419,7 @@ mod runtime_mode_parity_tests {
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
             ),
         });
+        assert_eq!(core.memory_model, "local-model");
         assert_eq!(core.compactor.model(), "local-model");
     }
 
@@ -5467,8 +5449,6 @@ mod runtime_mode_parity_tests {
             memory_config: MemoryConfig::default(),
             is_local: true,
             lane: Lane::default(),
-            compaction_provider: None,
-            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -5545,8 +5525,6 @@ mod runtime_mode_parity_tests {
             memory_config: MemoryConfig::default(),
             is_local: true,
             lane: Lane::default(),
-            compaction_provider: None,
-            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
@@ -5599,8 +5577,6 @@ mod runtime_mode_parity_tests {
             memory_config: MemoryConfig::default(),
             is_local: true,
             lane: Lane::default(),
-            compaction_provider: None,
-            compaction_manager: None,
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,

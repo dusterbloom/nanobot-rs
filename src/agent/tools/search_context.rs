@@ -1,4 +1,4 @@
-//! Unified search tool across workspace files, memory, and session history.
+//! Unified search tool across workspace files and curated memory.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -9,17 +9,16 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::base::Tool;
-use super::{RecallTool, SearchFilesTool, SessionSearchTool};
+use super::{RecallTool, SearchFilesTool};
 
-/// Tool that searches local files, memory, and sessions through one interface.
+/// Tool that searches local files and curated memory through one interface.
 pub struct SearchContextTool {
     workspace: PathBuf,
-    db_path: Option<PathBuf>,
 }
 
 impl SearchContextTool {
-    pub fn new(workspace: PathBuf, db_path: Option<PathBuf>) -> Self {
-        Self { workspace, db_path }
+    pub fn new(workspace: PathBuf) -> Self {
+        Self { workspace }
     }
 }
 
@@ -30,7 +29,7 @@ impl Tool for SearchContextTool {
     }
 
     fn description(&self) -> &str {
-        "Search across workspace files, long-term memory, and past sessions. Results are labeled by source."
+        "Search workspace files and curated long-term memory. Results are labeled by source; use session_search for past conversations."
     }
 
     fn parameters(&self) -> Value {
@@ -43,7 +42,7 @@ impl Tool for SearchContextTool {
                 },
                 "sources": {
                     "type": "array",
-                    "items": {"type": "string", "enum": ["files", "memory", "sessions"]},
+                    "items": {"type": "string", "enum": ["files", "memory"]},
                     "description": "Sources to search. Default: all available sources."
                 },
                 "path": {
@@ -57,10 +56,6 @@ impl Tool for SearchContextTool {
                 "limit": {
                     "type": "integer",
                     "description": "Per-source result limit. Default: 10, max: 100."
-                },
-                "channel": {
-                    "type": "string",
-                    "description": "Optional session key/channel prefix for session search."
                 },
                 "mode": {
                     "type": "string",
@@ -124,24 +119,6 @@ impl Tool for SearchContextTool {
             }));
         }
 
-        if sources.contains(&"sessions") {
-            if let Some(db_path) = self.db_path.clone() {
-                let q = query.clone();
-                let channel = params.get("channel").cloned();
-                futs.push(Box::pin(async move {
-                    let tool = SessionSearchTool::new(db_path);
-                    let mut session_params = HashMap::new();
-                    session_params.insert("query".to_string(), json!(q));
-                    session_params.insert("limit".to_string(), json!(limit));
-                    if let Some(channel) = channel {
-                        session_params.insert("channel".to_string(), channel);
-                    }
-                    let out = tool.execute(session_params).await;
-                    ("sessions".to_string(), out)
-                }));
-            }
-        }
-
         if futs.is_empty() {
             return "Error: no searchable sources are available".to_string();
         }
@@ -157,7 +134,7 @@ impl Tool for SearchContextTool {
 
 fn parse_sources(value: Option<&Value>) -> Vec<&'static str> {
     let Some(Value::Array(items)) = value else {
-        return vec!["files", "memory", "sessions"];
+        return vec!["files", "memory"];
     };
     let mut out = Vec::new();
     for item in items {
@@ -168,11 +145,7 @@ fn parse_sources(value: Option<&Value>) -> Vec<&'static str> {
             _ => {}
         }
     }
-    if out.is_empty() {
-        vec!["files", "memory", "sessions"]
-    } else {
-        out
-    }
+    out
 }
 
 #[cfg(test)]
@@ -185,7 +158,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("notes.txt");
         tokio::fs::write(&file, "alpha beta gamma\n").await.unwrap();
-        let tool = SearchContextTool::new(tmp.path().to_path_buf(), None);
+        let tool = SearchContextTool::new(tmp.path().to_path_buf());
         let mut params = HashMap::new();
         params.insert("query".to_string(), json!("beta"));
         params.insert("sources".to_string(), json!(["files"]));
@@ -193,5 +166,31 @@ mod tests {
         let out = tool.execute(params).await;
         assert!(out.contains("## files"), "{out}");
         assert!(out.contains("notes.txt"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn test_search_context_does_not_bypass_session_search_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("sessions.db");
+        let db = crate::session::db::SessionDb::new(&db_path);
+        let session = db.create_session("cli:past").await;
+        db.add_messages(
+            &session.id,
+            &[json!({"role": "user", "content": "solepathtranscript"})],
+        )
+        .await;
+        let tool = SearchContextTool::new(tmp.path().to_path_buf());
+
+        let out = tool
+            .execute(HashMap::from([
+                ("query".to_string(), json!("solepathtranscript")),
+                ("sources".to_string(), json!(["sessions"])),
+            ]))
+            .await;
+
+        assert!(
+            out.contains("no searchable sources"),
+            "session_search must be the sole user-facing transcript path: {out}"
+        );
     }
 }

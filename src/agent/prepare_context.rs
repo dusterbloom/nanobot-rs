@@ -280,10 +280,9 @@ impl AgentLoopShared {
                 })
                 .clone()
         };
-        if tools.contains("recall") {
+        if tools.contains("session_search") {
             tools.register(Box::new(
-                crate::agent::tools::RecallTool::new(&core.workspace)
-                    .with_db(Some(core.sessions.path().to_path_buf()))
+                crate::agent::tools::SessionSearchTool::new(core.sessions.path().to_path_buf())
                     .with_current_session_id(Some(session_id.clone())),
             ));
         }

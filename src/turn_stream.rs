@@ -311,6 +311,39 @@ pub(crate) enum ControlMarker {
         idle_ms: u64,
     },
     CacheStatus(CacheStatus),
+    /// LCM compaction lifecycle. `Started` fires before the agent loop awaits
+    /// the summarizer; `Finished` fires after the checkpoint is installed.
+    /// Renderers show an animated progress indicator between the two.
+    Compaction(CompactionStatus),
+}
+
+/// LCM compaction progress marker carried on the delta channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionStatus {
+    /// Compaction started; `messages` is the active-context size about to be
+    /// summarized. Renderers use this as the denominator of a progress hint.
+    Started { messages: u32 },
+    /// Compaction finished and the checkpoint was installed. The cache is now
+    /// cold; the next LLM call re-prefills.
+    Finished,
+}
+
+impl CompactionStatus {
+    fn as_wire(self) -> String {
+        match self {
+            CompactionStatus::Started { messages } => format!("started:{messages}"),
+            CompactionStatus::Finished => "finished".to_string(),
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        if raw == "finished" {
+            return Some(CompactionStatus::Finished);
+        }
+        let rest = raw.strip_prefix("started:")?;
+        let messages = rest.parse().ok()?;
+        Some(CompactionStatus::Started { messages })
+    }
 }
 
 /// Agent-side backend progress state for a live LLM call.
@@ -424,6 +457,9 @@ impl ControlMarker {
                     format!("\x00cache:reset:{}", reason.as_wire())
                 }
             },
+            ControlMarker::Compaction(status) => {
+                format!("\x00compaction:{}", status.as_wire())
+            }
         }
     }
 }
@@ -511,6 +547,10 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
             }
             _ => None,
         };
+    }
+    if let Some(compaction) = rest.strip_prefix("compaction:") {
+        return CompactionStatus::from_wire(compaction)
+            .map(ControlMarker::Compaction);
     }
     None
 }
@@ -604,6 +644,8 @@ mod tests {
             ControlMarker::CacheStatus(CacheStatus::Reset {
                 reason: CacheResetReason::StalledProviderRequest,
             }),
+            ControlMarker::Compaction(CompactionStatus::Started { messages: 48 }),
+            ControlMarker::Compaction(CompactionStatus::Finished),
         ];
         for m in variants {
             let wire = m.encode();

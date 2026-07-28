@@ -221,27 +221,15 @@ impl AgentLoop {
             {
                 return;
             }
-            let Some(manager) = core.compaction_manager.as_ref() else {
-                tracing::warn!("Background reflection skipped: no managed compaction sidecar");
-                return;
-            };
-            let lease = match manager.acquire().await {
-                Ok(lease) => lease,
-                Err(error) => {
-                    tracing::warn!(%error, "Background reflection: compaction sidecar unavailable");
-                    return;
-                }
-            };
             let reflector = Reflector::new(
                 core.memory_provider.clone(),
-                lease.served_model().to_string(),
+                core.memory_model.clone(),
                 &core.workspace,
                 core.reflection_threshold,
                 core.sessions.clone(),
             );
             info!("Background: reflecting on completed SQLite working memory...");
             let result = reflector.reflect().await;
-            lease.release().await;
             if let Err(error) = result {
                 tracing::warn!(%error, "Background reflection failed");
             } else {
