@@ -100,16 +100,19 @@ impl AgentLoopShared {
                         crate::agent::provenance::redact_fabrications(&ctx.final_content, &claims);
                     ctx.final_content = redacted;
                     if redaction_count > 0 {
-                        let warning_role = ctx.core.mode().grounding_role();
+                        // Cache-replay tagged: a warning the model saw live must
+                        // replay byte-identical on reload or the warm prompt
+                        // prefix diverges. Force `user` role (matches the
+                        // response-boundary nudge convention at shared.rs:1193)
+                        // — Anthropic's OpenAI-compat layer strips mid-thread
+                        // system messages anyway.
                         let warning_content = format!(
                             "NOTICE: {} claim(s) in the previous response could not be \
                              verified against tool outputs and were removed.",
                             redaction_count
                         );
-                        ctx.messages.push(json!({
-                            "role": warning_role,
-                            "content": warning_content
-                        }));
+                        ctx.messages
+                            .push(crate::agent::markers::scaffold_user(warning_content));
                     }
                 }
             }
@@ -139,12 +142,11 @@ impl AgentLoopShared {
                     );
                 }
 
-                // Inject system reminder for the next turn.
-                let warning_role = ctx.core.mode().grounding_role();
-                ctx.messages.push(json!({
-                    "role": warning_role,
-                    "content": detection.system_warning
-                }));
+                // Inject warning for the next turn. Cache-replay tagged;
+                // user role for the same reason as the fabrication warning
+                // above.
+                ctx.messages
+                    .push(crate::agent::markers::scaffold_user(detection.system_warning));
             }
         }
 

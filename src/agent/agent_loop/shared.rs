@@ -754,11 +754,12 @@ impl AgentLoopShared {
                 {
                     let engine = ctx.reasoning.lock();
                     if let Some(instruction) = engine.step_instruction() {
-                        ctx.messages.push(json!({
-                            "role": "user",
-                            "content": format!("[Current objective] {}", instruction),
-                            "_synthetic": true,
-                        }));
+                        // Cache-replay tagged: a step instruction sent live must
+                        // replay byte-identical on reload or the warm prefix
+                        // diverges and Higgs re-prefills.
+                        ctx.messages.push(crate::agent::markers::scaffold_user(
+                            format!("[Current objective] {}", instruction),
+                        ));
                     }
                 }
             }
@@ -1077,22 +1078,18 @@ impl AgentLoopShared {
                 while let Ok(signal) = rx.try_recv() {
                     match signal.priority {
                         AhaPriority::Critical => {
-                            ctx.messages.push(json!({
-                                "role": "user",
-                                "content": format!(
+                            ctx.messages
+                                .push(crate::agent::markers::scaffold_user(format!(
                                     "[ALERT from subagent {}] {}",
                                     signal.agent_id, signal.message
-                                )
-                            }));
+                                )));
                         }
                         AhaPriority::High => {
-                            ctx.messages.push(json!({
-                                "role": "user",
-                                "content": format!(
+                            ctx.messages
+                                .push(crate::agent::markers::scaffold_user(format!(
                                     "[Signal from subagent {}] {}",
                                     signal.agent_id, signal.message
-                                )
-                            }));
+                                )));
                         }
                         AhaPriority::Normal => {
                             // Normal signals are informational — logged only.

@@ -3283,22 +3283,6 @@ fn assert_wire_prefix(first: &[Value], second: &[Value]) {
         second.len()
     );
     for (i, msg) in first.iter().enumerate() {
-        // Skip transient "Continue." nudges — they are sent to the model
-        // as a streaming-prompt continuation but NOT persisted to the
-        // session DB. On the next turn's history reload they're absent,
-        // so the wire at the same index has the actual assistant
-        // response instead. This is a sanctioned transient, not a cache
-        // mutation. (The protocol's tool-role rendering change on
-        // 2026-07-27 shifted the nudge's position into the compared
-        // range; the old user-role rendering with separators kept it
-        // past the range.)
-        let is_transient_continue = msg
-            .get("content")
-            .and_then(|c| c.as_str())
-            .is_some_and(|c| c == "Continue.");
-        if is_transient_continue {
-            continue;
-        }
         assert_eq!(
             serde_json::to_string(msg).unwrap(),
             serde_json::to_string(&second[i]).unwrap(),

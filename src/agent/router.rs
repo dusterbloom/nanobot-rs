@@ -1055,8 +1055,12 @@ pub(crate) async fn router_preflight(
                         "[specialist:{}] {}",
                         decision.target, record.specialist_response
                     );
+                    // Cache-replay tagged: this specialist output was sent to the
+                    // model live, so the next turn's reload must replay it byte-
+                    // for-byte or the warm prompt prefix shrinks and Higgs's
+                    // radix cache diverges (full re-prefill).
                     ctx.messages
-                        .push(json!({"role":"user","content": injected, "_synthetic": true}));
+                        .push(crate::agent::markers::scaffold_user(injected));
                     specialist_preflight_result(
                         &record.specialist_response,
                         ctx.core.tool_delegation_config.specialist_synthesis,
@@ -1083,7 +1087,8 @@ pub(crate) async fn router_preflight(
                         trace.outcome = Some(text.clone());
                         append_router_decision_trace(&trace);
                     }
-                    ctx.messages.push(json!({"role":"user","content": text}));
+                    ctx.messages
+                        .push(crate::agent::markers::scaffold_user(text.clone()));
                     subagent_preflight_result(&text)
                 }
                 Err(e) => {
@@ -1119,10 +1124,8 @@ pub(crate) async fn router_preflight(
                     trace.outcome = Some(format!("BLOCKED: {}", e));
                     append_router_decision_trace(&trace);
                 }
-                ctx.messages.push(json!({
-                    "role":"user",
-                    "content": format!("[tool-guard] {}", e),
-                }));
+                ctx.messages
+                    .push(crate::agent::markers::scaffold_user(format!("[tool-guard] {}", e)));
                 return PreflightResult::Continue;
             }
             let tr = ctx.tools.execute(&decision.target, params_map).await;
@@ -1139,15 +1142,14 @@ pub(crate) async fn router_preflight(
                     .router_tuning
                     .max_tool_result_chars,
             );
-            ctx.messages.push(json!({
-                "role":"user",
-                "content": format!(
-                    "[router:tool:{}] The tool returned the following data. \
-                     Summarize it concisely for the user:\n\n{}",
-                    decision.target, truncated
-                ),
-                "_synthetic": true,
-            }));
+            // Cache-replay tagged: tool evidence sent to the model must survive
+            // session reload byte-identical, or the next turn's prompt prefix
+            // diverges and the server re-prefills everything.
+            ctx.messages.push(crate::agent::markers::scaffold_user(format!(
+                "[router:tool:{}] The tool returned the following data. \
+                 Summarize it concisely for the user:\n\n{}",
+                decision.target, truncated
+            )));
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some(decision.target.clone());
             ctx.used_tools.insert(decision.target.clone());
             tool_preflight_result(&decision.target, &truncated, None)
@@ -1198,10 +1200,8 @@ pub(crate) async fn router_preflight(
                     trace.outcome = Some(format!("BLOCKED: {}", e));
                     append_router_decision_trace(&trace);
                 }
-                ctx.messages.push(json!({
-                    "role":"user",
-                    "content": format!("[tool-guard] {}", e),
-                }));
+                ctx.messages
+                    .push(crate::agent::markers::scaffold_user(format!("[tool-guard] {}", e)));
                 return PreflightResult::Continue;
             }
 
@@ -1220,15 +1220,13 @@ pub(crate) async fn router_preflight(
                     .router_tuning
                     .max_tool_result_chars,
             );
-            ctx.messages.push(serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "[router:pipeline] Pipeline execution result. \
-                     Summarize the completed steps and outcome for the user:\n\n{}",
-                    truncated
-                ),
-                "_synthetic": true,
-            }));
+            // Cache-replay tagged: pipeline evidence sent live must replay
+            // byte-identical on reload (warm-prefix contract).
+            ctx.messages.push(crate::agent::markers::scaffold_user(format!(
+                "[router:pipeline] Pipeline execution result. \
+                 Summarize the completed steps and outcome for the user:\n\n{}",
+                truncated
+            )));
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some("spawn:pipeline".to_string());
             ctx.used_tools.insert("spawn".to_string());
             PreflightResult::Continue
@@ -1528,8 +1526,10 @@ pub(crate) async fn route_tool_calls(
                             "[specialist:{}] {}",
                             plan.target, record.specialist_response
                         );
+                        // Cache-replay tagged — same reason as the decision-path
+                        // specialist injection above.
                         ctx.messages
-                            .push(json!({"role":"user","content": injected, "_synthetic": true}));
+                            .push(crate::agent::markers::scaffold_user(injected));
                         return specialist_route_result(&record.specialist_response);
                     }
                     Err(e) => return RouteResult::Break(e),
@@ -1547,7 +1547,8 @@ pub(crate) async fn route_tool_calls(
                 .await
                 {
                     Ok(text) => {
-                        ctx.messages.push(json!({"role":"user","content": text}));
+                        ctx.messages
+                            .push(crate::agent::markers::scaffold_user(text.clone()));
                         return subagent_route_result(&text);
                     }
                     Err(e) => return RouteResult::Break(e),

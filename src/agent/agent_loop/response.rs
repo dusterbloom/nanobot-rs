@@ -666,11 +666,11 @@ impl AgentLoopShared {
             }));
         }
 
-        ctx.messages.push(json!({
-            "role": "user",
-            "content": hint,
-            "_synthetic": true
-        }));
+        // Cache-replay tagged: a validation hint sent live must survive
+        // session reload byte-identical, otherwise the warm prompt prefix
+        // diverges and Higgs re-prefills the whole context.
+        ctx.messages
+            .push(crate::agent::markers::scaffold_user(hint));
         debug!(
             "Injected validation retry hint (retry {}/{})",
             retry_num,

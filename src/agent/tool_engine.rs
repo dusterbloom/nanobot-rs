@@ -672,10 +672,10 @@ pub(crate) async fn execute_tools_delegated(
             } else {
                 TOOL_RUNNER_SUMMARY_PREFIX
             };
-            ctx.messages.push(json!({
-                "role": "user",
-                "content": format!("{} {}", prefix, summary_text)
-            }));
+            ctx.messages.push(crate::agent::markers::scaffold_user(format!(
+                "{} {}",
+                prefix, summary_text
+            )));
             ctx.persist_pending_protocol_messages().await;
         }
     }

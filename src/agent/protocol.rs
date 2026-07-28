@@ -344,8 +344,17 @@ impl ConversationProtocol for LocalProtocol {
         // Merge consecutive same-role messages (avoids "consecutive user" violations).
         out = repair_role_alternation(out);
 
-        // Must always end with user.
-        if out.last().map(|m| m["role"] != "user").unwrap_or(true) {
+        // Append the continuation sentinel only when the render ends with an
+        // assistant turn (mirrors CloudProtocol at line 161). The previous
+        // broader condition (`!= "user"`) fired after `role:tool` results too,
+        // injecting a transient `Continue.` user message that was hashed into
+        // the stored fingerprint but never persisted — so the next iteration's
+        // model response filled that index and the prefix diverged
+        // (~60s/turn re-prefills on local, every divergence in 2026-07-27/28
+        // logs shared the literal sentinel hash 6787951084353679885).
+        // Native tool-calling chat templates handle `tool → assistant` without
+        // help; textual replay folds tool results into user messages already.
+        if out.last().map(|m| m["role"] == "assistant").unwrap_or(false) {
             out.push(json!({"role": "user", "content": CONTINUE_SENTINEL}));
         }
 

@@ -1097,8 +1097,13 @@ impl ContextBuilder {
     /// invariant.
     ///
     /// No-op when `tail` is blank or the array does not end with a user message.
-    /// The caller MUST bump its `new_start` persistence watermark by 1 so the
-    /// ephemeral tail is never written into session history.
+    ///
+    /// Cache contract: the tail is tagged `_cache_replay: true` via
+    /// `markers::scaffold_user`, so it persists to session history and replays
+    /// byte-for-byte on reload. The prior "ephemeral tail" contract (caller
+    /// bumps `new_start` to skip persist) violated the warm-prefix invariant —
+    /// a tail sent live but absent on reload forces Higgs to re-prefill the
+    /// whole context. Callers must NOT bump `new_start` past this insertion.
     pub fn insert_tail_before_user(&self, messages: &mut Vec<Value>, tail: &str) {
         if tail.trim().is_empty() {
             return;
@@ -1111,10 +1116,12 @@ impl ContextBuilder {
             return;
         }
         let pos = messages.len() - 1;
-        messages.insert(
-            pos,
-            json!({"role": "user", "content": tail, "_synthetic": true}),
-        );
+        // Cache-replay tagged: this tail block was sent to the model live, so
+        // the next turn's reload MUST replay it byte-for-byte or the warm
+        // prompt prefix shrinks and the Higgs radix cache diverges. The prior
+        // "ephemeral tail" contract (caller bumps new_start to skip persist)
+        // violated the cache invariant — see logs from 2026-07-27/28.
+        messages.insert(pos, crate::agent::markers::scaffold_user(tail));
     }
 
     /// Add a tool result to the message list and return the updated list.
