@@ -709,23 +709,17 @@ impl ToolRegistry {
         "session_search",
     ];
 
-    /// Hot tools advertised as native schemas for CLOUD models at turn 1.
-    /// Local models skip these entirely (pure proxy) — see `select_tool_definitions`.
+    /// Hot tools advertised as native schemas at turn 1. Kept to the 4 the
+    /// model uses every turn — the rest go through the `tool` proxy to keep
+    /// the tool-schema prefix small (~670 tok vs ~2000 tok for 14 native).
+    /// See commit f03c6e8 for the prior pure-proxy attempt; this is the
+    /// middle ground that avoids the proxy/native arg confusion that killed
+    /// pure-proxy while still cutting cold-start prefill by ~60%.
     const CORE_NATIVE_TOOLS: &'static [&'static str] = &[
         "read_file",
-        "list_dir",
-        "find_files",
-        "search_files",
-        "write_file",
         "edit_file",
+        "write_file",
         "exec",
-        "recall",
-        "session_search",
-        "remember",
-        "recall_tool_result",
-        "search_tool_result",
-        "slice_tool_result",
-        "todo",
     ];
 
     /// Internal Lean-catalog builder: condense every available schema before
@@ -1348,24 +1342,22 @@ mod tests {
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        // 14 hot native tools + 1 proxy = 15 total for cloud.
+        // 4 hot native tools + 1 proxy = 5 total.
         assert_eq!(
             names.len(),
-            15,
-            "cloud core+proxy must be 14 native + 1 proxy, got {names:?}"
+            5,
+            "core+proxy must be 4 native + 1 proxy, got {names:?}"
         );
         assert!(names.contains(&"tool"), "missing proxy: {names:?}");
         for expected in [
             "read_file",
             "edit_file",
+            "write_file",
             "exec",
-            "recall",
-            "session_search",
-            "todo",
         ] {
             assert!(
                 names.contains(&expected),
-                "cloud missing {expected}: {names:?}"
+                "core missing {expected}: {names:?}"
             );
         }
         let write_content = defs
