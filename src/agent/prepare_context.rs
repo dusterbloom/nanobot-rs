@@ -362,6 +362,19 @@ impl AgentLoopShared {
             .sessions
             .get_history(&session_id, max_messages, core.max_history_turns)
             .await;
+        // get_history applies byte-changing transformations (recall_tool_result
+        // raw→digest at filters.rs:236, tool-body cap, message windowing) that
+        // make the previous turn's stored fingerprint/watermark invalid. Without
+        // clearing here, the first LLM call of each new user turn compares
+        // against stale bytes and logs a false prompt_prefix_diverged — forcing
+        // a full re-prefill. The Higgs radix cache is unaffected (it matches by
+        // content, not by nanobot's fingerprint); this only prevents false
+        // divergence diagnostics and the stale-watermark frozen-prefix miscalc.
+        counters.prompt_fingerprints.lock().remove(&session_key);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .remove(&session_key);
         let history_ms = lap_ms();
         // LCM history adoption: when the engine holds a summary DAG, the
         // engine's active context IS the conversation history — summary
