@@ -223,18 +223,6 @@ impl Lease {
         }
     }
 
-    /// Record a tool call without family tracking (for callers that
-    /// don't use the coarse cap). Returns `false` when the lease is
-    /// exhausted — the caller should then strip tools from the next
-    /// request and require a renewal-or-answer.
-    pub fn record_tool_call(&mut self) -> bool {
-        if self.iterations_used >= self.lease_size {
-            return false;
-        }
-        self.iterations_used += 1;
-        true
-    }
-
     /// Record a tool call with coarse-family tracking. Returns whether
     /// the call was allowed plus the rejection reason if not. A blocked
     /// call does NOT consume the per-lease budget — the model is told
@@ -265,10 +253,6 @@ impl Lease {
 
     pub fn is_exhausted(&self) -> bool {
         self.iterations_used >= self.lease_size
-    }
-
-    pub fn iterations_used(&self) -> u32 {
-        self.iterations_used
     }
 
     pub fn renewals_used(&self) -> u32 {
@@ -349,6 +333,16 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
             .collect()
+    }
+
+    /// Advance the lease by one call via the live family-tracking API, used by
+    /// the state-machine tests below to exercise exhaustion/renewal/progress in
+    /// isolation. The bare `record_tool_call` overload was removed; there is now
+    /// one way to record a call.
+    fn tick(lease: &mut Lease) -> bool {
+        lease
+            .record_tool_call_in_family("read_file", &HashMap::new())
+            .allowed
     }
 
     // -----------------------------------------------------------------
@@ -469,16 +463,15 @@ mod tests {
     #[test]
     fn lease_allows_n_tool_calls_then_reports_exhausted() {
         let mut lease = Lease::new(3, 2);
-        assert!(lease.record_tool_call());
-        assert!(lease.record_tool_call());
-        assert!(lease.record_tool_call());
+        assert!(tick(&mut lease));
+        assert!(tick(&mut lease));
+        assert!(tick(&mut lease));
         // Three tools consumed the lease; the 4th call must be rejected.
         assert!(
-            !lease.record_tool_call(),
-            "lease must be exhausted after lease_size tool calls"
+            !tick(&mut lease),
+             "lease must be exhausted after lease_size tool calls"
         );
         assert!(lease.is_exhausted());
-        assert_eq!(lease.iterations_used(), 3);
     }
 
     /// After exhaustion, the model must either answer or request a
@@ -487,8 +480,8 @@ mod tests {
     #[test]
     fn lease_renewal_restores_budget_when_checkpoint_is_valid() {
         let mut lease = Lease::new(2, 3);
-        lease.record_tool_call();
-        lease.record_tool_call();
+        tick(&mut lease);
+        tick(&mut lease);
         assert!(lease.is_exhausted());
 
         let checkpoint = "Findings: located tau_soft in config/schema.rs.\n\
@@ -499,7 +492,6 @@ mod tests {
             "valid checkpoint (findings + next + will) must renew the lease"
         );
         assert!(!lease.is_exhausted());
-        assert_eq!(lease.iterations_used(), 0, "renewal resets the budget");
         assert_eq!(lease.renewals_used(), 1);
     }
 
@@ -509,7 +501,7 @@ mod tests {
     #[test]
     fn lease_renewal_rejected_when_any_required_field_is_missing() {
         let mut lease = Lease::new(1, 3);
-        lease.record_tool_call();
+        tick(&mut lease);
         assert!(lease.is_exhausted());
 
         // Missing findings.
@@ -549,7 +541,7 @@ mod tests {
     fn lease_renewal_capped_at_max_renewals() {
         let mut lease = Lease::new(1, 2);
         for lease_num in 0..2 {
-            lease.record_tool_call();
+            tick(&mut lease);
             assert!(lease.is_exhausted());
             let valid = format!(
                 "Findings: did step {lease_num}.\nNext: step {}.\nWill: continue.",
@@ -564,7 +556,7 @@ mod tests {
         }
         // Used both renewals; the third must be rejected for lease-count
         // reasons, not checkpoint-quality reasons.
-        lease.record_tool_call();
+        tick(&mut lease);
         assert!(lease.is_exhausted());
         let valid = "Findings: x.\nNext: y.\nWill: z.";
         let result = lease.try_renew(valid);
@@ -622,24 +614,24 @@ mod tests {
     fn lease_progress_signal_format() {
         let mut lease = Lease::new(5, 3);
         // First call records, then signal describes that call.
-        lease.record_tool_call();
+        tick(&mut lease);
         let s1 = lease.progress_signal();
         assert!(s1.contains("Tool call 1 of 5"), "got: {s1}");
         assert!(s1.contains("3 leases remaining"), "got: {s1}");
 
-        lease.record_tool_call();
+        tick(&mut lease);
         let s2 = lease.progress_signal();
         assert!(s2.contains("Tool call 2 of 5"), "got: {s2}");
         assert!(s2.contains("3 leases remaining"), "got: {s2}");
 
         // Renew — now in lease 2; 2 future leases obtainable.
         for _ in 0..3 {
-            lease.record_tool_call();
+            tick(&mut lease);
         }
         assert!(lease.is_exhausted());
         lease.try_renew("Findings: x.\nNext: y.\nWill: z.");
         // After renewal, the next call records as call 1 of the new lease.
-        lease.record_tool_call();
+        tick(&mut lease);
         let s_after = lease.progress_signal();
         assert!(
             s_after.contains("Tool call 1 of 5"),

@@ -19,7 +19,7 @@ use crate::agent::agent_loop::heuristics::{
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::context::ContextBuilder;
 use crate::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
-use crate::agent::lease::{Lease, DEFAULT_MAX_LEASES_PER_TURN, DEFAULT_TOOLS_PER_LEASE};
+use crate::agent::lease::Lease;
 use crate::agent::policy;
 use crate::agent::prefix_guard;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
