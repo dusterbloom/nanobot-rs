@@ -725,6 +725,24 @@ impl ToolRegistry {
         "get_skills",
     ];
 
+    /// Tools kept registered and reachable via the `get_tools` proxy (call with
+    /// no `tool_name` to list) but omitted from the per-turn prompt catalog to
+    /// save cold-prefill tokens. Empirically 0 invocations across 17 days of
+    /// sessions and peripheral to the hot path. `remember` and `lcm_expand` are
+    /// intentionally NOT here (core to memory formation / LCM expansion).
+    const RARELY_ADVERTISED_TOOLS: &'static [&'static str] = &[
+        "file_preview",
+        "file_info",
+        "workspace_diff",
+        "system_info",
+        "tool_status",
+        "browser",
+        "search_context",
+        "recall_tool_result",
+        "search_tool_result",
+        "slice_tool_result",
+    ];
+
     /// Internal Lean-catalog builder: condense every available schema before
     /// selecting the fixed production subset. `pub(crate)` so the delegation
     /// (sub-agent) path can also send condensed descriptions without losing
@@ -976,12 +994,16 @@ impl ToolRegistry {
     /// four native core tools aren't double-listed (once as native schemas,
     /// once in the proxy catalog).
     fn get_proxy_definition_excluding(&self, exclude: &[&str]) -> Vec<serde_json::Value> {
+        // Rarely-used tools stay registered and reachable via `get_tools({})`
+        // (omit tool_name to list) but are not enumerated in the per-turn prompt
+        // catalog, to save cold-prefill tokens. See `RARELY_ADVERTISED_TOOLS`.
         let mut hints: Vec<String> = self
             .tools
             .values()
             .filter(|t| t.is_available())
             .map(|t| Self::tool_hint(t.as_ref()))
             .filter(|h| !exclude.iter().any(|e| h.starts_with(e)))
+            .filter(|h| !Self::RARELY_ADVERTISED_TOOLS.iter().any(|r| h.starts_with(r)))
             .collect();
         hints.sort();
 
@@ -1440,19 +1462,33 @@ mod tests {
             desc.contains("full parameter"),
             "proxy must teach inspect-then-execute: {desc}"
         );
-
-        // Every reachable lean tool must be named in the proxy so the model
-        // knows what it can unlock. Only assert tools actually registered here.
+        // Hot tools must be named in the catalog so the model routes without a
+        // round-trip; rarely-used tools are intentionally omitted (discoverable
+        // via the omit-tool_name list path — see RARELY_ADVERTISED_TOOLS).
+        assert!(
+            desc.contains("Omit tool_name to list every available tool"),
+            "proxy must teach the list-all discovery path: {desc}"
+        );
         let available: std::collections::HashSet<String> =
             reg.available_tool_names().into_iter().collect();
         for t in ToolRegistry::CORE_TOOLS
             .iter()
             .chain(ToolRegistry::LEAN_EXTRA_TOOLS.iter())
         {
+            if !available.contains(*t) || ToolRegistry::RARELY_ADVERTISED_TOOLS.contains(t) {
+                continue;
+            }
+            assert!(
+                desc.contains(t),
+                "proxy must advertise hot tool '{t}': {desc}"
+            );
+        }
+        // Rarely-advertised tools must NOT clutter the per-turn catalog.
+        for t in ToolRegistry::RARELY_ADVERTISED_TOOLS {
             if available.contains(*t) {
                 assert!(
-                    desc.contains(t),
-                    "proxy must advertise reachable tool '{t}': {desc}"
+                    !desc.contains(t),
+                    "rarely-used tool '{t}' should be de-listed from catalog: {desc}"
                 );
             }
         }
