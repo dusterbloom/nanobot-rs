@@ -61,7 +61,7 @@ const RAW_JSON_TOOL_NAMES: &[&str] = &[
     "message",
     "plan",
     "read_file",
-    "read_skill",
+    "get_skills",
     "recall",
     "remember",
     "send_email",

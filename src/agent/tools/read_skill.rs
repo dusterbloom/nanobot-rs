@@ -29,7 +29,7 @@ impl ReadSkillTool {
 #[async_trait]
 impl Tool for ReadSkillTool {
     fn name(&self) -> &str {
-        "read_skill"
+        "get_skills"
     }
 
     fn description(&self) -> &str {
@@ -155,9 +155,9 @@ mod tests {
     fn test_tool_schema() {
         let tmp = TempDir::new().unwrap();
         let tool = ReadSkillTool::new(tmp.path());
-        assert_eq!(tool.name(), "read_skill");
+        assert_eq!(tool.name(), "get_skills");
         let schema = tool.to_schema();
-        assert_eq!(schema["function"]["name"], "read_skill");
+        assert_eq!(schema["function"]["name"], "get_skills");
         assert!(schema["function"]["parameters"]["properties"]["name"].is_object());
     }
 

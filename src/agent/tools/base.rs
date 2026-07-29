@@ -39,7 +39,7 @@ pub(crate) use require_str;
 #[serde(rename_all = "camelCase")]
 pub enum PermissionLevel {
     /// Read-only tools: read_file, list_dir, find_files, file_info,
-    /// workspace_diff, system_info, recall, read_skill, session_search
+    /// workspace_diff, system_info, recall, get_skills, session_search
     ReadOnly,
     /// Network access: web_search, web_fetch, browser
     Network,

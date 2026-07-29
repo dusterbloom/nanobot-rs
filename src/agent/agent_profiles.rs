@@ -376,7 +376,7 @@ Do stuff."#;
         assert!(tools.contains(&"web_search".to_string()));
         assert!(tools.contains(&"web_fetch".to_string()));
         assert!(tools.contains(&"browser".to_string()));
-        assert!(tools.contains(&"read_skill".to_string()));
+        assert!(tools.contains(&"get_skills".to_string()));
         assert_eq!(tools.len(), 7);
         // Verify sorted
         for i in 1..tools.len() {

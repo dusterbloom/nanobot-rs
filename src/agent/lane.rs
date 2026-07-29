@@ -274,7 +274,7 @@ mod tests {
         assert_contains(&tools, "web_fetch");
         assert_contains(&tools, "browser");
         // Skills
-        assert_contains(&tools, "read_skill");
+        assert_contains(&tools, "get_skills");
         // Not in tiny tier
         let list = tools.unwrap();
         assert!(
@@ -293,7 +293,7 @@ mod tests {
         assert_contains(&tools, "read_file");
         assert_contains(&tools, "recall_tool_result");
         assert_contains(&tools, "web_search");
-        assert_contains(&tools, "read_skill");
+        assert_contains(&tools, "get_skills");
         // Plus the balanced additions
         assert_contains(&tools, "write_file");
         assert_contains(&tools, "edit_file");

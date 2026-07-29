@@ -171,7 +171,7 @@ pub struct ContextBuilder {
     /// Whether to inject provenance verification rules into the system prompt.
     pub provenance_enabled: bool,
     /// When true, all skills are loaded as summaries only (RLM lazy mode).
-    /// The agent uses `read_skill` to fetch full content on demand.
+    /// The agent uses `get_skills` to fetch full content on demand.
     pub lazy_skills: bool,
     /// Controls how skills are disclosed in the system prompt.
     /// - "compact" (default): one-line index per skill (~20 tokens each)
@@ -897,7 +897,7 @@ impl ContextBuilder {
     /// Build the skills content string based on the disclosure mode.
     ///
     /// Tier selection is driven by `skill_disclosure`:
-    ///   "compact" (default): one-line index, full content on demand via read_skill
+    ///   "compact" (default): one-line index, full content on demand via get_skills
     ///   "xml": full XML summary with descriptions and metadata
     ///   "eager": always-on skills loaded in full, others as XML summary (legacy)
     /// `lazy_skills` is kept for backward compat and treated as "xml" disclosure.
@@ -932,7 +932,7 @@ impl ContextBuilder {
                     let load_hint = if mode == "eager" {
                         "To use a skill, read its SKILL.md file using the read_file tool."
                     } else {
-                        "Use the read_skill tool to load a skill's full instructions."
+                        "Use the get_skills tool to load a skill's full instructions."
                     };
                     parts.push(format!(
                         "The following skills extend your capabilities. {load_hint}\n\
@@ -1272,10 +1272,10 @@ impl ContextBuilder {
                 format!(
                     "You are nanobot.\n\
                      Date: {today}. Model: {model_line}. Cwd: {cwd}. Workspace: {workspace_path}.\n\n\
-                     Native tools: read_file, edit_file, write_file, exec — call with schema args; never wrap. \
-                     Other tools via `tool` proxy: omit name to list; \
-                     {{\"name\":\"X\"}} inspect; {{\"name\":\"X\",\"args\":{{...}}}} invoke. \
-                     Skills: read_skill; curated facts: recall; past conversations: session_search. \
+                     Native tools: read_file, edit_file, write_file, exec, get_skills — call with schema args; never wrap. \
+                     Other tools via `get_tools` proxy: omit tool_name to list; \
+                     {{\"tool_name\":\"X\"}} inspect; {{\"tool_name\":\"X\",\"tool_args\":{{...}}}} invoke. \
+                     get_skills: omit name to list, name to read; recall; session_search. \
                      Quote exact tool errors; never invent causes or tool results. \
                      edit_file uses path, old_text, new_text—not content. \
                      Never pass read_file line prefixes as args. \
@@ -1383,7 +1383,7 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
 
         // Bootstrap files (AGENTS.md/SOUL.md/USER.md) and the skill name index
         // are NOT inlined into the local system prompt. The identity above
-        // points the model at them via the `tool` proxy + read_file / read_skill,
+        // points the model at them via the `get_tools` proxy + read_file / get_skills,
         // same on-demand discipline used for memory. Explicitly requested skills
         // are still loaded below.
 
@@ -2010,21 +2010,19 @@ mod tests {
         assert!(identity.contains("Native tools:"), "{identity}");
         assert!(identity.contains("never wrap"), "{identity}");
         assert!(
-            identity.contains("Other tools via `tool` proxy"),
+            identity.contains("Other tools via `get_tools` proxy"),
             "{identity}"
         );
-        assert!(identity.contains("`tool` proxy"), "{identity}");
-        assert!(identity.contains("omit name to list"), "{identity}");
-        assert!(identity.contains(r#"{"name":"X"}"#), "{identity}");
+        assert!(identity.contains("`get_tools` proxy"), "{identity}");
+        assert!(identity.contains("omit tool_name to list"), "{identity}");
+        assert!(identity.contains(r#"{"tool_name":"X"}"#), "{identity}");
         assert!(
-            identity.contains(r#"{"name":"X","args":{...}}"#),
+            identity.contains(r#"{"tool_name":"X","tool_args":{...}}"#),
             "{identity}"
         );
-        assert!(identity.contains("curated facts: recall"), "{identity}");
-        assert!(
-            identity.contains("past conversations: session_search"),
-            "{identity}"
-        );
+        assert!(identity.contains("get_skills"), "{identity}");
+        assert!(identity.contains("recall"), "{identity}");
+        assert!(identity.contains("session_search"), "{identity}");
 
         // (c) error discipline
         assert!(identity.contains("Quote exact tool errors"), "{identity}");
@@ -2818,7 +2816,7 @@ mod tests {
 
         // The cached prefix itself must stay within the 1000-token ceiling even
         // with bootstrap/skills present. After the ratel-ai-style shrink, the
-        // identity advertises the catalog as fetch hooks (read_file / read_skill
+        // identity advertises the catalog as fetch hooks (read_file / get_skills
         // / recall) instead of inlining it, so a workspace full of large files
         // can no longer push the prefix over the cap.
         let (stable, _runtime, _) =
@@ -2831,8 +2829,8 @@ mod tests {
         // The stable prefix carries the model identity and the proxy hooks.
         assert!(stable.contains("nanobot"));
         assert!(stable.contains("mlx:Qwen3-8B-MLX-4bit"));
-        assert!(stable.contains("`tool` proxy"));
-        assert!(stable.contains("read_skill"));
+        assert!(stable.contains("`get_tools` proxy"));
+        assert!(stable.contains("get_skills"));
         assert!(stable.contains("recall"));
 
         // On-demand contract: AGENTS.md / MEMORY.md / skill bodies are NOT

@@ -12,7 +12,7 @@ const READ_TOOLS: &[&str] = &[
     "find_files",
     "search_files",
     "recall",
-    "read_skill",
+    "get_skills",
 ];
 const READ_CACHE_INVALIDATORS: &[&str] =
     &["exec", "write_file", "edit_file", "apply_patch", "remember"];

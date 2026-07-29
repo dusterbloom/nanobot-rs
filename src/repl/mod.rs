@@ -335,7 +335,7 @@ fn extract_tool_context(tool_name: &str, result_data: &str, args_preview: &str) 
             clip_param(extract_json_string_field(args_preview, "query"))
         }
         "web_fetch" => clip_param(extract_json_string_field(args_preview, "url")),
-        "read_skill" | "spawn" => clip_param(extract_json_string_field(args_preview, "name")),
+        "get_skills" | "spawn" => clip_param(extract_json_string_field(args_preview, "name")),
         "list_dir" | "write_file" => clip_param(extract_json_string_field(args_preview, "path")),
         _ => {
             // Generic: surface the first recognisable string argument so the tool

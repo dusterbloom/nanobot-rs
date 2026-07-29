@@ -74,7 +74,7 @@ pub fn coarse_family(tool_name: &str, args: &std::collections::HashMap<String, V
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             exec_coarse_family(command)
         }
-        "read_file" | "list_dir" | "find_files" | "search_files" | "recall" | "read_skill" => {
+        "read_file" | "list_dir" | "find_files" | "search_files" | "recall" | "get_skills" => {
             "read".to_string()
         }
         "web_search" | "web_fetch" => "web".to_string(),
@@ -435,7 +435,7 @@ mod tests {
             "list_dir",
             "find_files",
             "recall",
-            "read_skill",
+            "get_skills",
         ] {
             assert_eq!(
                 coarse_family(tool, &HashMap::new()),

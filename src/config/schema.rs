@@ -1196,7 +1196,7 @@ pub struct MemoryConfig {
     pub max_history_turns: usize,
 
     /// When true, skills are loaded as names+descriptions only (not full content).
-    /// The agent fetches full skill content on demand via the `read_skill` tool.
+    /// The agent fetches full skill content on demand via the `get_skills` tool.
     /// This keeps the system prompt lean (RLM pattern: context as variable).
     #[deprecated(
         note = "Superseded by `skill_disclosure` enum; set skill_disclosure = \"compact\" instead"

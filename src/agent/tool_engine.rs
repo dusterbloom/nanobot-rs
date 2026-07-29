@@ -1756,7 +1756,7 @@ mod tests {
             "file_info",
             "web_fetch",
             "web_search",
-            "read_skill",
+            "get_skills",
         ] {
             assert_eq!(registry.concurrency(name), ToolConcurrency::ParallelSafe);
         }

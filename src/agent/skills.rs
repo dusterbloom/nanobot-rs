@@ -290,9 +290,9 @@ impl SkillsLoader {
         }
         let mut lines = vec![
             "Available skills. Before reading any SKILL.md file by hand, \
-             call `read_skill __list__` first to get canonical file paths — \
+             call `get_skills __list__` first to get canonical file paths — \
              editing by a guessed path will hit the wrong file. Then use \
-             `read_skill <name>` for full content."
+             `get_skills <name>` for full content."
                 .to_string(),
         ];
         for record in &skill_records {
@@ -422,7 +422,7 @@ impl SkillsLoader {
     /// Build a minimal skill name index for small local prompts.
     ///
     /// This is intentionally terse: names only, no descriptions. The model can
-    /// call `read_skill __list__` for discovery details and `read_skill <name>`
+    /// call `get_skills __list__` for discovery details and `get_skills <name>`
     /// for full content.
     pub fn build_name_index(&self, max_names: usize) -> String {
         let mut names: Vec<String> = self
@@ -438,16 +438,16 @@ impl SkillsLoader {
         let extra = names.len().saturating_sub(max_names);
         let visible: Vec<String> = names.into_iter().take(max_names).collect();
         let mut text = format!(
-            "Skills available on demand via `read_skill`: {}.",
+            "Skills available on demand via `get_skills`: {}.",
             visible.join(", ")
         );
         if extra > 0 {
             text.push_str(&format!(
-                " Plus {} more. Use `read_skill __list__` for the full list.",
+                " Plus {} more. Use `get_skills __list__` for the full list.",
                 extra
             ));
         } else {
-            text.push_str(" Use `read_skill __list__` for descriptions.");
+            text.push_str(" Use `get_skills __list__` for descriptions.");
         }
         text
     }
@@ -1092,7 +1092,7 @@ mod tests {
 
     #[test]
     fn test_compact_index_preamble_is_imperative() {
-        // The header must tell the model to call `read_skill __list__`
+        // The header must tell the model to call `get_skills __list__`
         // BEFORE reading any SKILL.md file by hand. A parenthetical hint
         // is not enough — small local models routinely skip hints and
         // re-read skill files from guessed paths, which is how Qwen3.6
@@ -1102,8 +1102,8 @@ mod tests {
         let index = loader.build_compact_index();
         let lower = index.to_lowercase();
         assert!(
-            lower.contains("read_skill __list__"),
-            "preamble must name the read_skill __list__ tool call: {index}"
+            lower.contains("get_skills __list__"),
+            "preamble must name the get_skills __list__ tool call: {index}"
         );
         // The preamble must frame __list__ as a prerequisite, not an option.
         assert!(
@@ -1332,7 +1332,7 @@ mod tests {
         let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
         let index = loader.build_name_index(12);
         assert!(index.contains("test-skill"));
-        assert!(index.contains("read_skill __list__"));
+        assert!(index.contains("get_skills __list__"));
         assert!(!index.contains("A versioned skill"));
     }
 

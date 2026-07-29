@@ -30,7 +30,7 @@ impl Capability {
             Capability::Http => &["web_search", "web_fetch", "browser"],
             Capability::Memory => &["recall", "remember", "session_search"],
             Capability::Spawn => &["spawn"],
-            Capability::Skills => &["read_skill"],
+            Capability::Skills => &["get_skills"],
             Capability::Cron => &["cron_schedule"],
             Capability::Message => &["message"],
             Capability::Code => &["execute_code"],

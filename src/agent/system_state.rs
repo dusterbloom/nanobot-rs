@@ -104,7 +104,7 @@ pub fn infer_phase(recent_tools: &[&str]) -> TaskPhase {
     }
 
     // Recall/skill = reflection.
-    if last3.iter().any(|t| *t == "recall" || *t == "read_skill") {
+    if last3.iter().any(|t| *t == "recall" || *t == "get_skills") {
         return TaskPhase::Reflection;
     }
 

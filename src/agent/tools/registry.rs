@@ -383,7 +383,7 @@ impl ToolRegistry {
         if should_include("remember") {
             self.register(Box::new(RememberTool::new(config.workspace.clone())));
         }
-        if should_include("read_skill") {
+        if should_include("get_skills") {
             self.register(Box::new(ReadSkillTool::new(&config.workspace)));
         }
         if should_include("session_search") {
@@ -543,8 +543,8 @@ impl ToolRegistry {
         name: &str,
         params: HashMap<String, serde_json::Value>,
     ) -> ToolExecutionResult {
-        // Proxy intercept: "tool" is the meta-tool, not a registered tool.
-        if name == "tool" {
+        // Proxy intercept: "get_tools" (alias "tool") is the meta-tool, not a registered tool.
+        if name == "get_tools" || name == "tool" {
             return self.execute_proxy(params, None).await;
         }
         self.execute_inner(name, params, None).await
@@ -608,8 +608,8 @@ impl ToolRegistry {
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolExecutionContext,
     ) -> ToolExecutionResult {
-        // Proxy intercept: "tool" is the meta-tool, not a registered tool.
-        if name == "tool" {
+        // Proxy intercept: "get_tools" (alias "tool") is the meta-tool, not a registered tool.
+        if name == "get_tools" || name == "tool" {
             return self.execute_proxy(params, Some(ctx)).await;
         }
         self.execute_inner(name, params, Some(ctx)).await
@@ -687,7 +687,7 @@ impl ToolRegistry {
     /// on top of `CORE_TOOLS`. Everything else is reachable via the proxy
     /// meta-tool appended by `get_lean_definitions`.
     const LEAN_EXTRA_TOOLS: &'static [&'static str] = &[
-        "read_skill",
+        "get_skills",
         "web_search",
         "web_fetch",
         "message",
@@ -709,9 +709,11 @@ impl ToolRegistry {
         "session_search",
     ];
 
-    /// Hot tools advertised as native schemas at turn 1. Kept to the 4 the
+    /// Hot tools advertised as native schemas at turn 1. Kept to the 5 the
     /// model uses every turn — the rest go through the `tool` proxy to keep
     /// the tool-schema prefix small (~670 tok vs ~2000 tok for 14 native).
+    /// `get_skills` is native (not proxied) so the model reads skill content
+    /// directly instead of hitting the proxy's inspect mode.
     /// See commit f03c6e8 for the prior pure-proxy attempt; this is the
     /// middle ground that avoids the proxy/native arg confusion that killed
     /// pure-proxy while still cutting cold-start prefill by ~60%.
@@ -720,6 +722,7 @@ impl ToolRegistry {
         "edit_file",
         "write_file",
         "exec",
+        "get_skills",
     ];
 
     /// Internal Lean-catalog builder: condense every available schema before
@@ -823,7 +826,7 @@ impl ToolRegistry {
         // a proxy round-trip.
         const KEEP_PARAM_DESCRIPTIONS: &[&str] = &[
             "read_file",
-            "read_skill",
+            "get_skills",
             "recall",
             "session_search",
             "remember",
@@ -959,7 +962,7 @@ impl ToolRegistry {
 
     /// Build a single compact proxy schema that lists all available tools.
     ///
-    /// Returns one tool definition called `"tool"` whose description embeds
+    /// Returns one tool definition called `"get_tools"` whose description embeds
     /// the full catalog with arg hints. The model calls `tool(name: "X")`
     /// to inspect a tool's schema, or `tool(name: "X", args: {...})` to execute.
     ///
@@ -983,10 +986,10 @@ impl ToolRegistry {
         hints.sort();
 
         let description = format!(
-            "Gateway to all tools. Omit name to list every available tool. \
-             Provide {{\"name\":\"NAME\"}} to inspect that tool's full parameter \
-             schema, or {{\"name\":\"NAME\",\"args\":{{\"arg\":\"value\"}}}} to invoke it. \
-             Starter tools: read_file, read_skill (no args lists skills), recall \
+            "Gateway to all tools. Omit tool_name to list every available tool. \
+             Provide {{\"tool_name\":\"NAME\"}} to inspect that tool's full parameter \
+             schema, or {{\"tool_name\":\"NAME\",\"tool_args\":{{\"arg\":\"value\"}}}} to invoke it. \
+             Starter tools: read_file, get_skills (native; omit name to list skills), recall \
              (memory search), remember, todo (plan multi-step artifact work), edit_file, \
              exec, write_file. A complete write_file call may contain the whole file. \
              For voluntary staged writes, keep state=more pieces to 4096 characters or \
@@ -999,7 +1002,7 @@ impl ToolRegistry {
         vec![serde_json::json!({
             "type": "function",
             "function": {
-                "name": "tool",
+                "name": "get_tools",
                 "description": description,
                 "parameters": {
                     "type": "object",
@@ -1007,7 +1010,7 @@ impl ToolRegistry {
                         // The proxy selector and argument envelope are named
                         // `tool_name`/`tool_args` rather than `name`/`args`.
                         // The old names overloaded with inner-tool params
-                        // (e.g. `read_skill` has its own `name`), causing
+                        // (e.g. `get_skills` has its own `name`), causing
                         // small local models to collapse everything into
                         // `args` and omit the top-level selector. Live
                         // failure 2026-07-27 17:21 (session
@@ -1152,7 +1155,7 @@ impl ToolRegistry {
         outer_name: &str,
         params: &HashMap<String, Value>,
     ) -> Option<(String, HashMap<String, Value>)> {
-        if outer_name != "tool" {
+        if outer_name != "get_tools" && outer_name != "tool" {
             return Some((outer_name.to_string(), params.clone()));
         }
         match self.resolve_proxy_call(params) {
@@ -1342,18 +1345,19 @@ mod tests {
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        // 4 hot native tools + 1 proxy = 5 total.
+        // 5 hot native tools + 1 proxy = 6 total.
         assert_eq!(
             names.len(),
-            5,
-            "core+proxy must be 4 native + 1 proxy, got {names:?}"
+            6,
+            "core+proxy must be 5 native + 1 proxy, got {names:?}"
         );
-        assert!(names.contains(&"tool"), "missing proxy: {names:?}");
+        assert!(names.contains(&"get_tools"), "missing proxy: {names:?}");
         for expected in [
             "read_file",
             "edit_file",
             "write_file",
             "exec",
+            "get_skills",
         ] {
             assert!(
                 names.contains(&expected),
@@ -1372,10 +1376,10 @@ mod tests {
         // The proxy must teach all three modes and name starter tools.
         let proxy_desc = defs
             .iter()
-            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("tool"))
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("get_tools"))
             .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
             .unwrap_or("");
-        assert!(proxy_desc.contains("Omit name to list"), "{proxy_desc}");
+        assert!(proxy_desc.contains("Omit tool_name to list"), "{proxy_desc}");
         assert!(proxy_desc.contains("read_file"), "{proxy_desc}");
         assert!(proxy_desc.contains("todo"), "{proxy_desc}");
         assert!(proxy_desc.contains("validate"), "{proxy_desc}");
@@ -1397,7 +1401,7 @@ mod tests {
         );
         let proxy_desc = defs
             .iter()
-            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("tool"))
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("get_tools"))
             .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
             .unwrap_or("");
         assert!(
@@ -1424,7 +1428,7 @@ mod tests {
         // Lazy-load contract: exactly ONE tool advertised at turn 1.
         assert_eq!(lean.len(), 1, "lean surface must be the single proxy tool");
         let name = lean[0].pointer("/function/name").and_then(|v| v.as_str());
-        assert_eq!(name, Some("tool"), "only the proxy meta-tool is advertised");
+        assert_eq!(name, Some("get_tools"), "only the proxy meta-tool is advertised");
 
         let desc = lean[0]
             .pointer("/function/description")
@@ -2367,7 +2371,7 @@ mod tests {
         assert!(allowed_tools.contains(&"recall".to_string()));
         assert!(allowed_tools.contains(&"remember".to_string()));
         assert!(allowed_tools.contains(&"session_search".to_string()));
-        assert!(allowed_tools.contains(&"read_skill".to_string()));
+        assert!(allowed_tools.contains(&"get_skills".to_string()));
 
         // These should NOT be allowed (not in the declared capabilities).
         assert!(!allowed_tools.contains(&"exec".to_string()));
@@ -2476,7 +2480,7 @@ mod tests {
             "web_fetch",
             "recall",
             "remember",
-            "read_skill",
+            "get_skills",
             "browser",
             "spawn",
         ];
@@ -2613,8 +2617,8 @@ mod tests {
         assert_eq!(defs.len(), 1, "Proxy must return exactly 1 tool schema");
         assert_eq!(
             defs[0]["function"]["name"].as_str().unwrap(),
-            "tool",
-            "Proxy tool must be named 'tool'"
+            "get_tools",
+            "Proxy tool must be named 'get_tools'"
         );
 
         let props = &defs[0]["function"]["parameters"]["properties"];
@@ -2668,7 +2672,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("name".to_string(), serde_json::json!("read_file"));
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(result.ok, "Inspect should succeed: {:?}", result.error);
         assert!(
             result.data.contains("parameters"),
@@ -2690,7 +2694,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("name".to_string(), serde_json::json!("nonexistent"));
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(!result.ok, "Unknown tool inspect should fail");
         assert!(
             result.data.contains("read_file"),
@@ -2708,7 +2712,7 @@ mod tests {
         params.insert("name".to_string(), serde_json::json!("mock_tool"));
         params.insert("args".to_string(), serde_json::json!({"value": "hello"}));
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             result.ok,
             "Proxy dispatch should succeed: {:?}",
@@ -2724,7 +2728,7 @@ mod tests {
     // -----------------------------------------------------------------
     // Proxy parameter rename (2026-07-27) — `name`/`args` →
     // `tool_name`/`tool_args`. The old names overloaded with inner
-    // tool params (e.g. `read_skill` has its own `name`), causing
+    // tool params (e.g. `get_skills` has its own `name`), causing
     // small local models to collapse everything into `args` and omit
     // the top-level tool name. See live failure 2026-07-27 17:21
     // (session 20260727_173522_263450).
@@ -2732,7 +2736,7 @@ mod tests {
 
     /// The proxy schema MUST advertise `tool_name` (not `name`) as the
     /// parameter that selects the inner tool. The old `name` parameter
-    /// is reserved for the inner tool's own use (e.g. `read_skill(name)`).
+    /// is reserved for the inner tool's own use (e.g. `get_skills(name)`).
     #[test]
     fn proxy_schema_uses_tool_name_not_name() {
         let mut registry = ToolRegistry::new();
@@ -2772,7 +2776,7 @@ mod tests {
             serde_json::json!({"value": "via_tool_name"}),
         );
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             result.ok,
             "dispatch via tool_name/tool_args must succeed: {:?}",
@@ -2798,7 +2802,7 @@ mod tests {
         params.insert("name".to_string(), serde_json::json!("mock_tool"));
         params.insert("args".to_string(), serde_json::json!({"value": "legacy"}));
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             result.ok,
             "legacy name/args must still be accepted for back-compat: {:?}",
@@ -2823,7 +2827,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("url".to_string(), serde_json::json!("https://example.com"));
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             !result.ok,
             "flattened-form without tool selector must fail (not silently succeed)"
@@ -2859,7 +2863,7 @@ mod tests {
             }),
         );
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
 
         assert!(result.ok, "large complete proxy write failed: {result:?}");
         assert!(
@@ -2888,7 +2892,7 @@ mod tests {
             }),
         );
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
 
         assert!(!result.ok, "oversized state=more must be rejected");
         assert!(result.data.contains("state=\"more\""), "{}", result.data);
@@ -2925,7 +2929,7 @@ mod tests {
         params.insert("name".to_string(), serde_json::json!("recall"));
         params.insert("mode".to_string(), serde_json::json!("latest"));
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             result.ok,
             "Flattened proxy dispatch should succeed: {:?}",
@@ -2947,7 +2951,7 @@ mod tests {
         params.insert("name".to_string(), serde_json::json!("read_file"));
         params.insert("reason".to_string(), serde_json::json!("need schema first"));
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             result.ok,
             "Stray metadata should not dispatch tool: {:?}",
@@ -2978,7 +2982,7 @@ mod tests {
             serde_json::json!({"file_path": "/foo", "path": "/foo"}),
         );
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             result.ok,
             "Dispatch with alias should succeed: {:?}",
@@ -2993,13 +2997,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_missing_name_returns_tool_list() {
-        // No name → list mode (success). The prompt teaches "omit name to list"
+        // No name → list mode (success). The prompt teaches "omit tool_name to list"
         // so this MUST return a success with the catalog, not a failure error.
         // Returning a failure here was the bonsai confabulation trigger.
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("read_file")));
 
-        let result = registry.execute("tool", HashMap::new()).await;
+        let result = registry.execute("get_tools", HashMap::new()).await;
         assert!(
             result.ok,
             "Missing name should return success with tool list"
@@ -3023,7 +3027,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("url".to_string(), serde_json::json!("https://example.com"));
 
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             !result.ok,
             "Missing tool_name with stray params should be FAILURE, not success catalog: {}",
@@ -3047,7 +3051,7 @@ mod tests {
 
         // Case 2: Empty params (genuine discovery) → should still be SUCCESS with catalog.
         // This is the regression guard: the documented discovery path must work.
-        let result = registry.execute("tool", HashMap::new()).await;
+        let result = registry.execute("get_tools", HashMap::new()).await;
         assert!(
             result.ok,
             "Empty params should return success with tool list (discovery path)"
@@ -3071,7 +3075,7 @@ mod tests {
             "args".to_string(),
             serde_json::json!({"url": "https://example.com"}),
         );
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             !result.ok,
             "args without tool_name must fail, not return the catalog: {}",
@@ -3087,7 +3091,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("args".to_string(), serde_json::json!({}));
         params.insert("name".to_string(), serde_json::Value::Null);
-        let result = registry.execute("tool", params).await;
+        let result = registry.execute("get_tools", params).await;
         assert!(
             result.ok && result.data.contains("Available tools:"),
             "empty args/null name is a bare discovery call: {}",
@@ -3100,7 +3104,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("list_dir")));
 
-        // Call through the main execute() path with "tool" as the tool name
+        // Back-compat: the legacy "tool" alias must still dispatch to the proxy.
         let mut params = HashMap::new();
         params.insert("name".to_string(), serde_json::json!("list_dir"));
         params.insert("args".to_string(), serde_json::json!({"value": "test"}));
