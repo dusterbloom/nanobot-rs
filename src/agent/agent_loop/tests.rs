@@ -5793,4 +5793,92 @@ mod runtime_mode_parity_tests {
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
+
+    /// Regression for the 2026-07-30 incident: a recalled body must NOT re-enter
+    /// live context raw (a 172KB recall inflated a session to 77k tokens and
+    /// dropped the warm cache). The model runs a command whose output is huge
+    /// (stashed under its tool_call_id), then recalls it. The recalled result
+    /// persisted in the conversation must be bounded AND point at slice/search —
+    /// not the full body. This exercises the real tool-execution + shaping path
+    /// end-to-end (the unit test only covers `digest_tool_result`).
+    #[tokio::test]
+    async fn convergence_recall_of_oversized_body_stays_bounded() {
+        let mut exec_args = std::collections::HashMap::new();
+        // ~230KB of output — far over any in-context cap, guaranteed to stash.
+        exec_args.insert("command".to_string(), json!("seq 1 40000"));
+        let mut recall_args = std::collections::HashMap::new();
+        recall_args.insert("tool_call_id".to_string(), json!("tc_big"));
+
+        let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
+            "local-main",
+            vec![
+                crate::providers::base::LLMResponse {
+                    content: Some(String::new()),
+                    tool_calls: vec![crate::providers::base::ToolCallRequest {
+                        id: "tc_big".to_string(),
+                        name: "exec".to_string(),
+                        arguments: exec_args,
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: std::collections::HashMap::new(),
+                },
+                crate::providers::base::LLMResponse {
+                    content: Some(String::new()),
+                    tool_calls: vec![crate::providers::base::ToolCallRequest {
+                        id: "tc_recall".to_string(),
+                        name: "recall_tool_result".to_string(),
+                        arguments: recall_args,
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: std::collections::HashMap::new(),
+                },
+                crate::providers::base::LLMResponse {
+                    content: Some(attested_text("done")),
+                    tool_calls: vec![],
+                    finish_reason: "stop".to_string(),
+                    usage: std::collections::HashMap::new(),
+                },
+            ],
+        ));
+        let (agent_loop, workspace) = build_local_inline_harness(main);
+        let session_key = format!("conv-recall-bound-{}", uuid::Uuid::new_v4());
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent_loop.process_direct("run then recall", &session_key, "test", "offline"),
+        )
+        .await
+        .expect("recall e2e must terminate");
+
+        assert_eq!(response, "done");
+
+        // The recalled body persisted in the conversation must be bounded, not
+        // the raw ~230KB, and must direct the model at slice/search.
+        let core = agent_loop.shared.core_handle.swappable();
+        let meta = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .expect("session should exist");
+        let msgs = core.sessions.get_all_messages(&meta.id).await;
+        let recall_result = msgs
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_recall"))
+            .expect("recall tool result must be persisted");
+        let content = recall_result
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            content.chars().count() < 5000,
+            "recalled body must be bounded in context, got {} chars (regression of the 172KB blowup)",
+            content.chars().count()
+        );
+        assert!(
+            content.contains("slice_tool_result") || content.contains("search_tool_result"),
+            "recalled preview must point at slice/search, got: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
 }

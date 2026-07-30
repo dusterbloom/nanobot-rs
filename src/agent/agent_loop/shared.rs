@@ -295,6 +295,32 @@ fn advance_response_boundary(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Loop convergence bounds
+// ---------------------------------------------------------------------------
+//
+// These three constants govern the loop's termination guards. They INTERACT,
+// and the ordering invariant below MUST hold — editing one in isolation can
+// re-introduce a spin (2026-07-30 incident class). Co-located so the
+// relationship is auditable in one place; these are tuning constants, not
+// user config (no flag, no struct — see AGENTS.md "no configurability that
+// wasn't requested").
+//
+// Ordering invariant:
+//   NO_PROGRESS_HARD_STOP > LEASE_BLOCKS_BEFORE_STRIP
+//
+// The lease strip must arm BEFORE the hard stop forces a finish, so a model
+// that ignored "lease exhausted" receipts gets `NO_PROGRESS_HARD_STOP -
+// LEASE_BLOCKS_BEFORE_STRIP` tools-absent rounds to comply with the strip and
+// produce a final answer. If they were equal (or reversed) the hard stop would
+// fire before/during the strip, prematurely ending turns that could have
+// converged. `MAX_LEASE_RENEWAL_REJECTIONS` is independent (it bounds the
+// renewal-rejection path in response.rs, not the no-progress streak) but is
+// kept here for visibility.
+pub(crate) const LEASE_BLOCKS_BEFORE_STRIP: u32 = 2;
+pub(crate) const NO_PROGRESS_HARD_STOP: u32 = 4;
+pub(crate) const MAX_LEASE_RENEWAL_REJECTIONS: u32 = 2;
+
 /// Per-turn flow control flags.
 ///
 /// These are orthogonal fields (not a linear state machine):
@@ -865,7 +891,6 @@ impl AgentLoopShared {
                     // consecutive no-progress rounds: after the hard stop the loop
                     // forces a final answer regardless of the reason. This is the
                     // universal convergence invariant — without it the loop spins.
-                    const NO_PROGRESS_HARD_STOP: u32 = 4;
                     if ctx.flow.round_executed_no_tools {
                         ctx.flow.consecutive_no_progress_rounds = ctx
                             .flow
@@ -1228,7 +1253,6 @@ impl AgentLoopShared {
         // forces a text answer. The counter resets as soon as any tool
         // succeeds (renewal, new lease, etc.).
         let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx);
-        const LEASE_BLOCKS_BEFORE_STRIP: u32 = 2;
         // `lease_forced_text_only` is computed from the same counter the
         // strip below uses, and is honored by the router-passthrough
         // restore further down. Without this hand-off the strip is undone

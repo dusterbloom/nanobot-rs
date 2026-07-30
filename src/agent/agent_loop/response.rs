@@ -498,11 +498,13 @@ impl AgentLoopShared {
                         // can succeed — narrow, deterministic, visible. Bound
                         // it: a model that keeps emitting partial checkpoints
                         // gets only MAX_LEASE_RENEWAL_REJECTIONS nudges, then
-                        // the turn finishes with the text it produced.
-                        const MAX_LEASE_RENEWAL_REJECTIONS: u32 = 2;
+                        // the turn finishes with the text it produced. (The
+                        // constant lives with the other loop bounds in
+                        // agent_loop::shared — see its ordering invariant.)
                         ctx.flow.retries.lease_renewal_rejections =
                             ctx.flow.retries.lease_renewal_rejections.saturating_add(1);
-                        if ctx.flow.retries.lease_renewal_rejections > MAX_LEASE_RENEWAL_REJECTIONS
+                        if ctx.flow.retries.lease_renewal_rejections
+                            > super::shared::MAX_LEASE_RENEWAL_REJECTIONS
                         {
                             tracing::info!(
                                 session = %ctx.session_key,
