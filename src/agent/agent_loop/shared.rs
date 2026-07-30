@@ -2720,28 +2720,25 @@ impl AgentLoopShared {
             })
             .collect();
 
-        // Tool-lease enforcement. Each call is recorded against the
-        // per-turn lease; calls that exceed the lease budget OR the
-        // consecutive-same-coarse-family cap are NOT executed — they
-        // get a rejection receipt in their tool_call_id slot (preserves
-        // the wire contract) and the model sees a clear renewal prompt.
+        // Tool-lease enforcement. Each call is recorded against the per-turn
+        // lease; calls that exceed the lease budget are NOT executed — they
+        // get a rejection receipt in their tool_call_id slot (preserves the
+        // wire contract) and the model sees a clear renewal prompt.
         //
-        // Cache-safe by design: tool_defs are NOT modified, so the
-        // tool-block hash stays byte-stable across the entire turn and
-        // the prefix cache hits on every iteration.
-        let lease_cap = ctx.flow.lease.coarse_family_cap();
+        // Cache-safe by design: tool_defs are NOT modified at execution time
+        // (only the later sticky-strip path clears them), so the tool-block
+        // hash stays byte-stable across tool rounds and the prefix cache hits.
+        //
+        // There is no longer a consecutive-same-family cap (retired 2026-07-30
+        // — it over-fired on legitimate exploration and busted the cache).
+        // Identical-call loops are bounded by `ToolGuard`'s per-key counter.
         let mut allowed_calls: Vec<_> = Vec::with_capacity(routed_tool_calls.len());
         let mut blocked_calls: Vec<(String, String, &'static str)> = Vec::new();
         for tc in routed_tool_calls {
-            // `lease.record_tool_call_in_family` checks both the
-            // per-lease cap and the consecutive-same-family cap. We do
-            // NOT pre-check `is_exhausted` separately — record_* does
-            // the right thing and returns `lease_exhausted` as the
-            // reason when the budget is gone.
-            let result = ctx
-                .flow
-                .lease
-                .record_tool_call_in_family(&tc.name, &tc.arguments);
+            // `lease.record_tool_call` returns `lease_exhausted` when the
+            // per-lease budget is gone. We do NOT pre-check `is_exhausted`
+            // separately — record_tool_call is the single source of truth.
+            let result = ctx.flow.lease.record_tool_call();
             if result.allowed {
                 allowed_calls.push(tc);
             } else {
@@ -2759,24 +2756,14 @@ impl AgentLoopShared {
                 session = %ctx.session_key,
                 tool = %name,
                 reason,
-                cap = lease_cap,
                 "tool_lease_blocked_call"
             );
-            let msg = if *reason == "coarse_family_cap" {
-                format!(
-                    "lease cap: {name} was not executed — you have hit the \
-                     consecutive same-family limit ({lease_cap} calls). Switch \
-                     to a different tool/command family, or write a renewal \
-                     checkpoint (findings:/next:/will:) to continue."
-                )
-            } else {
-                format!(
-                    "lease exhausted: {name} was not executed — your per-turn \
-                     tool budget is used up. Write a renewal checkpoint \
-                     (findings:/next:/will:) to continue with more tools, or \
-                     write your final answer."
-                )
-            };
+            let msg = format!(
+                "lease exhausted: {name} was not executed — your per-turn \
+                 tool budget is used up. Write a renewal checkpoint \
+                 (findings:/next:/will:) to continue with more tools, or \
+                 write your final answer."
+            );
             ContextBuilder::add_tool_result_immutable_with_status(
                 &mut ctx.messages,
                 id,

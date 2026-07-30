@@ -5763,10 +5763,12 @@ mod runtime_mode_parity_tests {
     #[tokio::test]
     async fn convergence_loop_terminates_via_sticky_strip_when_model_loops() {
         let provider = Arc::new(LoopingProvider::new("local-main"));
-        // max_iterations must exceed the coarse-family cap (6) so the cap can
-        // fire before the bare iteration limit does.
+        // max_iterations must exceed the per-lease budget (DEFAULT_TOOLS_PER_LEASE
+        // = 12) so the lease can exhaust and arm the sticky strip before the
+        // bare iteration limit stops the loop. (The coarse-family cap that
+        // used to fire at 6 was retired 2026-07-30.)
         let (agent_loop, workspace) =
-            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 12);
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
         let session_key = format!("conv-sticky-strip-{}", uuid::Uuid::new_v4());
 
         let response = tokio::time::timeout(
@@ -5783,7 +5785,7 @@ mod runtime_mode_parity_tests {
         assert!(
             provider.saw_tools_absent(),
             "loop never observed a tools-absent call — the sticky strip (Fix A1) did not fire. \
-             Either the family cap wasn't reached or the router restored tools (regression)."
+             Either the lease never exhausted or the router restored tools (regression)."
         );
         let calls = provider.call_count();
         assert!(
@@ -5794,8 +5796,107 @@ mod runtime_mode_parity_tests {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
-    /// Regression for the 2026-07-30 incident: a recalled body must NOT re-enter
-    /// live context raw (a 172KB recall inflated a session to 77k tokens and
+    /// Positive counterpart to the convergence test: legitimate bounded
+    /// exploration — 8 distinct same-family (read) calls, the exact pattern the
+    /// retired coarse-family cap used to block at 6 — must complete normally
+    /// with the model's own answer, WITHOUT arming the sticky strip or any loop
+    /// guard. Under the OLD cap the 7th call would be blocked and the sticky
+    /// strip would fire a tools-absent request, so this asserts tools were
+    /// present on EVERY call (no strip) and the turn reaches the model's answer.
+    #[tokio::test]
+    async fn convergence_legitimate_exploration_completes_without_guard() {
+        // A sequence provider that ALSO records whether any call observed
+        // `tools == None` (the sticky-strip signal). Without this, a blind
+        // sequence dequeue would pass even if the 7th call were capped.
+        struct ExploringProvider {
+            responses: parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
+            calls: std::sync::atomic::AtomicU32,
+            saw_tools_absent: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl LLMProvider for ExploringProvider {
+            async fn chat(
+                &self,
+                _messages: &[Value],
+                tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+                _thinking_budget: Option<u32>,
+                _top_p: Option<f64>,
+            ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if tools.is_none() {
+                    self.saw_tools_absent
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(self.responses.lock().pop_front().unwrap_or_else(|| {
+                    crate::providers::base::LLMResponse {
+                        content: Some("ERROR: exploration sequence exhausted".to_string()),
+                        tool_calls: vec![],
+                        finish_reason: "stop".to_string(),
+                        usage: std::collections::HashMap::new(),
+                    }
+                }))
+            }
+            fn get_default_model(&self) -> &str {
+                "local-main"
+            }
+        }
+
+        let mut seq: Vec<crate::providers::base::LLMResponse> = (0..8)
+            .map(|n| {
+                let mut a = std::collections::HashMap::new();
+                a.insert("path".to_string(), json!(format!("dir{n}")));
+                crate::providers::base::LLMResponse {
+                    content: Some(String::new()),
+                    tool_calls: vec![crate::providers::base::ToolCallRequest {
+                        id: format!("tc_ex_{n}"),
+                        name: "list_dir".to_string(),
+                        arguments: a,
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: std::collections::HashMap::new(),
+                }
+            })
+            .collect();
+        seq.push(crate::providers::base::LLMResponse {
+            content: Some(attested_text("done exploring")),
+            tool_calls: vec![],
+            finish_reason: "stop".to_string(),
+            usage: std::collections::HashMap::new(),
+        });
+        let provider = Arc::new(ExploringProvider {
+            responses: parking_lot::Mutex::new(seq.into()),
+            calls: std::sync::atomic::AtomicU32::new(0),
+            saw_tools_absent: std::sync::atomic::AtomicBool::new(false),
+        });
+        // max_iterations well above 8 so the only way this fails to reach the
+        // final answer is if a guard (lease/cap/strip) interrupts exploration.
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
+        let session_key = format!("conv-explore-{}", uuid::Uuid::new_v4());
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent_loop.process_direct("explore these dirs", &session_key, "test", "offline"),
+        )
+        .await
+        .expect("exploration must terminate");
+
+        assert_eq!(
+            response, "done exploring",
+            "8 distinct exploration calls must complete with the model's answer, not a guard"
+        );
+        assert!(
+            !provider.saw_tools_absent.load(std::sync::atomic::Ordering::Relaxed),
+            "tools were stripped during exploration — a loop guard fired (regression of the family-cap retirement)"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+
     /// dropped the warm cache). The model runs a command whose output is huge
     /// (stashed under its tool_call_id), then recalls it. The recalled result
     /// persisted in the conversation must be bounded AND point at slice/search —

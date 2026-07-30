@@ -5,12 +5,13 @@
 //! Each user turn starts with a tool lease of `TOOLS_PER_LEASE` tool
 //! iterations. After exhaustion, tool definitions are stripped from the
 //! request: the model must produce a final text answer OR emit a renewal
-//! checkpoint (findings + remaining question + next bounded actions). The
-//! design makes the live 13-call `exec grep` loop (session
-//! `20260727_161730_6e61a0`, 2026-07-27 16:19-16:21) structurally
-//! impossible.
+//! checkpoint (findings + remaining question + next bounded actions). Together
+//! with `ToolGuard`'s per-key identical-call counter (which bounds the live
+//! 13-call identical-`exec grep` loop, session `20260727_161730_6e61a0`) and
+//! the no-progress hard stop, this makes runaway tool loops structurally
+//! impossible without a coarse-family cap (retired 2026-07-30 — it over-fired
+//! on legitimate exploration and busted the prefix cache).
 
-use serde_json::Value;
 
 /// Default per-lease tool budget. Tuned for coding tasks where the
 /// model needs to read multiple files, run searches, and exec commands
@@ -25,110 +26,8 @@ pub const DEFAULT_TOOLS_PER_LEASE: u32 = 12;
 /// validated checkpoint.
 pub const DEFAULT_MAX_LEASES_PER_TURN: u32 = 3;
 
-/// Default cap on consecutive same-coarse-family tool calls within a
-/// lease. Six calls to `exec:grep` is fine; the seventh is blocked.
-/// The original 3 was too tight for legitimate file exploration
-/// (reading 4+ files in a row). 6 prevents the 13-call loop while
-/// allowing reasonable exploration.
-pub const DEFAULT_COARSE_FAMILY_CAP: u32 = 6;
-
-/// Read-only exec commands (by leading word). Writes and unknown
-/// commands are treated as their own family — `exec:write` or
-/// `exec:other`. Read-only classification is deliberately narrow so the
-/// coarse-family cap cannot let a write slip past as a "read".
-const READONLY_EXEC_FIRST_WORDS: &[&str] = &[
-    "grep", "rg", "find", "ls", "cat", "head", "tail", "wc", "which", "file", "stat",
-    "tree",
-    // `git <subcommand>` is read-only only for these subcommands. Bare
-    // `git` (e.g. `git add`, `git commit`) is a write.
-];
-
-/// `git` read-only subcommands. Matched when the command starts with
-/// `git <sub>`.
-const READONLY_GIT_SUBCOMMANDS: &[&str] = &[
-    "status",
-    "log",
-    "diff",
-    "show",
-    "blame",
-    "ls-files",
-    "rev-parse",
-];
-
-/// Coarse family of a tool call. Used by the consecutive-cap enforcer.
-///
-/// The family string is intentionally human-readable (logged and visible
-/// to the model in receipts) so debugging is straightforward.
-///
-/// `exec` is classified by first word of the command (`exec:grep`,
-/// `exec:find`, `exec:git`), so the cap distinguishes "3 greps then a
-/// find" (allowed — different commands, the model is exploring) from
-/// "4 greps" (blocked — the live 13×grep failure pattern). The
-/// `git` subcommand is part of the family only when ambiguous on the
-/// first word — e.g. `git status` and `git log` are both `exec:git`
-/// (the model switching subcommands under one binary is the loop shape
-/// we cap).
-pub fn coarse_family(tool_name: &str, args: &std::collections::HashMap<String, Value>) -> String {
-    match tool_name {
-        "exec" => {
-            let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            exec_coarse_family(command)
-        }
-        "read_file" | "list_dir" | "find_files" | "search_files" | "recall" | "get_skills" => {
-            "read".to_string()
-        }
-        "web_search" | "web_fetch" => "web".to_string(),
-        _ => format!("tool:{tool_name}"),
-    }
-}
-
-/// Classify an exec command into a coarse family by first word.
-///
-/// The family is `exec:{first_word}` (e.g. `exec:grep`, `exec:git`,
-/// `exec:npm`). The first word is the actual binary being invoked, so
-/// `grep` and `find` are different families — switching from one to the
-/// other is genuine exploration, not loop repetition. Trailing `&` is
-/// stripped so backgrounded commands cluster with their foreground
-/// equivalents.
-fn exec_coarse_family(command: &str) -> String {
-    let trimmed = command.trim();
-    let first_word = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('&');
-    if first_word.is_empty() {
-        return "exec:other".to_string();
-    }
-    format!("exec:{first_word}")
-}
-
-/// True iff the exec command is read-only (no filesystem mutation).
-/// Used by the future A3 readonly-exec result cache. Distinct from
-/// `coarse_family` — the cap treats `exec:grep` and `exec:find` as
-/// different families, but BOTH are readonly for caching purposes.
-#[allow(dead_code)]
-pub fn is_readonly_exec(command: &str) -> bool {
-    let trimmed = command.trim();
-    let first_word = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('&');
-    if READONLY_EXEC_FIRST_WORDS.contains(&first_word) {
-        return true;
-    }
-    if first_word == "git" {
-        let sub = trimmed
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("")
-            .trim_end_matches('&');
-        return READONLY_GIT_SUBCOMMANDS.contains(&sub);
-    }
-    false
-}
-
+// ---------------------------------------------------------------------------
+// Lease state machine
 // ---------------------------------------------------------------------------
 // Lease state machine
 // ---------------------------------------------------------------------------
@@ -148,17 +47,11 @@ pub struct Lease {
     max_renewals: u32,
     iterations_used: u32,
     renewals_used: u32,
-    /// Coarse family of the most recent tool call, with its consecutive
-    /// count. Reset on a different family, on renewal, or when the cap
-    /// blocks a call (so the model can switch family on the next call).
-    last_family: Option<String>,
-    consecutive_same_family: u32,
-    coarse_family_cap: u32,
 }
 
-/// Outcome of `record_tool_call_in_family`. The `reason` is a stable
-/// machine-readable code (`lease_exhausted`, `coarse_family_cap`) so
-/// callers can route receipts without parsing prose.
+/// Outcome of `record_tool_call`. The `reason` is a stable machine-readable
+/// code (`lease_exhausted`) so callers can route receipts without parsing
+/// prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallResult {
     pub allowed: bool,
@@ -242,35 +135,24 @@ impl Lease {
             max_renewals,
             iterations_used: 0,
             renewals_used: 0,
-            last_family: None,
-            consecutive_same_family: 0,
-            coarse_family_cap: DEFAULT_COARSE_FAMILY_CAP,
         }
     }
 
-    /// Record a tool call with coarse-family tracking. Returns whether
-    /// the call was allowed plus the rejection reason if not. A blocked
-    /// call does NOT consume the per-lease budget — the model is told
-    /// it hit the cap and is expected to switch family or checkpoint.
-    pub fn record_tool_call_in_family(
-        &mut self,
-        tool_name: &str,
-        args: &std::collections::HashMap<String, Value>,
-    ) -> ToolCallResult {
+    /// Record one tool call against the per-lease budget. Returns whether the
+    /// call is allowed; once `lease_size` calls have been used this returns
+    /// `lease_exhausted` and the caller must strip tool_defs so the model
+    /// produces a final answer or a renewal checkpoint.
+    ///
+    /// There is NO consecutive-same-family cap anymore: it over-fired on
+    /// legitimate exploration (N different greps) and busted the prompt-prefix
+    /// cache when it triggered a strip (2026-07-30). Identical-call loops are
+    /// bounded by `ToolGuard`'s per-key `seen` counter (tool_guard.rs, applies
+    /// to all tools); different-args exploration is bounded by this per-lease
+    /// budget plus the no-progress hard stop. See
+    /// docs/superpowers/plans/2026-07-30-reuse-not-rerun-tool-dedup.md.
+    pub fn record_tool_call(&mut self) -> ToolCallResult {
         if self.iterations_used >= self.lease_size {
             return ToolCallResult::blocked("lease_exhausted");
-        }
-        let family = coarse_family(tool_name, args);
-        if family == self.last_family.as_deref().unwrap_or("")
-            && self.consecutive_same_family >= self.coarse_family_cap
-        {
-            return ToolCallResult::blocked("coarse_family_cap");
-        }
-        if Some(&family) == self.last_family.as_ref() {
-            self.consecutive_same_family += 1;
-        } else {
-            self.last_family = Some(family);
-            self.consecutive_same_family = 1;
         }
         self.iterations_used += 1;
         ToolCallResult::allowed()
@@ -288,13 +170,6 @@ impl Lease {
     /// can tell the model exactly how many calls it has after renewal.
     pub fn lease_size(&self) -> u32 {
         self.lease_size
-    }
-
-    /// Coarse-family cap (consecutive same-family calls allowed within
-    /// a lease). Exposed for logging/receipts — modification is via
-    /// `new()` defaults only for now.
-    pub fn coarse_family_cap(&self) -> u32 {
-        self.coarse_family_cap
     }
 
     /// Try to renew the lease with a model-emitted checkpoint. The
@@ -335,8 +210,6 @@ impl Lease {
         }
         self.renewals_used += 1;
         self.iterations_used = 0;
-        self.last_family = None;
-        self.consecutive_same_family = 0;
         RenewalResult::accepted()
     }
 
@@ -359,136 +232,19 @@ impl Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use Value;
 
-    fn args(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
-            .collect()
-    }
-
-    /// Advance the lease by one call via the live family-tracking API, used by
-    /// the state-machine tests below to exercise exhaustion/renewal/progress in
-    /// isolation. The bare `record_tool_call` overload was removed; there is now
-    /// one way to record a call.
+    /// Advance the lease by one call. Used by the state-machine tests below to
+    /// exercise exhaustion/renewal/progress in isolation.
     fn tick(lease: &mut Lease) -> bool {
-        lease
-            .record_tool_call_in_family("read_file", &HashMap::new())
-            .allowed
+        lease.record_tool_call().allowed
     }
 
     // -----------------------------------------------------------------
     // RED tests — write first, watch fail, then GREEN each
     // -----------------------------------------------------------------
 
-    /// The live failure was 13 `exec grep` calls. The cap keys on
-    /// `exec:{first_word}`, so all `grep` invocations cluster as
-    /// `exec:grep` (regardless of args). `find`, `rg`, `cat` are
-    /// separate families — switching between them is genuine
-    /// exploration, not loop repetition.
-    #[test]
-    fn coarse_family_classifies_exec_grep_as_distinct_per_first_word() {
-        let g = coarse_family("exec", &args(&[("command", "grep pattern path")]));
-        let r = coarse_family("exec", &args(&[("command", "rg pattern path")]));
-        let f = coarse_family("exec", &args(&[("command", "find . -name x")]));
-        let l = coarse_family("exec", &args(&[("command", "ls -la")]));
-        let c = coarse_family("exec", &args(&[("command", "cat file.txt")]));
-        assert_eq!(g, "exec:grep", "grep must be exec:grep");
-        assert_eq!(r, "exec:rg", "rg must be exec:rg");
-        assert_eq!(f, "exec:find", "find must be exec:find");
-        assert_eq!(l, "exec:ls", "ls must be exec:ls");
-        assert_eq!(c, "exec:cat", "cat must be exec:cat");
-        // All distinct — switching between them does NOT count as
-        // repetition. The live loop was 13× THE SAME grep, which
-        // the cap fires on.
-        let families = [g, r, f, l, c];
-        let unique: std::collections::HashSet<_> = families.iter().collect();
-        assert_eq!(
-            families.len(),
-            unique.len(),
-            "all five must be distinct families"
-        );
-    }
-
-    /// Writes (`rm`, `mv`, `git add`, `npm install`) classify by first
-    /// word just like reads — there is no read/write split in the
-    /// coarse family. A write after three reads is NOT blocked (different
-    /// family); a write after three of THE SAME write IS blocked.
-    #[test]
-    fn coarse_family_distinguishes_readonly_exec_from_write() {
-        let rm = coarse_family("exec", &args(&[("command", "rm file")]));
-        let grep = coarse_family("exec", &args(&[("command", "grep x y")]));
-        assert_eq!(rm, "exec:rm");
-        assert_eq!(grep, "exec:grep");
-        assert_ne!(rm, grep, "rm and grep must be different families");
-        // `is_readonly_exec` is the separate concern (for A3 caching),
-        // NOT the coarse family — different functions, different layers.
-        assert!(!is_readonly_exec("rm file"));
-        assert!(is_readonly_exec("grep x y"));
-    }
-
-    /// `git status`, `git log`, `git diff` are common read-only
-    /// inspections via `is_readonly_exec`. They classify as `exec:git`
-    /// for coarse-family purposes (one family per binary), but the
-    /// readonly check distinguishes them from `git add` / `git commit`.
-    #[test]
-    fn coarse_family_git_subcommands_classified_correctly() {
-        // Coarse family — all `git …` are `exec:git` (the model
-        // switching subcommands under one binary is the loop shape we
-        // cap; if the model runs `git status` three times in a row the
-        // cap fires correctly).
-        let status = coarse_family("exec", &args(&[("command", "git status")]));
-        let log = coarse_family("exec", &args(&[("command", "git log --oneline")]));
-        let add = coarse_family("exec", &args(&[("command", "git add file")]));
-        assert_eq!(status, "exec:git");
-        assert_eq!(log, "exec:git");
-        assert_eq!(add, "exec:git");
-
-        // Readonly check — distinguishes read subcommands from writes.
-        assert!(is_readonly_exec("git status"));
-        assert!(is_readonly_exec("git log --oneline"));
-        assert!(is_readonly_exec("git diff HEAD~1"));
-        assert!(!is_readonly_exec("git add file"));
-        assert!(!is_readonly_exec("git commit -m x"));
-    }
-
-    /// Non-exec read tools all share the `read` family so the cap
-    /// catches back-to-back `read_file`/`list_dir`/`recall` cycles too.
-    #[test]
-    fn coarse_family_clusters_non_exec_read_tools() {
-        for tool in [
-            "read_file",
-            "list_dir",
-            "find_files",
-            "recall",
-            "get_skills",
-        ] {
-            assert_eq!(
-                coarse_family(tool, &HashMap::new()),
-                "read",
-                "{tool} should be in the 'read' family"
-            );
-        }
-    }
-
-    /// Write tools (`write_file`, `edit_file`, `apply_patch`) each get
-    /// their own family so they don't share a cap with reads. The
-    /// generic fallback is `tool:<name>` so every tool has a family.
-    #[test]
-    fn coarse_family_write_tools_get_own_family() {
-        let w = coarse_family("write_file", &HashMap::new());
-        let e = coarse_family("edit_file", &HashMap::new());
-        let a = coarse_family("apply_patch", &HashMap::new());
-        assert_eq!(w, "tool:write_file");
-        assert_eq!(e, "tool:edit_file");
-        assert_eq!(a, "tool:apply_patch");
-        assert_ne!(w, e);
-    }
-
     // -----------------------------------------------------------------
-    // Lease state machine — these go RED until the `Lease` struct exists.
+    // Lease state machine
     // -----------------------------------------------------------------
 
     /// A fresh lease allows `lease_size` tool iterations. The
@@ -664,37 +420,30 @@ mod tests {
         assert!(valid_result.was_attempted());
     }
 
-    /// Within a lease, the coarse-family cap blocks the 4th consecutive
-    /// same-family call. A different family is still allowed.
+    /// There is NO consecutive-same-family cap anymore (retired 2026-07-30 — it
+    /// over-fired on legitimate exploration like N different greps and busted
+    /// the prompt-prefix cache). The lease now bounds only by `lease_size`;
+    /// identical-call loops are bounded by `ToolGuard`'s per-key counter. So
+    /// many calls up to `lease_size` are all allowed regardless of family, and
+    /// the only block reason is `lease_exhausted`.
     #[test]
-    fn coarse_family_cap_blocks_excessive_consecutive_grep() {
-        let mut lease = Lease::new(20, 2);
-        let grep_args = args(&[("command", "grep pattern path")]);
-        let find_args = args(&[("command", "find . -name x")]);
-
-        // Six consecutive `exec:grep` calls are allowed (cap = 6).
-        for _ in 0..6 {
+    fn record_tool_call_allows_up_to_lease_size_with_no_family_cap() {
+        let mut lease = Lease::new(5, 2);
+        // Five calls — all allowed, no matter how "same-family" they'd be.
+        for _ in 0..5 {
             assert!(
-                lease.record_tool_call_in_family("exec", &grep_args).allowed,
-                "calls within cap must be allowed"
+                lease.record_tool_call().allowed,
+                "calls within lease_size must be allowed (no family cap)"
             );
         }
-
-        // The 7th same-family call is blocked.
-        let blocked = lease.record_tool_call_in_family("exec", &grep_args);
-        assert!(
-            !blocked.allowed,
-            "7th consecutive exec:grep must be blocked by the cap"
-        );
+        // The 6th exhausts the lease — that is the only block path now.
+        let blocked = lease.record_tool_call();
+        assert!(!blocked.allowed, "lease_size+1 must be blocked by exhaustion");
         assert_eq!(
             blocked.reason,
-            Some("coarse_family_cap"),
-            "blocked reason must name the cap"
+            Some("lease_exhausted"),
+            "the only block reason is lease_exhausted; no coarse_family_cap"
         );
-
-        // A different family is still allowed within the same lease.
-        let allowed = lease.record_tool_call_in_family("exec", &find_args);
-        assert!(allowed.allowed, "different family must still be allowed");
     }
 
     /// Tool results include the progress signal
