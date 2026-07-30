@@ -335,6 +335,29 @@ pub struct SessionDb {
     path: PathBuf,
 }
 
+/// Outcome of [`SessionDb::store_tool_result_immutable`]. The tool-result
+/// stash is keyed by `(session_id, tool_call_id)` and, under the
+/// "handles-not-bodies" invariant, a prompt handle references the body by
+/// digest. A silent overwrite would make that handle lie (point at different
+/// bytes than its `sha256` claims), so storage is IMMUTABLE: identical retries
+/// are accepted; conflicting bytes are rejected; SQLite failures surface
+/// explicitly so the caller can fail the turn rather than show a raw body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredResult {
+    /// Newly stored this call.
+    Stored { digest: String },
+    /// Key already present with byte-identical content (idempotent retry).
+    Identical { digest: String },
+    /// Key already present with DIFFERENT bytes — the body is ambiguous and a
+    /// handle MUST NOT be emitted for it. The caller surfaces this.
+    Conflict {
+        existing_digest: String,
+        attempted_digest: String,
+    },
+    /// SQLite failure (disk full, locked, etc.). The caller must fail the turn.
+    Failed,
+}
+
 impl SessionDb {
     /// Open (or create) the database at `db_path`.
     ///
@@ -994,6 +1017,97 @@ impl SessionDb {
             |row| row.get(0),
         )
         .ok()
+    }
+
+    /// Store a tool result IMMUTABLY: never overwrite an existing
+    /// `(session_id, tool_call_id)` row. Returns a [`StoredResult`] so the
+    /// caller can prove the stash exists (and matches) before emitting a
+    /// handle that references it. This is the durability foundation for the
+    /// "handles-not-bodies" invariant — see
+    /// docs/superpowers/plans/2026-07-30-tool-result-handles-not-bodies.md.
+    ///
+    /// Atomic in practice: the connection is held under the SessionDb Mutex
+    /// across the INSERT-OR-IGNORE and the read-back, so no other writer can
+    /// interleave on this connection.
+    pub async fn store_tool_result_immutable(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        content: &str,
+    ) -> StoredResult {
+        let attempted_digest = sha256_hex(content.as_bytes());
+        let mut conn = self.conn.lock().await;
+        // Real transaction (BEGIN…COMMIT) so the insert+read-back is atomic
+        // ACROSS connections — recall_tool_result and subagents open their own
+        // SessionDb on the same file, and autocommit INSERT+SELECT would race
+        // with them. The transaction's write lock is acquired by the INSERT,
+        // so no other writer can interleave before COMMIT.
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(error) => {
+                warn!(
+                    "Failed to begin tool-result store tx session={} call={}: {}",
+                    session_id, tool_call_id, error
+                );
+                return StoredResult::Failed;
+            }
+        };
+        // INSERT OR IGNORE: never overwrite. rows_affected == 1 means newly
+        // inserted; 0 means the key already existed.
+        let inserted_rows = match tx.execute(
+            "INSERT OR IGNORE INTO tool_results \
+             (session_id, tool_call_id, tool_name, content, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, tool_call_id, tool_name, content, Utc::now().to_rfc3339()],
+        ) {
+            Ok(n) => n,
+            Err(error) => {
+                warn!(
+                    "Failed to persist tool result (immutable) session={} call={}: {}",
+                    session_id, tool_call_id, error
+                );
+                return StoredResult::Failed;
+            }
+        };
+        // Read back what is now stored under the key (either what we just wrote
+        // or the pre-existing bytes) — same transaction, no interleave.
+        let stored_content: String = match tx.query_row(
+            "SELECT content FROM tool_results WHERE session_id = ?1 AND tool_call_id = ?2",
+            params![session_id, tool_call_id],
+            |row| row.get(0),
+        ) {
+            Ok(c) => c,
+            Err(error) => {
+                warn!(
+                    "Stored row vanished after insert session={} call={}: {}",
+                    session_id, tool_call_id, error
+                );
+                return StoredResult::Failed;
+            }
+        };
+        if let Err(error) = tx.commit() {
+            warn!(
+                "Failed to commit tool-result store tx session={} call={}: {}",
+                session_id, tool_call_id, error
+            );
+            return StoredResult::Failed;
+        }
+        let existing_digest = sha256_hex(stored_content.as_bytes());
+        if inserted_rows == 1 {
+            StoredResult::Stored {
+                digest: existing_digest,
+            }
+        } else if existing_digest == attempted_digest {
+            StoredResult::Identical {
+                digest: existing_digest,
+            }
+        } else {
+            StoredResult::Conflict {
+                existing_digest,
+                attempted_digest,
+            }
+        }
     }
 
     /// Append a `role: "clear"` marker to `session_id`.
@@ -2516,6 +2630,60 @@ mod tests {
             Some("full exact body".to_string())
         );
         assert_eq!(reopened.path(), db_path.as_path());
+    }
+
+    #[tokio::test]
+    async fn immutable_store_returns_stored_then_identical_then_conflict() {
+        let (db, _dir) = make_db();
+        let session = db.create_session("cli:immutable").await;
+
+        // First write: newly stored, with a real digest.
+        let first = db
+            .store_tool_result_immutable(&session.id, "call_x", "exec", "body bytes v1")
+            .await;
+        let digest = match first {
+            StoredResult::Stored { digest } => digest,
+            other => panic!("first store must be Stored, got {other:?}"),
+        };
+        assert!(!digest.is_empty());
+
+        // Second write with IDENTICAL bytes: idempotent — Identical, same digest.
+        let again = db
+            .store_tool_result_immutable(&session.id, "call_x", "exec", "body bytes v1")
+            .await;
+        match again {
+            StoredResult::Identical { digest: d } => assert_eq!(d, digest),
+            other => panic!("identical retry must be Identical, got {other:?}"),
+        }
+
+        // The body actually stored is still the ORIGINAL — never overwritten.
+        assert_eq!(
+            db.load_tool_result(&session.id, "call_x").await,
+            Some("body bytes v1".to_string()),
+            "immutable store must never overwrite"
+        );
+
+        // Third write with DIFFERENT bytes under the same key: Conflict.
+        let conflict = db
+            .store_tool_result_immutable(&session.id, "call_x", "exec", "body bytes v2")
+            .await;
+        match conflict {
+            StoredResult::Conflict {
+                existing_digest,
+                attempted_digest,
+            } => {
+                assert_eq!(existing_digest, digest, "existing must be the original v1");
+                assert_ne!(attempted_digest, digest, "attempted must be the v2 digest");
+            }
+            other => panic!("different bytes must Conflict, got {other:?}"),
+        }
+
+        // Still never overwritten — the conflicting write was rejected.
+        assert_eq!(
+            db.load_tool_result(&session.id, "call_x").await,
+            Some("body bytes v1".to_string()),
+            "a conflicting write must not replace the stored body"
+        );
     }
 
     #[tokio::test]
