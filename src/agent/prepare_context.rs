@@ -621,6 +621,7 @@ impl AgentLoopShared {
                 iterations_since_compaction: 0,
                 content_was_streamed: false,
                 consecutive_all_blocked: 0,
+                consecutive_no_progress_rounds: 0,
                 round_executed_no_tools: false,
                 lease: crate::agent::lease::Lease::new(
                     crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,

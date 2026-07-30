@@ -75,6 +75,19 @@ pub(crate) struct RetryState {
     pub(crate) rescue_attempted: bool,
     /// One-shot: agent-level retry for transient LLM errors (per iteration).
     pub(crate) api_retried: bool,
+    /// One-shot: already retried a phantom-tool-claim text response by
+    /// looping back to PreCall with tools attached. Bounded to one extra
+    /// provider call; a second phantom finishes via the annotation path
+    /// in `finalize_response`.
+    pub(crate) phantom_claim_retried: bool,
+    /// Consecutive lease-renewal rejections (the model emitted a PARTIAL
+    /// checkpoint — some labels, missing a field — and was nudged what to
+    /// add). Without a cap a small model that keeps emitting partial
+    /// checkpoints loops forever: each rejection returns to PreCall, which
+    /// advances neither `max_iterations` nor the no-progress counter. After
+    /// `MAX_LEASE_RENEWAL_REJECTIONS` the turn finishes with whatever text
+    /// the model produced — renewal is a privilege, not a right.
+    pub(crate) lease_renewal_rejections: u32,
 }
 
 impl RetryState {
@@ -85,6 +98,8 @@ impl RetryState {
             empty_think_retried: false,
             rescue_attempted: false,
             api_retried: false,
+            phantom_claim_retried: false,
+            lease_renewal_rejections: 0,
         }
     }
 }
@@ -457,6 +472,13 @@ impl AgentLoopShared {
                             renewals_used = ctx.flow.lease.renewals_used(),
                             "tool_lease_renewed"
                         );
+                        // The lease is live again — clear the ignored-receipt
+                        // streak. step_pre_call strips tools at
+                        // `LEASE_BLOCKS_BEFORE_STRIP`; without this reset it
+                        // would re-strip on the next iteration and instantly
+                        // undo the renewal.
+                        ctx.flow.consecutive_lease_blocks = 0;
+                        ctx.flow.retries.lease_renewal_rejections = 0;
                         // Nudge the model so it knows tools are available
                         // again. Without this, a small local model may
                         // emit another text answer instead of tool calls
@@ -468,31 +490,103 @@ impl AgentLoopShared {
                                 ctx.flow.lease.lease_size()
                             )));
                         return StepResult::Next(IterationPhase::PreCall);
-                    } else if !renewal.missing_field().is_empty()
+                    } else if renewal.was_attempted()
                         && renewal.missing_field() != "out_of_leases"
                     {
                         // Renewal attempted but missing a field. Tell the
                         // model exactly what's missing so the next attempt
-                        // can succeed — narrow, deterministic, visible.
+                        // can succeed — narrow, deterministic, visible. Bound
+                        // it: a model that keeps emitting partial checkpoints
+                        // gets only MAX_LEASE_RENEWAL_REJECTIONS nudges, then
+                        // the turn finishes with the text it produced.
+                        const MAX_LEASE_RENEWAL_REJECTIONS: u32 = 2;
+                        ctx.flow.retries.lease_renewal_rejections =
+                            ctx.flow.retries.lease_renewal_rejections.saturating_add(1);
+                        if ctx.flow.retries.lease_renewal_rejections > MAX_LEASE_RENEWAL_REJECTIONS
+                        {
+                            tracing::info!(
+                                session = %ctx.session_key,
+                                rejections = ctx.flow.retries.lease_renewal_rejections,
+                                "tool_lease_renewal_rejection_cap_reached — finishing turn with model text"
+                            );
+                            // Fall through to finish: the model's text is its answer.
+                        } else {
+                            tracing::info!(
+                                session = %ctx.session_key,
+                                missing = renewal.missing_field(),
+                                rejection = ctx.flow.retries.lease_renewal_rejections,
+                                "tool_lease_renewal_rejected"
+                            );
+                            ctx.messages
+                                .push(crate::agent::markers::scaffold_user(format!(
+                                    "[Lease renewal rejected — your checkpoint is missing \
+                                     '{}'. Either include all of findings:/next:/will: to \
+                                     renew, or write your final answer.]",
+                                    renewal.missing_field()
+                                )));
+                            return StepResult::Next(IterationPhase::PreCall);
+                        }
+                    }
+                    // Fall through: either out_of_leases, the renewal-rejection
+                    // cap was reached, or the model wrote plain text with no
+                    // checkpoint labels (try_renew returned not_attempted). All
+                    // mean "finish the turn" — log only a genuine out_of_leases,
+                    // not the cap/not_attempted cases it would otherwise mask.
+                    if renewal.was_attempted() && renewal.missing_field() == "out_of_leases" {
                         tracing::info!(
                             session = %ctx.session_key,
-                            missing = renewal.missing_field(),
-                            "tool_lease_renewal_rejected"
+                            "tool_lease_renewal_out_of_leases"
+                        );
+                    }
+                }
+                // One-shot phantom-claim retry. Local models sometimes
+                // narrate a tool action as prose ("here's what I found",
+                // "let me read ...") instead of emitting a tool_call, then
+                // end the turn having done zero useful work. Give the model
+                // exactly one chance to correct while tools are still
+                // attached. Bounded — not a loop.
+                //
+                // The structural gates (no tools ran + tools advertised +
+                // lease live + local/provenance) define WHEN a phantom is
+                // possible; the phrase-list detector (`detect_phantom_claims`)
+                // is the content discriminator that says the text actually
+                // claimed a tool action. Both are required — the structural
+                // signal alone fires on every normal text answer, which is
+                // why `plain_text_response_is_final_answer` exists.
+                //
+                // The lease guard (`!lease.is_exhausted()`) is what keeps
+                // this retry from fighting the lease: a lease-forced
+                // text-only call MUST finish, never be retried with tools
+                // it cannot have.
+                let tools_this_turn: Vec<String> = ctx.used_tools.iter().cloned().collect();
+                if !ctx.flow.retries.phantom_claim_retried
+                    && tools_this_turn.is_empty()
+                    && ctx
+                        .advertised_tool_names
+                        .as_ref()
+                        .map_or(false, |s| !s.is_empty())
+                    && !ctx.flow.lease.is_exhausted()
+                    && ctx.core.provenance_config.enabled
+                    && ctx.core.mode().is_local()
+                {
+                    if let Some(detection) =
+                        crate::agent::provenance::detect_phantom_claims(&content, &tools_this_turn)
+                    {
+                        ctx.flow.retries.phantom_claim_retried = true;
+                        if ctx.flow.content_was_streamed {
+                            send_retract_reply(&ctx.text_delta_tx);
+                            ctx.flow.content_was_streamed = false;
+                        }
+                        tracing::info!(
+                            session = %ctx.session_key,
+                            model = %ctx.core.model,
+                            patterns = detection.matched_patterns.len(),
+                            "phantom_tool_claims_retry"
                         );
                         ctx.messages
-                            .push(crate::agent::markers::scaffold_user(format!(
-                                "[Lease renewal rejected — your checkpoint is missing \
-                                 '{}'. Either include all of findings:/next:/will: to \
-                                 renew, or write your final answer.]",
-                                renewal.missing_field()
-                            )));
+                            .push(crate::agent::markers::scaffold_user(detection.system_warning));
                         return StepResult::Next(IterationPhase::PreCall);
                     }
-                    // out_of_leases: fall through to finish the turn.
-                    tracing::info!(
-                        session = %ctx.session_key,
-                        "tool_lease_renewal_out_of_leases"
-                    );
                 }
                 if !ctx.flow.content_was_streamed {
                     send_delta(&ctx.text_delta_tx, &content);

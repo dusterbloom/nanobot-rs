@@ -183,10 +183,16 @@ impl ToolCallResult {
 /// Outcome of `try_renew`. `missing_field` is `"findings"`, `"next"`,
 /// `"will"`, or `"out_of_leases"` — the caller renders it into a
 /// human-readable rejection that names exactly what's missing.
+///
+/// `attempted` distinguishes a real checkpoint attempt (some labels
+/// present) from plain final text (no labels at all). An exhausted lease
+/// must let the model choose to stop: nagging every text response would,
+/// once the strip is made sticky, loop until max iterations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenewalResult {
     valid: bool,
     missing_field: &'static str,
+    attempted: bool,
 }
 
 impl RenewalResult {
@@ -194,12 +200,24 @@ impl RenewalResult {
         Self {
             valid: true,
             missing_field: "",
+            attempted: true,
         }
     }
     fn rejected(missing: &'static str) -> Self {
         Self {
             valid: false,
             missing_field: missing,
+            attempted: true,
+        }
+    }
+    /// Plain text with no checkpoint labels — the model chose to answer,
+    /// not to renew. `missing_field` is empty so this is distinct from
+    /// both a field rejection and the `"out_of_leases"` cap.
+    fn not_attempted() -> Self {
+        Self {
+            valid: false,
+            missing_field: "",
+            attempted: false,
         }
     }
     pub fn is_valid(&self) -> bool {
@@ -207,6 +225,13 @@ impl RenewalResult {
     }
     pub fn missing_field(&self) -> &str {
         self.missing_field
+    }
+    /// Did the text look like a checkpoint at all? Callers use this to
+    /// separate "model tried to renew but missed a field" (nudge with the
+    /// missing field) from "model just wrote its final answer" (let it
+    /// finish).
+    pub fn was_attempted(&self) -> bool {
+        self.attempted
     }
 }
 
@@ -277,6 +302,10 @@ impl Lease {
     /// case). Returns `RenewalResult::accepted()` and resets the
     /// iteration budget on success; on failure returns which field is
     /// missing.
+    ///
+    /// Text with no checkpoint labels at all returns `not_attempted()`
+    /// — the model is writing a final answer, not requesting more tools,
+    /// and the lease must allow that exit.
     pub fn try_renew(&mut self, checkpoint: &str) -> RenewalResult {
         if self.renewals_used >= self.max_renewals {
             return RenewalResult::rejected("out_of_leases");
@@ -287,6 +316,11 @@ impl Lease {
             .any(|k| lower.contains(k));
         let has_next = ["next:", "still need:"].iter().any(|k| lower.contains(k));
         let has_will = ["will:", "plan:"].iter().any(|k| lower.contains(k));
+        // No checkpoint labels = plain final text. Treat as a choice to
+        // stop, not a failed renewal.
+        if !has_findings && !has_next && !has_will {
+            return RenewalResult::not_attempted();
+        }
         let missing = if !has_findings {
             "findings"
         } else if !has_next {
@@ -569,6 +603,65 @@ mod tests {
             "rejection must name 'out_of_leases', got: {:?}",
             result.missing_field()
         );
+    }
+
+    /// Plain final text (no checkpoint labels) is NOT a renewal attempt.
+    /// `try_renew` returns `not_attempted`: invalid, but `was_attempted()`
+    /// is false and `missing_field` is empty. This is the exit that lets an
+    /// exhausted lease finish the turn instead of nagging every text
+    /// response — required for convergence once the strip is sticky, since
+    /// otherwise a plain answer would be rejected forever.
+    #[test]
+    fn lease_plain_text_is_not_a_renewal_attempt() {
+        let mut lease = Lease::new(1, 3);
+        tick(&mut lease);
+        assert!(lease.is_exhausted());
+
+        // Plain prose, no findings:/next:/will: labels.
+        let plain = "Based on what I read, the loop lives in agent_loop/mod.rs. \
+                     It's a fan-out pattern over inbound messages.";
+        let result = lease.try_renew(plain);
+        assert!(!result.is_valid(), "plain text must not renew");
+        assert!(
+            !result.was_attempted(),
+            "plain text must report was_attempted=false so the caller finishes the turn"
+        );
+        assert!(
+            result.missing_field().is_empty(),
+            "plain text is neither a field rejection nor out_of_leases; got: {:?}",
+            result.missing_field()
+        );
+        // Lease state is unchanged — the model did not request more tools.
+        assert!(lease.is_exhausted());
+        assert_eq!(lease.renewals_used(), 0);
+    }
+
+    /// A checkpoint with some-but-not-all labels IS an attempt. The caller
+    /// nudge path keys off `was_attempted()`, so a partial checkpoint must
+    /// still report true (and name the missing field) while plain text
+    /// reports false. This is the discriminator the response handler uses.
+    #[test]
+    fn lease_partial_checkpoint_is_attempted_and_names_missing_field() {
+        let mut lease = Lease::new(1, 3);
+        tick(&mut lease);
+        assert!(lease.is_exhausted());
+
+        // Has findings + will, missing next.
+        let partial = "Findings: located the loop.\nWill: read it next.";
+        let result = lease.try_renew(partial);
+        assert!(!result.is_valid());
+        assert!(
+            result.was_attempted(),
+            "a checkpoint with any labels counts as an attempt"
+        );
+        assert!(result.missing_field().contains("next"));
+
+        // A fully valid checkpoint is also an attempt (trivially).
+        let mut lease2 = Lease::new(1, 3);
+        tick(&mut lease2);
+        let valid_result = lease2.try_renew("Findings: a.\nNext: b.\nWill: c.");
+        assert!(valid_result.is_valid());
+        assert!(valid_result.was_attempted());
     }
 
     /// Within a lease, the coarse-family cap blocks the 4th consecutive

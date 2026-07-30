@@ -2467,6 +2467,72 @@ fn build_local_inline_harness(main: Arc<dyn LLMProvider>) -> (AgentLoop, std::pa
     build_local_inline_harness_with_model(main, "local-qwen-test")
 }
 
+/// Same as [`build_local_inline_harness`] but with a custom `max_iterations`.
+/// Convergence tests need this above the lease coarse-family cap (6) so the
+/// sticky-strip path is actually reachable — the default of 5 stops the loop
+/// before the family cap can fire.
+fn build_local_inline_harness_with_iters(
+    main: Arc<dyn LLMProvider>,
+    max_iterations: u32,
+) -> (AgentLoop, std::path::PathBuf) {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider: main,
+        workspace: workspace.clone(),
+        model: "local-qwen-test".to_string(),
+        max_iterations,
+        max_continuations: 2,
+        max_tokens: 512,
+        temperature: 0.3,
+        max_context_tokens: 4096,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        crw_url: String::new(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: true,
+        memory_config: MemoryConfig::default(),
+        is_local: true,
+        lane: Lane::default(),
+        tool_delegation: ToolDelegationConfig::default(),
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        delegation_provider: None,
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
+    });
+
+    let counters = test_runtime_counters(4096);
+    let core_handle = AgentHandle::new(core, counters);
+
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+    let agent_loop = AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx,
+        None,
+        1,
+        None,
+        None,
+        None,
+        crate::config::schema::ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    );
+    (agent_loop, workspace)
+}
+
 fn build_local_inline_harness_with_model(
     main: Arc<dyn LLMProvider>,
     model: &str,
@@ -5601,5 +5667,130 @@ mod runtime_mode_parity_tests {
         // falls through to CloudProtocol via the `!starts_with("mlx:")` guard.
         assert!(local_mlx.mode().is_local());
         assert!(local_mlx.model.starts_with("mlx:"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Convergence harness
+    // -------------------------------------------------------------------------
+    //
+    // The property that was missing for all three 2026-07 incidents: no matter
+    // what the model emits, the loop must terminate in a BOUNDED number of
+    // provider calls and return something — it must never spin. These tests
+    // feed adversarial providers that never cooperate and assert bounded
+    // termination. They are the one e2e layer that would have caught the
+    // strip/restore churn, the phantom regression, and the family-cap spin.
+
+    /// A provider that emits a list_dir tool call on every turn, never
+    /// exhausts, and counts calls. Each call uses a DISTINCT path argument
+    /// (defeats the cached-duplicate breaker, which keys on name+args) so the
+    /// loop is forced through the lease coarse-family cap → sticky-strip path.
+    /// It records whether any call observed `tools == None` — the direct signal
+    /// that the sticky strip fired.
+    struct LoopingProvider {
+        name: String,
+        call_count: std::sync::atomic::AtomicU32,
+        saw_tools_absent: std::sync::atomic::AtomicBool,
+    }
+
+    impl LoopingProvider {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                call_count: std::sync::atomic::AtomicU32::new(0),
+                saw_tools_absent: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            self.call_count.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn saw_tools_absent(&self) -> bool {
+            self.saw_tools_absent.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for LoopingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            let n = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if tools.is_none() {
+                self.saw_tools_absent
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Distinct path per call: the cached-duplicate breaker cannot arm,
+            // so the lease read-family cap is the only thing that can stop the
+            // run — exactly the 2026-07-30 incident path.
+            let mut args = std::collections::HashMap::new();
+            args.insert("path".to_string(), json!(format!("dir{n}")));
+            Ok(crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: format!("tc_loop_{n}"),
+                    name: "list_dir".to_string(),
+                    arguments: args,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            &self.name
+        }
+    }
+
+    /// Adversarial convergence: the model emits a fresh list_dir every turn
+    /// (distinct args, so no cached-duplicate shortcut) and NEVER writes a
+    /// final answer. The loop must still converge — via the lease coarse-family
+    /// cap (6) → sticky tool strip (Fix A1) → a tools-absent call → forced text.
+    ///
+    /// This is the test that was missing for the 2026-07 incidents. It is only
+    /// meaningful because it ASSERTS the sticky strip fired (`saw_tools_absent`);
+    /// if Fix A1 were reverted, the router would restore tools on every call and
+    /// this assertion would fail.
+    #[tokio::test]
+    async fn convergence_loop_terminates_via_sticky_strip_when_model_loops() {
+        let provider = Arc::new(LoopingProvider::new("local-main"));
+        // max_iterations must exceed the coarse-family cap (6) so the cap can
+        // fire before the bare iteration limit does.
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 12);
+        let session_key = format!("conv-sticky-strip-{}", uuid::Uuid::new_v4());
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent_loop.process_direct("list files forever", &session_key, "test", "offline"),
+        )
+        .await
+        .expect("loop must terminate — it hung (convergence regression)");
+
+        assert!(
+            !response.trim().is_empty(),
+            "a converged turn must return text, got empty"
+        );
+        assert!(
+            provider.saw_tools_absent(),
+            "loop never observed a tools-absent call — the sticky strip (Fix A1) did not fire. \
+             Either the family cap wasn't reached or the router restored tools (regression)."
+        );
+        let calls = provider.call_count();
+        assert!(
+            calls < 25,
+            "loop made {calls} provider calls — did not converge (termination guard regressed)"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

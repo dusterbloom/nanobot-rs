@@ -313,6 +313,16 @@ pub(crate) struct FlowControl {
     /// Consecutive rounds where ALL tool calls were blocked by the guard.
     /// When this reaches the threshold, the loop forces a text response.
     pub(crate) consecutive_all_blocked: u32,
+    /// Consecutive rounds that executed zero tools (for ANY reason: lease
+    /// exhausted, coarse-family cap, boundary reject, duplicate block). Such
+    /// rounds are "not counted" against `max_iterations` so they cannot silently
+    /// eat the model's budget — but without a hard cap a model that keeps
+    /// emitting blocked tool calls (e.g. lease exhausted but still emitting
+    /// tool_calls after the strip) would spin forever. After
+    /// `NO_PROGRESS_HARD_STOP` such rounds the loop forces a final answer
+    /// regardless. This is the universal termination invariant the loop relies
+    /// on; the per-reason counters above feed into it but do not replace it.
+    pub(crate) consecutive_no_progress_rounds: u32,
     /// Set during tool execution when a round executed ZERO tools — every call
     /// was boundary-rejected or duplicate-blocked. Such a round made no progress,
     /// so the main loop does not spend a real iteration on it. Reset at the start
@@ -849,17 +859,40 @@ impl AgentLoopShared {
                     // A round where every tool call was blocked/rejected ran no
                     // tool and made no progress — don't spend a real iteration on
                     // it (so a behavioral-boundary rejection or a duplicate block
-                    // can't silently eat the budget). Bounded: the boundary is
-                    // one-shot and the duplicate circuit breaker caps it at 2.
+                    // can't silently eat the budget). But a model can keep emitting
+                    // blocked tool calls indefinitely (e.g. lease exhausted, tools
+                    // stripped, still emitting tool_calls). Bound the TOTAL
+                    // consecutive no-progress rounds: after the hard stop the loop
+                    // forces a final answer regardless of the reason. This is the
+                    // universal convergence invariant — without it the loop spins.
+                    const NO_PROGRESS_HARD_STOP: u32 = 4;
                     if ctx.flow.round_executed_no_tools {
+                        ctx.flow.consecutive_no_progress_rounds = ctx
+                            .flow
+                            .consecutive_no_progress_rounds
+                            .saturating_add(1);
+                        if ctx.flow.consecutive_no_progress_rounds >= NO_PROGRESS_HARD_STOP {
+                            warn!(
+                                rounds = ctx.flow.consecutive_no_progress_rounds,
+                                "no_progress_hard_stop: repeated zero-tool rounds, forcing final answer"
+                            );
+                            ctx.final_content =
+                                "I was looping on blocked tool requests without making progress, \
+                                 so I stopped. Rephrase the request or restart the turn."
+                                    .to_string();
+                            break;
+                        }
                         debug!(
+                            rounds = ctx.flow.consecutive_no_progress_rounds,
                             "iteration not counted: round executed no tools (all blocked/rejected)"
                         );
                         continue;
                     }
 
-                    // Successful tool execution — reset the empty counter.
+                    // Successful tool execution — reset the empty counter and the
+                    // no-progress streak.
                     consecutive_empty = 0;
+                    ctx.flow.consecutive_no_progress_rounds = 0;
 
                     // Repeated successful tool-call breaker: the model fires
                     // tools without consuming their results when it dispatches
@@ -1196,7 +1229,17 @@ impl AgentLoopShared {
         // succeeds (renewal, new lease, etc.).
         let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx);
         const LEASE_BLOCKS_BEFORE_STRIP: u32 = 2;
-        if ctx.flow.consecutive_lease_blocks >= LEASE_BLOCKS_BEFORE_STRIP && !tool_defs.is_empty() {
+        // `lease_forced_text_only` is computed from the same counter the
+        // strip below uses, and is honored by the router-passthrough
+        // restore further down. Without this hand-off the strip is undone
+        // in the SAME step_pre_call: the restore sees empty tool_defs and
+        // repopulates them, so the model keeps emitting tool calls the
+        // lease then blocks — the 6× strip/restore churn documented in
+        // session 20260729_155613_2b65f0. Router passthrough may reverse
+        // trio stripping; it must never reverse lease enforcement.
+        let lease_forced_text_only =
+            ctx.flow.consecutive_lease_blocks >= LEASE_BLOCKS_BEFORE_STRIP && !tool_defs.is_empty();
+        if lease_forced_text_only {
             tracing::info!(
                 session = %ctx.session_key,
                 consecutive_blocks = ctx.flow.consecutive_lease_blocks,
@@ -1356,23 +1399,36 @@ impl AgentLoopShared {
             ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
         }
 
-        // Router-first preflight for strict trio mode.
-        match crate::agent::router::router_preflight(ctx, self.health_registry.as_deref()).await {
-            crate::agent::router::PreflightResult::Continue => {
-                return StepResult::Done(IterationOutcome::Continue);
-            }
-            crate::agent::router::PreflightResult::Break(msg) => {
-                return StepResult::Done(IterationOutcome::Finished(msg));
-            }
-            crate::agent::router::PreflightResult::Passthrough => {
-                // Router decided not to handle this request — restore tools so
-                // the main model can still call them directly as a fallback.
-                // Without this, tool_defs was cleared in the trio stripping block
-                // above and the main model would answer "I cannot directly do X"
-                // instead of calling list_dir, exec, etc.
-                if tool_defs.is_empty() && !saved_tool_defs.is_empty() {
-                    debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
-                    tool_defs = saved_tool_defs;
+        // Router-first preflight for strict trio mode. The router can only
+        // strip tools when trio is active, so the passthrough-restore below
+        // is only meaningful then. When trio is off (the common local
+        // single-model setup) the preflight is a pure passthrough and the
+        // restore must NOT run — `tool_defs` is empty here only because the
+        // lease forced a text-only call, and restoring would undo lease
+        // enforcement (the 20260729_155613_2b65f0 failure). Gating the
+        // whole block makes trio-off absent from the hot path instead of
+        // present-but-inert.
+        let trio_active = ctx.core.mode().is_local()
+            && ctx.core.tool_delegation_config.strict_no_tools_main();
+        if trio_active {
+            match crate::agent::router::router_preflight(ctx, self.health_registry.as_deref()).await
+            {
+                crate::agent::router::PreflightResult::Continue => {
+                    return StepResult::Done(IterationOutcome::Continue);
+                }
+                crate::agent::router::PreflightResult::Break(msg) => {
+                    return StepResult::Done(IterationOutcome::Finished(msg));
+                }
+                crate::agent::router::PreflightResult::Passthrough => {
+                    // Restore undoes trio stripping — but never when the lease
+                    // simultaneously forced a text-only call.
+                    if !lease_forced_text_only
+                        && tool_defs.is_empty()
+                        && !saved_tool_defs.is_empty()
+                    {
+                        debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
+                        tool_defs = saved_tool_defs;
+                    }
                 }
             }
         }

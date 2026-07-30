@@ -87,9 +87,10 @@ async fn stash_tool_result_for_prompt_shaping(
     cap: usize,
     force: bool,
 ) -> bool {
-    if tool_name == "recall_tool_result" {
-        return false;
-    }
+    // No recall exemption: a recalled body can be hundreds of KB and must be
+    // stashable under the recall's own id so slice_tool_result /
+    // search_tool_result can query it. Exempting it left the raw body in live
+    // context, which inflated a session to 77k tokens (2026-07-30).
     if !force && data.chars().count() <= cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES {
         return false;
     }
@@ -152,16 +153,36 @@ fn build_tool_result_preview(
     }
     let source = tool_arg_summary(args);
     let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
-    let header = format!(
-        "[truncated: {tool_name}({source}) returned {total_chars} chars (~{estimated_tokens} tokens); \
-         head+tail shown — call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output, \
-         or search_tool_result/slice_tool_result to query it without loading the whole body]\n"
-    );
-    let compact_header = format!(
-        "[truncated: {tool_name} returned {total_chars} chars (~{estimated_tokens} tokens); \
-         call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output; \
-         search_tool_result/slice_tool_result can query it]\n"
-    );
+    // A recalled body that is still too large for live context must NOT point
+    // back at recall_tool_result (circular — the model just recalled it and
+    // would loop). The full body is stashed under this id; direct the model at
+    // slice_tool_result / search_tool_result to query it without reloading.
+    let is_recall = tool_name == "recall_tool_result";
+    let header = if is_recall {
+        format!(
+            "[recalled output still too large for context: {total_chars} chars (~{estimated_tokens} tokens); \
+             head+tail shown — use slice_tool_result or search_tool_result with \
+             tool_call_id=\"{tool_call_id}\" to query this body without reloading it]\n"
+        )
+    } else {
+        format!(
+            "[truncated: {tool_name}({source}) returned {total_chars} chars (~{estimated_tokens} tokens); \
+             head+tail shown — call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output, \
+             or search_tool_result/slice_tool_result to query it without loading the whole body]\n"
+        )
+    };
+    let compact_header = if is_recall {
+        format!(
+            "[recalled output too large: {total_chars} chars (~{estimated_tokens} tokens); \
+             use slice_tool_result/search_tool_result with tool_call_id=\"{tool_call_id}\"]\n"
+        )
+    } else {
+        format!(
+            "[truncated: {tool_name} returned {total_chars} chars (~{estimated_tokens} tokens); \
+             call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output; \
+             search_tool_result/slice_tool_result can query it]\n"
+        )
+    };
     let footer = "\n[...]\n";
     let header = if header.chars().count() + footer.chars().count() + 80 <= cap {
         header
@@ -200,12 +221,9 @@ fn digest_tool_result(
     cap: usize,
     tool_call_id: &str,
 ) -> String {
-    // A recalled output IS the verbatim body the model explicitly asked for.
-    // Keep it raw for this live turn only; session reload renders a compact
-    // digest/reference so the one-time recall cannot balloon every later turn.
-    if tool_name == "recall_tool_result" {
-        return data.to_string();
-    }
+    // No recall exemption: recalled bodies are shaped by the same cap as any
+    // other result. build_tool_result_preview points recalled output at
+    // slice/search (not back at recall) so the model cannot loop.
     let prompt_cap = cap.min(TOOL_RESULT_REPLAY_MAX_BYTES);
     let total_chars = data.chars().count();
     if total_chars <= prompt_cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES {
@@ -606,7 +624,7 @@ pub(crate) async fn execute_tools_delegated(
         } else {
             build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
         };
-        if stashed_raw && !injected.contains("recall_tool_result") {
+        if stashed_raw && tc.name != "recall_tool_result" && !injected.contains("recall_tool_result") {
             injected.push_str(&format!(
                 "\n[full original output retrievable via recall_tool_result({{\"tool_call_id\": \"{}\"}})]",
                 tc.id
@@ -1010,14 +1028,34 @@ async fn inject_tool_result(
     // Gate tool result through context budget.
     let threshold = summary_threshold_tokens(&r.tool_name);
     let cap = prompt_cap.max(1);
-    // A recalled output is the verbatim body the model explicitly requested.
-    // It is raw only inside this active turn; persisted replay is compacted by
-    // session filters. Still charge its tokens so this batch sees true usage.
     let data = if r.tool_name == "recall_tool_result" {
-        ctx.content_gate
-            .budget
-            .consume(crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data));
-        result_data
+        // A recalled body is verbatim what the model asked for, but a large
+        // one cannot enter live context raw: a 172KB recall inflated a
+        // session to 77k tokens and triggered a cache-dropping compaction
+        // (session 20260730_094531_508b68, 2026-07-30). Route it through the
+        // same stash+digest as any other oversized result — the full body is
+        // stashed under this recall's id and the model queries it via
+        // slice_tool_result / search_tool_result.
+        let stashed_raw = stash_tool_result_for_prompt_shaping(
+            &ctx.core.sessions,
+            &ctx.session_id,
+            &r.tool_id,
+            &r.tool_name,
+            &result_data,
+            cap,
+            force_stash_raw,
+        )
+        .await;
+        if must_preserve_unstashed_raw(&result_data, cap, stashed_raw) {
+            ctx.content_gate.budget.consume(
+                crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data),
+            );
+            result_data
+        } else {
+            let prompt_data =
+                digest_tool_result(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id);
+            ctx.content_gate.admit_simple(&prompt_data).into_text()
+        }
     } else if ctx.core.specialist_provider.is_some()
         && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > threshold
     {
@@ -1695,6 +1733,44 @@ mod tests {
         // Points the model at the recall tool with the right id.
         assert!(out.contains("recall_tool_result"));
         assert!(out.contains("call_42"));
+    }
+
+    /// A recalled body that exceeds the replay cap must NOT enter live context
+    /// raw — that is the 2026-07-30 regression (a 172KB recall inflated a
+    /// session to 77k tokens and dropped the cache). The digest must (a) bound
+    /// it, (b) point the model at slice/search against the recall's own id,
+    /// and (c) NOT point back at recall_tool_result (which would loop).
+    #[test]
+    fn digest_tool_result_caps_recalled_body_and_points_to_slice_search() {
+        let args = HashMap::new();
+        // ~200KB body, far over the replay cap.
+        let data = format!(
+            "{}NEVER_INLINE_THIS_SECRET{}",
+            "head line\n".repeat(10_000),
+            "tail line\n".repeat(10_000)
+        );
+        let cap = TOOL_RESULT_REPLAY_MAX_BYTES;
+
+        let out = digest_tool_result("recall_tool_result", &args, &data, cap, "recall_call_7");
+
+        // (a) bounded — never the raw 200KB.
+        assert!(
+            out.chars().count() <= cap + 40,
+            "recalled body must be capped to ~replay budget, got {} chars",
+            out.chars().count()
+        );
+        assert!(
+            !out.contains("NEVER_INLINE_THIS_SECRET"),
+            "the oversized middle must not enter the preview"
+        );
+        // (b) the model can recover parts via slice/search against this id.
+        assert!(out.contains("slice_tool_result") || out.contains("search_tool_result"));
+        assert!(out.contains("recall_call_7"));
+        // (c) NOT a circular recall pointer — the model just recalled it.
+        assert!(
+            !out.contains("call recall_tool_result"),
+            "recalled-body preview must not point back at recall_tool_result (loop)"
+        );
     }
 
     #[test]
