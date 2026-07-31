@@ -8,7 +8,7 @@ use chrono::Local;
 use serde_json::{json, Value};
 use tokio::fs;
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{PermissionLevel, Tool, ToolExecutionResult};
 
 const MAX_FACT_CHARS: usize = 180;
 
@@ -124,15 +124,6 @@ pub fn dedupe_facts(current: &str) -> (String, usize) {
     (join_preserving_final_newline(lines, current), removed)
 }
 
-pub fn list_facts(current: &str, limit: usize) -> Vec<String> {
-    current
-        .lines()
-        .filter_map(fact_text_from_line)
-        .take(limit)
-        .map(|fact| fact.to_string())
-        .collect()
-}
-
 #[async_trait]
 impl Tool for RememberTool {
     fn name(&self) -> &str {
@@ -144,7 +135,7 @@ impl Tool for RememberTool {
     }
 
     fn description(&self) -> &str {
-        "Manage curated long-term facts in MEMORY.md. Add only concise, durable facts explicitly stated by the user; do not infer emotions, intent, causality, or narrative context. One fact per call, at most 180 characters. Default action is add when fact is present; otherwise list."
+        "Manage curated long-term facts in MEMORY.md. Add only concise, durable facts explicitly stated by the user; do not infer emotions, intent, causality, or narrative context. Batch: remember({\"facts\":[\"...\",\"...\"]}) adds up to 20 facts (each ≤180 chars) in one call. Reading memory is NOT done here — use recall({\"query\":\"...\",\"scope\":\"memory\"})."
     }
 
     fn parameters(&self) -> Value {
@@ -153,13 +144,19 @@ impl Tool for RememberTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["add", "list", "replace", "delete", "dedupe"],
-                    "description": "Memory operation. Default: add"
+                    "enum": ["add", "replace", "delete", "dedupe"],
+                    "description": "Memory operation. Default: add. (Reading memory: use recall with scope=\"memory\".)"
+                },
+                "facts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 20,
+                    "description": "One or more concise facts to add (batch). Each ≤180 chars."
                 },
                 "fact": {
                     "type": "string",
                     "maxLength": MAX_FACT_CHARS,
-                    "description": "One concise fact to add, or the exact fact to delete. For add, use only an explicit user-stated fact; no interpretation or session narrative."
+                    "description": "Legacy single-fact form for add/delete (prefer 'facts' array)."
                 },
                 "old_fact": {
                     "type": "string",
@@ -171,7 +168,7 @@ impl Tool for RememberTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum facts to show for action='list'. Default: 50, max: 200"
+                    "description": "Max facts for dedupe. Default: 50"
                 }
             },
             "required": []
@@ -183,13 +180,7 @@ impl Tool for RememberTool {
             .get("action")
             .and_then(|v| v.as_str())
             .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| {
-                if args.contains_key("fact") {
-                    "add".to_string()
-                } else {
-                    "list".to_string()
-                }
-            });
+            .unwrap_or_else(|| "add".to_string());
 
         let memory_path = self.workspace.join("memory").join("MEMORY.md");
 
@@ -203,38 +194,68 @@ impl Tool for RememberTool {
 
         let (updated, message, should_write) = match action.as_str() {
             "add" => {
-                let fact = match required_string(&args, "fact") {
-                    Ok(f) => f,
-                    Err(e) => return e,
-                };
-                if let Err(error) = validate_new_fact(fact) {
-                    return error;
+                // Collect facts from the batch `facts` array, plus the legacy
+                // single `fact` param (folded in for back-compat).
+                let mut facts: Vec<String> = args
+                    .get("facts")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(single) = args
+                    .get("fact")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    facts.push(single.to_string());
                 }
-                if memory_has_fact(&current, fact) {
-                    return format!("Already remembered: {}", fact.trim());
+                if facts.is_empty() {
+                    // execute_with_result returns the structured MissingArg;
+                    // this is the defensive path for direct execute() callers.
+                    return "Error: nothing to remember. Call as remember({\"facts\":[\"...\"]})."
+                        .to_string();
+                }
+                if facts.len() > 20 {
+                    return format!("Error: too many facts ({}) — max 20 per call.", facts.len());
+                }
+                for f in &facts {
+                    if let Err(error) = validate_new_fact(f) {
+                        return error;
+                    }
                 }
                 let date = Local::now().format("%Y-%m-%d").to_string();
-                (
-                    append_fact(&current, fact, &date),
-                    format!("Remembered: {}", fact.trim()),
-                    true,
-                )
+                let mut updated = current.clone();
+                let mut added = 0usize;
+                let mut skipped = 0usize;
+                for fact in &facts {
+                    if memory_has_fact(&updated, fact) {
+                        skipped += 1;
+                        continue;
+                    }
+                    updated = append_fact(&updated, fact, &date);
+                    added += 1;
+                }
+                let message = if added == 0 {
+                    format!(
+                        "Already remembered: {}",
+                        facts.iter().map(|s| s.trim()).collect::<Vec<_>>().join("; ")
+                    )
+                } else if facts.len() == 1 && skipped == 0 {
+                    format!("Remembered: {}", facts[0].trim())
+                } else if skipped == 0 {
+                    format!("Remembered {} fact(s).", added)
+                } else {
+                    format!("Remembered {} fact(s); {} already present.", added, skipped)
+                };
+                (updated, message, added > 0)
             }
             "list" => {
-                let limit = args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| (v as usize).clamp(1, 200))
-                    .unwrap_or(50);
-                let facts = list_facts(&current, limit);
-                if facts.is_empty() {
-                    return "No memory facts found.".to_string();
-                }
-                let mut out = format!("Memory facts (showing {}):", facts.len());
-                for fact in facts {
-                    out.push_str(&format!("\n- {}", fact));
-                }
-                return out;
+                return "Error: remember no longer has a 'list' action. Read memory with recall({\"query\":\"...\",\"scope\":\"memory\"}).".to_string();
             }
             "replace" => {
                 let old_fact = match required_string(&args, "old_fact") {
@@ -280,8 +301,7 @@ impl Tool for RememberTool {
                 )
             }
             _ => {
-                return "Error: action must be one of: add, list, replace, delete, dedupe"
-                    .to_string()
+                return "Error: action must be one of: add, replace, delete, dedupe".to_string()
             }
         };
 
@@ -304,6 +324,33 @@ impl Tool for RememberTool {
         }
 
         message
+    }
+
+    /// Structured empty-arg path: an `add` with no facts sets `MissingArg` so
+    /// the registry appends a corrective worked example. Without this, a
+    /// zero-temp model emitting `remember({})` got a silent success (the old
+    /// list default) and looped. Other actions delegate to the default.
+    async fn execute_with_result(&self, args: HashMap<String, Value>) -> ToolExecutionResult {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "add".to_string());
+        if action == "add" {
+            let has_input = args.contains_key("facts") || args.contains_key("fact");
+            if !has_input {
+                return ToolExecutionResult {
+                    ok: false,
+                    data: "Error: nothing to remember.".to_string(),
+                    error: None,
+                    error_kind: Some(crate::errors::ToolErrorKind::MissingArg {
+                        param: "facts".to_string(),
+                        example: r#"remember({"facts":["a concise fact"]})"#.to_string(),
+                    }),
+                };
+            }
+        }
+        ToolExecutionResult::from_output(self.execute(args).await)
     }
 }
 
@@ -471,11 +518,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_fact_param_defaults_to_list() {
+    async fn test_empty_add_returns_structural_missing_arg() {
+        let dir = TempDir::new().unwrap();
+        let tool = RememberTool::new(dir.path().to_path_buf());
+        let res = tool.execute_with_result(HashMap::new()).await;
+        assert!(!res.ok, "empty add must not be a silent success (old list-default loop)");
+        assert!(
+            matches!(
+                res.error_kind,
+                Some(crate::errors::ToolErrorKind::MissingArg { ref param, .. }) if param == "facts"
+            ),
+            "empty add must set structural MissingArg on `facts`: {:?}",
+            res.error_kind
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_add_direct_execute_errors_not_succeeds() {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
         let result = tool.execute(HashMap::new()).await;
-        assert_eq!(result, "No memory facts found.");
+        assert!(
+            result.starts_with("Error:") && result.contains("nothing to remember"),
+            "direct execute({{}}) must error, not succeed as list: {result}"
+        );
     }
 
     #[tokio::test]
@@ -555,7 +621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_replace_delete_and_list_memory_facts() {
+    async fn test_replace_and_delete_memory_facts() {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
 
@@ -569,12 +635,6 @@ mod tests {
         replace.insert("new_fact".to_string(), json!("New preference"));
         let result = tool.execute(replace).await;
         assert!(result.starts_with("Replaced 1"), "got: {result}");
-
-        let mut list = HashMap::new();
-        list.insert("action".to_string(), json!("list"));
-        let result = tool.execute(list).await;
-        assert!(result.contains("New preference"), "got: {result}");
-        assert!(!result.contains("Old preference"), "got: {result}");
 
         let mut delete = HashMap::new();
         delete.insert("action".to_string(), json!("delete"));
@@ -639,5 +699,53 @@ mod tests {
             .expect("remember should resume after the transaction releases")
             .expect("remember task should complete");
         assert!(result.starts_with("Remembered:"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_batch_add_writes_all_facts_atomically() {
+        let dir = TempDir::new().unwrap();
+        let tool = RememberTool::new(dir.path().to_path_buf());
+        let mut args = HashMap::new();
+        args.insert(
+            "facts".to_string(),
+            json!(["alpha fact", "bravo fact", "charlie fact"]),
+        );
+        let result = tool.execute(args).await;
+        assert!(
+            result.starts_with("Remembered 3 fact(s)"),
+            "batch add must report 3 facts: {result}"
+        );
+        let mem = std::fs::read_to_string(dir.path().join("memory").join("MEMORY.md")).unwrap();
+        assert!(mem.contains("- alpha fact"));
+        assert!(mem.contains("- bravo fact"));
+        assert!(mem.contains("- charlie fact"));
+    }
+
+    #[tokio::test]
+    async fn test_list_action_is_rejected_with_recall_redirect() {
+        let dir = TempDir::new().unwrap();
+        let tool = RememberTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute(HashMap::from([("action".to_string(), json!("list"))]))
+            .await;
+        assert!(
+            result.contains("recall") && result.contains("scope"),
+            "list must redirect to recall(scope=memory): {result}"
+        );
+        assert!(result.starts_with("Error:"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_add_respects_twenty_fact_cap() {
+        let dir = TempDir::new().unwrap();
+        let tool = RememberTool::new(dir.path().to_path_buf());
+        let many: Vec<String> = (0..25).map(|i| format!("fact {i}")).collect();
+        let result = tool
+            .execute(HashMap::from([("facts".to_string(), json!(many))]))
+            .await;
+        assert!(
+            result.contains("too many facts") && result.contains("max 20"),
+            "over-20 batch must be rejected: {result}"
+        );
     }
 }
