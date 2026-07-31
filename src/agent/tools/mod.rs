@@ -15,8 +15,6 @@ pub mod recall;
 pub mod recall_tool_result;
 pub mod registry;
 pub mod remember;
-pub mod search_context;
-pub mod session_search;
 pub mod shell;
 pub mod spawn;
 pub mod stash_search;
@@ -41,8 +39,6 @@ pub use read_skill::ReadSkillTool;
 pub use recall::RecallTool;
 pub use registry::ToolRegistry;
 pub use remember::RememberTool;
-pub use search_context::SearchContextTool;
-pub use session_search::SessionSearchTool;
 pub use shell::ExecTool;
 pub use spawn::{
     CancelCallback, CheckCallback, ListCallback, LoopCallback, PipelineCallback, SpawnCallback,

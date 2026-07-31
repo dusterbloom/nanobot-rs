@@ -280,11 +280,14 @@ impl AgentLoopShared {
                 })
                 .clone()
         };
-        if tools.contains("session_search") {
-            tools.register(Box::new(
-                crate::agent::tools::SessionSearchTool::new(core.sessions.path().to_path_buf())
-                    .with_current_session_id(Some(session_id.clone())),
-            ));
+        if tools.contains("recall") {
+            // recall absorbed session_search; re-register it bound to the
+            // concrete session so the fetch/search legs exclude the turn in
+            // progress (mirrors the former session_search wiring).
+            let tool = crate::agent::tools::RecallTool::new(&core.workspace)
+                .with_db(core.sessions.path().to_path_buf())
+                .with_current_session_id(Some(session_id.clone()));
+            tools.register(Box::new(tool));
         }
 
         // Register lcm_expand and restore this concrete session's LCM DAG.

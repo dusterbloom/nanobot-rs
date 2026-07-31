@@ -15,8 +15,8 @@ use super::filesystem::MAX_WRITE_FILE_PIECE_CHARS;
 use super::{
     ApplyPatchTool, BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, FileInfoTool,
     FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool,
-    RememberTool, SearchContextTool, SearchFilesTool, SessionSearchTool, SystemInfoTool,
-    ToolStatusTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileTool,
+    RememberTool, SearchFilesTool, SystemInfoTool, ToolStatusTool, WebFetchTool, WebSearchTool,
+    WorkspaceDiffTool, WriteFileTool,
 };
 use crate::config::schema::CodeExecutionConfig;
 
@@ -120,6 +120,11 @@ impl ToolRegistry {
     ) -> Result<(String, HashMap<String, Value>), String> {
         let canonical_name = match name {
             "wait" | "check" | "list" | "cancel" => "spawn",
+            // Dissolution: session_search and search_context collapse into
+            // recall. Which recall path runs is decided by the params present
+            // (query -> search; session/message_ids/mode=latest -> fetch), so
+            // a plain name rewrite here is sufficient.
+            "session_search" | "search_context" => "recall",
             other => other,
         };
 
@@ -328,9 +333,6 @@ impl ToolRegistry {
         if should_include("search_files") {
             self.register(Box::new(SearchFilesTool));
         }
-        if should_include("search_context") {
-            self.register(Box::new(SearchContextTool::new(config.workspace.clone())));
-        }
         if should_include("file_info") {
             self.register(Box::new(FileInfoTool));
         }
@@ -378,18 +380,20 @@ impl ToolRegistry {
             self.register(Box::new(BrowserTool::new(config.max_tool_result_chars)));
         }
         if should_include("recall") {
-            self.register(Box::new(RecallTool::new(&config.workspace)));
+            // recall is the unified retrieval tool: it absorbs the dissolved
+            // session_search + search_context. Attach the sessions database so
+            // the session fetch/search legs and the trust-ranked merge work.
+            let mut tool = RecallTool::new(&config.workspace);
+            if let Some(ref db_path) = config.db_path {
+                tool = tool.with_db(db_path.clone());
+            }
+            self.register(Box::new(tool));
         }
         if should_include("remember") {
             self.register(Box::new(RememberTool::new(config.workspace.clone())));
         }
         if should_include("get_skills") {
             self.register(Box::new(ReadSkillTool::new(&config.workspace)));
-        }
-        if should_include("session_search") {
-            if let Some(ref db_path) = config.db_path {
-                self.register(Box::new(SessionSearchTool::new(db_path.clone())));
-            }
         }
         if config.code_execution.enabled && should_include("execute_code") {
             // Collect tool names for the Python stub (excluding execute_code itself).
@@ -728,12 +732,11 @@ impl ToolRegistry {
         // schema must be advertised or local models fall back to guessing
         // (observed: recall_tool_result with invented ids).
         "lcm_expand",
-        // Memory tools: medium local models (e.g. Qwen3.6-35B-A3B) fail to route
+        // Memory tools: medium local models (e.g. Qwen3.6-35B-A3M) fail to route
         // through the `tool` proxy meta-tool reliably, so they get dedicated
         // slim schemas instead of proxy-only reachability.
         "recall",
         "remember",
-        "session_search",
     ];
 
     /// Hot tools advertised as native schemas at turn 1. Kept to the 5 the
@@ -764,7 +767,6 @@ impl ToolRegistry {
         "system_info",
         "tool_status",
         "browser",
-        "search_context",
         "recall_tool_result",
         "search_tool_result",
         "slice_tool_result",
@@ -873,7 +875,6 @@ impl ToolRegistry {
             "read_file",
             "get_skills",
             "recall",
-            "session_search",
             "remember",
         ];
         for def in &mut defs {
@@ -3268,6 +3269,21 @@ mod tests {
         // Genuinely no-arg tool → None (no augmentation possible).
         let no_args = serde_json::json!({"type": "object", "properties": {}});
         assert_eq!(ToolRegistry::worked_example_call("system_info", &no_args), None);
+    }
+
+    /// Old tool names from prior sessions must keep resolving to their dissolved
+    /// target via `normalize_tool_request`, so in-flight and replayed
+    /// `tool_calls` rows never hit "Tool not found". (Recovery-tool renames are
+    /// a separate follow-up — not yet applied — so they aren't aliased here.)
+    #[test]
+    fn normalize_routes_old_tool_names_to_new_targets() {
+        for (old, new) in [
+            ("session_search", "recall"),
+            ("search_context", "recall"),
+        ] {
+            let (c, _) = ToolRegistry::normalize_tool_request(old, HashMap::new()).unwrap();
+            assert_eq!(c, new, "alias {old} -> {new}");
+        }
     }
 
     /// Regression (defect 2): a tool that rejects empty args with the canonical
