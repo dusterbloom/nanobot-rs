@@ -974,41 +974,7 @@ impl SessionDb {
         }
     }
 
-    /// Durably store the complete pre-compaction output for an oversized tool
-    /// result. Repeated writes for the same protocol call are idempotent.
-    pub async fn store_tool_result(
-        &self,
-        session_id: &str,
-        tool_call_id: &str,
-        tool_name: &str,
-        content: &str,
-    ) -> bool {
-        let conn = self.conn.lock().await;
-        match conn.execute(
-            "INSERT INTO tool_results (session_id, tool_call_id, tool_name, content, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(session_id, tool_call_id) DO UPDATE SET \
-             tool_name = excluded.tool_name, content = excluded.content",
-            params![
-                session_id,
-                tool_call_id,
-                tool_name,
-                content,
-                Utc::now().to_rfc3339()
-            ],
-        ) {
-            Ok(_) => true,
-            Err(error) => {
-                warn!(
-                    "Failed to persist tool result session={} call={}: {}",
-                    session_id, tool_call_id, error
-                );
-                false
-            }
-        }
-    }
-
-    /// Load a complete tool output previously stored by [`store_tool_result`].
+    /// Load a complete tool output previously stored by [`store_tool_result_immutable`].
     pub async fn load_tool_result(&self, session_id: &str, tool_call_id: &str) -> Option<String> {
         let conn = self.conn.lock().await;
         conn.query_row(
@@ -2617,10 +2583,11 @@ mod tests {
         let session_id = {
             let db = SessionDb::new(&db_path);
             let session = db.create_session("cli:durable-tool-result").await;
-            assert!(
-                db.store_tool_result(&session.id, "call_42", "read_file", "full exact body")
-                    .await
-            );
+            assert!(matches!(
+                db.store_tool_result_immutable(&session.id, "call_42", "read_file", "full exact body")
+                    .await,
+                StoredResult::Stored { .. }
+            ));
             session.id
         };
 
@@ -2692,14 +2659,16 @@ mod tests {
         let first = db.create_session("cli:first-tool-session").await;
         let second = db.create_session("cli:second-tool-session").await;
 
-        assert!(
-            db.store_tool_result(&first.id, "call_0", "read_file", "first body")
-                .await
-        );
-        assert!(
-            db.store_tool_result(&second.id, "call_0", "read_file", "second body")
-                .await
-        );
+        assert!(matches!(
+            db.store_tool_result_immutable(&first.id, "call_0", "read_file", "first body")
+                .await,
+            StoredResult::Stored { .. }
+        ));
+        assert!(matches!(
+            db.store_tool_result_immutable(&second.id, "call_0", "read_file", "second body")
+                .await,
+            StoredResult::Stored { .. }
+        ));
 
         assert_eq!(
             db.load_tool_result(&first.id, "call_0").await.as_deref(),
@@ -3650,10 +3619,11 @@ mod tests {
             LegacyImportOutcome::Imported { session_id, .. } => session_id,
             LegacyImportOutcome::AlreadyImported { .. } => unreachable!(),
         };
-        assert!(
-            db.store_tool_result(&session_id, "call_1", "read_file", "raw body")
-                .await
-        );
+        assert!(matches!(
+            db.store_tool_result_immutable(&session_id, "call_1", "read_file", "raw body")
+                .await,
+            StoredResult::Stored { .. }
+        ));
         db.save_summary_node(
             &session_id,
             901,

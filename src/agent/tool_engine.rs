@@ -120,14 +120,6 @@ async fn stash_tool_result_for_prompt_shaping(
     }
 }
 
-/// Persistence must succeed before an oversized result can be replaced by a
-/// bounded preview. If SQLite rejects the write, retaining the raw body in the
-/// active context is the only lossless fallback: a recall pointer would point
-/// at data that does not exist.
-fn must_preserve_unstashed_raw(data: &str, cap: usize, stashed: bool) -> bool {
-    data.chars().count() > cap && !stashed
-}
-
 /// The canonical stable handle marker. A tool-result message whose content
 /// starts with this is a handle — it carries metadata + a tiny excerpt, never
 /// the full body. The body lives in the stash, fetchable via
@@ -1136,7 +1128,7 @@ async fn inject_tool_result(
         // same stash+digest as any other oversized result — the full body is
         // stashed under this recall's id and the model queries it via
         // slice_tool_result / search_tool_result.
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
+        let _stashed_raw = match stash_tool_result_for_prompt_shaping(
             &ctx.core.sessions,
             &ctx.session_id,
             &r.tool_id,
@@ -1153,16 +1145,12 @@ async fn inject_tool_result(
                 return;
             }
         };
-        if must_preserve_unstashed_raw(&result_data, cap, stashed_raw) {
-            ctx.content_gate.budget.consume(
-                crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data),
-            );
-            result_data
-        } else {
-            let prompt_data =
-                digest_tool_result(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id);
-            ctx.content_gate.admit_simple(&prompt_data).into_text()
-        }
+        // Recall is an explicit-retrieval tool: its result carries a bounded
+        // excerpt (digest_tool_result handles small-as-passthrough + large as
+        // head+tail preview). The full body is stashed for slice/search.
+        let prompt_data =
+            digest_tool_result(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id);
+        ctx.content_gate.admit_simple(&prompt_data).into_text()
     } else if ctx.core.specialist_provider.is_some()
         && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > threshold
     {
@@ -1195,11 +1183,8 @@ async fn inject_tool_result(
             )
             .await
             .into_text();
-        let mut preview = if must_preserve_unstashed_raw(&result_data, cap, stashed_raw) {
-            result_data.clone()
-        } else {
-            build_tool_result_preview(&r.tool_name, &r.arguments, &summarized, cap, &r.tool_id)
-        };
+        let mut preview =
+            build_tool_result_preview(&r.tool_name, &r.arguments, &summarized, cap, &r.tool_id);
         // If the summary fit under cap, build_tool_result_preview returned it
         // unchanged with no recall pointer — but the raw IS stashed, so tell
         // the model it can still recover the original.
@@ -1776,11 +1761,7 @@ mod tests {
         )
         .await
         .expect("fresh-key stash of oversized data must succeed");
-        let injected = if must_preserve_unstashed_raw(&data, cap, stashed) {
-            data.clone()
-        } else {
-            digest_tool_result("read_file", &HashMap::new(), &data, cap, "call_stored")
-        };
+        let injected = digest_tool_result("read_file", &HashMap::new(), &data, cap, "call_stored");
 
         assert!(stashed);
         assert!(injected.contains("recall_tool_result"));
@@ -1818,17 +1799,13 @@ mod tests {
         )
         .await
         .expect("fresh-key stash must succeed");
-        let injected = if must_preserve_unstashed_raw(&data, 10_000, stashed) {
-            data.clone()
-        } else {
-            digest_tool_result(
-                "read_file",
-                &HashMap::new(),
-                &data,
-                10_000,
-                "call_replay_cap",
-            )
-        };
+        let injected = digest_tool_result(
+            "read_file",
+            &HashMap::new(),
+            &data,
+            10_000,
+            "call_replay_cap",
+        );
 
         assert!(stashed);
         assert!(injected.contains("recall_tool_result"));

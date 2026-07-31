@@ -407,10 +407,11 @@ mod tests {
 
     async fn seed(db_path: &PathBuf, session_id: &str, call_id: &str, body: &str) {
         let db = SessionDb::new(db_path);
-        assert!(
-            db.store_tool_result(session_id, call_id, "exec", body)
-                .await
-        );
+        assert!(matches!(
+            db.store_tool_result_immutable(session_id, call_id, "exec", body)
+                .await,
+            crate::session::db::StoredResult::Stored { .. }
+        ));
     }
 
     #[tokio::test]

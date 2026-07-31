@@ -11,7 +11,7 @@ use base64::Engine;
 use chrono::Local;
 use serde_json::{json, Value};
 
-use crate::agent::context_hygiene::{cap_tool_result_for_replay, tool_result_ok};
+use crate::agent::context_hygiene::tool_result_ok;
 
 use crate::agent::memory::MemoryStore;
 use crate::agent::skills::SkillsLoader;
@@ -1148,22 +1148,15 @@ impl ContextBuilder {
         result: &str,
         ok: bool,
     ) {
-        // Handles are already canonical + bounded — capping them would
-        // corrupt the stable marker. Recalled bytes are also one-shot raw.
-        // All other bodies get the deterministic replay cap.
-        let content = if tool_name == "recall_tool_result"
-            || result.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
-        {
-            result.to_string()
-        } else {
-            cap_tool_result_for_replay(result)
-        };
+        // Handles are canonical + bounded; recalled bytes are one-shot raw.
+        // All other content reaching here is already bounded by inject_tool_result
+        // (small raw, digest, preview, or handle) — no cap needed.
         messages.push(json!({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
             "ok": ok,
-            "content": content,
+            "content": result,
         }));
     }
 
@@ -1194,21 +1187,12 @@ impl ContextBuilder {
         result: &str,
         ok: bool,
     ) {
-        // Handles are already canonical + bounded — capping them would
-        // corrupt the stable marker. Recalled bytes are also one-shot raw.
-        let content = if tool_name == "recall_tool_result"
-            || result.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
-        {
-            result.to_string()
-        } else {
-            cap_tool_result_for_replay(result)
-        };
         messages.push(json!({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
             "ok": ok,
-            "content": content,
+            "content": result,
         }));
     }
 
@@ -2359,14 +2343,16 @@ mod tests {
     }
 
     #[test]
-    fn test_add_tool_result_applies_replay_cap_before_live_prompt() {
+    fn test_add_tool_result_passes_content_through_verbatim() {
+        // Under the handles-not-bodies design, add_tool_result* is a pure
+        // structuring helper — the caller (inject_tool_result) is responsible
+        // for bounding content (handle, small raw, digest, or preview). A body
+        // reaching here is stored verbatim so the handle bytes or excerpt the
+        // caller produced are what the prompt and SQLite see.
         let mut messages: Vec<Value> = Vec::new();
-        let body = "x".repeat(crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES + 1024);
-        ContextBuilder::add_tool_result(&mut messages, "c1", "read_file", &body);
-
-        let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.len() < body.len());
-        assert!(content.ends_with("[tool output truncated]"));
+        let body = "exact bytes that the caller already bounded";
+        ContextBuilder::add_tool_result(&mut messages, "c1", "read_file", body);
+        assert_eq!(messages[0]["content"].as_str().unwrap(), body);
     }
 
     #[test]
@@ -2459,14 +2445,12 @@ mod tests {
     }
 
     #[test]
-    fn test_add_tool_result_immutable_caps_after_wrapping() {
+    fn test_add_tool_result_immutable_passes_content_through_verbatim() {
+        // Same as the non-immutable variant: pure passthrough, no capping.
         let mut messages: Vec<Value> = Vec::new();
-        let body = "x".repeat(crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES + 1024);
-        ContextBuilder::add_tool_result_immutable(&mut messages, "c1", "read_file", &body);
-
-        let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.len() < body.len() + 128);
-        assert!(content.ends_with("[tool output truncated]"));
+        let body = "exact bytes that the caller already bounded";
+        ContextBuilder::add_tool_result_immutable(&mut messages, "c1", "read_file", body);
+        assert_eq!(messages[0]["content"].as_str().unwrap(), body);
     }
 
     #[test]

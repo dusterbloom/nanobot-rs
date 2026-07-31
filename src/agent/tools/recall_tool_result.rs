@@ -88,10 +88,11 @@ mod tests {
         let db_path = dir.path().join("sessions.db");
         let db = crate::session::db::SessionDb::new(&db_path);
         let session = db.create_session("cli:restart-recall").await;
-        assert!(
-            db.store_tool_result(&session.id, "call_restart", "exec", "durable body")
-                .await
-        );
+        assert!(matches!(
+            db.store_tool_result_immutable(&session.id, "call_restart", "exec", "durable body")
+                .await,
+            crate::session::db::StoredResult::Stored { .. }
+        ));
 
         let tool = RecallToolResultTool::with_db(db_path, session.id);
         let result = tool
@@ -111,14 +112,16 @@ mod tests {
         let db = crate::session::db::SessionDb::new(&db_path);
         let first = db.create_session("cli:first").await;
         let second = db.create_session("cli:second").await;
-        assert!(
-            db.store_tool_result(&first.id, "call_1", "exec", "first body")
-                .await
-        );
-        assert!(
-            db.store_tool_result(&second.id, "call_1", "exec", "second body")
-                .await
-        );
+        assert!(matches!(
+            db.store_tool_result_immutable(&first.id, "call_1", "exec", "first body")
+                .await,
+            crate::session::db::StoredResult::Stored { .. }
+        ));
+        assert!(matches!(
+            db.store_tool_result_immutable(&second.id, "call_1", "exec", "second body")
+                .await,
+            crate::session::db::StoredResult::Stored { .. }
+        ));
 
         let params = HashMap::from([(
             "tool_call_id".to_string(),
