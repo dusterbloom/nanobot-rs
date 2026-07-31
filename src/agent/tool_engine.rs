@@ -107,42 +107,12 @@ fn must_preserve_unstashed_raw(data: &str, cap: usize, stashed: bool) -> bool {
     data.chars().count() > cap && !stashed
 }
 
-fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> String {
-    let mut parts = Vec::new();
-    for key in [
-        "path",
-        "lines",
-        "query",
-        "pattern",
-        "url",
-        "command",
-        "glob",
-        "max_lines",
-    ] {
-        if let Some(value) = args.get(key) {
-            let rendered = value
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| value.to_string());
-            parts.push(format!("{}={}", key, rendered));
-        }
-    }
-
-    let summary = if parts.is_empty() {
-        "(arguments omitted)".to_string()
-    } else {
-        parts.join(", ")
-    };
-
-    summary.chars().take(260).collect()
-}
-
 /// Build a head+tail preview of `data` (≤ `cap` chars) with a `recall_tool_result`
 /// pointer to `tool_call_id`. Assumes the full body is ALREADY stashed (by the
 /// caller) when `data` was truncated — this only shapes the in-context preview.
 fn build_tool_result_preview(
     tool_name: &str,
-    args: &std::collections::HashMap<String, Value>,
+    _args: &std::collections::HashMap<String, Value>,
     data: &str,
     cap: usize,
     tool_call_id: &str,
@@ -151,44 +121,23 @@ fn build_tool_result_preview(
     if total_chars <= cap {
         return data.to_string();
     }
-    let source = tool_arg_summary(args);
     let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
     // A recalled body that is still too large for live context must NOT point
-    // back at recall_tool_result (circular — the model just recalled it and
+    // back at recall_tool_result (circular: the model just recalled it and
     // would loop). The full body is stashed under this id; direct the model at
     // slice_tool_result / search_tool_result to query it without reloading.
-    let is_recall = tool_name == "recall_tool_result";
-    let header = if is_recall {
+    let header = if tool_name == "recall_tool_result" {
         format!(
-            "[recalled output still too large for context: {total_chars} chars (~{estimated_tokens} tokens); \
-             head+tail shown — use slice_tool_result or search_tool_result with \
-             tool_call_id=\"{tool_call_id}\" to query this body without reloading it]\n"
-        )
-    } else {
-        format!(
-            "[truncated: {tool_name}({source}) returned {total_chars} chars (~{estimated_tokens} tokens); \
-             head+tail shown — call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output, \
-             or search_tool_result/slice_tool_result to query it without loading the whole body]\n"
-        )
-    };
-    let compact_header = if is_recall {
-        format!(
-            "[recalled output too large: {total_chars} chars (~{estimated_tokens} tokens); \
+            "[recalled output still too large (~{estimated_tokens} tokens); \
              use slice_tool_result/search_tool_result with tool_call_id=\"{tool_call_id}\"]\n"
         )
     } else {
         format!(
-            "[truncated: {tool_name} returned {total_chars} chars (~{estimated_tokens} tokens); \
-             call recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for the full output; \
-             search_tool_result/slice_tool_result can query it]\n"
+            "[truncated: {tool_name}, ~{estimated_tokens} tokens; \
+             recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for full]\n"
         )
     };
     let footer = "\n[...]\n";
-    let header = if header.chars().count() + footer.chars().count() + 80 <= cap {
-        header
-    } else {
-        compact_header
-    };
     let fixed_chars = header.chars().count() + footer.chars().count();
     if fixed_chars >= cap {
         return header;
@@ -238,7 +187,7 @@ fn digest_tool_result(
 #[allow(dead_code)]
 fn compact_inline_tool_result(
     tool_name: &str,
-    args: &std::collections::HashMap<String, Value>,
+    _args: &std::collections::HashMap<String, Value>,
     data: &str,
     max_chars: usize,
 ) -> String {
@@ -247,11 +196,10 @@ fn compact_inline_tool_result(
         return data.to_string();
     }
 
-    let source = tool_arg_summary(args);
     let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
     let header = format!(
-        "[truncated: {tool_name}({source}) returned {total_chars} chars (~{estimated_tokens} tokens); \
-         head+tail shown — re-request with a narrower range/query if the middle is needed]\n"
+        "[truncated: {tool_name}, ~{estimated_tokens} tokens; \
+         head+tail shown, re-request with a narrower range/query for the middle]\n"
     );
 
     let footer = "\n[...]\n";
@@ -1565,9 +1513,7 @@ mod tests {
         let compacted = compact_inline_tool_result("read_file", &args, &data, 900);
 
         assert!(compacted.chars().count() <= 900);
-        assert!(compacted.contains("[truncated: read_file("));
-        assert!(compacted.contains("path=src/lib.rs"));
-        assert!(compacted.contains("lines=1:1000"));
+        assert!(compacted.contains("[truncated: read_file"));
         assert!(compacted.contains("re-request with a narrower range/query"));
         assert!(compacted.contains("\n[...]\n"));
         assert!(!compacted.contains("MIDDLE_SHOULD_BE_OMITTED"));

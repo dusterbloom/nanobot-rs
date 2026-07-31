@@ -486,8 +486,8 @@ impl Tool for ListDirTool {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| ".".to_string());
                     output.push_str(&format!(
-                        "\n\n⚠ This is your internal workspace (memory, skills, config). \
-                         The user's project is at: {cwd} — use list_dir on that path instead."
+                        "\n\nNote: this is your internal workspace (memory, skills, config). \
+                         The user's project is at: {cwd} - use list_dir on that path instead."
                     ));
                 }
 
@@ -655,18 +655,11 @@ impl Tool for FindFilesTool {
 
         matches.sort_by(|a, b| a.rel.cmp(&b.rel));
         let total = matches.len();
-        if total == 0 {
-            return format!(
-                "No matches under {} for pattern=\"{}\" kind={} max_depth={}",
-                path, pattern, kind, max_depth
-            );
-        }
-
         let shown = total.min(limit);
-        let mut out = format!(
-            "Found {} match(es) under {} for pattern=\"{}\" kind={} max_depth={} (showing {})",
-            total, path, pattern, kind, max_depth, shown
-        );
+        if total == 0 {
+            return format!("No matches under {} for pattern=\"{}\".", path, pattern);
+        }
+        let mut out = format!("{} matches (showing {}):", total, shown);
         for item in matches.iter().take(limit) {
             out.push('\n');
             if tree {
@@ -820,7 +813,6 @@ impl Tool for SearchFilesTool {
 
         let root_canon = root.canonicalize().unwrap_or(root.clone());
         let mut stack = vec![(root.clone(), 0usize)];
-        let mut files_seen = 0usize;
         let mut files_searched = 0usize;
         let mut skipped_binary = 0usize;
         let mut skipped_large = 0usize;
@@ -885,7 +877,6 @@ impl Tool for SearchFilesTool {
                     continue;
                 }
 
-                files_seen += 1;
                 let metadata = match entry.metadata() {
                     Ok(m) => m,
                     Err(_) => {
@@ -927,28 +918,22 @@ impl Tool for SearchFilesTool {
             }
         }
 
-        let mut out = format!(
-            "Searched {} file(s) under {} for {} query {:?}; found {} matching line(s) (showing {})",
-            files_searched,
-            path,
-            if regex { "regex" } else { "text" },
-            query,
-            matched_lines,
-            out_lines.len().min(limit)
-        );
-        if files_seen != files_searched
-            || skipped_binary > 0
-            || skipped_large > 0
-            || skipped_unreadable > 0
-        {
+        let shown = out_lines.len().min(limit);
+        let mut out = if out_lines.is_empty() {
+            format!("No matches for {:?} under {}.", query, path)
+        } else {
+            format!(
+                "Found {} matching line(s) in {} file(s); showing {}",
+                matched_lines, files_searched, shown
+            )
+        };
+        if skipped_large > 0 || skipped_binary > 0 || skipped_unreadable > 0 {
             out.push_str(&format!(
-                "\nSkipped: {} large, {} binary, {} unreadable ({} candidate file(s) seen)",
-                skipped_large, skipped_binary, skipped_unreadable, files_seen
+                "\nSkipped: {} large, {} binary, {} unreadable",
+                skipped_large, skipped_binary, skipped_unreadable
             ));
         }
-        if out_lines.is_empty() {
-            out.push_str("\nNo matches.");
-        } else {
+        if !out_lines.is_empty() {
             out.push('\n');
             out.push_str(&out_lines.join("\n"));
         }
@@ -1590,9 +1575,7 @@ fn render_range(
         let chunk_len = end.saturating_sub(start).saturating_add(1).max(1);
         let next_end = (end + chunk_len).min(total);
         out.push_str(&format!(
-            "\n[{} more lines — only if the task needs later lines, continue with lines=\"{}:{}\"; \
-             use read_file with the same path; do not use slice_tool_result or \
-             search_tool_result because this result is not stashed]",
+            "\n[{} more lines; next: read_file lines=\"{}:{}\"]",
             total - end,
             end + 1,
             next_end
@@ -1840,18 +1823,8 @@ mod tests {
             "read_file must never head+tail-truncate"
         );
         assert!(
-            result.contains("more lines — only if the task needs later lines"),
+            result.contains("more lines; next: read_file lines="),
             "must tell the model the next range: {result}"
-        );
-        assert!(
-            result.contains(
-                "use read_file with the same path; do not use slice_tool_result or search_tool_result"
-            ),
-            "continuation must distinguish direct file paging from stashed artifacts: {result}"
-        );
-        assert!(
-            result.contains("only if the task needs later lines"),
-            "paging must not compel an unnecessary whole-file read: {result}"
         );
         // Budget-bounded: never reaches line 1000 (each line renders ~13 chars,
         // budget allows ~500). The first line is always present.
@@ -1891,7 +1864,7 @@ mod tests {
             result.len()
         );
         assert!(
-            result.contains("more lines — only if the task needs later lines"),
+            result.contains("more lines; next: read_file lines="),
             "{result}"
         );
     }
@@ -1917,7 +1890,7 @@ mod tests {
             result.len()
         );
         assert!(
-            result.contains("more lines — only if the task needs later lines"),
+            result.contains("more lines; next: read_file lines="),
             "{result}"
         );
     }
@@ -1946,7 +1919,7 @@ mod tests {
         assert!(result.contains("  40: line 40"), "{result}");
         assert!(!result.contains(" 41: line 41"), "{result}");
         assert!(
-            result.contains("more lines — only if the task needs later lines"),
+            result.contains("more lines; next: read_file lines="),
             "must point at the next range"
         );
     }
@@ -2138,7 +2111,7 @@ mod tests {
         );
         assert!(out.contains("of 5000)"), "header reports the true total");
         assert!(
-            out.contains("more lines — only if the task needs later lines"),
+            out.contains("more lines; next: read_file lines="),
             "must point at the next range"
         );
         assert!(out.contains("   1:"), "range starts at line 1");
@@ -2175,7 +2148,7 @@ mod tests {
             out.chars().count()
         );
         assert!(
-            out.contains("more lines — only if the task needs later lines"),
+            out.contains("more lines; next: read_file lines="),
             "must still point at the next range"
         );
         assert!(out.contains("   1:"), "range starts at line 1");
@@ -2542,7 +2515,7 @@ mod tests {
         params.insert("context".to_string(), serde_json::json!(1));
         let result = tool.execute(params).await;
 
-        assert!(result.contains("found 1 matching line"), "{result}");
+        assert!(result.contains("Found 1 matching line"), "{result}");
         assert!(result.contains("src/lib.rs:1- alpha"), "{result}");
         assert!(result.contains("src/lib.rs:2: Needle here"), "{result}");
         assert!(result.contains("src/lib.rs:3- omega"), "{result}");

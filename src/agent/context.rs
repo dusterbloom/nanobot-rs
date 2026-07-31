@@ -1192,16 +1192,12 @@ impl ContextBuilder {
         result: &str,
         ok: bool,
     ) {
-        let wrapped = format!(
-            "[VERBATIM TOOL OUTPUT — do not paraphrase]\n{}\n[END TOOL OUTPUT]",
-            result
-        );
-        // Same one-shot recall rule as `add_tool_result`: provenance wrapping
-        // is visible live, while SQLite replay later emits only a reference.
+        // The "quote verbatim" instruction lives in the system prompt; the
+        // result body is stored bare so replay doesn't bloat per-result.
         let content = if tool_name == "recall_tool_result" {
-            wrapped
+            result.to_string()
         } else {
-            cap_tool_result_for_replay(&wrapped)
+            cap_tool_result_for_replay(result)
         };
         messages.push(json!({
             "role": "tool",
@@ -2446,9 +2442,8 @@ mod tests {
         assert_eq!(messages[0]["tool_call_id"], "call_1");
         assert_eq!(messages[0]["name"], "read_file");
         let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.starts_with("[VERBATIM TOOL OUTPUT"));
-        assert!(content.contains("file content"));
-        assert!(content.ends_with("[END TOOL OUTPUT]"));
+        // Bare body — verbatim instruction lives in the system prompt, not per-result.
+        assert_eq!(content, "file content");
     }
 
     #[test]
@@ -2456,8 +2451,7 @@ mod tests {
         let mut messages: Vec<Value> = Vec::new();
         ContextBuilder::add_tool_result_immutable(&mut messages, "c1", "exec", "");
         let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.contains("[VERBATIM TOOL OUTPUT"));
-        assert!(content.contains("[END TOOL OUTPUT]"));
+        assert_eq!(content, "");
     }
 
     #[test]
@@ -2468,7 +2462,6 @@ mod tests {
 
         let content = messages[0]["content"].as_str().unwrap();
         assert!(content.len() < body.len() + 128);
-        assert!(content.starts_with("[VERBATIM TOOL OUTPUT"));
         assert!(content.ends_with("[tool output truncated]"));
     }
 

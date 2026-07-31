@@ -137,20 +137,18 @@ fn render_slice_page(
 
     let header = |last_line: usize| {
         let page_status = if last_line < total {
-            format!("next_start={}", last_line + 1)
+            format!("next={}", last_line + 1)
         } else {
-            "end of result".to_string()
+            "end".to_string()
         };
         format!(
-            "[artifact_tool_call_id={artifact_tool_call_id}; stashed lines {clamped_start}-{last_line} of {total}; {page_status}; \
-             use artifact_tool_call_id for follow-up search_tool_result/slice_tool_result calls; never use this slice call's ID]\n"
+            "[source={artifact_tool_call_id} lines {clamped_start}-{last_line}/{total} {page_status}]\n"
         )
     };
 
     if clamped_start > total {
         return format!(
-            "[artifact_tool_call_id={artifact_tool_call_id}; lines {clamped_start}-{clamped_end} are out of range (file has {total} lines); \
-             use artifact_tool_call_id for follow-up search_tool_result/slice_tool_result calls; never use this slice call's ID]"
+            "[source={artifact_tool_call_id} lines {clamped_start}-{clamped_end} out of range (file has {total} lines)]"
         );
     }
 
@@ -177,8 +175,7 @@ fn render_slice_page(
     match last_line {
         Some(last_line) => format!("{}{}", header(last_line), rows.join("\n")),
         None => format!(
-            "[artifact_tool_call_id={artifact_tool_call_id}; stashed line {clamped_start} exceeds the {MAX_OUTPUT_CHARS}-character page limit; \
-             next_start={clamped_start}; use artifact_tool_call_id for follow-up search_tool_result/slice_tool_result calls; never use this slice call's ID]"
+            "[source={artifact_tool_call_id} line {clamped_start} exceeds the {MAX_OUTPUT_CHARS}-char page limit; next={clamped_start}]"
         ),
     }
 }
@@ -508,9 +505,7 @@ mod tests {
             ]))
             .await;
         assert!(
-            first_page.starts_with(
-                "[artifact_tool_call_id=call_page; stashed lines 10-60 of 100; next_start=61;"
-            ),
+            first_page.starts_with("[source=call_page lines 10-60/100 next=61]"),
             "slice must tell the model how to request the next page: {first_page}"
         );
 
@@ -521,9 +516,7 @@ mod tests {
             ]))
             .await;
         assert!(
-            last_page.starts_with(
-                "[artifact_tool_call_id=call_page; stashed lines 90-100 of 100; end of result;"
-            ),
+            last_page.starts_with("[source=call_page lines 90-100/100 end]"),
             "slice must tell the model that paging is complete: {last_page}"
         );
     }
@@ -542,12 +535,8 @@ mod tests {
             .await;
 
         assert!(
-            out.starts_with("[artifact_tool_call_id=artifact_read_7; "),
+            out.starts_with("[source=artifact_read_7 "),
             "every page must repeat the immutable source artifact id: {out}"
-        );
-        assert!(
-            out.contains("never use this slice call's ID"),
-            "the receipt must prevent a model from chaining through a transient slice call id: {out}"
         );
     }
 
@@ -571,7 +560,7 @@ mod tests {
 
         assert!(out.chars().count() <= MAX_OUTPUT_CHARS);
         let next_start = out
-            .split("next_start=")
+            .split("next=")
             .nth(1)
             .and_then(|tail| tail.split(|c: char| !c.is_ascii_digit()).next())
             .and_then(|n| n.parse::<usize>().ok())

@@ -1593,7 +1593,7 @@ impl SessionDb {
     ) -> Vec<SearchResult> {
         let mut sql = "SELECT m.session_id, s.session_key, m.role,
                               CAST(m.content AS TEXT), m.timestamp,
-                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snip, rank
+                              snippet(messages_fts, 0, '', '', '...', 80) as snip, rank
                        FROM messages_fts
                        JOIN messages m ON m.id = messages_fts.rowid
                        JOIN sessions s ON s.id = m.session_id

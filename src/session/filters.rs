@@ -1265,10 +1265,22 @@ mod tests {
             "replay reference must stay compact, got {} bytes",
             content.len()
         );
-        assert!(content.contains("shown raw once"));
-        assert!(content.contains("TOOL_OUTPUT_DIGEST v1"));
-        assert!(content.contains("len:13000"));
-        assert!(content.contains("original_tool_call"));
+        assert!(
+            content.contains("recalled earlier"),
+            "replay reference must be the short receipt: {content}"
+        );
+        assert!(
+            !content.contains("TOOL_OUTPUT_DIGEST"),
+            "replay reference must not embed the noisy digest hash: {content}"
+        );
+        assert!(
+            !content.contains("len:"),
+            "replay reference must not embed byte length: {content}"
+        );
+        assert!(
+            content.contains("original_tool_call"),
+            "replay reference must keep the recovery tool_call_id: {content}"
+        );
         assert!(!content.contains(&"x".repeat(100)));
     }
 

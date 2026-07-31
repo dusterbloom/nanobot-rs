@@ -37,7 +37,7 @@ const TRUNCATED_ASSISTANT_PLACEHOLDER: &str = "[assistant message truncated]";
 #[derive(Clone, Copy, Debug)]
 pub enum ToolBodyPolicy {
     /// Cap the body to at most this many bytes (backed off to a UTF-8 char
-    /// boundary), appending the `…[tool output truncated]` marker.
+///   boundary), appending the `...[tool output truncated]` marker.
     ByteCap(usize),
     /// Replace bodies longer than `preview_len` bytes with a digest marker
     /// (sha256 prefix + original length + single-line preview).
@@ -84,22 +84,18 @@ pub(crate) fn tool_result_ok(content: &str) -> bool {
 /// reloads, replaying those bytes would turn a one-time explicit recall into a
 /// permanent prompt balloon. Keep only identity and the exact re-recall handle.
 pub(crate) fn recall_tool_result_replay_reference(
-    content: &str,
+    _content: &str,
     source_tool_call_id: Option<&str>,
 ) -> String {
-    let digest = tool_output_digest(content, 0);
     let recall_hint = source_tool_call_id.map(|id| {
         let encoded_id = serde_json::to_string(id).unwrap_or_else(|_| "\"<tool_call_id>\"".into());
         format!(
-            "; exact bytes remain in SQLite; recall again with recall_tool_result({{\"tool_call_id\": {encoded_id}}})"
+            r#", re-call recall_tool_result({{"tool_call_id": {encoded_id}}}) for bytes"#
         )
     });
     format!(
-        "[recall_tool_result output was shown raw once and is omitted from replay; {digest}{}]",
-        recall_hint.unwrap_or_else(|| {
-            "; exact bytes remain in SQLite; use the tool_call_id from the recall call if needed"
-                .to_string()
-        })
+        "[recalled earlier; raw output omitted from replay{}]",
+        recall_hint.unwrap_or_default()
     )
 }
 
@@ -119,7 +115,7 @@ pub fn shrink_tool_body(content: &str, policy: ToolBodyPolicy) -> Option<String>
             while end > 0 && !content.is_char_boundary(end) {
                 end -= 1;
             }
-            Some(format!("{}\n…[tool output truncated]", &content[..end]))
+            Some(format!("{}\n...[tool output truncated]", &content[..end]))
         }
         ToolBodyPolicy::Digest { preview_len } => {
             if content.len() <= preview_len {
@@ -528,7 +524,7 @@ mod tests {
         // Cap landing inside a multi-byte char must back off to a boundary.
         let s = format!("{}é tail", "x".repeat(9)); // 'é' spans bytes 9..11
         let capped = shrink_tool_body(&s, ToolBodyPolicy::ByteCap(10)).unwrap();
-        assert_eq!(capped, "xxxxxxxxx\n…[tool output truncated]");
+        assert_eq!(capped, "xxxxxxxxx\n...[tool output truncated]");
 
         // Over-threshold digest emits the digest marker.
         let long = "y".repeat(300);
