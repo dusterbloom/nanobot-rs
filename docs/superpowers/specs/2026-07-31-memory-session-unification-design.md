@@ -126,21 +126,32 @@ Three contract changes (each kills a documented failure mode):
 
 ### 3.4 Structural `MissingArg` (root-cause fix)
 
-`Tool::execute` changes from `String` to `Result<String, ToolError>`, where:
+The structured-error slot **already exists**: `ToolExecutionResult` carries
+`error_kind: Option<crate::errors::ToolErrorKind>` (base.rs:64-71), and
+`execute_with_result` is the override hook tools use to report structured
+outcomes. The fix extends the existing `ToolErrorKind` enum rather than
+changing `execute()`'s signature:
 
 ```rust
-enum ToolError {
+// in crate::errors
+enum ToolErrorKind {
+    // ...existing variants...
     MissingArg { param: String, example: String },
-    Other(String),
 }
 ```
 
-The registry matches `ToolError::MissingArg { param, example }` (not prose) and
+Tools that need a corrective empty-arg path override `execute_with_result` to
+return `ToolExecutionResult { ok: false, data: <human message>, error_kind:
+Some(ToolErrorKind::MissingArg { param, example }), .. }`. The registry's gate
+at `execute_inner` (registry.rs:677) switches from the fragile substring test
+(`result.data.contains("is required")`) to a structural test
+(`matches!(result.error_kind, Some(ToolErrorKind::MissingArg { .. }))`) and
 appends the canonical call-shape from `example`. Every tool's empty-arg path
 becomes self-correcting in one mechanism — `recall`, `remember`, `lcm_expand`
-fixed together. Tools return `Ok(String)` for success, `Err(ToolError::MissingArg{..})`
-for a correctable empty/wrong-arg call, `Err(ToolError::Other(s))` for other
-errors (the existing "Error: "-prefixed strings).
+fixed together, with **no change to the `execute()` signature** (so the ~all
+tool impls that return `String` are untouched). The existing substring-gate
+test (`test_missing_required_arg_error_appends_schema_derived_example`,
+registry.rs:3259) is updated to the structural path.
 
 ### 3.5 Unify the two FTS tokenizers
 Align knowledge.db's `chunks_fts` from bare `unicode61` to `porter unicode61` to
@@ -184,23 +195,24 @@ evidence source.
 
 ## 5. Migration & risk
 
-- **Trait change is the widest blast radius.** `String → Result<String, ToolError>`
-  touches ~all tool impls. Land as **one atomic commit; let `rustc` drive** —
-  change the trait, the compiler enumerates every impl/caller to fix (same
-  technique as the Phase-09 Wave-4 field deletion). Existing string-asserting
-  tests adjust mechanically.
+- **`MissingArg` is low blast-radius** thanks to the existing `error_kind` slot:
+  extend `ToolErrorKind`, switch the registry gate, and only tools that need the
+  corrective path override `execute_with_result`. `execute()` signatures stay
+  `String` — no wide migration.
 - **`remember` list removal / `session_search`+`search_context` dissolution** —
   logic migrates into `recall`; old tool files become thin alias dispatchers (or
-  delete + alias-map entries). No internal caller depends on `remember(action=list)`.
+  delete + alias-map entries via the existing `normalize_tool_request`). No
+  internal caller depends on `remember(action=list)`.
 - **knowledge.db FTS rebuild** — auto on open, idempotent, no data loss.
-- **Aliases** keep old session `tool_calls` replaying — no history migration.
+- **Aliases** (via `normalize_tool_request`) keep old session `tool_calls`
+  replaying — no history migration.
 
 ## 6. Order of operations (for the implementation plan)
 
-1. Trait change + `MissingArg` (foundation, compiler-driven) + e2e #1.
+1. `ToolErrorKind::MissingArg` + registry gate switch (structural foundation, low blast-radius) + e2e #1.
 2. `remember` hardening + batch + e2e #2, #5.
-3. Dissolve into `recall` + alias shim + trust-ranking + e2e #3, #4.
-4. FTS tokenizer unification + worked-shapes + e2e #6.
+3. Dissolve into `recall` + alias shim (via `normalize_tool_request`) + trust-ranking + e2e #3, #4.
+4. FTS tokenizer unification + worked-shapes (both identity paths) + e2e #6.
 
 Each step ships independently green (unit + e2e).
 
