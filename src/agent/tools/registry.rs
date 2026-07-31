@@ -674,8 +674,22 @@ impl ToolRegistry {
         // required" does not teach the shape, so the model retries identically
         // until the dedup guard terminates the turn. Generic across every tool
         // — reads the schema, no per-tool hardcoding.
-        if !result.ok && result.data.contains("is required") {
-            if let Some(example) = Self::worked_example_call(&name, &tool.parameters()) {
+        // Structural path: a tool that set `error_kind = MissingArg` carries
+        // the canonical example directly — no string matching. Back-compat:
+        // legacy tools whose error string still contains "is required" (e.g.
+        // recall's "'query' parameter is required") keep getting a
+        // schema-derived example until they migrate to the structured path.
+        if !result.ok {
+            let example = match &result.error_kind {
+                Some(crate::errors::ToolErrorKind::MissingArg { example, .. }) => {
+                    Some(example.clone())
+                }
+                _ if result.data.contains("is required") => {
+                    Self::worked_example_call(&name, &tool.parameters())
+                }
+                _ => None,
+            };
+            if let Some(example) = example {
                 let base = result.data.trim_end_matches('.');
                 result.data = format!("{}. Call as {}.", base, example);
             }
@@ -3303,6 +3317,59 @@ mod tests {
         assert!(
             result.data.contains("'query' parameter is required"),
             "augmentation must preserve the original error: {}",
+            result.data
+        );
+    }
+
+    /// Structural path: a tool that sets `error_kind = MissingArg` gets its
+    /// worked example appended EVEN when its data string lacks the "is
+    /// required" substring — the failure mode that left `remember` and
+    /// `lcm_expand` unaugmented under the old substring gate.
+    #[tokio::test]
+    async fn missing_arg_error_kind_appends_structured_example() {
+        use crate::agent::tools::base::ToolExecutionResult;
+
+        struct StructuredMissingArg;
+        #[async_trait]
+        impl Tool for StructuredMissingArg {
+            fn name(&self) -> &str {
+                "structured_missing_arg"
+            }
+            fn description(&self) -> &str {
+                "test"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{"facts":{"type":"array"}}})
+            }
+            async fn execute(&self, _: HashMap<String, serde_json::Value>) -> String {
+                "Error: provide facts".to_string() // NOTE: no "is required" substring
+            }
+            async fn execute_with_result(
+                &self,
+                _: HashMap<String, serde_json::Value>,
+            ) -> ToolExecutionResult {
+                ToolExecutionResult {
+                    ok: false,
+                    data: "Error: provide facts".to_string(),
+                    error: None,
+                    error_kind: Some(crate::errors::ToolErrorKind::MissingArg {
+                        param: "facts".to_string(),
+                        example: r#"structured_missing_arg({"facts":["..."]})"#.to_string(),
+                    }),
+                }
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StructuredMissingArg));
+
+        let result = registry
+            .execute("structured_missing_arg", HashMap::new())
+            .await;
+        assert!(!result.ok, "must still report failure");
+        assert!(
+            result.data.contains(r#"Call as structured_missing_arg({"facts":["..."]})"#),
+            "structural MissingArg must append the example from error_kind: {}",
             result.data
         );
     }

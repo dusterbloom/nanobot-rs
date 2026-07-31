@@ -114,6 +114,9 @@ pub enum ToolErrorKind {
 
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    #[error("Missing required argument '{param}'; call as {example}")]
+    MissingArg { param: String, example: String },
 }
 
 impl ToolErrorKind {
