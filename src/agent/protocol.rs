@@ -534,6 +534,95 @@ pub fn parse_xml_tool_calls(text: &str) -> Vec<ParsedToolCall> {
         });
     }
 
+    // Lenient fallback: recover TRUNCATED markup. Local models sometimes emit
+    // the opening `<tool_call><function=…><parameter=…>` tags and stop without
+    // any closing tag; the strict block regex needs `</tool_call>` so it returns
+    // nothing, and the response would be discarded as pathological — forcing
+    // the user to re-roll until the model emits a native call (2026-07-30
+    // incident). Only engages when strict parsing found nothing AND no block
+    // was ever closed (pure truncation), so well-formed input is unaffected.
+    // Strictness on the function NAME is preserved; only the closing is lenient.
+    if result.is_empty() {
+        result.extend(parse_xml_tool_calls_lenient(text));
+    }
+
+    result
+}
+
+/// Recover tool calls from truncated Hermes-style markup that never wrote a
+/// closing tag. Engages only when the strict parser found nothing, the text
+/// contains `<tool_call>`, and contains NO `</tool_call>` (pure truncation —
+/// mixed partially-closed input is left to the strict/parser/pathological path
+/// to avoid any regression). Function-name matching stays strict.
+fn parse_xml_tool_calls_lenient(text: &str) -> Vec<ParsedToolCall> {
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("<tool_call>") || lower.contains("</tool_call>") {
+        return Vec::new();
+    }
+    let open_tag = "<tool_call>".len();
+    let mut result = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = lower[cursor..].find("<tool_call>") {
+        let start = cursor + rel;
+        let inner_start = start + open_tag;
+        // Inner runs to the next `<tool_call>` opening or EOF (there are no
+        // closers by the guard above).
+        let inner_end = lower[inner_start..]
+            .find("<tool_call>")
+            .map(|r| inner_start + r)
+            .unwrap_or(text.len());
+        cursor = inner_end;
+        let inner = &text[inner_start..inner_end];
+
+        let tool_name = match XML_FUNCTION_NAME_RE.captures(inner) {
+            Some(cap) => cap[1].trim().to_string(),
+            None => continue,
+        };
+
+        let mut args = serde_json::Map::new();
+        // Lenient parameters: `<parameter=KEY>` value runs to the NEAREST of the
+        // next `<parameter=`, `</parameter>`, or end of inner. Taking the
+        // nearest (not a fixed `or_else` priority) prevents one parameter from
+        // swallowing a sibling when closers are missing or reordered.
+        let mut p = 0usize;
+        while let Some(po_rel) = inner[p..].find("<parameter=") {
+            let po = p + po_rel;
+            let key_start = po + "<parameter=".len();
+            let Some(key_end_rel) = inner[key_start..].find('>') else { break };
+            let key = inner[key_start..key_start + key_end_rel].trim();
+            let val_start = key_start + key_end_rel + 1;
+            let tail = &inner[val_start..];
+            let val_end_rel = [
+                tail.find("</parameter>"),
+                tail.find("<parameter="),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(tail.len());
+            let value = tail[..val_end_rel].trim();
+            if !key.is_empty() {
+                let json_val = serde_json::from_str::<Value>(value)
+                    .unwrap_or_else(|_| Value::String(value.to_string()));
+                args.insert(key.to_string(), json_val);
+            }
+            p = val_start + val_end_rel;
+        }
+
+        // Gate: only recover blocks that look like a real tool attempt — i.e.
+        // at least one complete `<parameter=KEY>` was parsed. A block with just
+        // `<function=name>` and degenerate trailing garbage (`!!!`) has no
+        // parameter and must NOT be synthesized into a bogus empty-args call;
+        // leave it for the pathological path to discard.
+        if args.is_empty() {
+            continue;
+        }
+
+        result.push(ParsedToolCall {
+            tool: tool_name,
+            args: Value::Object(args),
+        });
+    }
     result
 }
 
@@ -556,7 +645,24 @@ pub fn strip_xml_tool_calls(content: &str) -> String {
     }
 
     stripped.push_str(&content[last_end..]);
-    stripped.trim().to_string()
+    let stripped = stripped.trim().to_string();
+
+    // Lenient mirror of parse_xml_tool_calls_lenient: if a `<tool_call>` remains
+    // (truncated, no closer) and it actually parsed as a tool (has a function
+    // name), drop from the first such opening to EOF so the recovered tool
+    // markup does not leak into the visible response. Only runs when there is
+    // no `</tool_call>` (pure truncation) — same guard as the parser.
+    let lower = stripped.to_ascii_lowercase();
+    if lower.contains("<tool_call>") && !lower.contains("</tool_call>") {
+        if let Some(idx) = lower.find("<tool_call>") {
+            let tail = &stripped[idx..];
+            if XML_FUNCTION_NAME_RE.is_match(tail) {
+                return stripped[..idx].trim().to_string();
+            }
+        }
+    }
+
+    stripped
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1385,6 +1491,67 @@ And also:
     fn parse_xml_no_match() {
         let text = "No tool calls here. Just some <b>HTML</b>.";
         assert!(parse_xml_tool_calls(text).is_empty());
+    }
+
+    /// Regression for the 2026-07-30 discard loop: a local model emitted the
+    /// opening tags and stopped with NO closing tag. The strict parser needs
+    /// `</tool_call>` so it returned nothing and the response was discarded as
+    /// pathological, forcing the user to re-roll. The lenient fallback must
+    /// recover it. This is the exact bytes from the incident.
+    #[test]
+    fn parse_xml_recovers_truncated_unclosed_block() {
+        let text = "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
+        let calls = parse_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1, "truncated unclosed block must be recovered");
+        assert_eq!(calls[0].tool, "exec");
+        assert_eq!(calls[0].args["command"], "cat ~/.config/higgs/config.toml");
+    }
+
+    /// Truncated markup must be recovered AND stripped from the visible
+    /// response — never leak the raw `<tool_call>` XML to the user.
+    #[test]
+    fn strip_xml_removes_truncated_block_no_leak() {
+        let text = "Let me read the config.\n<tool_call>\n<function=read_file>\n<parameter=path>~/.config/higgs/config.toml";
+        assert_eq!(
+            strip_xml_tool_calls(text),
+            "Let me read the config.",
+            "preamble must remain, truncated tool markup must not leak"
+        );
+    }
+
+    /// Lenient recovery must NOT engage when a block IS closed — that stays
+    /// the strict parser's job (well-formed handling unchanged).
+    #[test]
+    fn parse_xml_lenient_does_not_engage_when_closed() {
+        let text = "<tool_call>\n<function=exec>\n<parameter=command>ls</parameter>\n</tool_call>";
+        let calls = parse_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args["command"], "ls");
+    }
+
+    /// A `<function=NAME>` with degenerate trailing garbage and NO parameter
+    /// must NOT be recovered as a bogus empty-args call — leave it for the
+    /// pathological path to discard. (Otherwise `<tool_call><function=exec>\n!!!`
+    /// would synthesize `exec {}`.)
+    #[test]
+    fn parse_xml_lenient_rejects_function_tag_without_parameter() {
+        let text = "<tool_call>\n<function=exec>\n!!!!!!!!";
+        assert!(
+            parse_xml_tool_calls(text).is_empty(),
+            "garbage with a function tag but no parameter must not be recovered"
+        );
+    }
+
+    /// Lenient param values must stop at the NEAREST marker, so a missing closer
+    /// cannot let one parameter swallow a sibling. `<parameter=a>1<parameter=b>2`
+    /// → a="1", b="2", no `<parameter=` leakage into the value.
+    #[test]
+    fn parse_xml_lenient_picks_nearest_param_marker() {
+        let text = "<tool_call>\n<function=exec>\n<parameter=a>1<parameter=b>2</parameter>";
+        let calls = parse_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args["a"], serde_json::json!(1), "a must not swallow sibling b");
+        assert_eq!(calls[0].args["b"], serde_json::json!(2));
     }
 
     #[test]

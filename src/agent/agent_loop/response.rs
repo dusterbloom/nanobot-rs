@@ -126,21 +126,29 @@ pub(crate) fn classify_response(
     }
 
     let content = response.content.as_deref().unwrap_or("");
-    if is_local && !response.has_tool_calls() {
-        if let Some(reason) = pathological_local_output_reason(content) {
-            return ResponseKind::PathologicalLocalOutput { reason };
-        }
-    }
-
     let has_native_tools = response.has_tool_calls();
     let has_visible_text = !content.trim().is_empty();
 
     // Check for text-embedded tool calls (bracket or XML format) when no
     // native tool_calls exist. We only *detect* here — the actual parsing
     // and stripping happens in the handler so `response` stays immutable.
+    // The XML path includes a lenient fallback that recovers TRUNCATED markup
+    // (opening tags with no closer), so this returns true for partially-formed
+    // tool calls too.
     let has_textual_tools = !has_native_tools
         && has_visible_text
         && (has_bracket_tool_calls(content) || has_xml_tool_calls(content));
+
+    // Pathological discard only when there is NO recoverable tool call: a
+    // textual tool call — even truncated and recovered by the lenient parser —
+    // is real work, not degenerate output, and must not be thrown away
+    // (2026-07-30: truncated `<tool_call>` markup was discarded here ×4,
+    // forcing the user to re-roll until the model emitted a native call).
+    if is_local && !has_native_tools && !has_textual_tools {
+        if let Some(reason) = pathological_local_output_reason(content) {
+            return ResponseKind::PathologicalLocalOutput { reason };
+        }
+    }
 
     // If there are tool calls (native or textual), validate first.
     if has_native_tools || has_textual_tools {
@@ -1249,6 +1257,23 @@ mod tests {
         assert_eq!(
             AgentLoopShared::raw_pathological_response(&make_response(Some("healthy"), "stop")),
             None
+        );
+    }
+
+    /// Regression for the 2026-07-30 discard loop: a truncated textual tool
+    /// call (opening tags, no closer) must classify as a recoverable ToolCalls
+    /// response, NOT PathologicalLocalOutput. Before the fix, the `<tool_call`
+    /// substring check fired before textual detection and discarded it ×4.
+    #[test]
+    fn classify_recovers_truncated_tool_call_not_pathological() {
+        let raw = "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
+        let resp = make_response(Some(raw), "stop");
+
+        let kind = classify_response(&resp, true, false, false, &default_retries(), false);
+
+        assert!(
+            matches!(kind, ResponseKind::ToolCalls { .. }),
+            "truncated textual tool call must be recovered as ToolCalls, not discarded; got {kind:?}"
         );
     }
 
