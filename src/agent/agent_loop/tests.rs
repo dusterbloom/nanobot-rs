@@ -3737,57 +3737,38 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
 }
 
 /// STEP 2 integration test: a turn that produces a stashed (large/forced) tool
-/// result must persist a HANDLE as the tool-result message content — not the
-/// raw body. The body lives only in the stash, fetchable via recall_tool_result.
+/// A GENUINELY oversized (>8KB / TOOL_RESULT_REPLAY_MAX_BYTES) tool result
+/// must persist a HANDLE as the tool-result message content — not the raw
+/// body. The body lives only in the stash, fetchable via recall_tool_result.
 /// The handle is byte-identical live and after a SQLite round-trip (reload).
+/// Uses `exec seq` (~13KB) because read_file self-caps under the replay limit.
 #[tokio::test]
 async fn stashed_tool_result_persists_handle_not_body_in_messages() {
     use crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER;
 
-    let files_dir = tempfile::tempdir().unwrap();
-    let body = "secret_line_one\nsecret_line_two\nsecret_line_three\n".repeat(80);
-    let path = files_dir.path().join("big.txt");
-    std::fs::write(&path, &body).unwrap();
-    let path_s = path.to_string_lossy().to_string();
-
-    // Two read_file calls on DIFFERENT files so both execute (no duplicate
-    // collapse) and force_stash_raw=true (multi-result batch always stashes).
-    let path2 = files_dir.path().join("big2.txt");
-    std::fs::write(&path2, "other content\n".repeat(80)).unwrap();
-    let path2_s = path2.to_string_lossy().to_string();
-
-    let mut a1 = std::collections::HashMap::new();
-    a1.insert("path".to_string(), json!(path_s));
-    let mut a2 = std::collections::HashMap::new();
-    a2.insert("path".to_string(), json!(path2_s));
-    let batch = crate::providers::base::LLMResponse {
+    let mut a = std::collections::HashMap::new();
+    a.insert("command".to_string(), json!("seq 1 3000")); // ~13KB > 8KB replay cap
+    let resp = crate::providers::base::LLMResponse {
         content: Some(String::new()),
-        tool_calls: vec![
-            crate::providers::base::ToolCallRequest {
-                id: "tc_handle".to_string(),
-                name: "read_file".to_string(),
-                arguments: a1,
-            },
-            crate::providers::base::ToolCallRequest {
-                id: "tc_handle_extra".to_string(),
-                name: "read_file".to_string(),
-                arguments: a2,
-            },
-        ],
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_handle".to_string(),
+            name: "exec".to_string(),
+            arguments: a,
+        }],
         finish_reason: "tool_calls".to_string(),
         usage: std::collections::HashMap::new(),
     };
 
     let provider = Arc::new(WireRecordingProvider::new(
         "local-qwen-test",
-        vec![batch, WireRecordingProvider::text_response("done")],
+        vec![resp, WireRecordingProvider::text_response("done")],
     ));
     let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
     let session_key = format!("handle-persist-{}", uuid::Uuid::new_v4());
 
     let _turn = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        agent_loop.process_direct("read the files", &session_key, "test", "offline"),
+        agent_loop.process_direct("run it", &session_key, "test", "offline"),
     )
     .await
     .expect("turn must terminate");
@@ -3795,7 +3776,6 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
     let core = agent_loop.shared.core_handle.swappable();
     let session = core.sessions.get_or_resume(&session_key).await;
 
-    // The persisted messages must contain a HANDLE for tc_handle, not the body.
     let messages = core.sessions.get_all_messages(&session.id).await;
     let tool_msg = messages.iter().find(|m| {
         m.get("role").and_then(|v| v.as_str()) == Some("tool")
@@ -3810,9 +3790,10 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
         content.starts_with(TOOL_RESULT_HANDLE_MARKER),
         "persisted tool-result content must be a HANDLE; got: {content}"
     );
-    // The raw body is NOT in the message — not even a fragment of the secret.
+    // The raw body is NOT in the message — "2999" is a seq line, absent from
+    // the handle (excerpt is "1"; args is "seq 1 3000").
     assert!(
-        !content.contains("secret_line_two"),
+        !content.contains("2999"),
         "the handle must not contain the raw body; got: {content}"
     );
 
@@ -3823,8 +3804,9 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
         .await
         .expect("body must be stashed under tc_handle");
     assert!(
-        stashed.contains("secret_line_one") && stashed.contains("secret_line_two"),
-        "the stash must retain the full body; got: {stashed}"
+        stashed.contains("2999") && stashed.contains("1500"),
+        "the stash must retain the full body; got first 80 chars: {}",
+        &stashed[..stashed.len().min(80)]
     );
 
     // Cache stability: the handle in the LIVE prompt (provider call 2) is
@@ -3849,6 +3831,71 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
     assert_eq!(
         live_content, content,
         "live and persisted handle must be byte-identical (cache-stable)"
+    );
+}
+
+/// A MEDIUM result (over the hot-prompt char cap but ≤8KB replay cap) must
+/// show actual CONTENT, NOT an opaque handle — the model needs bytes for
+/// normal read/exec work. Regression: the initial handles uproot handled these
+/// too, starving the model and forcing hallucination (2026-07-31). Only
+/// genuinely oversized (>8KB) results take the handle path.
+#[tokio::test]
+async fn medium_tool_result_shows_content_not_handle() {
+    use crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER;
+
+    let files_dir = tempfile::tempdir().unwrap();
+    // ~5.6KB: over the small hot-prompt cap (stashed) but under the 8KB replay
+    // cap → must be content, not a handle.
+    let body = "medium_line_one\nmedium_line_two\n".repeat(200);
+    let path = files_dir.path().join("medium.txt");
+    std::fs::write(&path, &body).unwrap();
+    let path_s = path.to_string_lossy().to_string();
+
+    let mut a = std::collections::HashMap::new();
+    a.insert("path".to_string(), json!(path_s));
+    let resp = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_medium".to_string(),
+            name: "read_file".to_string(),
+            arguments: a,
+        }],
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![resp, WireRecordingProvider::text_response("done")],
+    ));
+    let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("medium-content-{}", uuid::Uuid::new_v4());
+
+    let _turn = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        agent_loop.process_direct("read the file", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("turn must terminate");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    let messages = core.sessions.get_all_messages(&session.id).await;
+    let tool_msg = messages
+        .iter()
+        .find(|m| {
+            m.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && m.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_medium")
+        })
+        .expect("tc_medium tool message must exist");
+    let content = tool_msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+    assert!(
+        !content.starts_with(TOOL_RESULT_HANDLE_MARKER),
+        "medium (<=8KB) result must show CONTENT, not a handle; got: {content}"
+    );
+    assert!(
+        content.contains("medium_line_one"),
+        "medium result must carry real body content; got: {content}"
     );
 
     let _ = std::fs::remove_dir_all(files_dir);

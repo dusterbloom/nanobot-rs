@@ -704,9 +704,13 @@ pub(crate) async fn execute_tools_delegated(
                 continue;
             }
         };
-        let mut injected = if stashed_raw && !is_explicit_retrieval_tool(&tc.name) {
-            // LARGE delegated output was stashed → handle only. The body lives
-            // in the stash; the model recalls it via recall_tool_result.
+        let mut injected = if stashed_raw
+            && !is_explicit_retrieval_tool(&tc.name)
+            && full_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES
+        {
+            // Genuinely oversized (>8KB) non-retrieval delegated output →
+            // handle only. Body lives in the stash; model recalls it. (A 95KB
+            // result replayed raw was the cache-break class.)
             render_tool_result_handle(
                 &tc.id,
                 &tc.name,
@@ -714,12 +718,11 @@ pub(crate) async fn execute_tools_delegated(
                 full_data.as_bytes(),
                 &tc.arguments,
             )
-        } else if stashed_raw {
-            // Retrieval tools keep their bounded excerpt even when stashed.
-            build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
         } else {
-            // Small output, not stashed — preview the (already-shaped)
-            // injected_raw inline.
+            // Medium (over hot-prompt cap but ≤8KB), retrieval tools (bounded
+            // excerpt by design), or small — show actual CONTENT via the
+            // deterministic head+tail preview. Handling medium results starved
+            // the model of normal read/exec bytes (2026-07-31 regression).
             build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
         };
         // Prepend the per-lease progress signal so the model can see
@@ -1213,11 +1216,11 @@ async fn inject_tool_result(
                 return;
             }
         };
-        if stashed_raw {
-            // LARGE result was durably stashed → the prompt carries only the
-            // canonical handle (metadata + tiny excerpt). The body lives in
-            // the stash, fetchable via recall_tool_result. This is the
-            // handles-not-bodies invariant: no oversized body in the prompt.
+        if stashed_raw && result_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES {
+            // GENUINELY oversized (>8KB): handle only. A single 95KB result
+            // replayed raw was the cache-break class (token_mismatch under
+            // ExactBootstrap). The body lives in the stash, fetchable via
+            // recall_tool_result.
             let handle = render_tool_result_handle(
                 &r.tool_id,
                 &r.tool_name,
@@ -1226,6 +1229,13 @@ async fn inject_tool_result(
                 &r.arguments,
             );
             ctx.content_gate.admit_simple(&handle).into_text()
+        } else if stashed_raw {
+            // Medium (over the hot-prompt char cap but ≤8KB replay cap): show
+            // actual CONTENT via a deterministic head+tail preview. Handling
+            // these deprived the model of normal read/exec bytes and forced
+            // hallucination (2026-07-31 regression after the handles uproot).
+            // Stable per-result (body doesn't change) → no cache drift.
+            build_tool_result_preview(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id)
         } else {
             // Small result, not stashed — small enough to carry inline raw
             // (under both the char cap and the replay byte cap). A handle
