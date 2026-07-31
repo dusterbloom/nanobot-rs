@@ -643,6 +643,7 @@ impl AgentLoopShared {
                 prev_round_keys: Vec::new(),
                 consecutive_repeat_rounds: 0,
                 repeat_nudged: false,
+                infra_error: None,
             },
             health_registry: self.health_registry.clone(),
             taint_state: TaintState::new(),

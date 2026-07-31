@@ -405,6 +405,13 @@ pub(crate) struct FlowControl {
     /// and churning the cache with unique-UUID receipts.
     pub(crate) consecutive_lease_blocks: u32,
     pub(crate) repeat_nudged: bool,
+    /// Infrastructure error surfaced by the tool engine when the
+    /// "handles-not-bodies" invariant cannot be honored — i.e. the immutable
+    /// tool-result stash rejected a write (`Conflict` / `Failed`). When set
+    /// after `step_execute_tools`, the loop finalizes the turn with this error
+    /// so the user sees the abort reason and the body is NEVER shown raw.
+    /// See `abort_turn_on_stash_failure` in `tool_engine.rs`.
+    pub(crate) infra_error: Option<String>,
 }
 
 impl FlowControl {
@@ -2879,6 +2886,12 @@ impl AgentLoopShared {
             )
             .await
             {
+                // Stash invariant violation (Hole 1): the immutable store
+                // rejected a write. Fail the turn with the infra error — never
+                // re-run a side-effect tool, never show a raw body.
+                if let Some(e) = ctx.flow.infra_error.take() {
+                    return StepResult::Done(IterationOutcome::Error(e));
+                }
                 // Delegation handled execution — continue the main loop.
                 ctx.emit_pending_request_metrics(routed_tool_calls.len() as u32);
                 ctx.flow.tool_rounds_completed = ctx.flow.tool_rounds_completed.saturating_add(1);
@@ -2905,6 +2918,12 @@ impl AgentLoopShared {
 
         // Inline path (default, unchanged): execute tools directly.
         crate::agent::tool_engine::execute_tools_inline(ctx, &routed_tool_calls, &response).await;
+        // Stash invariant violation (Hole 1): the immutable store rejected a
+        // write during inline execution. Fail the turn with the infra error —
+        // never re-run a side-effect tool, never show a raw body.
+        if let Some(e) = ctx.flow.infra_error.take() {
+            return StepResult::Done(IterationOutcome::Error(e));
+        }
         let executed = ctx
             .turn_tool_entries
             .len()

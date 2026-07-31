@@ -78,6 +78,16 @@ fn inline_hot_prompt_result_cap_for_ctx_batch(ctx: &TurnContext, result_count: u
 
 /// Stash raw output before prompt shaping. Multi-result batches force this so
 /// even medium reads can be reduced to receipts without losing exact recall.
+///
+/// Returns:
+/// - `Ok(false)` — small data, not stashed (cap gate hit, no store needed).
+/// - `Ok(true)` — newly stashed (`Stored`) or idempotent retry (`Identical`);
+///   the body is durably present under `(session_id, tool_call_id)`.
+/// - `Err(StoredResult)` — the stash could NOT prove durability of the exact
+///   bytes (`Conflict`: different bytes already present; `Failed`: SQLite
+///   error). The caller MUST NOT show a raw body or re-run a side-effect tool;
+///   it surfaces this via `abort_turn_on_stash_failure` so the turn fails
+///   cleanly. See `docs/superpowers/plans/2026-07-30-tool-result-handles-not-bodies.md`.
 async fn stash_tool_result_for_prompt_shaping(
     sessions: &crate::session::SessionDb,
     session_id: &str,
@@ -86,17 +96,28 @@ async fn stash_tool_result_for_prompt_shaping(
     data: &str,
     cap: usize,
     force: bool,
-) -> bool {
+) -> Result<bool, crate::session::db::StoredResult> {
+    use crate::session::db::StoredResult;
     // No recall exemption: a recalled body can be hundreds of KB and must be
     // stashable under the recall's own id so slice_tool_result /
     // search_tool_result can query it. Exempting it left the raw body in live
     // context, which inflated a session to 77k tokens (2026-07-30).
     if !force && data.chars().count() <= cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES {
-        return false;
+        return Ok(false);
     }
-    sessions
-        .store_tool_result(session_id, tool_call_id, tool_name, data)
+    match sessions
+        .store_tool_result_immutable(session_id, tool_call_id, tool_name, data)
         .await
+    {
+        StoredResult::Stored { .. } => Ok(true),
+        // Idempotent retry — the same tool_call_id with byte-identical content
+        // (e.g. a model re-reading the same file). Accept it as "stashed":
+        // the body IS present under this key.
+        StoredResult::Identical { .. } => Ok(true),
+        // Different bytes already stored under this key, or SQLite failure.
+        // Either way the invariant is violated; surface it.
+        sr @ (StoredResult::Conflict { .. } | StoredResult::Failed) => Err(sr),
+    }
 }
 
 /// Persistence must succeed before an oversized result can be replaced by a
@@ -105,6 +126,25 @@ async fn stash_tool_result_for_prompt_shaping(
 /// at data that does not exist.
 fn must_preserve_unstashed_raw(data: &str, cap: usize, stashed: bool) -> bool {
     data.chars().count() > cap && !stashed
+}
+
+/// Surface a stash failure to the loop and to the user. Sets
+/// `ctx.flow.infra_error` so `step_execute_tools` finalizes the turn with this
+/// message after the tool engine returns; also pushes an `ok:false` tool
+/// receipt so the model's tool-call gets a deterministic error response
+/// (rather than dangling). The raw body is NEVER shown — a handle pointing at
+/// un-stashed bytes would lie (the cache-desync root cause). See plan Hole 1.
+fn abort_turn_on_stash_failure(
+    ctx: &mut TurnContext,
+    tool_id: &str,
+    tool_name: &str,
+    sr: &crate::session::db::StoredResult,
+) {
+    ctx.flow.infra_error = Some(format!(
+        "tool-result stash failed for {tool_id} ({sr:?}) — turn aborted to preserve the exact-bytes invariant"
+    ));
+    let msg = format!("Error: result for {tool_id} could not be durably stored; turn aborted.");
+    ContextBuilder::add_tool_result_with_status(&mut ctx.messages, tool_id, tool_name, &msg, false);
 }
 
 /// Build a head+tail preview of `data` (≤ `cap` chars) with a `recall_tool_result`
@@ -557,7 +597,7 @@ pub(crate) async fn execute_tools_delegated(
         // lossless recall — digesting `injected_raw` directly would store the
         // summary instead of the original. Then preview injected_raw and add a
         // recall pointer when the raw was stashed.
-        let stashed_raw = stash_tool_result_for_prompt_shaping(
+        let stashed_raw = match stash_tool_result_for_prompt_shaping(
             &ctx.core.sessions,
             &ctx.session_id,
             &tc.id,
@@ -566,7 +606,17 @@ pub(crate) async fn execute_tools_delegated(
             cap,
             force_routed_stash,
         )
-        .await;
+        .await
+        {
+            Ok(b) => b,
+            Err(sr) => {
+                abort_turn_on_stash_failure(ctx, &tc.id, &tc.name, &sr);
+                // Skip this iteration's post-stash shaping (the abort helper
+                // already pushed an ok:false receipt). The loop-level
+                // infra_error check in step_execute_tools finalizes the turn.
+                continue;
+            }
+        };
         let mut injected = if must_preserve_unstashed_raw(full_data, cap, stashed_raw) {
             full_data.to_string()
         } else {
@@ -984,7 +1034,7 @@ async fn inject_tool_result(
         // same stash+digest as any other oversized result — the full body is
         // stashed under this recall's id and the model queries it via
         // slice_tool_result / search_tool_result.
-        let stashed_raw = stash_tool_result_for_prompt_shaping(
+        let stashed_raw = match stash_tool_result_for_prompt_shaping(
             &ctx.core.sessions,
             &ctx.session_id,
             &r.tool_id,
@@ -993,7 +1043,14 @@ async fn inject_tool_result(
             cap,
             force_stash_raw,
         )
-        .await;
+        .await
+        {
+            Ok(b) => b,
+            Err(sr) => {
+                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
+                return;
+            }
+        };
         if must_preserve_unstashed_raw(&result_data, cap, stashed_raw) {
             ctx.content_gate.budget.consume(
                 crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data),
@@ -1010,7 +1067,7 @@ async fn inject_tool_result(
         // Specialist path: stash the RAW (pre-specialist) output for lossless
         // recall — without this, recall would return the specialist's summary
         // instead of the original. Then summarize and preview the summary.
-        let stashed_raw = stash_tool_result_for_prompt_shaping(
+        let stashed_raw = match stash_tool_result_for_prompt_shaping(
             &ctx.core.sessions,
             &ctx.session_id,
             &r.tool_id,
@@ -1019,7 +1076,14 @@ async fn inject_tool_result(
             cap,
             force_stash_raw,
         )
-        .await;
+        .await
+        {
+            Ok(b) => b,
+            Err(sr) => {
+                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
+                return;
+            }
+        };
         let summarized = ctx
             .content_gate
             .admit_with_specialist(
@@ -1045,7 +1109,7 @@ async fn inject_tool_result(
         }
         preview
     } else {
-        let stashed_raw = stash_tool_result_for_prompt_shaping(
+        let stashed_raw = match stash_tool_result_for_prompt_shaping(
             &ctx.core.sessions,
             &ctx.session_id,
             &r.tool_id,
@@ -1054,7 +1118,14 @@ async fn inject_tool_result(
             cap,
             force_stash_raw,
         )
-        .await;
+        .await
+        {
+            Ok(b) => b,
+            Err(sr) => {
+                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
+                return;
+            }
+        };
         if must_preserve_unstashed_raw(&result_data, cap, stashed_raw) {
             ctx.content_gate.budget.consume(
                 crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data),
@@ -1533,7 +1604,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_tool_result_stash_preserves_raw_body_without_recall_pointer() {
+    async fn failed_tool_result_stash_surfaces_err_failed_never_raw() {
+        // Under the "handles-not-bodies" invariant (plan Hole 1), a stash
+        // failure MUST NOT fall back to showing the raw body — that would put
+        // un-stashed bytes in the prompt and a recall pointer at nothing. The
+        // caller aborts the turn. This replaces the prior fall-back-to-raw
+        // contract and its regression test.
         let temp = tempfile::tempdir().unwrap();
         let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
         let data = format!(
@@ -1544,7 +1620,7 @@ mod tests {
         let cap = 120;
 
         // The missing session makes SQLite reject the foreign-keyed result.
-        let stashed = stash_tool_result_for_prompt_shaping(
+        let outcome = stash_tool_result_for_prompt_shaping(
             &sessions,
             "missing-session",
             "call_failed",
@@ -1554,16 +1630,16 @@ mod tests {
             false,
         )
         .await;
-        let injected = if must_preserve_unstashed_raw(&data, cap, stashed) {
-            data.clone()
-        } else {
-            digest_tool_result("read_file", &HashMap::new(), &data, cap, "call_failed")
-        };
 
-        assert!(!stashed);
-        assert_eq!(injected, data);
-        assert!(injected.contains("MIDDLE_SECRET"));
-        assert!(!injected.contains("recall_tool_result"));
+        assert!(
+            outcome.is_err(),
+            "a stash failure must surface as Err so the caller aborts the turn; got {outcome:?}"
+        );
+        assert_eq!(
+            outcome.unwrap_err(),
+            crate::session::db::StoredResult::Failed,
+            "missing-session insert must report Failed, never Ok(false)-and-show-raw"
+        );
     }
 
     #[tokio::test]
@@ -1587,7 +1663,8 @@ mod tests {
             cap,
             false,
         )
-        .await;
+        .await
+        .expect("fresh-key stash of oversized data must succeed");
         let injected = if must_preserve_unstashed_raw(&data, cap, stashed) {
             data.clone()
         } else {
@@ -1628,7 +1705,8 @@ mod tests {
             10_000,
             false,
         )
-        .await;
+        .await
+        .expect("fresh-key stash must succeed");
         let injected = if must_preserve_unstashed_raw(&data, 10_000, stashed) {
             data.clone()
         } else {
@@ -2220,5 +2298,73 @@ mod tests {
         assert!(is_routed_call("id_a", &routed));
         assert!(is_routed_call("id_b", &routed));
         assert!(!is_routed_call("id_c", &routed));
+    }
+
+    /// STEP 1 invariant test: the tool-result stash must be IMMUTABLE — a
+    /// second store under the same `(session_id, tool_call_id)` with DIFFERENT
+    /// bytes is a Conflict and MUST NOT overwrite the original body. A handle
+    /// that referenced the second bytes while the first remained stored would
+    /// be a lying handle (the cache-desync class this uproot kills).
+    #[tokio::test]
+    async fn stash_tool_result_rejects_conflicting_bytes_not_overwrite() {
+        use crate::session::db::StoredResult;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("cli:stash-conflict").await;
+        let sid = session.id.clone();
+
+        let body_a = "alpha\n".repeat(2000);
+        let body_b = "beta\n".repeat(2000);
+
+        // First write under (sid, "tc_1") with body_a — Stored (or Identical).
+        let first = stash_tool_result_for_prompt_shaping(
+            &sessions,
+            &sid,
+            "tc_1",
+            "read_file",
+            &body_a,
+            4096,
+            true, // force: the cap gate is a no-op so we exercise the store path
+        )
+        .await
+        .expect("first stash of a fresh key must succeed");
+        assert!(
+            first,
+            "force=true on a >cap body must report it was newly stashed"
+        );
+
+        // Second write under the SAME key with DIFFERENT bytes: Conflict, NOT
+        // an overwrite. The function surfaces the failure as Err(StoredResult).
+        let conflict = stash_tool_result_for_prompt_shaping(
+            &sessions,
+            &sid,
+            "tc_1",
+            "read_file",
+            &body_b,
+            4096,
+            true,
+        )
+        .await
+        .expect_err("a different-bytes retry must surface as Err(Conflict), not Ok");
+        match conflict {
+            StoredResult::Conflict {
+                existing_digest,
+                attempted_digest,
+            } => {
+                assert_ne!(
+                    existing_digest, attempted_digest,
+                    "conflict must report distinct digests"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // The stored body is still body_a — never overwritten by body_b.
+        assert_eq!(
+            sessions.load_tool_result(&sid, "tc_1").await.as_deref(),
+            Some(body_a.as_str()),
+            "conflicting write must not replace the stored body"
+        );
     }
 }

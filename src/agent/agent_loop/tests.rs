@@ -3570,6 +3570,172 @@ async fn test_local_wire_prefix_stable_across_batched_tool_results_and_next_turn
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+/// STEP 1 agent-loop invariant test: when a second executed tool result would
+/// stash DIFFERENT bytes under an existing `(session_id, tool_call_id)`, the
+/// turn FAILS with the infrastructure error instead of overwriting the body or
+/// surfacing file B's content. The stash retains file A.
+///
+/// This is the load-bearing contract behind
+/// `docs/superpowers/plans/2026-07-30-tool-result-handles-not-bodies.md` Hole 1:
+/// a lying handle (pointing at overwritten bytes) is what caused the
+/// `token_mismatch` cache-desync class.
+#[tokio::test]
+async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
+    // Directly verify the agent-loop abort path: when the immutable stash
+    // rejects a conflicting write, the turn FAILS with the infra error and
+    // the body is never shown raw.
+    //
+    // Setup: pre-stash body A under "tc_conflict" (simulating a prior turn
+    // that stashed it). Then run ONE turn that emits a 2-call batch (so
+    // force_stash_raw=true) re-using "tc_conflict" for body B → Conflict.
+    let files_dir = tempfile::tempdir().unwrap();
+    let body_a = "alpha\n".repeat(200);
+    let body_b = "beta\n".repeat(210);
+    let path_a = files_dir.path().join("big_a.txt");
+    let path_b = files_dir.path().join("big_b.txt");
+    std::fs::write(&path_a, &body_a).unwrap();
+    std::fs::write(&path_b, &body_b).unwrap();
+    let path_a_s = path_a.to_string_lossy().to_string();
+    let path_b_s = path_b.to_string_lossy().to_string();
+
+    // Two read_file calls so force_stash_raw=true (multi-result batch always
+    // stashes, regardless of per-result size). tc_conflict reads file_b
+    // (conflicts with pre-stashed body A); tc_extra reads file_a.
+    let mut a1 = std::collections::HashMap::new();
+    a1.insert("path".to_string(), json!(path_b_s));
+    let mut a2 = std::collections::HashMap::new();
+    a2.insert("path".to_string(), json!(path_a_s));
+    let conflict_batch = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![
+            crate::providers::base::ToolCallRequest {
+                id: "tc_conflict".to_string(),
+                name: "read_file".to_string(),
+                arguments: a1,
+            },
+            crate::providers::base::ToolCallRequest {
+                id: "tc_extra".to_string(),
+                name: "read_file".to_string(),
+                arguments: a2,
+            },
+        ],
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![
+            conflict_batch.clone(),
+            // Call 2: UNREACHABLE — the turn aborts at the stash-conflict
+            // before the next LLM round.
+            WireRecordingProvider::text_response("UNREACHABLE post-conflict answer"),
+        ],
+    ));
+    let (agent_loop, _harness_workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("stash-conflict-{}", uuid::Uuid::new_v4());
+
+    // Pre-stash body A under "tc_conflict" by running a PRIOR turn that
+    // produces a force-stash for that id (2-call batch reading DIFFERENT
+    // files, so the duplicate-call guard doesn't collapse them).
+    {
+        let mut pa1 = std::collections::HashMap::new();
+        pa1.insert("path".to_string(), json!(path_a_s.clone()));
+        let mut pa2 = std::collections::HashMap::new();
+        pa2.insert("path".to_string(), json!(path_b_s.clone()));
+        let seed_batch = crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![
+                crate::providers::base::ToolCallRequest {
+                    id: "tc_conflict".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: pa1,
+                },
+                crate::providers::base::ToolCallRequest {
+                    id: "tc_seed_extra".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: pa2,
+                },
+            ],
+            finish_reason: "tool_calls".to_string(),
+            usage: std::collections::HashMap::new(),
+        };
+        // Replace the provider's queue with the seed batch first.
+        {
+            let mut queue = provider.responses.lock().unwrap();
+            queue.clear();
+            queue.push_back(seed_batch);
+            queue.push_back(WireRecordingProvider::text_response("seeded"));
+            queue.push_back(conflict_batch.clone());
+            queue.push_back(WireRecordingProvider::text_response(
+                "UNREACHABLE post-conflict answer",
+            ));
+        }
+    }
+
+    // Seed turn: stashes body A under tc_conflict (force=true, 2-call batch).
+    let _seed = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        agent_loop.process_direct("seed file_a read", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("seed turn must terminate");
+
+    // Confirm body A was stashed under tc_conflict.
+    {
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core.sessions.get_or_resume(&session_key).await;
+        let stashed = core
+            .sessions
+            .load_tool_result(&session.id, "tc_conflict")
+            .await;
+        assert!(
+            stashed.as_deref().map(|s| s.contains("alpha")).unwrap_or(false),
+            "seed turn must have stashed body A under tc_conflict; got {stashed:?}"
+        );
+    }
+
+    // Conflict turn: reuses tc_conflict for body B → stash Conflict → abort.
+    let conflict_turn = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        agent_loop.process_direct(
+            "now read file_b with the same call id",
+            &session_key,
+            "test",
+            "offline",
+        ),
+    )
+    .await
+    .expect("conflict turn must still terminate (with the infra error)");
+
+    // The infra error is surfaced — never body B's raw content.
+    assert!(
+        !conflict_turn.contains("beta"),
+        "conflict turn must NOT surface file B's body; got: {conflict_turn}"
+    );
+    assert!(
+        conflict_turn.to_lowercase().contains("abort")
+            || conflict_turn.to_lowercase().contains("error"),
+        "conflict turn must surface the abort/error to the user; got: {conflict_turn}"
+    );
+
+    // The stash retains body A — never overwritten by body B.
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    let stashed = core
+        .sessions
+        .load_tool_result(&session.id, "tc_conflict")
+        .await;
+    let stashed = stashed.expect("tc_conflict must retain a stashed body");
+    assert!(
+        stashed.contains("alpha") && !stashed.contains("beta"),
+        "the stash must retain body A (alpha), not body B (beta); got: {stashed}"
+    );
+
+    let _ = std::fs::remove_dir_all(files_dir);
+}
+
 #[tokio::test]
 async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
     let duplicate_call = |id: usize| {
