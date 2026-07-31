@@ -75,7 +75,11 @@ fn matching_memory_facts<'a>(content: &'a str, query: &str, limit: usize) -> Vec
             let fact = line.trim_start().strip_prefix("- ")?.trim();
             let lower = fact.to_lowercase();
             let score = terms.iter().filter(|term| lower.contains(*term)).count();
-            (score > 0).then_some((score, index, fact))
+            // Require ≥2 matching terms on multi-word queries so a single
+            // common word (e.g. "design") can't surface an unrelated fact
+            // (e.g. "Project Zephyr Prime" for an architecture query).
+            let min_score = if terms.len() >= 3 { 2 } else { 1 };
+            (score >= min_score).then_some((score, index, fact))
         })
         .collect();
     ranked.sort_by_key(|(score, index, _)| (std::cmp::Reverse(*score), *index));
@@ -565,7 +569,11 @@ impl RecallTool {
         let qmode = choose_query_mode(mode_str, query, cfg!(feature = "semantic"));
 
         let want_memory = matches!(scope, "all" | "memory");
-        let want_files = matches!(scope, "all" | "files");
+        // Files excluded from default `all` — the leg searches the agent's own
+        // workspace (~/.nanobot/workspace: memory/audit/skills), which is noise
+        // for conceptual queries and echoes past search recordings. Opt in with
+        // scope="files" explicitly. See recall tool description.
+        let want_files = scope == "files";
         let want_sessions = matches!(scope, "all" | "sessions");
 
         // Trust order: curated memory > knowledge docs > workspace files > sessions.
@@ -614,12 +622,13 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Unified retrieval. SEARCH across curated memory, indexed docs, workspace files, \
-         and past conversations (trust-ranked: canonical facts first), OR FETCH a specific \
-         session. Search: pass {\"query\":\"...\",\"scope\":\"all|memory|files|sessions\"}. \
-         Fetch: pass {\"session\":\"KEY\"} to dump a transcript, {\"message_ids\":\"5-12\"} \
-         with {\"session\":\"KEY\"} to extract turns, or {\"mode\":\"latest\"} to list recent \
-         sessions. Multi-word queries auto-use hybrid keyword+semantic search when available."
+        "Unified retrieval. SEARCH curated memory, indexed knowledge, and past conversations \
+         (trust-ranked: canonical facts first) — workspace files are opt-in via scope=\"files\" \
+         (they search the agent workspace, rarely useful). OR FETCH a specific session. \
+         Search: {\"query\":\"...\",\"scope\":\"all|memory|files|sessions\"} (default 'all' = \
+         memory + knowledge + sessions, NO files). Fetch: {\"session\":\"KEY\"} to dump a \
+         transcript, {\"session\":\"KEY\",\"message_ids\":\"5-12\"} to extract turns, or \
+         {\"mode\":\"latest\"} to list recent sessions."
     }
 
     fn parameters(&self) -> Value {
@@ -633,7 +642,7 @@ impl Tool for RecallTool {
                 "scope": {
                     "type": "string",
                     "enum": ["all", "memory", "files", "sessions"],
-                    "description": "Sources to search. 'memory' = curated MEMORY.md + indexed knowledge docs. Default: all (trust-ranked)."
+                    "description": "Sources to search. Default 'all' = memory + knowledge + sessions (files excluded — workspace internals are noise; use 'files' to opt in). 'memory' = curated MEMORY.md + indexed knowledge docs."
                 },
                 "n": {
                     "type": "integer",
