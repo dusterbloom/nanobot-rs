@@ -1275,7 +1275,7 @@ impl ContextBuilder {
                      Native tools: read_file, edit_file, write_file, exec, get_skills — call with schema args; never wrap. \
                      Other tools via `get_tools` proxy: omit tool_name to list; \
                      {{\"tool_name\":\"X\"}} inspect; {{\"tool_name\":\"X\",\"tool_args\":{{...}}}} invoke. \
-                     get_skills: omit name to list, name to read; recall; session_search. \
+                      get_skills: omit name to list, name to read; recall (memory + files + past sessions). \
                      Quote exact tool errors; never invent causes or tool results. \
                      edit_file uses path, old_text, new_text—not content. \
                      Never pass read_file line prefixes as args. \
@@ -1323,10 +1323,11 @@ impl ContextBuilder {
                     "## Memory\n\
                      Working Memory is injected automatically (session state). \
                      Long-term facts: {memory_path}.\n\
-                     For curated facts and indexed knowledge, use recall — for example \
-                     recall({{\"query\":\"serramanna\"}}). For raw past conversations and \
-                     recent sessions, use session_search — for example \
-                     session_search({{\"query\":\"diary of two threads\"}}).\n\n\
+                     Write facts with remember({{\"facts\":[\"a concise fact\"]}}) (batch up to 20). \
+                     Read with recall — recall({{\"query\":\"serramanna\"}}) searches curated memory, \
+                     indexed docs, files, and past conversations (trust-ranked, canonical facts first); \
+                     recall({{\"scope\":\"sessions\",\"query\":\"diary of two threads\"}}) limits to past \
+                     conversations; recall({{\"session\":\"KEY\"}}) or recall({{\"message_ids\":\"5-12\"}}) fetches by id.\n\n\
                      If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your \
                      approach — it takes precedence."
                 ),
@@ -2024,7 +2025,11 @@ mod tests {
         );
         assert!(identity.contains("get_skills"), "{identity}");
         assert!(identity.contains("recall"), "{identity}");
-        assert!(identity.contains("session_search"), "{identity}");
+        // session_search was dissolved into recall — must not appear.
+        assert!(
+            !identity.contains("session_search"),
+            "dissolved session_search must not appear in local identity: {identity}"
+        );
 
         // (c) error discipline
         assert!(identity.contains("Quote exact tool errors"), "{identity}");
@@ -2057,23 +2062,27 @@ mod tests {
 
         // The Memory section must show the exact call shape (worked example),
         // not just name the tools — a weak zero-temp model copies the shape it
-        // sees. Mirror the LCM_EXPAND_GUIDE style: name(args). The param names
-        // (`query`) match the real recall/session_search schemas.
+        // sees. recall is now the unified retrieval tool (session_search
+        // dissolved into it); the shape must show recall + its sessions scope.
         assert!(
             identity.contains("recall({\"query\":"),
             "Memory section must show recall's worked call shape: {identity}"
         );
         assert!(
-            identity.contains("session_search({\"query\":"),
-            "Memory section must show session_search's worked call shape: {identity}"
+            identity.contains("scope\":\"sessions\""),
+            "Memory section must show recall's sessions scope: {identity}"
         );
         assert!(
-            identity.contains("curated facts"),
-            "must still distinguish curated memory (recall): {identity}"
+            identity.contains("remember({\"facts\":"),
+            "Memory section must show remember's batch write shape: {identity}"
         );
         assert!(
-            identity.contains("raw past conversations"),
-            "must still distinguish session history (session_search): {identity}"
+            identity.contains("curated memory"),
+            "must still distinguish curated memory: {identity}"
+        );
+        assert!(
+            identity.contains("past conversations"),
+            "must still distinguish session history: {identity}"
         );
     }
 

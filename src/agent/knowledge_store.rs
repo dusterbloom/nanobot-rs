@@ -106,7 +106,8 @@ impl KnowledgeStore {
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 content,
                 content='chunks',
-                content_rowid='id'
+                content_rowid='id',
+                tokenize='porter unicode61'
             );
 
             CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
@@ -128,6 +129,11 @@ impl KnowledgeStore {
         // Initialize vector search schema when the semantic feature is enabled.
         #[cfg(feature = "semantic")]
         Self::init_vec_schema(&conn)?;
+
+        // Migrate chunks_fts to the porter tokenizer if it predates this change,
+        // so knowledge.db matches sessions.db (both porter unicode61) and a query
+        // stems consistently across stores. External-content FTS — no data lost.
+        Self::migrate_fts_tokenizer(&conn)?;
 
         Ok(Self {
             conn,
@@ -155,6 +161,41 @@ impl KnowledgeStore {
         ))
         .context("Failed to initialize vector search schema")?;
 
+        Ok(())
+    }
+
+    /// Migrate `chunks_fts` to the `porter unicode61` tokenizer if it was
+    /// created under the bare `unicode61` default. Idempotent: no-op when
+    /// already porter (or when the table doesn't exist yet — the schema init's
+    /// CREATE handles new DBs). External-content FTS, so the rebuild repopulates
+    /// from `chunks` with no text loss.
+    fn migrate_fts_tokenizer(conn: &Connection) -> Result<()> {
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let needs_rebuild = match existing.as_deref() {
+            Some(sql) => !sql.to_ascii_lowercase().contains("porter"),
+            None => false,
+        };
+        if needs_rebuild {
+            conn.execute_batch(
+                r#"
+                DROP TABLE chunks_fts;
+                CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                    content,
+                    content='chunks',
+                    content_rowid='id',
+                    tokenize='porter unicode61'
+                );
+                INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');
+                "#,
+            )
+            .context("Failed to migrate chunks_fts to porter tokenizer")?;
+        }
         Ok(())
     }
 
@@ -615,6 +656,48 @@ mod tests {
         // Verify we can retrieve it
         let chunk = store.get_chunk("test_doc", 0).unwrap();
         assert_eq!(chunk, Some(text.to_string()));
+    }
+
+    #[test]
+    fn test_porter_tokenizer_stems_across_query_and_doc() {
+        let dir = tempdir().unwrap();
+        let store = KnowledgeStore::open(&dir.path().join("test.db")).unwrap();
+        store
+            .ingest("doc", None, "The daemon was running all night.", 4096, 256)
+            .unwrap();
+        // porter unicode61 stems "ran" and "running" to the same root; bare
+        // unicode61 (the old default) would NOT match. Pins tokenizer parity
+        // with sessions.db so recall searches both stores consistently.
+        let hits = store.search("run", 5).unwrap();
+        assert!(!hits.is_empty(), "porter must stem run -> running");
+    }
+
+    #[test]
+    fn test_migrates_legacy_fts_to_porter_on_open() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        // Create a store, then regress chunks_fts to the legacy bare-unicode61
+        // tokenizer (simulating a knowledge.db from before this change).
+        {
+            let store = KnowledgeStore::open(&db_path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE chunks_fts;\
+                     CREATE VIRTUAL TABLE chunks_fts USING fts5(content, content='chunks', content_rowid='id');",
+                )
+                .unwrap();
+        }
+        // Reopen — migrate_fts_tokenizer must detect the missing 'porter' and rebuild.
+        let store = KnowledgeStore::open(&db_path).unwrap();
+        store
+            .ingest("doc", None, "The daemon was running all night.", 4096, 256)
+            .unwrap();
+        let hits = store.search("run", 5).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "reopened legacy db must stem run -> running after migration"
+        );
     }
 
     #[test]
