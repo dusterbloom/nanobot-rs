@@ -32,6 +32,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::render;
 use crate::agent::audit::ToolEvent;
+use crate::agent::token_budget::TokenBudget;
 use crate::repl::commands::ModelEntry;
 use crate::repl::{parse_control_marker, CacheResetReason, CacheStatus, ControlMarker};
 use crate::session::db::SessionSnapshot;
@@ -49,6 +50,61 @@ const TOOL_BRIDGE_TEXT: &str = "Sure, on it ...";
 const OK_COLOR: Color = Color::Rgb(0x39, 0xB8, 0x45);
 const WARN_COLOR: Color = Color::Rgb(0xC8, 0xA1, 0x3A);
 const ERR_COLOR: Color = Color::Rgb(0xE0, 0x66, 0x66);
+const UNKNOWN_CONTEXT_TOKENS: usize = 8_192;
+const PASTE_CONTEXT_DIVISOR: usize = 8;
+const PASTE_BYTES_PER_TOKEN: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PasteLimits {
+    tokens: usize,
+    bytes: usize,
+}
+
+fn paste_limits(max_context_tokens: usize) -> PasteLimits {
+    let context = if max_context_tokens == 0 {
+        UNKNOWN_CONTEXT_TOKENS
+    } else {
+        max_context_tokens
+    };
+    let tokens = (context / PASTE_CONTEXT_DIVISOR).max(1);
+    PasteLimits {
+        tokens,
+        bytes: tokens.saturating_mul(PASTE_BYTES_PER_TOKEN),
+    }
+}
+
+fn normalize_paste(text: &str) -> String {
+    use std::fmt::Write;
+
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                normalized.push('\n');
+            }
+            '\n' | '\t' => normalized.push(c),
+            c if c.is_control() => {
+                write!(&mut normalized, "\\u{{{:x}}}", c as u32)
+                    .expect("writing to String cannot fail");
+            }
+            c => normalized.push(c),
+        }
+    }
+    normalized
+}
+
+fn textarea_bytes(input: &TextArea<'_>) -> usize {
+    input
+        .lines()
+        .iter()
+        .map(|line| line.len())
+        .sum::<usize>()
+        .saturating_add(input.lines().len().saturating_sub(1))
+}
 
 /// Number of rotatable color schemes (Ctrl+P cycles through them).
 const THEME_COUNT: u8 = 32;
@@ -444,6 +500,8 @@ enum Cell {
 pub(crate) struct App {
     transcript: Vec<Cell>,
     input: TextArea<'static>,
+    /// Active model context size used only to derive the stable paste admission budget.
+    paste_context_tokens: usize,
     /// True while the agent is producing a turn.
     streaming: bool,
     /// True between turn start and the first text/tool output (prefill phase).
@@ -548,6 +606,7 @@ impl App {
         Self {
             transcript: Vec::new(),
             input: configure_input(),
+            paste_context_tokens: UNKNOWN_CONTEXT_TOKENS,
             streaming: false,
             awaiting_first: false,
             got_text: false,
@@ -592,6 +651,14 @@ impl App {
             cursor_on: true,
             slash_sel: 0,
         }
+    }
+
+    pub(crate) fn set_paste_context_tokens(&mut self, max_context_tokens: usize) {
+        self.paste_context_tokens = if max_context_tokens == 0 {
+            UNKNOWN_CONTEXT_TOKENS
+        } else {
+            max_context_tokens
+        };
     }
 
     /// Cycle calm → inspect → deep → calm (`/mode` with no argument).
@@ -1686,20 +1753,54 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) {
-        let (cleaned, media) = extract_image_attachments(text);
+        let limits = paste_limits(self.paste_context_tokens);
+        let prospective_raw_bytes = textarea_bytes(&self.input).saturating_add(text.len());
+        if prospective_raw_bytes > limits.bytes {
+            self.push_note(format!(
+                "paste rejected: {prospective_raw_bytes} bytes exceeds limit {}",
+                limits.bytes
+            ));
+            return;
+        }
+
+        let normalized = normalize_paste(text);
+        let mut candidate = self.input.clone();
+        candidate.insert_str(&normalized);
+        let candidate_text = candidate.lines().join("\n");
+
+        if candidate_text.len() > limits.bytes {
+            self.push_note(format!(
+                "paste rejected: {} normalized bytes exceeds limit {}",
+                candidate_text.len(),
+                limits.bytes
+            ));
+            return;
+        }
+
+        let tokens = TokenBudget::estimate_str_tokens(&candidate_text);
+        if tokens > limits.tokens {
+            self.push_note(format!(
+                "paste rejected: {tokens} tokens exceeds limit {}",
+                limits.tokens
+            ));
+            return;
+        }
+
+        let (cleaned, media) = extract_image_attachments(&normalized);
         if !media.is_empty() && cleaned.trim().is_empty() {
             self.add_attachments(media);
         } else {
-            self.input.insert_str(text);
+            self.input = candidate;
         }
     }
 
     fn submit(&mut self) -> Action {
         let text = self.input.lines().join("\n");
         let (cleaned, mut media) = extract_image_attachments(&text);
+        let submitted_text = if media.is_empty() { text } else { cleaned };
         media.extend(std::mem::take(&mut self.attachments));
         dedupe(&mut media);
-        let trimmed = cleaned.trim();
+        let trimmed = submitted_text.trim();
         if trimmed.is_empty() && media.is_empty() {
             return Action::Continue;
         }
@@ -6070,6 +6171,182 @@ mod tests {
 
     fn input_text(app: &App) -> String {
         app.input.lines().join("\n")
+    }
+
+    const RECOVERED_TABLE_PASTE: &str = r##"no that is fine here the plan I put together
+
+┌─┬─────────────────────────────────┬───────┬────────────────────────────────────────────────────────┐ │#│Fix │Verdict│Why │ ├─┼─────────────────────────────────┼───────┼────────────────────────────────────────────────────────┤ │1│Memory section worked examples ( │LAND │True root cause. Fixes an asymmetry with the LCM guide │ │ │context.rs:1326-1327) │ │— not a new feature. │ ├─┼─────────────────────────────────┼───────┼────────────────────────────────────────────────────────┤ │2│Empty-arg error echoes a correct │LAND │Generalizes the debugger's defect-1 hint into one │ │ │example (registry.rs:1078) │ │reactive mechanism; "the moment the model is paying │ │ │ │ │attention." │ ped? ├─┼─────────────────────────────────┼───────┼────────────────────────────────────────────────────────┤ │3│Make dedup-block message │LAND │This is defect-2 option B. Resolves the checkpoint │ │ │corrective (tool_runner/mod.rs: │ │decision. │ │ │316) │ │ │ ├─┼─────────────────────────────────┼───────┼────────────────────────────────────────────────────────┤ │5│get_skills vs get_tools │LAND │One-liner; prevents a real, repeated confusion. │ ▀▀▀▀▀▀▀ │ │disambiguator (registry.rs:1014 /│ │ │ │ │ identity) │ │"##;
+
+    #[test]
+    fn paste_recovered_table_remains_submittable_and_renderable() {
+        let mut app = App::new();
+        app.set_paste_context_tokens(65_536);
+
+        assert!(matches!(
+            app.on_idle_event(Event::Paste(RECOVERED_TABLE_PASTE.to_string())),
+            Action::Continue
+        ));
+        let turn = match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            Action::Submit(turn) => turn,
+            _ => panic!("accepted table paste must remain submittable"),
+        };
+        assert_eq!(turn.text, RECOVERED_TABLE_PASTE);
+
+        app.begin_turn(&turn.text);
+        let rows = app.transcript_rows(1);
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn paste_recovered_table_during_streaming_remains_submittable() {
+        let mut app = App::new();
+        app.set_paste_context_tokens(65_536);
+        app.begin_turn("current request");
+
+        assert!(matches!(
+            app.on_streaming_event(Event::Paste(RECOVERED_TABLE_PASTE.to_string())),
+            StreamingAction::Continue
+        ));
+        match app.on_streaming_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            StreamingAction::CancelAndSubmit(turn) => {
+                assert_eq!(turn.text, RECOVERED_TABLE_PASTE)
+            }
+            _ => panic!("accepted streaming paste must remain submittable"),
+        }
+    }
+
+    #[test]
+    fn paste_limit_applies_to_complete_input_and_rejects_atomically() {
+        let mut app = App::new();
+        app.set_paste_context_tokens(8); // one-token paste budget
+
+        let _ = app.on_idle_event(Event::Paste("hello".into()));
+        assert_eq!(input_text(&app), "hello");
+
+        let before_input = input_text(&app);
+        let before_cursor = app.input.cursor();
+        let before_history = app.history.clone();
+        let before_attachments = app.attachments.clone();
+        let before_streaming = app.streaming;
+
+        let _ = app.on_idle_event(Event::Paste(" world".into()));
+
+        assert_eq!(input_text(&app), before_input);
+        assert_eq!(app.input.cursor(), before_cursor);
+        assert_eq!(app.history, before_history);
+        assert_eq!(app.attachments, before_attachments);
+        assert_eq!(app.streaming, before_streaming);
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Cell::Note(note))
+                if note.contains("paste rejected")
+                    && note.contains("2 tokens")
+                    && note.contains("limit 1")
+        ));
+    }
+
+    #[test]
+    fn paste_byte_preflight_rejects_before_tokenization() {
+        let mut app = App::new();
+        app.set_paste_context_tokens(8); // one token → 128-byte safety bound
+
+        let _ = app.on_idle_event(Event::Paste("x".repeat(129)));
+
+        assert_eq!(input_text(&app), "");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Cell::Note(note))
+                if note.contains("129 bytes") && note.contains("limit 128")
+        ));
+    }
+
+    #[test]
+    fn paste_rejection_does_not_cancel_streaming_or_mutate_draft() {
+        let mut app = App::new();
+        app.set_paste_context_tokens(8);
+        app.begin_turn("current request");
+        app.input.insert_str("hello");
+
+        let before_cursor = app.input.cursor();
+        let before_history = app.history.clone();
+        let before_attachments = app.attachments.clone();
+
+        assert!(matches!(
+            app.on_streaming_event(Event::Paste(" world".into())),
+            StreamingAction::Continue
+        ));
+        assert_eq!(input_text(&app), "hello");
+        assert_eq!(app.input.cursor(), before_cursor);
+        assert_eq!(app.history, before_history);
+        assert_eq!(app.attachments, before_attachments);
+        assert!(app.streaming);
+    }
+
+    #[test]
+    fn paste_normalizes_line_endings_and_escapes_terminal_controls() {
+        let mut app = App::new();
+        app.set_paste_context_tokens(8_192);
+
+        let _ = app.on_idle_event(Event::Paste("a\r\nb\rc\u{1b}\0\u{85}\td".into()));
+        let turn = match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            Action::Submit(turn) => turn,
+            _ => panic!("normalized paste must submit"),
+        };
+
+        assert_eq!(turn.text, "a\nb\nc\\u{1b}\\u{0}\\u{85}\td");
+        assert!(!turn
+            .text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t'));
+    }
+
+    #[test]
+    fn paste_accepts_difficult_unicode_without_changing_it() {
+        let input = "┌─表─┐ e\u{301} 👩\u{200d}💻 العربية אבגדה";
+        let mut app = App::new();
+        app.set_paste_context_tokens(8_192);
+
+        let _ = app.on_idle_event(Event::Paste(input.into()));
+        let turn = match app.on_idle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            Action::Submit(turn) => turn,
+            _ => panic!("Unicode paste must submit"),
+        };
+
+        assert_eq!(turn.text, input);
+        app.begin_turn(&turn.text);
+        assert!(!app.transcript_rows(1).is_empty());
+    }
+
+    #[test]
+    fn paste_image_only_still_attaches_without_inserting_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("table.png");
+        std::fs::write(&image, b"png").unwrap();
+        let mut app = App::new();
+        app.set_paste_context_tokens(8_192);
+
+        let _ = app.on_idle_event(Event::Paste(image.display().to_string()));
+
+        assert_eq!(input_text(&app), "");
+        assert_eq!(
+            app.attachments,
+            vec![std::fs::canonicalize(image)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()]
+        );
     }
 
     #[test]
