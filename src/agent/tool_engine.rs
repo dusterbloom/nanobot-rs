@@ -128,6 +128,101 @@ fn must_preserve_unstashed_raw(data: &str, cap: usize, stashed: bool) -> bool {
     data.chars().count() > cap && !stashed
 }
 
+/// The canonical stable handle marker. A tool-result message whose content
+/// starts with this is a handle — it carries metadata + a tiny excerpt, never
+/// the full body. The body lives in the stash, fetchable via
+/// `recall_tool_result({"tool_call_id": id})`.
+pub(crate) const TOOL_RESULT_HANDLE_MARKER: &str = "TOOL_RESULT_HANDLE v1 |";
+
+/// The explicit-retrieval tools whose results are ALREADY bounded (≤4KB) by
+/// their own cap. Per plan §2 they carry their bounded excerpt directly —
+/// wrapping them in a handle would be pointless double-indirection.
+fn is_explicit_retrieval_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "recall_tool_result" | "slice_tool_result" | "search_tool_result"
+    )
+}
+
+/// Render the canonical, write-once-stable handle for a tool result. Pure and
+/// deterministic: identical inputs always produce byte-identical output, so a
+/// handle rendered live at ingestion is identical to the one persisted to
+/// SQLite and reloaded later — no prefix-cache drift (the root cause of the
+/// `token_mismatch` desync class).
+///
+/// Built ONCE at ingestion from the exact stored bytes. The `sha256` is over
+/// those bytes; `chars` is the Unicode char count; `args` is a fixed-scalar
+/// allowlist (path/command/query) in a fixed order; `excerpt` is the first
+/// non-empty line, trimmed, whitespace-run-collapsed, char-capped at 160.
+/// Never LLM-summarized — summarization would make it non-stable.
+fn render_tool_result_handle(
+    id: &str,
+    tool: &str,
+    ok: bool,
+    stored_bytes: &[u8],
+    args: &std::collections::HashMap<String, Value>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(stored_bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    let chars = std::str::from_utf8(stored_bytes)
+        .map(|s| s.chars().count())
+        .unwrap_or(stored_bytes.len());
+    let excerpt = handle_excerpt(stored_bytes);
+    format!(
+        r#"{MARKER} id:{id_j} | tool:{tool_j} | ok:{ok} | chars:{chars} | sha256:{digest} | args:{args_j} | excerpt:{excerpt_j} | fetch:"recall_tool_result""#,
+        MARKER = TOOL_RESULT_HANDLE_MARKER,
+        id_j = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".into()),
+        tool_j = serde_json::to_string(tool).unwrap_or_else(|_| "\"\"".into()),
+        args_j = serde_json::to_string(&tool_arg_summary(args)).unwrap_or_else(|_| "{}".into()),
+        excerpt_j = serde_json::to_string(&excerpt).unwrap_or_else(|_| "\"\"".into()),
+    )
+}
+
+/// Fixed-scalar allowlist for the handle's `args` field, in a fixed order.
+/// Only these keys are surfaced (deterministic + compact); everything else is
+/// dropped. JSON-escaped by the caller via `serde_json::to_string`.
+fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for key in &["path", "command", "query"] {
+        if let Some(v) = args.get(*key) {
+            if let Some(s) = v.as_str() {
+                out.push((*key, s.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// First non-empty line of `stored_bytes`, trimmed, with runs of whitespace
+/// collapsed to a single space, char-capped at 160. Deterministic — never
+/// LLM-summarized.
+fn handle_excerpt(stored_bytes: &[u8]) -> String {
+    let text = std::str::from_utf8(stored_bytes).unwrap_or("");
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut collapsed = String::with_capacity(line.len().min(320));
+    let mut prev_ws = false;
+    for ch in line.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws {
+                collapsed.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            collapsed.push(ch);
+            prev_ws = false;
+        }
+    }
+    collapsed.chars().take(160).collect()
+}
+
 /// Surface a stash failure to the loop and to the user. Sets
 /// `ctx.flow.infra_error` so `step_execute_tools` finalizes the turn with this
 /// message after the tool engine returns; also pushes an `ok:false` tool
@@ -617,17 +712,24 @@ pub(crate) async fn execute_tools_delegated(
                 continue;
             }
         };
-        let mut injected = if must_preserve_unstashed_raw(full_data, cap, stashed_raw) {
-            full_data.to_string()
+        let mut injected = if stashed_raw && !is_explicit_retrieval_tool(&tc.name) {
+            // LARGE delegated output was stashed → handle only. The body lives
+            // in the stash; the model recalls it via recall_tool_result.
+            render_tool_result_handle(
+                &tc.id,
+                &tc.name,
+                tool_result_ok(full_data),
+                full_data.as_bytes(),
+                &tc.arguments,
+            )
+        } else if stashed_raw {
+            // Retrieval tools keep their bounded excerpt even when stashed.
+            build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
         } else {
+            // Small output, not stashed — preview the (already-shaped)
+            // injected_raw inline.
             build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
         };
-        if stashed_raw && tc.name != "recall_tool_result" && !injected.contains("recall_tool_result") {
-            injected.push_str(&format!(
-                "\n[full original output retrievable via recall_tool_result({{\"tool_call_id\": \"{}\"}})]",
-                tc.id
-            ));
-        }
         // Prepend the per-lease progress signal so the model can see
         // remaining budget inline (B3 of the lease design — visible,
         // deterministic, helps the model self-regulate instead of being
@@ -1126,15 +1228,24 @@ async fn inject_tool_result(
                 return;
             }
         };
-        if must_preserve_unstashed_raw(&result_data, cap, stashed_raw) {
-            ctx.content_gate.budget.consume(
-                crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data),
+        if stashed_raw {
+            // LARGE result was durably stashed → the prompt carries only the
+            // canonical handle (metadata + tiny excerpt). The body lives in
+            // the stash, fetchable via recall_tool_result. This is the
+            // handles-not-bodies invariant: no oversized body in the prompt.
+            let handle = render_tool_result_handle(
+                &r.tool_id,
+                &r.tool_name,
+                r.result.ok,
+                result_data.as_bytes(),
+                &r.arguments,
             );
-            result_data
+            ctx.content_gate.admit_simple(&handle).into_text()
         } else {
-            let prompt_data =
-                digest_tool_result(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id);
-            ctx.content_gate.admit_simple(&prompt_data).into_text()
+            // Small result, not stashed — small enough to carry inline raw
+            // (under both the char cap and the replay byte cap). A handle
+            // would be larger than the body itself.
+            ctx.content_gate.admit_simple(&result_data).into_text()
         }
     };
 
@@ -2365,6 +2476,90 @@ mod tests {
             sessions.load_tool_result(&sid, "tc_1").await.as_deref(),
             Some(body_a.as_str()),
             "conflicting write must not replace the stored body"
+        );
+    }
+
+    /// STEP 2: the canonical handle must be a pure deterministic function of
+    /// (id, tool, ok, stored_bytes, args). Same inputs → byte-identical output
+    /// across calls (write-once-stable → no prefix-cache drift). The full body
+    /// must NOT be a substring of the handle (handles carry only a tiny
+    /// excerpt; the body lives in the stash).
+    #[test]
+    fn render_tool_result_handle_is_deterministic_and_hides_body() {
+        let body = "line one with specific content\nline two\nline three";
+        let mut args = HashMap::new();
+        args.insert(
+            "path".to_string(),
+            Value::String("src/main.rs".to_string()),
+        );
+        args.insert(
+            "ignored_thing".to_string(),
+            Value::String("should not appear".to_string()),
+        );
+
+        let h1 = render_tool_result_handle("call_42", "read_file", true, body.as_bytes(), &args);
+        let h2 = render_tool_result_handle("call_42", "read_file", true, body.as_bytes(), &args);
+
+        assert_eq!(h1, h2, "handle must be byte-identical across calls");
+        assert!(
+            h1.starts_with("TOOL_RESULT_HANDLE v1 |"),
+            "handle must start with the canonical versioned marker; got: {h1}"
+        );
+        // The body's specific content is NOT in the handle — only a tiny
+        // single-line excerpt and metadata.
+        assert!(
+            !h1.contains("line two"),
+            "the full body must not be a substring of the handle; got: {h1}"
+        );
+        assert!(
+            !h1.contains("line three"),
+            "the full body must not be a substring of the handle; got: {h1}"
+        );
+        // The handle points the model at recall_tool_result for the full body.
+        assert!(
+            h1.contains("recall_tool_result") && h1.contains("call_42"),
+            "handle must reference recall_tool_result and the id; got: {h1}"
+        );
+        // The deterministic args summary includes the allowlisted scalar (path)
+        // but NOT non-allowlisted fields.
+        assert!(
+            h1.contains("src/main.rs"),
+            "handle must include the path arg; got: {h1}"
+        );
+        assert!(
+            !h1.contains("should not appear"),
+            "handle must not include non-allowlisted args; got: {h1}"
+        );
+        // The excerpt is the first non-empty line, bounded.
+        assert!(
+            h1.contains("line one with specific content"),
+            "handle must include the first-line excerpt; got: {h1}"
+        );
+    }
+
+    /// The handle excerpt must be whitespace-normalized and char-capped — a
+    /// first line with embedded newlines or huge length must not bloat the
+    /// handle or drift across renders.
+    #[test]
+    fn render_tool_result_handle_excerpt_is_normalized_and_capped() {
+        let body = "    \n   first    line   with   spaces   \nsecond\n";
+        let args = HashMap::new();
+        let h = render_tool_result_handle("c1", "exec", true, body.as_bytes(), &args);
+        // The excerpt skipped the whitespace-only first line, took the second,
+        // and collapsed internal whitespace runs.
+        assert!(
+            h.contains("first line with spaces"),
+            "excerpt must skip blank leading lines and collapse whitespace; got: {h}"
+        );
+        // Char cap: a very long first line is truncated.
+        let long_line: String = std::iter::repeat('x').take(500).collect();
+        let body_long = long_line.clone();
+        let h2 = render_tool_result_handle("c2", "exec", true, body_long.as_bytes(), &args);
+        // The handle itself stays small — well under the body size.
+        assert!(
+            h2.len() < 600,
+            "handle with a 500-char first line must stay small; got len={}",
+            h2.len()
         );
     }
 }

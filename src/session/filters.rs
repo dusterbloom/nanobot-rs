@@ -240,6 +240,12 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
                     let source_id = recalled_source_tool_call_id(messages, safe_start + offset);
                     recall_tool_result_replay_reference(raw, source_id.as_deref())
                 }
+            } else if role == "tool"
+                && raw.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
+            {
+                // Handles are write-once-stable: pass through byte-identical
+                // on reload so the prefix cache never sees a drift.
+                raw.to_string()
             } else if role == "tool" {
                 cap_tool_body(raw)
             } else {

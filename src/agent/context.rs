@@ -1148,10 +1148,12 @@ impl ContextBuilder {
         result: &str,
         ok: bool,
     ) {
-        // Recalled bytes are intentionally one-shot: keep them raw for the
-        // immediate follow-up LLM call, then session replay replaces the
-        // persisted tool message with a compact digest/reference.
-        let content = if tool_name == "recall_tool_result" {
+        // Handles are already canonical + bounded — capping them would
+        // corrupt the stable marker. Recalled bytes are also one-shot raw.
+        // All other bodies get the deterministic replay cap.
+        let content = if tool_name == "recall_tool_result"
+            || result.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
+        {
             result.to_string()
         } else {
             cap_tool_result_for_replay(result)
@@ -1192,9 +1194,11 @@ impl ContextBuilder {
         result: &str,
         ok: bool,
     ) {
-        // The "quote verbatim" instruction lives in the system prompt; the
-        // result body is stored bare so replay doesn't bloat per-result.
-        let content = if tool_name == "recall_tool_result" {
+        // Handles are already canonical + bounded — capping them would
+        // corrupt the stable marker. Recalled bytes are also one-shot raw.
+        let content = if tool_name == "recall_tool_result"
+            || result.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
+        {
             result.to_string()
         } else {
             cap_tool_result_for_replay(result)
