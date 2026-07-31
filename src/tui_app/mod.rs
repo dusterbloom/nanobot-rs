@@ -262,6 +262,8 @@ async fn event_loop(
                 continue;
             }
         };
+        let paste_context_tokens = ctx.core_handle.swappable().token_budget.max_context();
+        app.set_paste_context_tokens(paste_context_tokens);
         match app.on_idle_event(ev) {
             Action::Quit => break,
             Action::Continue => {}
@@ -917,6 +919,7 @@ async fn run_turn(
     channel: &str,
     ev_rx: &mut UnboundedReceiver<Event>,
 ) -> std::io::Result<TurnOutcome> {
+    app.set_paste_context_tokens(session.core.swappable().token_budget.max_context());
     app.begin_turn(&turn.display_text());
 
     let (delta_tx, delta_rx) = unbounded_channel::<String>();
