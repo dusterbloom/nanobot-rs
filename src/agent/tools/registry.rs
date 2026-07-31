@@ -661,12 +661,25 @@ impl ToolRegistry {
                 futures_util::FutureExt::catch_unwind(fut).await
             }
         };
-        let result = match unwound {
+        let mut result = match unwound {
             Ok(result) => result,
             Err(_) => {
                 ToolExecutionResult::failure(format!("Tool '{}' panicked during execution", name))
             }
         };
+
+        // When a tool rejects a call for a missing required arg, append the
+        // exact call shape derived from its schema. This is the moment a weak
+        // (temp 0) model pays attention; a passive "Error: 'query' is
+        // required" does not teach the shape, so the model retries identically
+        // until the dedup guard terminates the turn. Generic across every tool
+        // — reads the schema, no per-tool hardcoding.
+        if !result.ok && result.data.contains("is required") {
+            if let Some(example) = Self::worked_example_call(&name, &tool.parameters()) {
+                let base = result.data.trim_end_matches('.');
+                result.data = format!("{}. Call as {}.", base, example);
+            }
+        }
 
         self.run_post_hook(&name, &params, &result).await;
         result
@@ -1011,7 +1024,7 @@ impl ToolRegistry {
             "Gateway to all tools. Omit tool_name to list every available tool. \
              Provide {{\"tool_name\":\"NAME\"}} to inspect that tool's full parameter \
              schema, or {{\"tool_name\":\"NAME\",\"tool_args\":{{\"arg\":\"value\"}}}} to invoke it. \
-             Starter tools: read_file, get_skills (native; omit name to list skills), recall \
+             Starter tools: read_file, get_skills (lists SKILLS, not tools), recall \
              (memory search), remember, todo (plan multi-step artifact work), edit_file, \
              exec, write_file. A complete write_file call may contain the whole file. \
              For voluntary staged writes, keep state=more pieces to 4096 characters or \
@@ -1068,7 +1081,15 @@ impl ToolRegistry {
         let mut sent = Self::proxy_intent_keys(params);
         let names = self.available_tool_names();
         if sent.is_empty() {
-            return ToolExecutionResult::success(format!("Available tools: {}", names.join(", ")));
+            // The catalog result is the feedback a weak model actually reads.
+            // A bare name list gives no way to reach schemas, so the model
+            // loops calling get_tools({}) identically until the dedup guard
+            // terminates the turn. State the inspect path in the result itself.
+            return ToolExecutionResult::success(format!(
+                "Available tools: {}. Pass {{\"tool_name\":\"NAME\"}} to inspect NAME's \
+                 full parameter schema.",
+                names.join(", ")
+            ));
         }
         sent.sort_unstable();
         warn!(
@@ -1105,6 +1126,36 @@ impl ToolRegistry {
             })
             .map(|(key, _)| key.as_str())
             .collect()
+    }
+
+    /// Build a worked-example call shape from a tool's parameter schema, for
+    /// appending to missing-required-arg error messages. Returns `None` only
+    /// when the tool genuinely takes no parameters. Declared `required` params
+    /// are used when present; otherwise the first property is used, so
+    /// mode-defaulted tools (e.g. `session_search`, whose `required` array is
+    /// empty because the default mode doesn't need `query`) still surface a
+    /// useful example at the moment the model is paying attention.
+    fn worked_example_call(name: &str, schema_params: &serde_json::Value) -> Option<String> {
+        let props = schema_params.get("properties")?.as_object()?;
+        if props.is_empty() {
+            return None;
+        }
+        let required: Vec<&str> = schema_params
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let keys: Vec<&str> = if !required.is_empty() {
+            required
+        } else {
+            vec![props.keys().next()?.as_str()]
+        };
+        let inner = keys
+            .iter()
+            .map(|k| format!("\"{k}\":\"...\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("{name}({{{inner}}})"))
     }
 
     /// Decode the compact proxy envelope once at its wire boundary.
@@ -3131,6 +3182,127 @@ mod tests {
         assert!(
             result.ok && result.data.contains("Available tools:"),
             "empty args/null name is a bare discovery call: {}",
+            result.data
+        );
+    }
+
+    /// Regression: a bare `get_tools({})` discovery call must tell the model
+    /// HOW to retrieve a tool's schema. Without an inspect hint in the result,
+    /// weak local models loop calling `get_tools({})` identically (each call
+    /// returns the same flat name list) until the dedup guard terminates the
+    /// turn with a generic message. The catalog result is the feedback the
+    /// model actually reads, so the hint must live here, not only in the tool
+    /// description. See .planning/debug/get-tools-dedup-drop.md.
+    #[tokio::test]
+    async fn test_proxy_catalog_directs_model_to_inspect_path() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("edit_file")));
+        registry.register(Box::new(MockTool::new("read_file")));
+
+        let result = registry.execute("get_tools", HashMap::new()).await;
+        assert!(result.ok, "discovery must succeed: {:?}", result.data);
+        assert!(
+            result.data.contains("Available tools:"),
+            "catalog must still list tools: {}",
+            result.data
+        );
+        // The actionable hint: the model must learn, from THIS result, that
+        // passing tool_name yields a schema. A flat "Available tools: a, b"
+        // alone does not break the identical-retry loop.
+        assert!(
+            result.data.contains("tool_name")
+                && (result.data.contains("schema")
+                    || result.data.contains("inspect")
+                    || result.data.contains("parameters")),
+            "catalog must direct the model to the inspect path (tool_name → schema): {}",
+            result.data
+        );
+    }
+
+    /// Unit test for the schema-derived worked-example builder. Pins the three
+    /// branches: declared required params, fallback to first property (for
+    /// mode-defaulted tools like session_search whose `required` is empty), and
+    /// None for genuinely no-arg tools.
+    #[test]
+    fn worked_example_call_derives_from_schema() {
+        // Declared required params → example includes exactly those.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}, "mode": {"type": "string"}},
+            "required": ["query"]
+        });
+        assert_eq!(
+            ToolRegistry::worked_example_call("recall", &schema).as_deref(),
+            Some("recall({\"query\":\"...\"})")
+        );
+
+        // No required declared → falls back to first property (session_search
+        // declares required: [] because its default mode needs no args, but the
+        // empty-arg loop is on `query`).
+        let schema_no_required = serde_json::json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}, "mode": {"type": "string"}}
+        });
+        let example =
+            ToolRegistry::worked_example_call("session_search", &schema_no_required)
+                .expect("first-property fallback must yield an example");
+        assert!(
+            example.starts_with("session_search({\""),
+            "fallback example must include a property: {example}"
+        );
+
+        // Genuinely no-arg tool → None (no augmentation possible).
+        let no_args = serde_json::json!({"type": "object", "properties": {}});
+        assert_eq!(ToolRegistry::worked_example_call("system_info", &no_args), None);
+    }
+
+    /// Regression (defect 2): a tool that rejects empty args with the canonical
+    /// "Error: 'X' is required" must, at the registry dispatch boundary, get a
+    /// corrective worked example appended — derived from the tool's OWN schema.
+    /// This is the moment a zero-temp weak model pays attention; without the
+    /// shape it retries identically until the dedup guard kills the turn.
+    /// See .planning/debug/get-tools-dedup-drop.md.
+    #[tokio::test]
+    async fn test_missing_required_arg_error_appends_schema_derived_example() {
+        struct RequireQueryTool;
+        #[async_trait]
+        impl Tool for RequireQueryTool {
+            fn name(&self) -> &str {
+                "require_query"
+            }
+            fn description(&self) -> &str {
+                "test tool requiring query"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                })
+            }
+            async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
+                "Error: 'query' parameter is required and must be non-empty.".to_string()
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(RequireQueryTool));
+
+        let result = registry.execute("require_query", HashMap::new()).await;
+        assert!(
+            !result.ok,
+            "tool must still report failure (no silent success)"
+        );
+        // The corrective shape, derived from the schema's required params:
+        assert!(
+            result.data.contains("Call as require_query({\"query\":\"...\"})"),
+            "missing-arg error must echo the schema-derived worked example: {}",
+            result.data
+        );
+        // The original error text is preserved (augmented, not replaced):
+        assert!(
+            result.data.contains("'query' parameter is required"),
+            "augmentation must preserve the original error: {}",
             result.data
         );
     }

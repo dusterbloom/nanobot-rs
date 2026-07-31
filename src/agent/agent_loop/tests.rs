@@ -3607,9 +3607,19 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
     .await
     .expect("cached duplicate loop must terminate");
 
-    assert_eq!(
-        response,
-        "The same tool request repeated after its result was already available, so the loop was stopped to prevent further duplicate work."
+    // The forced Break message must be CORRECTIVE (why + what to change), not a
+    // false "result already available" claim — that framing is wrong for
+    // meta-tools like get_tools whose cached result (a flat name list) is NOT
+    // what the model's repeated empty-arg call was trying to reach. See
+    // .planning/debug/get-tools-dedup-drop.md defect 2 (option B).
+    assert!(
+        response.contains("Change the arguments"),
+        "dedup Break must be corrective: {response}"
+    );
+    assert!(
+        !response.contains("result was already available"),
+        "dedup Break must not falsely claim the cached result satisfied the \
+         request (wrong for meta-tools like get_tools): {response}"
     );
     assert_eq!(
         provider.call_count(),

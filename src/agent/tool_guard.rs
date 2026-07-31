@@ -365,4 +365,57 @@ mod tests {
         }
         assert!(guard.allow("exec", &a).is_err());
     }
+
+    /// Regression for the get_tools dedup-drop: a successful non-read/non-web
+    /// tool (e.g. the `get_tools` meta-tool) gets its result stored in the
+    /// `results` map by `record_result_with_status`, even though
+    /// `uses_cached_result()` is false for it. The router's block classifier
+    /// then calls `get_cached_result()` directly and finds the stored result,
+    /// classifying the blocked call as `blocked_with_result` — which makes the
+    /// circuit breaker fire at rounds=1 and discard the actionable receipt.
+    ///
+    /// This test pins the surprising-but-load-bearing behavior: get_tools is
+    /// stored AND retrievable via get_cached_result, yet allow() blocks it via
+    /// the count-limit path (not the cache path). See
+    /// .planning/debug/get-tools-dedup-drop.md.
+    #[test]
+    fn test_get_tools_result_cached_but_blocked_via_count_limit() {
+        let mut guard = ToolGuard::new(2);
+        let empty = HashMap::new();
+        let key = ToolGuard::key("get_tools", &empty);
+
+        // get_tools is NOT a read/web tool, so the cache-block path in allow()
+        // never fires — only the count-limit path does.
+        assert!(!ToolGuard::uses_cached_result("get_tools"));
+
+        // Two identical discovery calls succeed; each result is recorded.
+        assert!(guard.allow("get_tools", &empty).is_ok());
+        guard.record_result_with_status(
+            "get_tools",
+            &empty,
+            "Available tools: a, b".to_string(),
+            true,
+        );
+        assert!(guard.allow("get_tools", &empty).is_ok());
+        guard.record_result_with_status(
+            "get_tools",
+            &empty,
+            "Available tools: a, b".to_string(),
+            true,
+        );
+
+        // The cached result is retrievable even though get_tools isn't a
+        // read/web tool — this is what makes the router classify the next
+        // block as `blocked_with_result`.
+        assert_eq!(guard.get_cached_result(&key), Some("Available tools: a, b"));
+
+        // Third identical call is blocked by the count-limit path (limit 2).
+        let err = guard
+            .allow("get_tools", &empty)
+            .expect_err("third identical call must be blocked");
+        assert!(
+            err.contains("exceeded 2 identical calls"),
+            "block must come from the count-limit path: {err}"
+        );
+    }
 }

@@ -1323,8 +1323,10 @@ impl ContextBuilder {
                     "## Memory\n\
                      Working Memory is injected automatically (session state). \
                      Long-term facts: {memory_path}.\n\
-                     Use `recall` for curated facts and indexed knowledge. Use \
-                     `session_search` for raw past conversations and recent sessions.\n\n\
+                     For curated facts and indexed knowledge, use recall — for example \
+                     recall({{\"query\":\"serramanna\"}}). For raw past conversations and \
+                     recent sessions, use session_search — for example \
+                     session_search({{\"query\":\"diary of two threads\"}}).\n\n\
                      If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your \
                      approach — it takes precedence."
                 ),
@@ -2053,13 +2055,25 @@ mod tests {
         let (_tmp, cb) = make_context();
         let identity = cb._get_identity(false);
 
+        // The Memory section must show the exact call shape (worked example),
+        // not just name the tools — a weak zero-temp model copies the shape it
+        // sees. Mirror the LCM_EXPAND_GUIDE style: name(args). The param names
+        // (`query`) match the real recall/session_search schemas.
         assert!(
-            identity.contains("`recall` for curated facts and indexed knowledge"),
-            "{identity}"
+            identity.contains("recall({\"query\":"),
+            "Memory section must show recall's worked call shape: {identity}"
         );
         assert!(
-            identity.contains("`session_search` for raw past conversations"),
-            "{identity}"
+            identity.contains("session_search({\"query\":"),
+            "Memory section must show session_search's worked call shape: {identity}"
+        );
+        assert!(
+            identity.contains("curated facts"),
+            "must still distinguish curated memory (recall): {identity}"
+        );
+        assert!(
+            identity.contains("raw past conversations"),
+            "must still distinguish session history (session_search): {identity}"
         );
     }
 

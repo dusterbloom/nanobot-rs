@@ -1638,7 +1638,7 @@ pub(crate) async fn route_tool_calls(
                     "tool_loop_circuit_breaker: model stuck requesting blocked tools, forcing response"
                 );
                 return RouteResult::Break(
-                    "The same tool request repeated after its result was already available, so the loop was stopped to prevent further duplicate work."
+                    "You repeated an identical tool call with no new arguments, so the loop was stopped. Change the arguments or pick a different tool."
                         .to_string(),
                 );
             }
