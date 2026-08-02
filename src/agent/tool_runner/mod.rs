@@ -271,7 +271,7 @@ impl ToolCallIdAllocator {
 
 fn is_external_runner_tool(name: &str) -> bool {
     worker_tools::is_worker_tool(name)
-        || (!context_store::is_micro_tool(name) && name != "ctx_summarize" && name != DELEGATE_TOOL)
+        || (!context_store::is_micro_tool(name) && name != "ctx_summarize")
 }
 
 /// Normalize a tool call key for dedup: sort JSON keys and use compact serialization.
@@ -440,27 +440,30 @@ async fn analyze_via_scratch_pad(
                 break;
             }
 
-            let external_count = response
+            // The lease accounts for the batch that can actually execute.
+            // Provider call IDs are not semantic identity: local models often
+            // repeat one call under multiple IDs in the same response. Build
+            // one stable unique set before both admission and rejection so a
+            // duplicate cannot consume an extra slot or receive a fake receipt.
+            let mut external_seen = std::collections::HashSet::new();
+            let external_calls: Vec<_> = response
                 .tool_calls
                 .iter()
                 .filter(|tc| {
                     allowed_tools.contains(tc.name.as_str())
                         && !seen_calls.contains(&normalize_call_key(&tc.name, &tc.arguments))
                         && is_external_runner_tool(&tc.name)
+                        && external_seen.insert(normalize_call_key(&tc.name, &tc.arguments))
                 })
-                .count() as u32;
+                .collect();
+            let external_count = external_calls.len() as u32;
             if external_count > 0 {
                 if let Some(active_lease) = lease.as_deref_mut() {
                     if let crate::agent::lease::BatchAdmission::Rejected { remaining } =
                         active_lease.admit_batch(external_count)
                     {
                         let instruction = active_lease.rejection_instruction();
-                        for tc in response.tool_calls.iter().filter(|tc| {
-                            allowed_tools.contains(tc.name.as_str())
-                                && !seen_calls
-                                    .contains(&normalize_call_key(&tc.name, &tc.arguments))
-                                && is_external_runner_tool(&tc.name)
-                        }) {
+                        for tc in external_calls {
                             let id = ids.allocate("sp");
                             let result = format!(
                                 "lease exhausted: {} was not executed — this batch requested {} external calls with {} remaining. {}",

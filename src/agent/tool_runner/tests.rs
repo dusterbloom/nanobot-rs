@@ -136,6 +136,13 @@ fn make_tool_calls(names: &[&str]) -> Vec<ToolCallRequest> {
         .collect()
 }
 
+#[test]
+fn recursive_delegate_is_an_external_leased_call() {
+    assert!(is_external_runner_tool(DELEGATE_TOOL));
+    assert!(!is_external_runner_tool("ctx_slice"));
+    assert!(!is_external_runner_tool("ctx_summarize"));
+}
+
 #[tokio::test]
 async fn persisted_runner_rejects_scratch_batch_on_shared_local_lease() {
     let provider = Arc::new(MockProvider::new(vec![
@@ -206,6 +213,142 @@ async fn persisted_runner_rejects_scratch_batch_on_shared_local_lease() {
             Some(false)
         );
     }
+}
+
+#[tokio::test]
+async fn scratch_lease_counts_unique_external_calls_before_admission() {
+    let duplicate = ToolCallRequest {
+        id: "duplicate_a".to_string(),
+        name: "test_tool".to_string(),
+        arguments: HashMap::from([("query".to_string(), json!("same"))]),
+    };
+    let mut duplicate_b = duplicate.clone();
+    duplicate_b.id = "duplicate_b".to_string();
+    let provider = Arc::new(MockProvider::new(vec![
+        crate::providers::base::LLMResponse {
+            content: None,
+            tool_calls: vec![duplicate, duplicate_b],
+            finish_reason: "tool_calls".to_string(),
+            usage: HashMap::new(),
+        },
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(CountingTool::new()));
+    let config = ToolRunnerConfig {
+        provider,
+        model: "mock".into(),
+        max_iterations: 3,
+        max_tokens: 4096,
+        max_tool_result_chars: 30_000,
+        short_circuit_chars: 0,
+        depth: 0,
+        cancellation_token: None,
+        verbatim: false,
+        budget: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = Arc::new(crate::session::SessionDb::new(
+        &dir.path().join("sessions.db"),
+    ));
+    let session = sessions.create_session("runner:unique-lease-count").await;
+    let persistence = ToolResultPersistence::new(sessions, session.id, ["root".to_string()]);
+    let mut lease = crate::agent::lease::Lease::new(12, 0);
+    assert_eq!(
+        lease.admit_batch(11),
+        crate::agent::lease::BatchAdmission::Admitted
+    );
+
+    let result = run_tool_loop_persisted(
+        &config,
+        &[ToolCallRequest {
+            id: "root".into(),
+            name: "test_tool".into(),
+            arguments: HashMap::from([("query".into(), json!("root"))]),
+        }],
+        &tools,
+        "test",
+        &persistence,
+        &mut lease,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(result.tool_results[0].0, "root");
+    assert_eq!(result.tool_results[1].1, "test_tool");
+    assert_eq!(result.tool_results[1].2, "tool result data");
+}
+
+#[tokio::test]
+async fn exhausted_shared_lease_rejects_recursive_delegate_before_provider_call() {
+    let child_delegate = crate::providers::base::LLMResponse {
+        content: None,
+        tool_calls: vec![ToolCallRequest {
+            id: "reused_recursive_delegate".to_string(),
+            name: DELEGATE_TOOL.to_string(),
+            arguments: HashMap::from([("task".to_string(), json!("recurse"))]),
+        }],
+        finish_reason: "tool_calls".to_string(),
+        usage: HashMap::new(),
+    };
+    let provider = Arc::new(MockProvider::new(vec![
+        child_delegate,
+        crate::providers::base::LLMResponse {
+            content: Some("grandchild escaped the lease".to_string()),
+            tool_calls: vec![],
+            finish_reason: "stop".to_string(),
+            usage: HashMap::new(),
+        },
+    ]));
+    let config = ToolRunnerConfig {
+        provider: provider.clone(),
+        model: "mock".into(),
+        max_iterations: 3,
+        max_tokens: 4096,
+        max_tool_result_chars: 30_000,
+        short_circuit_chars: 0,
+        depth: 0,
+        cancellation_token: None,
+        verbatim: false,
+        budget: Some(Budget::root(3, 2)),
+    };
+    let tools = ToolRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = Arc::new(crate::session::SessionDb::new(
+        &dir.path().join("sessions.db"),
+    ));
+    let session = sessions
+        .create_session("runner:recursive-delegate-lease")
+        .await;
+    let persistence =
+        ToolResultPersistence::new(sessions, session.id, ["root_delegate".to_string()]);
+    let mut lease = crate::agent::lease::Lease::new(12, 0);
+    assert_eq!(
+        lease.admit_batch(12),
+        crate::agent::lease::BatchAdmission::Admitted
+    );
+
+    let result = run_tool_loop_persisted(
+        &config,
+        &[ToolCallRequest {
+            id: "root_delegate".into(),
+            name: DELEGATE_TOOL.into(),
+            arguments: HashMap::from([("task".into(), json!("start"))]),
+        }],
+        &tools,
+        "test",
+        &persistence,
+        &mut lease,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(result.tool_results[0].0, "root_delegate");
+    assert!(result.tool_results[0].2.contains("Finalize now"));
+    assert!(!result.tool_results[0]
+        .2
+        .contains("grandchild escaped the lease"));
 }
 
 #[tokio::test]
