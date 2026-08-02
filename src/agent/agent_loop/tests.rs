@@ -3049,6 +3049,24 @@ async fn gateway_clear_waits_for_active_same_session_turn() {
         "/clear completed while an older same-session turn still held the session lock"
     );
 
+    let third = InboundMessage::new("test", "user", "other", "independent");
+    let independent_started = provider.second_started.notified();
+    inbound_tx.send(third).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        independent_started,
+    )
+    .await
+    .expect("a queued same-session clear must not consume another session's permit");
+    let independent_outbound = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        outbound_rx.recv(),
+    )
+    .await
+    .expect("independent response must arrive while the first turn remains blocked")
+    .expect("outbound channel must stay open");
+    assert_eq!(independent_outbound.content, "response 2");
+
     provider.allow_first.notify_one();
     let first_outbound = tokio::time::timeout(
         std::time::Duration::from_secs(5),

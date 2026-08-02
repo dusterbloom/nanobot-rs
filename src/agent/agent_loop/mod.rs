@@ -304,8 +304,8 @@ impl AgentLoop {
                             let _other_display_tx = self.shared.repl_display_tx.clone();
                             let other_sem = semaphore.clone();
                             tokio::spawn(async move {
+                                let _guard = other_lock.lock().await;
                                 if let Ok(permit) = other_sem.acquire_owned().await {
-                                    let _guard = other_lock.lock().await;
                                     if let Some(resp) = other_shared
                                         .process_message(&other, None, None, None, None)
                                         .await
@@ -347,15 +347,6 @@ impl AgentLoop {
                 continue;
             }
 
-            // Acquire a concurrency permit.
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    error!("Semaphore closed unexpectedly");
-                    break;
-                }
-            };
-
             // Get or create the per-session lock.
             let session_key = msg.session_key();
             let session_lock = session_lock_for(&session_locks, &session_key).await;
@@ -363,6 +354,7 @@ impl AgentLoop {
             let shared = self.shared.clone();
             let outbound_tx = self.shared.bus_outbound_tx.clone();
             let display_tx = self.shared.repl_display_tx.clone();
+            let request_sem = semaphore.clone();
 
             tokio::spawn(async move {
                 // Serialize within the same session.
@@ -388,6 +380,18 @@ impl AgentLoop {
                         return;
                     }
                 }
+
+                // Same-session work waits on its ordering lock without
+                // reserving global inference capacity. Recognized commands do
+                // not need a model permit at all; unknown slash commands fall
+                // through and acquire one like any other inference request.
+                let permit = match request_sem.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        error!("Semaphore closed unexpectedly");
+                        return;
+                    }
+                };
 
                 // Notify REPL about inbound channel message.
                 if let Some(ref dtx) = display_tx {
