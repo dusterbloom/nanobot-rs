@@ -3001,18 +3001,21 @@ async fn concurrent_direct_turns_for_one_session_are_serialized() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
-#[tokio::test]
-async fn gateway_clear_waits_for_active_same_session_turn() {
-    let provider = Arc::new(BlockingFirstProvider::new());
-    let (base_loop, workspace) =
-        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+fn build_gateway_harness(
+    provider: Arc<dyn LLMProvider>,
+) -> (
+    AgentLoop,
+    tokio::sync::mpsc::UnboundedSender<InboundMessage>,
+    tokio::sync::mpsc::UnboundedReceiver<OutboundMessage>,
+    std::path::PathBuf,
+) {
+    let (base_loop, workspace) = build_local_inline_harness(provider);
     let core_handle = base_loop.shared.core_handle.clone();
-    let sessions = core_handle.swappable().sessions.clone();
     drop(base_loop);
 
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut gateway_loop = AgentLoop::new(
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
         outbound_tx,
@@ -3026,6 +3029,15 @@ async fn gateway_clear_waits_for_active_same_session_turn() {
         LcmSchemaConfig::default(),
         None,
     );
+    (gateway_loop, inbound_tx, outbound_rx, workspace)
+}
+
+#[tokio::test]
+async fn gateway_clear_waits_for_active_same_session_turn() {
+    let provider = Arc::new(BlockingFirstProvider::new());
+    let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+        build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let sessions = gateway_loop.shared.core_handle.swappable().sessions.clone();
     let running = gateway_loop.running.clone();
     let runner = tokio::spawn(async move { gateway_loop.run().await });
     let session_key = "test:offline".to_string();
@@ -3100,6 +3112,58 @@ async fn gateway_clear_waits_for_active_same_session_turn() {
     tokio::time::timeout(std::time::Duration::from_secs(5), runner)
         .await
         .expect("gateway loop must stop after its input channel closes")
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn cross_session_command_seen_during_coalescing_uses_gateway_dispatch() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-main",
+        vec![WireRecordingProvider::text_response("coalesced response")],
+    ));
+    let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+        build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let running = gateway_loop.running.clone();
+    let runner = tokio::spawn(async move { gateway_loop.run().await });
+
+    inbound_tx
+        .send(InboundMessage::new("test", "user", "first", "hello"))
+        .unwrap();
+    inbound_tx
+        .send(InboundMessage::new("test", "user", "second", "/clear"))
+        .unwrap();
+
+    let mut responses = Vec::new();
+    for _ in 0..2 {
+        responses.push(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                outbound_rx.recv(),
+            )
+            .await
+            .expect("both the normal turn and command must complete")
+            .expect("outbound channel must stay open")
+            .content,
+        );
+    }
+    assert!(responses.iter().any(|response| response == "coalesced response"));
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "Working memory and history cleared."),
+        "the cross-session /clear was routed to the model: {responses:?}"
+    );
+    assert_eq!(
+        provider.call_count(),
+        1,
+        "recognized gateway commands must not consume an inference request"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+        .await
+        .expect("gateway loop must stop")
         .unwrap();
     let _ = std::fs::remove_dir_all(&workspace);
 }

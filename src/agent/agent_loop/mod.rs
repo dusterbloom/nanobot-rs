@@ -268,17 +268,24 @@ impl AgentLoop {
         // Every entrypoint shares this map, so direct/TUI turns cannot race a
         // gateway turn through prompt fingerprint and Higgs epoch state.
         let session_locks = self.session_locks.clone();
+        // Coalescing can observe the first message for another session. Retain
+        // it for the next loop iteration so it traverses the exact same
+        // system/command/lock/permit path instead of a parallel side path.
+        let mut pending_msg = None;
 
         while self.running.load(Ordering::SeqCst) {
-            let msg = match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv())
-                .await
-            {
-                Ok(Some(msg)) => msg,
-                Ok(None) => {
-                    info!("Inbound channel closed, stopping agent loop");
-                    break;
+            let msg = if let Some(msg) = pending_msg.take() {
+                msg
+            } else {
+                match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv()).await
+                {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
+                        info!("Inbound channel closed, stopping agent loop");
+                        break;
+                    }
+                    Err(_) => continue, // timeout - loop and check running flag
                 }
-                Err(_) => continue, // timeout - loop and check running flag
             };
 
             // Coalesce rapid messages from the same session (Telegram, WhatsApp).
@@ -295,26 +302,11 @@ impl AgentLoop {
                             batch.push(next);
                         }
                         Ok(Some(other)) => {
-                            // Different session — coalesce what we have, push other back.
-                            // Can't push back into mpsc, so process inline as separate spawn.
-                            let other_key = other.session_key();
-                            let other_lock = session_lock_for(&session_locks, &other_key).await;
-                            let other_shared = self.shared.clone();
-                            let other_outbound_tx = self.shared.bus_outbound_tx.clone();
-                            let _other_display_tx = self.shared.repl_display_tx.clone();
-                            let other_sem = semaphore.clone();
-                            tokio::spawn(async move {
-                                let _guard = other_lock.lock().await;
-                                if let Ok(permit) = other_sem.acquire_owned().await {
-                                    if let Some(resp) = other_shared
-                                        .process_message(&other, None, None, None, None)
-                                        .await
-                                    {
-                                        let _ = other_outbound_tx.send(resp);
-                                    }
-                                    drop(permit);
-                                }
-                            });
+                            // Preserve the different-session message for the
+                            // next normal iteration. This is the in-process
+                            // equivalent of push-back without a second gateway
+                            // execution pipeline.
+                            pending_msg = Some(other);
                             break;
                         }
                         _ => break, // timeout or channel closed
