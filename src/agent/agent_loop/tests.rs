@@ -4267,14 +4267,14 @@ async fn lease_rejects_crossing_batch_atomically_with_complete_protocol_pairing(
 }
 
 #[tokio::test]
-async fn valid_lease_renewal_restores_batch_admission_without_tool_schema_churn() {
+async fn local_lease_does_not_renew_after_twelve_calls() {
     let mut responses: Vec<_> = (0..12)
         .map(|n| WireRecordingProvider::tool_response(&format!("tc_lease_{n}"), &format!("dir{n}")))
         .collect();
-    responses.push(WireRecordingProvider::text_response(
-        "findings: inspected the first set\nnext: inspect the workspace root\nwill: list it once",
-    ));
-    responses.push(WireRecordingProvider::tool_response("tc_after_renewal", "."));
+    let checkpoint =
+        "findings: inspected the first set\nnext: inspect the workspace root\nwill: list it once";
+    responses.push(WireRecordingProvider::text_response(checkpoint));
+    responses.push(WireRecordingProvider::tool_response("tc_thirteen", "."));
     responses.push(WireRecordingProvider::text_response("done after renewal"));
     let provider = Arc::new(WireRecordingProvider::new("local-main", responses));
     let (agent_loop, workspace) =
@@ -4286,16 +4286,24 @@ async fn valid_lease_renewal_restores_batch_admission_without_tool_schema_churn(
         agent_loop.process_direct("inspect, renew, then finish", &session_key, "test", "offline"),
     )
     .await
-    .expect("valid renewal must complete");
+    .expect("zero-renewal local lease must terminate");
 
-    assert_eq!(response, "done after renewal");
+    assert_eq!(response, checkpoint);
     assert_eq!(
         provider.call_count(),
-        crate::agent::lease::DEFAULT_TOOLS_PER_LEASE as usize + 3
+        crate::agent::lease::DEFAULT_TOOLS_PER_LEASE as usize + 1,
+        "the valid checkpoint must be treated as the final response"
     );
     let snapshots = provider.tool_snapshots();
     assert!(snapshots.iter().all(|tools| !tools.is_empty()));
     assert!(snapshots.iter().all(|tools| tools == &snapshots[0]));
+
+    assert!(provider.calls().iter().flatten().all(|message| {
+        !message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("[Lease renewed"))
+    }));
 
     let core = agent_loop.shared.core_handle.swappable();
     let meta = core
@@ -4304,13 +4312,9 @@ async fn valid_lease_renewal_restores_batch_admission_without_tool_schema_churn(
         .await
         .expect("session should exist");
     let raw = core.sessions.get_all_messages(&meta.id).await;
-    let receipt = raw
-        .iter()
-        .find(|message| {
-            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_after_renewal")
-        })
-        .expect("renewed tool call must execute and persist");
-    assert_eq!(receipt.get("ok").and_then(Value::as_bool), Some(true));
+    assert!(raw.iter().all(|message| {
+        message.get("tool_call_id").and_then(Value::as_str) != Some("tc_thirteen")
+    }));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }

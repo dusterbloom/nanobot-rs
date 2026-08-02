@@ -25,6 +25,10 @@ pub const DEFAULT_TOOLS_PER_LEASE: u32 = 12;
 /// validated checkpoint.
 pub const DEFAULT_MAX_LEASES_PER_TURN: u32 = 3;
 
+/// Local models get one atomic lease per turn. Their exhausted response must
+/// be final rather than opening another inference/tool cycle.
+pub const LOCAL_MAX_LEASE_RENEWALS: u32 = 0;
+
 // Lease state machine
 // ---------------------------------------------------------------------------
 
@@ -136,11 +140,18 @@ impl Lease {
             self.iterations_used, self.lease_size, renewals_remaining
         );
         if self.is_exhausted() {
-            signal.push_str(
-                " Lease exhausted: your next response must be either a final answer or a \
-                 renewal checkpoint containing findings:/next:/will:. Do not request \
-                 another tool before renewal.",
-            );
+            if renewals_remaining == 0 {
+                signal.push_str(
+                    " Lease exhausted: your next response must be your final answer. Do not \
+                     request another tool.",
+                );
+            } else {
+                signal.push_str(
+                    " Lease exhausted: your next response must be either a final answer or a \
+                     renewal checkpoint containing findings:/next:/will:. Do not request \
+                     another tool before renewal.",
+                );
+            }
         }
         signal.push(']');
         format!("{signal}\n{body}")
@@ -436,5 +447,20 @@ mod tests {
         assert!(annotated.contains("findings:/next:/will:"));
         assert!(annotated.contains("Do not request another tool before renewal"));
         assert!(annotated.ends_with("\npayload"));
+    }
+
+    #[test]
+    fn zero_renewal_lease_requires_final_answer_at_exhaustion() {
+        let mut lease = Lease::new(2, 0);
+        assert_eq!(lease.admit_batch(2), BatchAdmission::Admitted);
+        let note = lease.annotate_result("evidence");
+        assert!(note.contains("final answer"));
+        assert!(!note.contains("findings:/next:/will:"));
+        assert_eq!(
+            lease
+                .try_renew("Findings: x\nNext: y\nWill: z")
+                .missing_field(),
+            "out_of_leases",
+        );
     }
 }

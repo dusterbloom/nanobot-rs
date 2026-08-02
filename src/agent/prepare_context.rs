@@ -578,6 +578,11 @@ impl AgentLoopShared {
             }
             RuntimeMode::Local { .. } | RuntimeMode::Cloud => Arc::new(CloudProtocol),
         };
+        let max_lease_renewals = if core.mode().is_local() {
+            crate::agent::lease::LOCAL_MAX_LEASE_RENEWALS
+        } else {
+            crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN
+        };
 
         TurnContext {
             core,
@@ -623,7 +628,7 @@ impl AgentLoopShared {
                 round_executed_no_tools: false,
                 lease: crate::agent::lease::Lease::new(
                     crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,
-                    crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN,
+                    max_lease_renewals,
                 ),
                 tool_preview_chars_remaining:
                     crate::agent::tool_engine::TOOL_PREVIEW_BUDGET_CHARS,
