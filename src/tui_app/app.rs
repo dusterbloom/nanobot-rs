@@ -2739,6 +2739,10 @@ fn cache_status_label(status: CacheStatus) -> (String, Color) {
             CacheResetReason::ToolTopology => {
                 ("cache reset · tool topology".to_string(), WARN_COLOR)
             }
+            CacheResetReason::UnexpectedReplayDivergence => (
+                "cache reset · unexpected replay divergence".to_string(),
+                WARN_COLOR,
+            ),
         },
     }
 }

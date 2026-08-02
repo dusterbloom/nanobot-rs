@@ -3749,6 +3749,131 @@ async fn unchanged_tool_topology_preserves_higgs_epoch() {
 }
 
 #[tokio::test]
+async fn retained_higgs_history_never_applies_routine_windowing() {
+    let provider = Arc::new(
+        WireRecordingProvider::new(
+            "local-higgs-test",
+            vec![WireRecordingProvider::text_response("reply")],
+        )
+        .with_higgs_session_cache(),
+    );
+    let memory_config = MemoryConfig {
+        max_history_turns: 2,
+        ..Default::default()
+    };
+    let (agent_loop, workspace) = build_local_inline_harness_with_memory(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "local-higgs-test",
+        64_000,
+        LcmSchemaConfig::default(),
+        memory_config,
+    );
+    let session_key = format!("higgs-append-only-history-{}", uuid::Uuid::new_v4());
+
+    for turn in 0..4 {
+        agent_loop
+            .process_direct(
+                &format!("persisted turn {turn}"),
+                &session_key,
+                "test",
+                "offline",
+            )
+            .await;
+    }
+
+    let requests = provider.higgs_requests();
+    assert_eq!(requests.len(), 4);
+    for pair in requests.windows(2) {
+        assert_wire_prefix(&pair[0], &pair[1]);
+        let first_id = pair[0][0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+            .as_u64()
+            .unwrap();
+        let second_id = pair[1][0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+            .as_u64()
+            .unwrap();
+        assert_eq!(first_id, second_id);
+    }
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .session_prompt_epoch(&session_key),
+        0
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn unexpected_replay_divergence_rotates_before_provider_io() {
+    let provider = Arc::new(
+        WireRecordingProvider::new(
+            "local-higgs-test",
+            vec![
+                WireRecordingProvider::text_response("first"),
+                WireRecordingProvider::text_response("second"),
+            ],
+        )
+        .with_higgs_session_cache(),
+    );
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("higgs-unexpected-divergence-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("original persisted bytes", &session_key, "test", "offline")
+        .await;
+    let first_requests = provider.higgs_requests();
+    assert_eq!(first_requests.len(), 1);
+    let first_id = first_requests[0][0]
+        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+        .as_u64()
+        .unwrap();
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(core.sessions.path()).unwrap();
+    let updated = connection
+        .execute(
+            "UPDATE messages SET content = ?1 WHERE session_id = ?2 AND role = 'user'",
+            rusqlite::params!["mutated persisted bytes", session.id],
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    agent_loop
+        .process_direct("second turn", &session_key, "test", "offline")
+        .await;
+
+    let requests = provider.higgs_requests();
+    assert_eq!(requests.len(), 2);
+    let second_head = &requests[1][0];
+    let second_id = second_head[crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+        .as_u64()
+        .unwrap();
+    assert_ne!(second_id, first_id);
+    assert_eq!(
+        second_head[crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
+        json!(first_id)
+    );
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .session_prompt_epoch(&session_key),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn changed_tool_topology_rotates_before_request() {
     let provider = Arc::new(
         WireRecordingProvider::new(
@@ -5182,18 +5307,15 @@ async fn test_local_streaming_cache_markers_append_only_across_turns() {
         cache_markers[0].starts_with("\u{0}cache:first:"),
         "first turn should establish the cache: {cache_markers:?}"
     );
-    // Each new turn reloads history from DB via filter_history, which applies
-    // byte-changing transformations (recall_tool_result raw→digest, etc.).
-    // The fingerprint is cleared at the start of each turn to prevent false
-    // divergences — the first call of each turn shows First, not AppendOnly.
-    // The Higgs radix cache still hits (content-based, not fingerprint-based).
+    // Routine DB replay preserves provider-visible bytes, so every later turn
+    // extends the retained prefix instead of discarding the prior fingerprint.
     assert!(
-        cache_markers[1].starts_with("\u{0}cache:first:"),
-        "second turn starts fresh (fingerprint cleared on DB reload): {cache_markers:?}"
+        cache_markers[1].starts_with("\u{0}cache:append:"),
+        "second turn extends the retained prefix: {cache_markers:?}"
     );
     assert!(
-        cache_markers[2].starts_with("\u{0}cache:first:"),
-        "third turn starts fresh: {cache_markers:?}"
+        cache_markers[2].starts_with("\u{0}cache:append:"),
+        "third turn extends the retained prefix: {cache_markers:?}"
     );
     assert!(
         cache_markers

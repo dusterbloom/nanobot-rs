@@ -359,25 +359,20 @@ impl AgentLoopShared {
         // Get session history. Track count so we know where new messages start.
         // The trim ceiling must stay above LCM's soft
         // compaction threshold, or compaction never fires (see history_limit_lcm).
-        let max_messages =
-            crate::agent::agent_core::history_limit_lcm(core.token_budget.max_context());
+        let retained_higgs =
+            core.mode().is_local() && core.provider.supports_higgs_session_cache();
+        let (max_messages, max_turns) = if retained_higgs {
+            (0, 0)
+        } else {
+            (
+                crate::agent::agent_core::history_limit_lcm(core.token_budget.max_context()),
+                core.max_history_turns,
+            )
+        };
         let history = core
             .sessions
-            .get_history(&session_id, max_messages, core.max_history_turns)
+            .get_history(&session_id, max_messages, max_turns)
             .await;
-        // get_history applies byte-changing transformations (recall_tool_result
-        // raw→digest at filters.rs:236, tool-body cap, message windowing) that
-        // make the previous turn's stored fingerprint/watermark invalid. Without
-        // clearing here, the first LLM call of each new user turn compares
-        // against stale bytes and logs a false prompt_prefix_diverged — forcing
-        // a full re-prefill. The Higgs radix cache is unaffected (it matches by
-        // content, not by nanobot's fingerprint); this only prevents false
-        // divergence diagnostics and the stale-watermark frozen-prefix miscalc.
-        counters.prompt_fingerprints.lock().remove(&session_key);
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .remove(&session_key);
         let history_ms = lap_ms();
         // LCM history adoption: when the engine holds a summary DAG, the
         // engine's active context IS the conversation history — summary

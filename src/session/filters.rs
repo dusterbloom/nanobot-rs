@@ -8,9 +8,6 @@ use tracing::warn;
 
 #[cfg(test)]
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
-use crate::agent::context_hygiene::{
-    cap_tool_result_for_replay, recall_tool_result_replay_reference, tool_result_ok,
-};
 
 /// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
 ///
@@ -78,52 +75,6 @@ fn is_cache_replay_synthetic(msg: &Value) -> bool {
         || content.starts_with("[System notice]")
         || content.starts_with("[System] Loop detected:")
         || content.starts_with("[system] Report what the previous tool results showed before")
-}
-
-fn recalled_source_tool_call_id(messages: &[Value], tool_msg_index: usize) -> Option<String> {
-    let recall_call_id = messages
-        .get(tool_msg_index)?
-        .get("tool_call_id")
-        .and_then(|v| v.as_str())?;
-
-    messages[..tool_msg_index]
-        .iter()
-        .rev()
-        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-        .filter_map(|m| m.get("tool_calls").and_then(|v| v.as_array()))
-        .flat_map(|calls| calls.iter())
-        .find(|call| call.get("id").and_then(|v| v.as_str()) == Some(recall_call_id))
-        .and_then(recall_tool_call_source_id)
-}
-
-fn recall_tool_call_source_id(call: &Value) -> Option<String> {
-    if call
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(|v| v.as_str())
-        != Some("recall_tool_result")
-    {
-        return None;
-    }
-
-    let args = call
-        .get("function")
-        .and_then(|f| f.get("arguments"))
-        .or_else(|| call.get("arguments"))?;
-    if let Some(raw) = args.as_str() {
-        let parsed: Value = serde_json::from_str(raw).ok()?;
-        return parsed
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-    }
-    args.get("tool_call_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-}
-
-fn failed_recall_tool_result(content: &str) -> bool {
-    !tool_result_ok(content)
 }
 
 /// Advance an index past leading `role: "tool"` messages whose parent
@@ -209,8 +160,7 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     // Stage 5: filter and map each surviving message to wire format.
     let mapped: Vec<Value> = messages[safe_start..]
         .iter()
-        .enumerate()
-        .filter(|(_, m)| {
+        .filter(|m| {
             // Skip synthetic router/specialist injections. Cache-replay
             // scaffolds were already sent to the model, so dropping them on
             // reload would mutate the warm prompt prefix.
@@ -220,37 +170,16 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
                 // Skip internal LCM summary entries — not valid wire format.
                 && m.get("role").and_then(|r| r.as_str()) != Some("summary")
         })
-        .map(|(offset, m)| {
+        .map(|m| {
             let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-            // Tool results are the bulkiest, lowest-value-once-stale part of
-            // history (web_fetch / skill dumps). Cap their body to a generous,
-            // FIXED size so one large dump can't crowd conversation out of the
-            // token budget. The cap is applied identically on every reload (not
-            // age-based), so it never shifts the prompt prefix — no extra
-            // re-prefill, unlike dropping or sliding truncation. Recalled raw
-            // outputs are one-shot: the requesting turn saw exact bytes, but
-            // replay gets only a stable digest/handle so recall cannot become
-            // a permanent prompt balloon.
-            let raw = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let tool_name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let content = if role == "tool" && tool_name == "recall_tool_result" {
-                if failed_recall_tool_result(raw) {
-                    raw.to_string()
-                } else {
-                    let source_id = recalled_source_tool_call_id(messages, safe_start + offset);
-                    recall_tool_result_replay_reference(raw, source_id.as_deref())
-                }
-            } else if role == "tool"
-                && raw.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
-            {
-                // Handles are write-once-stable: pass through byte-identical
-                // on reload so the prefix cache never sees a drift.
-                raw.to_string()
-            } else if role == "tool" {
-                cap_tool_body(raw)
-            } else {
-                raw.to_string()
-            };
+            // Routine replay is an immutable projection of stored provider-visible
+            // bytes. Any budgeting or replacement must happen before persistence;
+            // explicit reset/compaction paths own later rewrites.
+            let content = m
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let mut msg = serde_json::json!({
                 "role": role,
                 "content": content,
@@ -353,12 +282,6 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
         );
     }
     mapped[keep_from..].to_vec()
-}
-
-/// Cap an oversized tool-result body to the shared replay limit. Deterministic
-/// in its input, so the same stored tool result always renders identically.
-fn cap_tool_body(content: &str) -> String {
-    cap_tool_result_for_replay(content)
 }
 
 #[cfg(test)]
@@ -1185,59 +1108,25 @@ mod tests {
     }
 
     #[test]
-    fn test_oversized_tool_body_capped_deterministically() {
-        // A large tool result is capped to a fixed size with a marker, and the
-        // render is deterministic — the same stored result yields identical wire
-        // bytes on every reload, so it never shifts the prompt prefix (no extra
-        // re-prefill). Small tool bodies and non-tool content pass through.
-        let big = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5000);
+    fn tool_result_content_is_byte_identical_during_replay() {
+        let stored = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5_000);
         let messages = vec![
-            user("fetch something"),
-            tool_call_assistant("t1"),
-            json!({"role": "tool", "tool_call_id": "t1", "name": "exec", "content": big}),
-            assistant("done"),
-            user("and a small one"),
-            tool_call_assistant("t2"),
-            json!({"role": "tool", "tool_call_id": "t2", "name": "exec", "content": "short result"}),
-            assistant("ok"),
+            user("inspect"),
+            tool_call_assistant("call_1"),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "exec",
+                "content": stored,
+            }),
         ];
-        // Stages 1/4/6 disabled (0,0) to isolate the Stage-5 tool-body cap.
-        let a = filter_history(&messages, 0, 0);
-        let b = filter_history(&messages, 0, 0);
-        assert_eq!(a, b, "render must be deterministic for prefix stability");
 
-        let big_tool = a
-            .iter()
-            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "t1")
-            .unwrap();
-        let body = big_tool["content"].as_str().unwrap();
-        assert!(
-            body.len() <= TOOL_RESULT_REPLAY_MAX_BYTES + 40,
-            "oversized tool body must be capped"
-        );
-        assert!(
-            body.ends_with("[tool output truncated]"),
-            "truncation marker appended"
-        );
-
-        // Small tool body and non-tool content are untouched.
-        let small_tool = a
-            .iter()
-            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "t2")
-            .unwrap();
-        assert_eq!(
-            small_tool["content"], "short result",
-            "small tool unchanged"
-        );
-        assert_eq!(
-            a[0]["content"], "fetch something",
-            "user content not capped"
-        );
+        let replay = filter_history(&messages, 0, 0);
+        assert_eq!(replay[2]["content"], messages[2]["content"]);
     }
 
     #[test]
-    fn test_recall_tool_result_body_becomes_one_shot_replay_reference() {
-        let big = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5000);
+    fn recalled_result_content_is_byte_identical_during_replay() {
         let messages = vec![
             user("recall it"),
             json!({
@@ -1256,38 +1145,15 @@ mod tests {
                 "role": "tool",
                 "tool_call_id": "recall_1",
                 "name": "recall_tool_result",
-                "content": big,
+                "content": "bounded exact recalled bytes",
             }),
         ];
 
-        let result = filter_history(&messages, 0, 0);
-        let tool = result
-            .iter()
-            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "recall_1")
-            .unwrap();
-        let content = tool["content"].as_str().unwrap();
-        assert!(
-            content.len() < 512,
-            "replay reference must stay compact, got {} bytes",
-            content.len()
+        let replay = filter_history(&messages, 0, 0);
+        assert_eq!(
+            replay.last().unwrap()["content"],
+            "bounded exact recalled bytes"
         );
-        assert!(
-            content.contains("recalled earlier"),
-            "replay reference must be the short receipt: {content}"
-        );
-        assert!(
-            !content.contains("TOOL_OUTPUT_DIGEST"),
-            "replay reference must not embed the noisy digest hash: {content}"
-        );
-        assert!(
-            !content.contains("len:"),
-            "replay reference must not embed byte length: {content}"
-        );
-        assert!(
-            content.contains("original_tool_call"),
-            "replay reference must keep the recovery tool_call_id: {content}"
-        );
-        assert!(!content.contains(&"x".repeat(100)));
     }
 
     #[test]

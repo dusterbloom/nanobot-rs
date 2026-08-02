@@ -2043,9 +2043,11 @@ impl AgentLoopShared {
         let prompt_total_estimate =
             TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens);
         ctx.flow.provider_prompt_estimate = Some(prompt_total_estimate);
-        {
+        let prompt_delta = {
             let store = counters.prompt_fingerprints.lock();
-            let prompt_delta = prompt_fingerprint::compare(store.get(&ctx.session_key), &prompt_fp);
+            prompt_fingerprint::compare(store.get(&ctx.session_key), &prompt_fp)
+        };
+        {
             let prefill_estimate = match prompt_delta {
                 PromptDelta::First => prompt_total_estimate,
                 PromptDelta::AppendOnly { added_msgs } => {
@@ -2085,6 +2087,7 @@ impl AgentLoopShared {
                     // Diagnostic: dump the full rendered content of the
                     // divergent message and its neighbors so the exact
                     // byte change is visible in the log.
+                    let store = counters.prompt_fingerprints.lock();
                     let prev_fp = store.get(&ctx.session_key);
                     if let Some(prev_fp) = prev_fp {
                         let prev_hash = prev_fp.msg_hash_at(first_divergent_msg);
@@ -2199,6 +2202,12 @@ impl AgentLoopShared {
                         .send(ControlMarker::PrefillEstimate(prefill_estimate as u64).encode());
                 }
             }
+        }
+        let unexpected_higgs_divergence = matches!(prompt_delta, PromptDelta::Diverged { .. })
+            && ctx.core.mode().is_local()
+            && ctx.core.provider.supports_higgs_session_cache();
+        if unexpected_higgs_divergence {
+            invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::UnexpectedReplayDivergence);
         }
         // Tool schemas are rendered at the prompt head but deliberately absent
         // from the message fingerprint. A real topology change therefore needs

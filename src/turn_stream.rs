@@ -413,6 +413,7 @@ pub(crate) enum CacheResetReason {
     LcmCheckpoint,
     StalledProviderRequest,
     ToolTopology,
+    UnexpectedReplayDivergence,
 }
 
 impl CacheResetReason {
@@ -423,6 +424,7 @@ impl CacheResetReason {
             CacheResetReason::LcmCheckpoint => "lcm_checkpoint",
             CacheResetReason::StalledProviderRequest => "stalled_provider_request",
             CacheResetReason::ToolTopology => "tool_topology",
+            CacheResetReason::UnexpectedReplayDivergence => "unexpected_replay_divergence",
         }
     }
 }
@@ -544,6 +546,7 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
                     "lcm_checkpoint" => CacheResetReason::LcmCheckpoint,
                     "stalled_provider_request" => CacheResetReason::StalledProviderRequest,
                     "tool_topology" => CacheResetReason::ToolTopology,
+                    "unexpected_replay_divergence" => CacheResetReason::UnexpectedReplayDivergence,
                     _ => return None,
                 };
                 Some(ControlMarker::CacheStatus(CacheStatus::Reset { reason }))
@@ -649,6 +652,9 @@ mod tests {
             }),
             ControlMarker::CacheStatus(CacheStatus::Reset {
                 reason: CacheResetReason::ToolTopology,
+            }),
+            ControlMarker::CacheStatus(CacheStatus::Reset {
+                reason: CacheResetReason::UnexpectedReplayDivergence,
             }),
             ControlMarker::Compaction(CompactionStatus::Started { messages: 48 }),
             ControlMarker::Compaction(CompactionStatus::Finished),
