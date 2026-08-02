@@ -272,7 +272,7 @@ fn build_tool_result_preview(
     let footer = "\n[...]\n";
     let fixed_chars = header.chars().count() + footer.chars().count();
     if fixed_chars >= cap {
-        return header;
+        return header.chars().take(cap).collect();
     }
     let preview_budget = cap.saturating_sub(fixed_chars).max(200);
     let head_chars = preview_budget * 2 / 3;
@@ -657,10 +657,32 @@ pub(crate) async fn execute_tools_delegated(
             .map(|(_, _, data)| data.as_str())
             .unwrap_or("(no result)");
 
+        // Store the exact completed body before any runner summary, content
+        // gate, or specialist call can delay or transform it.
+        let cap = routed_result_cap;
+        let needs_shaping = match stash_tool_result_for_prompt_shaping(
+            &ctx.core.sessions,
+            &ctx.session_id,
+            &tc.id,
+            &tc.name,
+            full_data,
+            cap,
+            force_routed_stash,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(sr) => {
+                abort_turn_on_stash_failure(ctx, &tc.id, &tc.name, &sr);
+                // Skip all shaping for an unproven body. The loop-level
+                // infra_error check in step_execute_tools finalizes the turn.
+                continue;
+            }
+        };
+
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
         let threshold = summary_threshold_tokens(&tc.name);
-        let cap = routed_result_cap;
         let injected_raw = if let Some(ref summary) = run_result.summary {
             // Summary exists from scratch-pad analysis.
             if full_tokens > threshold {
@@ -687,30 +709,6 @@ pub(crate) async fn execute_tools_delegated(
                 .into_text()
         } else {
             ctx.content_gate.admit_simple(full_data).into_text()
-        };
-        // Stash the RAW delegated output (pre-runner-summary / pre-gate) for
-        // lossless recall — digesting `injected_raw` directly would store the
-        // summary instead of the original. Then preview injected_raw and add a
-        // recall pointer when the raw was stashed.
-        let needs_shaping = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &tc.id,
-            &tc.name,
-            full_data,
-            cap,
-            force_routed_stash,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &tc.id, &tc.name, &sr);
-                // Skip this iteration's post-stash shaping (the abort helper
-                // already pushed an ok:false receipt). The loop-level
-                // infra_error check in step_execute_tools finalizes the turn.
-                continue;
-            }
         };
         let mut injected = if cap == 0 {
             render_tool_result_handle(
@@ -1756,6 +1754,24 @@ mod tests {
         assert_eq!(first_batch_cap, 10_000);
         assert_eq!(second_batch_cap, 6_384);
         assert_eq!(turn_preview_cap(10_000, 1, 0), 0);
+    }
+
+    #[test]
+    fn tool_result_preview_never_exceeds_cap_with_long_call_id() {
+        let call_id = "provider-controlled-id-".repeat(500);
+        let preview = build_tool_result_preview(
+            "read_file",
+            &HashMap::new(),
+            &"body".repeat(2_000),
+            64,
+            &call_id,
+        );
+
+        assert!(
+            preview.chars().count() <= 64,
+            "non-handle preview exceeded its append allowance: {} chars",
+            preview.chars().count()
+        );
     }
 
     #[tokio::test]

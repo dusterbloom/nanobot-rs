@@ -4847,6 +4847,161 @@ async fn stored_tool_preview_reloads_byte_identically() {
 }
 
 #[tokio::test]
+async fn inline_success_and_failure_store_exact_completed_bodies() {
+    let tool_calls = vec![
+        crate::providers::base::ToolCallRequest {
+            id: "tc_inline_ok".to_string(),
+            name: "exec".to_string(),
+            arguments: std::collections::HashMap::from([(
+                "command".to_string(),
+                json!("printf inline_success_exact"),
+            )]),
+        },
+        crate::providers::base::ToolCallRequest {
+            id: "tc_inline_err".to_string(),
+            name: "exec".to_string(),
+            arguments: std::collections::HashMap::from([(
+                "command".to_string(),
+                json!("printf inline_failure_exact >&2; exit 9"),
+            )]),
+        },
+    ];
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls,
+                finish_reason: "tool_calls".to_string(),
+                usage: std::collections::HashMap::new(),
+            },
+            WireRecordingProvider::text_response("done"),
+        ],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider as Arc<dyn LLMProvider>);
+    let session_key = format!("inline-exact-bodies-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct("run both", &session_key, "test", "offline")
+        .await;
+    assert_eq!(response, "done");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    assert_eq!(
+        core.sessions
+            .load_tool_result(&session.id, "tc_inline_ok")
+            .await
+            .as_deref(),
+        Some("inline_success_exact")
+    );
+    assert_eq!(
+        core.sessions
+            .load_tool_result(&session.id, "tc_inline_err")
+            .await
+            .as_deref(),
+        Some("Error: Command failed\nSTDERR:\ninline_failure_exact\nExit code: 9")
+    );
+
+    let messages = core.sessions.get_all_messages(&session.id).await;
+    for (id, expected_ok) in [("tc_inline_ok", true), ("tc_inline_err", false)] {
+        let message = messages
+            .iter()
+            .find(|message| {
+                message.get("tool_call_id").and_then(Value::as_str) == Some(id)
+            })
+            .unwrap_or_else(|| panic!("missing persisted result {id}"));
+        assert_eq!(message.get("ok").and_then(Value::as_bool), Some(expected_ok));
+    }
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn delegated_failure_is_stored_before_specialist_shaping() {
+    let specialist = Arc::new(BlockingFirstProvider::new());
+    let main = MockLLM::named("local-qwen-test");
+    let (agent_loop, workspace) = build_local_inline_harness_with_memory_and_reflection(
+        main,
+        "local-qwen-test",
+        4_096,
+        LcmSchemaConfig::default(),
+        MemoryConfig::default(),
+        Some(specialist.clone() as Arc<dyn LLMProvider>),
+    );
+    let session_key = format!("delegated-store-order-{}", uuid::Uuid::new_v4());
+    let mut message = InboundMessage::new("test", "user", "offline", "run delegated failure");
+    message
+        .metadata
+        .insert("session_key".to_string(), json!(session_key));
+    let mut ctx = agent_loop
+        .shared
+        .prepare_context(&message, None, None, None, None)
+        .await;
+    let sessions = ctx.core.sessions.clone();
+    let session_id = ctx.session_id.clone();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let call = crate::providers::base::ToolCallRequest {
+        id: "tc_delegated_err".to_string(),
+        name: "exec".to_string(),
+        arguments: std::collections::HashMap::from([(
+            "command".to_string(),
+            json!("seq 1 10000 >&2; exit 7"),
+        )]),
+    };
+    let calls = vec![call];
+    let response = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: calls.clone(),
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+    let delegation_provider = Some(MockLLM::named("local-qwen-test"));
+    let delegation_model = Some("local-qwen-test".to_string());
+    let stored_before_shaping;
+    let handled = {
+        let specialist_started = specialist.first_started.notified();
+        tokio::pin!(specialist_started);
+        let delegated = crate::agent::tool_engine::execute_tools_delegated(
+            &mut ctx,
+            &counters,
+            &calls,
+            &response,
+            &delegation_provider,
+            &delegation_model,
+        );
+        tokio::pin!(delegated);
+
+        tokio::select! {
+            _ = &mut specialist_started => {}
+            handled = &mut delegated => panic!("delegated shaping completed before specialist blocked: {handled}"),
+        }
+        stored_before_shaping = sessions
+            .load_tool_result(&session_id, "tc_delegated_err")
+            .await;
+        specialist.allow_first.notify_one();
+        delegated.await
+    };
+    assert!(handled);
+
+    let stored = stored_before_shaping
+        .expect("completed delegated failure must be stored before specialist shaping starts");
+    assert!(stored.starts_with("Error: Command failed\nSTDERR:\n1\n2\n3"));
+    assert!(stored.contains("\n10000\nExit code: 7"));
+    let persisted = ctx
+        .messages
+        .iter()
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_delegated_err")
+        })
+        .expect("delegated failure receipt must be appended");
+    assert_eq!(persisted.get("ok").and_then(Value::as_bool), Some(false));
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
 async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
     let duplicate_call = |id: usize| {
         let mut arguments = std::collections::HashMap::new();
