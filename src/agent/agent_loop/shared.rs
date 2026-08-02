@@ -2745,8 +2745,11 @@ impl AgentLoopShared {
                     "tool_lease_rejected_batch"
                 );
                 let receipt = format!(
-                    "lease exhausted: {} was not executed — this batch requested {} calls with {} remaining. Write a renewal checkpoint before requesting another tool in a new turn.",
-                    tool_call.name, batch_count, remaining
+                    "lease exhausted: {} was not executed — this batch requested {} calls with {} remaining. {}",
+                    tool_call.name,
+                    batch_count,
+                    remaining,
+                    ctx.flow.lease.rejection_instruction()
                 );
                 ContextBuilder::add_tool_result_immutable_with_status(
                     &mut ctx.messages,

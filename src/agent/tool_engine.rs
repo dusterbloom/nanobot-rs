@@ -33,13 +33,11 @@ const MIN_BATCH_TOOL_RESULT_CAP_CHARS: usize = 320;
 pub(crate) const TOOL_PREVIEW_BUDGET_CHARS: usize = 16 * 1024;
 
 fn turn_preview_cap(per_result_cap: usize, batch_len: usize, remaining: usize) -> usize {
-    if remaining < MIN_BATCH_TOOL_RESULT_CAP_CHARS {
+    let share = per_result_cap.min(remaining / batch_len.max(1));
+    if share < MIN_BATCH_TOOL_RESULT_CAP_CHARS {
         return 0;
     }
-    per_result_cap
-        .min(remaining / batch_len.max(1))
-        .max(MIN_BATCH_TOOL_RESULT_CAP_CHARS)
-        .min(remaining)
+    share
 }
 
 /// Per-tool token threshold above which a raw tool result is replaced by a
@@ -100,6 +98,7 @@ async fn stash_tool_result_for_prompt_shaping(
     tool_call_id: &str,
     tool_name: &str,
     data: &str,
+    ok: bool,
     cap: usize,
     force: bool,
 ) -> Result<bool, crate::session::db::StoredResult> {
@@ -110,7 +109,7 @@ async fn stash_tool_result_for_prompt_shaping(
     // context, which inflated a session to 77k tokens (2026-07-30).
     let needs_shaping = tool_result_needs_shaping(data, cap, force);
     match sessions
-        .store_tool_result_immutable(session_id, tool_call_id, tool_name, data)
+        .store_tool_result_immutable_with_status(session_id, tool_call_id, tool_name, data, ok)
         .await
     {
         StoredResult::Stored { .. } => Ok(needs_shaping),
@@ -185,12 +184,14 @@ fn render_tool_result_handle(
 /// Fixed-scalar allowlist for the handle's `args` field, in a fixed order.
 /// Only these keys are surfaced (deterministic + compact); everything else is
 /// dropped. JSON-escaped by the caller via `serde_json::to_string`.
-fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> Vec<(&'static str, String)> {
+fn tool_arg_summary(
+    args: &std::collections::HashMap<String, Value>,
+) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     for key in &["path", "command", "query"] {
         if let Some(v) = args.get(*key) {
             if let Some(s) = v.as_str() {
-                out.push((*key, s.to_string()));
+                out.push((*key, s.chars().take(160).collect()));
             }
         }
     }
@@ -242,6 +243,27 @@ fn abort_turn_on_stash_failure(
     ContextBuilder::add_tool_result_with_status(&mut ctx.messages, tool_id, tool_name, &msg, false);
 }
 
+async fn abort_delegated_routed_batch(
+    ctx: &mut TurnContext,
+    routed_tool_calls: &[ToolCallRequest],
+    reason: String,
+) {
+    ctx.flow.infra_error = Some(reason);
+    for tool_call in routed_tool_calls {
+        ContextBuilder::add_tool_result_with_status(
+            &mut ctx.messages,
+            &tool_call.id,
+            &tool_call.name,
+            &format!(
+                "Error: delegated result for {} was unresolved; turn aborted.",
+                tool_call.id
+            ),
+            false,
+        );
+    }
+    ctx.persist_pending_protocol_messages().await;
+}
+
 /// Build a head+tail preview of `data` (≤ `cap` chars) with a `recall_tool_result`
 /// pointer to `tool_call_id`. Assumes the full body is ALREADY stashed (by the
 /// caller) when `data` was truncated — this only shapes the in-context preview.
@@ -288,6 +310,28 @@ fn build_tool_result_preview(
         out = out.chars().take(cap).collect();
     }
     out
+}
+
+fn render_extra_tool_result(
+    tool_call_id: &str,
+    tool_name: &str,
+    ok: bool,
+    prompt_data: &str,
+    raw_body: &str,
+    cap: usize,
+) -> String {
+    let args = std::collections::HashMap::new();
+    let id_json = serde_json::to_string(tool_call_id).unwrap_or_else(|_| "\"\"".to_string());
+    let metadata = format!(
+        "id:{id_json} | tool:{} | ok:{ok} | recall:recall_tool_result({{\"tool_call_id\":{id_json}}})\n",
+        serde_json::to_string(tool_name).unwrap_or_else(|_| "\"\"".to_string()),
+    );
+    let body_cap = cap.saturating_sub(metadata.chars().count());
+    if body_cap < MIN_BATCH_TOOL_RESULT_CAP_CHARS || raw_body.len() > TOOL_RESULT_REPLAY_MAX_BYTES {
+        return render_tool_result_handle(tool_call_id, tool_name, ok, raw_body.as_bytes(), &args);
+    }
+    let body = build_tool_result_preview(tool_name, &args, prompt_data, body_cap, tool_call_id);
+    format!("{metadata}{body}")
 }
 
 /// Digest a tool result for in-context storage with lossless retrieval.
@@ -588,7 +632,15 @@ pub(crate) async fn execute_tools_delegated(
         response.content.as_deref(),
         Some(&tc_json),
     );
-    ctx.persist_pending_protocol_messages().await;
+    if !ctx.persist_pending_protocol_messages().await {
+        abort_delegated_routed_batch(
+            ctx,
+            routed_tool_calls,
+            "delegated tool-call carrier could not be persisted; turn aborted".to_string(),
+        )
+        .await;
+        return true;
+    }
 
     let persistence = tool_runner::ToolResultPersistence::new(
         ctx.core.sessions.clone(),
@@ -601,46 +653,44 @@ pub(crate) async fn execute_tools_delegated(
         &ctx.tools,
         &task_desc,
         &persistence,
+        &mut ctx.flow.lease,
     )
     .await
     {
         Ok(result) => result,
         Err(error) => {
-            abort_turn_on_stash_failure(ctx, &error.tool_call_id, &error.tool_name, &error.outcome);
+            abort_delegated_routed_batch(
+                ctx,
+                routed_tool_calls,
+                format!(
+                    "tool-result stash failed for {} ({:?}) — turn aborted to preserve the exact-bytes invariant",
+                    error.tool_call_id, error.outcome
+                ),
+            )
+            .await;
             return true;
         }
     };
     let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
 
     let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
-    let routed_result_cap = turn_preview_cap(
-        inline_hot_prompt_result_cap(ctx),
-        routed_tool_calls.len(),
-        ctx.flow.tool_preview_chars_remaining,
-    );
     let force_routed_stash = routed_tool_calls.len() > 1;
-    for tc in routed_tool_calls {
-        if !run_result
+    if let Some(missing) = routed_tool_calls.iter().find(|tc| {
+        !run_result
             .tool_results
             .iter()
             .any(|(tool_call_id, _, _)| tool_call_id == &tc.id)
-        {
-            ctx.flow.infra_error = Some(format!(
+    }) {
+        abort_delegated_routed_batch(
+            ctx,
+            routed_tool_calls,
+            format!(
                 "delegated runner returned no result for {} — turn aborted to preserve the exact-bytes invariant",
-                tc.id
-            ));
-            ContextBuilder::add_tool_result_with_status(
-                &mut ctx.messages,
-                &tc.id,
-                &tc.name,
-                &format!(
-                    "Error: delegated result for {} was missing; turn aborted.",
-                    tc.id
-                ),
-                false,
-            );
-            return true;
-        }
+                missing.id
+            ),
+        )
+        .await;
+        return true;
     }
 
     // Only mark unhealthy on actual provider/tool-runner errors.
@@ -693,7 +743,7 @@ pub(crate) async fn execute_tools_delegated(
     );
 
     // Add tool results from the runner to the main context.
-    for tc in routed_tool_calls {
+    for (index, tc) in routed_tool_calls.iter().enumerate() {
         let full_data = run_result
             .tool_results
             .iter()
@@ -701,7 +751,11 @@ pub(crate) async fn execute_tools_delegated(
             .map(|(_, _, data)| data.as_str())
             .expect("routed results were validated before publication");
 
-        let cap = routed_result_cap;
+        let cap = turn_preview_cap(
+            inline_hot_prompt_result_cap(ctx),
+            routed_tool_calls.len().saturating_sub(index),
+            ctx.flow.tool_preview_chars_remaining,
+        );
         let needs_shaping = tool_result_needs_shaping(full_data, cap, force_routed_stash);
         let ok = persistence
             .ok_for(&tc.id)
@@ -797,18 +851,44 @@ pub(crate) async fn execute_tools_delegated(
 
     // Inject the runner's summary so the main LLM knows what
     // the tools found without needing full output.
-    let has_extra = run_result.tool_results.len() > routed_tool_calls.len();
+    let extras: Vec<_> = run_result
+        .tool_results
+        .iter()
+        .filter(|(id, _, _)| !is_routed_call(id, routed_tool_calls))
+        .collect();
+    let has_extra = !extras.is_empty();
     if run_result.summary.is_some() || has_extra {
         let summary_text = if has_extra {
-            let extra = tool_runner::format_results_for_context(
-                &run_result,
-                preview_max,
-                Some(&mut ctx.content_gate), // Wire ContentGate for budget-aware truncation
-            );
+            let mut rendered = Vec::with_capacity(extras.len() + 1);
+            for (index, (id, tool_name, prompt_data)) in extras.iter().enumerate() {
+                let ok = persistence
+                    .ok_for(id)
+                    .unwrap_or_else(|| tool_result_ok(prompt_data));
+                let raw_body = persistence
+                    .raw_body_for(id)
+                    .expect("extra result raw body was persisted before publication");
+                let cap = turn_preview_cap(
+                    preview_max.min(inline_hot_prompt_result_cap(ctx)),
+                    extras.len().saturating_sub(index),
+                    ctx.flow.tool_preview_chars_remaining,
+                );
+                let visible =
+                    render_extra_tool_result(id, tool_name, ok, prompt_data, &raw_body, cap);
+                if cap > 0 && !visible.starts_with(TOOL_RESULT_HANDLE_MARKER) {
+                    ctx.flow.tool_preview_chars_remaining = ctx
+                        .flow
+                        .tool_preview_chars_remaining
+                        .saturating_sub(visible.chars().count());
+                }
+                rendered.push(visible);
+            }
+            if let Some(summary) = &run_result.summary {
+                rendered.push(format!("Summary: {summary}"));
+            }
             format!(
                 "[Tool runner executed {} additional calls]\n{}",
-                run_result.tool_results.len() - routed_tool_calls.len(),
-                extra
+                extras.len(),
+                rendered.join("\n")
             )
         } else {
             run_result.summary.clone().unwrap_or_default()
@@ -819,10 +899,11 @@ pub(crate) async fn execute_tools_delegated(
             } else {
                 TOOL_RUNNER_SUMMARY_PREFIX
             };
-            ctx.messages.push(crate::agent::markers::scaffold_user(format!(
-                "{} {}",
-                prefix, summary_text
-            )));
+            ctx.messages
+                .push(crate::agent::markers::scaffold_user(format!(
+                    "{} {}",
+                    prefix, summary_text
+                )));
             ctx.persist_pending_protocol_messages().await;
         }
     }
@@ -1155,6 +1236,7 @@ async fn inject_tool_result(
         &r.tool_id,
         &r.tool_name,
         &r.result.data,
+        r.result.ok,
         cap,
         force_stash_raw,
     )
@@ -1236,7 +1318,7 @@ async fn inject_tool_result(
                 &r.tool_id,
                 &r.tool_name,
                 r.result.ok,
-                result_data.as_bytes(),
+                r.result.data.as_bytes(),
                 &r.arguments,
             );
             ctx.content_gate.admit_simple(&handle).into_text()
@@ -1505,13 +1587,13 @@ pub(crate) async fn execute_tools_inline(
         taints,
     )
     .await;
-    let result_cap = turn_preview_cap(
-        inline_hot_prompt_result_cap(ctx),
-        ordered_results.len(),
-        ctx.flow.tool_preview_chars_remaining,
-    );
     let force_stash_raw = ordered_results.len() > 1;
-    for result in &ordered_results {
+    for (index, result) in ordered_results.iter().enumerate() {
+        let result_cap = turn_preview_cap(
+            inline_hot_prompt_result_cap(ctx),
+            ordered_results.len().saturating_sub(index),
+            ctx.flow.tool_preview_chars_remaining,
+        );
         inject_tool_result(ctx, result, result_cap, force_stash_raw).await;
     }
 
@@ -1756,6 +1838,7 @@ mod tests {
                 id,
                 "fixture",
                 &body,
+                !body.starts_with("Error:"),
                 10_000,
                 false,
             )
@@ -1778,6 +1861,18 @@ mod tests {
         assert_eq!(first_batch_cap, 10_000);
         assert_eq!(second_batch_cap, 6_384);
         assert_eq!(turn_preview_cap(10_000, 1, 0), 0);
+    }
+
+    #[test]
+    fn low_remaining_preview_budget_never_oversubscribes_a_batch() {
+        let remaining = MIN_BATCH_TOOL_RESULT_CAP_CHARS + 40;
+        let cap = turn_preview_cap(10_000, 2, remaining);
+
+        assert!(
+            cap.saturating_mul(2) <= remaining,
+            "the per-result cap must fit the whole remaining batch budget"
+        );
+        assert_eq!(cap, 0, "too-small preview shares should publish handles");
     }
 
     #[test]
@@ -1821,6 +1916,7 @@ mod tests {
             "call_failed",
             "read_file",
             &data,
+            true,
             cap,
             false,
         )
@@ -1855,6 +1951,7 @@ mod tests {
             "call_stored",
             "read_file",
             &data,
+            true,
             cap,
             false,
         )
@@ -1893,6 +1990,7 @@ mod tests {
             "call_replay_cap",
             "read_file",
             &data,
+            true,
             10_000,
             false,
         )
@@ -2511,6 +2609,7 @@ mod tests {
             "tc_1",
             "read_file",
             &body_a,
+            true,
             4096,
             true, // force: the cap gate is a no-op so we exercise the store path
         )
@@ -2529,6 +2628,7 @@ mod tests {
             "tc_1",
             "read_file",
             &body_b,
+            true,
             4096,
             true,
         )
@@ -2637,5 +2737,20 @@ mod tests {
             "handle with a 500-char first line must stay small; got len={}",
             h2.len()
         );
+    }
+
+    #[test]
+    fn render_tool_result_handle_caps_scalar_arguments() {
+        let long = format!("START-{}-TAIL", "x".repeat(4_000));
+        let args = HashMap::from([
+            ("path".to_string(), json!(long.clone())),
+            ("command".to_string(), json!(long.clone())),
+            ("query".to_string(), json!(long)),
+        ]);
+
+        let handle = render_tool_result_handle("call_args", "exec", true, b"ok", &args);
+
+        assert!(handle.len() < 1_500, "handle metadata must stay compact");
+        assert!(!handle.contains("-TAIL"), "argument tails must be clipped");
     }
 }

@@ -168,7 +168,7 @@ pub(crate) struct ToolResultPersistence {
 
 struct PersistedToolOutcome {
     ok: bool,
-    raw_body: Option<Arc<str>>,
+    raw_body: Arc<str>,
 }
 
 impl ToolResultPersistence {
@@ -196,7 +196,7 @@ impl ToolResultPersistence {
         self.outcomes
             .lock()
             .get(tool_call_id)
-            .and_then(|outcome| outcome.raw_body.clone())
+            .map(|outcome| outcome.raw_body.clone())
     }
 }
 
@@ -220,7 +220,13 @@ async fn persist_completed_result(
     use crate::session::db::StoredResult;
     match persistence
         .sessions
-        .store_tool_result_immutable(&persistence.session_id, tool_call_id, tool_name, data)
+        .store_tool_result_immutable_with_status(
+            &persistence.session_id,
+            tool_call_id,
+            tool_name,
+            data,
+            ok,
+        )
         .await
     {
         StoredResult::Stored { .. } | StoredResult::Identical { .. } => {
@@ -228,10 +234,7 @@ async fn persist_completed_result(
                 tool_call_id.to_string(),
                 PersistedToolOutcome {
                     ok,
-                    raw_body: persistence
-                        .routed_ids
-                        .contains(tool_call_id)
-                        .then(|| Arc::<str>::from(data)),
+                    raw_body: Arc::<str>::from(data),
                 },
             );
             Ok(())
@@ -244,6 +247,31 @@ async fn persist_completed_result(
             })
         }
     }
+}
+
+struct ToolCallIdAllocator {
+    namespace: String,
+    next: u64,
+}
+
+impl ToolCallIdAllocator {
+    fn new() -> Self {
+        Self {
+            namespace: uuid::Uuid::new_v4().simple().to_string(),
+            next: 0,
+        }
+    }
+
+    fn allocate(&mut self, lane: &str) -> String {
+        let id = format!("{lane}_{}_{}", &self.namespace[..12], self.next);
+        self.next = self.next.saturating_add(1);
+        id
+    }
+}
+
+fn is_external_runner_tool(name: &str) -> bool {
+    worker_tools::is_worker_tool(name)
+        || (!context_store::is_micro_tool(name) && name != "ctx_summarize" && name != DELEGATE_TOOL)
 }
 
 /// Normalize a tool call key for dedup: sort JSON keys and use compact serialization.
@@ -304,9 +332,10 @@ async fn analyze_via_scratch_pad(
     all_results: &mut Vec<(String, String, String)>,
     max_rounds: usize,
     persistence: Option<&ToolResultPersistence>,
+    lease: &mut Option<&mut crate::agent::lease::Lease>,
+    ids: &mut ToolCallIdAllocator,
 ) -> Result<Option<String>, ToolResultPersistenceError> {
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut id_counter: usize = 1000; // offset to avoid collision with iteration-0 IDs
 
     // Cost tracking: accumulate across rounds, stop if budget exceeded.
     let mut cost_spent: f64 = 0.0;
@@ -411,6 +440,41 @@ async fn analyze_via_scratch_pad(
                 break;
             }
 
+            let external_count = response
+                .tool_calls
+                .iter()
+                .filter(|tc| {
+                    allowed_tools.contains(tc.name.as_str())
+                        && !seen_calls.contains(&normalize_call_key(&tc.name, &tc.arguments))
+                        && is_external_runner_tool(&tc.name)
+                })
+                .count() as u32;
+            if external_count > 0 {
+                if let Some(active_lease) = lease.as_deref_mut() {
+                    if let crate::agent::lease::BatchAdmission::Rejected { remaining } =
+                        active_lease.admit_batch(external_count)
+                    {
+                        let instruction = active_lease.rejection_instruction();
+                        for tc in response.tool_calls.iter().filter(|tc| {
+                            allowed_tools.contains(tc.name.as_str())
+                                && !seen_calls
+                                    .contains(&normalize_call_key(&tc.name, &tc.arguments))
+                                && is_external_runner_tool(&tc.name)
+                        }) {
+                            let id = ids.allocate("sp");
+                            let result = format!(
+                                "lease exhausted: {} was not executed — this batch requested {} external calls with {} remaining. {}",
+                                tc.name, external_count, remaining, instruction
+                            );
+                            persist_completed_result(persistence, &id, &tc.name, &result, false)
+                                .await?;
+                            all_results.push((id, tc.name.clone(), result));
+                        }
+                        return Ok(Some(instruction.to_string()));
+                    }
+                }
+            }
+
             // Execute tool calls against ContextStore.
             for tc in &response.tool_calls {
                 // Block disallowed tools.
@@ -504,8 +568,7 @@ async fn analyze_via_scratch_pad(
                 } else if worker_tools::is_worker_tool(&tc.name) {
                     let result =
                         worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
-                    let original_id = format!("sp{:07}", id_counter);
-                    id_counter += 1;
+                    let original_id = ids.allocate("sp");
                     persist_completed_result(
                         persistence,
                         &original_id,
@@ -528,8 +591,7 @@ async fn analyze_via_scratch_pad(
                         TOOL_MAX_RETRIES,
                     )
                     .await;
-                    let original_id = format!("sp{:07}", id_counter);
-                    id_counter += 1;
+                    let original_id = ids.allocate("sp");
                     persist_completed_result(
                         persistence,
                         &original_id,
@@ -635,9 +697,20 @@ pub async fn run_tool_loop(
     tools: &ToolRegistry,
     system_context: &str,
 ) -> ToolRunResult {
-    run_tool_loop_inner(config, initial_tool_calls, tools, system_context, None)
-        .await
-        .expect("the sink-free runner cannot fail persistence")
+    let mut lease = None;
+    let mut ids = ToolCallIdAllocator::new();
+    run_tool_loop_inner(
+        config,
+        initial_tool_calls,
+        tools,
+        system_context,
+        None,
+        &mut lease,
+        &mut ids,
+        true,
+    )
+    .await
+    .expect("the sink-free runner cannot fail persistence")
 }
 
 pub(crate) async fn run_tool_loop_persisted(
@@ -646,13 +719,19 @@ pub(crate) async fn run_tool_loop_persisted(
     tools: &ToolRegistry,
     system_context: &str,
     persistence: &ToolResultPersistence,
+    lease: &mut crate::agent::lease::Lease,
 ) -> Result<ToolRunResult, ToolResultPersistenceError> {
+    let mut lease = Some(lease);
+    let mut ids = ToolCallIdAllocator::new();
     run_tool_loop_inner(
         config,
         initial_tool_calls,
         tools,
         system_context,
         Some(persistence),
+        &mut lease,
+        &mut ids,
+        true,
     )
     .await
 }
@@ -663,6 +742,9 @@ async fn run_tool_loop_inner(
     tools: &ToolRegistry,
     system_context: &str,
     persistence: Option<&ToolResultPersistence>,
+    lease: &mut Option<&mut crate::agent::lease::Lease>,
+    ids: &mut ToolCallIdAllocator,
+    preserve_initial_ids: bool,
 ) -> Result<ToolRunResult, ToolResultPersistenceError> {
     info!(
         role = "delegation",
@@ -810,6 +892,40 @@ async fn run_tool_loop_inner(
                 error: None,
             });
         }
+        if !preserve_initial_ids {
+            let external_count = pending_calls
+                .iter()
+                .filter(|tc| is_external_runner_tool(&tc.name))
+                .count() as u32;
+            if external_count > 0 {
+                if let Some(active_lease) = lease.as_deref_mut() {
+                    if let crate::agent::lease::BatchAdmission::Rejected { remaining } =
+                        active_lease.admit_batch(external_count)
+                    {
+                        let instruction = active_lease.rejection_instruction();
+                        for tc in pending_calls
+                            .iter()
+                            .filter(|tc| is_external_runner_tool(&tc.name))
+                        {
+                            let id = ids.allocate("child");
+                            let result = format!(
+                                "lease exhausted: {} was not executed — this batch requested {} external calls with {} remaining. {}",
+                                tc.name, external_count, remaining, instruction
+                            );
+                            persist_completed_result(persistence, &id, &tc.name, &result, false)
+                                .await?;
+                            all_results.push((id, tc.name.clone(), result));
+                        }
+                        return Ok(ToolRunResult {
+                            tool_results: all_results,
+                            summary: Some(instruction.to_string()),
+                            iterations_used,
+                            error: None,
+                        });
+                    }
+                }
+            }
+        }
 
         // Mistral/Ministral models require tool call IDs to be exactly
         // 9 alphanumeric characters. Normalize IDs for the internal
@@ -818,7 +934,12 @@ async fn run_tool_loop_inner(
         for tc in &mut pending_calls {
             let normalized = normalize_tool_call_id(id_counter);
             id_counter += 1;
-            id_map.insert(normalized.clone(), tc.id.clone());
+            let durable_id = if preserve_initial_ids {
+                tc.id.clone()
+            } else {
+                ids.allocate("child")
+            };
+            id_map.insert(normalized.clone(), durable_id);
             tc.id = normalized;
         }
 
@@ -1056,6 +1177,9 @@ async fn run_tool_loop_inner(
                         tools,
                         &child_system,
                         persistence,
+                        lease,
+                        ids,
+                        false,
                     ))
                     .await?;
                     // Return the child's summary, or concatenated results if no summary.
@@ -1251,6 +1375,8 @@ async fn run_tool_loop_inner(
             &mut all_results,
             scratch_rounds,
             persistence,
+            lease,
+            ids,
         )
         .await?;
         return Ok(ToolRunResult {

@@ -5102,6 +5102,7 @@ async fn delegated_scratchpad_results_store_exact_success_and_failure_bodies() {
 
     let sessions = ctx.core.sessions.clone();
     let session_id = ctx.session_id.clone();
+    ctx.flow.tool_preview_chars_remaining = 0;
     let handled = {
         let summary_started = blocking_provider.summary_started.notified();
         tokio::pin!(summary_started);
@@ -5119,50 +5120,55 @@ async fn delegated_scratchpad_results_store_exact_success_and_failure_bodies() {
             _ = &mut summary_started => {}
             handled = &mut delegated => panic!("delegated execution completed before summary provider blocked: {handled}"),
         }
-        for (id, expected) in [
-            ("tc_routed", "routed_exact_body"),
-            ("sp0001000", "scratchpad_success_exact"),
-            (
-                "sp0001001",
-                "Error: Command failed\nSTDERR:\nscratchpad_failure_exact\nExit code: 4",
-            ),
-        ] {
-            assert_eq!(
-                sessions.load_tool_result(&session_id, id).await.as_deref(),
-                Some(expected),
-                "{id} must be durable before the next provider call completes",
-            );
-        }
+        assert_eq!(
+            sessions
+                .load_tool_result(&session_id, "tc_routed")
+                .await
+                .as_deref(),
+            Some("routed_exact_body"),
+            "the routed body must be durable before analysis completes",
+        );
         blocking_provider.allow_summary.notify_one();
         delegated.await
     };
     assert!(handled);
 
-    assert_eq!(
-        sessions
-            .load_tool_result(&session_id, "sp0001000")
-            .await
-            .as_deref(),
-        Some("scratchpad_success_exact")
-    );
-    assert_eq!(
-        sessions
-            .load_tool_result(&session_id, "sp0001001")
-            .await
-            .as_deref(),
-        Some("Error: Command failed\nSTDERR:\nscratchpad_failure_exact\nExit code: 4")
-    );
+    let extra_entries: Vec<_> = ctx
+        .turn_tool_entries
+        .iter()
+        .filter(|entry| entry.id != "tc_routed")
+        .collect();
+    assert_eq!(extra_entries.len(), 2);
+    assert_ne!(extra_entries[0].id, extra_entries[1].id);
+    assert!(extra_entries
+        .iter()
+        .all(|entry| entry.id.starts_with("sp_")));
+    for (entry, expected, expected_ok) in [
+        (&extra_entries[0], "scratchpad_success_exact", true),
+        (
+            &extra_entries[1],
+            "Error: Command failed\nSTDERR:\nscratchpad_failure_exact\nExit code: 4",
+            false,
+        ),
+    ] {
+        assert_eq!(
+            sessions
+                .load_tool_result_with_status(&session_id, &entry.id)
+                .await,
+            Some((expected.to_string(), Some(expected_ok)))
+        );
+    }
     assert!(ctx.messages.iter().any(|message| {
         message
             .get("content")
             .and_then(Value::as_str)
             .is_some_and(|content| content.contains("scratch summary publishable"))
     }));
-    for (id, expected_ok) in [
-        ("tc_routed", true),
-        ("sp0001000", true),
-        ("sp0001001", false),
-    ] {
+    for (id, expected_ok) in std::iter::once(("tc_routed", true)).chain(
+        extra_entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.ok)),
+    ) {
         let entry = ctx
             .turn_tool_entries
             .iter()
@@ -5170,6 +5176,28 @@ async fn delegated_scratchpad_results_store_exact_success_and_failure_bodies() {
             .unwrap_or_else(|| panic!("missing turn audit entry {id}"));
         assert_eq!(entry.ok, expected_ok);
     }
+    let runner_summary = ctx
+        .messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .find(|content| content.contains("[Tool runner executed 2 additional calls]"))
+        .expect("scratch extras need one prompt-visible summary");
+    assert!(!runner_summary.contains("routed_exact_body"));
+    for entry in extra_entries {
+        assert!(runner_summary.contains(&entry.id));
+    }
+    assert!(runner_summary.contains("ok:false"));
+    assert!(runner_summary.contains("recall_tool_result"));
+    assert_eq!(ctx.flow.tool_preview_chars_remaining, 0);
+    assert_eq!(
+        runner_summary
+            .matches(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
+            .count(),
+        2,
+        "zero shared budget must render both extras as bounded handles",
+    );
+    assert!(!runner_summary.contains("[exec]: scratchpad_success_exact"));
+    assert!(!runner_summary.contains("[exec]: Error: Command failed"));
 
     let _ = std::fs::remove_dir_all(workspace);
 }
@@ -5231,6 +5259,34 @@ async fn delegated_missing_routed_result_aborts_without_synthetic_publication() 
             .and_then(Value::as_str)
             .is_none_or(|content| !content.contains("(no result)"))
     }));
+    for expected_id in ["tc_kept", "tc_deduplicated"] {
+        let receipts: Vec<&Value> = ctx
+            .messages
+            .iter()
+            .filter(|message| {
+                message.get("tool_call_id").and_then(Value::as_str) == Some(expected_id)
+            })
+            .collect();
+        assert_eq!(
+            receipts.len(),
+            1,
+            "every routed assistant call needs exactly one terminal receipt"
+        );
+        assert_eq!(receipts[0].get("ok").and_then(Value::as_bool), Some(false));
+    }
+    let persisted = ctx.core.sessions.get_all_messages(&ctx.session_id).await;
+    for expected_id in ["tc_kept", "tc_deduplicated"] {
+        assert_eq!(
+            persisted
+                .iter()
+                .filter(|message| {
+                    message.get("tool_call_id").and_then(Value::as_str) == Some(expected_id)
+                })
+                .count(),
+            1,
+            "aborted receipts must be durable before the turn returns"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(workspace);
 }
@@ -5253,18 +5309,18 @@ async fn delegated_web_result_stores_raw_envelope_before_provider_extraction() {
             json!({"type": "object", "properties": {"url": {"type": "string"}}})
         }
 
-        async fn execute(&self, _params: std::collections::HashMap<String, Value>) -> String {
-            raw_web_envelope()
+        async fn execute(&self, params: std::collections::HashMap<String, Value>) -> String {
+            web_envelope_for(&params)
         }
 
         async fn execute_with_result_and_context(
             &self,
-            _params: std::collections::HashMap<String, Value>,
+            params: std::collections::HashMap<String, Value>,
             _ctx: &crate::agent::tools::base::ToolExecutionContext,
         ) -> crate::agent::tools::base::ToolExecutionResult {
             crate::agent::tools::base::ToolExecutionResult {
                 ok: false,
-                data: raw_web_envelope(),
+                data: web_envelope_for(&params),
                 error: Some("upstream failed".to_string()),
                 error_kind: None,
             }
@@ -5274,6 +5330,23 @@ async fn delegated_web_result_stores_raw_envelope_before_provider_extraction() {
     fn raw_web_envelope() -> String {
         r#"{"text":"provider-facing article","error":"upstream failed","raw_only":true}"#
             .to_string()
+    }
+
+    fn web_envelope_for(params: &std::collections::HashMap<String, Value>) -> String {
+        if params
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.contains("inline-large"))
+        {
+            serde_json::json!({
+                "text": "provider-facing article ".repeat(600),
+                "error": "upstream failed",
+                "raw_only": "exact stored envelope metadata",
+            })
+            .to_string()
+        } else {
+            raw_web_envelope()
+        }
     }
 
     let main = MockLLM::named("local-qwen-test");
@@ -5396,6 +5469,45 @@ async fn delegated_web_result_stores_raw_envelope_before_provider_extraction() {
     assert!(handle.contains(
         r#"excerpt:"{\"text\":\"provider-facing article\",\"error\":\"upstream failed\",\"raw_only\":true}""#
     ));
+
+    ctx.flow.tool_preview_chars_remaining = crate::agent::tool_engine::TOOL_PREVIEW_BUDGET_CHARS;
+    let inline_calls = vec![crate::providers::base::ToolCallRequest {
+        id: "tc_inline_large_raw_web".to_string(),
+        name: "web_fetch".to_string(),
+        arguments: std::collections::HashMap::from([(
+            "url".to_string(),
+            json!("https://example.invalid/inline-large"),
+        )]),
+    }];
+    let inline_response = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: inline_calls.clone(),
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+    crate::agent::tool_engine::execute_tools_inline(&mut ctx, &inline_calls, &inline_response)
+        .await;
+    let stored_inline = ctx
+        .core
+        .sessions
+        .load_tool_result(&ctx.session_id, "tc_inline_large_raw_web")
+        .await
+        .expect("inline raw envelope must be durable");
+    let inline_handle = ctx
+        .messages
+        .iter()
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_inline_large_raw_web")
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .expect("oversized inline web result must publish a handle");
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(stored_inline.as_bytes()));
+    assert!(inline_handle.contains(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER));
+    assert!(inline_handle.contains(&format!("| chars:{} |", stored_inline.chars().count())));
+    assert!(inline_handle.contains(&format!("| sha256:{digest} |")));
+    assert!(stored_inline.contains("exact stored envelope metadata"));
 
     let _ = std::fs::remove_dir_all(workspace);
 }

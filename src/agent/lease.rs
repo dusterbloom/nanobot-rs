@@ -171,6 +171,17 @@ impl Lease {
         self.lease_size
     }
 
+    /// Prompt instruction for a batch rejected by this lease. Local turns
+    /// cannot renew, so their receipt must end the current turn instead of
+    /// advertising a checkpoint the runtime will reject.
+    pub fn rejection_instruction(&self) -> &'static str {
+        if self.max_renewals == 0 {
+            "Finalize now without another tool; start a fresh user turn if more tool work is needed."
+        } else {
+            "Write a renewal checkpoint before requesting another tool."
+        }
+    }
+
     /// Try to renew the lease with a model-emitted checkpoint. The
     /// checkpoint must contain `findings:`, `next:`, and `will:` (any
     /// case). Returns `RenewalResult::accepted()` and resets the
@@ -211,7 +222,6 @@ impl Lease {
         self.iterations_used = 0;
         RenewalResult::accepted()
     }
-
 }
 
 #[cfg(test)]
@@ -462,5 +472,18 @@ mod tests {
                 .missing_field(),
             "out_of_leases",
         );
+    }
+
+    #[test]
+    fn local_rejection_instruction_finalizes_without_renewal_language() {
+        let mut lease = Lease::new(1, LOCAL_MAX_LEASE_RENEWALS);
+        assert_eq!(lease.admit_batch(1), BatchAdmission::Admitted);
+
+        let instruction = lease.rejection_instruction();
+
+        let instruction = instruction.to_lowercase();
+        assert!(instruction.contains("finalize now"));
+        assert!(instruction.contains("fresh user turn"));
+        assert!(!instruction.contains("renewal checkpoint"));
     }
 }

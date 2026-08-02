@@ -137,6 +137,178 @@ fn make_tool_calls(names: &[&str]) -> Vec<ToolCallRequest> {
 }
 
 #[tokio::test]
+async fn persisted_runner_rejects_scratch_batch_on_shared_local_lease() {
+    let provider = Arc::new(MockProvider::new(vec![
+        crate::providers::base::LLMResponse {
+            content: None,
+            tool_calls: make_tool_calls(&["test_tool", "test_tool"]),
+            finish_reason: "tool_calls".to_string(),
+            usage: HashMap::new(),
+        },
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(CountingTool::new()));
+    let config = ToolRunnerConfig {
+        provider,
+        model: "mock".into(),
+        max_iterations: 3,
+        max_tokens: 4096,
+        max_tool_result_chars: 30_000,
+        short_circuit_chars: 0,
+        depth: 0,
+        cancellation_token: None,
+        verbatim: false,
+        budget: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = Arc::new(crate::session::SessionDb::new(
+        &dir.path().join("sessions.db"),
+    ));
+    let session = sessions.create_session("runner:lease").await;
+    let persistence =
+        ToolResultPersistence::new(sessions.clone(), session.id.clone(), ["root".to_string()]);
+    let mut lease = crate::agent::lease::Lease::new(12, 0);
+    assert_eq!(
+        lease.admit_batch(11),
+        crate::agent::lease::BatchAdmission::Admitted
+    );
+    let result = run_tool_loop_persisted(
+        &config,
+        &[ToolCallRequest {
+            id: "root".into(),
+            name: "test_tool".into(),
+            arguments: HashMap::from([("query".into(), json!("root"))]),
+        }],
+        &tools,
+        "test",
+        &persistence,
+        &mut lease,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.tool_results.len(), 3);
+    assert_eq!(result.tool_results[0].0, "root");
+    let extras = &result.tool_results[1..];
+    assert_ne!(extras[0].0, extras[1].0);
+    assert!(extras.iter().all(|(id, _, body)| {
+        id.starts_with("sp_")
+            && body.contains("Finalize now")
+            && !body.to_lowercase().contains("renewal checkpoint")
+    }));
+    for (id, _, _) in extras {
+        assert_eq!(
+            sessions
+                .load_tool_result_with_status(&session.id, id)
+                .await
+                .unwrap()
+                .1,
+            Some(false)
+        );
+    }
+}
+
+#[tokio::test]
+async fn persisted_nested_sibling_runners_namespace_reused_provider_ids() {
+    let child_call = |query: &str| crate::providers::base::LLMResponse {
+        content: None,
+        tool_calls: vec![ToolCallRequest {
+            id: "provider_reused_child_id".to_string(),
+            name: "test_tool".to_string(),
+            arguments: HashMap::from([("query".to_string(), json!(query))]),
+        }],
+        finish_reason: "tool_calls".to_string(),
+        usage: HashMap::new(),
+    };
+    let text = |content: &str| crate::providers::base::LLMResponse {
+        content: Some(content.to_string()),
+        tool_calls: vec![],
+        finish_reason: "stop".to_string(),
+        usage: HashMap::new(),
+    };
+    let provider = Arc::new(MockProvider::new(vec![
+        child_call("first child"),
+        text("first child summary"),
+        text("first parent summary"),
+        child_call("second child"),
+        text("second child summary"),
+        text("second parent summary"),
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(CountingTool::new()));
+    let config = ToolRunnerConfig {
+        provider,
+        model: "mock".to_string(),
+        max_iterations: 10,
+        max_tokens: 4096,
+        max_tool_result_chars: 30_000,
+        short_circuit_chars: 0,
+        depth: 0,
+        cancellation_token: None,
+        verbatim: false,
+        budget: Some(Budget::root(10, 2)),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = Arc::new(crate::session::SessionDb::new(
+        &dir.path().join("sessions.db"),
+    ));
+    let session = sessions.create_session("runner:nested-siblings").await;
+    let persistence = ToolResultPersistence::new(
+        sessions.clone(),
+        session.id.clone(),
+        ["root_delegate_1".to_string(), "root_delegate_2".to_string()],
+    );
+    let mut lease = crate::agent::lease::Lease::new(12, 0);
+    let delegate_call = |id: &str| ToolCallRequest {
+        id: id.to_string(),
+        name: DELEGATE_TOOL.to_string(),
+        arguments: HashMap::from([
+            ("task".to_string(), json!("inspect")),
+            ("tools".to_string(), json!(["test_tool"])),
+        ]),
+    };
+
+    for root_id in ["root_delegate_1", "root_delegate_2"] {
+        assert_eq!(
+            lease.admit_batch(1),
+            crate::agent::lease::BatchAdmission::Admitted
+        );
+        let result = run_tool_loop_persisted(
+            &config,
+            &[delegate_call(root_id)],
+            &tools,
+            "test",
+            &persistence,
+            &mut lease,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.tool_results[0].0, root_id,
+            "root id must be preserved"
+        );
+    }
+
+    let child_ids: Vec<String> = persistence
+        .outcomes
+        .lock()
+        .keys()
+        .filter(|id| id.starts_with("child_"))
+        .cloned()
+        .collect();
+    assert_eq!(child_ids.len(), 2);
+    assert_ne!(child_ids[0], child_ids[1]);
+    for id in child_ids {
+        assert_eq!(
+            sessions
+                .load_tool_result_with_status(&session.id, &id)
+                .await,
+            Some(("tool result data".to_string(), Some(true)))
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_run_tool_loop_executes_tools() {
     let provider = Arc::new(MockProvider::new(vec![
         // After initial tool execution, model says "done".
