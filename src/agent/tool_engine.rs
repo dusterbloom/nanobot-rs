@@ -30,6 +30,17 @@ const MAX_PARALLEL_TOOL_CALLS: usize = 4;
 /// Minimum room for a compact receipt with a recall handle. Below this, the
 /// prompt may save a few bytes while losing the exact retrieval path.
 const MIN_BATCH_TOOL_RESULT_CAP_CHARS: usize = 320;
+pub(crate) const TOOL_PREVIEW_BUDGET_CHARS: usize = 16 * 1024;
+
+fn turn_preview_cap(per_result_cap: usize, batch_len: usize, remaining: usize) -> usize {
+    if remaining < MIN_BATCH_TOOL_RESULT_CAP_CHARS {
+        return 0;
+    }
+    per_result_cap
+        .min(remaining / batch_len.max(1))
+        .max(MIN_BATCH_TOOL_RESULT_CAP_CHARS)
+        .min(remaining)
+}
 
 /// Per-tool token threshold above which a raw tool result is replaced by a
 /// summary. Enumerative tools (`exec`, `list_dir`, `web_search`, `read_file`)
@@ -57,6 +68,7 @@ fn inline_hot_prompt_result_cap(ctx: &TurnContext) -> usize {
     effective_tool_result_cap(ctx.core.max_tool_result_chars)
 }
 
+#[cfg(test)]
 fn inline_hot_prompt_result_cap_from_effective(cap: usize, result_count: usize) -> usize {
     if result_count <= 1 {
         return cap;
@@ -72,17 +84,11 @@ fn inline_hot_prompt_result_cap_from_effective(cap: usize, result_count: usize) 
         .max(1)
 }
 
-fn inline_hot_prompt_result_cap_for_ctx_batch(ctx: &TurnContext, result_count: usize) -> usize {
-    inline_hot_prompt_result_cap_from_effective(inline_hot_prompt_result_cap(ctx), result_count)
-}
-
-/// Stash raw output before prompt shaping. Multi-result batches force this so
-/// even medium reads can be reduced to receipts without losing exact recall.
+/// Store raw output before prompt shaping. `force` only controls whether an
+/// otherwise-fitting result needs a bounded batch representation.
 ///
-/// Returns:
-/// - `Ok(false)` — small data, not stashed (cap gate hit, no store needed).
-/// - `Ok(true)` — newly stashed (`Stored`) or idempotent retry (`Identical`);
-///   the body is durably present under `(session_id, tool_call_id)`.
+/// Returns whether the provider-facing representation needs shaping. Every
+/// completed body is stored first, including small successes and failures.
 /// - `Err(StoredResult)` — the stash could NOT prove durability of the exact
 ///   bytes (`Conflict`: different bytes already present; `Failed`: SQLite
 ///   error). The caller MUST NOT show a raw body or re-run a side-effect tool;
@@ -102,18 +108,17 @@ async fn stash_tool_result_for_prompt_shaping(
     // stashable under the recall's own id so slice_tool_result /
     // search_tool_result can query it. Exempting it left the raw body in live
     // context, which inflated a session to 77k tokens (2026-07-30).
-    if !force && data.chars().count() <= cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES {
-        return Ok(false);
-    }
+    let needs_shaping =
+        force || data.chars().count() > cap || data.len() > TOOL_RESULT_REPLAY_MAX_BYTES;
     match sessions
         .store_tool_result_immutable(session_id, tool_call_id, tool_name, data)
         .await
     {
-        StoredResult::Stored { .. } => Ok(true),
+        StoredResult::Stored { .. } => Ok(needs_shaping),
         // Idempotent retry — the same tool_call_id with byte-identical content
         // (e.g. a model re-reading the same file). Accept it as "stashed":
         // the body IS present under this key.
-        StoredResult::Identical { .. } => Ok(true),
+        StoredResult::Identical { .. } => Ok(needs_shaping),
         // Different bytes already stored under this key, or SQLite failure.
         // Either way the invariant is violated; surface it.
         sr @ (StoredResult::Conflict { .. } | StoredResult::Failed) => Err(sr),
@@ -637,8 +642,11 @@ pub(crate) async fn execute_tools_delegated(
 
     // Add tool results from the runner to the main context.
     let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
-    let routed_result_cap =
-        inline_hot_prompt_result_cap_for_ctx_batch(ctx, routed_tool_calls.len());
+    let routed_result_cap = turn_preview_cap(
+        inline_hot_prompt_result_cap(ctx),
+        routed_tool_calls.len(),
+        ctx.flow.tool_preview_chars_remaining,
+    );
     let force_routed_stash = routed_tool_calls.len() > 1;
 
     for tc in routed_tool_calls {
@@ -684,7 +692,7 @@ pub(crate) async fn execute_tools_delegated(
         // lossless recall — digesting `injected_raw` directly would store the
         // summary instead of the original. Then preview injected_raw and add a
         // recall pointer when the raw was stashed.
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
+        let needs_shaping = match stash_tool_result_for_prompt_shaping(
             &ctx.core.sessions,
             &ctx.session_id,
             &tc.id,
@@ -704,7 +712,15 @@ pub(crate) async fn execute_tools_delegated(
                 continue;
             }
         };
-        let mut injected = if stashed_raw
+        let mut injected = if cap == 0 {
+            render_tool_result_handle(
+                &tc.id,
+                &tc.name,
+                tool_result_ok(full_data),
+                full_data.as_bytes(),
+                &tc.arguments,
+            )
+        } else if needs_shaping
             && !is_explicit_retrieval_tool(&tc.name)
             && full_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES
         {
@@ -725,6 +741,12 @@ pub(crate) async fn execute_tools_delegated(
             // the model of normal read/exec bytes (2026-07-31 regression).
             build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
         };
+        if cap > 0 && !injected.starts_with(TOOL_RESULT_HANDLE_MARKER) {
+            ctx.flow.tool_preview_chars_remaining = ctx
+                .flow
+                .tool_preview_chars_remaining
+                .saturating_sub(injected.chars().count());
+        }
         injected = ctx.flow.lease.annotate_result(&injected);
 
         let ok = tool_result_ok(full_data);
@@ -1106,6 +1128,25 @@ async fn inject_tool_result(
     prompt_cap: usize,
     force_stash_raw: bool,
 ) {
+    let cap = prompt_cap;
+    let needs_shaping = match stash_tool_result_for_prompt_shaping(
+        &ctx.core.sessions,
+        &ctx.session_id,
+        &r.tool_id,
+        &r.tool_name,
+        &r.result.data,
+        cap,
+        force_stash_raw,
+    )
+    .await
+    {
+        Ok(needs_shaping) => needs_shaping,
+        Err(sr) => {
+            abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
+            return;
+        }
+    };
+
     // For web_fetch/web_search: unwrap the JSON envelope so the model
     // sees clean article text rather than a JSON metadata summary.
     let result_data = if r.tool_name == "web_fetch" || r.tool_name == "web_search" {
@@ -1116,8 +1157,15 @@ async fn inject_tool_result(
 
     // Gate tool result through context budget.
     let threshold = summary_threshold_tokens(&r.tool_name);
-    let cap = prompt_cap.max(1);
-    let data = if r.tool_name == "recall_tool_result" {
+    let data = if cap == 0 {
+        render_tool_result_handle(
+            &r.tool_id,
+            &r.tool_name,
+            r.result.ok,
+            r.result.data.as_bytes(),
+            &r.arguments,
+        )
+    } else if r.tool_name == "recall_tool_result" {
         // A recalled body is verbatim what the model asked for, but a large
         // one cannot enter live context raw: a 172KB recall inflated a
         // session to 77k tokens and triggered a cache-dropping compaction
@@ -1125,23 +1173,6 @@ async fn inject_tool_result(
         // same stash+digest as any other oversized result — the full body is
         // stashed under this recall's id and the model queries it via
         // slice_tool_result / search_tool_result.
-        let _stashed_raw = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &r.tool_id,
-            &r.tool_name,
-            &result_data,
-            cap,
-            force_stash_raw,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
-                return;
-            }
-        };
         // Recall is an explicit-retrieval tool: its result carries a bounded
         // excerpt (digest_tool_result handles small-as-passthrough + large as
         // head+tail preview). The full body is stashed for slice/search.
@@ -1154,23 +1185,6 @@ async fn inject_tool_result(
         // Specialist path: stash the RAW (pre-specialist) output for lossless
         // recall — without this, recall would return the specialist's summary
         // instead of the original. Then summarize and preview the summary.
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &r.tool_id,
-            &r.tool_name,
-            &result_data,
-            cap,
-            force_stash_raw,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
-                return;
-            }
-        };
         let summarized = ctx
             .content_gate
             .admit_with_specialist(
@@ -1185,7 +1199,7 @@ async fn inject_tool_result(
         // If the summary fit under cap, build_tool_result_preview returned it
         // unchanged with no recall pointer — but the raw IS stashed, so tell
         // the model it can still recover the original.
-        if stashed_raw && !preview.contains("recall_tool_result") {
+        if !preview.contains("recall_tool_result") {
             preview.push_str(&format!(
                 "\n[full original output retrievable via recall_tool_result({{\"tool_call_id\": \"{}\"}})]",
                 r.tool_id
@@ -1193,24 +1207,7 @@ async fn inject_tool_result(
         }
         preview
     } else {
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &r.tool_id,
-            &r.tool_name,
-            &result_data,
-            cap,
-            force_stash_raw,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
-                return;
-            }
-        };
-        if stashed_raw && result_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES {
+        if needs_shaping && result_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES {
             // GENUINELY oversized (>8KB): handle only. A single 95KB result
             // replayed raw was the cache-break class (token_mismatch under
             // ExactBootstrap). The body lives in the stash, fetchable via
@@ -1223,7 +1220,7 @@ async fn inject_tool_result(
                 &r.arguments,
             );
             ctx.content_gate.admit_simple(&handle).into_text()
-        } else if stashed_raw {
+        } else if needs_shaping {
             // Medium (over the hot-prompt char cap but ≤8KB replay cap): show
             // actual CONTENT via a deterministic head+tail preview. Handling
             // these deprived the model of normal read/exec bytes and forced
@@ -1231,13 +1228,23 @@ async fn inject_tool_result(
             // Stable per-result (body doesn't change) → no cache drift.
             build_tool_result_preview(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id)
         } else {
-            // Small result, not stashed — small enough to carry inline raw
-            // (under both the char cap and the replay byte cap). A handle
-            // would be larger than the body itself.
+            // Small stored result — small enough to carry inline raw. A
+            // handle would be larger than the body itself.
             ctx.content_gate.admit_simple(&result_data).into_text()
         }
     };
 
+    let data = if cap > 0 && data.chars().count() > cap {
+        build_tool_result_preview(&r.tool_name, &r.arguments, &data, cap, &r.tool_id)
+    } else {
+        data
+    };
+    if cap > 0 && !data.starts_with(TOOL_RESULT_HANDLE_MARKER) {
+        ctx.flow.tool_preview_chars_remaining = ctx
+            .flow
+            .tool_preview_chars_remaining
+            .saturating_sub(data.chars().count());
+    }
     let data = ctx.flow.lease.annotate_result(&data);
 
     if ctx.core.provenance_config.enabled {
@@ -1478,7 +1485,11 @@ pub(crate) async fn execute_tools_inline(
         taints,
     )
     .await;
-    let result_cap = inline_hot_prompt_result_cap_for_ctx_batch(ctx, ordered_results.len());
+    let result_cap = turn_preview_cap(
+        inline_hot_prompt_result_cap(ctx),
+        ordered_results.len(),
+        ctx.flow.tool_preview_chars_remaining,
+    );
     let force_stash_raw = ordered_results.len() > 1;
     for result in &ordered_results {
         inject_tool_result(ctx, result, result_cap, force_stash_raw).await;
@@ -1703,6 +1714,48 @@ mod tests {
     fn configured_tool_result_cap_is_the_hot_prompt_cap() {
         assert_eq!(effective_tool_result_cap(10_000), 10_000);
         assert_eq!(effective_tool_result_cap(2_000), 2_000);
+    }
+
+    #[tokio::test]
+    async fn every_tool_result_is_stored_before_prompt_shaping() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("test:store-every-tool-result").await;
+
+        for (id, body) in [
+            ("small_ok", "ok".to_string()),
+            ("small_err", "Error: nope".to_string()),
+            ("medium", "m".repeat(7_000)),
+            ("large", "l".repeat(40_000)),
+        ] {
+            stash_tool_result_for_prompt_shaping(
+                &sessions,
+                &session.id,
+                id,
+                "fixture",
+                &body,
+                10_000,
+                false,
+            )
+            .await
+            .expect("the exact completed result must be durably stored");
+            assert_eq!(
+                sessions.load_tool_result(&session.id, id).await.as_deref(),
+                Some(body.as_str()),
+                "completed result {id} was not stored exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_preview_budget_bounds_multiple_medium_results() {
+        let first_batch_cap = turn_preview_cap(10_000, 1, 16_384);
+        let second_batch_cap = turn_preview_cap(10_000, 1, 16_384 - first_batch_cap);
+
+        assert_eq!(turn_preview_cap(10_000, 4, 16_384), 4_096);
+        assert_eq!(first_batch_cap, 10_000);
+        assert_eq!(second_batch_cap, 6_384);
+        assert_eq!(turn_preview_cap(10_000, 1, 0), 0);
     }
 
     #[tokio::test]

@@ -2532,6 +2532,63 @@ fn build_local_inline_harness_with_iters(
     (agent_loop, workspace)
 }
 
+fn build_preview_budget_harness(main: Arc<dyn LLMProvider>) -> (AgentLoop, std::path::PathBuf) {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider: main,
+        workspace: workspace.clone(),
+        model: "local-qwen-test".to_string(),
+        max_iterations: 20,
+        max_continuations: 2,
+        max_tokens: 512,
+        temperature: 0.3,
+        max_context_tokens: 100_000,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        crw_url: String::new(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: true,
+        memory_config: MemoryConfig::default(),
+        is_local: true,
+        lane: Lane::default(),
+        tool_delegation: ToolDelegationConfig::default(),
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 10_000,
+        delegation_provider: None,
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
+    });
+    let counters = test_runtime_counters(100_000);
+    let core_handle = AgentHandle::new(core, counters);
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+    let agent_loop = AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx,
+        None,
+        1,
+        None,
+        None,
+        None,
+        ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    );
+    (agent_loop, workspace)
+}
+
 fn build_local_inline_harness_with_model(
     main: Arc<dyn LLMProvider>,
     model: &str,
@@ -4669,6 +4726,122 @@ async fn medium_tool_result_shows_content_not_handle() {
         content.contains("medium_line_one"),
         "medium result must carry real body content; got: {content}"
     );
+
+    let _ = std::fs::remove_dir_all(files_dir);
+}
+
+#[tokio::test]
+async fn stored_tool_preview_reloads_byte_identically() {
+    use crate::agent::tool_engine::{TOOL_PREVIEW_BUDGET_CHARS, TOOL_RESULT_HANDLE_MARKER};
+
+    let files_dir = tempfile::tempdir().unwrap();
+    let mut responses = Vec::new();
+    for index in 0..4 {
+        let mut arguments = std::collections::HashMap::new();
+        let tool_name = if index == 3 {
+            arguments.insert("tool_call_id".to_string(), json!("tc_budget_0"));
+            "recall_tool_result"
+        } else if index % 2 == 0 {
+            let body = format!("medium_{index}_line\n").repeat(500);
+            let path = files_dir.path().join(format!("medium_{index}.txt"));
+            std::fs::write(&path, body).unwrap();
+            arguments.insert(
+                "path".to_string(),
+                json!(path.to_string_lossy().to_string()),
+            );
+            "read_file"
+        } else {
+            arguments.insert(
+                "command".to_string(),
+                json!(format!("seq 1 {}", 1_000 + index)),
+            );
+            "exec"
+        };
+        responses.push(crate::providers::base::LLMResponse {
+            content: Some(if index == 0 {
+                String::new()
+            } else {
+                "continuing".to_string()
+            }),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: format!("tc_budget_{index}"),
+                name: tool_name.to_string(),
+                arguments,
+            }],
+            finish_reason: "tool_calls".to_string(),
+            usage: std::collections::HashMap::new(),
+        });
+    }
+    responses.push(WireRecordingProvider::text_response("done"));
+
+    let provider = Arc::new(WireRecordingProvider::new("local-qwen-test", responses));
+    let (agent_loop, _ws) = build_preview_budget_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("turn-preview-budget-{}", uuid::Uuid::new_v4());
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent_loop.process_direct("read every file", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("budgeted turn must terminate");
+    assert_eq!(response, "done");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    let messages = core.sessions.get_all_messages(&session.id).await;
+    let tool_messages: Vec<_> = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .collect();
+    assert_eq!(tool_messages.len(), 4);
+
+    let detailed_chars: usize = tool_messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(|v| v.as_str()))
+        .filter(|content| !content.contains(TOOL_RESULT_HANDLE_MARKER))
+        .map(|content| content.split_once('\n').map_or(content, |(_, body)| body))
+        .map(str::chars)
+        .map(Iterator::count)
+        .sum();
+    assert!(
+        detailed_chars <= TOOL_PREVIEW_BUDGET_CHARS,
+        "new detailed tool content exceeded the turn budget: {detailed_chars}"
+    );
+    assert!(tool_messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .is_some_and(|content| content.contains(TOOL_RESULT_HANDLE_MARKER))
+    }));
+
+    for message in &tool_messages {
+        let tool_call_id = message
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(
+            core.sessions
+                .load_tool_result(&session.id, tool_call_id)
+                .await
+                .is_some(),
+            "handle/detail {tool_call_id} must resolve to its exact stored body"
+        );
+    }
+
+    let reloaded = core.sessions.get_history(&session.id, 0, 0).await;
+    for persisted in tool_messages {
+        let tool_call_id = persisted
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let replayed = reloaded
+            .iter()
+            .find(|message| {
+                message.get("tool_call_id").and_then(|v| v.as_str()) == Some(tool_call_id)
+            })
+            .expect("persisted tool result must survive an unlimited replay");
+        assert_eq!(replayed.get("content"), persisted.get("content"));
+    }
 
     let _ = std::fs::remove_dir_all(files_dir);
 }

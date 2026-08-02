@@ -365,6 +365,9 @@ pub(crate) struct FlowControl {
     /// changing the advertised tool schema. See
     /// `docs/superpowers/specs/2026-07-27-tool-leases-design.md`.
     pub(crate) lease: Lease,
+    /// Append-only provider-facing detail allowance shared by every new tool
+    /// result in this turn. Persisted messages are never revisited to reclaim it.
+    pub(crate) tool_preview_chars_remaining: usize,
     /// When the LLM call started — set in step_call_llm, read in step_process_response.
     pub(crate) llm_call_start: Option<std::time::Instant>,
     /// Time to first token (ms) for the current LLM call: elapsed from
