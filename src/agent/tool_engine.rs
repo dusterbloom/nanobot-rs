@@ -710,13 +710,7 @@ pub(crate) async fn execute_tools_delegated(
             let raw_body = persistence
                 .raw_body_for(&tc.id)
                 .expect("routed result raw body was persisted before publication");
-            render_tool_result_handle(
-                &tc.id,
-                &tc.name,
-                ok,
-                raw_body.as_bytes(),
-                &tc.arguments,
-            )
+            render_tool_result_handle(&tc.id, &tc.name, ok, raw_body.as_bytes(), &tc.arguments)
         };
 
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);

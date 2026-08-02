@@ -224,19 +224,16 @@ async fn persist_completed_result(
         .await
     {
         StoredResult::Stored { .. } | StoredResult::Identical { .. } => {
-            persistence
-                .outcomes
-                .lock()
-                .insert(
-                    tool_call_id.to_string(),
-                    PersistedToolOutcome {
-                        ok,
-                        raw_body: persistence
-                            .routed_ids
-                            .contains(tool_call_id)
-                            .then(|| Arc::<str>::from(data)),
-                    },
-                );
+            persistence.outcomes.lock().insert(
+                tool_call_id.to_string(),
+                PersistedToolOutcome {
+                    ok,
+                    raw_body: persistence
+                        .routed_ids
+                        .contains(tool_call_id)
+                        .then(|| Arc::<str>::from(data)),
+                },
+            );
             Ok(())
         }
         outcome @ (StoredResult::Conflict { .. } | StoredResult::Failed) => {

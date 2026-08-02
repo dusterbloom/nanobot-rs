@@ -5327,9 +5327,7 @@ async fn delegated_web_result_stores_raw_envelope_before_provider_extraction() {
     let visible = ctx
         .messages
         .iter()
-        .find(|message| {
-            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_raw_web")
-        })
+        .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some("tc_raw_web"))
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str)
         .expect("delegated web result must be provider-visible");
@@ -5340,7 +5338,10 @@ async fn delegated_web_result_stores_raw_envelope_before_provider_extraction() {
         .iter()
         .find(|entry| entry.id == "tc_raw_web")
         .expect("delegated web result must have an audit entry");
-    assert!(!audit.ok, "audit status must come from the raw failed result");
+    assert!(
+        !audit.ok,
+        "audit status must come from the raw failed result"
+    );
 
     ctx.flow.tool_preview_chars_remaining = 0;
     let handle_calls = vec![crate::providers::base::ToolCallRequest {
@@ -5390,9 +5391,8 @@ async fn delegated_web_result_stores_raw_envelope_before_provider_extraction() {
     assert!(handle.contains(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER));
     assert!(handle.contains("id:\"tc_raw_web_handle\""));
     assert!(handle.contains("| chars:76 |"));
-    assert!(handle.contains(
-        "| sha256:81ad9c42e39774d1148dde99c31b0c46c4f6e915475dfd07cabda5beddc935f7 |"
-    ));
+    assert!(handle
+        .contains("| sha256:81ad9c42e39774d1148dde99c31b0c46c4f6e915475dfd07cabda5beddc935f7 |"));
     assert!(handle.contains(
         r#"excerpt:"{\"text\":\"provider-facing article\",\"error\":\"upstream failed\",\"raw_only\":true}""#
     ));
