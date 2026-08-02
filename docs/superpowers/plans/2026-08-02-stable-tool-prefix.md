@@ -53,7 +53,7 @@
 - Preserves temporarily: `ToolCallResult`, `Lease::record_tool_call`, and
   `Lease::progress_signal`, so this commit compiles before Task 2 migrates their callers.
 
-- [ ] **Step 1: Refresh the graph and run impact analysis**
+- [x] **Step 1: Refresh the graph and run impact analysis**
 
 Run:
 
@@ -65,7 +65,7 @@ node .gitnexus/run.cjs impact progress_signal --direction upstream --repo nanobo
 
 Expected: fresh index; both symbols remain LOW risk. Record the d=1 callers so none survive the final migration.
 
-- [ ] **Step 2: Write failing atomic-admission tests**
+- [x] **Step 2: Write failing atomic-admission tests**
 
 Replace the single-call budget test with these tests in `lease.rs`:
 
@@ -93,7 +93,7 @@ fn admitted_multi_call_batch_consumes_every_call() {
 }
 ```
 
-- [ ] **Step 3: Write failing annotation tests**
+- [x] **Step 3: Write failing annotation tests**
 
 Add exact contract tests:
 
@@ -121,7 +121,7 @@ fn final_batch_annotation_requires_answer_or_renewal() {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify RED**
+- [x] **Step 4: Run the tests to verify RED**
 
 Run:
 
@@ -131,7 +131,7 @@ cargo test --lib agent::lease::tests -- --nocapture
 
 Expected: compile failures for missing `BatchAdmission`, `admit_batch`, and `annotate_result`.
 
-- [ ] **Step 5: Implement the typed atomic API**
+- [x] **Step 5: Implement the typed atomic API**
 
 Add the typed batch API beside the existing single-call compatibility methods:
 
@@ -185,7 +185,7 @@ Keep the compatibility methods themselves until Task 2 migrates their two
 production callers; this keeps Task 1's commit buildable. Remove stale comments
 saying callers strip tool definitions.
 
-- [ ] **Step 6: Run focused tests to verify GREEN**
+- [x] **Step 6: Run focused tests to verify GREEN**
 
 Run:
 
@@ -195,7 +195,7 @@ cargo test --lib agent::lease::tests -- --nocapture
 
 Expected: all lease tests pass, including exact annotation text and atomic rejection.
 
-- [ ] **Step 7: Check scope and commit**
+- [x] **Step 7: Check scope and commit**
 
 Run:
 
@@ -227,7 +227,7 @@ Expected GitNexus scope: `Lease` and its unit tests only. Do not stage unrelated
   `LEASE_OVER_BUDGET_FINAL: &str`.
 - Removes: `LEASE_BLOCKS_BEFORE_STRIP`, `FlowControl::consecutive_lease_blocks`, and all lease-driven `tool_defs.clear()` behavior.
 
-- [ ] **Step 1: Refresh the graph, run impact analysis, and report CRITICAL risk before editing**
+- [x] **Step 1: Refresh the graph, run impact analysis, and report CRITICAL risk before editing**
 
 Run:
 
@@ -244,7 +244,7 @@ Expected: `execute_tools_delegated`, `step_pre_call`, `step_execute_tools`, and
 caller (`run_iteration`) plus the agent-loop/tool-result flows requiring
 regression coverage.
 
-- [ ] **Step 2: Extend the wire-recording fixture to capture complete tool arrays**
+- [x] **Step 2: Extend the wire-recording fixture to capture complete tool arrays**
 
 Change `WireRecordingProvider` in `agent_loop/tests.rs`:
 
@@ -287,7 +287,7 @@ fn tool_snapshots(&self) -> Vec<Vec<Value>> {
 
 Initialize `tool_snapshots` and `higgs_session_cache: false` in `new`. In `chat`, record `tools.unwrap_or(&[]).to_vec()` before dequeuing the response. Override `supports_higgs_session_cache` to return the fixture field; Task 3 will add a builder that enables it.
 
-- [ ] **Step 3: Replace the sticky-strip convergence assertion with the stable-schema contract**
+- [x] **Step 3: Replace the sticky-strip convergence assertion with the stable-schema contract**
 
 Rename the current sticky-strip test and make these assertions:
 
@@ -346,7 +346,7 @@ self.tool_snapshots
 
 Delete `saw_tools_absent` and its accessor.
 
-- [ ] **Step 4: Add an inline annotation regression to the existing prefix test**
+- [x] **Step 4: Add an inline annotation regression to the existing prefix test**
 
 Extend `test_local_wire_prompt_tool_result_appends_only` after `assert_wire_prefix`:
 
@@ -362,7 +362,7 @@ assert!(
 );
 ```
 
-- [ ] **Step 5: Add the crossing-boundary protocol test**
+- [x] **Step 5: Add the crossing-boundary protocol test**
 
 Use `WireRecordingProvider` for eleven single `list_dir` calls followed by one
 two-call response. The complete test setup and assertions are:
@@ -439,7 +439,7 @@ async fn lease_rejects_crossing_batch_atomically_with_complete_protocol_pairing(
 }
 ```
 
-- [ ] **Step 6: Add a valid-renewal continuation test**
+- [x] **Step 6: Add a valid-renewal continuation test**
 
 This guards the cooperative path: the final admitted result advertises
 exhaustion, a valid checkpoint renews without changing the schema, and another
@@ -501,7 +501,7 @@ async fn exhausted_lease_renews_without_changing_tool_schema() {
 }
 ```
 
-- [ ] **Step 7: Run the new tests to verify RED**
+- [x] **Step 7: Run the new tests to verify RED**
 
 Run:
 
@@ -517,7 +517,7 @@ repeated blocks; over-boundary batch is partially admitted or lacks a complete
 assistant/results group. The renewal test is a cooperative-path control and may
 already pass before the fix.
 
-- [ ] **Step 8: Use the shared annotation in both result paths**
+- [x] **Step 8: Use the shared annotation in both result paths**
 
 In delegated execution, replace manual `progress_signal` formatting with:
 
@@ -534,7 +534,7 @@ let data = ctx.flow.lease.annotate_result(&data);
 
 Do not change raw stash bytes, tool audit bytes, or `ToolEvent::CallEnd` bytes; only the prompt/session result receives the lease annotation.
 
-- [ ] **Step 9: Make lease admission atomic and terminal in `step_execute_tools`**
+- [x] **Step 9: Make lease admission atomic and terminal in `step_execute_tools`**
 
 After routing, batch deduplication, and `working_dir` injection—but before any tool executes—replace the per-call admission loop with:
 
@@ -580,7 +580,7 @@ pub(crate) const LEASE_OVER_BUDGET_FINAL: &str =
 
 An admitted batch proceeds unchanged. Do not set `round_executed_no_tools` for the terminal lease path.
 
-- [ ] **Step 10: Remove the schema mutation and dead strip state**
+- [x] **Step 10: Remove the schema mutation and dead strip state**
 
 Delete:
 
@@ -598,7 +598,7 @@ In `step_process_response`, keep renewal behavior unchanged but delete the
 
 Keep `tool_defs` mutable because trio passthrough still restores `saved_tool_defs`. Update comments in `FlowControl`, `step_pre_call`, `step_execute_tools`, and the phantom-claim lease gate so they describe stable execution-time enforcement rather than tools-absent generation.
 
-- [ ] **Step 11: Run focused and neighboring regressions to verify GREEN**
+- [x] **Step 11: Run focused and neighboring regressions to verify GREEN**
 
 Run:
 
@@ -613,7 +613,7 @@ cargo test --lib agent::tool_engine::tests -- --nocapture
 
 Expected: stable serialized tool arrays, immediate termination on the first over-budget batch, complete assistant/result pairing, inline/delegated annotation parity, and unchanged non-lease convergence.
 
-- [ ] **Step 12: Check scope and commit**
+- [x] **Step 12: Check scope and commit**
 
 Run:
 

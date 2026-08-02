@@ -480,12 +480,6 @@ impl AgentLoopShared {
                             renewals_used = ctx.flow.lease.renewals_used(),
                             "tool_lease_renewed"
                         );
-                        // The lease is live again — clear the ignored-receipt
-                        // streak. step_pre_call strips tools at
-                        // `LEASE_BLOCKS_BEFORE_STRIP`; without this reset it
-                        // would re-strip on the next iteration and instantly
-                        // undo the renewal.
-                        ctx.flow.consecutive_lease_blocks = 0;
                         ctx.flow.retries.lease_renewal_rejections = 0;
                         // Nudge the model so it knows tools are available
                         // again. Without this, a small local model may

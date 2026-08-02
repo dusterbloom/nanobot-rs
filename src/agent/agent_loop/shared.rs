@@ -19,7 +19,7 @@ use crate::agent::agent_loop::heuristics::{
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::context::ContextBuilder;
 use crate::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
-use crate::agent::lease::Lease;
+use crate::agent::lease::{BatchAdmission, Lease};
 use crate::agent::policy;
 use crate::agent::prefix_guard;
 use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
@@ -299,27 +299,14 @@ fn advance_response_boundary(
 // Loop convergence bounds
 // ---------------------------------------------------------------------------
 //
-// These three constants govern the loop's termination guards. They INTERACT,
-// and the ordering invariant below MUST hold — editing one in isolation can
-// re-introduce a spin (2026-07-30 incident class). Co-located so the
-// relationship is auditable in one place; these are tuning constants, not
-// user config (no flag, no struct — see AGENTS.md "no configurability that
-// wasn't requested").
-//
-// Ordering invariant:
-//   NO_PROGRESS_HARD_STOP > LEASE_BLOCKS_BEFORE_STRIP
-//
-// The lease strip must arm BEFORE the hard stop forces a finish, so a model
-// that ignored "lease exhausted" receipts gets `NO_PROGRESS_HARD_STOP -
-// LEASE_BLOCKS_BEFORE_STRIP` tools-absent rounds to comply with the strip and
-// produce a final answer. If they were equal (or reversed) the hard stop would
-// fire before/during the strip, prematurely ending turns that could have
-// converged. `MAX_LEASE_RENEWAL_REJECTIONS` is independent (it bounds the
-// renewal-rejection path in response.rs, not the no-progress streak) but is
-// kept here for visibility.
-pub(crate) const LEASE_BLOCKS_BEFORE_STRIP: u32 = 2;
+// These constants govern independent loop termination paths. They are tuning
+// constants, not user config (see AGENTS.md "no configurability that wasn't
+// requested"). Lease exhaustion terminates at the first rejected batch and
+// therefore does not feed the generic no-progress breaker.
 pub(crate) const NO_PROGRESS_HARD_STOP: u32 = 4;
 pub(crate) const MAX_LEASE_RENEWAL_REJECTIONS: u32 = 2;
+pub(crate) const LEASE_OVER_BUDGET_FINAL: &str =
+    "I stopped this turn because the model requested another tool batch after exhausting its tool lease. Ask me to continue if you want a fresh lease.";
 
 /// Per-turn flow control flags.
 ///
@@ -357,11 +344,9 @@ pub(crate) struct FlowControl {
     /// duplicate receipts force a text response immediately.
     pub(crate) round_executed_no_tools: bool,
     /// Per-turn tool lease. Caps the total tool calls per turn at
-    /// `lease_size * (1 + max_renewals)`; on exhaustion `step_pre_call`
-    /// strips tool definitions from the request so the model cannot
-    /// emit more tool calls and must produce a final text answer. This
-    /// is the structural prevention for the 2026-07-27 13-call loop
-    /// (session 20260727_161730_6e61a0). See
+    /// `lease_size * (1 + max_renewals)`. A complete assistant batch is
+    /// admitted or rejected before execution; rejection ends the turn without
+    /// changing the advertised tool schema. See
     /// `docs/superpowers/specs/2026-07-27-tool-leases-design.md`.
     pub(crate) lease: Lease,
     /// When the LLM call started — set in step_call_llm, read in step_process_response.
@@ -397,13 +382,6 @@ pub(crate) struct FlowControl {
     pub(crate) consecutive_repeat_rounds: u32,
     /// True once we've already nudged about a repeating tool call; the next
     /// repeat forces a stop instead of nudging again.
-    /// Consecutive rounds where ALL tool calls were blocked by the lease.
-    /// After 2, tool_defs are stripped for the next iteration — one cache
-    /// miss, but the model then physically cannot emit tool calls and must
-    /// produce a text answer. Without this, a small model that ignores
-    /// the lease receipt keeps trying indefinitely, burning iterations
-    /// and churning the cache with unique-UUID receipts.
-    pub(crate) consecutive_lease_blocks: u32,
     pub(crate) repeat_nudged: bool,
     /// Infrastructure error surfaced by the tool engine when the
     /// "handles-not-bodies" invariant cannot be honored — i.e. the immutable
@@ -1249,35 +1227,10 @@ impl AgentLoopShared {
                 )));
         }
 
-        // Select and filter tool definitions for this turn.
-        //
-        // Tool-lease enforcement happens at execution time (cache-safe).
-        // But after 2 consecutive rounds where ALL calls were blocked by
-        // the lease, we strip tool_defs entirely — a small model that
-        // ignores the "lease exhausted" receipt keeps trying tools
-        // indefinitely, burning iterations and churning the cache with
-        // unique-UUID receipts. One cache miss here stops the churn and
-        // forces a text answer. The counter resets as soon as any tool
-        // succeeds (renewal, new lease, etc.).
+        // Select and filter tool definitions for this turn. Lease enforcement
+        // never mutates this array: Higgs retains the tool schema as part of
+        // the session prefix, so admission happens atomically at execution.
         let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx);
-        // `lease_forced_text_only` is computed from the same counter the
-        // strip below uses, and is honored by the router-passthrough
-        // restore further down. Without this hand-off the strip is undone
-        // in the SAME step_pre_call: the restore sees empty tool_defs and
-        // repopulates them, so the model keeps emitting tool calls the
-        // lease then blocks — the 6× strip/restore churn documented in
-        // session 20260729_155613_2b65f0. Router passthrough may reverse
-        // trio stripping; it must never reverse lease enforcement.
-        let lease_forced_text_only =
-            ctx.flow.consecutive_lease_blocks >= LEASE_BLOCKS_BEFORE_STRIP && !tool_defs.is_empty();
-        if lease_forced_text_only {
-            tracing::info!(
-                session = %ctx.session_key,
-                consecutive_blocks = ctx.flow.consecutive_lease_blocks,
-                "tool_lease_stripping_after_blocks — model ignored receipts, forcing text-only iteration"
-            );
-            tool_defs.clear();
-        }
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
         } else {
@@ -1451,12 +1404,9 @@ impl AgentLoopShared {
                     return StepResult::Done(IterationOutcome::Finished(msg));
                 }
                 crate::agent::router::PreflightResult::Passthrough => {
-                    // Restore undoes trio stripping — but never when the lease
-                    // simultaneously forced a text-only call.
-                    if !lease_forced_text_only
-                        && tool_defs.is_empty()
-                        && !saved_tool_defs.is_empty()
-                    {
+                    // Restore tool definitions removed by strict trio routing
+                    // when the router elects to fall back to the main model.
+                    if tool_defs.is_empty() && !saved_tool_defs.is_empty() {
                         debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
                         tool_defs = saved_tool_defs;
                     }
@@ -2727,71 +2677,48 @@ impl AgentLoopShared {
             })
             .collect();
 
-        // Tool-lease enforcement. Each call is recorded against the per-turn
-        // lease; calls that exceed the lease budget are NOT executed — they
-        // get a rejection receipt in their tool_call_id slot (preserves the
-        // wire contract) and the model sees a clear renewal prompt.
-        //
-        // Cache-safe by design: tool_defs are NOT modified at execution time
-        // (only the later sticky-strip path clears them), so the tool-block
-        // hash stays byte-stable across tool rounds and the prefix cache hits.
-        //
-        // There is no longer a consecutive-same-family cap (retired 2026-07-30
-        // — it over-fired on legitimate exploration and busted the cache).
-        // Identical-call loops are bounded by `ToolGuard`'s per-key counter.
-        let mut allowed_calls: Vec<_> = Vec::with_capacity(routed_tool_calls.len());
-        let mut blocked_calls: Vec<(String, String, &'static str)> = Vec::new();
-        for tc in routed_tool_calls {
-            // `lease.record_tool_call` returns `lease_exhausted` when the
-            // per-lease budget is gone. We do NOT pre-check `is_exhausted`
-            // separately — record_tool_call is the single source of truth.
-            let result = ctx.flow.lease.record_tool_call();
-            if result.allowed {
-                allowed_calls.push(tc);
-            } else {
-                let reason = result.reason.unwrap_or("lease_blocked");
-                let name = tc.name.clone();
-                let id = tc.id.clone();
-                blocked_calls.push((name, id, reason));
-            }
-        }
-        // Inject rejection receipts for blocked calls. Each receipt
-        // carries the tool_call_id the model emitted, so the wire's
-        // assistant-tool_calls → tool-results pairing stays intact.
-        for (name, id, reason) in &blocked_calls {
-            tracing::info!(
-                session = %ctx.session_key,
-                tool = %name,
-                reason,
-                "tool_lease_blocked_call"
-            );
-            let msg = format!(
-                "lease exhausted: {name} was not executed — your per-turn \
-                 tool budget is used up. Write a renewal checkpoint \
-                 (findings:/next:/will:) to continue with more tools, or \
-                 write your final answer."
-            );
-            ContextBuilder::add_tool_result_immutable_with_status(
+        // The assistant emitted one protocol batch, so the lease makes one
+        // atomic decision before any member can execute. Partial execution
+        // would leave the model believing the whole batch ran and makes retry
+        // semantics unsafe for side-effect tools.
+        let batch_count = u32::try_from(routed_tool_calls.len()).unwrap_or(u32::MAX);
+        if let BatchAdmission::Rejected { remaining } =
+            ctx.flow.lease.admit_batch(batch_count)
+        {
+            let tool_calls: Vec<Value> = routed_tool_calls
+                .iter()
+                .map(|tool_call| tool_call.to_openai_json())
+                .collect();
+            ContextBuilder::add_assistant_message(
                 &mut ctx.messages,
-                id,
-                name,
-                &msg,
-                false,
+                response.content.as_deref(),
+                Some(&tool_calls),
             );
-        }
-        let routed_tool_calls = allowed_calls;
-        if routed_tool_calls.is_empty() && !blocked_calls.is_empty() {
-            // Every call this round was blocked by the lease — flag it
-            // so the loop machinery doesn't count this as a real
-            // iteration (matches the response_boundary pattern).
-            ctx.flow.round_executed_no_tools = true;
-            ctx.flow.tool_guard.had_blocked_calls = true;
-            // Track consecutive lease-only-blocked rounds. After 2,
-            // step_pre_call strips tool_defs to force a text answer.
-            ctx.flow.consecutive_lease_blocks = ctx.flow.consecutive_lease_blocks.saturating_add(1);
-        } else if !routed_tool_calls.is_empty() {
-            // At least one tool ran — reset the consecutive-block counter.
-            ctx.flow.consecutive_lease_blocks = 0;
+            for tool_call in &routed_tool_calls {
+                tracing::info!(
+                    session = %ctx.session_key,
+                    tool = %tool_call.name,
+                    batch_count,
+                    remaining,
+                    "tool_lease_rejected_batch"
+                );
+                let receipt = format!(
+                    "lease exhausted: {} was not executed — this batch requested {} calls with {} remaining. Write a renewal checkpoint before requesting another tool in a new turn.",
+                    tool_call.name, batch_count, remaining
+                );
+                ContextBuilder::add_tool_result_immutable_with_status(
+                    &mut ctx.messages,
+                    &tool_call.id,
+                    &tool_call.name,
+                    &receipt,
+                    false,
+                );
+            }
+            ctx.persist_pending_protocol_messages().await;
+            ctx.emit_pending_request_metrics(0);
+            return StepResult::Done(IterationOutcome::Finished(
+                LEASE_OVER_BUDGET_FINAL.to_string(),
+            ));
         }
         // Snapshot the dispatched tool-call keys for the repeated-call breaker.
         let dispatched_keys: Vec<String> = routed_tool_calls

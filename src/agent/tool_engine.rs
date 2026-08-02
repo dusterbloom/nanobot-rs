@@ -725,13 +725,7 @@ pub(crate) async fn execute_tools_delegated(
             // the model of normal read/exec bytes (2026-07-31 regression).
             build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
         };
-        // Prepend the per-lease progress signal so the model can see
-        // remaining budget inline (B3 of the lease design — visible,
-        // deterministic, helps the model self-regulate instead of being
-        // interrupted). Recorded calls already incremented the counter,
-        // so this describes the call that produced this result.
-        let lease_signal = ctx.flow.lease.progress_signal();
-        injected = format!("{lease_signal}\n{injected}");
+        injected = ctx.flow.lease.annotate_result(&injected);
 
         let ok = tool_result_ok(full_data);
         if ctx.core.provenance_config.enabled {
@@ -1243,6 +1237,8 @@ async fn inject_tool_result(
             ctx.content_gate.admit_simple(&result_data).into_text()
         }
     };
+
+    let data = ctx.flow.lease.annotate_result(&data);
 
     if ctx.core.provenance_config.enabled {
         ContextBuilder::add_tool_result_immutable_with_status(

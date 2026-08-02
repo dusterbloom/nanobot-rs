@@ -25,9 +25,6 @@ pub const DEFAULT_TOOLS_PER_LEASE: u32 = 12;
 /// validated checkpoint.
 pub const DEFAULT_MAX_LEASES_PER_TURN: u32 = 3;
 
-// ---------------------------------------------------------------------------
-// Lease state machine
-// ---------------------------------------------------------------------------
 // Lease state machine
 // ---------------------------------------------------------------------------
 
@@ -53,30 +50,6 @@ pub struct Lease {
 pub enum BatchAdmission {
     Admitted,
     Rejected { remaining: u32 },
-}
-
-/// Outcome of `record_tool_call`. The `reason` is a stable machine-readable
-/// code (`lease_exhausted`) so callers can route receipts without parsing
-/// prose.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCallResult {
-    pub allowed: bool,
-    pub reason: Option<&'static str>,
-}
-
-impl ToolCallResult {
-    fn allowed() -> Self {
-        Self {
-            allowed: true,
-            reason: None,
-        }
-    }
-    fn blocked(reason: &'static str) -> Self {
-        Self {
-            allowed: false,
-            reason: Some(reason),
-        }
-    }
 }
 
 /// Outcome of `try_renew`. `missing_field` is `"findings"`, `"next"`,
@@ -173,26 +146,6 @@ impl Lease {
         format!("{signal}\n{body}")
     }
 
-    /// Record one tool call against the per-lease budget. Returns whether the
-    /// call is allowed; once `lease_size` calls have been used this returns
-    /// `lease_exhausted`. Retained temporarily while production callers migrate
-    /// to atomic batch admission.
-    ///
-    /// There is NO consecutive-same-family cap anymore: it over-fired on
-    /// legitimate exploration (N different greps) and busted the prompt-prefix
-    /// cache when it triggered a strip (2026-07-30). Identical-call loops are
-    /// bounded by `ToolGuard`'s per-key `seen` counter (tool_guard.rs, applies
-    /// to all tools); different-args exploration is bounded by this per-lease
-    /// budget plus the no-progress hard stop. See
-    /// docs/superpowers/plans/2026-07-30-reuse-not-rerun-tool-dedup.md.
-    pub fn record_tool_call(&mut self) -> ToolCallResult {
-        if self.iterations_used >= self.lease_size {
-            return ToolCallResult::blocked("lease_exhausted");
-        }
-        self.iterations_used += 1;
-        ToolCallResult::allowed()
-    }
-
     pub fn is_exhausted(&self) -> bool {
         self.iterations_used >= self.lease_size
     }
@@ -248,20 +201,6 @@ impl Lease {
         RenewalResult::accepted()
     }
 
-    /// Format the progress signal for inclusion in tool results.
-    ///
-    /// `L = max_renewals - renewals_used` (future leases still obtainable
-    /// this turn). The call index `N` is `iterations_used` — the call that
-    /// just executed (record_tool_call* was already called by the time
-    /// tool_engine adds the result). For the first call this is 1, etc.
-    pub fn progress_signal(&self) -> String {
-        let current_call = self.iterations_used;
-        let leases_remaining = self.max_renewals.saturating_sub(self.renewals_used);
-        format!(
-            "[Tool call {} of {} this lease — {} leases remaining]",
-            current_call, self.lease_size, leases_remaining
-        )
-    }
 }
 
 #[cfg(test)]
@@ -283,8 +222,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// A fresh lease allows `lease_size` tool iterations. The
-    /// `(iteration + 1) == lease_size`-th call must report exhaustion
-    /// (tools should be stripped by the caller on the next LLM request).
+    /// `(iteration + 1) == lease_size`-th call must report exhaustion while
+    /// the caller keeps its advertised tool schema stable.
     #[test]
     fn lease_allows_n_tool_calls_then_reports_exhausted() {
         let mut lease = Lease::new(3, 2);

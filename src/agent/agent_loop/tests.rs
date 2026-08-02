@@ -2468,9 +2468,8 @@ fn build_local_inline_harness(main: Arc<dyn LLMProvider>) -> (AgentLoop, std::pa
 }
 
 /// Same as [`build_local_inline_harness`] but with a custom `max_iterations`.
-/// Convergence tests need this above the lease coarse-family cap (6) so the
-/// sticky-strip path is actually reachable — the default of 5 stops the loop
-/// before the family cap can fire.
+/// Convergence tests need this above the per-lease batch budget so lease
+/// exhaustion, renewal, and rejection happen before the iteration limit.
 fn build_local_inline_harness_with_iters(
     main: Arc<dyn LLMProvider>,
     max_iterations: u32,
@@ -2776,6 +2775,8 @@ struct WireRecordingProvider {
     name: String,
     responses: std::sync::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
     calls: std::sync::Mutex<Vec<Vec<Value>>>,
+    tool_snapshots: std::sync::Mutex<Vec<Vec<Value>>>,
+    higgs_session_cache: bool,
 }
 
 impl WireRecordingProvider {
@@ -2784,6 +2785,27 @@ impl WireRecordingProvider {
             name: name.to_string(),
             responses: std::sync::Mutex::new(responses.into()),
             calls: std::sync::Mutex::new(Vec::new()),
+            tool_snapshots: std::sync::Mutex::new(Vec::new()),
+            higgs_session_cache: false,
+        }
+    }
+
+    fn tool_call(id: &str, path: &str) -> crate::providers::base::ToolCallRequest {
+        let mut arguments = std::collections::HashMap::new();
+        arguments.insert("path".to_string(), json!(path));
+        crate::providers::base::ToolCallRequest {
+            id: id.to_string(),
+            name: "list_dir".to_string(),
+            arguments,
+        }
+    }
+
+    fn tool_response(id: &str, path: &str) -> crate::providers::base::LLMResponse {
+        crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![Self::tool_call(id, path)],
+            finish_reason: "tool_calls".to_string(),
+            usage: std::collections::HashMap::new(),
         }
     }
 
@@ -2809,6 +2831,14 @@ impl WireRecordingProvider {
     fn calls(&self) -> Vec<Vec<Value>> {
         self.calls.lock().unwrap().clone()
     }
+
+    fn call_count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+
+    fn tool_snapshots(&self) -> Vec<Vec<Value>> {
+        self.tool_snapshots.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -2816,7 +2846,7 @@ impl LLMProvider for WireRecordingProvider {
     async fn chat(
         &self,
         messages: &[Value],
-        _tools: Option<&[Value]>,
+        tools: Option<&[Value]>,
         _model: Option<&str>,
         _max_tokens: u32,
         _temperature: f64,
@@ -2824,6 +2854,10 @@ impl LLMProvider for WireRecordingProvider {
         _top_p: Option<f64>,
     ) -> anyhow::Result<crate::providers::base::LLMResponse> {
         self.calls.lock().unwrap().push(messages.to_vec());
+        self.tool_snapshots
+            .lock()
+            .unwrap()
+            .push(tools.unwrap_or(&[]).to_vec());
         let mut queue = self.responses.lock().unwrap();
         Ok(if queue.len() > 1 {
             queue.pop_front().unwrap()
@@ -2837,6 +2871,10 @@ impl LLMProvider for WireRecordingProvider {
 
     fn get_default_model(&self) -> &str {
         &self.name
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        self.higgs_session_cache
     }
 }
 
@@ -3486,6 +3524,146 @@ async fn test_local_wire_prompt_tool_result_appends_only() {
         calls.len()
     );
     assert_wire_prefix(&calls[0], &calls[1]);
+    let result = calls[1]
+        .iter()
+        .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some("tc_prefix"))
+        .expect("the second request must contain the first tool result");
+    assert!(
+        result
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .starts_with("[Lease usage after this batch: 1 of 12 calls"),
+        "prompt-visible tool results must carry the shared lease annotation"
+    );
+}
+
+#[tokio::test]
+async fn lease_rejects_crossing_batch_atomically_with_complete_protocol_pairing() {
+    let mut responses: Vec<_> = (0..11)
+        .map(|n| WireRecordingProvider::tool_response(&format!("tc_before_{n}"), &format!("dir{n}")))
+        .collect();
+    responses.push(crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![
+            WireRecordingProvider::tool_call("tc_over_a", "over-a"),
+            WireRecordingProvider::tool_call("tc_over_b", "over-b"),
+        ],
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    });
+    let provider = Arc::new(WireRecordingProvider::new("local-main", responses));
+    let (agent_loop, workspace) =
+        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
+    let session_key = format!("lease-atomic-reject-{}", uuid::Uuid::new_v4());
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        agent_loop.process_direct("inspect until the lease ends", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("over-budget batch must terminate without another inference");
+
+    assert_eq!(response, LEASE_OVER_BUDGET_FINAL);
+    assert_eq!(provider.call_count(), 12);
+    let snapshots = provider.tool_snapshots();
+    assert!(snapshots.iter().all(|tools| !tools.is_empty()));
+    assert!(snapshots.iter().all(|tools| tools == &snapshots[0]));
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("session should exist");
+    let raw = core.sessions.get_all_messages(&meta.id).await;
+    let carrier = raw
+        .iter()
+        .find(|message| {
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    ["tc_over_a", "tc_over_b"].iter().all(|id| {
+                        calls
+                            .iter()
+                            .any(|call| call.get("id").and_then(Value::as_str) == Some(id))
+                    })
+                })
+        })
+        .expect("the rejected batch must retain its assistant carrier");
+    assert_eq!(
+        carrier
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(2)
+    );
+    for id in ["tc_over_a", "tc_over_b"] {
+        let receipt = raw
+            .iter()
+            .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some(id))
+            .unwrap_or_else(|| panic!("missing rejection receipt for {id}"));
+        assert_eq!(receipt.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(
+            receipt
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("lease exhausted")
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn valid_lease_renewal_restores_batch_admission_without_tool_schema_churn() {
+    let mut responses: Vec<_> = (0..12)
+        .map(|n| WireRecordingProvider::tool_response(&format!("tc_lease_{n}"), &format!("dir{n}")))
+        .collect();
+    responses.push(WireRecordingProvider::text_response(
+        "findings: inspected the first set\nnext: inspect the workspace root\nwill: list it once",
+    ));
+    responses.push(WireRecordingProvider::tool_response("tc_after_renewal", "."));
+    responses.push(WireRecordingProvider::text_response("done after renewal"));
+    let provider = Arc::new(WireRecordingProvider::new("local-main", responses));
+    let (agent_loop, workspace) =
+        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 25);
+    let session_key = format!("lease-valid-renewal-{}", uuid::Uuid::new_v4());
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        agent_loop.process_direct("inspect, renew, then finish", &session_key, "test", "offline"),
+    )
+    .await
+    .expect("valid renewal must complete");
+
+    assert_eq!(response, "done after renewal");
+    assert_eq!(
+        provider.call_count(),
+        crate::agent::lease::DEFAULT_TOOLS_PER_LEASE as usize + 3
+    );
+    let snapshots = provider.tool_snapshots();
+    assert!(snapshots.iter().all(|tools| !tools.is_empty()));
+    assert!(snapshots.iter().all(|tools| tools == &snapshots[0]));
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("session should exist");
+    let raw = core.sessions.get_all_messages(&meta.id).await;
+    let receipt = raw
+        .iter()
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_after_renewal")
+        })
+        .expect("renewed tool call must execute and persist");
+    assert_eq!(receipt.get("ok").and_then(Value::as_bool), Some(true));
+
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 #[tokio::test]
@@ -3787,8 +3965,9 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert!(
-        content.starts_with(TOOL_RESULT_HANDLE_MARKER),
-        "persisted tool-result content must be a HANDLE; got: {content}"
+        content.starts_with("[Lease usage after this batch: 1 of 12 calls")
+            && content.contains(&format!("\n{TOOL_RESULT_HANDLE_MARKER}")),
+        "persisted tool-result content must be an annotated HANDLE; got: {content}"
     );
     // The raw body is NOT in the message — "2999" is a seq line, absent from
     // the handle (excerpt is "1"; args is "seq 1 3000").
@@ -3825,8 +4004,9 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert!(
-        live_content.starts_with(TOOL_RESULT_HANDLE_MARKER),
-        "live prompt tool-result must be a handle; got: {live_content}"
+        live_content.starts_with("[Lease usage after this batch: 1 of 12 calls")
+            && live_content.contains(&format!("\n{TOOL_RESULT_HANDLE_MARKER}")),
+        "live prompt tool-result must be an annotated handle; got: {live_content}"
     );
     assert_eq!(
         live_content, content,
@@ -6024,13 +6204,12 @@ mod runtime_mode_parity_tests {
     /// A provider that emits a list_dir tool call on every turn, never
     /// exhausts, and counts calls. Each call uses a DISTINCT path argument
     /// (defeats the cached-duplicate breaker, which keys on name+args) so the
-    /// loop is forced through the lease coarse-family cap → sticky-strip path.
-    /// It records whether any call observed `tools == None` — the direct signal
-    /// that the sticky strip fired.
+    /// loop is forced through the per-turn lease. Every advertised tool array
+    /// is retained so the test can prove the provider schema never changes.
     struct LoopingProvider {
         name: String,
         call_count: std::sync::atomic::AtomicU32,
-        saw_tools_absent: std::sync::atomic::AtomicBool,
+        tool_snapshots: std::sync::Mutex<Vec<Vec<Value>>>,
     }
 
     impl LoopingProvider {
@@ -6038,7 +6217,7 @@ mod runtime_mode_parity_tests {
             Self {
                 name: name.to_string(),
                 call_count: std::sync::atomic::AtomicU32::new(0),
-                saw_tools_absent: std::sync::atomic::AtomicBool::new(false),
+                tool_snapshots: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -6046,8 +6225,8 @@ mod runtime_mode_parity_tests {
             self.call_count.load(std::sync::atomic::Ordering::Relaxed)
         }
 
-        fn saw_tools_absent(&self) -> bool {
-            self.saw_tools_absent.load(std::sync::atomic::Ordering::Relaxed)
+        fn tool_snapshots(&self) -> Vec<Vec<Value>> {
+            self.tool_snapshots.lock().unwrap().clone()
         }
     }
 
@@ -6066,10 +6245,10 @@ mod runtime_mode_parity_tests {
             let n = self
                 .call_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if tools.is_none() {
-                self.saw_tools_absent
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            self.tool_snapshots
+                .lock()
+                .unwrap()
+                .push(tools.unwrap_or(&[]).to_vec());
             // Distinct path per call: the cached-duplicate breaker cannot arm,
             // so the lease read-family cap is the only thing that can stop the
             // run — exactly the 2026-07-30 incident path.
@@ -6094,23 +6273,18 @@ mod runtime_mode_parity_tests {
 
     /// Adversarial convergence: the model emits a fresh list_dir every turn
     /// (distinct args, so no cached-duplicate shortcut) and NEVER writes a
-    /// final answer. The loop must still converge — via the lease coarse-family
-    /// cap (6) → sticky tool strip (Fix A1) → a tools-absent call → forced text.
-    ///
-    /// This is the test that was missing for the 2026-07 incidents. It is only
-    /// meaningful because it ASSERTS the sticky strip fired (`saw_tools_absent`);
-    /// if Fix A1 were reverted, the router would restore tools on every call and
-    /// this assertion would fail.
+    /// final answer. The loop must still converge via the lease budget. The
+    /// first over-budget batch is rejected atomically and ends the
+    /// turn without another provider call or a tool-schema mutation.
     #[tokio::test]
-    async fn convergence_loop_terminates_via_sticky_strip_when_model_loops() {
+    async fn convergence_stops_first_over_budget_batch_with_stable_tools() {
         let provider = Arc::new(LoopingProvider::new("local-main"));
         // max_iterations must exceed the per-lease budget (DEFAULT_TOOLS_PER_LEASE
-        // = 12) so the lease can exhaust and arm the sticky strip before the
-        // bare iteration limit stops the loop. (The coarse-family cap that
-        // used to fire at 6 was retired 2026-07-30.)
+        // = 12) so the next request reaches atomic lease rejection before the
+        // bare iteration limit stops the loop.
         let (agent_loop, workspace) =
             build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
-        let session_key = format!("conv-sticky-strip-{}", uuid::Uuid::new_v4());
+        let session_key = format!("conv-stable-lease-{}", uuid::Uuid::new_v4());
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -6119,20 +6293,16 @@ mod runtime_mode_parity_tests {
         .await
         .expect("loop must terminate — it hung (convergence regression)");
 
-        assert!(
-            !response.trim().is_empty(),
-            "a converged turn must return text, got empty"
-        );
-        assert!(
-            provider.saw_tools_absent(),
-            "loop never observed a tools-absent call — the sticky strip (Fix A1) did not fire. \
-             Either the lease never exhausted or the router restored tools (regression)."
-        );
+        assert_eq!(response, LEASE_OVER_BUDGET_FINAL);
         let calls = provider.call_count();
-        assert!(
-            calls < 25,
-            "loop made {calls} provider calls — did not converge (termination guard regressed)"
+        assert_eq!(
+            calls,
+            crate::agent::lease::DEFAULT_TOOLS_PER_LEASE + 1,
+            "the first over-budget request must terminate immediately"
         );
+        let snapshots = provider.tool_snapshots();
+        assert!(snapshots.iter().all(|tools| !tools.is_empty()));
+        assert!(snapshots.iter().all(|tools| tools == &snapshots[0]));
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -6140,14 +6310,13 @@ mod runtime_mode_parity_tests {
     /// Positive counterpart to the convergence test: legitimate bounded
     /// exploration — 8 distinct same-family (read) calls, the exact pattern the
     /// retired coarse-family cap used to block at 6 — must complete normally
-    /// with the model's own answer, WITHOUT arming the sticky strip or any loop
-    /// guard. Under the OLD cap the 7th call would be blocked and the sticky
-    /// strip would fire a tools-absent request, so this asserts tools were
-    /// present on EVERY call (no strip) and the turn reaches the model's answer.
+    /// with the model's own answer, WITHOUT arming any loop guard. Under the
+    /// OLD cap the 7th call would be blocked, so this asserts tools were present
+    /// on EVERY call and the turn reaches the model's answer.
     #[tokio::test]
     async fn convergence_legitimate_exploration_completes_without_guard() {
         // A sequence provider that ALSO records whether any call observed
-        // `tools == None` (the sticky-strip signal). Without this, a blind
+        // `tools == None` (a schema-mutation signal). Without this, a blind
         // sequence dequeue would pass even if the 7th call were capped.
         struct ExploringProvider {
             responses: parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
