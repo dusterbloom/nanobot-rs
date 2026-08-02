@@ -51,7 +51,7 @@
 - Consumes: `prompt_fingerprint::compare`, `invalidate_prompt_cache_for_rewrite`, `LLMProvider::supports_higgs_session_cache`.
 - Produces: `CacheResetReason::UnexpectedReplayDivergence`; exact retained loading; emergency rotation before provider I/O.
 
-- [ ] **Step 1: Run blast-radius checks before editing**
+- [x] **Step 1: Run blast-radius checks before editing**
 
 ~~~bash
 npx gitnexus impact filter_history --direction upstream --repo nanobot-rs
@@ -62,7 +62,7 @@ npx gitnexus impact CacheResetReason --direction upstream --repo nanobot-rs
 
 Record depth-1 callers. Stop and warn before editing if any result is HIGH or CRITICAL.
 
-- [ ] **Step 2: Write replay tests requiring byte-identical stored content**
+- [x] **Step 2: Write replay tests requiring byte-identical stored content**
 
 Add tests with these assertions:
 
@@ -93,7 +93,7 @@ fn recalled_result_content_is_byte_identical_during_replay() {
 }
 ~~~
 
-- [ ] **Step 3: Write retained-Higgs integration regressions**
+- [x] **Step 3: Write retained-Higgs integration regressions**
 
 Drive enough persisted turns to exceed the normal history window:
 
@@ -108,7 +108,7 @@ assert_eq!(counters.session_prompt_epoch(&session_key), 0);
 
 Add a second test that seeds a prior fingerprint, mutates a provider-visible stored row, and asserts the next request uses a new Higgs ID and sends the old ID in `_nanobot_higgs_drop_session_id`.
 
-- [ ] **Step 4: Run focused tests and verify RED**
+- [x] **Step 4: Run focused tests and verify RED**
 
 ~~~bash
 cargo test --lib session::filters::tests::tool_result_content_is_byte_identical_during_replay -- --exact --nocapture
@@ -119,7 +119,7 @@ cargo test --lib agent::agent_loop::tests::unexpected_replay_divergence_rotates_
 
 Expected: replay transformations, retained windowing/fingerprint clearing, and same-ID divergence make the tests fail for the intended reasons.
 
-- [ ] **Step 5: Preserve tool content during replay**
+- [x] **Step 5: Preserve tool content during replay**
 
 In `filter_history`, use the stored content directly:
 
@@ -133,7 +133,7 @@ let content = m
 
 Remove replay-only capping and recalled-body replacement helpers/imports. Keep clear markers, non-provider synthetic filtering, structured content restoration, and assistant/tool protocol pairing.
 
-- [ ] **Step 6: Disable routine windows for retained Higgs only**
+- [x] **Step 6: Disable routine windows for retained Higgs only**
 
 ~~~rust
 let retained_higgs = core.mode().is_local()
@@ -154,7 +154,7 @@ let history = core
 
 Delete unconditional removal of `prompt_fingerprints` and `prompt_cache_watermark`. Explicit reset/compaction paths remain their sole invalidators.
 
-- [ ] **Step 7: Rotate only on unexpected real divergence**
+- [x] **Step 7: Rotate only on unexpected real divergence**
 
 Add `CacheResetReason::UnexpectedReplayDivergence` with wire label `unexpected_replay_divergence`. Copy `PromptDelta` out of the fingerprint lock, emit current diagnostics, then recover before deriving the Higgs marker:
 
@@ -173,7 +173,7 @@ if unexpected_higgs_divergence {
 
 The later request-marker construction must observe the incremented epoch and queued drop ID.
 
-- [ ] **Step 8: Verify GREEN and commit**
+- [x] **Step 8: Verify GREEN and commit**
 
 Run the four Step 4 tests, then:
 
@@ -204,7 +204,7 @@ Expected: all focused tests pass and GitNexus reports only replay/cache flows.
 - Consumes: `SessionDb::store_tool_result_immutable`, `render_tool_result_handle`, `build_tool_result_preview`.
 - Produces: `TOOL_PREVIEW_BUDGET_CHARS: usize = 16_384`; `FlowControl::tool_preview_chars_remaining`; unconditional storage before message persistence.
 
-- [ ] **Step 1: Run blast-radius checks**
+- [x] **Step 1: Run blast-radius checks**
 
 ~~~bash
 npx gitnexus impact stash_tool_result_for_prompt_shaping --direction upstream --repo nanobot-rs
@@ -215,7 +215,7 @@ npx gitnexus impact FlowControl --direction upstream --repo nanobot-rs
 
 Report HIGH/CRITICAL findings before editing and update every depth-1 construction site.
 
-- [ ] **Step 2: Write failing durable-storage coverage**
+- [x] **Step 2: Write failing durable-storage coverage**
 
 Use the real SQLite-backed tool-engine harness:
 
@@ -236,7 +236,7 @@ for (id, body, ok) in [
 
 The current small-result early return must make this RED.
 
-- [ ] **Step 3: Write failing preview-budget coverage**
+- [x] **Step 3: Write failing preview-budget coverage**
 
 Add pure and integration assertions:
 
@@ -256,7 +256,7 @@ assert!(messages.iter().any(is_tool_handle));
 
 Also assert every handle ID loads from SQLite and exact persisted `messages.content` survives `get_history(..., 0, 0)`.
 
-- [ ] **Step 4: Run focused tests and verify RED**
+- [x] **Step 4: Run focused tests and verify RED**
 
 ~~~bash
 cargo test --lib agent::tool_engine::tests::every_tool_result_is_stored_before_prompt_shaping -- --exact --nocapture
@@ -266,7 +266,7 @@ cargo test --lib agent::agent_loop::tests::stored_tool_preview_reloads_byte_iden
 
 Expected: small/error bodies are absent and sequential medium results exceed the shared budget.
 
-- [ ] **Step 5: Store exact bodies unconditionally**
+- [x] **Step 5: Store exact bodies unconditionally**
 
 Keep the helper name to avoid a broad rename, but store before returning:
 
@@ -287,7 +287,7 @@ match sessions
 
 Use the exact pre-summary/pre-gate body for inline and delegated calls, including failed results. Keep fail-closed conflict handling.
 
-- [ ] **Step 6: Add one append-only per-turn detail budget**
+- [x] **Step 6: Add one append-only per-turn detail budget**
 
 Add to `FlowControl`:
 
@@ -321,11 +321,11 @@ fn turn_preview_cap(
 
 For inline and delegated results: zero cap means deterministic handle; positive cap means raw when it fits or deterministic head/tail preview otherwise. Debit the detailed characters appended; handles do not consume detail budget. Never rewrite an older message to reclaim budget.
 
-- [ ] **Step 7: Keep retrieval results on the same path**
+- [x] **Step 7: Keep retrieval results on the same path**
 
 Route `recall_tool_result`, `slice_tool_result`, and `search_tool_result` through the same append budget. Their implementations remain bounded, but an exhausted turn publishes a handle under the retrieval call's own ID. Add no replay-time special case.
 
-- [ ] **Step 8: Verify GREEN and commit**
+- [x] **Step 8: Verify GREEN and commit**
 
 ~~~bash
 cargo test --lib agent::tool_engine::tests::every_tool_result_is_stored_before_prompt_shaping -- --exact --nocapture
@@ -356,7 +356,7 @@ Expected: every exact body is durable and appended detailed content stays within
 - Consumes: `RuntimeMode::is_local`, `Lease::new`.
 - Produces: `LOCAL_MAX_LEASE_RENEWALS: u32 = 0`; exhaustion annotation that requires a final answer and offers no checkpoint renewal.
 
-- [ ] **Step 1: Run blast-radius checks**
+- [x] **Step 1: Run blast-radius checks**
 
 ~~~bash
 npx gitnexus impact Lease::new --direction upstream --repo nanobot-rs
@@ -366,7 +366,7 @@ npx gitnexus impact step_process_response --direction upstream --repo nanobot-rs
 
 If lookup is ambiguous, rerun with `--file src/agent/lease.rs` or the UID GitNexus prints.
 
-- [ ] **Step 2: Write failing zero-renewal tests**
+- [x] **Step 2: Write failing zero-renewal tests**
 
 ~~~rust
 #[test]
@@ -387,7 +387,7 @@ fn zero_renewal_lease_requires_final_answer_at_exhaustion() {
 
 Add a local loop regression supplying 12 successful tools followed by a valid renewal checkpoint; assert no 13th tool executes and no renewal nudge appears.
 
-- [ ] **Step 3: Run tests and verify RED**
+- [x] **Step 3: Run tests and verify RED**
 
 ~~~bash
 cargo test --lib agent::lease::tests::zero_renewal_lease_requires_final_answer_at_exhaustion -- --exact --nocapture
@@ -396,7 +396,7 @@ cargo test --lib agent::agent_loop::tests::local_lease_does_not_renew_after_twel
 
 Expected: annotation advertises renewal and local preparation grants three renewals.
 
-- [ ] **Step 4: Configure lease by runtime mode**
+- [x] **Step 4: Configure lease by runtime mode**
 
 Define:
 
@@ -417,7 +417,7 @@ let lease = Lease::new(DEFAULT_TOOLS_PER_LEASE, max_renewals);
 
 When an exhausted lease has zero renewals, `annotate_result` must require the next response to be final; only leases with remaining renewals advertise `findings:/next:/will:`. Keep the existing cloud renewal path.
 
-- [ ] **Step 5: Verify GREEN and preserve cloud coverage**
+- [x] **Step 5: Verify GREEN and preserve cloud coverage**
 
 ~~~bash
 cargo test --lib agent::lease::tests::zero_renewal_lease_requires_final_answer_at_exhaustion -- --exact --nocapture
@@ -428,7 +428,7 @@ cargo test --lib agent::agent_loop::tests::lease_exhaustion_keeps_one_higgs_epoc
 
 Move the existing valid-renewal integration setup to a non-local/cloud harness, or retain cloud renewal coverage through the real `Lease::new(..., 3)` state-machine tests if the integration harness would require unrelated changes.
 
-- [ ] **Step 6: Scope-check and commit**
+- [x] **Step 6: Scope-check and commit**
 
 ~~~bash
 npx gitnexus detect-changes --repo nanobot-rs
@@ -449,7 +449,7 @@ git commit -m "fix(lease): stop local turns after twelve tools"
 - Consumes: Tasks 1-3.
 - Produces: fresh correctness, build, formatting, scope, and speed evidence.
 
-- [ ] **Step 1: Run all targeted suites**
+- [x] **Step 1: Run all targeted suites**
 
 ~~~bash
 cargo test --lib session::filters::tests -- --nocapture
@@ -460,7 +460,7 @@ cargo test --lib agent::agent_loop::tests -- --nocapture
 
 Expected: zero failures. If one fails, write the smallest new failing regression before changing production code.
 
-- [ ] **Step 2: Run full correctness and build tracks**
+- [x] **Step 2: Run full correctness and build tracks**
 
 ~~~bash
 cargo test
@@ -469,7 +469,7 @@ cargo build
 
 Expected: both exit 0; record fresh passed/ignored counts.
 
-- [ ] **Step 3: Run formatting and whitespace checks**
+- [x] **Step 3: Run formatting and whitespace checks**
 
 ~~~bash
 cargo fmt --all -- --check
@@ -478,7 +478,7 @@ git diff --check
 
 Expected: no formatting or whitespace errors.
 
-- [ ] **Step 4: Run the hot-path speed track**
+- [x] **Step 4: Run the hot-path speed track**
 
 ~~~bash
 scripts/turn_bench.sh
@@ -486,7 +486,7 @@ scripts/turn_bench.sh
 
 Expected: no matched speed regression outside the script's accepted variance. Record append-only prompt deltas and suffix-size evidence when emitted.
 
-- [ ] **Step 5: Verify graph scope**
+- [x] **Step 5: Verify graph scope**
 
 ~~~bash
 npx gitnexus detect-changes --scope all --repo nanobot-rs
@@ -494,7 +494,7 @@ npx gitnexus detect-changes --scope all --repo nanobot-rs
 
 Expected: only session replay, prompt-cache, tool persistence/shaping, and lease flows. Investigate any unrelated process.
 
-- [ ] **Step 6: Audit the branch against the design**
+- [x] **Step 6: Audit the branch against the design**
 
 ~~~bash
 git diff be33003...HEAD -- src/agent src/session src/turn_stream.rs docs/superpowers/specs docs/superpowers/plans
@@ -510,7 +510,7 @@ Confirm:
 - tool definitions remain stable through exhaustion;
 - local renewal count is zero.
 
-- [ ] **Step 7: Commit verification bookkeeping only if changed**
+- [x] **Step 7: Commit verification bookkeeping only if changed**
 
 Run `npx gitnexus detect-changes --repo nanobot-rs` first, then:
 
