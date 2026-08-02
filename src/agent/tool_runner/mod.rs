@@ -5,7 +5,7 @@
 //! shared [`ToolRegistry`], and lets a cheap model decide if more tools are
 //! needed. Returns aggregated results for injection into the main context.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -162,20 +162,41 @@ pub struct ToolRunResult {
 pub(crate) struct ToolResultPersistence {
     sessions: Arc<crate::session::SessionDb>,
     session_id: String,
-    statuses: parking_lot::Mutex<HashMap<String, bool>>,
+    routed_ids: HashSet<String>,
+    outcomes: parking_lot::Mutex<HashMap<String, PersistedToolOutcome>>,
+}
+
+struct PersistedToolOutcome {
+    ok: bool,
+    raw_body: Option<Arc<str>>,
 }
 
 impl ToolResultPersistence {
-    pub(crate) fn new(sessions: Arc<crate::session::SessionDb>, session_id: String) -> Self {
+    pub(crate) fn new(
+        sessions: Arc<crate::session::SessionDb>,
+        session_id: String,
+        routed_ids: impl IntoIterator<Item = String>,
+    ) -> Self {
         Self {
             sessions,
             session_id,
-            statuses: parking_lot::Mutex::new(HashMap::new()),
+            routed_ids: routed_ids.into_iter().collect(),
+            outcomes: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
     pub(crate) fn ok_for(&self, tool_call_id: &str) -> Option<bool> {
-        self.statuses.lock().get(tool_call_id).copied()
+        self.outcomes
+            .lock()
+            .get(tool_call_id)
+            .map(|outcome| outcome.ok)
+    }
+
+    pub(crate) fn raw_body_for(&self, tool_call_id: &str) -> Option<Arc<str>> {
+        self.outcomes
+            .lock()
+            .get(tool_call_id)
+            .and_then(|outcome| outcome.raw_body.clone())
     }
 }
 
@@ -204,9 +225,18 @@ async fn persist_completed_result(
     {
         StoredResult::Stored { .. } | StoredResult::Identical { .. } => {
             persistence
-                .statuses
+                .outcomes
                 .lock()
-                .insert(tool_call_id.to_string(), ok);
+                .insert(
+                    tool_call_id.to_string(),
+                    PersistedToolOutcome {
+                        ok,
+                        raw_body: persistence
+                            .routed_ids
+                            .contains(tool_call_id)
+                            .then(|| Arc::<str>::from(data)),
+                    },
+                );
             Ok(())
         }
         outcome @ (StoredResult::Conflict { .. } | StoredResult::Failed) => {

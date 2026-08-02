@@ -5342,6 +5342,61 @@ async fn delegated_web_result_stores_raw_envelope_before_provider_extraction() {
         .expect("delegated web result must have an audit entry");
     assert!(!audit.ok, "audit status must come from the raw failed result");
 
+    ctx.flow.tool_preview_chars_remaining = 0;
+    let handle_calls = vec![crate::providers::base::ToolCallRequest {
+        id: "tc_raw_web_handle".to_string(),
+        name: "web_fetch".to_string(),
+        arguments: std::collections::HashMap::from([(
+            "url".to_string(),
+            json!("https://example.invalid/handle"),
+        )]),
+    }];
+    let handle_response = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: handle_calls.clone(),
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+    assert!(
+        crate::agent::tool_engine::execute_tools_delegated(
+            &mut ctx,
+            &counters,
+            &handle_calls,
+            &handle_response,
+            &delegation_provider,
+            &delegation_model,
+        )
+        .await
+    );
+
+    let stored_handle_body = ctx
+        .core
+        .sessions
+        .load_tool_result(&ctx.session_id, "tc_raw_web_handle")
+        .await
+        .expect("exhausted-budget body must remain exactly retrievable");
+    assert_eq!(stored_handle_body, raw_web_envelope());
+    assert_eq!(stored_handle_body.len(), 76);
+    assert_eq!(stored_handle_body.chars().count(), 76);
+    let handle = ctx
+        .messages
+        .iter()
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_raw_web_handle")
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .expect("exhausted-budget delegated web result must publish a handle");
+    assert!(handle.contains(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER));
+    assert!(handle.contains("id:\"tc_raw_web_handle\""));
+    assert!(handle.contains("| chars:76 |"));
+    assert!(handle.contains(
+        "| sha256:81ad9c42e39774d1148dde99c31b0c46c4f6e915475dfd07cabda5beddc935f7 |"
+    ));
+    assert!(handle.contains(
+        r#"excerpt:"{\"text\":\"provider-facing article\",\"error\":\"upstream failed\",\"raw_only\":true}""#
+    ));
+
     let _ = std::fs::remove_dir_all(workspace);
 }
 

@@ -590,8 +590,11 @@ pub(crate) async fn execute_tools_delegated(
     );
     ctx.persist_pending_protocol_messages().await;
 
-    let persistence =
-        tool_runner::ToolResultPersistence::new(ctx.core.sessions.clone(), ctx.session_id.clone());
+    let persistence = tool_runner::ToolResultPersistence::new(
+        ctx.core.sessions.clone(),
+        ctx.session_id.clone(),
+        routed_tool_calls.iter().map(|tc| tc.id.clone()),
+    );
     let run_result = match tool_runner::run_tool_loop_persisted(
         &runner_config,
         routed_tool_calls,
@@ -703,6 +706,18 @@ pub(crate) async fn execute_tools_delegated(
         let ok = persistence
             .ok_for(&tc.id)
             .unwrap_or_else(|| tool_result_ok(full_data));
+        let render_persisted_handle = || {
+            let raw_body = persistence
+                .raw_body_for(&tc.id)
+                .expect("routed result raw body was persisted before publication");
+            render_tool_result_handle(
+                &tc.id,
+                &tc.name,
+                ok,
+                raw_body.as_bytes(),
+                &tc.arguments,
+            )
+        };
 
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
@@ -735,13 +750,7 @@ pub(crate) async fn execute_tools_delegated(
             ctx.content_gate.admit_simple(full_data).into_text()
         };
         let mut injected = if cap == 0 {
-            render_tool_result_handle(
-                &tc.id,
-                &tc.name,
-                ok,
-                full_data.as_bytes(),
-                &tc.arguments,
-            )
+            render_persisted_handle()
         } else if needs_shaping
             && !is_explicit_retrieval_tool(&tc.name)
             && full_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES
@@ -749,13 +758,7 @@ pub(crate) async fn execute_tools_delegated(
             // Genuinely oversized (>8KB) non-retrieval delegated output →
             // handle only. Body lives in the stash; model recalls it. (A 95KB
             // result replayed raw was the cache-break class.)
-            render_tool_result_handle(
-                &tc.id,
-                &tc.name,
-                ok,
-                full_data.as_bytes(),
-                &tc.arguments,
-            )
+            render_persisted_handle()
         } else {
             // Medium (over hot-prompt cap but ≤8KB), retrieval tools (bounded
             // excerpt by design), or small — show actual CONTENT via the
