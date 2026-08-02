@@ -987,7 +987,7 @@ Expected scope: retained-session cache boundary plus TUI reset rendering. No pro
 - Consumes the completed Tasks 1-3.
 - Produces verification evidence for correctness, cache stability, performance, and GitNexus scope.
 
-- [ ] **Step 1: Format and run focused regression suites**
+- [x] **Step 1: Format and run focused regression suites**
 
 Run:
 
@@ -1002,7 +1002,11 @@ cargo test --lib tui_app::app::tests -- --nocapture
 
 Expected: all pass with no ignored failure. If formatting fails, run `cargo fmt --all`, inspect the diff, and repeat the check.
 
-- [ ] **Step 2: Run full correctness validation**
+Result: every focused suite passed. Repository-wide `cargo fmt --check`
+still reports pre-existing formatting debt outside this range; the feature range
+passes `git diff --check` and no unrelated formatting was rewritten.
+
+- [x] **Step 2: Run full correctness validation**
 
 Run:
 
@@ -1012,6 +1016,9 @@ cargo build
 ```
 
 Expected: both exit 0. Do not claim completion from targeted tests alone.
+
+Result: `cargo test --quiet` passed 2,669 tests with 28 intentional ignores and
+zero failures; `cargo build` exited 0.
 
 - [ ] **Step 3: Run the matched turn benchmark**
 
@@ -1023,7 +1030,9 @@ scripts/turn_bench.sh
 
 Expected: the benchmark completes and shows no unexplained regression in matched agent-loop/provider/context timing. Save the before/after figures in the handoff; do not weaken thresholds to obtain a pass.
 
-- [ ] **Step 4: Verify final GitNexus scope and all direct dependents**
+Not run: no release `nanobot` binary or live local backend was available.
+
+- [x] **Step 4: Verify final GitNexus scope and all direct dependents**
 
 Run:
 
@@ -1058,7 +1067,10 @@ no provider request after that rejection
 
 If no live Higgs server is available, report this check as not run; do not substitute mocked evidence for the runtime trace.
 
-- [ ] **Step 6: Commit any formatting-only delta, otherwise leave the verified commits unchanged**
+Not run: no Nanobot/Higgs process, tmux server, or listener on port 9000 was
+available during final verification.
+
+- [x] **Step 6: Commit any formatting-only delta, otherwise leave the verified commits unchanged**
 
 Only when `cargo fmt --all` changed files:
 
@@ -1085,5 +1097,5 @@ Do not create an empty verification commit.
       serialized tool schemas differ before retained-session rotation.
 - [x] Make the crossing-batch test attempt two file writes and prove neither
       side effect happens.
-- [ ] Run focused/full verification, GitNexus change detection, and the final
+- [x] Run focused/full verification, GitNexus change detection, and the final
       ponytail review on the remediation diff.
