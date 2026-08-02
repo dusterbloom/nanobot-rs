@@ -156,6 +156,55 @@ pub struct ToolRunResult {
     pub error: Option<String>,
 }
 
+/// Optional production sink for durably recording completed delegated results
+/// before the runner exposes them to its own analysis loop.
+pub(crate) struct ToolResultPersistence {
+    sessions: Arc<crate::session::SessionDb>,
+    session_id: String,
+}
+
+impl ToolResultPersistence {
+    pub(crate) fn new(sessions: Arc<crate::session::SessionDb>, session_id: String) -> Self {
+        Self {
+            sessions,
+            session_id,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ToolResultPersistenceError {
+    pub(crate) tool_call_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) outcome: crate::session::db::StoredResult,
+}
+
+async fn persist_completed_result(
+    persistence: Option<&ToolResultPersistence>,
+    tool_call_id: &str,
+    tool_name: &str,
+    data: &str,
+) -> Result<(), ToolResultPersistenceError> {
+    let Some(persistence) = persistence else {
+        return Ok(());
+    };
+    use crate::session::db::StoredResult;
+    match persistence
+        .sessions
+        .store_tool_result_immutable(&persistence.session_id, tool_call_id, tool_name, data)
+        .await
+    {
+        StoredResult::Stored { .. } | StoredResult::Identical { .. } => Ok(()),
+        outcome @ (StoredResult::Conflict { .. } | StoredResult::Failed) => {
+            Err(ToolResultPersistenceError {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                outcome,
+            })
+        }
+    }
+}
+
 /// Normalize a tool call key for dedup: sort JSON keys and use compact serialization.
 pub(crate) fn normalize_call_key(name: &str, arguments: &HashMap<String, Value>) -> String {
     let mut sorted: Vec<_> = arguments.iter().collect();
@@ -213,7 +262,8 @@ async fn analyze_via_scratch_pad(
     task_context: &str,
     all_results: &mut Vec<(String, String, String)>,
     max_rounds: usize,
-) -> Option<String> {
+    persistence: Option<&ToolResultPersistence>,
+) -> Result<Option<String>, ToolResultPersistenceError> {
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut id_counter: usize = 1000; // offset to avoid collision with iteration-0 IDs
 
@@ -231,7 +281,7 @@ async fn analyze_via_scratch_pad(
             .as_ref()
             .map_or(false, |t| t.is_cancelled())
         {
-            return Some("Analysis cancelled.".to_string());
+            return Ok(Some("Analysis cancelled.".to_string()));
         }
 
         // Check cost budget.
@@ -413,9 +463,10 @@ async fn analyze_via_scratch_pad(
                 } else if worker_tools::is_worker_tool(&tc.name) {
                     let result =
                         worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
-                    let (_, _metadata) = context_store.store(result.clone());
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
+                    persist_completed_result(persistence, &original_id, &tc.name, &result).await?;
+                    let (_, _metadata) = context_store.store(result.clone());
                     all_results.push((original_id, tc.name.clone(), result));
                 } else {
                     // Real tool — execute with retry on transient errors.
@@ -429,9 +480,11 @@ async fn analyze_via_scratch_pad(
                         TOOL_MAX_RETRIES,
                     )
                     .await;
-                    let (_, _metadata) = context_store.store(result.data.clone());
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
+                    persist_completed_result(persistence, &original_id, &tc.name, &result.data)
+                        .await?;
+                    let (_, _metadata) = context_store.store(result.data.clone());
                     all_results.push((original_id, tc.name.clone(), result.data));
                 }
             }
@@ -441,7 +494,7 @@ async fn analyze_via_scratch_pad(
             if let Some(text) = response.content {
                 if !text.is_empty() {
                     debug!("Scratch pad analysis complete after {} rounds", round + 1);
-                    return Some(text);
+                    return Ok(Some(text));
                 }
             }
         }
@@ -466,10 +519,10 @@ async fn analyze_via_scratch_pad(
                 "Scratch pad fallback: synthesizing from {} memory findings",
                 findings.len()
             );
-            return Some(findings.join("\n"));
+            return Ok(Some(findings.join("\n")));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Pick a bounded scratch-pad analysis round budget from config + model family.
@@ -528,6 +581,35 @@ pub async fn run_tool_loop(
     tools: &ToolRegistry,
     system_context: &str,
 ) -> ToolRunResult {
+    run_tool_loop_inner(config, initial_tool_calls, tools, system_context, None)
+        .await
+        .expect("the sink-free runner cannot fail persistence")
+}
+
+pub(crate) async fn run_tool_loop_persisted(
+    config: &ToolRunnerConfig,
+    initial_tool_calls: &[ToolCallRequest],
+    tools: &ToolRegistry,
+    system_context: &str,
+    persistence: &ToolResultPersistence,
+) -> Result<ToolRunResult, ToolResultPersistenceError> {
+    run_tool_loop_inner(
+        config,
+        initial_tool_calls,
+        tools,
+        system_context,
+        Some(persistence),
+    )
+    .await
+}
+
+async fn run_tool_loop_inner(
+    config: &ToolRunnerConfig,
+    initial_tool_calls: &[ToolCallRequest],
+    tools: &ToolRegistry,
+    system_context: &str,
+    persistence: Option<&ToolResultPersistence>,
+) -> Result<ToolRunResult, ToolResultPersistenceError> {
     info!(
         role = "delegation",
         model = %config.model,
@@ -658,21 +740,21 @@ pub async fn run_tool_loop(
             .as_ref()
             .map_or(false, |t| t.is_cancelled())
         {
-            return ToolRunResult {
+            return Ok(ToolRunResult {
                 tool_results: all_results,
                 summary: Some("Tool execution cancelled.".to_string()),
                 iterations_used,
                 error: None,
-            };
+            });
         }
 
         if pending_calls.is_empty() {
-            return ToolRunResult {
+            return Ok(ToolRunResult {
                 tool_results: all_results,
                 summary: None,
                 iterations_used,
                 error: None,
-            };
+            });
         }
 
         // Mistral/Ministral models require tool call IDs to be exactly
@@ -746,9 +828,11 @@ pub async fn run_tool_loop(
                     Some(b) => b,
                     None => {
                         let result = "Error: delegation depth limit reached.".to_string();
-                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         let original_id =
                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                        persist_completed_result(persistence, &original_id, &tc.name, &result)
+                            .await?;
+                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         all_results.push((original_id, tc.name.clone(), result));
                         continue;
                     }
@@ -888,9 +972,11 @@ pub async fn run_tool_loop(
                     Ok(r) => r,
                     Err(e) => {
                         let result = format!("Delegate error: {}", e);
-                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         let original_id =
                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                        persist_completed_result(persistence, &original_id, &tc.name, &result)
+                            .await?;
+                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         all_results.push((original_id, tc.name.clone(), result));
                         continue;
                     }
@@ -898,13 +984,14 @@ pub async fn run_tool_loop(
 
                 let result = if child_response.has_tool_calls() {
                     // Child wants to use tools — run the tool loop.
-                    let child_result = Box::pin(run_tool_loop(
+                    let child_result = Box::pin(run_tool_loop_inner(
                         &child_config,
                         &child_response.tool_calls,
                         tools,
                         &child_system,
+                        persistence,
                     ))
-                    .await;
+                    .await?;
                     // Return the child's summary, or concatenated results if no summary.
                     child_result.summary.unwrap_or_else(|| {
                         child_result
@@ -924,6 +1011,8 @@ pub async fn run_tool_loop(
                 };
 
                 // Store delegate result like any other tool.
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                persist_completed_result(persistence, &original_id, &tc.name, &result).await?;
                 let (_, metadata) = context_store.store(result.clone());
                 let delegation_data = if result.len() > config.max_tool_result_chars {
                     metadata
@@ -931,12 +1020,13 @@ pub async fn run_tool_loop(
                     result.clone()
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
-                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
                 all_results.push((original_id, tc.name.clone(), result));
             } else if worker_tools::is_worker_tool(&tc.name) {
                 // Async worker tool: runs a command/script and returns result.
                 debug!("Worker tool: {} (id: {})", tc.name, tc.id);
                 let result = worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                persist_completed_result(persistence, &original_id, &tc.name, &result).await?;
                 // Store result in ContextStore for subsequent micro-tool access.
                 let (_, metadata) = context_store.store(result.clone());
                 let delegation_data = if result.len() > config.max_tool_result_chars {
@@ -945,7 +1035,6 @@ pub async fn run_tool_loop(
                     result.clone()
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
-                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
                 all_results.push((original_id, tc.name.clone(), result));
 
                 // Track result hashes for loop detection.
@@ -987,6 +1076,8 @@ pub async fn run_tool_loop(
                     result.data.clone()
                 };
                 let stripped = strip_tool_output(&raw_data);
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                persist_completed_result(persistence, &original_id, &tc.name, &stripped).await?;
                 let (_, metadata) = context_store.store(stripped.clone());
                 let delegation_data = if stripped.len() > config.max_tool_result_chars {
                     // Large result: model sees metadata, uses micro-tools to dig in.
@@ -996,7 +1087,6 @@ pub async fn run_tool_loop(
                     stripped.clone()
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
-                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
                 all_results.push((original_id, tc.name.clone(), stripped));
 
                 // Track result hashes for loop detection.
@@ -1023,12 +1113,12 @@ pub async fn run_tool_loop(
         // Verbatim mode: skip delegation entirely, return raw results.
         if config.verbatim {
             debug!("Verbatim mode — skipping delegation LLM, returning raw results");
-            return ToolRunResult {
+            return Ok(ToolRunResult {
                 tool_results: all_results,
                 summary: None,
                 iterations_used,
                 error: None,
-            };
+            });
         }
 
         if config.short_circuit_chars > 0 {
@@ -1046,12 +1136,12 @@ pub async fn run_tool_loop(
                     "All {} tool results are short (< {} chars) — skipping delegation LLM, returning raw results",
                     all_results.len(), threshold
                 );
-                return ToolRunResult {
+                return Ok(ToolRunResult {
                     tool_results: all_results,
                     summary: None,
                     iterations_used,
                     error: None,
-                };
+                });
             }
         }
 
@@ -1073,23 +1163,24 @@ pub async fn run_tool_loop(
             &task_context,
             &mut all_results,
             scratch_rounds,
+            persistence,
         )
-        .await;
-        return ToolRunResult {
+        .await?;
+        return Ok(ToolRunResult {
             tool_results: all_results,
             summary,
             iterations_used,
             error: None,
-        };
+        });
     }
 
     // Ran out of iterations or broke out of loop.
-    ToolRunResult {
+    Ok(ToolRunResult {
         tool_results: all_results,
         summary: None,
         iterations_used,
         error: None,
-    }
+    })
 }
 
 /// Format tool run results for injection into the main LLM context.

@@ -108,8 +108,7 @@ async fn stash_tool_result_for_prompt_shaping(
     // stashable under the recall's own id so slice_tool_result /
     // search_tool_result can query it. Exempting it left the raw body in live
     // context, which inflated a session to 77k tokens (2026-07-30).
-    let needs_shaping =
-        force || data.chars().count() > cap || data.len() > TOOL_RESULT_REPLAY_MAX_BYTES;
+    let needs_shaping = tool_result_needs_shaping(data, cap, force);
     match sessions
         .store_tool_result_immutable(session_id, tool_call_id, tool_name, data)
         .await
@@ -123,6 +122,10 @@ async fn stash_tool_result_for_prompt_shaping(
         // Either way the invariant is violated; surface it.
         sr @ (StoredResult::Conflict { .. } | StoredResult::Failed) => Err(sr),
     }
+}
+
+fn tool_result_needs_shaping(data: &str, cap: usize, force: bool) -> bool {
+    force || data.chars().count() > cap || data.len() > TOOL_RESULT_REPLAY_MAX_BYTES
 }
 
 /// The canonical stable handle marker. A tool-result message whose content
@@ -587,14 +590,25 @@ pub(crate) async fn execute_tools_delegated(
     );
     ctx.persist_pending_protocol_messages().await;
 
-    let run_result =
-        tool_runner::run_tool_loop(&runner_config, routed_tool_calls, &ctx.tools, &task_desc).await;
+    let persistence =
+        tool_runner::ToolResultPersistence::new(ctx.core.sessions.clone(), ctx.session_id.clone());
+    let run_result = match tool_runner::run_tool_loop_persisted(
+        &runner_config,
+        routed_tool_calls,
+        &ctx.tools,
+        &task_desc,
+        &persistence,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            abort_turn_on_stash_failure(ctx, &error.tool_call_id, &error.tool_name, &error.outcome);
+            return true;
+        }
+    };
     let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
 
-    // Prove durable storage for every completed runner result before any
-    // summary, content gate, specialist, or other prompt representation can
-    // transform it. Scratchpad/internal calls are completed outputs too, even
-    // though only routed calls receive protocol tool-result messages below.
     let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
     let routed_result_cap = turn_preview_cap(
         inline_hot_prompt_result_cap(ctx),
@@ -602,30 +616,27 @@ pub(crate) async fn execute_tools_delegated(
         ctx.flow.tool_preview_chars_remaining,
     );
     let force_routed_stash = routed_tool_calls.len() > 1;
-    let mut routed_shaping = std::collections::HashMap::new();
-    for (tool_call_id, tool_name, data) in &run_result.tool_results {
-        let routed = is_routed_call(tool_call_id, routed_tool_calls);
-        let cap = if routed { routed_result_cap } else { usize::MAX };
-        match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            tool_call_id,
-            tool_name,
-            data,
-            cap,
-            routed && force_routed_stash,
-        )
-        .await
+    for tc in routed_tool_calls {
+        if !run_result
+            .tool_results
+            .iter()
+            .any(|(tool_call_id, _, _)| tool_call_id == &tc.id)
         {
-            Ok(needs_shaping) => {
-                if routed {
-                    routed_shaping.insert(tool_call_id.clone(), needs_shaping);
-                }
-            }
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, tool_call_id, tool_name, &sr);
-                return true;
-            }
+            ctx.flow.infra_error = Some(format!(
+                "delegated runner returned no result for {} — turn aborted to preserve the exact-bytes invariant",
+                tc.id
+            ));
+            ContextBuilder::add_tool_result_with_status(
+                &mut ctx.messages,
+                &tc.id,
+                &tc.name,
+                &format!(
+                    "Error: delegated result for {} was missing; turn aborted.",
+                    tc.id
+                ),
+                false,
+            );
+            return true;
         }
     }
 
@@ -685,10 +696,10 @@ pub(crate) async fn execute_tools_delegated(
             .iter()
             .find(|(id, _, _)| id == &tc.id)
             .map(|(_, _, data)| data.as_str())
-            .unwrap_or("(no result)");
+            .expect("routed results were validated before publication");
 
         let cap = routed_result_cap;
-        let needs_shaping = routed_shaping.get(&tc.id).copied().unwrap_or(false);
+        let needs_shaping = tool_result_needs_shaping(full_data, cap, force_routed_stash);
 
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
