@@ -347,23 +347,6 @@ impl AgentLoop {
                 continue;
             }
 
-            // Gateway slash command interception — handle before LLM processing.
-            if msg.content.trim().starts_with('/') {
-                if let Some(response_text) =
-                    crate::agent::gateway_commands::dispatch(&self.shared, &msg).await
-                {
-                    let outbound = crate::bus::events::OutboundMessage::new(
-                        &msg.channel,
-                        &msg.chat_id,
-                        &response_text,
-                    );
-                    if let Err(e) = self.shared.bus_outbound_tx.send(outbound) {
-                        tracing::error!("Failed to send command response: {}", e);
-                    }
-                    continue;
-                }
-            }
-
             // Acquire a concurrency permit.
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
@@ -384,6 +367,27 @@ impl AgentLoop {
             tokio::spawn(async move {
                 // Serialize within the same session.
                 let _session_guard = session_lock.lock().await;
+
+                // Commands such as /clear mutate session history and retained
+                // prompt state, so dispatch them under the same lock as normal
+                // turns. Keeping dispatch inside this spawned task preserves
+                // cross-session gateway concurrency while preventing an older
+                // in-flight turn from resurrecting state after the reset.
+                if msg.content.trim().starts_with('/') {
+                    if let Some(response_text) =
+                        crate::agent::gateway_commands::dispatch(&shared, &msg).await
+                    {
+                        let outbound = crate::bus::events::OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            &response_text,
+                        );
+                        if let Err(error) = outbound_tx.send(outbound) {
+                            tracing::error!(%error, "Failed to send command response");
+                        }
+                        return;
+                    }
+                }
 
                 // Notify REPL about inbound channel message.
                 if let Some(ref dtx) = display_tx {

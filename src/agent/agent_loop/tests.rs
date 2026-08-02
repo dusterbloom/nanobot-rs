@@ -3002,6 +3002,91 @@ async fn concurrent_direct_turns_for_one_session_are_serialized() {
 }
 
 #[tokio::test]
+async fn gateway_clear_waits_for_active_same_session_turn() {
+    let provider = Arc::new(BlockingFirstProvider::new());
+    let (base_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let core_handle = base_loop.shared.core_handle.clone();
+    let sessions = core_handle.swappable().sessions.clone();
+    drop(base_loop);
+
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut gateway_loop = AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx.clone(),
+        None,
+        2,
+        None,
+        None,
+        None,
+        ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    );
+    let running = gateway_loop.running.clone();
+    let runner = tokio::spawn(async move { gateway_loop.run().await });
+    let session_key = "test:offline".to_string();
+
+    let first = InboundMessage::new("test", "user", "offline", "first");
+    let first_started = provider.first_started.notified();
+    inbound_tx.send(first).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), first_started)
+        .await
+        .expect("first gateway turn must reach the provider");
+
+    let clear = InboundMessage::new("test", "user", "offline", "/clear");
+    inbound_tx.send(clear).unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            outbound_rx.recv(),
+        )
+        .await
+        .is_err(),
+        "/clear completed while an older same-session turn still held the session lock"
+    );
+
+    provider.allow_first.notify_one();
+    let first_outbound = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        outbound_rx.recv(),
+    )
+    .await
+    .expect("first response must arrive")
+    .expect("outbound channel must stay open");
+    assert_eq!(first_outbound.content, "response 1");
+    let clear_outbound = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        outbound_rx.recv(),
+    )
+    .await
+    .expect("clear response must arrive after the active turn")
+    .expect("outbound channel must stay open");
+    assert_eq!(clear_outbound.content, "Working memory and history cleared.");
+
+    let session = sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("gateway session must exist");
+    let replay = sessions.get_history(&session.id, 100, 0).await;
+    assert!(
+        replay.is_empty(),
+        "the completed pre-clear turn must remain behind the clear marker on replay: {replay:?}"
+    );
+
+    drop(inbound_tx);
+    running.store(false, Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+        .await
+        .expect("gateway loop must stop after its input channel closes")
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
     let provider = Arc::new(WireRecordingProvider::new(
         "local-hard-lcm-test",
