@@ -642,7 +642,7 @@ Expected scope: tool execution, agent-loop convergence, and prompt-prefix flows.
 - Extends: `WireRecordingProvider::with_higgs_session_cache() -> Self`.
 - Enforces: a changed tool hash rotates the retained-session epoch before `stable_higgs_session_id` is evaluated.
 
-- [ ] **Step 1: Refresh the graph, run impact analysis, and report CRITICAL risk before editing**
+- [x] **Step 1: Refresh the graph, run impact analysis, and report CRITICAL risk before editing**
 
 Run:
 
@@ -654,7 +654,7 @@ node .gitnexus/run.cjs impact cache_status_label --direction upstream --repo nan
 
 Expected: `step_call_llm` and `cache_status_label` are CRITICAL. Name `run_iteration` and `cell_lines_with_reply_mark` as d=1 callers and retain full exhaustive-match coverage.
 
-- [ ] **Step 2: Write failing marker round-trip and TUI tests**
+- [x] **Step 2: Write failing marker round-trip and TUI tests**
 
 Add `ToolTopology` to the `ControlMarker` round-trip fixture and add:
 
@@ -672,7 +672,7 @@ fn tool_topology_reset_is_explicit() {
 }
 ```
 
-- [ ] **Step 3: Write failing Higgs epoch-transition tests**
+- [x] **Step 3: Write failing Higgs epoch-transition tests**
 
 Extend `WireRecordingProvider`:
 
@@ -871,7 +871,7 @@ async fn lease_exhaustion_keeps_one_higgs_epoch() {
 Use the existing singular drop constant because one active epoch is retired in
 this test. Do not infer rotation from logs alone.
 
-- [ ] **Step 4: Run the new tests to verify RED**
+- [x] **Step 4: Run the new tests to verify RED**
 
 Run:
 
@@ -886,7 +886,7 @@ cargo test --lib agent::agent_loop::tests::lease_exhaustion_keeps_one_higgs_epoc
 Expected: marker tests fail to compile and the changed-topology test observes no
 epoch rotation. The unchanged-topology test is a control and should already pass.
 
-- [ ] **Step 5: Add the explicit reset reason**
+- [x] **Step 5: Add the explicit reset reason**
 
 Add:
 
@@ -904,7 +904,7 @@ CacheResetReason::ToolTopology => {
 
 Do not change cache-status ranking.
 
-- [ ] **Step 6: Enforce the epoch boundary in the existing tool-hash diagnostic block**
+- [x] **Step 6: Enforce the epoch boundary in the existing tool-hash diagnostic block**
 
 In `step_call_llm`, compute and install the hash without holding the lock across invalidation:
 
@@ -946,7 +946,7 @@ hash is still the current diagnostic baseline. The lock scope shown above is
 mandatory: the Higgs invalidation path clears `prompt_tool_hashes` and would
 deadlock if called while the map is locked.
 
-- [ ] **Step 7: Run focused and neighboring tests to verify GREEN**
+- [x] **Step 7: Run focused and neighboring tests to verify GREEN**
 
 Run:
 
@@ -962,7 +962,7 @@ cargo test --lib providers::openai_compat::tests::test_higgs_session_cache_capab
 
 Expected: explicit marker round trip, correct TUI label, stable epoch for equal tools, and pre-request rotation/drop marker for changed tools.
 
-- [ ] **Step 8: Check scope and commit**
+- [x] **Step 8: Check scope and commit**
 
 Run:
 

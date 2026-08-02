@@ -2736,6 +2736,9 @@ fn cache_status_label(status: CacheStatus) -> (String, Color) {
             CacheResetReason::StalledProviderRequest => {
                 ("cache reset · stalled request".to_string(), WARN_COLOR)
             }
+            CacheResetReason::ToolTopology => {
+                ("cache reset · tool topology".to_string(), WARN_COLOR)
+            }
         },
     }
 }
@@ -5085,6 +5088,22 @@ mod tests {
             "stalled provider request should not be labeled as LCM: {rendered}"
         );
         assert!(!rendered.contains("lcm checkpoint"));
+    }
+
+    #[test]
+    fn tool_topology_reset_is_explicit() {
+        let mut app = App::new();
+        app.begin_turn("q");
+        app.on_delta("\u{0}cache:reset:tool_topology");
+        app.on_delta("real");
+        app.finish_turn(String::new());
+
+        let rendered: String = cell_lines(app.transcript.last().unwrap(), Mode::Calm, 1.0)
+            .iter()
+            .flatten()
+            .map(|(text, _)| text.clone())
+            .collect();
+        assert!(rendered.contains("cache reset · tool topology"));
     }
 
     #[test]

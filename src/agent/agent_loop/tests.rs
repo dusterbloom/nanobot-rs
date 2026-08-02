@@ -2790,6 +2790,11 @@ impl WireRecordingProvider {
         }
     }
 
+    fn with_higgs_session_cache(mut self) -> Self {
+        self.higgs_session_cache = true;
+        self
+    }
+
     fn tool_call(id: &str, path: &str) -> crate::providers::base::ToolCallRequest {
         let mut arguments = std::collections::HashMap::new();
         arguments.insert("path".to_string(), json!(path));
@@ -2839,6 +2844,19 @@ impl WireRecordingProvider {
     fn tool_snapshots(&self) -> Vec<Vec<Value>> {
         self.tool_snapshots.lock().unwrap().clone()
     }
+
+    fn higgs_requests(&self) -> Vec<Vec<Value>> {
+        self.calls()
+            .into_iter()
+            .filter(|messages| {
+                messages.first().is_some_and(|message| {
+                    message
+                        .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD)
+                        .is_some()
+                })
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -2871,6 +2889,11 @@ impl LLMProvider for WireRecordingProvider {
 
     fn get_default_model(&self) -> &str {
         &self.name
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        self.higgs_session_cache
+            .then_some("http://127.0.0.1:9000/v1")
     }
 
     fn supports_higgs_session_cache(&self) -> bool {
@@ -3410,6 +3433,165 @@ async fn test_local_wire_prompt_prefix_stable_across_turns() {
         calls.len()
     );
     assert_wire_prefix(&calls[0], &calls[calls.len() - 1]);
+}
+
+#[tokio::test]
+async fn unchanged_tool_topology_preserves_higgs_epoch() {
+    let provider = Arc::new(
+        WireRecordingProvider::new(
+            "local-higgs-test",
+            vec![
+                WireRecordingProvider::text_response("first"),
+                WireRecordingProvider::text_response("second"),
+            ],
+        )
+        .with_higgs_session_cache(),
+    );
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("higgs-stable-tools-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("first turn", &session_key, "test", "offline")
+        .await;
+    agent_loop
+        .process_direct("second turn", &session_key, "test", "offline")
+        .await;
+
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .session_prompt_epoch(&session_key),
+        0
+    );
+    let requests = provider.higgs_requests();
+    assert_eq!(requests.len(), 2);
+    let first_id = requests[0][0]
+        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+        .as_u64()
+        .unwrap();
+    let second_id = requests[1][0]
+        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+        .as_u64()
+        .unwrap();
+    assert_eq!(first_id, second_id);
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn changed_tool_topology_rotates_before_request() {
+    let provider = Arc::new(
+        WireRecordingProvider::new(
+            "local-higgs-test",
+            vec![
+                WireRecordingProvider::text_response("first"),
+                WireRecordingProvider::text_response("second"),
+            ],
+        )
+        .with_higgs_session_cache(),
+    );
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("higgs-tool-change-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("first turn", &session_key, "test", "offline")
+        .await;
+    let first_requests = provider.higgs_requests();
+    assert_eq!(first_requests.len(), 1);
+    let first_id = first_requests[0][0]
+        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+        .as_u64()
+        .unwrap();
+    let counters = &agent_loop.shared.core_handle.counters;
+    let installed_hash = *counters
+        .prompt_tool_hashes
+        .lock()
+        .get(&session_key)
+        .expect("first request must install the tool hash");
+    counters
+        .prompt_tool_hashes
+        .lock()
+        .insert(session_key.clone(), installed_hash ^ 1);
+
+    agent_loop
+        .process_direct("second turn", &session_key, "test", "offline")
+        .await;
+
+    assert_eq!(counters.session_prompt_epoch(&session_key), 1);
+    let requests = provider.higgs_requests();
+    assert_eq!(requests.len(), 2);
+    let second_head = &requests[1][0];
+    let second_id = second_head
+        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+        .as_u64()
+        .unwrap();
+    assert_ne!(second_id, first_id);
+    assert_eq!(
+        second_head[crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
+        json!(first_id)
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn lease_exhaustion_keeps_one_higgs_epoch() {
+    let responses: Vec<_> = (0..=crate::agent::lease::DEFAULT_TOOLS_PER_LEASE)
+        .map(|n| {
+            WireRecordingProvider::tool_response(
+                &format!("tc_higgs_lease_{n}"),
+                &format!("higgs-lease-{n}"),
+            )
+        })
+        .collect();
+    let provider = Arc::new(
+        WireRecordingProvider::new("local-higgs-test", responses).with_higgs_session_cache(),
+    );
+    let (agent_loop, workspace) =
+        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
+    let session_key = format!("higgs-lease-stable-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct("keep listing", &session_key, "test", "offline")
+        .await;
+
+    assert_eq!(response, LEASE_OVER_BUDGET_FINAL);
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .session_prompt_epoch(&session_key),
+        0
+    );
+    let requests = provider.higgs_requests();
+    assert_eq!(
+        requests.len(),
+        crate::agent::lease::DEFAULT_TOOLS_PER_LEASE as usize + 1
+    );
+    let ids: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            request[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(requests.iter().all(|request| {
+        request[0]
+            .get(crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD)
+            .is_none()
+            && request[0]
+                .get(crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD)
+                .is_none()
+    }));
+
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 #[tokio::test]

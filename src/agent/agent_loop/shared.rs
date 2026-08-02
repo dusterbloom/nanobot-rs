@@ -2184,27 +2184,41 @@ impl AgentLoopShared {
                 }
             }
         }
-        // Tool-block divergence diagnostic. The message fingerprint above is
-        // blind to tool schemas by design, yet chat templates render the tool
-        // block at the prompt head — so a tool block that changes between turns
-        // busts the prefix cache invisibly (server re-prefills everything). This
-        // catches that case: WARN when the serialized tool array hash changes.
+        // Tool schemas are rendered at the prompt head but deliberately absent
+        // from the message fingerprint. A real topology change therefore needs
+        // a new Higgs retained-session epoch before deriving the request marker;
+        // otherwise Higgs receives changed prefix bytes under the old session.
+        let tool_count = tool_defs_opt.map_or(0, |tools| tools.len());
+        let new_tool_hash = prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
+        let previous_tool_hash = counters
+            .prompt_tool_hashes
+            .lock()
+            .insert(ctx.session_key.to_string(), new_tool_hash);
+        if let Some(previous_tool_hash) =
+            previous_tool_hash.filter(|old| *old != new_tool_hash)
         {
-            let tool_count = tool_defs_opt.map_or(0, |t| t.len());
-            let new_tool_hash = prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
-            let mut tool_store = counters.prompt_tool_hashes.lock();
-            if let Some(prev) = tool_store.get(&ctx.session_key) {
-                if *prev != new_tool_hash {
-                    tracing::warn!(
-                        session = %ctx.session_key,
-                        tool_count,
-                        prev_hash = prev,
-                        new_hash = new_tool_hash,
-                        "tool_block_changed — chat template re-renders tool head, busting prefix cache"
-                    );
-                }
-            }
-            tool_store.insert(ctx.session_key.to_string(), new_tool_hash);
+            // Invalidation clears every prompt fingerprint, including the tool
+            // hash. Do not hold its lock across this call, and reinstall the
+            // new topology afterward as the baseline for the next request.
+            let rotated = if ctx.core.mode().is_local()
+                && ctx.core.provider.supports_higgs_session_cache()
+            {
+                invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::ToolTopology)
+            } else {
+                false
+            };
+            counters
+                .prompt_tool_hashes
+                .lock()
+                .insert(ctx.session_key.to_string(), new_tool_hash);
+            tracing::warn!(
+                session = %ctx.session_key,
+                tool_count,
+                prev_hash = previous_tool_hash,
+                new_hash = new_tool_hash,
+                rotated,
+                "tool_block_changed — rotated retained session before changed prompt head"
+            );
         }
         tracing::info!(
             target: "turn_timing",
