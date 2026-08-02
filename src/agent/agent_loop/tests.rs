@@ -5236,6 +5236,116 @@ async fn delegated_missing_routed_result_aborts_without_synthetic_publication() 
 }
 
 #[tokio::test]
+async fn delegated_web_result_stores_raw_envelope_before_provider_extraction() {
+    struct RawEnvelopeWebTool;
+
+    #[async_trait]
+    impl crate::agent::tools::base::Tool for RawEnvelopeWebTool {
+        fn name(&self) -> &str {
+            "web_fetch"
+        }
+
+        fn description(&self) -> &str {
+            "Test web fetch returning a raw structured failure envelope"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {"url": {"type": "string"}}})
+        }
+
+        async fn execute(&self, _params: std::collections::HashMap<String, Value>) -> String {
+            raw_web_envelope()
+        }
+
+        async fn execute_with_result_and_context(
+            &self,
+            _params: std::collections::HashMap<String, Value>,
+            _ctx: &crate::agent::tools::base::ToolExecutionContext,
+        ) -> crate::agent::tools::base::ToolExecutionResult {
+            crate::agent::tools::base::ToolExecutionResult {
+                ok: false,
+                data: raw_web_envelope(),
+                error: Some("upstream failed".to_string()),
+                error_kind: None,
+            }
+        }
+    }
+
+    fn raw_web_envelope() -> String {
+        r#"{"text":"provider-facing article","error":"upstream failed","raw_only":true}"#
+            .to_string()
+    }
+
+    let main = MockLLM::named("local-qwen-test");
+    let (agent_loop, workspace) = build_local_inline_harness(main);
+    let session_key = format!("delegated-raw-web-{}", uuid::Uuid::new_v4());
+    let mut message = InboundMessage::new("test", "user", "offline", "fetch test page");
+    message
+        .metadata
+        .insert("session_key".to_string(), json!(session_key));
+    let mut ctx = agent_loop
+        .shared
+        .prepare_context(&message, None, None, None, None)
+        .await;
+    ctx.tools.register(Box::new(RawEnvelopeWebTool));
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let routed_calls = vec![crate::providers::base::ToolCallRequest {
+        id: "tc_raw_web".to_string(),
+        name: "web_fetch".to_string(),
+        arguments: std::collections::HashMap::from([(
+            "url".to_string(),
+            json!("https://example.invalid"),
+        )]),
+    }];
+    let response = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: routed_calls.clone(),
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+    let delegation_provider = Some(MockLLM::named("local-qwen-test"));
+    let delegation_model = Some("local-qwen-test".to_string());
+
+    assert!(
+        crate::agent::tool_engine::execute_tools_delegated(
+            &mut ctx,
+            &counters,
+            &routed_calls,
+            &response,
+            &delegation_provider,
+            &delegation_model,
+        )
+        .await
+    );
+    assert_eq!(
+        ctx.core
+            .sessions
+            .load_tool_result(&ctx.session_id, "tc_raw_web")
+            .await,
+        Some(raw_web_envelope()),
+    );
+    let visible = ctx
+        .messages
+        .iter()
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_raw_web")
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .expect("delegated web result must be provider-visible");
+    assert!(visible.contains("provider-facing article"));
+    assert!(!visible.contains("raw_only"));
+    let audit = ctx
+        .turn_tool_entries
+        .iter()
+        .find(|entry| entry.id == "tc_raw_web")
+        .expect("delegated web result must have an audit entry");
+    assert!(!audit.ok, "audit status must come from the raw failed result");
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
 async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
     let duplicate_call = |id: usize| {
         let mut arguments = std::collections::HashMap::new();

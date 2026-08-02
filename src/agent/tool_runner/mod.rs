@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::agent::context::ContextBuilder;
+use crate::agent::context_hygiene::tool_result_ok;
 use crate::agent::context_store::{self, ContextStore};
 use crate::agent::sanitize::strip_tool_output;
 use crate::agent::tools::ToolRegistry;
@@ -161,6 +162,7 @@ pub struct ToolRunResult {
 pub(crate) struct ToolResultPersistence {
     sessions: Arc<crate::session::SessionDb>,
     session_id: String,
+    statuses: parking_lot::Mutex<HashMap<String, bool>>,
 }
 
 impl ToolResultPersistence {
@@ -168,7 +170,12 @@ impl ToolResultPersistence {
         Self {
             sessions,
             session_id,
+            statuses: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn ok_for(&self, tool_call_id: &str) -> Option<bool> {
+        self.statuses.lock().get(tool_call_id).copied()
     }
 }
 
@@ -184,6 +191,7 @@ async fn persist_completed_result(
     tool_call_id: &str,
     tool_name: &str,
     data: &str,
+    ok: bool,
 ) -> Result<(), ToolResultPersistenceError> {
     let Some(persistence) = persistence else {
         return Ok(());
@@ -194,7 +202,13 @@ async fn persist_completed_result(
         .store_tool_result_immutable(&persistence.session_id, tool_call_id, tool_name, data)
         .await
     {
-        StoredResult::Stored { .. } | StoredResult::Identical { .. } => Ok(()),
+        StoredResult::Stored { .. } | StoredResult::Identical { .. } => {
+            persistence
+                .statuses
+                .lock()
+                .insert(tool_call_id.to_string(), ok);
+            Ok(())
+        }
         outcome @ (StoredResult::Conflict { .. } | StoredResult::Failed) => {
             Err(ToolResultPersistenceError {
                 tool_call_id: tool_call_id.to_string(),
@@ -465,7 +479,14 @@ async fn analyze_via_scratch_pad(
                         worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
-                    persist_completed_result(persistence, &original_id, &tc.name, &result).await?;
+                    persist_completed_result(
+                        persistence,
+                        &original_id,
+                        &tc.name,
+                        &result,
+                        tool_result_ok(&result),
+                    )
+                    .await?;
                     let (_, _metadata) = context_store.store(result.clone());
                     all_results.push((original_id, tc.name.clone(), result));
                 } else {
@@ -482,8 +503,14 @@ async fn analyze_via_scratch_pad(
                     .await;
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
-                    persist_completed_result(persistence, &original_id, &tc.name, &result.data)
-                        .await?;
+                    persist_completed_result(
+                        persistence,
+                        &original_id,
+                        &tc.name,
+                        &result.data,
+                        result.ok,
+                    )
+                    .await?;
                     let (_, _metadata) = context_store.store(result.data.clone());
                     all_results.push((original_id, tc.name.clone(), result.data));
                 }
@@ -830,8 +857,14 @@ async fn run_tool_loop_inner(
                         let result = "Error: delegation depth limit reached.".to_string();
                         let original_id =
                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                        persist_completed_result(persistence, &original_id, &tc.name, &result)
-                            .await?;
+                        persist_completed_result(
+                            persistence,
+                            &original_id,
+                            &tc.name,
+                            &result,
+                            false,
+                        )
+                        .await?;
                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         all_results.push((original_id, tc.name.clone(), result));
                         continue;
@@ -974,8 +1007,14 @@ async fn run_tool_loop_inner(
                         let result = format!("Delegate error: {}", e);
                         let original_id =
                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                        persist_completed_result(persistence, &original_id, &tc.name, &result)
-                            .await?;
+                        persist_completed_result(
+                            persistence,
+                            &original_id,
+                            &tc.name,
+                            &result,
+                            false,
+                        )
+                        .await?;
                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         all_results.push((original_id, tc.name.clone(), result));
                         continue;
@@ -1012,7 +1051,14 @@ async fn run_tool_loop_inner(
 
                 // Store delegate result like any other tool.
                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                persist_completed_result(persistence, &original_id, &tc.name, &result).await?;
+                persist_completed_result(
+                    persistence,
+                    &original_id,
+                    &tc.name,
+                    &result,
+                    tool_result_ok(&result),
+                )
+                .await?;
                 let (_, metadata) = context_store.store(result.clone());
                 let delegation_data = if result.len() > config.max_tool_result_chars {
                     metadata
@@ -1026,7 +1072,14 @@ async fn run_tool_loop_inner(
                 debug!("Worker tool: {} (id: {})", tc.name, tc.id);
                 let result = worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                persist_completed_result(persistence, &original_id, &tc.name, &result).await?;
+                persist_completed_result(
+                    persistence,
+                    &original_id,
+                    &tc.name,
+                    &result,
+                    tool_result_ok(&result),
+                )
+                .await?;
                 // Store result in ContextStore for subsequent micro-tool access.
                 let (_, metadata) = context_store.store(result.clone());
                 let delegation_data = if result.len() > config.max_tool_result_chars {
@@ -1068,6 +1121,15 @@ async fn run_tool_loop_inner(
                     TOOL_MAX_RETRIES,
                 )
                 .await;
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                persist_completed_result(
+                    persistence,
+                    &original_id,
+                    &tc.name,
+                    &result.data,
+                    result.ok,
+                )
+                .await?;
                 // For web_fetch/web_search: unwrap the JSON envelope so the model
                 // sees clean article text rather than a JSON metadata summary.
                 let raw_data = if tc.name == "web_fetch" || tc.name == "web_search" {
@@ -1076,8 +1138,6 @@ async fn run_tool_loop_inner(
                     result.data.clone()
                 };
                 let stripped = strip_tool_output(&raw_data);
-                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                persist_completed_result(persistence, &original_id, &tc.name, &stripped).await?;
                 let (_, metadata) = context_store.store(stripped.clone());
                 let delegation_data = if stripped.len() > config.max_tool_result_chars {
                     // Large result: model sees metadata, uses micro-tools to dig in.

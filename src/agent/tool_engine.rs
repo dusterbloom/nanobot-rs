@@ -700,6 +700,9 @@ pub(crate) async fn execute_tools_delegated(
 
         let cap = routed_result_cap;
         let needs_shaping = tool_result_needs_shaping(full_data, cap, force_routed_stash);
+        let ok = persistence
+            .ok_for(&tc.id)
+            .unwrap_or_else(|| tool_result_ok(full_data));
 
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
@@ -735,7 +738,7 @@ pub(crate) async fn execute_tools_delegated(
             render_tool_result_handle(
                 &tc.id,
                 &tc.name,
-                tool_result_ok(full_data),
+                ok,
                 full_data.as_bytes(),
                 &tc.arguments,
             )
@@ -749,7 +752,7 @@ pub(crate) async fn execute_tools_delegated(
             render_tool_result_handle(
                 &tc.id,
                 &tc.name,
-                tool_result_ok(full_data),
+                ok,
                 full_data.as_bytes(),
                 &tc.arguments,
             )
@@ -768,7 +771,6 @@ pub(crate) async fn execute_tools_delegated(
         }
         injected = ctx.flow.lease.annotate_result(&injected);
 
-        let ok = tool_result_ok(full_data);
         if ctx.core.provenance_config.enabled {
             ContextBuilder::add_tool_result_immutable_with_status(
                 &mut ctx.messages,
@@ -832,7 +834,9 @@ pub(crate) async fn execute_tools_delegated(
     let executor = format!("tool_runner:{}", tr_model);
     let n_results = run_result.tool_results.len().max(1) as u64;
     for (tool_call_id, tool_name, data) in &run_result.tool_results {
-        let ok = !data.starts_with("Error:");
+        let ok = persistence
+            .ok_for(tool_call_id)
+            .unwrap_or_else(|| tool_result_ok(data));
         let per_tool_ms = delegation_elapsed_ms / n_results;
 
         // Only render CallEnd in the TUI for results that the caller asked
