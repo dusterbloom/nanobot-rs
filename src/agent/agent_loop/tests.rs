@@ -4882,8 +4882,7 @@ async fn inline_success_and_failure_store_exact_completed_bodies() {
             WireRecordingProvider::text_response("done"),
         ],
     ));
-    let (agent_loop, workspace) =
-        build_local_inline_harness(provider as Arc<dyn LLMProvider>);
+    let (agent_loop, workspace) = build_local_inline_harness(provider as Arc<dyn LLMProvider>);
     let session_key = format!("inline-exact-bodies-{}", uuid::Uuid::new_v4());
 
     let response = agent_loop
@@ -4912,11 +4911,12 @@ async fn inline_success_and_failure_store_exact_completed_bodies() {
     for (id, expected_ok) in [("tc_inline_ok", true), ("tc_inline_err", false)] {
         let message = messages
             .iter()
-            .find(|message| {
-                message.get("tool_call_id").and_then(Value::as_str) == Some(id)
-            })
+            .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some(id))
             .unwrap_or_else(|| panic!("missing persisted result {id}"));
-        assert_eq!(message.get("ok").and_then(Value::as_bool), Some(expected_ok));
+        assert_eq!(
+            message.get("ok").and_then(Value::as_bool),
+            Some(expected_ok)
+        );
     }
 
     let _ = std::fs::remove_dir_all(workspace);
@@ -5001,6 +5001,114 @@ async fn delegated_failure_is_stored_before_specialist_shaping() {
         })
         .expect("delegated failure receipt must be appended");
     assert_eq!(persisted.get("ok").and_then(Value::as_bool), Some(false));
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn delegated_scratchpad_results_store_exact_success_and_failure_bodies() {
+    let main = MockLLM::named("local-qwen-test");
+    let (agent_loop, workspace) = build_local_inline_harness(main);
+    let session_key = format!("delegated-scratchpad-store-{}", uuid::Uuid::new_v4());
+    let mut message = InboundMessage::new("test", "user", "offline", "run delegated tools");
+    message
+        .metadata
+        .insert("session_key".to_string(), json!(session_key));
+    let mut ctx = agent_loop
+        .shared
+        .prepare_context(&message, None, None, None, None)
+        .await;
+    let counters = agent_loop.shared.core_handle.counters.clone();
+
+    let routed_calls = vec![crate::providers::base::ToolCallRequest {
+        id: "tc_routed".to_string(),
+        name: "exec".to_string(),
+        arguments: std::collections::HashMap::from([(
+            "command".to_string(),
+            json!("printf routed_exact_body"),
+        )]),
+    }];
+    let response = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: routed_calls.clone(),
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+    let scratchpad_calls = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![
+            crate::providers::base::ToolCallRequest {
+                id: "scratch_ok".to_string(),
+                name: "exec".to_string(),
+                arguments: std::collections::HashMap::from([(
+                    "command".to_string(),
+                    json!("printf scratchpad_success_exact"),
+                )]),
+            },
+            crate::providers::base::ToolCallRequest {
+                id: "scratch_err".to_string(),
+                name: "exec".to_string(),
+                arguments: std::collections::HashMap::from([(
+                    "command".to_string(),
+                    json!("printf scratchpad_failure_exact >&2; exit 4"),
+                )]),
+            },
+        ],
+        finish_reason: "tool_calls".to_string(),
+        usage: std::collections::HashMap::new(),
+    };
+    let delegation_provider: Option<Arc<dyn LLMProvider>> =
+        Some(Arc::new(ResponseSequenceProvider::new(
+            "delegated-test",
+            vec![
+                scratchpad_calls,
+                WireRecordingProvider::text_response("scratch summary publishable"),
+            ],
+        )));
+    let delegation_model = Some("delegated-test".to_string());
+
+    assert!(
+        crate::agent::tool_engine::execute_tools_delegated(
+            &mut ctx,
+            &counters,
+            &routed_calls,
+            &response,
+            &delegation_provider,
+            &delegation_model,
+        )
+        .await
+    );
+
+    assert_eq!(
+        ctx.core
+            .sessions
+            .load_tool_result(&ctx.session_id, "sp0001000")
+            .await
+            .as_deref(),
+        Some("scratchpad_success_exact")
+    );
+    assert_eq!(
+        ctx.core
+            .sessions
+            .load_tool_result(&ctx.session_id, "sp0001001")
+            .await
+            .as_deref(),
+        Some("Error: Command failed\nSTDERR:\nscratchpad_failure_exact\nExit code: 4")
+    );
+    assert!(ctx.messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("scratch summary publishable"))
+    }));
+    for (id, expected_ok) in [("sp0001000", true), ("sp0001001", false)] {
+        let entry = ctx
+            .turn_tool_entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap_or_else(|| panic!("missing turn audit entry {id}"));
+        assert_eq!(entry.ok, expected_ok);
+    }
 
     let _ = std::fs::remove_dir_all(workspace);
 }

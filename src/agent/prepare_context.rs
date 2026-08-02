@@ -359,8 +359,7 @@ impl AgentLoopShared {
         // Get session history. Track count so we know where new messages start.
         // The trim ceiling must stay above LCM's soft
         // compaction threshold, or compaction never fires (see history_limit_lcm).
-        let retained_higgs =
-            core.mode().is_local() && core.provider.supports_higgs_session_cache();
+        let retained_higgs = core.mode().is_local() && core.provider.supports_higgs_session_cache();
         let (max_messages, max_turns) = if retained_higgs {
             (0, 0)
         } else {
@@ -630,8 +629,7 @@ impl AgentLoopShared {
                     crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,
                     max_lease_renewals,
                 ),
-                tool_preview_chars_remaining:
-                    crate::agent::tool_engine::TOOL_PREVIEW_BUDGET_CHARS,
+                tool_preview_chars_remaining: crate::agent::tool_engine::TOOL_PREVIEW_BUDGET_CHARS,
                 llm_call_start: None,
                 ttft_ms: None,
                 provider_prompt_estimate: None,

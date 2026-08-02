@@ -591,6 +591,44 @@ pub(crate) async fn execute_tools_delegated(
         tool_runner::run_tool_loop(&runner_config, routed_tool_calls, &ctx.tools, &task_desc).await;
     let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
 
+    // Prove durable storage for every completed runner result before any
+    // summary, content gate, specialist, or other prompt representation can
+    // transform it. Scratchpad/internal calls are completed outputs too, even
+    // though only routed calls receive protocol tool-result messages below.
+    let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
+    let routed_result_cap = turn_preview_cap(
+        inline_hot_prompt_result_cap(ctx),
+        routed_tool_calls.len(),
+        ctx.flow.tool_preview_chars_remaining,
+    );
+    let force_routed_stash = routed_tool_calls.len() > 1;
+    let mut routed_shaping = std::collections::HashMap::new();
+    for (tool_call_id, tool_name, data) in &run_result.tool_results {
+        let routed = is_routed_call(tool_call_id, routed_tool_calls);
+        let cap = if routed { routed_result_cap } else { usize::MAX };
+        match stash_tool_result_for_prompt_shaping(
+            &ctx.core.sessions,
+            &ctx.session_id,
+            tool_call_id,
+            tool_name,
+            data,
+            cap,
+            routed && force_routed_stash,
+        )
+        .await
+        {
+            Ok(needs_shaping) => {
+                if routed {
+                    routed_shaping.insert(tool_call_id.clone(), needs_shaping);
+                }
+            }
+            Err(sr) => {
+                abort_turn_on_stash_failure(ctx, tool_call_id, tool_name, &sr);
+                return true;
+            }
+        }
+    }
+
     // Only mark unhealthy on actual provider/tool-runner errors.
     let is_hard_failure = run_result.error.is_some();
     if is_hard_failure && !run_result.tool_results.is_empty() {
@@ -641,14 +679,6 @@ pub(crate) async fn execute_tools_delegated(
     );
 
     // Add tool results from the runner to the main context.
-    let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
-    let routed_result_cap = turn_preview_cap(
-        inline_hot_prompt_result_cap(ctx),
-        routed_tool_calls.len(),
-        ctx.flow.tool_preview_chars_remaining,
-    );
-    let force_routed_stash = routed_tool_calls.len() > 1;
-
     for tc in routed_tool_calls {
         let full_data = run_result
             .tool_results
@@ -657,28 +687,8 @@ pub(crate) async fn execute_tools_delegated(
             .map(|(_, _, data)| data.as_str())
             .unwrap_or("(no result)");
 
-        // Store the exact completed body before any runner summary, content
-        // gate, or specialist call can delay or transform it.
         let cap = routed_result_cap;
-        let needs_shaping = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &tc.id,
-            &tc.name,
-            full_data,
-            cap,
-            force_routed_stash,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &tc.id, &tc.name, &sr);
-                // Skip all shaping for an unproven body. The loop-level
-                // infra_error check in step_execute_tools finalizes the turn.
-                continue;
-            }
-        };
+        let needs_shaping = routed_shaping.get(&tc.id).copied().unwrap_or(false);
 
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
@@ -1718,7 +1728,9 @@ mod tests {
     async fn every_tool_result_is_stored_before_prompt_shaping() {
         let temp = tempfile::tempdir().unwrap();
         let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
-        let session = sessions.create_session("test:store-every-tool-result").await;
+        let session = sessions
+            .create_session("test:store-every-tool-result")
+            .await;
 
         for (id, body) in [
             ("small_ok", "ok".to_string()),
