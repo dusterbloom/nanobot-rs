@@ -210,10 +210,12 @@ impl TurnContext {
     /// results immediately after injection, so a crash cannot leave a side
     /// effect without the conversation bytes that caused and described it.
     /// The row ids also make same-turn messages visible to the LCM ingester.
-    pub(crate) async fn persist_pending_protocol_messages(&mut self) {
+    pub(crate) async fn persist_pending_protocol_messages(&mut self) -> bool {
         // Do not rely solely on `new_start`: token trimming can remove old
         // history and shift every index during the turn. Persist by durable-id
         // presence instead; DB-loaded history already carries `_db_id`.
+        let mut pending_indices = Vec::new();
+        let mut pending_messages = Vec::new();
         for index in 0..self.messages.len() {
             let role = self.messages[index]
                 .get("role")
@@ -237,23 +239,37 @@ impl TurnContext {
                 continue;
             }
 
-            let message = self.messages[index].clone();
-            let Some(row_id) = self
-                .core
-                .sessions
-                .add_message(&self.session_id, &message)
-                .await
-            else {
+            pending_indices.push(index);
+            pending_messages.push(self.messages[index].clone());
+        }
+
+        if pending_messages.is_empty() {
+            self.new_start = self.messages.len();
+            return true;
+        }
+
+        let row_ids = match self
+            .core
+            .sessions
+            .add_messages_checked(&self.session_id, &pending_messages)
+            .await
+        {
+            Ok(row_ids) => row_ids,
+            Err(error) => {
                 warn!(
                     session = %self.session_key,
-                    role = message.get("role").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                    "active_turn_message_persist_failed"
+                    pending = pending_messages.len(),
+                    %error,
+                    "active_turn_protocol_group_persist_failed"
                 );
-                break;
-            };
+                return false;
+            }
+        };
+        for (index, row_id) in pending_indices.into_iter().zip(row_ids) {
             self.messages[index]["_db_id"] = json!(row_id);
         }
         self.new_start = self.messages.len();
+        true
     }
 }
 
@@ -2728,7 +2744,13 @@ impl AgentLoopShared {
                     false,
                 );
             }
-            ctx.persist_pending_protocol_messages().await;
+            if !ctx.persist_pending_protocol_messages().await {
+                ctx.emit_pending_request_metrics(0);
+                return StepResult::Done(IterationOutcome::Error(
+                    "[Session Error] Rejected tool batch could not be recorded atomically; no tools were executed."
+                        .to_string(),
+                ));
+            }
             ctx.emit_pending_request_metrics(0);
             return StepResult::Done(IterationOutcome::Finished(
                 LEASE_OVER_BUDGET_FINAL.to_string(),

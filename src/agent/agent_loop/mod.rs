@@ -69,6 +69,16 @@ use heuristics::{last_user_message, render_via_protocol, should_strip_tools_for_
 // AgentLoop (owns the receiver + orchestrates concurrency)
 // ---------------------------------------------------------------------------
 
+type SessionLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+async fn session_lock_for(session_locks: &SessionLocks, session_key: &str) -> Arc<Mutex<()>> {
+    let mut locks = session_locks.lock().await;
+    locks
+        .entry(session_key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 /// The core agent loop.
 ///
 /// Consumes [`InboundMessage`]s from the bus, runs the LLM + tool loop, and
@@ -83,6 +93,7 @@ pub struct AgentLoop {
     running: Arc<AtomicBool>,
     max_concurrent_chats: usize,
     reflection_spawned: AtomicBool,
+    session_locks: SessionLocks,
 }
 
 impl AgentLoop {
@@ -189,6 +200,7 @@ impl AgentLoop {
             running: Arc::new(AtomicBool::new(false)),
             max_concurrent_chats,
             reflection_spawned: AtomicBool::new(false),
+            session_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -253,9 +265,9 @@ impl AgentLoop {
         Self::spawn_background_reflection(&self.shared);
 
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent_chats));
-        // Per-session locks to serialize messages within the same conversation.
-        let session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        // Every entrypoint shares this map, so direct/TUI turns cannot race a
+        // gateway turn through prompt fingerprint and Higgs epoch state.
+        let session_locks = self.session_locks.clone();
 
         while self.running.load(Ordering::SeqCst) {
             let msg = match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv())
@@ -286,13 +298,7 @@ impl AgentLoop {
                             // Different session — coalesce what we have, push other back.
                             // Can't push back into mpsc, so process inline as separate spawn.
                             let other_key = other.session_key();
-                            let other_lock = {
-                                let mut locks = session_locks.lock().await;
-                                locks
-                                    .entry(other_key)
-                                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                                    .clone()
-                            };
+                            let other_lock = session_lock_for(&session_locks, &other_key).await;
                             let other_shared = self.shared.clone();
                             let other_outbound_tx = self.shared.bus_outbound_tx.clone();
                             let _other_display_tx = self.shared.repl_display_tx.clone();
@@ -369,13 +375,7 @@ impl AgentLoop {
 
             // Get or create the per-session lock.
             let session_key = msg.session_key();
-            let session_lock = {
-                let mut locks = session_locks.lock().await;
-                locks
-                    .entry(session_key)
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone()
-            };
+            let session_lock = session_lock_for(&session_locks, &session_key).await;
 
             let shared = self.shared.clone();
             let outbound_tx = self.shared.bus_outbound_tx.clone();
@@ -536,6 +536,9 @@ impl AgentLoop {
                 .insert("detected_language".to_string(), json!(lang));
         }
 
+        let session_lock = session_lock_for(&self.session_locks, session_key).await;
+        let _session_guard = session_lock.lock().await;
+
         match self
             .shared
             .process_message(&msg, None, None, None, None)
@@ -573,6 +576,9 @@ impl AgentLoop {
             detected_language,
             media_paths,
         );
+
+        let session_lock = session_lock_for(&self.session_locks, session_key).await;
+        let _session_guard = session_lock.lock().await;
 
         match self
             .shared
@@ -636,7 +642,10 @@ impl AgentLoop {
             Self::spawn_background_reflection(&self.shared);
         }
         let shared = self.shared.clone();
+        let session_locks = self.session_locks.clone();
         tokio::spawn(async move {
+            let session_lock = session_lock_for(&session_locks, &session_key).await;
+            let _session_guard = session_lock.lock().await;
             let msg = Self::build_direct_message(
                 &channel,
                 &chat_id,

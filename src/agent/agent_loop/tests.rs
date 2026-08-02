@@ -2779,6 +2779,56 @@ struct WireRecordingProvider {
     higgs_session_cache: bool,
 }
 
+/// Blocks the first provider request so a test can prove that another direct
+/// turn for the same session cannot enter the provider concurrently.
+struct BlockingFirstProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    first_started: tokio::sync::Notify,
+    allow_first: tokio::sync::Notify,
+    second_started: tokio::sync::Notify,
+}
+
+impl BlockingFirstProvider {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            first_started: tokio::sync::Notify::new(),
+            allow_first: tokio::sync::Notify::new(),
+            second_started: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for BlockingFirstProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.first_started.notify_one();
+            self.allow_first.notified().await;
+        } else {
+            self.second_started.notify_one();
+        }
+        Ok(WireRecordingProvider::text_response(&format!(
+            "response {}",
+            call + 1
+        )))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "local-qwen-test"
+    }
+}
+
 impl WireRecordingProvider {
     fn new(name: &str, responses: Vec<crate::providers::base::LLMResponse>) -> Self {
         Self {
@@ -2899,6 +2949,56 @@ impl LLMProvider for WireRecordingProvider {
     fn supports_higgs_session_cache(&self) -> bool {
         self.higgs_session_cache
     }
+}
+
+#[tokio::test]
+async fn concurrent_direct_turns_for_one_session_are_serialized() {
+    let provider = Arc::new(BlockingFirstProvider::new());
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let agent_loop = Arc::new(agent_loop);
+    let session_key = format!("serialized-direct-{}", uuid::Uuid::new_v4());
+
+    let first_started = provider.first_started.notified();
+    let first_loop = agent_loop.clone();
+    let first_session = session_key.clone();
+    let first = tokio::spawn(async move {
+        first_loop
+            .process_direct("first", &first_session, "cli", "offline")
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), first_started)
+        .await
+        .expect("first turn must reach the provider");
+
+    let second_loop = agent_loop.clone();
+    let second_session = session_key.clone();
+    let second = tokio::spawn(async move {
+        second_loop
+            .process_direct("second", &second_session, "cli", "offline")
+            .await
+    });
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            provider.second_started.notified(),
+        )
+        .await
+        .is_err(),
+        "the second same-session turn entered the provider before the first completed"
+    );
+
+    provider.allow_first.notify_one();
+    assert_eq!(first.await.unwrap(), "response 1");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.second_started.notified(),
+    )
+    .await
+    .expect("second turn must proceed after the first releases the session");
+    assert_eq!(second.await.unwrap(), "response 2");
+
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 #[tokio::test]
@@ -3498,7 +3598,7 @@ async fn changed_tool_topology_rotates_before_request() {
     let session_key = format!("higgs-tool-change-{}", uuid::Uuid::new_v4());
 
     agent_loop
-        .process_direct("first turn", &session_key, "test", "offline")
+        .process_direct("first turn", &session_key, "cli", "offline")
         .await;
     let first_requests = provider.higgs_requests();
     assert_eq!(first_requests.len(), 1);
@@ -3507,21 +3607,23 @@ async fn changed_tool_topology_rotates_before_request() {
         .as_u64()
         .unwrap();
     let counters = &agent_loop.shared.core_handle.counters;
-    let installed_hash = *counters
-        .prompt_tool_hashes
-        .lock()
-        .get(&session_key)
-        .expect("first request must install the tool hash");
-    counters
-        .prompt_tool_hashes
-        .lock()
-        .insert(session_key.clone(), installed_hash ^ 1);
 
     agent_loop
         .process_direct("second turn", &session_key, "test", "offline")
         .await;
 
     assert_eq!(counters.session_prompt_epoch(&session_key), 1);
+    let tool_snapshots = provider.tool_snapshots();
+    assert_eq!(tool_snapshots.len(), 2);
+    assert_ne!(
+        tool_snapshots[0], tool_snapshots[1],
+        "the real channel-specific registry must change before cache rotation"
+    );
+    assert_ne!(
+        crate::agent::prompt_fingerprint::hash_tools(&tool_snapshots[0]),
+        crate::agent::prompt_fingerprint::hash_tools(&tool_snapshots[1]),
+        "the channel-specific registry change must alter serialized prompt-head bytes"
+    );
     let requests = provider.higgs_requests();
     assert_eq!(requests.len(), 2);
     let second_head = &requests[1][0];
@@ -3728,8 +3830,22 @@ async fn lease_rejects_crossing_batch_atomically_with_complete_protocol_pairing(
     responses.push(crate::providers::base::LLMResponse {
         content: Some(String::new()),
         tool_calls: vec![
-            WireRecordingProvider::tool_call("tc_over_a", "over-a"),
-            WireRecordingProvider::tool_call("tc_over_b", "over-b"),
+            crate::providers::base::ToolCallRequest {
+                id: "tc_over_a".to_string(),
+                name: "write_file".to_string(),
+                arguments: std::collections::HashMap::from([
+                    ("path".to_string(), json!("over-a.txt")),
+                    ("content".to_string(), json!("must not be written")),
+                ]),
+            },
+            crate::providers::base::ToolCallRequest {
+                id: "tc_over_b".to_string(),
+                name: "write_file".to_string(),
+                arguments: std::collections::HashMap::from([
+                    ("path".to_string(), json!("over-b.txt")),
+                    ("content".to_string(), json!("must not be written")),
+                ]),
+            },
         ],
         finish_reason: "tool_calls".to_string(),
         usage: std::collections::HashMap::new(),
@@ -3748,6 +3864,8 @@ async fn lease_rejects_crossing_batch_atomically_with_complete_protocol_pairing(
 
     assert_eq!(response, LEASE_OVER_BUDGET_FINAL);
     assert_eq!(provider.call_count(), 12);
+    assert!(!workspace.join("over-a.txt").exists());
+    assert!(!workspace.join("over-b.txt").exists());
     let snapshots = provider.tool_snapshots();
     assert!(snapshots.iter().all(|tools| !tools.is_empty()));
     assert!(snapshots.iter().all(|tools| tools == &snapshots[0]));

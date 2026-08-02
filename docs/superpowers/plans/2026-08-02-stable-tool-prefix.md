@@ -1070,3 +1070,20 @@ node .gitnexus/run.cjs analyze
 ```
 
 Do not create an empty verification commit.
+
+---
+
+### Task 5: Ponytail Review Remediation
+
+- [x] Persist each pending protocol group with a checked SQLite transaction;
+      roll back every row when any carrier or receipt insert fails.
+- [x] Surface rejected-batch durability failure as an infrastructure error and
+      never report normal lease exhaustion after a partial/failed commit.
+- [x] Share one per-session lock across gateway, CLI, REPL, and TUI entrypoints
+      so prompt topology comparison and Higgs epoch rotation cannot race.
+- [x] Exercise a real channel-specific tool-registry transition and assert the
+      serialized tool schemas differ before retained-session rotation.
+- [x] Make the crossing-batch test attempt two file writes and prove neither
+      side effect happens.
+- [ ] Run focused/full verification, GitNexus change detection, and the final
+      ponytail review on the remediation diff.
