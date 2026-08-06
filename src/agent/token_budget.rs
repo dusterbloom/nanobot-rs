@@ -1,3 +1,12 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+)]
 #![allow(dead_code)]
 //! Token budget management for context window overflow prevention.
 //!
@@ -176,7 +185,9 @@ fn hard_reset(msgs: &mut Vec<Value>) {
         return;
     }
     let system_msg = msgs[0].clone();
-    let last_msg = msgs.last().cloned().unwrap();
+    let Some(last_msg) = msgs.last().cloned() else {
+        return; // len > 2 was checked above
+    };
     let summary_msg = serde_json::json!({
         "role": "user",
         "content": "[Previous conversation truncated due to context limits. Please continue from the latest message.]"

@@ -1,3 +1,11 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::indexing_slicing,
+)]
 //! Thin wrapper around fastembed for local ONNX text embeddings.
 //!
 //! Single responsibility: text → f32 vector. Lazy-loads the model on first use.

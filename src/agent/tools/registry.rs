@@ -1,3 +1,12 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+)]
 #![allow(dead_code)]
 //! Tool registry for dynamic tool management.
 
@@ -610,7 +619,7 @@ impl ToolRegistry {
             crate::agent::hooks::HookPhase::PostToolUse,
             name,
             params,
-            Some((&result.data, result.ok)),
+            Some((result.data(), result.ok())),
         )
         .await;
     }
@@ -696,19 +705,23 @@ impl ToolRegistry {
         // legacy tools whose error string still contains "is required" (e.g.
         // recall's "'query' parameter is required") keep getting a
         // schema-derived example until they migrate to the structured path.
-        if !result.ok {
-            let example = match &result.error_kind {
+        if !result.ok() {
+            let example = match result.error_kind() {
                 Some(crate::errors::ToolErrorKind::MissingArg { example, .. }) => {
                     Some(example.clone())
                 }
-                _ if result.data.contains("is required") => {
+                _ if result.data().contains("is required") => {
                     Self::worked_example_call(&name, &tool.parameters())
                 }
                 _ => None,
             };
             if let Some(example) = example {
-                let base = result.data.trim_end_matches('.');
-                result.data = format!("{}. Call as {}.", base, example);
+                // Migrated tools render the example into the wire string
+                // already (`ToolError::MissingArg::render` ends with
+                // "call as {example}"); appending again would double it.
+                if !result.data().contains(example.as_str()) {
+                    result.append_worked_example(&example);
+                }
             }
         }
 
@@ -1900,9 +1913,9 @@ mod tests {
         );
 
         let result = registry.execute("echo", params).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "echo:hello");
-        assert!(result.error.is_none());
+        assert!(result.ok());
+        assert_eq!(result.data(), "echo:hello");
+        assert!(result.error().is_none());
     }
 
     #[tokio::test]
@@ -1911,12 +1924,11 @@ mod tests {
         let params = HashMap::new();
 
         let result = registry.execute("nonexistent", params).await;
-        assert!(!result.ok);
-        assert!(result.data.contains("Error"));
-        assert!(result.data.contains("nonexistent"));
+        assert!(!result.ok());
+        assert!(result.data().contains("Error"));
+        assert!(result.data().contains("nonexistent"));
         assert!(result
-            .error
-            .as_deref()
+            .error()
             .unwrap_or_default()
             .contains("not found"));
     }
@@ -1933,8 +1945,8 @@ mod tests {
         );
 
         let result = registry.execute("wait", params).await;
-        assert!(result.ok, "{}", result.data);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "{}", result.data());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["action"], "wait");
         assert_eq!(parsed["task_id"], "abc123");
     }
@@ -1945,10 +1957,9 @@ mod tests {
         registry.register(Box::new(ParamEchoTool::new("spawn")));
 
         let result = registry.execute("spawn", HashMap::new()).await;
-        assert!(!result.ok);
+        assert!(!result.ok());
         assert!(result
-            .error
-            .as_deref()
+            .error()
             .unwrap_or_default()
             .contains("requires non-empty 'task'"));
     }
@@ -1965,10 +1976,9 @@ mod tests {
         );
 
         let result = registry.execute("spawn", params).await;
-        assert!(!result.ok);
+        assert!(!result.ok());
         assert!(result
-            .error
-            .as_deref()
+            .error()
             .unwrap_or_default()
             .contains("requires non-empty 'task_id'"));
     }
@@ -1985,8 +1995,8 @@ mod tests {
         );
 
         let result = registry.execute("web_search", params).await;
-        assert!(result.ok, "{}", result.data);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "{}", result.data());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["query"], "latest news");
     }
 
@@ -2002,8 +2012,8 @@ mod tests {
         );
 
         let result = registry.execute("read_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test.txt");
     }
 
@@ -2019,8 +2029,8 @@ mod tests {
         );
 
         let result = registry.execute("read_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test.txt");
     }
 
@@ -2036,8 +2046,8 @@ mod tests {
         );
 
         let result = registry.execute("read_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test.txt");
     }
 
@@ -2058,8 +2068,8 @@ mod tests {
         );
 
         let result = registry.execute("read_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/correct.txt");
     }
 
@@ -2079,8 +2089,8 @@ mod tests {
         );
 
         let result = registry.execute("write_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/out.txt");
     }
 
@@ -2100,8 +2110,8 @@ mod tests {
         );
 
         let result = registry.execute("write_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/out.txt");
     }
 
@@ -2117,8 +2127,8 @@ mod tests {
         );
 
         let result = registry.execute("edit_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/edit.txt");
     }
 
@@ -2134,8 +2144,8 @@ mod tests {
         );
 
         let result = registry.execute("edit_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/edit.txt");
     }
 
@@ -2151,8 +2161,8 @@ mod tests {
         );
 
         let result = registry.execute("list_dir", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp");
     }
 
@@ -2168,8 +2178,8 @@ mod tests {
         );
 
         let result = registry.execute("list_dir", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp");
     }
 
@@ -2185,8 +2195,8 @@ mod tests {
         );
 
         let result = registry.execute("list_dir", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp");
     }
 
@@ -2244,8 +2254,8 @@ mod tests {
         );
 
         let result = registry.execute_with_context("echo", params, &ctx).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "echo:world");
+        assert!(result.ok());
+        assert_eq!(result.data(), "echo:world");
     }
 
     #[tokio::test]
@@ -2265,8 +2275,8 @@ mod tests {
         let result = registry
             .execute_with_context("nonexistent", HashMap::new(), &ctx)
             .await;
-        assert!(!result.ok);
-        assert!(result.data.contains("not found"));
+        assert!(!result.ok());
+        assert!(result.data().contains("not found"));
     }
 
     #[test]
@@ -2407,11 +2417,11 @@ mod tests {
         // The tool is registered but not in definitions; execute() should still work.
         let result = registry.execute("unavailable_test", HashMap::new()).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Unavailable tool should still execute when called directly: {:?}",
-            result.error
+            result.error()
         );
-        assert_eq!(result.data, "executed");
+        assert_eq!(result.data(), "executed");
     }
 
     #[test]
@@ -2792,16 +2802,16 @@ mod tests {
         params.insert("name".to_string(), serde_json::json!("read_file"));
 
         let result = registry.execute("get_tools", params).await;
-        assert!(result.ok, "Inspect should succeed: {:?}", result.error);
+        assert!(result.ok(), "Inspect should succeed: {:?}", result.error());
         assert!(
-            result.data.contains("parameters"),
+            result.data().contains("parameters"),
             "Inspect result should contain parameters schema: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("value"),
+            result.data().contains("value"),
             "Schema should mention required param 'value': {}",
-            result.data
+            result.data()
         );
     }
 
@@ -2814,11 +2824,11 @@ mod tests {
         params.insert("name".to_string(), serde_json::json!("nonexistent"));
 
         let result = registry.execute("get_tools", params).await;
-        assert!(!result.ok, "Unknown tool inspect should fail");
+        assert!(!result.ok(), "Unknown tool inspect should fail");
         assert!(
-            result.data.contains("read_file"),
+            result.data().contains("read_file"),
             "Error should list available tools: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -2833,14 +2843,14 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Proxy dispatch should succeed: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("hello"),
+            result.data().contains("hello"),
             "Should contain dispatched tool output: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -2897,14 +2907,14 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "dispatch via tool_name/tool_args must succeed: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("via_tool_name"),
+            result.data().contains("via_tool_name"),
             "should contain dispatched tool output: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -2923,11 +2933,11 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "legacy name/args must still be accepted for back-compat: {:?}",
-            result.error
+            result.error()
         );
-        assert!(result.data.contains("legacy"));
+        assert!(result.data().contains("legacy"));
     }
 
     /// The model emitting flattened args with no tool selector MUST produce
@@ -2948,10 +2958,10 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "flattened-form without tool selector must fail (not silently succeed)"
         );
-        let err = result.error.as_deref().unwrap_or("");
+        let err = result.error().unwrap_or("");
         assert!(
             err.contains("tool_name"),
             "error must reference `tool_name` (the new parameter), got: {err}"
@@ -2984,11 +2994,11 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
 
-        assert!(result.ok, "large complete proxy write failed: {result:?}");
+        assert!(result.ok(), "large complete proxy write failed: {result:?}");
         assert!(
-            result.data.contains("Validate the published artifact"),
+            result.data().contains("Validate the published artifact"),
             "publication must require validation: {}",
-            result.data
+            result.data()
         );
         assert_eq!(std::fs::metadata(file_path).unwrap().len(), 4097);
     }
@@ -3013,8 +3023,8 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
 
-        assert!(!result.ok, "oversized state=more must be rejected");
-        assert!(result.data.contains("state=\"more\""), "{}", result.data);
+        assert!(!result.ok(), "oversized state=more must be rejected");
+        assert!(result.data().contains("state=\"more\""), "{}", result.data());
         assert!(!file_path.exists());
     }
 
@@ -3032,9 +3042,9 @@ mod tests {
         let result = registry.execute("write_file", params).await;
 
         assert!(
-            result.ok,
+            result.ok(),
             "proxy guard must not alter direct/cloud write_file calls: {:?}",
-            result.error
+            result.error()
         );
         assert_eq!(std::fs::metadata(file_path).unwrap().len(), 4097);
     }
@@ -3050,14 +3060,14 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Flattened proxy dispatch should succeed: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("latest"),
+            result.data().contains("latest"),
             "Flattened mode should be moved into args: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3072,19 +3082,19 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Stray metadata should not dispatch tool: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("\"parameters\""),
+            result.data().contains("\"parameters\""),
             "Stray metadata should leave proxy in inspect mode: {}",
-            result.data
+            result.data()
         );
         assert!(
-            !result.data.contains("read_file:default"),
+            !result.data().contains("read_file:default"),
             "Inspect mode must not execute the underlying tool: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3103,14 +3113,14 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Dispatch with alias should succeed: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("path"),
+            result.data().contains("path"),
             "Normalization should convert file_path to path: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3124,13 +3134,13 @@ mod tests {
 
         let result = registry.execute("get_tools", HashMap::new()).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Missing name should return success with tool list"
         );
         assert!(
-            result.data.contains("read_file"),
+            result.data().contains("read_file"),
             "Should list available tools: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3148,42 +3158,42 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "Missing tool_name with stray params should be FAILURE, not success catalog: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("'tool_name' is required"),
+            result.data().contains("'tool_name' is required"),
             "Error should mention tool_name is required: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("url"),
+            result.data().contains("url"),
             "Error should mention the stray parameter sent: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("web_fetch"),
+            result.data().contains("web_fetch"),
             "Error should list available tools including web_fetch: {}",
-            result.data
+            result.data()
         );
 
         // Case 2: Empty params (genuine discovery) → should still be SUCCESS with catalog.
         // This is the regression guard: the documented discovery path must work.
         let result = registry.execute("get_tools", HashMap::new()).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Empty params should return success with tool list (discovery path)"
         );
         assert!(
-            result.data.contains("Available tools:"),
+            result.data().contains("Available tools:"),
             "Should list available tools: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("web_fetch"),
+            result.data().contains("web_fetch"),
             "Should include web_fetch in tool list: {}",
-            result.data
+            result.data()
         );
 
         // Case 3: `args` present but no name. Observed in production — the model
@@ -3196,14 +3206,14 @@ mod tests {
         );
         let result = registry.execute("get_tools", params).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "args without tool_name must fail, not return the catalog: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("'tool_name' is required"),
+            result.data().contains("'tool_name' is required"),
             "{}",
-            result.data
+            result.data()
         );
 
         // Case 4: blank filler around an otherwise bare call is still discovery.
@@ -3212,9 +3222,9 @@ mod tests {
         params.insert("name".to_string(), serde_json::Value::Null);
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok && result.data.contains("Available tools:"),
+            result.ok() && result.data().contains("Available tools:"),
             "empty args/null name is a bare discovery call: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3232,22 +3242,22 @@ mod tests {
         registry.register(Box::new(MockTool::new("read_file")));
 
         let result = registry.execute("get_tools", HashMap::new()).await;
-        assert!(result.ok, "discovery must succeed: {:?}", result.data);
+        assert!(result.ok(), "discovery must succeed: {:?}", result.data());
         assert!(
-            result.data.contains("Available tools:"),
+            result.data().contains("Available tools:"),
             "catalog must still list tools: {}",
-            result.data
+            result.data()
         );
         // The actionable hint: the model must learn, from THIS result, that
         // passing tool_name yields a schema. A flat "Available tools: a, b"
         // alone does not break the identical-retry loop.
         assert!(
-            result.data.contains("tool_name")
-                && (result.data.contains("schema")
-                    || result.data.contains("inspect")
-                    || result.data.contains("parameters")),
+            result.data().contains("tool_name")
+                && (result.data().contains("schema")
+                    || result.data().contains("inspect")
+                    || result.data().contains("parameters")),
             "catalog must direct the model to the inspect path (tool_name → schema): {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3337,20 +3347,20 @@ mod tests {
 
         let result = registry.execute("require_query", HashMap::new()).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "tool must still report failure (no silent success)"
         );
         // The corrective shape, derived from the schema's required params:
         assert!(
-            result.data.contains("Call as require_query({\"query\":\"...\"})"),
+            result.data().contains("Call as require_query({\"query\":\"...\"})"),
             "missing-arg error must echo the schema-derived worked example: {}",
-            result.data
+            result.data()
         );
         // The original error text is preserved (augmented, not replaced):
         assert!(
-            result.data.contains("'query' parameter is required"),
+            result.data().contains("'query' parameter is required"),
             "augmentation must preserve the original error: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3381,15 +3391,13 @@ mod tests {
                 &self,
                 _: HashMap<String, serde_json::Value>,
             ) -> ToolExecutionResult {
-                ToolExecutionResult {
-                    ok: false,
-                    data: "Error: provide facts".to_string(),
-                    error: None,
-                    error_kind: Some(crate::errors::ToolErrorKind::MissingArg {
+                ToolExecutionResult::failure_with_kind(
+                    "Error: provide facts".to_string(),
+                    crate::errors::ToolErrorKind::MissingArg {
                         param: "facts".to_string(),
                         example: r#"structured_missing_arg({"facts":["..."]})"#.to_string(),
-                    }),
-                }
+                    },
+                )
             }
         }
 
@@ -3399,11 +3407,11 @@ mod tests {
         let result = registry
             .execute("structured_missing_arg", HashMap::new())
             .await;
-        assert!(!result.ok, "must still report failure");
+        assert!(!result.ok(), "must still report failure");
         assert!(
-            result.data.contains(r#"Call as structured_missing_arg({"facts":["..."]})"#),
+            result.data().contains(r#"Call as structured_missing_arg({"facts":["..."]})"#),
             "structural MissingArg must append the example from error_kind: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3419,14 +3427,14 @@ mod tests {
 
         let result = registry.execute("tool", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Proxy intercept via execute() should work: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("test"),
+            result.data().contains("test"),
             "Should dispatch to real tool: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3441,14 +3449,14 @@ mod tests {
 
         let result = registry.execute("mock_tool", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Direct call should still work: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("direct"),
+            result.data().contains("direct"),
             "Should get direct tool output: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3546,8 +3554,8 @@ mod tests {
         registry.register(Box::new(ExecuteTool));
 
         let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(!result.ok);
-        assert!(result.data.contains("Permission denied"));
+        assert!(!result.ok());
+        assert!(result.data().contains("Permission denied"));
     }
 
     #[tokio::test]
@@ -3556,8 +3564,8 @@ mod tests {
         registry.register(Box::new(ExecuteTool));
 
         let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "executed");
+        assert!(result.ok());
+        assert_eq!(result.data(), "executed");
     }
 
     #[tokio::test]
@@ -3566,7 +3574,7 @@ mod tests {
         registry.register(Box::new(ExecuteTool));
 
         let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(result.ok);
+        assert!(result.ok());
     }
 
     #[test]

@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+)]
 //! Tool execution engine: delegated and inline paths.
 //!
 //! Extracted from `agent_loop.rs` to isolate tool execution logic.
@@ -689,15 +700,19 @@ pub(crate) async fn execute_tools_delegated(
                 // Small data — raw injection is safe; compaction won't truncate it.
                 ctx.content_gate.admit_simple(full_data).into_text()
             }
-        } else if ctx.core.specialist_provider.is_some() && full_tokens > threshold {
-            ctx.content_gate
-                .admit_with_specialist(
-                    full_data,
-                    ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
-                    ctx.core.specialist_model.as_deref().unwrap_or(""),
-                )
-                .await
-                .into_text()
+        } else if full_tokens > threshold {
+            if let Some(specialist) = ctx.core.specialist_provider.as_ref() {
+                ctx.content_gate
+                    .admit_with_specialist(
+                        full_data,
+                        specialist.as_ref(),
+                        ctx.core.specialist_model.as_deref().unwrap_or(""),
+                    )
+                    .await
+                    .into_text()
+            } else {
+                ctx.content_gate.admit_simple(full_data).into_text()
+            }
         } else {
             ctx.content_gate.admit_simple(full_data).into_text()
         };
@@ -900,7 +915,7 @@ struct SingleToolResult {
 }
 
 fn completed_reportable_tool(result: &SingleToolResult) -> Option<&str> {
-    if !result.result.ok || !requires_result_report(&result.tool_name) {
+    if !result.result.ok() || !requires_result_report(&result.tool_name) {
         return None;
     }
     if result.tool_name == "write_file"
@@ -1044,12 +1059,12 @@ async fn execute_single_tool(
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        tracing::Span::current().record("ok", result.ok);
+        tracing::Span::current().record("ok", result.ok());
         debug!(
             "Tool {} result ({}B, ok={}, {}ms)",
             tc.name,
-            result.data.len(),
-            result.ok,
+            result.data().len(),
+            result.ok(),
             duration_ms
         );
 
@@ -1138,9 +1153,9 @@ async fn inject_tool_result(
     // For web_fetch/web_search: unwrap the JSON envelope so the model
     // sees clean article text rather than a JSON metadata summary.
     let result_data = if r.tool_name == "web_fetch" || r.tool_name == "web_search" {
-        crate::agent::tools::web::extract_web_content(&r.result.data)
+        crate::agent::tools::web::extract_web_content(r.result.data())
     } else {
-        r.result.data.clone()
+        r.result.data().to_string()
     };
 
     // Gate tool result through context budget.
@@ -1200,15 +1215,20 @@ async fn inject_tool_result(
                 return;
             }
         };
-        let summarized = ctx
-            .content_gate
-            .admit_with_specialist(
-                &result_data,
-                ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
-                ctx.core.specialist_model.as_deref().unwrap_or(""),
-            )
-            .await
-            .into_text();
+        let summarized = match ctx.core.specialist_provider.as_ref() {
+            Some(specialist) => ctx
+                .content_gate
+                .admit_with_specialist(
+                    &result_data,
+                    specialist.as_ref(),
+                    ctx.core.specialist_model.as_deref().unwrap_or(""),
+                )
+                .await
+                .into_text(),
+            // Defensive: the caller previously panicked here if the provider
+            // was None; fall back to the simple admit instead.
+            None => ctx.content_gate.admit_simple(&result_data).into_text(),
+        };
         let mut preview =
             build_tool_result_preview(&r.tool_name, &r.arguments, &summarized, cap, &r.tool_id);
         // If the summary fit under cap, build_tool_result_preview returned it
@@ -1247,7 +1267,7 @@ async fn inject_tool_result(
             let handle = render_tool_result_handle(
                 &r.tool_id,
                 &r.tool_name,
-                r.result.ok,
+                r.result.ok(),
                 result_data.as_bytes(),
                 &r.arguments,
             );
@@ -1274,7 +1294,7 @@ async fn inject_tool_result(
             &r.tool_id,
             &r.tool_name,
             &data,
-            r.result.ok,
+            r.result.ok(),
         );
     } else {
         ContextBuilder::add_tool_result_with_status(
@@ -1282,7 +1302,7 @@ async fn inject_tool_result(
             &r.tool_id,
             &r.tool_name,
             &data,
-            r.result.ok,
+            r.result.ok(),
         );
     }
     ctx.persist_pending_protocol_messages().await;
@@ -1290,7 +1310,7 @@ async fn inject_tool_result(
         &r.tool_name,
         &r.arguments,
         data.clone(),
-        r.result.ok,
+        r.result.ok(),
     );
 
     // Emit CallEnd.
@@ -1298,8 +1318,8 @@ async fn inject_tool_result(
         let _ = tx.send(ToolEvent::CallEnd {
             tool_name: r.tool_name.clone(),
             tool_call_id: r.tool_id.clone(),
-            result_data: r.result.data.clone(),
-            ok: r.result.ok,
+            result_data: r.result.data().to_string(),
+            ok: r.result.ok(),
             duration_ms: r.duration_ms,
         });
     }
@@ -1311,8 +1331,8 @@ async fn inject_tool_result(
             &r.tool_name,
             &r.tool_id,
             &args_value,
-            &r.result.data,
-            r.result.ok,
+            r.result.data(),
+            r.result.ok(),
             r.duration_ms,
             "inline",
         );
@@ -1335,9 +1355,9 @@ async fn inject_tool_result(
         .push(crate::agent::audit::TurnToolEntry {
             name: r.tool_name.clone(),
             id: r.tool_id.clone(),
-            ok: r.result.ok,
+            ok: r.result.ok(),
             duration_ms: r.duration_ms,
-            result_chars: r.result.data.len(),
+            result_chars: r.result.data().len(),
         });
 
     // NOTE: response-boundary arming is NOT done here. This function sees only
@@ -2180,7 +2200,7 @@ mod tests {
         };
         for _ in 0..2 {
             let result = execute_single_tool(&staged, &registry, &None, &None, 60, None).await;
-            assert!(result.result.ok, "{:?}", result.result.error);
+            assert!(result.result.ok(), "{:?}", result.result.error());
         }
 
         let final_piece = ToolCallRequest {
@@ -2193,7 +2213,7 @@ mod tests {
             ]),
         };
         let result = execute_single_tool(&final_piece, &registry, &None, &None, 60, None).await;
-        assert!(result.result.ok, "{:?}", result.result.error);
+        assert!(result.result.ok(), "{:?}", result.result.error());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "once-done");
     }
 
@@ -2361,9 +2381,9 @@ mod tests {
             gate.cancel();
         };
         let (results, ()) = tokio::join!(execution, release);
-        assert!(!results[0].result.ok);
-        assert!(results[1].result.ok);
-        assert!(results[2].result.ok);
+        assert!(!results[0].result.ok());
+        assert!(results[1].result.ok());
+        assert!(results[2].result.ok());
     }
 
     #[tokio::test]
@@ -2439,10 +2459,10 @@ mod tests {
             state.started.load(Ordering::SeqCst),
             MAX_PARALLEL_TOOL_CALLS
         );
-        assert!(results.iter().all(|result| !result.result.ok));
+        assert!(results.iter().all(|result| !result.result.ok()));
         assert!(results
             .iter()
-            .all(|result| result.result.data.contains("cancelled")));
+            .all(|result| result.result.data().contains("cancelled")));
     }
 
     #[test]

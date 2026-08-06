@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+)]
 //! Native Anthropic Messages API provider.
 //!
 //! Speaks the Anthropic Messages API (`POST /v1/messages`) directly, translating
@@ -5,6 +16,7 @@
 //! Anthropic-native format. Used with OAuth tokens from Claude Max subscriptions
 //! where the OpenAI-compat endpoint doesn't work.
 
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -861,7 +873,7 @@ async fn parse_anthropic_sse(
                     let mut indices: Vec<u64> = tool_blocks.keys().copied().collect();
                     indices.sort();
                     for idx in indices {
-                        let (id, name, args_str) = tool_blocks.remove(&idx).unwrap();
+                        let Some((id, name, args_str)) = tool_blocks.remove(&idx) else { continue; };
                         let arguments: HashMap<String, Value> =
                             serde_json::from_str(&args_str).unwrap_or_default();
                         tool_calls.push(ToolCallRequest {
@@ -895,7 +907,7 @@ async fn parse_anthropic_sse(
     let mut indices: Vec<u64> = tool_blocks.keys().copied().collect();
     indices.sort();
     for idx in indices {
-        let (id, name, args_str) = tool_blocks.remove(&idx).unwrap();
+        let Some((id, name, args_str)) = tool_blocks.remove(&idx) else { continue; };
         let arguments: HashMap<String, Value> = serde_json::from_str(&args_str).unwrap_or_default();
         tool_calls.push(ToolCallRequest {
             id,

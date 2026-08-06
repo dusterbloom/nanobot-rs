@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+    clippy::string_add,
+)]
 //! Conversation protocol — renders canonical `Turn` history to LLM wire format.
 //!
 //! Two implementations:
@@ -28,6 +39,7 @@ use crate::agent::model_capabilities::{lookup_default, ModelSizeClass};
 // `[Calling tool: ...]` bracket. Captures the inner content.
 // The alternation handles both past tense (called/calling) and the extra "tool"
 // word that local models sometimes insert.
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static TEXTUAL_CALL_OUTER_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\[(?:I\s+)?call(?:ed|ing)(?:\s+tool)?[:\s]\s*(.*?)\]")
         .expect("textual call outer regex")
@@ -36,6 +48,7 @@ static TEXTUAL_CALL_OUTER_RE: Lazy<Regex> = Lazy::new(|| {
 // Matches a single `tool_name({...})` pair within the inner content.
 // The format rendered by TextualReplay is: tool_name({"arg": "val"})
 // Captures: (1) tool name, (2) JSON args string (including the braces)
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static TEXTUAL_CALL_ITEM_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(\w+)\s*\(\s*(\{[^}]*(?:\{[^}]*\}[^}]*)?\})\s*\)")
         .expect("textual call item regex")
@@ -471,6 +484,7 @@ pub fn strip_textual_tool_calls(content: &str) -> String {
 // ─────────────────────────────────────────────────────────────
 
 // Matches `<tool_call>...</tool_call>` blocks (possibly multiline).
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static XML_TOOL_CALL_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?si)<tool_call>\s*(.*?)\s*</tool_call>").expect("xml tool_call block regex")
 });
@@ -481,12 +495,14 @@ static XML_TOOL_CALL_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
 // the function name, producing fragments like `<function=list_dir\n</function>`.
 // A permissive `[^">]+` capture turns that into a real tool name and leaks XML
 // into the tool engine/TUI.
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static XML_FUNCTION_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)<function(?:=|\s+name=)"?([A-Za-z_][A-Za-z0-9_]*)"?\s*>"#)
         .expect("xml function name regex")
 });
 
 // Extracts `<parameter=KEY>VALUE</parameter>` pairs.
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static XML_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?si)<parameter=(\w+)>\s*(.*?)\s*</parameter>"#).expect("xml parameter regex")
 });

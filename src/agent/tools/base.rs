@@ -61,16 +61,49 @@ pub enum ToolConcurrency {
 }
 
 /// Structured outcome for a tool invocation.
+///
+/// Invariant: `ok == true` implies `error.is_none()`, and every failure
+/// carries a model-visible `Error: ...` string in `data`. The fields are
+/// private so the invariant cannot be violated from outside this module —
+/// the only ways to build a value are the constructors (all `#[must_use]`)
+/// and the `From<ToolResult>` conversion introduced with the typed error
+/// protocol. Readers use the accessors.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionResult {
-    pub ok: bool,
-    pub data: String,
-    pub error: Option<String>,
+    ok: bool,
+    data: String,
+    error: Option<String>,
     /// Structured error classification when available.
-    pub error_kind: Option<crate::errors::ToolErrorKind>,
+    error_kind: Option<crate::errors::ToolErrorKind>,
 }
 
 impl ToolExecutionResult {
+    /// Whether the tool call succeeded.
+    #[must_use]
+    pub fn ok(&self) -> bool {
+        self.ok
+    }
+
+    /// The model-facing output text. On failure this carries the rendered
+    /// `Error: ...` wire string.
+    #[must_use]
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+
+    /// The failure detail, when this is a failure.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// The structured error classification, when known.
+    #[must_use]
+    pub fn error_kind(&self) -> Option<&crate::errors::ToolErrorKind> {
+        self.error_kind.as_ref()
+    }
+
+    #[must_use]
     pub fn success(data: String) -> Self {
         Self {
             ok: true,
@@ -81,26 +114,30 @@ impl ToolExecutionResult {
     }
 
     /// Whether this result represents a retryable (transient) error.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         self.error_kind.as_ref().map_or(false, |k| k.is_retryable())
     }
 
-    /// Map a raw tool output string to a structured result.
-    /// Outputs starting with `Error:` are treated as failures.
-    pub fn from_output(out: String) -> Self {
-        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
-            let error_kind = crate::errors::classify_tool_error(&err);
-            Self {
-                ok: false,
-                data: out,
-                error: Some(err),
-                error_kind,
-            }
-        } else {
-            Self::success(out)
+    /// Build a failure from a message plus a structural classification.
+    ///
+    /// The `data` is the full model-visible string (already `Error:`-prefixed);
+    /// `error_kind` is produced at the source instead of by substring
+    /// classification. Transitional: used by the legacy registry
+    /// example-append path until Phase 3 deletes the legacy channel.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn failure_with_kind(data: String, error_kind: crate::errors::ToolErrorKind) -> Self {
+        Self {
+            ok: false,
+            data,
+            error: None,
+            error_kind: Some(error_kind),
         }
     }
 
+    #[must_use]
+    #[allow(clippy::disallowed_methods)] // legacy constructor — deleted in Phase 3
     pub fn failure(message: String) -> Self {
         let error_kind = crate::errors::classify_tool_error(&message);
         Self {
@@ -108,6 +145,47 @@ impl ToolExecutionResult {
             data: format!("Error: {}", message),
             error: Some(message),
             error_kind,
+        }
+    }
+
+    /// Append a corrective worked example to a failure's model-visible text
+    /// (the registry's MissingArg path: `"... is required. Call as X."`).
+    /// Only meaningful on failures.
+    pub fn append_worked_example(&mut self, example: &str) {
+        let base = self.data.trim_end_matches('.');
+        self.data = format!("{}. Call as {}.", base, example);
+    }
+}
+
+/// The typed success payload of a tool call (error protocol, §2.2).
+///
+/// A plain struct rather than `String` so the registry can attach audit
+/// metadata later without a breaking change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutput {
+    /// The model-facing text. May carry `TOOL_RESULT_HANDLE v1` receipts,
+    /// `[truncated: …]` markers, or raw output.
+    pub text: String,
+}
+
+/// The one result type of the tool layer.
+pub type ToolResult = Result<ToolOutput, crate::errors::ToolError>;
+
+impl From<ToolResult> for ToolExecutionResult {
+    fn from(r: ToolResult) -> Self {
+        match r {
+            Ok(out) => ToolExecutionResult {
+                ok: true,
+                data: out.text,
+                error: None,
+                error_kind: None,
+            },
+            Err(e) => ToolExecutionResult {
+                ok: false,
+                data: e.render(),
+                error: Some(e.to_string()),
+                error_kind: crate::errors::legacy_kind_from_tool_error(&e),
+            },
         }
     }
 }
@@ -143,18 +221,6 @@ pub trait Tool: Send + Sync {
     /// Returns the result as a string.
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String;
 
-    /// Execute and return a structured outcome.
-    ///
-    /// Tools can override this to report explicit success/failure semantics.
-    /// The default implementation keeps backward compatibility and maps
-    /// `Error:`-prefixed outputs to failures.
-    async fn execute_with_result(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-    ) -> ToolExecutionResult {
-        ToolExecutionResult::from_output(self.execute(params).await)
-    }
-
     /// Execute the tool with an execution context for progress reporting
     /// and cancellation.
     ///
@@ -170,16 +236,55 @@ pub trait Tool: Send + Sync {
         self.execute(params).await
     }
 
+    /// Execute and return the typed outcome (error protocol, Phase 1 —
+    /// additive). This is the migration seam: tools land on `ToolResult` by
+    /// overriding this method and building [`crate::errors::ToolError`]
+    /// variants at their failure sites.
+    ///
+    /// The default implementation funnels the legacy `String` channel through
+    /// [`crate::errors::ToolError::from_legacy`] so every unmigrated tool
+    /// keeps working — and keeps producing byte-identical `Error: ...` wire
+    /// strings — with no changes.
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolExecutionContext,
+    ) -> ToolResult {
+        let out = self.execute_with_context(params, ctx).await;
+        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+            Err(crate::errors::ToolError::from_legacy(&err))
+        } else {
+            Ok(ToolOutput { text: out })
+        }
+    }
+
+    /// Execute and return a structured outcome.
+    ///
+    /// Default renders the typed [`execute_typed`] result into the legacy
+    /// structured shape (`From<ToolResult> for ToolExecutionResult`).
+    async fn execute_with_result(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+    ) -> ToolExecutionResult {
+        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolExecutionContext {
+            event_tx,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tool_call_id: String::new(),
+        };
+        ToolExecutionResult::from(self.execute_typed(params, &ctx).await)
+    }
+
     /// Like [`execute_with_result`] but with an execution context.
     ///
-    /// Default delegates to [`execute_with_context`] and maps `Error:`-prefixed
-    /// outputs to failures, same as [`execute_with_result`].
+    /// Default renders the typed [`execute_typed`] result into the legacy
+    /// structured shape.
     async fn execute_with_result_and_context(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolExecutionContext,
     ) -> ToolExecutionResult {
-        ToolExecutionResult::from_output(self.execute_with_context(params, ctx).await)
+        ToolExecutionResult::from(self.execute_typed(params, ctx).await)
     }
 
     /// The permission level required to execute this tool.
@@ -334,9 +439,9 @@ mod tests {
             serde_json::Value::String("hello".to_string()),
         );
         let result = tool.execute_with_result(params).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "executed with: hello");
-        assert!(result.error.is_none());
+        assert!(result.ok());
+        assert_eq!(result.data(), "executed with: hello");
+        assert!(result.error().is_none());
     }
 
     #[tokio::test]
@@ -361,9 +466,12 @@ mod tests {
 
         let tool = ErrorTool;
         let result = tool.execute_with_result(HashMap::new()).await;
-        assert!(!result.ok);
-        assert_eq!(result.data, "Error: bad input");
-        assert_eq!(result.error.as_deref(), Some("bad input"));
+        assert!(!result.ok());
+        // Wire string stays byte-identical through the typed funnel.
+        assert_eq!(result.data(), "Error: bad input");
+        // The `error` field now carries the typed Display (internal channel);
+        // the model-visible string is `data()` (rendered).
+        assert_eq!(result.error(), Some("Execution failed: bad input"));
     }
 
     #[tokio::test]
@@ -412,8 +520,8 @@ mod tests {
         );
 
         let result = tool.execute_with_result_and_context(params, &ctx).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "executed with: test");
+        assert!(result.ok());
+        assert_eq!(result.data(), "executed with: test");
     }
 
     #[test]

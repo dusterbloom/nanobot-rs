@@ -1,3 +1,11 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::shadow_reuse,
+)]
 /// Strip tool output to reduce token usage before storing in context.
 ///
 /// Handles three content types:
@@ -12,25 +20,30 @@ pub fn strip_tool_output(text: &str) -> String {
     use regex::Regex;
 
     // CSS class tokens like css-1abc234 (at least 6 trailing alphanumeric chars).
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static CSS_CLASS_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"\bcss-[0-9a-zA-Z]{6,}\b").expect("invalid css class regex"));
 
     // Bare navigation URLs: http(s) URLs that are at least 40 chars and appear alone on a line.
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static NAV_URL_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"(?m)^\s*https?://\S{30,}\s*$").expect("invalid nav url regex"));
 
     // Pipe-separated nav bars, e.g. "Home | News | Sport | Business".
     // Require at least two pipe-separated tokens of 2-30 word chars/spaces each.
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static NAV_BAR_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(r"(?m)^[\w][\w ]{1,29}(?:\s*\|\s*[\w][\w ]{1,29}){2,}\s*$")
             .expect("invalid nav bar regex")
     });
 
     // Three or more consecutive blank lines.
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static EXCESS_BLANK_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"\n{3,}").expect("invalid blank line regex"));
 
     // HTML tags.
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static HTML_TAG_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"<[^>]{1,200}>").expect("invalid html tag regex"));
 
@@ -125,6 +138,7 @@ pub fn sanitize_reasoning_output(content: &str) -> String {
     use once_cell::sync::Lazy;
     use regex::Regex;
 
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static THINK_RE: Lazy<Regex> = Lazy::new(|| {
         // (?s) enables dotall so `.` matches newlines (multiline think blocks).
         // .*? is lazy to avoid eating content between two separate blocks.

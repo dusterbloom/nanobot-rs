@@ -10,10 +10,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::{require_str, PermissionLevel, Tool};
+use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolOutput, ToolResult};
+use crate::errors::ToolError;
 use crate::bus::events::OutboundMessage;
 
 /// Type alias for the send callback.
+#[allow(clippy::disallowed_types)] // anyhow at the callback boundary — replaced by MessageHost (host bridge, Topic 2)
 pub type SendCallback =
     Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
@@ -85,8 +87,28 @@ impl Tool for MessageTool {
         })
     }
 
+    /// Legacy string entry point — thin render-wrapped call into the typed
+    /// path (error protocol Phase 2 migration).
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let content = require_str!(params, "content").to_string();
+        self.execute_with_result(params).await.data().to_string()
+    }
+
+    /// Typed entry point: builds [`crate::errors::ToolError`] variants at
+    /// every failure site.
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolExecutionContext,
+    ) -> ToolResult {
+        let content = match params.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => {
+                return Err(ToolError::MissingArg {
+                    param: "content".to_string(),
+                    example: r#"message({"content":"hello"})"#.to_string(),
+                })
+            }
+        };
 
         let default_channel = self.default_channel.lock().await.clone();
         let default_chat_id = self.default_chat_id.lock().await.clone();
@@ -106,13 +128,19 @@ impl Tool for MessageTool {
             .unwrap_or(default_chat_id);
 
         if channel.is_empty() || chat_id.is_empty() {
-            return "Error: No target channel/chat specified".to_string();
+            return Err(ToolError::Execution {
+                message: "No target channel/chat specified".to_string(),
+            });
         }
 
         let callback_guard = self.send_callback.lock().await;
         let callback = match callback_guard.as_ref() {
             Some(cb) => cb.clone(),
-            None => return "Error: Message sending not configured".to_string(),
+            None => {
+                return Err(ToolError::Execution {
+                    message: "Message sending not configured".to_string(),
+                })
+            }
         };
         // Drop the lock before awaiting the callback.
         drop(callback_guard);
@@ -120,8 +148,12 @@ impl Tool for MessageTool {
         let msg = OutboundMessage::new(&channel, &chat_id, &content);
 
         match callback(msg).await {
-            Ok(()) => format!("Message sent to {}:{}", channel, chat_id),
-            Err(e) => format!("Error sending message: {}", e),
+            Ok(()) => Ok(ToolOutput {
+                text: format!("Message sent to {}:{}", channel, chat_id),
+            }),
+            Err(e) => Err(ToolError::Execution {
+                message: format!("Error sending message: {}", e),
+            }),
         }
     }
 }

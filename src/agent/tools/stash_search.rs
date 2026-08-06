@@ -1,3 +1,13 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::shadow_reuse,
+)]
 //! Bounded retrieval over stashed (truncated) tool results.
 //!
 //! Large tool outputs are stashed to SQLite and reduced to a head+tail preview

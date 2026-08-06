@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+)]
 //! SQLite-backed session store.
 //!
 //! Replaces the JSONL `SessionManager` with a single SQLite database
@@ -362,6 +373,7 @@ impl SessionDb {
     /// Open (or create) the database at `db_path`.
     ///
     /// Enables WAL journal mode and creates the schema on first run.
+    #[allow(clippy::panic)] // session-DB open is a hard startup failure; callers treat it as fatal
     pub fn new(db_path: &Path) -> Self {
         let conn = Connection::open(db_path).unwrap_or_else(|e| {
             panic!("Failed to open session DB at {}: {}", db_path.display(), e)
@@ -666,14 +678,14 @@ impl SessionDb {
     /// List sessions updated within a time range.
     pub async fn list_sessions_since(&self, since: &str, limit: usize) -> Vec<SessionMeta> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, session_key, created_at, updated_at, message_count \
-                 FROM sessions WHERE updated_at >= ?1 \
-                 ORDER BY updated_at DESC LIMIT ?2",
-            )
-            .unwrap();
-        stmt.query_map(params![since, limit as i64], |row| {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, session_key, created_at, updated_at, message_count \
+             FROM sessions WHERE updated_at >= ?1 \
+             ORDER BY updated_at DESC LIMIT ?2",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(params![since, limit as i64], |row| {
             Ok(SessionMeta {
                 id: row.get(0)?,
                 session_key: row.get(1)?,
@@ -687,10 +699,10 @@ impl SessionDb {
                     .unwrap_or_else(|_| Utc::now()),
                 message_count: row.get::<_, i64>(4)? as usize,
             })
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     /// Delete one session and every derived/persisted row that belongs to it.
@@ -2252,6 +2264,12 @@ fn reconstruct_message(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+// Narrow per-test-module escape hatch (research doc §3.6): the two
+// `unreachable!()` assertions below assert exhaustive-match invariants in
+// import tests. The crate-root test hatch no longer exempts
+// `clippy::unreachable` (it masks incomplete coverage); this module's tests
+// still use it legitimately, so it is allowed here alone.
+#[allow(clippy::unreachable)]
 mod tests {
     use super::*;
     use crate::agent::lcm::ManifestItem;

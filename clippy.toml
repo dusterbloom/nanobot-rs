@@ -11,3 +11,19 @@ cognitive-complexity-threshold = 15
 
 # G4: Grow -> Split — function length limit (default 100, we want 60)
 too-many-lines-threshold = 60
+
+# Error-protocol enforcement layer 2 (docs/research/2026-08-06-error-conventions-and-host-bridge.md §2.5):
+# ban the legacy string-error channel and anyhow at tool boundaries.
+disallowed-methods = [
+    # The legacy string-error adapter (deleted in the error-protocol migration).
+    # New code must construct ToolError variants; rendering happens once, at
+    # the registry boundary.
+    { path = "crate::agent::tools::base::ToolExecutionResult::from_output", reason = "legacy string-error adapter — migrate to ToolResult" },
+    # Substring classification is fragile; return typed ToolError variants.
+    { path = "crate::errors::classify_tool_error", reason = "string classification — produce ToolError at the source" },
+]
+
+disallowed-types = [
+    # No anyhow at the tool boundary.
+    { path = "anyhow::Error", reason = "tool layer must return ToolResult; convert at the edge" },
+]

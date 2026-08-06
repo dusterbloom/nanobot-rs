@@ -1,3 +1,15 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+)]
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 #![allow(dead_code)]
 //! Subagent manager for background task execution.
 //!
@@ -653,10 +665,8 @@ impl SubagentManager {
         // Find the task and subscribe to its result channel.
         let mut rx = {
             let tasks = self.running_tasks.lock().await;
-            let key = tasks.keys().find(|k| k.starts_with(task_id)).cloned();
-            match key {
-                Some(k) => {
-                    let (info, _, result_tx) = tasks.get(&k).unwrap();
+            match tasks.iter().find(|(k, _)| k.starts_with(task_id)) {
+                Some((k, (info, _, result_tx))) => {
                     // Check if already finished (JoinHandle done but not yet cleaned up).
                     debug!("Waiting for subagent {} ({})", info.label, k);
                     result_tx.subscribe()

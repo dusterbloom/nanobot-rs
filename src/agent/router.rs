@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+)]
 //! Router decision parsing and dispatch functions.
 //!
 //! Extracted from `agent_loop.rs` to isolate routing logic into a focused module.
@@ -767,7 +778,7 @@ pub(crate) async fn dispatch_subagent(
         return Ok(format!("[tool-guard] {}", e));
     }
     let spawn_result = tools.execute("spawn", params).await;
-    Ok(format!("[router:subagent] {}", spawn_result.data))
+    Ok(format!("[router:subagent] {}", spawn_result.data()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,10 +1145,10 @@ pub(crate) async fn router_preflight(
             let tr = ctx.tools.execute(&decision.target, params_map).await;
             if ctx.core.trace_log {
                 let mut trace = base_trace.clone();
-                trace.outcome = Some(tr.data.clone());
+                trace.outcome = Some(tr.data().to_string());
                 append_router_decision_trace(&trace);
             }
-            let content = extract_tool_content(&tr.data);
+            let content = extract_tool_content(tr.data());
             let truncated = truncate_tool_result(
                 &content,
                 ctx.core
@@ -1216,10 +1227,10 @@ pub(crate) async fn router_preflight(
             let tr = ctx.tools.execute("spawn", params).await;
             if ctx.core.trace_log {
                 let mut trace = base_trace.clone();
-                trace.outcome = Some(tr.data.clone());
+                trace.outcome = Some(tr.data().to_string());
                 append_router_decision_trace(&trace);
             }
-            let content = extract_tool_content(&tr.data);
+            let content = extract_tool_content(tr.data());
             let truncated = truncate_tool_result(
                 &content,
                 ctx.core
