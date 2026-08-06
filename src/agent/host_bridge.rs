@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_path_matches_legacy_message_tool_output() {
+    async fn dispatcher_over_adapter_matches_legacy_message_output() {
         let (_, _, _, _, _, _, _, send) = legacy_callbacks();
         let adapter = Arc::new(HostBridgeAdapter::new(
             None, None, None, None, None, None, None, Some(send.clone()),
@@ -1075,11 +1075,6 @@ mod tests {
             adapter.clone(),
         );
 
-        let legacy_tool = MessageTool::new(Some(send), "telegram", "42");
-        let mut p = HashMap::new();
-        p.insert("content".to_string(), json!("hi"));
-        let legacy = legacy_tool.execute(p).await;
-
         let reply = dispatcher
             .dispatch(HostRequest::SendMessage(SendMessageRequest {
                 channel: "telegram".to_string(),
@@ -1087,7 +1082,32 @@ mod tests {
                 content: "hi".to_string(),
             }))
             .await;
-        assert_eq!(reply_text(&reply), legacy, "message text diverged");
+        // The pre-bridge MessageTool wire format, unchanged.
+        assert_eq!(reply_text(&reply), "Message sent to telegram:42");
+    }
+
+    #[tokio::test]
+    async fn message_tool_through_bridge_matches_legacy_output() {
+        let host: Arc<dyn MessageHost> = Arc::new(LegacyWireHost);
+        let tool = MessageTool::new(host, "telegram", "42");
+
+        let mut p = HashMap::new();
+        p.insert("content".to_string(), json!("hi"));
+        assert_eq!(tool.execute(p).await, "Message sent to telegram:42");
+
+        // Per-call channel/chat overrides win over the baked defaults.
+        let mut p = HashMap::new();
+        p.insert("content".to_string(), json!("hi"));
+        p.insert("channel".to_string(), json!("discord"));
+        p.insert("chat_id".to_string(), json!("999"));
+        assert_eq!(tool.execute(p).await, "Message sent to discord:999");
+
+        // Missing content → the exact legacy MissingArg wire string.
+        let p = HashMap::new();
+        assert_eq!(
+            tool.execute(p).await,
+            "Error: 'content' parameter is required; call as message({\"content\":\"hello\"})"
+        );
     }
 
     // -----------------------------------------------------------------------

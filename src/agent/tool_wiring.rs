@@ -34,7 +34,6 @@ use crate::agent::pipeline;
 use crate::agent::policy;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
-use crate::agent::tools::message::SendCallback;
 use crate::agent::tools::{
     CheckInboxTool, CronScheduleTool, MessageTool, SendEmailTool, SpawnTool, SpawnToolLite,
     TodoTool,
@@ -290,7 +289,12 @@ impl MessageHost for AgentHost {
         self.outbound
             .send(msg)
             .map_err(|e| ToolError::Execution {
-                message: format!("Error sending message: {e}"),
+                // Byte-identical to the legacy send closure: it wrapped the
+                // bus error in anyhow as "Failed to send outbound message: {e}"
+                // and the old MessageTool prefixed "Error sending message: ".
+                // The merged host must reproduce both prefixes so the model
+                // sees the same string after the message swap.
+                message: format!("Error sending message: Failed to send outbound message: {e}"),
             })?;
         Ok(SendMessageReply {
             text: format!("Message sent to {}:{}", req.channel, req.chat_id),
@@ -343,21 +347,6 @@ impl AgentLoopShared {
         };
         let mut tools = ToolRegistry::with_standard_tools(&tool_config);
 
-        // Direct UI channels already reply through `finalize_response`; exposing
-        // `message` there gives models a second, failure-prone way to answer.
-        if should_register_message_tool(channel) {
-            let outbound_tx_clone = self.bus_outbound_tx.clone();
-            let send_cb: SendCallback = Arc::new(move |msg: OutboundMessage| {
-                let tx = outbound_tx_clone.clone();
-                Box::pin(async move {
-                    tx.send(msg)
-                        .map_err(|e| anyhow::anyhow!("Failed to send outbound message: {}", e))
-                })
-            });
-            let message_tool = Arc::new(MessageTool::new(Some(send_cb), channel, chat_id));
-            tools.register(Box::new(ArcToolProxy(message_tool)));
-        }
-
         // Typed host bridge (research §3.3 DIP): build the production host once
         // and inject it at the registry boundary. Each AgentHost method is the
         // byte-identical port of the legacy closure body that used to live
@@ -388,6 +377,15 @@ impl AgentLoopShared {
             agent_host.clone(),
             agent_host.clone(),
         ));
+
+        // Direct UI channels already reply through `finalize_response`; exposing
+        // `message` there gives models a second, failure-prone way to answer.
+        if should_register_message_tool(channel) {
+            // The send closure is gone (doc §3.7 Step 3): the message path is
+            // the typed MessageHost trait on AgentHost, injected here.
+            let message_tool = Arc::new(MessageTool::new(host.clone(), channel, chat_id));
+            tools.register(Box::new(ArcToolProxy(message_tool)));
+        }
 
         // Spawn tool - origin channel/chat are baked into the host (doc
         // §3.2/§3.3); the tool no longer carries context or callback slots.

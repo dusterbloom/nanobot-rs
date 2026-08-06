@@ -2,57 +2,52 @@
 //! Message tool for sending messages to users.
 
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::Future; // transitional callback alias (deleted with HostBridgeAdapter, doc §3.7 Step 3)
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::Result; // transitional callback alias boundary only
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
 use super::base::{PermissionLevel, Tool, ToolContext, ToolOutput, ToolResult};
-use crate::errors::ToolError;
 use crate::bus::events::OutboundMessage;
+use crate::agent::host_bridge::{MessageHost, SendMessageRequest};
+use crate::errors::ToolError;
 
-/// Type alias for the send callback.
-#[allow(clippy::disallowed_types)] // anyhow at the callback boundary — replaced by MessageHost (host bridge, Topic 2)
+// Transitional callback alias — consumed only by HostBridgeAdapter and its
+// byte-stability tests (doc §3.7 Step 1); deleted in Step 3 once the adapter
+// is gone. No production tool uses it.
+/// Type alias for the legacy send callback.
+#[allow(clippy::disallowed_types)] // anyhow at the callback boundary — transitional adapter only (host bridge, doc §3.7 Step 3)
 pub type SendCallback =
     Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
 /// Tool to send messages to users on chat channels.
+///
+/// Depends only on [`MessageHost`] (research §3.3 ISP/DIP): the production
+/// host (`AgentHost` in `tool_wiring`) and test mocks are interchangeable.
+/// Default channel/chat are baked in at the registry boundary; per-call
+/// `channel`/`chat_id` params override them.
 pub struct MessageTool {
-    send_callback: Arc<Mutex<Option<SendCallback>>>,
-    default_channel: Arc<Mutex<String>>,
-    default_chat_id: Arc<Mutex<String>>,
+    host: Arc<dyn MessageHost>,
+    default_channel: String,
+    default_chat_id: String,
 }
 
 impl MessageTool {
-    /// Create a new message tool.
+    /// Create a new message tool wired to a typed message host.
     pub fn new(
-        send_callback: Option<SendCallback>,
+        host: Arc<dyn MessageHost>,
         default_channel: &str,
         default_chat_id: &str,
     ) -> Self {
         Self {
-            send_callback: Arc::new(Mutex::new(send_callback)),
-            default_channel: Arc::new(Mutex::new(default_channel.to_string())),
-            default_chat_id: Arc::new(Mutex::new(default_chat_id.to_string())),
+            host,
+            default_channel: default_channel.to_string(),
+            default_chat_id: default_chat_id.to_string(),
         }
     }
-
-    /// Set the current message context.
-    pub async fn set_context(&self, channel: &str, chat_id: &str) {
-        *self.default_channel.lock().await = channel.to_string();
-        *self.default_chat_id.lock().await = chat_id.to_string();
-    }
-
-    /// Set the callback for sending messages.
-    pub async fn set_send_callback(&self, callback: SendCallback) {
-        *self.send_callback.lock().await = Some(callback);
-    }
-}
-
-#[async_trait]
+}#[async_trait]
 impl Tool for MessageTool {
     fn name(&self) -> &str {
         "message"
@@ -93,8 +88,12 @@ impl Tool for MessageTool {
         self.execute_with_result(params).await.data().to_string()
     }
 
-    /// Typed entry point: builds [`crate::errors::ToolError`] variants at
-    /// every failure site.
+    /// Typed entry point: resolves the target channel/chat (per-call params
+    /// override the baked defaults; same `"No target channel/chat
+    /// specified"` guard as legacy), then drives the send through the
+    /// [`MessageHost`] trait — no callback slot, no `anyhow` at the tool
+    /// boundary. The host's reply text is the model-visible output; host
+    /// errors propagate typed and render byte-identically.
     async fn execute_typed(
         &self,
         params: HashMap<String, serde_json::Value>,
@@ -110,22 +109,19 @@ impl Tool for MessageTool {
             }
         };
 
-        let default_channel = self.default_channel.lock().await.clone();
-        let default_chat_id = self.default_chat_id.lock().await.clone();
-
         let channel = params
             .get("channel")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or(default_channel);
+            .map(str::to_string)
+            .unwrap_or_else(|| self.default_channel.clone());
 
         let chat_id = params
             .get("chat_id")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or(default_chat_id);
+            .map(str::to_string)
+            .unwrap_or_else(|| self.default_chat_id.clone());
 
         if channel.is_empty() || chat_id.is_empty() {
             return Err(ToolError::Execution {
@@ -133,50 +129,58 @@ impl Tool for MessageTool {
             });
         }
 
-        let callback_guard = self.send_callback.lock().await;
-        let callback = match callback_guard.as_ref() {
-            Some(cb) => cb.clone(),
-            None => {
-                return Err(ToolError::Execution {
-                    message: "Message sending not configured".to_string(),
-                })
-            }
-        };
-        // Drop the lock before awaiting the callback.
-        drop(callback_guard);
-
-        let msg = OutboundMessage::new(&channel, &chat_id, &content);
-
-        match callback(msg).await {
-            Ok(()) => Ok(ToolOutput {
-                text: format!("Message sent to {}:{}", channel, chat_id),
-            }),
-            Err(e) => Err(ToolError::Execution {
-                message: format!("Error sending message: {}", e),
-            }),
-        }
+        let reply = self
+            .host
+            .send(SendMessageRequest { channel, chat_id, content })
+            .await?;
+        Ok(ToolOutput { text: reply.text })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::host_bridge::SendMessageReply;
+
+    /// Mock host echoing the legacy confirmation text back unchanged.
+    struct MockHost;
+
+    #[async_trait]
+    impl MessageHost for MockHost {
+        async fn send(&self, req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
+            Ok(SendMessageReply {
+                text: format!("Message sent to {}:{}", req.channel, req.chat_id),
+            })
+        }
+    }
+
+    /// Mock host whose send fails with a typed error.
+    struct FailingHost;
+
+    #[async_trait]
+    impl MessageHost for FailingHost {
+        async fn send(&self, _req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
+            Err(ToolError::Execution {
+                message: "Error sending message: network error".to_string(),
+            })
+        }
+    }
 
     #[test]
     fn test_message_tool_name() {
-        let tool = MessageTool::new(None, "test_channel", "test_chat");
+        let tool = MessageTool::new(Arc::new(MockHost), "test_channel", "test_chat");
         assert_eq!(tool.name(), "message");
     }
 
     #[test]
     fn test_message_tool_description() {
-        let tool = MessageTool::new(None, "test_channel", "test_chat");
+        let tool = MessageTool::new(Arc::new(MockHost), "test_channel", "test_chat");
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn test_message_tool_parameters() {
-        let tool = MessageTool::new(None, "test_channel", "test_chat");
+        let tool = MessageTool::new(Arc::new(MockHost), "test_channel", "test_chat");
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["content"].is_object());
@@ -185,133 +189,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_without_callback() {
-        let tool = MessageTool::new(None, "chan", "chat");
-        let mut params = HashMap::new();
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("hello".to_string()),
-        );
-        let result = tool.execute(params).await;
-        assert!(result.contains("Message sending not configured"));
-    }
-
-    #[tokio::test]
     async fn test_execute_missing_content() {
-        let tool = MessageTool::new(None, "chan", "chat");
+        let tool = MessageTool::new(Arc::new(MockHost), "chan", "chat");
         let params = HashMap::new();
         let result = tool.execute(params).await;
-        assert!(result.contains("'content' parameter is required"));
+        assert_eq!(
+            result,
+            "Error: 'content' parameter is required; call as message({\"content\":\"hello\"})"
+        );
     }
 
     #[tokio::test]
     async fn test_execute_empty_channel_and_chat() {
-        let tool = MessageTool::new(None, "", "");
+        let tool = MessageTool::new(Arc::new(MockHost), "", "");
         let mut params = HashMap::new();
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("hello".to_string()),
-        );
+        params.insert("content".to_string(), serde_json::Value::String("hello".to_string()));
         let result = tool.execute(params).await;
-        assert!(result.contains("No target channel/chat specified"));
+        assert_eq!(result, "Error: No target channel/chat specified");
     }
 
     #[tokio::test]
-    async fn test_set_context() {
-        let tool = MessageTool::new(None, "old_channel", "old_chat");
-        tool.set_context("new_channel", "new_chat").await;
-
-        // Verify context changed by executing without callback -- channel/chat
-        // should now be "new_channel"/"new_chat" (we cannot directly observe
-        // this, but we can verify it does not error with "No target channel").
+    async fn test_execute_uses_baked_defaults() {
+        let tool = MessageTool::new(Arc::new(MockHost), "telegram", "12345");
         let mut params = HashMap::new();
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("test".to_string()),
-        );
-        let result = tool.execute(params).await;
-        // Should not complain about missing channel -- it should fail on the
-        // callback not being set instead.
-        assert!(result.contains("Message sending not configured"));
-    }
-
-    #[tokio::test]
-    async fn test_execute_with_mock_callback() {
-        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| Box::pin(async { Ok(()) }));
-        let tool = MessageTool::new(Some(callback), "telegram", "12345");
-
-        let mut params = HashMap::new();
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("hello!".to_string()),
-        );
+        params.insert("content".to_string(), serde_json::Value::String("hello!".to_string()));
         let result = tool.execute(params).await;
         assert_eq!(result, "Message sent to telegram:12345");
     }
 
     #[tokio::test]
-    async fn test_execute_with_failing_callback() {
-        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| {
-            Box::pin(async { Err(anyhow::anyhow!("network error")) })
-        });
-        let tool = MessageTool::new(Some(callback), "discord", "999");
-
+    async fn test_execute_with_failing_host() {
+        let tool = MessageTool::new(Arc::new(FailingHost), "discord", "999");
         let mut params = HashMap::new();
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("hello".to_string()),
-        );
+        params.insert("content".to_string(), serde_json::Value::String("hello".to_string()));
         let result = tool.execute(params).await;
         assert!(result.contains("Error sending message"));
         assert!(result.contains("network error"));
     }
 
     #[tokio::test]
-    async fn test_set_send_callback() {
-        let tool = MessageTool::new(None, "chan", "chat");
-
-        // Initially no callback.
+    async fn test_execute_with_channel_override() {
+        let tool = MessageTool::new(Arc::new(MockHost), "default_chan", "default_chat");
         let mut params = HashMap::new();
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("test".to_string()),
-        );
+        params.insert("content".to_string(), serde_json::Value::String("hello".to_string()));
+        params.insert("channel".to_string(), serde_json::Value::String("override_chan".to_string()));
+        params.insert("chat_id".to_string(), serde_json::Value::String("override_chat".to_string()));
         let result = tool.execute(params).await;
-        assert!(result.contains("Message sending not configured"));
-
-        // Set callback.
-        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| Box::pin(async { Ok(()) }));
-        tool.set_send_callback(callback).await;
-
-        // Now it should succeed.
-        let mut params = HashMap::new();
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("test".to_string()),
-        );
-        let result = tool.execute(params).await;
-        assert_eq!(result, "Message sent to chan:chat");
+        assert_eq!(result, "Message sent to override_chan:override_chat");
     }
 
     #[tokio::test]
-    async fn test_execute_with_channel_override() {
-        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| Box::pin(async { Ok(()) }));
-        let tool = MessageTool::new(Some(callback), "default_chan", "default_chat");
-
+    async fn test_empty_override_falls_back_to_default() {
+        // An empty channel/chat param is treated as "use the default" —
+        // same filter as the legacy surface.
+        let tool = MessageTool::new(Arc::new(MockHost), "telegram", "42");
         let mut params = HashMap::new();
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("hello".to_string()),
-        );
-        params.insert(
-            "channel".to_string(),
-            serde_json::Value::String("override_chan".to_string()),
-        );
-        params.insert(
-            "chat_id".to_string(),
-            serde_json::Value::String("override_chat".to_string()),
-        );
+        params.insert("content".to_string(), serde_json::Value::String("hi".to_string()));
+        params.insert("channel".to_string(), serde_json::Value::String("".to_string()));
+        params.insert("chat_id".to_string(), serde_json::Value::String("".to_string()));
         let result = tool.execute(params).await;
-        assert_eq!(result, "Message sent to override_chan:override_chat");
+        assert_eq!(result, "Message sent to telegram:42");
     }
 }
