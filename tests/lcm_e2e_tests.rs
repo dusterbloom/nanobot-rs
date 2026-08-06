@@ -32,7 +32,7 @@ use nanobot::agent::compaction::ContextCompactor;
 use nanobot::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
 use nanobot::agent::token_budget::TokenBudget;
 use nanobot::agent::turn::Turn;
-use nanobot::providers::base::{LLMProvider, LLMResponse};
+use nanobot::providers::base::{FinishReason, LLMProvider, LLMResponse};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -141,7 +141,7 @@ impl LLMProvider for MockSummarizer {
         Ok(LLMResponse {
             content: Some(extractive_summary(request)),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }

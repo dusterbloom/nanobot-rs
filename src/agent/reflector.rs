@@ -289,7 +289,7 @@ fn parse_entities_into_graph(kg: &mut KnowledgeGraph, section: &str) -> (usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::base::{LLMProvider, LLMResponse};
+    use crate::providers::base::{FinishReason, LLMProvider, LLMResponse};
     use async_trait::async_trait;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -324,7 +324,7 @@ mod tests {
             Ok(LLMResponse {
                 content: Some(self.response.clone()),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: HashMap::new(),
             })
         }
@@ -383,7 +383,7 @@ mod tests {
             Ok(LLMResponse {
                 content: Some("- serialized fact".to_string()),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: HashMap::new(),
             })
         }

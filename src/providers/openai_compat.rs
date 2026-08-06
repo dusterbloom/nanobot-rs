@@ -28,7 +28,8 @@ use tracing::{debug, info, instrument, warn};
 use backon::Retryable;
 
 use super::base::{
-    LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest, ToolChoice,
+    FinishReason, LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest,
+    ToolChoice,
 };
 use super::constants::{
     ANTHROPIC_API_BASE, DEEPSEEK_API_BASE, GROQ_API_BASE, OPENAI_API_BASE, OPENROUTER_API_BASE,
@@ -1389,11 +1390,12 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
 
     let choice = &choices[0];
     let message = choice.get("message").cloned().unwrap_or_default();
-    let finish_reason = choice
-        .get("finish_reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("stop")
-        .to_string();
+    let finish_reason = FinishReason::parse_finish_reason(
+        choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stop"),
+    );
 
     // Extract reasoning_content (separate field used by reasoning models).
     let reasoning_text = message
@@ -1578,7 +1580,7 @@ async fn parse_sse_stream(
     let mut full_reasoning = String::new(); // API reasoning_content field only
     let mut full_inline_thinking = String::new(); // inline <think> tags — fallback when content empty
     let mut split_state = ThinkSplitState::default();
-    let mut finish_reason = String::from("stop");
+    let mut finish_reason = FinishReason::Stop;
     let mut usage: HashMap<String, i64> = HashMap::new();
 
     // Tool call accumulation: index → (id, name, arguments_json_str)
@@ -1728,9 +1730,9 @@ async fn parse_sse_stream(
             // Extract from choices[0].delta
             if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
                 if let Some(choice) = choices.first() {
-                    // Update finish_reason if present
+                    // Update finish_reason if present (wire boundary: parse once here).
                     if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-                        finish_reason = fr.to_string();
+                        finish_reason = FinishReason::parse_finish_reason(fr);
                     }
 
                     if let Some(delta) = choice.get("delta") {
@@ -1829,8 +1831,8 @@ async fn parse_sse_stream(
     // Stream ended without [DONE] — SLM may have crashed or dropped connection.
     // Treat an abnormal termination during content generation as "length" so
     // the auto-continue mechanism can detect and recover from it.
-    if finish_reason == "stop" {
-        finish_reason = String::from("length");
+    if finish_reason == FinishReason::Stop {
+        finish_reason = FinishReason::Length;
     }
     warn!(
         content_len = full_content.len(),
@@ -1850,7 +1852,7 @@ async fn parse_sse_stream(
                     .to_string(),
             ),
             tool_calls: Vec::new(),
-            finish_reason: "error".to_string(),
+            finish_reason: FinishReason::ProviderFailure,
             usage,
         }));
         return;
@@ -2512,7 +2514,7 @@ mod tests {
 
         let resp = parse_response(&data).expect("parse should succeed");
         assert_eq!(resp.content.as_deref(), Some("Sure, let me look that up."));
-        assert_eq!(resp.finish_reason, "tool_calls");
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
         assert_eq!(resp.tool_calls.len(), 1);
 
         let tc = &resp.tool_calls[0];
@@ -2604,7 +2606,7 @@ mod tests {
             resp.content.as_deref(),
             Some("Hello! How can I help you today?")
         );
-        assert_eq!(resp.finish_reason, "stop");
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.usage.get("total_tokens"), Some(&18));
     }
@@ -2644,7 +2646,7 @@ mod tests {
         assert_eq!(resp.tool_calls[0].name, "search");
         assert_eq!(resp.tool_calls[1].name, "read_file");
         assert_eq!(resp.tool_calls[1].id, "call_2");
-        assert_eq!(resp.finish_reason, "tool_calls");
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
         // No usage block -> empty map.
         assert!(resp.usage.is_empty());
     }
@@ -3556,7 +3558,7 @@ mod tests {
             heartbeat_started.elapsed() > Duration::from_secs(1),
             "heartbeats must allow total wall time to exceed the read timeout"
         );
-        assert_eq!(heartbeat_response.finish_reason, "stop");
+        assert_eq!(heartbeat_response.finish_reason, FinishReason::Stop);
         assert_eq!(heartbeat_response.content.as_deref(), Some("ready"));
         heartbeat_server.await.expect("heartbeat server task");
 
@@ -3581,7 +3583,7 @@ mod tests {
         })
         .await
         .expect("idle stream must end at the inactivity timeout");
-        assert_eq!(idle_response.finish_reason, "error");
+        assert_eq!(idle_response.finish_reason, FinishReason::ProviderFailure);
         idle_server.abort();
     }
 
@@ -3647,7 +3649,7 @@ mod tests {
         // Abnormal termination without [DONE] must report "length" so the
         // auto-continue mechanism can detect truncation (Bug 2 regression guard).
         assert_eq!(
-            resp.finish_reason, "length",
+            resp.finish_reason, FinishReason::Length,
             "stream ending without [DONE] must yield finish_reason=length"
         );
     }
@@ -3676,7 +3678,7 @@ mod tests {
 
         let resp = done_response.expect("should have received Done chunk");
         assert_eq!(
-            resp.finish_reason, "stop",
+            resp.finish_reason, FinishReason::Stop,
             "normal stream with [DONE] must keep finish_reason=stop"
         );
     }
@@ -3705,7 +3707,7 @@ mod tests {
 
         let resp = done_response.expect("should have received Done chunk");
         assert_eq!(
-            resp.finish_reason, "length",
+            resp.finish_reason, FinishReason::Length,
             "token-limit response must keep finish_reason=length"
         );
     }
@@ -3874,7 +3876,7 @@ mod tests {
         }
 
         let resp = done_response.expect("should produce Done even for empty stream");
-        assert_eq!(resp.finish_reason, "error");
+        assert_eq!(resp.finish_reason, FinishReason::ProviderFailure);
         assert!(
             resp.content
                 .as_deref()

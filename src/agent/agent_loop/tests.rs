@@ -13,7 +13,7 @@ use crate::config::schema::{
     AdaptiveTokenConfig, CodeExecutionConfig, MemoryConfig, ProvenanceConfig, ProviderConfig,
     PythonKernelConfig, ToolDelegationConfig, TrioConfig,
 };
-use crate::providers::base::LLMProvider;
+use crate::providers::base::{FinishReason, LLMProvider};
 use crate::providers::openai_compat::OpenAICompatProvider;
 use async_trait::async_trait;
 use backon::BackoffBuilder;
@@ -51,7 +51,7 @@ impl LLMProvider for MockLLM {
         Ok(crate::providers::base::LLMResponse {
             content: Some("mock".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -106,7 +106,7 @@ impl LLMProvider for StaticResponseLLM {
         Ok(crate::providers::base::LLMResponse {
             content: Some(self.body.clone()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -2071,7 +2071,7 @@ impl LLMProvider for SequenceProvider {
         Ok(crate::providers::base::LLMResponse {
             content: Some(response),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -2164,7 +2164,7 @@ impl LLMProvider for ToolRoundBarrierProvider {
                     name: "list_dir".to_string(),
                     arguments,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             });
         }
@@ -2174,7 +2174,7 @@ impl LLMProvider for ToolRoundBarrierProvider {
         Ok(crate::providers::base::LLMResponse {
             content: Some(attested_text("done")),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -2220,7 +2220,7 @@ impl LLMProvider for ResponseSequenceProvider {
             response.unwrap_or_else(|| crate::providers::base::LLMResponse {
                 content: Some("ERROR: no responses left in ResponseSequenceProvider".to_string()),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             }),
         )
@@ -2332,7 +2332,7 @@ impl LLMProvider for StreamingThinkingProvider {
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("visible answer")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
         ));
@@ -2385,7 +2385,7 @@ impl LLMProvider for RecordingProvider {
         Ok(crate::providers::base::LLMResponse {
             content: Some(self.response.clone()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -2819,7 +2819,7 @@ impl WireRecordingProvider {
         crate::providers::base::LLMResponse {
             content: Some(attested_text(content)),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         }
     }
@@ -2829,7 +2829,7 @@ impl WireRecordingProvider {
         crate::providers::base::LLMResponse {
             content: Some(content.to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         }
     }
@@ -3494,7 +3494,7 @@ async fn test_local_wire_prompt_tool_result_appends_only() {
                     name: "list_dir".to_string(),
                     arguments: args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             WireRecordingProvider::text_response("listed."),
@@ -3539,7 +3539,7 @@ async fn test_local_wire_prefix_stable_across_batched_tool_results_and_next_turn
                         arguments: args_b,
                     },
                 ],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             WireRecordingProvider::text_response("done turn one"),
@@ -3647,7 +3647,7 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
                 arguments: a2,
             },
         ],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
 
@@ -3686,7 +3686,7 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
                     arguments: pa2,
                 },
             ],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: std::collections::HashMap::new(),
         };
         // Replace the provider's queue with the seed batch first.
@@ -3783,7 +3783,7 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
             name: "exec".to_string(),
             arguments: a,
         }],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
 
@@ -3888,7 +3888,7 @@ async fn medium_tool_result_shows_content_not_handle() {
             name: "read_file".to_string(),
             arguments: a,
         }],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
     let provider = Arc::new(WireRecordingProvider::new(
@@ -3941,7 +3941,7 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
                 name: "list_dir".to_string(),
                 arguments,
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: std::collections::HashMap::new(),
         }
     };
@@ -4103,7 +4103,7 @@ async fn test_wire_prefix_stable_across_turn_after_side_effect_boundary_nudge() 
             name: "exec".to_string(),
             arguments: exec_args,
         }],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
     let mut ls_args = std::collections::HashMap::new();
@@ -4115,7 +4115,7 @@ async fn test_wire_prefix_stable_across_turn_after_side_effect_boundary_nudge() 
             name: "list_dir".to_string(),
             arguments: ls_args,
         }],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
     // Turn 1: exec (arms boundary → nudge injected before the next call) then a
@@ -4182,7 +4182,7 @@ async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
                 name: "exec".to_string(),
                 arguments,
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: std::collections::HashMap::new(),
         }
     };
@@ -4268,13 +4268,13 @@ async fn test_tool_call_carrier_persists_before_tool_result() {
                     name: "list_dir".to_string(),
                     arguments: args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("I listed the workspace.")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
         ],
@@ -4382,7 +4382,7 @@ async fn test_multiple_tool_round_carriers_persist_in_order() {
                     name: "list_dir".to_string(),
                     arguments: list_args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
@@ -4392,13 +4392,13 @@ async fn test_multiple_tool_round_carriers_persist_in_order() {
                     name: "exec".to_string(),
                     arguments: exec_args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("Done.")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
         ],
@@ -4455,7 +4455,7 @@ async fn test_local_truncated_response_requires_attested_correction_without_cont
         vec![crate::providers::base::LLMResponse {
             content: Some("Partial local answer".to_string()),
             tool_calls: vec![],
-            finish_reason: "length".to_string(),
+            finish_reason: FinishReason::Length,
             usage: std::collections::HashMap::new(),
         }],
     ));
@@ -4489,19 +4489,19 @@ async fn test_local_streaming_cache_markers_append_only_across_turns() {
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("one")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("two")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("three")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
         ],
@@ -4600,7 +4600,7 @@ async fn test_failed_local_call_does_not_seed_prompt_cache_marker() {
         crate::providers::base::LLMResponse {
             content: Some(attested_text("recovered")),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         },
     ));
@@ -6127,7 +6127,7 @@ mod runtime_mode_parity_tests {
                     name: "exec".to_string(),
                     arguments: args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -6170,7 +6170,7 @@ mod runtime_mode_parity_tests {
                         .to_string(),
                 ),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -6318,7 +6318,7 @@ mod runtime_mode_parity_tests {
                     crate::providers::base::LLMResponse {
                         content: Some("ERROR: exploration sequence exhausted".to_string()),
                         tool_calls: vec![],
-                        finish_reason: "stop".to_string(),
+                        finish_reason: FinishReason::Stop,
                         usage: std::collections::HashMap::new(),
                     }
                 }))
@@ -6339,7 +6339,7 @@ mod runtime_mode_parity_tests {
                         name: "list_dir".to_string(),
                         arguments: a,
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: std::collections::HashMap::new(),
                 }
             })
@@ -6347,7 +6347,7 @@ mod runtime_mode_parity_tests {
         seq.push(crate::providers::base::LLMResponse {
             content: Some(attested_text("done exploring")),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         });
         let provider = Arc::new(ExploringProvider {
@@ -6404,7 +6404,7 @@ mod runtime_mode_parity_tests {
                         name: "exec".to_string(),
                         arguments: exec_args,
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: std::collections::HashMap::new(),
                 },
                 crate::providers::base::LLMResponse {
@@ -6414,13 +6414,13 @@ mod runtime_mode_parity_tests {
                         name: "recall_tool_result".to_string(),
                         arguments: recall_args,
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: std::collections::HashMap::new(),
                 },
                 crate::providers::base::LLMResponse {
                     content: Some(attested_text("done")),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: std::collections::HashMap::new(),
                 },
             ],

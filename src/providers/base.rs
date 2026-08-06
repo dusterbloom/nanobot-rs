@@ -6,6 +6,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::errors::ProviderError;
+
 /// A tool call request from the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRequest {
@@ -29,12 +31,74 @@ impl ToolCallRequest {
     }
 }
 
+/// Why an LLM call finished.
+///
+/// Replaces the magic `String` on [`LLMResponse`]; the provider-visible wire
+/// string is recovered with [`FinishReason::wire_str`] so model-visible bytes
+/// are unchanged (error-protocol doc §2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    /// Model produced a complete response (`"stop"` on the wire).
+    Stop,
+    /// Output hit the token limit (`"length"` on the wire).
+    Length,
+    /// Response is a tool-call request (`"tool_calls"` on the wire).
+    ToolCalls,
+    /// Stream died before producing content/tool-calls
+    /// (was the literal `"error"` string, `openai_compat.rs:1842`).
+    ProviderFailure,
+    /// Turn was aborted/cancelled — was magic strings matched at
+    /// `agent_loop/response.rs:1024`.
+    Aborted,
+    Cancelled,
+    /// Unknown provider value — kept so foreign backends don't break parsing.
+    Other(String),
+}
+
+impl FinishReason {
+    /// Parse a provider-reported `finish_reason` string at the wire boundary.
+    /// Unknown values round-trip through [`FinishReason::Other`] so foreign
+    /// backends keep working unchanged.
+    #[must_use]
+    pub fn parse_finish_reason(s: &str) -> Self {
+        match s {
+            "stop" => Self::Stop,
+            "length" => Self::Length,
+            "tool_calls" => Self::ToolCalls,
+            "error" => Self::ProviderFailure,
+            "aborted" => Self::Aborted,
+            "cancelled" => Self::Cancelled,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// The byte-identical wire string for this reason.
+    #[must_use]
+    pub fn wire_str(&self) -> &str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+            Self::ToolCalls => "tool_calls",
+            Self::ProviderFailure => "error",
+            Self::Aborted => "aborted",
+            Self::Cancelled => "cancelled",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+impl std::fmt::Display for FinishReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_str())
+    }
+}
+
 /// Response from an LLM provider.
 #[derive(Debug, Clone)]
 pub struct LLMResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCallRequest>,
-    pub finish_reason: String,
+    pub finish_reason: FinishReason,
     pub usage: HashMap<String, i64>,
 }
 
@@ -44,24 +108,22 @@ impl LLMResponse {
         !self.tool_calls.is_empty()
     }
 
-    /// Returns `true` if this response represents an LLM provider error.
+    /// `Result` view: `Ok(())` for stop/length/tool_calls,
+    /// `Err(ProviderError::EmptyStream)` for the dead-stream case
+    /// (error-protocol doc §2.3).
     ///
-    /// `finish_reason = "error"` is synthesized by the streaming layer when a
-    /// stream ends without producing any content or tool-call payload (see
-    /// `parse_sse_stream`); hard transport/provider failures are still returned
-    /// as `Err(ProviderError)` from `chat()`.
-    pub fn is_error(&self) -> bool {
-        self.finish_reason == "error"
-    }
-
-    /// Returns the error detail if this response is an error, else `None`.
+    /// # Errors
     ///
-    /// See `is_error()` note.
-    pub fn error_detail(&self) -> Option<&str> {
-        if self.is_error() {
-            Some(self.content.as_deref().unwrap_or("Unknown LLM error"))
-        } else {
-            None
+    /// Returns `Err(ProviderError::EmptyStream(..))` when the stream died
+    /// before producing content or tool-calls.
+    pub fn outcome(&self) -> Result<(), ProviderError> {
+        match self.finish_reason {
+            FinishReason::ProviderFailure => Err(ProviderError::EmptyStream(
+                self.content
+                    .clone()
+                    .unwrap_or_else(|| "Unknown LLM error".to_string()),
+            )),
+            _ => Ok(()),
         }
     }
 }
@@ -230,5 +292,37 @@ pub trait LLMProvider: Send + Sync {
     /// decides whether the agent rotates the session id on compaction/trim.
     fn supports_higgs_session_cache(&self) -> bool {
         false
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::FinishReason;
+
+    /// Wire-stability guard (error-protocol doc §2.3 / §4): every wire string
+    /// the streaming layer can produce must parse and re-serialize to the
+    /// byte-identical value, including unknown provider values.
+    #[test]
+    fn finish_reason_wire_round_trip_is_byte_identical() {
+        let known = [
+            ("stop", FinishReason::Stop),
+            ("length", FinishReason::Length),
+            ("tool_calls", FinishReason::ToolCalls),
+            ("error", FinishReason::ProviderFailure),
+            ("aborted", FinishReason::Aborted),
+            ("cancelled", FinishReason::Cancelled),
+        ];
+        for (wire, reason) in known {
+            assert_eq!(FinishReason::parse_finish_reason(wire), reason, "parse {wire}");
+            assert_eq!(reason.wire_str(), wire, "wire_str for {wire}");
+            assert_eq!(reason.to_string(), wire, "Display for {wire}");
+        }
+        // Unknown provider values round-trip via Other(String).
+        for wire in ["function_call", "content_filter", "eos_token", ""] {
+            let parsed = FinishReason::parse_finish_reason(wire);
+            assert_eq!(parsed.wire_str(), wire, "unknown wire value {wire:?} must round-trip");
+            assert_eq!(parsed.to_string(), wire, "Display for unknown value {wire:?}");
+        }
     }
 }

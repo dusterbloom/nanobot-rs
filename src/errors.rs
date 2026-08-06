@@ -37,6 +37,13 @@ pub enum ProviderError {
 
     #[error("Request cancelled")]
     Cancelled,
+
+    /// The LLM stream ended before producing any content or tool-call payload
+    /// (`finish_reason = "error"` at the wire boundary). The payload is the
+    /// provider's final message when it reported one; `Display` reproduces
+    /// the legacy `error_detail()` string byte-for-byte (error-protocol doc §2.3).
+    #[error("{0}")]
+    EmptyStream(String),
 }
 
 impl ProviderError {
@@ -49,7 +56,8 @@ impl ProviderError {
             Self::ResponseReadError(_)
             | Self::JsonParseError(_)
             | Self::AuthError { .. }
-            | Self::Cancelled => false,
+            | Self::Cancelled
+            | Self::EmptyStream(_) => false,
         }
     }
 }

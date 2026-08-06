@@ -1852,7 +1852,7 @@ fn parse_id_runs(s: &str) -> Vec<usize> {
 mod tests {
     use super::*;
     use crate::agent::tools::base::Tool;
-    use crate::providers::base::{LLMProvider, LLMResponse};
+    use crate::providers::base::{FinishReason, LLMProvider, LLMResponse};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1875,7 +1875,7 @@ mod tests {
             Ok(LLMResponse {
                 content: Some("- User asked multiple questions about Rust ownership.".to_string()),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -1910,7 +1910,7 @@ mod tests {
                     .to_string(),
                 ),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -2047,7 +2047,7 @@ mod tests {
             Ok(LLMResponse {
                 content: Some(bullets.join("\n")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -2081,7 +2081,7 @@ mod tests {
             Ok(LLMResponse {
                 content: Some(babble),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
