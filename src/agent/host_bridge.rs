@@ -24,7 +24,6 @@
 // protocol §2.5 — remove when a tool executes through the host.
 #![cfg_attr(not(test), allow(dead_code))]
 
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
