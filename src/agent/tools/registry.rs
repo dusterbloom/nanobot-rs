@@ -707,7 +707,12 @@ impl ToolRegistry {
                 _ => None,
             };
             if let Some(example) = example {
-                result.append_worked_example(&example);
+                // Migrated tools render the example into the wire string
+                // already (`ToolError::MissingArg::render` ends with
+                // "call as {example}"); appending again would double it.
+                if !result.data().contains(example.as_str()) {
+                    result.append_worked_example(&example);
+                }
             }
         }
 

@@ -171,6 +171,39 @@ impl ToolExecutionResult {
     }
 }
 
+/// The typed success payload of a tool call (error protocol, §2.2).
+///
+/// A plain struct rather than `String` so the registry can attach audit
+/// metadata later without a breaking change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutput {
+    /// The model-facing text. May carry `TOOL_RESULT_HANDLE v1` receipts,
+    /// `[truncated: …]` markers, or raw output.
+    pub text: String,
+}
+
+/// The one result type of the tool layer.
+pub type ToolResult = Result<ToolOutput, crate::errors::ToolError>;
+
+impl From<ToolResult> for ToolExecutionResult {
+    fn from(r: ToolResult) -> Self {
+        match r {
+            Ok(out) => ToolExecutionResult {
+                ok: true,
+                data: out.text,
+                error: None,
+                error_kind: None,
+            },
+            Err(e) => ToolExecutionResult {
+                ok: false,
+                data: e.render(),
+                error: Some(e.to_string()),
+                error_kind: crate::errors::legacy_kind_from_tool_error(&e),
+            },
+        }
+    }
+}
+
 /// Context passed to tools during execution for progress reporting
 /// and cancellation support.
 pub struct ToolExecutionContext {
@@ -202,18 +235,6 @@ pub trait Tool: Send + Sync {
     /// Returns the result as a string.
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String;
 
-    /// Execute and return a structured outcome.
-    ///
-    /// Tools can override this to report explicit success/failure semantics.
-    /// The default implementation keeps backward compatibility and maps
-    /// `Error:`-prefixed outputs to failures.
-    async fn execute_with_result(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-    ) -> ToolExecutionResult {
-        ToolExecutionResult::from_output(self.execute(params).await)
-    }
-
     /// Execute the tool with an execution context for progress reporting
     /// and cancellation.
     ///
@@ -229,16 +250,55 @@ pub trait Tool: Send + Sync {
         self.execute(params).await
     }
 
+    /// Execute and return the typed outcome (error protocol, Phase 1 —
+    /// additive). This is the migration seam: tools land on `ToolResult` by
+    /// overriding this method and building [`crate::errors::ToolError`]
+    /// variants at their failure sites.
+    ///
+    /// The default implementation funnels the legacy `String` channel through
+    /// [`crate::errors::ToolError::from_legacy`] so every unmigrated tool
+    /// keeps working — and keeps producing byte-identical `Error: ...` wire
+    /// strings — with no changes.
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolExecutionContext,
+    ) -> ToolResult {
+        let out = self.execute_with_context(params, ctx).await;
+        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+            Err(crate::errors::ToolError::from_legacy(&err))
+        } else {
+            Ok(ToolOutput { text: out })
+        }
+    }
+
+    /// Execute and return a structured outcome.
+    ///
+    /// Default renders the typed [`execute_typed`] result into the legacy
+    /// structured shape (`From<ToolResult> for ToolExecutionResult`).
+    async fn execute_with_result(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+    ) -> ToolExecutionResult {
+        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolExecutionContext {
+            event_tx,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tool_call_id: String::new(),
+        };
+        ToolExecutionResult::from(self.execute_typed(params, &ctx).await)
+    }
+
     /// Like [`execute_with_result`] but with an execution context.
     ///
-    /// Default delegates to [`execute_with_context`] and maps `Error:`-prefixed
-    /// outputs to failures, same as [`execute_with_result`].
+    /// Default renders the typed [`execute_typed`] result into the legacy
+    /// structured shape.
     async fn execute_with_result_and_context(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolExecutionContext,
     ) -> ToolExecutionResult {
-        ToolExecutionResult::from_output(self.execute_with_context(params, ctx).await)
+        ToolExecutionResult::from(self.execute_typed(params, ctx).await)
     }
 
     /// The permission level required to execute this tool.
@@ -421,8 +481,11 @@ mod tests {
         let tool = ErrorTool;
         let result = tool.execute_with_result(HashMap::new()).await;
         assert!(!result.ok());
+        // Wire string stays byte-identical through the typed funnel.
         assert_eq!(result.data(), "Error: bad input");
-        assert_eq!(result.error().as_deref(), Some("bad input"));
+        // The `error` field now carries the typed Display (internal channel);
+        // the model-visible string is `data()` (rendered).
+        assert_eq!(result.error(), Some("Execution failed: bad input"));
     }
 
     #[tokio::test]
