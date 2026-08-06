@@ -162,6 +162,16 @@ fn run_rpc_server(
                             if result.ok() {
                                 json!({"result": result.data()})
                             } else {
+                                // Wire-format note (error-protocol phase 2): since tools
+                                // return `ToolResult`, the `error` field here carries the
+                                // *typed* `ToolError` Display string (e.g. "Execution
+                                // failed: ..."), not the legacy pre-formatted "Error: ..."
+                                // message. The model-visible `Error: ...` string still
+                                // travels in `data` via `ToolError::render()`, so the
+                                // external RPC contract for `data`/`result` is unchanged;
+                                // only the `error` detail field switched to the typed
+                                // Display form. Keep it that way — `from_output` /
+                                // `classify_tool_error` no longer parse this channel.
                                 json!({"error": result.error().unwrap_or_else(|| result.data())})
                             }
                         }
