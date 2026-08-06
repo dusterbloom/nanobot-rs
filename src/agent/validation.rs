@@ -19,6 +19,17 @@ static HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\[(?:\w+\s+)*call(?:ed|ing)(?:\s+tool)?[\s:]").expect("hallucination regex")
 });
 
+/// `[get_skills()]`, `[exec(command='date')]` — a Python-ish call literal
+/// emitted as plain content instead of a structured tool call. Observed from
+/// lfm2-2.6b / lfm2.5-2.6b on higgs, which ignore `tool_choice=required` and
+/// never populate `tool_calls`. Distinct from `[Called ...]` narration: there
+/// is no verb, just the call.
+///
+/// Markdown links are safe — `[text](url)` puts the paren outside the bracket.
+static BRACKET_CALL_LITERAL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\[\s*[a-z][a-z0-9_]{2,}\s*\([^()\[\]]*\)\s*\]").expect("bracket call literal regex")
+});
+
 static XML_HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r#"(?isx)
@@ -116,6 +127,7 @@ pub(crate) fn has_claimed_tool_intent(content: &str) -> bool {
 pub(crate) fn has_hallucinated_tool_call(content: &str) -> bool {
     HALLUCINATED_CALL_RE.is_match(content)
         || XML_HALLUCINATED_CALL_RE.is_match(content)
+        || BRACKET_CALL_LITERAL_RE.is_match(content)
         || raw_json_tool_call_span(content).is_some()
 }
 
@@ -265,6 +277,7 @@ pub fn strip_hallucinated_text(content: &str) -> String {
     while let Some((start, end)) = raw_json_tool_call_span(&content) {
         content.replace_range(start..end, "");
     }
+    let content = BRACKET_CALL_LITERAL_RE.replace_all(&content, "");
     HALLUCINATED_CALL_RE
         .replace_all(&content, "")
         .trim()
@@ -310,6 +323,42 @@ mod tests {
             result,
             ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
         ));
+    }
+
+    /// The lfm2 phantom shape: a bare call literal as content, no verb around
+    /// it, no `tool_calls` on the wire. Markdown links must not trip it.
+    #[test]
+    fn test_bracket_call_literal_is_hallucinated_not_prose() {
+        for content in [
+            "[get_skills()]",
+            "Let me check the time.[exec(command='date')]",
+            "[read_file(path='/tmp/x')]",
+        ] {
+            assert!(
+                matches!(
+                    validate_response(content, &[], false, false),
+                    ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
+                ),
+                "{content:?} must read as a phantom tool call"
+            );
+            assert!(
+                !strip_hallucinated_text(content).contains('('),
+                "{content:?} must have the call literal stripped"
+            );
+        }
+
+        for content in [
+            "See [the docs](https://example.com) for details.",
+            "The array is [1, 2, 3] and that is all.",
+        ] {
+            assert!(
+                matches!(
+                    validate_response(content, &[], false, false),
+                    ValidationOutcome::Ok
+                ),
+                "{content:?} is prose, not a phantom call"
+            );
+        }
     }
 
     #[test]

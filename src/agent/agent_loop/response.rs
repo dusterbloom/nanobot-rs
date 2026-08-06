@@ -753,16 +753,28 @@ impl AgentLoopShared {
             "response_validation_failed"
         );
 
-        if matches!(error, validation::ValidationError::ClaimedButNotExecuted)
-            && ctx.flow.retries.validation > 0
-        {
+        // The phantom text is already on the user's screen — a narrated
+        // `[exec(command='date')]` reads exactly like an executed call. Retract
+        // it so the retry (or the give-up message below) replaces it instead of
+        // trailing it. Without this the post-loop emit is suppressed by
+        // `content_was_streamed` and the phantom stands as the final answer
+        // (higgs + lfm2-2.6b, which never emits tool_calls at all).
+        if ctx.flow.content_was_streamed {
+            send_retract_reply(&ctx.text_delta_tx);
+            ctx.flow.content_was_streamed = false;
+        }
+
+        // Both phantom shapes give up after one failed retry: a local model
+        // that narrates a call twice narrates it forever, and each further
+        // round burns a real iteration for nothing.
+        if ctx.flow.retries.validation > 0 {
             warn!(
                 model = %ctx.core.model,
                 retry = retry_num,
                 "response_validation_claimed_tool_intent_repeated"
             );
             return StepResult::Done(IterationOutcome::Error(
-                "I could not complete the tool step because the model described a tool action without emitting a valid structured tool call."
+                "I could not complete the tool step: the model narrated a tool action instead of emitting a structured tool call, twice in a row. Nothing was executed. If this repeats, the model or endpoint likely does not support native function calling."
                     .to_string(),
             ));
         }

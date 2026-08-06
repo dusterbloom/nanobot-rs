@@ -47,6 +47,9 @@ pub struct Lease {
     max_renewals: u32,
     iterations_used: u32,
     renewals_used: u32,
+    /// Checkpoint-free renewals spent on read-only tools. Separate from
+    /// `renewals_used` so exploration can't starve the write path.
+    read_only_renewals_used: u32,
 }
 
 /// Outcome of `record_tool_call`. The `reason` is a stable machine-readable
@@ -135,6 +138,7 @@ impl Lease {
             max_renewals,
             iterations_used: 0,
             renewals_used: 0,
+            read_only_renewals_used: 0,
         }
     }
 
@@ -213,6 +217,26 @@ impl Lease {
         RenewalResult::accepted()
     }
 
+    /// Auto-renew the lease for read-only tools without requiring a checkpoint.
+    /// Read-only tools (read_file, list_dir, etc.) can't cause destructive
+    /// loops, so blocking them behind a manual checkpoint ceremony wastes
+    /// 3 round-trips on legitimate multi-file exploration. Returns false
+    /// when out of auto-renewals.
+    ///
+    /// Spends a SEPARATE budget from `try_renew`: a read-heavy turn that
+    /// auto-renewed its way through the checkpoint budget would then hard-stop
+    /// on its first `write_file`, which is exactly backwards — the reads are
+    /// the cheap part. Both budgets are capped at `max_renewals`, so the worst
+    /// case is 2× leases per turn, half of them read-only.
+    pub fn auto_renew_for_read_only(&mut self) -> bool {
+        if self.read_only_renewals_used >= self.max_renewals {
+            return false;
+        }
+        self.read_only_renewals_used += 1;
+        self.iterations_used = 0;
+        true
+    }
+
     /// Format the progress signal for inclusion in tool results.
     ///
     /// `L = max_renewals - renewals_used` (future leases still obtainable
@@ -232,6 +256,28 @@ impl Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exhausting the read-only auto-renewal budget must leave the
+    /// checkpoint budget untouched: a turn that explored its way to the cap
+    /// can still renew for the write it was exploring toward.
+    #[test]
+    fn read_only_auto_renewals_do_not_spend_the_checkpoint_budget() {
+        let mut lease = Lease::new(2, 2);
+        for _ in 0..2 {
+            assert!(lease.auto_renew_for_read_only());
+        }
+        assert!(
+            !lease.auto_renew_for_read_only(),
+            "read-only budget must be capped at max_renewals"
+        );
+        assert_eq!(lease.renewals_used(), 0);
+
+        let checkpoint = "findings: read 4 files. next: confirm. will: write the fix.";
+        for _ in 0..2 {
+            assert!(lease.try_renew(checkpoint).is_valid());
+        }
+        assert_eq!(lease.try_renew(checkpoint).missing_field(), "out_of_leases");
+    }
 
     /// Advance the lease by one call. Used by the state-machine tests below to
     /// exercise exhaustion/renewal/progress in isolation.
