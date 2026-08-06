@@ -7,6 +7,34 @@ license = "MIT"
 repository = "https://github.com/dusterbloom/nanobot-rs"
 default-run = "nanobot"
 
+# Error-protocol enforcement layer 3 — higgs-style deny regime
+# (docs/research/2026-08-06-error-conventions-and-host-bridge.md §2.5/§3.6).
+# Test code uses the sanctioned crate-root escape hatch in src/lib.rs:
+# `#![cfg_attr(test, allow(...))]`.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+as_conversions = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+shadow_reuse = "deny"
+shadow_same = "deny"
+shadow_unrelated = "deny"
+try_err = "deny"
+string_add = "deny"
+format_push_string = "deny"
+
 [[bin]]
 name = "nanobot"
 path = "src/main.rs"

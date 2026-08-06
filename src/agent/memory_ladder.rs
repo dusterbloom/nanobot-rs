@@ -1,3 +1,10 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::shadow_reuse,
+)]
 //! Memory Ladder: priority-ordered memory layer facade.
 //!
 //! Provides a unified query interface over 4 named memory layers with
@@ -86,6 +93,7 @@ impl<'a> MemoryLadder<'a> {
     /// Iterates layers in priority order, allocating up to 50% of total budget
     /// per layer. When remaining budget reaches 0, lower layers are skipped.
     ///
+    #[allow(clippy::unreachable)] // feature-gated layers cannot exist without their feature
     pub async fn query(&self, q: &MemoryQuery<'_>) -> Vec<LayerResult> {
         let mut results = Vec::new();
         let mut remaining = q.total_budget;
@@ -119,6 +127,7 @@ impl<'a> MemoryLadder<'a> {
     }
 
     /// Fetch content from a single layer, truncated to the given token budget.
+    #[allow(clippy::unreachable)] // feature-gated layers cannot exist without their feature
     async fn fetch_layer(
         &self,
         layer: MemoryLayer,

@@ -1,4 +1,28 @@
 #![deny(unsafe_code)]
+// Test builds get the sanctioned escape hatch (research doc §3.6): the
+// production deny regime (unwrap/expect/panic/indexing/as_conversions/...)
+// applies to `cargo clippy` lib/bin builds; test modules may keep their
+// pragmatic unwraps without blocking the flip.
+#![cfg_attr(test, allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::string_add,
+    clippy::format_push_string,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::pedantic,
+    clippy::nursery,
+))]
 //! nanobot library — exposes internal modules for the trio_bench binary.
 
 pub(crate) const VERSION: &str = "0.1.0";

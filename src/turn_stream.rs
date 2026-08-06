@@ -196,6 +196,7 @@ impl TurnStream {
     /// Post-completion backlog: buffered events (deltas first), then
     /// `Finished` with the agent's response. Mirrors the drain the TUI did
     /// after its select loop broke.
+    #[allow(clippy::unreachable)] // only dispatched from Phase::Draining (state-machine invariant)
     fn next_draining(&mut self) -> TurnEvent {
         if let Some(event) = self.buffered_event() {
             return event;

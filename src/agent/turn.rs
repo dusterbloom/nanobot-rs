@@ -1,3 +1,11 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::as_conversions,
+    clippy::shadow_unrelated,
+)]
 //! Canonical message representation — independent of any LLM wire format.
 //!
 //! `Turn` is the single source of truth for conversation history. It is stored

@@ -1,3 +1,12 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+)]
 //! Phase 1 of message processing: build the [`TurnContext`] from an inbound message.
 //!
 //! Extracted from `agent_loop.rs` to keep that file focused on the iteration
@@ -316,13 +325,22 @@ impl AgentLoopShared {
                 } else {
                     LcmEngine::new(config)
                 };
-
                 engines.insert(
                     session_id.clone(),
                     std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
                 );
             }
-            engines.get(&session_id).cloned().unwrap()
+            match engines.get(&session_id) {
+                Some(e) => e.clone(),
+                // Inserted above or pre-existing under the same lock — absent
+                // only if the invariant broke; fall back to a fresh engine.
+                None => {
+                    use crate::agent::lcm::{LcmConfig, LcmEngine};
+                    std::sync::Arc::new(tokio::sync::Mutex::new(LcmEngine::new(
+                        LcmConfig::from(&self.lcm_config),
+                    )))
+                }
+            }
         };
         use crate::agent::lcm::LcmExpandTool;
         tools.register(Box::new(LcmExpandTool::new(lcm_engine)));

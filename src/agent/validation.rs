@@ -1,3 +1,10 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::shadow_reuse,
+)]
 #![allow(dead_code)]
 //! Response validation to detect hallucinated tool calls and context drift.
 //!
@@ -13,6 +20,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     // Matches `[Called ...]`, `[I called: ...]`, `[Calling tool: ...]`, etc.
     // Both past tense (called) and present (calling) with optional "tool" word.
@@ -25,6 +33,7 @@ static HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
 /// never populate `tool_calls`. Distinct from `[Called ...]` narration: there
 /// is no verb, just the call.
 ///
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static XML_HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r#"(?isx)
@@ -38,6 +47,7 @@ static XML_HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("xml hallucinated tool-call regex")
 });
 
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static NAMED_TOOL_INTENT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?ix)

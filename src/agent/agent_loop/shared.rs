@@ -1,3 +1,13 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+)]
 //! `AgentLoopShared` struct, supporting types, and the `impl AgentLoopShared` block
 //! containing the main agent loop step methods.
 //!
@@ -1726,15 +1736,13 @@ impl AgentLoopShared {
             // engine only needs the current context window.
             let lcm_engine = {
                 let mut engines = self.lcm_engines.lock().await;
-                if !engines.contains_key(&ctx.session_id) {
-                    let config = LcmConfig::from(&self.lcm_config);
-                    let engine = LcmEngine::new(config);
-                    engines.insert(
-                        ctx.session_id.clone(),
-                        Arc::new(tokio::sync::Mutex::new(engine)),
-                    );
-                }
-                engines.get(&ctx.session_id).cloned().unwrap()
+                engines
+                    .entry(ctx.session_id.clone())
+                    .or_insert_with(|| {
+                        let config = LcmConfig::from(&self.lcm_config);
+                        Arc::new(tokio::sync::Mutex::new(LcmEngine::new(config)))
+                    })
+                    .clone()
             };
 
             // Feed messages into the LCM engine's append-only store.
@@ -2409,7 +2417,12 @@ impl AgentLoopShared {
                         }
                     } => {
                         counters.mark_inference_finished();
-                        let timeout = no_progress_timeout.expect("timeout branch is disabled when None");
+                        // The None branch above sleeps forever, so this arm is only
+                        // reachable when Some; a zero timeout is a safe fallback.
+                        let timeout = match no_progress_timeout {
+                            Some(t) => t,
+                            None => std::time::Duration::ZERO,
+                        };
                         let detail = local_no_stream_progress_error(timeout);
                         error!(
                             model = %ctx.core.model,

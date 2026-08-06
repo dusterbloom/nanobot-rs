@@ -94,6 +94,7 @@ def _rpc_call(tool_name, **kwargs):
 ///
 /// The listener is set to non-blocking mode with a 100 ms accept loop so the
 /// server can notice the stop signal promptly after the child process exits.
+#[allow(clippy::expect_used)] // Runtime::new in a spawn_blocking context without an ambient runtime
 fn run_rpc_server(
     listener: UnixListener,
     registry: Arc<ToolRegistry>,

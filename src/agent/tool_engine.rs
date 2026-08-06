@@ -1,3 +1,13 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+)]
 //! Tool execution engine: delegated and inline paths.
 //!
 //! Extracted from `agent_loop.rs` to isolate tool execution logic.
@@ -689,15 +699,19 @@ pub(crate) async fn execute_tools_delegated(
                 // Small data — raw injection is safe; compaction won't truncate it.
                 ctx.content_gate.admit_simple(full_data).into_text()
             }
-        } else if ctx.core.specialist_provider.is_some() && full_tokens > threshold {
-            ctx.content_gate
-                .admit_with_specialist(
-                    full_data,
-                    ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
-                    ctx.core.specialist_model.as_deref().unwrap_or(""),
-                )
-                .await
-                .into_text()
+        } else if full_tokens > threshold {
+            if let Some(specialist) = ctx.core.specialist_provider.as_ref() {
+                ctx.content_gate
+                    .admit_with_specialist(
+                        full_data,
+                        specialist.as_ref(),
+                        ctx.core.specialist_model.as_deref().unwrap_or(""),
+                    )
+                    .await
+                    .into_text()
+            } else {
+                ctx.content_gate.admit_simple(full_data).into_text()
+            }
         } else {
             ctx.content_gate.admit_simple(full_data).into_text()
         };
@@ -1200,15 +1214,20 @@ async fn inject_tool_result(
                 return;
             }
         };
-        let summarized = ctx
-            .content_gate
-            .admit_with_specialist(
-                &result_data,
-                ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
-                ctx.core.specialist_model.as_deref().unwrap_or(""),
-            )
-            .await
-            .into_text();
+        let summarized = match ctx.core.specialist_provider.as_ref() {
+            Some(specialist) => ctx
+                .content_gate
+                .admit_with_specialist(
+                    &result_data,
+                    specialist.as_ref(),
+                    ctx.core.specialist_model.as_deref().unwrap_or(""),
+                )
+                .await
+                .into_text(),
+            // Defensive: the caller previously panicked here if the provider
+            // was None; fall back to the simple admit instead.
+            None => ctx.content_gate.admit_simple(&result_data).into_text(),
+        };
         let mut preview =
             build_tool_result_preview(&r.tool_name, &r.arguments, &summarized, cap, &r.tool_id);
         // If the summary fit under cap, build_tool_result_preview returned it

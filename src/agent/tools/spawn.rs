@@ -333,8 +333,8 @@ impl Tool for SpawnTool {
             "list" => {
                 let cb_guard = self.list_callback.lock().await;
                 match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
+                    Some(cb_ref) => {
+                        let cb = cb_ref.clone();
                         drop(cb_guard);
                         into_result(cb().await)
                     }
@@ -356,8 +356,8 @@ impl Tool for SpawnTool {
                 };
                 let cb_guard = self.check_callback.lock().await;
                 match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
+                    Some(cb_ref) => {
+                        let cb = cb_ref.clone();
                         drop(cb_guard);
                         into_result(cb(task_id).await)
                     }
@@ -379,8 +379,8 @@ impl Tool for SpawnTool {
                 };
                 let cb_guard = self.cancel_callback.lock().await;
                 match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
+                    Some(cb_ref) => {
+                        let cb = cb_ref.clone();
                         drop(cb_guard);
                         into_result(cb(task_id).await)
                     }
@@ -406,8 +406,8 @@ impl Tool for SpawnTool {
                     .unwrap_or(120);
                 let cb_guard = self.wait_callback.lock().await;
                 match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
+                    Some(cb_ref) => {
+                        let cb = cb_ref.clone();
                         drop(cb_guard);
                         into_result(cb(task_id, timeout).await)
                     }
@@ -430,12 +430,13 @@ impl Tool for SpawnTool {
                 let ahead_by_k = params
                     .get("ahead_by_k")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
+                    .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
+                    .unwrap_or(0);
 
                 let cb_guard = self.pipeline_callback.lock().await;
                 match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
+                    Some(cb_ref) => {
+                        let cb = cb_ref.clone();
                         drop(cb_guard);
                         into_result(cb(steps_json, ahead_by_k).await)
                     }
@@ -458,7 +459,8 @@ impl Tool for SpawnTool {
                 let max_rounds = params
                     .get("max_rounds")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as u32;
+                    .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+                    .unwrap_or(5);
                 let tools_filter: Option<Vec<String>> =
                     params.get("tools").and_then(|v| v.as_array()).map(|arr| {
                         arr.iter()
@@ -480,8 +482,8 @@ impl Tool for SpawnTool {
 
                 let cb_guard = self.loop_callback.lock().await;
                 match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
+                    Some(cb_ref) => {
+                        let cb = cb_ref.clone();
                         drop(cb_guard);
                         into_result(
                             cb(

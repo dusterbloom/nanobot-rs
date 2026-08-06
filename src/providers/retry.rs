@@ -1,3 +1,10 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::shadow_reuse,
+)]
 //! Shared retry helpers for LLM providers.
 //!
 //! Provides backoff configurations and a rate-limit-aware delay adjuster

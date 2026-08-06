@@ -1,3 +1,10 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::as_conversions,
+)]
 #![allow(dead_code)]
 //! Delegated tool execution loop.
 //!
@@ -952,7 +959,9 @@ pub async fn run_tool_loop(
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 tc.name.hash(&mut hasher);
-                all_results.last().unwrap().2.hash(&mut hasher);
+                if let Some(last) = all_results.last() {
+                    last.2.hash(&mut hasher);
+                }
                 let result_hash = hasher.finish();
                 if !seen_results.insert(result_hash) {
                     warn!(

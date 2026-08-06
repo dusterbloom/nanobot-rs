@@ -1,3 +1,13 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+)]
 //! OpenAI-compatible API provider.
 //!
 //! Replaces LiteLLMProvider by calling OpenAI-compatible APIs directly via reqwest.
@@ -1655,7 +1665,7 @@ async fn parse_sse_stream(
                 let mut indices: Vec<u64> = tool_calls_acc.keys().copied().collect();
                 indices.sort();
                 for idx in indices {
-                    let (id, name, args_str) = tool_calls_acc.remove(&idx).unwrap();
+                    let Some((id, name, args_str)) = tool_calls_acc.remove(&idx) else { continue; };
                     if !is_valid_tool_call_name(&name) {
                         warn!(
                             id = %id,
@@ -1873,7 +1883,7 @@ async fn parse_sse_stream(
     let mut indices: Vec<u64> = tool_calls_acc.keys().copied().collect();
     indices.sort();
     for idx in indices {
-        let (id, name, args_str) = tool_calls_acc.remove(&idx).unwrap();
+        let Some((id, name, args_str)) = tool_calls_acc.remove(&idx) else { continue; };
         if !is_valid_tool_call_name(&name) {
             warn!(
                 id = %id,

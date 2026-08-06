@@ -1,3 +1,11 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+)]
 //! Shell execution tool.
 
 use std::collections::HashMap;
@@ -12,11 +20,15 @@ use regex::Regex;
 use tokio::process::Command;
 
 // Static regexes for command normalization (compiled once).
-static RE_ESCAPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([^nrtav\\0])").unwrap());
-static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
-static RE_POSIX_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/[^\s"']+"#).unwrap());
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_ESCAPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([^nrtav\\0])").expect("static regex"));
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("static regex"));
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_POSIX_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/[^\s"']+"#).expect("static regex"));
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_WIN_PATH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).expect("static regex"));
 
 use super::base::{require_str, PermissionLevel, Tool, ToolExecutionContext};
 use crate::agent::audit::ToolEvent;
@@ -500,8 +512,9 @@ impl Tool for ExecTool {
                 }
             };
 
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
+            let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+                return "Error: failed to capture command output".to_string();
+            };
 
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();

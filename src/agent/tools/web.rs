@@ -1,3 +1,13 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+)]
 //! Web tools: web_search and web_fetch.
 
 use std::collections::HashMap;
@@ -24,8 +34,10 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 // Static regexes (compiled once)
 // ---------------------------------------------------------------------------
-static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").unwrap());
-static RE_NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").expect("static regex"));
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").expect("static regex"));
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -826,12 +838,15 @@ fn extract_html_content(html: &str, mode: &str) -> String {
 /// images are dropped, links keep only their text. Pages like news front
 /// pages are mostly link targets by byte count.
 fn flatten_markdown_noise(text: &str) -> String {
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static RE_IMAGE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
+        LazyLock::new(|| Regex::new(r"!\[[^\]]*\]\([^)]*\)").expect("static regex"));
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static RE_LINK: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap());
+        LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\([^)]*\)").expect("static regex"));
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static RE_MD_ESCAPE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\\([\\`*_{}\[\]()#+.!|-])").unwrap());
+        LazyLock::new(|| Regex::new(r"\\([\\`*_{}\[\]()#+.!|-])").expect("static regex"));
     let text = RE_IMAGE.replace_all(text, "");
     let text = RE_LINK.replace_all(&text, "$1");
     let text = RE_MD_ESCAPE.replace_all(&text, "$1");
