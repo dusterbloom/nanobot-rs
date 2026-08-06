@@ -38,16 +38,13 @@ pub use filesystem::{
     EditFileTool, FileInfoTool, FindFilesTool, ListDirTool, ReadFileTool, SearchFilesTool,
     WorkspaceDiffTool, WriteFileTool,
 };
-pub use message::{MessageTool, SendCallback};
+pub use message::MessageTool;
 pub use read_skill::ReadSkillTool;
 pub use recall::RecallTool;
 pub use registry::ToolRegistry;
 pub use remember::RememberTool;
 pub use shell::ExecTool;
-pub use spawn::{
-    CancelCallback, CheckCallback, ListCallback, LoopCallback, PipelineCallback, SpawnCallback,
-    SpawnTool, SpawnToolLite, WaitCallback,
-};
+pub use spawn::{SpawnTool, SpawnToolLite};
 pub use system_info::SystemInfoTool;
 pub use todo::TodoTool;
 pub use tool_status::ToolStatusTool;

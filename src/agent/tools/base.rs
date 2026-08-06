@@ -138,7 +138,7 @@ impl ToolExecutionResult {
     }
 
     #[must_use]
-    #[allow(clippy::disallowed_methods)] // legacy constructor — deleted in Phase 3
+    #[allow(clippy::disallowed_methods)] // legacy constructor — retained for ToolExecutionResult::failure compatibility (Phase 4)
     pub fn failure(message: String) -> Self {
         let error_kind = crate::errors::classify_tool_error(&message);
         Self {

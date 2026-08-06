@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # scripts/quality-sentinel.sh — error-protocol legacy-channel sentinel.
 #
-# Fails if the legacy string-classification channels (`from_output`,
-# `classify_tool_error`) are used outside their allowed sites. These are the
+# Fails if (1) the legacy string-classification channels (`from_output`,
+# `classify_tool_error`) are used outside their allowed sites, or (2) any
+# legacy `set_*_callback` setter exists (host bridge Phase 3 deleted them). These are the
 # pre-typed-error parsing paths; the typed error protocol (ToolError /
 # ToolResult, error-protocol phase 2) replaces them, and the research doc
 # (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.8) plans
@@ -56,3 +57,21 @@ if [[ -n "$violations" ]]; then
 fi
 
 echo "error-protocol sentinel OK: no from_output/classify_tool_error usage outside allowed sites."
+
+# Host-bridge legacy callback setters (research doc §3.8): zero
+# set_*_callback may exist — Phase 3 deleted the callback slots and the typed
+# HostBridge / MessageHost traits replaced them. A new callback-coupled tool
+# is a regression against the migration.
+callback_pattern='fn set_[a-z_]*callback'
+callback_violations="$(grep -rnE "$callback_pattern" src/ --include='*.rs'   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//'   || true)"
+
+if [[ -n "$callback_violations" ]]; then
+    echo "error-protocol sentinel: legacy set_*_callback usage:" >&2
+    echo "$callback_violations" >&2
+    echo >&2
+    echo "Callback slots were deleted in Phase 3 (host bridge, research doc §3.8);" >&2
+    echo "use the typed HostBridge / MessageHost traits instead." >&2
+    exit 1
+fi
+
+echo "error-protocol sentinel OK: no set_*_callback usage."

@@ -13,28 +13,12 @@
 //!   [`MessageHost`], composed into the [`HostBridge`] blanket trait (DIP)
 //! - [`HostDispatcher`]: the single `match` (OCP seam) + the `From<Result<…>>`
 //!   envelope construction (DRY)
-//! - [`HostBridgeAdapter`]: transitional (doc §3.7 Step 1) — implements the
-//!   traits by invoking the *legacy* callback slots, so the dispatcher can be
-//!   exercised end-to-end against the pre-bridge wiring byte-for-byte.
-
-// The bridge is wired at the registry boundary (build_tools → with_host) but
-// dormant until the tool-adoption step (doc §3.7 Steps 2-3) puts requests on
-// the wire: no tool calls `HostDispatcher` in production yet, so the protocol
-// types are only constructed by the test suite. Scoped-allow style, error
-// protocol §2.5 — remove when a tool executes through the host.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::tools::message::SendCallback;
-use crate::agent::tools::spawn::{
-    CancelCallback, CheckCallback, ListCallback, LoopCallback, PipelineCallback, SpawnCallback,
-    WaitCallback,
-};
-use crate::bus::events::OutboundMessage;
 use crate::errors::ToolError;
 
 // ---------------------------------------------------------------------------
@@ -60,8 +44,7 @@ pub enum HostRequest {
     SendMessage(SendMessageRequest),
 }
 
-/// Spawn a background subagent (the contract that replaces the positional
-/// `SpawnCallback`).
+/// Spawn a background subagent (replaces the positional `SpawnCallback`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnRequest {
     pub task: String,
@@ -142,7 +125,7 @@ const fn default_max_rounds() -> u32 {
     5
 }
 
-/// Send an explicit out-of-band notification (the `SendCallback` contract).
+/// Send an explicit out-of-band notification (replaces the `SendCallback`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendMessageRequest {
     /// Resolved target channel (defaults already applied by the caller).
@@ -240,7 +223,40 @@ pub trait MessageHost: Send + Sync {
 /// Composite capability set. Blanket impl: any type implementing all four
 /// traits IS a [`HostBridge`] (DIP: depend on this, never on
 /// `SubagentManager` or callback slots).
-pub trait HostBridge: SpawnHost + PipelineHost + LoopHost + MessageHost {}
+#[async_trait]
+pub trait HostBridge: SpawnHost + PipelineHost + LoopHost + MessageHost {
+    /// Typed in-process call — the tool-facing entry point (research §3.4:
+    /// "one call, no locks, no Option, no stringify"). The OCP `match` over
+    /// the request enum routes each variant to the matching capability
+    /// method (shared by every host implementation), builds the reply
+    /// envelope, and round-trips the error channel byte-losslessly: an
+    /// `Error` envelope's rendered string converts back through
+    /// [`ToolError::from_legacy`] and re-renders identically, so a tool
+    /// that `?`-propagates never double-prefixes or rewrites it.
+    async fn call(&self, req: HostRequest) -> Result<serde_json::Value, ToolError> {
+        let reply: HostReply = match req {
+            HostRequest::Spawn(r) => self.spawn(r).await.into(),
+            HostRequest::ListSubagents(_) => self.list_subagents().await.into(),
+            HostRequest::CancelSubagent(r) => self.cancel(r).await.into(),
+            HostRequest::WaitSubagent(r) => self.wait(r).await.into(),
+            HostRequest::CheckSubagent(r) => self.check(r).await.into(),
+            HostRequest::RunPipeline(r) => self.run_pipeline(r).await.into(),
+            HostRequest::RunLoop(r) => self.run_loop(r).await.into(),
+            HostRequest::SendMessage(r) => self.send(r).await.into(),
+        };
+        match reply {
+            HostReply::Ok { data } => Ok(data),
+            HostReply::Error { error } => {
+                let message = error
+                    .strip_prefix("Error:")
+                    .map(str::trim)
+                    .unwrap_or(&error)
+                    .to_string();
+                Err(ToolError::from_legacy(&message))
+            }
+        }
+    }
+}
 impl<T: SpawnHost + PipelineHost + LoopHost + MessageHost> HostBridge for T {}
 
 // ---------------------------------------------------------------------------
@@ -270,6 +286,13 @@ impl HostDispatcher {
         Self { spawn, pipeline, loop_, message }
     }
 
+    // Transport seam (research doc §3.7 Step 4): a future UDS/ZeroMQ server
+    // deserializes `HostRequest` and calls `dispatch` — the envelope-level
+    // entry point. Today the in-process production path goes through
+    // `Arc<dyn HostBridge>::call` (the trait default, which shares this
+    // envelope construction), so the only current callers are the test suite
+    // and the Step-4 server; kept live as the documented OCP choke point.
+    #[allow(dead_code)]
     /// Transport entry point: request in, reply out. The single OCP `match`
     /// over the request enum — a new capability adds a variant + one arm here
     /// (or none, if routed through an existing host) and nothing else.
@@ -283,26 +306,6 @@ impl HostDispatcher {
             HostRequest::RunPipeline(r) => self.pipeline.run_pipeline(r).await.into(),
             HostRequest::RunLoop(r) => self.loop_.run_loop(r).await.into(),
             HostRequest::SendMessage(r) => self.message.send(r).await.into(),
-        }
-    }
-
-    /// Typed in-process call used by tools (skips the serde round-trip).
-    ///
-    /// The error channel is round-tripped byte-losslessly: the envelope
-    /// carries `ToolError::render()` output, and converting it back through
-    /// [`ToolError::from_legacy`] re-renders the identical string, so a tool
-    /// that `?`-propagates the error never double-prefixes or rewrites it.
-    pub async fn call(&self, req: HostRequest) -> Result<serde_json::Value, ToolError> {
-        match self.dispatch(req).await {
-            HostReply::Ok { data } => Ok(data),
-            HostReply::Error { error } => {
-                let message = error
-                    .strip_prefix("Error:")
-                    .map(str::trim)
-                    .unwrap_or(&error)
-                    .to_string();
-                Err(ToolError::from_legacy(&message))
-            }
         }
     }
 }
@@ -363,124 +366,6 @@ where
             },
             Err(e) => Self::Error { error: e.render() },
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HostBridgeAdapter — transitional bridge over the legacy callback slots
-// (doc §3.7 Step 1). Deleted in Step 3 once the closure bodies are fully
-// ported into the production host (AgentHost in tool_wiring).
-// ---------------------------------------------------------------------------
-
-/// Implements the capability traits by invoking the *legacy* callback
-/// closures, so the dispatcher can be driven end-to-end against the
-/// pre-bridge wiring and proven byte-identical to `SpawnTool`/`MessageTool`.
-pub struct HostBridgeAdapter {
-    spawn: Option<SpawnCallback>,
-    list: Option<ListCallback>,
-    cancel: Option<CancelCallback>,
-    wait: Option<WaitCallback>,
-    check: Option<CheckCallback>,
-    pipeline: Option<PipelineCallback>,
-    loop_: Option<LoopCallback>,
-    send: Option<SendCallback>,
-}
-
-impl HostBridgeAdapter {
-    #[allow(clippy::too_many_arguments)] // 8 legacy callback slots, one per capability method — transitional type, deleted in Step 3
-    pub fn new(
-        spawn: Option<SpawnCallback>,
-        list: Option<ListCallback>,
-        cancel: Option<CancelCallback>,
-        wait: Option<WaitCallback>,
-        check: Option<CheckCallback>,
-        pipeline: Option<PipelineCallback>,
-        loop_: Option<LoopCallback>,
-        send: Option<SendCallback>,
-    ) -> Self {
-        Self { spawn, list, cancel, wait, check, pipeline, loop_, send }
-    }
-}
-
-#[async_trait]
-impl SpawnHost for HostBridgeAdapter {
-    async fn spawn(&self, req: SpawnRequest) -> Result<SpawnReply, ToolError> {
-        let cb = self.spawn.clone().ok_or_else(|| ToolError::Execution {
-            message: "Spawn callback not configured".to_string(),
-        })?;
-        let text = into_model_text(
-            cb(req.task, req.label, req.profile, req.model, req.channel, req.chat_id, req.working_dir)
-                .await,
-        )?;
-        Ok(SpawnReply { task_id: spawn_task_id(&text), text })
-    }
-
-    async fn list_subagents(&self) -> Result<ListReply, ToolError> {
-        let cb = self.list.clone().ok_or_else(|| ToolError::Execution {
-            message: "List callback not configured".to_string(),
-        })?;
-        Ok(ListReply { text: into_model_text(cb().await)? })
-    }
-
-    async fn cancel(&self, req: CancelRequest) -> Result<CancelReply, ToolError> {
-        let cb = self.cancel.clone().ok_or_else(|| ToolError::Execution {
-            message: "Cancel callback not configured".to_string(),
-        })?;
-        Ok(CancelReply { text: into_model_text(cb(req.task_id).await)? })
-    }
-
-    async fn wait(&self, req: WaitRequest) -> Result<WaitReply, ToolError> {
-        let cb = self.wait.clone().ok_or_else(|| ToolError::Execution {
-            message: "Wait callback not configured".to_string(),
-        })?;
-        Ok(WaitReply { text: into_model_text(cb(req.task_id, req.timeout_secs).await)? })
-    }
-
-    async fn check(&self, req: CheckRequest) -> Result<CheckReply, ToolError> {
-        let cb = self.check.clone().ok_or_else(|| ToolError::Execution {
-            message: "Check callback not configured".to_string(),
-        })?;
-        Ok(CheckReply { text: into_model_text(cb(req.task_id).await)? })
-    }
-}
-
-#[async_trait]
-impl PipelineHost for HostBridgeAdapter {
-    async fn run_pipeline(&self, req: PipelineRequest) -> Result<PipelineReply, ToolError> {
-        let cb = self.pipeline.clone().ok_or_else(|| ToolError::Execution {
-            message: "Pipeline callback not configured".to_string(),
-        })?;
-        let steps_json = serde_json::to_string(&req.steps).unwrap_or_else(|_| "[]".to_string());
-        Ok(PipelineReply { text: into_model_text(cb(steps_json, req.ahead_by_k).await)? })
-    }
-}
-
-#[async_trait]
-impl LoopHost for HostBridgeAdapter {
-    async fn run_loop(&self, req: LoopRequest) -> Result<LoopReply, ToolError> {
-        let cb = self.loop_.clone().ok_or_else(|| ToolError::Execution {
-            message: "Loop callback not configured".to_string(),
-        })?;
-        Ok(LoopReply {
-            text: into_model_text(
-                cb(req.task, req.max_rounds, req.tools, req.stop_condition, req.model, req.working_dir)
-                    .await,
-            )?,
-        })
-    }
-}
-
-#[async_trait]
-impl MessageHost for HostBridgeAdapter {
-    async fn send(&self, req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
-        let cb = self.send.clone().ok_or_else(|| ToolError::Execution {
-            message: "Message sending not configured".to_string(),
-        })?;
-        let msg = OutboundMessage::new(&req.channel, &req.chat_id, &req.content);
-        cb(msg).await.map_err(|e| ToolError::Execution {
-            message: format!("Error sending message: {e}"),
-        })?;
-        Ok(SendMessageReply { text: format!("Message sent to {}:{}", req.channel, req.chat_id) })
     }
 }
 
@@ -816,294 +701,200 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Dispatcher over the legacy adapter — byte-stability proof
+    // Permanent byte-stability proof — tools through the bridge
+    // (doc §3.7 Steps 2-3: once the adapter and the legacy callback surface
+    // are deleted, these tests pin the tool→bridge→model path to the exact
+    // pre-bridge wire strings, so adopting the bridge cannot change what the
+    // model sees.)
     // -----------------------------------------------------------------------
 
-    fn legacy_callbacks() -> (
-        SpawnCallback,
-        ListCallback,
-        CancelCallback,
-        WaitCallback,
-        CheckCallback,
-        PipelineCallback,
-        LoopCallback,
-        SendCallback,
-    ) {
-        let spawn: SpawnCallback = Arc::new(
-            |_task, label, _agent, model, _ch, _cid, _wd| {
-                Box::pin(async move {
-                    format!(
-                        "Subagent '{}' spawned (id: abc12345, model: {}). It will announce results when done.",
-                        label.unwrap_or_default(),
-                        model.unwrap_or_else(|| "default".to_string())
-                    )
-                })
-            },
-        );
-        let list: ListCallback =
-            Arc::new(|| Box::pin(async { "No subagents currently running.".to_string() }));
-        let cancel: CancelCallback =
-            Arc::new(|id| Box::pin(async move { format!("Subagent '{id}' cancelled.") }));
-        let wait: WaitCallback = Arc::new(|id, timeout| {
-            Box::pin(async move { format!("waited {id} for {timeout}s") })
-        });
-        let check: CheckCallback =
-            Arc::new(|id| Box::pin(async move { format!("checked {id}") }));
-        let pipeline: PipelineCallback = Arc::new(|steps, ahead| {
-            Box::pin(async move { format!("pipeline over {steps} ahead {ahead}") })
-        });
-        let loop_: LoopCallback = Arc::new(|task, rounds, _t, _s, _m, _w| {
-            Box::pin(async move { format!("loop {task} r{rounds}") })
-        });
-        let send: SendCallback = Arc::new(|_msg| Box::pin(async { Ok(()) }));
-        (spawn, list, cancel, wait, check, pipeline, loop_, send)
+    /// Mock host emitting the exact pre-bridge wire formats (the strings the
+    /// legacy `build_tools` closures produced), used to prove the tool→bridge
+    /// path is byte-stable end-to-end.
+    struct LegacyWireHost;
+
+    #[async_trait]
+    impl SpawnHost for LegacyWireHost {
+        async fn spawn(&self, req: SpawnRequest) -> Result<SpawnReply, ToolError> {
+            Ok(SpawnReply {
+                task_id: "abc12345".to_string(),
+                text: format!(
+                    "Subagent '{}' spawned (id: abc12345, model: {}). It will announce results when done.",
+                    req.label.unwrap_or_default(),
+                    req.model.unwrap_or_else(|| "default".to_string())
+                ),
+            })
+        }
+        async fn list_subagents(&self) -> Result<ListReply, ToolError> {
+            Ok(ListReply { text: "No subagents currently running.".to_string() })
+        }
+        async fn cancel(&self, req: CancelRequest) -> Result<CancelReply, ToolError> {
+            Ok(CancelReply { text: format!("Subagent '{}' cancelled.", req.task_id) })
+        }
+        async fn wait(&self, req: WaitRequest) -> Result<WaitReply, ToolError> {
+            Ok(WaitReply { text: format!("waited {} for {}s", req.task_id, req.timeout_secs) })
+        }
+        async fn check(&self, req: CheckRequest) -> Result<CheckReply, ToolError> {
+            Ok(CheckReply { text: format!("checked {}", req.task_id) })
+        }
     }
 
-    fn adapter_dispatcher(
-        spawn: SpawnCallback,
-        list: ListCallback,
-        cancel: CancelCallback,
-        wait: WaitCallback,
-        check: CheckCallback,
-        pipeline: PipelineCallback,
-        loop_: LoopCallback,
-        send: SendCallback,
-    ) -> HostDispatcher {
-        let adapter = Arc::new(HostBridgeAdapter::new(
-            Some(spawn),
-            Some(list),
-            Some(cancel),
-            Some(wait),
-            Some(check),
-            Some(pipeline),
-            Some(loop_),
-            Some(send),
-        ));
-        HostDispatcher::new(
-            adapter.clone(),
-            adapter.clone(),
-            adapter.clone(),
-            adapter.clone(),
-        )
+    #[async_trait]
+    impl PipelineHost for LegacyWireHost {
+        async fn run_pipeline(&self, req: PipelineRequest) -> Result<PipelineReply, ToolError> {
+            let steps = serde_json::to_string(&req.steps).unwrap_or_default();
+            Ok(PipelineReply { text: format!("pipeline over {steps} ahead {}", req.ahead_by_k) })
+        }
+    }
+
+    #[async_trait]
+    impl LoopHost for LegacyWireHost {
+        async fn run_loop(&self, req: LoopRequest) -> Result<LoopReply, ToolError> {
+            Ok(LoopReply { text: format!("loop {} r{}", req.task, req.max_rounds) })
+        }
+    }
+
+    #[async_trait]
+    impl MessageHost for LegacyWireHost {
+        async fn send(&self, req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
+            Ok(SendMessageReply {
+                text: format!("Message sent to {}:{}", req.channel, req.chat_id),
+            })
+        }
+    }
+
+    fn legacy_wire_dispatcher() -> Arc<HostDispatcher> {
+        let host = Arc::new(LegacyWireHost);
+        Arc::new(HostDispatcher::new(
+            host.clone(),
+            host.clone(),
+            host.clone(),
+            host.clone(),
+        ))
     }
 
     #[tokio::test]
-    async fn dispatcher_over_legacy_callbacks_matches_spawn_tool_output() {
-        let (spawn, list, cancel, wait, check, pipeline, loop_, send) = legacy_callbacks();
-        let dispatcher = adapter_dispatcher(
-            spawn.clone(),
-            list.clone(),
-            cancel.clone(),
-            wait.clone(),
-            check.clone(),
-            pipeline.clone(),
-            loop_.clone(),
-            send.clone(),
-        );
+    async fn spawn_tool_through_bridge_matches_legacy_wire_strings() {
+        let tool = SpawnTool::new(legacy_wire_dispatcher());
 
-        // Legacy surface: the same callbacks wired into SpawnTool.
-        let tool = SpawnTool::new();
-        tool.set_callback(spawn).await;
-        tool.set_list_callback(list).await;
-        tool.set_cancel_callback(cancel).await;
-        tool.set_wait_callback(wait).await;
-        tool.set_check_callback(check).await;
-        tool.set_pipeline_callback(pipeline).await;
-        tool.set_loop_callback(loop_).await;
-        tool.set_context("telegram", "42").await;
-
-        // spawn
+        // spawn — the exact legacy confirmation line.
         let mut p = HashMap::new();
         p.insert("task".to_string(), json!("do x"));
         p.insert("label".to_string(), json!("explore"));
         p.insert("model".to_string(), json!("haiku"));
-        let legacy = tool.execute(p).await;
-        let reply = dispatcher
-            .dispatch(HostRequest::Spawn(SpawnRequest {
-                task: "do x".to_string(),
-                label: Some("explore".to_string()),
-                profile: None,
-                model: Some("haiku".to_string()),
-                working_dir: None,
-                channel: "telegram".to_string(),
-                chat_id: "42".to_string(),
-            }))
-            .await;
-        match reply {
-            HostReply::Ok { data } => {
-                assert_eq!(data["text"].as_str().unwrap(), legacy, "spawn text diverged");
-                assert_eq!(data["task_id"].as_str().unwrap(), "abc12345");
-            }
-            other => panic!("expected Ok, got {other:?}"),
-        }
+        assert_eq!(
+            tool.execute(p).await,
+            "Subagent 'explore' spawned (id: abc12345, model: haiku). It will announce results when done."
+        );
 
-        // list
+        // list / cancel / wait / check
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("list"));
-        let legacy = tool.execute(p).await;
-        let reply = dispatcher.dispatch(HostRequest::ListSubagents(ListSubagentsRequest {})).await;
-        assert_eq!(reply_text(&reply), legacy, "list text diverged");
+        assert_eq!(tool.execute(p).await, "No subagents currently running.");
 
-        // cancel
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("cancel"));
         p.insert("task_id".to_string(), json!("abc12345"));
-        let legacy = tool.execute(p).await;
-        let reply = dispatcher
-            .dispatch(HostRequest::CancelSubagent(CancelRequest {
-                task_id: "abc12345".to_string(),
-            }))
-            .await;
-        assert_eq!(reply_text(&reply), legacy, "cancel text diverged");
+        assert_eq!(tool.execute(p).await, "Subagent 'abc12345' cancelled.");
 
-        // wait
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("wait"));
         p.insert("task_id".to_string(), json!("abc12345"));
         p.insert("timeout".to_string(), json!(10));
-        let legacy = tool.execute(p).await;
-        let reply = dispatcher
-            .dispatch(HostRequest::WaitSubagent(WaitRequest {
-                task_id: "abc12345".to_string(),
-                timeout_secs: 10,
-            }))
-            .await;
-        assert_eq!(reply_text(&reply), legacy, "wait text diverged");
+        assert_eq!(tool.execute(p).await, "waited abc12345 for 10s");
 
-        // check
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("check"));
         p.insert("task_id".to_string(), json!("abc12345"));
-        let legacy = tool.execute(p).await;
-        let reply = dispatcher
-            .dispatch(HostRequest::CheckSubagent(CheckRequest {
-                task_id: "abc12345".to_string(),
-            }))
-            .await;
-        assert_eq!(reply_text(&reply), legacy, "check text diverged");
+        assert_eq!(tool.execute(p).await, "checked abc12345");
 
-        // pipeline
+        // pipeline / loop
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("pipeline"));
         p.insert("steps".to_string(), json!([{"prompt": "one"}, {"prompt": "two"}]));
         p.insert("ahead_by_k".to_string(), json!(2));
-        let legacy = tool.execute(p).await;
-        let reply = dispatcher
-            .dispatch(HostRequest::RunPipeline(PipelineRequest {
-                steps: vec![json!({"prompt": "one"}), json!({"prompt": "two"})],
-                ahead_by_k: 2,
-            }))
-            .await;
-        assert_eq!(reply_text(&reply), legacy, "pipeline text diverged");
+        assert_eq!(
+            tool.execute(p).await,
+            "pipeline over [{\"prompt\":\"one\"},{\"prompt\":\"two\"}] ahead 2"
+        );
 
-        // loop
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("loop"));
         p.insert("task".to_string(), json!("refine"));
         p.insert("max_rounds".to_string(), json!(3));
-        let legacy = tool.execute(p).await;
-        let reply = dispatcher
-            .dispatch(HostRequest::RunLoop(LoopRequest {
-                task: "refine".to_string(),
-                max_rounds: 3,
-                tools: None,
-                stop_condition: None,
-                model: None,
-                working_dir: None,
-            }))
-            .await;
-        assert_eq!(reply_text(&reply), legacy, "loop text diverged");
+        assert_eq!(tool.execute(p).await, "loop refine r3");
     }
 
     #[tokio::test]
-    async fn legacy_error_strings_classify_identically_through_the_bridge() {
-        let failing: SpawnCallback =
-            Arc::new(|_task, _l, _a, _m, _ch, _cid, _wd| {
-                Box::pin(async { "Error: Connection refused".to_string() })
-            });
-        let adapter = Arc::new(HostBridgeAdapter::new(
-            Some(failing),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ));
-        let dispatcher = HostDispatcher::new(
-            adapter.clone(),
-            adapter.clone(),
-            adapter.clone(),
-            adapter.clone(),
+    async fn spawn_tool_through_bridge_preserves_legacy_error_strings() {
+        // Host errors must reach the model byte-identically: the envelope
+        // round-trips through ToolError::from_legacy and re-renders the same
+        // "Error: …" string.
+        let d = HostDispatcher::new(
+            Arc::new(FailingSpawn),
+            Arc::new(MockPipeline),
+            Arc::new(MockLoop),
+            Arc::new(MockMessage),
         );
-        let reply = dispatcher
-            .dispatch(HostRequest::Spawn(SpawnRequest {
-                task: "t".to_string(),
-                label: None,
-                profile: None,
-                model: None,
-                working_dir: None,
-                channel: "cli".to_string(),
-                chat_id: "direct".to_string(),
-            }))
-            .await;
-        match reply {
-            HostReply::Error { error } => assert_eq!(error, "Error: Connection refused"),
-            other => panic!("expected Error envelope, got {other:?}"),
-        }
+        let tool = SpawnTool::new(Arc::new(d));
+        let mut p = HashMap::new();
+        p.insert("task".to_string(), json!("t"));
+        assert_eq!(tool.execute(p).await, "Error: Command timed out after 30s");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("check"));
+        p.insert("task_id".to_string(), json!("x"));
+        assert_eq!(tool.execute(p).await, "Error: Network error: dns");
     }
 
     #[tokio::test]
-    async fn adapter_missing_callback_reports_legacy_error_text() {
-        let adapter = Arc::new(HostBridgeAdapter::new(
-            None, None, None, None, None, None, None, None,
-        ));
-        let reply = adapter.list_subagents().await.unwrap_err();
-        assert_eq!(reply.render(), "Error: List callback not configured");
+    async fn spawn_tool_parse_errors_match_legacy_strings() {
+        let tool = SpawnTool::new(legacy_wire_dispatcher());
+        // Tool-level validation errors are the exact legacy strings (no host
+        // round-trip involved).
+        let p = HashMap::new();
+        assert_eq!(tool.execute(p).await, "Error: 'task' parameter is required");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("wait"));
+        assert_eq!(tool.execute(p).await, "Error: 'task_id' parameter is required for wait");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("pipeline"));
+        assert_eq!(tool.execute(p).await, "Error: 'steps' parameter is required for pipeline");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("loop"));
+        assert_eq!(tool.execute(p).await, "Error: 'task' parameter is required for loop");
     }
 
     #[tokio::test]
-    async fn message_path_matches_legacy_message_tool_output() {
-        let (_, _, _, _, _, _, _, send) = legacy_callbacks();
-        let adapter = Arc::new(HostBridgeAdapter::new(
-            None, None, None, None, None, None, None, Some(send.clone()),
-        ));
-        let dispatcher = HostDispatcher::new(
-            adapter.clone(),
-            adapter.clone(),
-            adapter.clone(),
-            adapter.clone(),
-        );
+    async fn message_tool_through_bridge_matches_legacy_output() {
+        let host: Arc<dyn MessageHost> = Arc::new(LegacyWireHost);
+        let tool = MessageTool::new(host, "telegram", "42");
 
-        let legacy_tool = MessageTool::new(Some(send), "telegram", "42");
         let mut p = HashMap::new();
         p.insert("content".to_string(), json!("hi"));
-        let legacy = legacy_tool.execute(p).await;
+        assert_eq!(tool.execute(p).await, "Message sent to telegram:42");
 
-        let reply = dispatcher
-            .dispatch(HostRequest::SendMessage(SendMessageRequest {
-                channel: "telegram".to_string(),
-                chat_id: "42".to_string(),
-                content: "hi".to_string(),
-            }))
-            .await;
-        assert_eq!(reply_text(&reply), legacy, "message text diverged");
+        // Per-call channel/chat overrides win over the baked defaults.
+        let mut p = HashMap::new();
+        p.insert("content".to_string(), json!("hi"));
+        p.insert("channel".to_string(), json!("discord"));
+        p.insert("chat_id".to_string(), json!("999"));
+        assert_eq!(tool.execute(p).await, "Message sent to discord:999");
+
+        // Missing content → the exact legacy MissingArg wire string.
+        let p = HashMap::new();
+        assert_eq!(
+            tool.execute(p).await,
+            "Error: 'content' parameter is required; call as message({\"content\":\"hello\"})"
+        );
     }
 
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
-
-    fn reply_text(reply: &HostReply) -> String {
-        match reply {
-            HostReply::Ok { data } => data["text"]
-                .as_str()
-                .unwrap_or_else(|| panic!("no text in {data}"))
-                .to_string(),
-            HostReply::Error { error } => panic!("unexpected error envelope: {error}"),
-        }
-    }
 
     #[test]
     fn spawn_task_id_extraction() {

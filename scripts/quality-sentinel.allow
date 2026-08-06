@@ -8,4 +8,4 @@ src/errors.rs
 #
 # Legacy ToolExecutionResult::failure constructor — funnels a legacy String
 # through classify_tool_error; deleted with the legacy channel in Phase 3.
-src/agent/tools/base.rs:142
+src/agent/tools/base.rs:143

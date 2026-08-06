@@ -306,7 +306,7 @@ impl ToolError {
     /// The single legacy bridge. Called only by the migration adapter
     /// (default `Tool::execute_typed`). Maps the exact strings
     /// `classify_tool_error` matched today, so retry behavior is preserved.
-    #[allow(clippy::disallowed_methods)] // legacy bridge — deleted in Phase 3
+    #[allow(clippy::disallowed_methods)] // legacy bridge — retained, called by HostBridge::call error round-trip
     pub fn from_legacy(msg: &str) -> Self {
         if let Some(kind) = classify_tool_error(msg) {
             return match kind {
@@ -350,7 +350,7 @@ pub fn legacy_kind_from_tool_error(e: &ToolError) -> Option<ToolErrorKind> {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // tests pin classify_tool_error's mapping; deleted in Phase 3
+#[allow(clippy::disallowed_methods)] // pins classify_tool_error's mapping for legacy string->typed conversion (kept while ToolExecutionResult lives)
 mod tests {
     use super::*;
 

@@ -9,6 +9,11 @@ regime (research doc: `docs/research/2026-08-06-error-conventions-and-host-bridg
 
 ## Status
 
+- [x] **Phase 3 milestone**: host bridge adopted — `SpawnTool`/`MessageTool`
+  route through `HostBridge`/`MessageHost`; legacy callbacks, the
+  `HostBridgeAdapter`, and the 8 `build_tools` closures are deleted (research
+  doc §3.7 Steps 2-3); the `host_bridge.rs` dead-code allow is gone and
+  `set_*_callback` is gated by `clippy.toml` + the quality sentinel.
 - [ ] **Phase 3 milestone**: zero modules carry the `Error-protocol layer-3 backlog` allow
 - [ ] **Phase 3 milestone**: `from_output` / `classify_tool_error` fully removed (see `scripts/quality-sentinel.sh`)
 
@@ -61,7 +66,7 @@ Check a module off as its `#![allow(...)]` block is deleted and the module passe
 | [`src/agent/token_budget.rs`](src/agent/token_budget.rs) | `clippy::as_conversions`, `clippy::indexing_slicing` | [ ] |
 | [`src/agent/tool_engine.rs`](src/agent/tool_engine.rs) | `clippy::as_conversions`, `clippy::indexing_slicing`, `clippy::shadow_reuse`, `clippy::format_push_string` | [ ] |
 | [`src/agent/tool_runner/mod.rs`](src/agent/tool_runner/mod.rs) | `clippy::as_conversions` | [ ] |
-| [`src/agent/tool_wiring.rs`](src/agent/tool_wiring.rs) | `clippy::as_conversions`, `clippy::shadow_reuse`, `clippy::shadow_unrelated`, `clippy::format_push_string` | [ ] |
+| [`src/agent/tool_wiring.rs`](src/agent/tool_wiring.rs) | `clippy::shadow_reuse`, `clippy::shadow_unrelated` | [~] — partially cleared in Phase 3: `as_conversions` (→ `u32::try_from`) and `format_push_string` (→ `writeln!`) removed; `shadow_*` remain |
 | [`src/agent/tools/apply_patch.rs`](src/agent/tools/apply_patch.rs) | `clippy::indexing_slicing`, `clippy::shadow_reuse` | [ ] |
 | [`src/agent/tools/browser.rs`](src/agent/tools/browser.rs) | `clippy::shadow_reuse` | [ ] |
 | [`src/agent/tools/cron_tool.rs`](src/agent/tools/cron_tool.rs) | `clippy::shadow_reuse` | [ ] |
@@ -105,6 +110,28 @@ Check a module off as its `#![allow(...)]` block is deleted and the module passe
 | [`src/syntax.rs`](src/syntax.rs) | `clippy::indexing_slicing`, `clippy::format_push_string` | [ ] |
 | **`src/utils`** | | |
 | [`src/utils/helpers.rs`](src/utils/helpers.rs) | `clippy::indexing_slicing`, `clippy::shadow_reuse`, `clippy::print_stderr` | [ ] |
+
+## Host bridge migration (Phase 3 — complete)
+
+The typed host bridge (research doc §3.2-§3.3) replaced the legacy callback
+channel; doc §3.7 Steps 2-3 are done:
+
+- [x] `SpawnTool` holds `Arc<dyn HostBridge>`: `execute` parses `SpawnAction`
+      and calls `host.call()`; the 7 callback fields, 7 setters and
+      `set_context` are deleted (`SpawnAction` preserves every legacy
+      validation string byte-for-byte).
+- [x] `MessageTool` holds `Arc<dyn MessageHost>`: `send_callback`,
+      `set_send_callback` and `set_context` are deleted.
+- [x] `HostBridgeAdapter` deleted — its byte-stability proof was ported into
+      permanent tests that drive `SpawnTool`/`MessageTool` through the
+      dispatcher over mock hosts emitting the exact pre-bridge wire strings.
+- [x] The 8 `build_tools` closures deleted — the logic lives in the named,
+      unit-testable `AgentHost` methods (the byte-identical port).
+- [x] `src/agent/host_bridge.rs` transitional `#![cfg_attr(not(test),
+      allow(dead_code))]` removed — the bridge is live in production.
+- [x] `clippy.toml` `disallowed-methods` gate the deleted `set_*_callback`
+      API (inert entries block reintroduction); `scripts/quality-sentinel.sh`
+      greps zero `set_*_callback` in `src/`.
 
 ## Lint legend
 

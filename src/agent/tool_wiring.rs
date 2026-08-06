@@ -4,8 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(
-    clippy::as_conversions,
-    clippy::format_push_string,
     clippy::shadow_reuse,
     clippy::shadow_unrelated,
 )]
@@ -15,6 +13,7 @@
 
 #![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,9 +34,8 @@ use crate::agent::policy;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
 use crate::agent::tools::{
-    CancelCallback, CheckCallback, CheckInboxTool, CronScheduleTool, ListCallback, LoopCallback,
-    MessageTool, PipelineCallback, SendCallback, SendEmailTool, SpawnCallback, SpawnTool,
-    SpawnToolLite, TodoTool, WaitCallback,
+    CheckInboxTool, CronScheduleTool, MessageTool, SendEmailTool, SpawnTool, SpawnToolLite,
+    TodoTool,
 };
 use crate::bus::events::OutboundMessage;
 use crate::errors::ToolError;
@@ -123,20 +121,21 @@ impl SpawnHost for AgentHost {
         if running.is_empty() {
             out.push_str("No subagents currently running.\n");
         } else {
-            out.push_str(&format!("{} subagent(s) running:\n", running.len()));
+            let _ = writeln!(out, "{} subagent(s) running:", running.len());
             for info in &running {
                 let elapsed = info.started_at.elapsed().as_secs();
-                out.push_str(&format!(
-                    "  • {} (id: {}) — running for {}s\n",
+                let _ = writeln!(
+                    out,
+                    "  • {} (id: {}) — running for {}s",
                     info.label, info.task_id, elapsed
-                ));
+                );
             }
         }
 
         // Recently completed (from events.jsonl)
         let recent = SubagentManager::read_recent_completed(&self.workspace, 10);
         if !recent.is_empty() {
-            out.push_str(&format!("\nRecently completed ({}):\n", recent.len()));
+            let _ = writeln!(out, "\nRecently completed ({}):", recent.len());
             for entry in &recent {
                 out.push_str(entry);
                 out.push('\n');
@@ -213,7 +212,9 @@ impl PipelineHost for AgentHost {
                         .filter_map(|v| v.as_str().map(|s| s.to_string()))
                         .collect()
                 }),
-                max_iterations: s["max_iterations"].as_u64().map(|n| n as u32),
+                max_iterations: s["max_iterations"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok()),
             })
             .collect();
         if pipeline_steps.is_empty() {
@@ -250,16 +251,17 @@ impl PipelineHost for AgentHost {
                 Some(false) => " ✗",
                 None => "",
             };
-            output.push_str(&format!(
-                "  Step {}: {}{} ({}ms, {} voters)\n",
+            let _ = writeln!(
+                output,
+                "  Step {}: {}{} ({}ms, {} voters)",
                 sr.index,
                 sr.answer.chars().take(200).collect::<String>(),
                 correct_str,
                 sr.duration_ms,
                 sr.voters_used
-            ));
+            );
         }
-        output.push_str(&format!("Total time: {}ms", result.total_duration_ms));
+        let _ = write!(output, "Total time: {}ms", result.total_duration_ms);
         Ok(PipelineReply { text: output })
     }
 }
@@ -290,7 +292,12 @@ impl MessageHost for AgentHost {
         self.outbound
             .send(msg)
             .map_err(|e| ToolError::Execution {
-                message: format!("Error sending message: {e}"),
+                // Byte-identical to the legacy send closure: it wrapped the
+                // bus error in anyhow as "Failed to send outbound message: {e}"
+                // and the old MessageTool prefixed "Error sending message: ".
+                // The merged host must reproduce both prefixes so the model
+                // sees the same string after the message swap.
+                message: format!("Error sending message: Failed to send outbound message: {e}"),
             })?;
         Ok(SendMessageReply {
             text: format!("Message sent to {}:{}", req.channel, req.chat_id),
@@ -343,254 +350,14 @@ impl AgentLoopShared {
         };
         let mut tools = ToolRegistry::with_standard_tools(&tool_config);
 
-        // Direct UI channels already reply through `finalize_response`; exposing
-        // `message` there gives models a second, failure-prone way to answer.
-        if should_register_message_tool(channel) {
-            let outbound_tx_clone = self.bus_outbound_tx.clone();
-            let send_cb: SendCallback = Arc::new(move |msg: OutboundMessage| {
-                let tx = outbound_tx_clone.clone();
-                Box::pin(async move {
-                    tx.send(msg)
-                        .map_err(|e| anyhow::anyhow!("Failed to send outbound message: {}", e))
-                })
-            });
-            let message_tool = Arc::new(MessageTool::new(Some(send_cb), channel, chat_id));
-            tools.register(Box::new(ArcToolProxy(message_tool)));
-        }
-
-        // Spawn tool - context baked in.
-        let subagents_ref = self.subagents.clone();
-        let session_policies_ref = self.session_policies.clone();
-        let spawn_cb: SpawnCallback =
-            Arc::new(move |task, label, agent, model, ch, cid, working_dir| {
-                let mgr = subagents_ref.clone();
-                let policies = session_policies_ref.clone();
-                Box::pin(async move {
-                    let key = format!("{}:{}", ch, cid);
-                    let policy = {
-                        let map = policies.lock().await;
-                        map.get(&key).cloned().unwrap_or_default()
-                    };
-                    let effective_model = policy::enforce_subagent_model(&policy, model);
-                    mgr.spawn(task, label, agent, effective_model, ch, cid, working_dir)
-                        .await
-                })
-            });
-        let subagents_ref2 = self.subagents.clone();
-        let list_workspace = core.workspace.clone();
-        let list_cb: ListCallback = Arc::new(move || {
-            let mgr = subagents_ref2.clone();
-            let ws = list_workspace.clone();
-            Box::pin(async move {
-                let running = mgr.list_running().await;
-                let mut out = String::new();
-
-                // Running subagents
-                if running.is_empty() {
-                    out.push_str("No subagents currently running.\n");
-                } else {
-                    out.push_str(&format!("{} subagent(s) running:\n", running.len()));
-                    for info in &running {
-                        let elapsed = info.started_at.elapsed().as_secs();
-                        out.push_str(&format!(
-                            "  • {} (id: {}) — running for {}s\n",
-                            info.label, info.task_id, elapsed
-                        ));
-                    }
-                }
-
-                // Recently completed (from events.jsonl)
-                let recent = SubagentManager::read_recent_completed(&ws, 10);
-                if !recent.is_empty() {
-                    out.push_str(&format!("\nRecently completed ({}):\n", recent.len()));
-                    for entry in &recent {
-                        out.push_str(entry);
-                        out.push('\n');
-                    }
-                }
-
-                out
-            })
-        });
-        let subagents_ref3 = self.subagents.clone();
-        let cancel_cb: CancelCallback = Arc::new(move |task_id: String| {
-            let mgr = subagents_ref3.clone();
-            Box::pin(async move {
-                if mgr.cancel(&task_id).await {
-                    format!("Subagent '{}' cancelled.", task_id)
-                } else {
-                    format!("No running subagent found matching '{}'.", task_id)
-                }
-            })
-        });
-        let subagents_ref4 = self.subagents.clone();
-        let wait_cb: WaitCallback = Arc::new(move |task_id: String, timeout_secs: u64| {
-            let mgr = subagents_ref4.clone();
-            Box::pin(async move {
-                let timeout = std::time::Duration::from_secs(timeout_secs);
-                mgr.wait_for(&task_id, timeout).await
-            })
-        });
-        let subagents_ref_check = self.subagents.clone();
-        let check_workspace = core.workspace.clone();
-        let check_cb: CheckCallback = Arc::new(move |task_id: String| {
-            let mgr = subagents_ref_check.clone();
-            let ws = check_workspace.clone();
-            Box::pin(async move {
-                match SubagentManager::read_event_result(&ws, &task_id) {
-                    Some(result) => result,
-                    None => {
-                        let running = mgr.list_running().await;
-                        if let Some(info) = running
-                            .iter()
-                            .find(|info| info.task_id.starts_with(&task_id))
-                        {
-                            let elapsed = info.started_at.elapsed().as_secs();
-                            format!(
-                                "Subagent '{}' ({}) is still running after {}s. Use action='wait' to block for completion, action='list' for all tasks, or action='cancel' to abort.",
-                                info.label, info.task_id, elapsed
-                            )
-                        } else {
-                            format!(
-                                "No running or completed result found for task_id '{}'.",
-                                task_id
-                            )
-                        }
-                    }
-                }
-            })
-        });
-        // Pipeline callback: parse steps JSON, build PipelineConfig, run pipeline.
-        // Uses the delegation provider/model (cheap) for pipeline LLM calls.
-        let pipeline_provider = core
-            .tool_runner_provider
-            .clone()
-            .unwrap_or_else(|| core.provider.clone());
-        let pipeline_model = core
-            .tool_runner_model
-            .clone()
-            .unwrap_or_else(|| core.model.clone());
-        let pipeline_workspace = core.workspace.clone();
-        let pipeline_cb: PipelineCallback =
-            Arc::new(move |steps_json: String, ahead_by_k: usize| {
-                let provider = pipeline_provider.clone();
-                let model = pipeline_model.clone();
-                let workspace = pipeline_workspace.clone();
-                Box::pin(async move {
-                    // Parse steps from JSON.
-                    let steps: Vec<serde_json::Value> = match serde_json::from_str(&steps_json) {
-                        Ok(s) => s,
-                        Err(e) => return format!("Error parsing pipeline steps: {}", e),
-                    };
-                    let pipeline_steps: Vec<pipeline::PipelineStep> = steps
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| pipeline::PipelineStep {
-                            index: i,
-                            prompt: s["prompt"].as_str().unwrap_or("").to_string(),
-                            expected: s["expected"].as_str().map(|s| s.to_string()),
-                            tools: s["tools"].as_array().map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                    .collect()
-                            }),
-                            max_iterations: s["max_iterations"].as_u64().map(|n| n as u32),
-                        })
-                        .collect();
-                    if pipeline_steps.is_empty() {
-                        return "Error: no valid pipeline steps provided.".to_string();
-                    }
-                    let config = pipeline::PipelineConfig {
-                        pipeline_id: format!(
-                            "pipe-{}",
-                            chrono::Utc::now().timestamp_millis() % 100_000_000
-                        ),
-                        steps: pipeline_steps,
-                        ahead_by_k,
-                        max_voters: if ahead_by_k > 0 {
-                            ahead_by_k * 2 + 1
-                        } else {
-                            1
-                        },
-                        model: model.clone(),
-                    };
-                    let result =
-                        pipeline::run_pipeline(&config, provider.as_ref(), &workspace).await;
-                    // Format result for the agent.
-                    let mut output = format!(
-                        "Pipeline '{}' completed: {}/{} steps\n",
-                        result.pipeline_id, result.steps_completed, result.steps_total
-                    );
-                    for sr in &result.results {
-                        let correct_str = match sr.correct {
-                            Some(true) => " ✓",
-                            Some(false) => " ✗",
-                            None => "",
-                        };
-                        output.push_str(&format!(
-                            "  Step {}: {}{} ({}ms, {} voters)\n",
-                            sr.index,
-                            sr.answer.chars().take(200).collect::<String>(),
-                            correct_str,
-                            sr.duration_ms,
-                            sr.voters_used
-                        ));
-                    }
-                    output.push_str(&format!("Total time: {}ms", result.total_duration_ms));
-                    output
-                })
-            });
-
-        // Loop callback: run an autonomous refinement loop via SubagentManager.
-        let subagents_ref5 = self.subagents.clone();
-        let loop_cb: LoopCallback = Arc::new(
-            move |task: String,
-                  max_rounds: u32,
-                  tools_filter: Option<Vec<String>>,
-                  stop_condition: Option<String>,
-                  model: Option<String>,
-                  working_dir: Option<String>| {
-                let mgr = subagents_ref5.clone();
-                Box::pin(async move {
-                    mgr.run_loop(
-                        task,
-                        max_rounds,
-                        tools_filter,
-                        stop_condition,
-                        model,
-                        working_dir,
-                    )
-                    .await
-                })
-            },
-        );
-
-        let spawn_tool = Arc::new(SpawnTool::new());
-        // Set callbacks and context before registering so they're ready for use.
-        spawn_tool.set_callback(spawn_cb).await;
-        spawn_tool.set_list_callback(list_cb).await;
-        spawn_tool.set_cancel_callback(cancel_cb).await;
-        spawn_tool.set_wait_callback(wait_cb).await;
-        spawn_tool.set_check_callback(check_cb).await;
-        spawn_tool.set_pipeline_callback(pipeline_cb).await;
-        spawn_tool.set_loop_callback(loop_cb).await;
-        spawn_tool.set_context(channel, chat_id).await;
-        // Local models get the lite schema (~200 tokens) instead of the full
-        // schema (~1,100 tokens) which would consume 55% of a 4K context.
-        // migrated from swappable().is_local — phase 09-03
-        if core.mode().is_local() {
-            tools.register(Box::new(SpawnToolLite(spawn_tool)));
-        } else {
-            tools.register(Box::new(ArcToolProxy(spawn_tool)));
-        }
-
         // Typed host bridge (research §3.3 DIP): build the production host once
-        // and inject it at the registry boundary. The legacy callbacks above
-        // remain live for the legacy SpawnTool/MessageTool surface (nothing
-        // model-visible changes); AgentHost is the named, testable port of the
-        // same closure bodies, ready for the tool-adoption step. The
-        // dispatcher is the single OCP choke point, so production and a future
-        // cross-process transport share one dispatch path.
+        // and inject it at the registry boundary. Each AgentHost method is the
+        // byte-identical port of the legacy closure body that used to live
+        // here (doc §3.7 Step 3); the closures are gone — the logic is a
+        // named, testable type, and tools depend on the trait, never on this
+        // struct or `SubagentManager`. The dispatcher is the single OCP choke
+        // point, so production and a future cross-process transport share one
+        // dispatch path.
         let agent_host = Arc::new(AgentHost {
             subagents: self.subagents.clone(),
             session_policies: self.session_policies.clone(),
@@ -613,6 +380,28 @@ impl AgentLoopShared {
             agent_host.clone(),
             agent_host.clone(),
         ));
+
+        // Direct UI channels already reply through `finalize_response`; exposing
+        // `message` there gives models a second, failure-prone way to answer.
+        if should_register_message_tool(channel) {
+            // The send closure is gone (doc §3.7 Step 3): the message path is
+            // the typed MessageHost trait on AgentHost, injected here.
+            let message_tool = Arc::new(MessageTool::new(host.clone(), channel, chat_id));
+            tools.register(Box::new(ArcToolProxy(message_tool)));
+        }
+
+        // Spawn tool - origin channel/chat are baked into the host (doc
+        // §3.2/§3.3); the tool no longer carries context or callback slots.
+        let spawn_tool = Arc::new(SpawnTool::new(host.clone()));
+        // Local models get the lite schema (~200 tokens) instead of the full
+        // schema (~1,100 tokens) which would consume 55% of a 4K context.
+        // migrated from swappable().is_local — phase 09-03
+        if core.mode().is_local() {
+            tools.register(Box::new(SpawnToolLite(spawn_tool)));
+        } else {
+            tools.register(Box::new(ArcToolProxy(spawn_tool)));
+        }
+
         tools = tools.with_host(Some(host));
 
         // Cron tool (optional) - context baked in.
