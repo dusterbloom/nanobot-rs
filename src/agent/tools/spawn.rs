@@ -11,7 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::{require_str, PermissionLevel, Tool};
+use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolOutput, ToolResult};
+use crate::errors::ToolError;
 
 /// Type alias for the spawn callback.
 ///
@@ -297,7 +298,32 @@ impl Tool for SpawnTool {
         })
     }
 
+    /// Legacy string entry point — thin render-wrapped call into the
+    /// typed path (error protocol Phase 2 migration).
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+        self.execute_with_result(params).await.data().to_string()
+    }
+
+    /// Typed entry point: builds [`crate::errors::ToolError`] variants at
+    /// every failure site; callback outputs are funnelled through
+    /// [`crate::errors::ToolError::from_legacy`] so their `Error: ...`
+    /// strings stay byte-identical.
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolExecutionContext,
+    ) -> ToolResult {
+        /// Funnel a callback's legacy `String` output into the typed channel:
+        /// `Error:`-prefixed strings become [`crate::errors::ToolError`]
+        /// (via `from_legacy`, byte-identical), everything else is a success.
+        fn into_result(out: String) -> ToolResult {
+            if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+                Err(crate::errors::ToolError::from_legacy(&err))
+            } else {
+                Ok(ToolOutput { text: out })
+            }
+        }
+
         let action = params
             .get("action")
             .and_then(|v| v.as_str())
@@ -310,37 +336,70 @@ impl Tool for SpawnTool {
                     Some(cb) => {
                         let cb = cb.clone();
                         drop(cb_guard);
-                        cb().await
+                        into_result(cb().await)
                     }
-                    None => "Error: List callback not configured".to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "List callback not configured".to_string(),
+                        })
+                    }
                 }
             }
             "check" => {
-                let task_id = require_str!(params, "task_id", " for check").to_string();
+                let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "'task_id' parameter is required for check".to_string(),
+                        })
+                    }
+                };
                 let cb_guard = self.check_callback.lock().await;
                 match cb_guard.as_ref() {
                     Some(cb) => {
                         let cb = cb.clone();
                         drop(cb_guard);
-                        cb(task_id).await
+                        into_result(cb(task_id).await)
                     }
-                    None => "Error: Check callback not configured".to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "Check callback not configured".to_string(),
+                        })
+                    }
                 }
             }
             "cancel" => {
-                let task_id = require_str!(params, "task_id", " for cancel").to_string();
+                let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "'task_id' parameter is required for cancel".to_string(),
+                        })
+                    }
+                };
                 let cb_guard = self.cancel_callback.lock().await;
                 match cb_guard.as_ref() {
                     Some(cb) => {
                         let cb = cb.clone();
                         drop(cb_guard);
-                        cb(task_id).await
+                        into_result(cb(task_id).await)
                     }
-                    None => "Error: Cancel callback not configured".to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "Cancel callback not configured".to_string(),
+                        })
+                    }
                 }
             }
             "wait" => {
-                let task_id = require_str!(params, "task_id", " for wait").to_string();
+                let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "'task_id' parameter is required for wait".to_string(),
+                        })
+                    }
+                };
                 let timeout = params
                     .get("timeout")
                     .and_then(|v| v.as_u64())
@@ -350,15 +409,23 @@ impl Tool for SpawnTool {
                     Some(cb) => {
                         let cb = cb.clone();
                         drop(cb_guard);
-                        cb(task_id, timeout).await
+                        into_result(cb(task_id, timeout).await)
                     }
-                    None => "Error: Wait callback not configured".to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "Wait callback not configured".to_string(),
+                        })
+                    }
                 }
             }
             "pipeline" => {
                 let steps_json = match params.get("steps") {
                     Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
-                    None => return "Error: 'steps' parameter is required for pipeline".to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "'steps' parameter is required for pipeline".to_string(),
+                        })
+                    }
                 };
                 let ahead_by_k = params
                     .get("ahead_by_k")
@@ -370,13 +437,24 @@ impl Tool for SpawnTool {
                     Some(cb) => {
                         let cb = cb.clone();
                         drop(cb_guard);
-                        cb(steps_json, ahead_by_k).await
+                        into_result(cb(steps_json, ahead_by_k).await)
                     }
-                    None => "Error: Pipeline callback not configured".to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "Pipeline callback not configured".to_string(),
+                        })
+                    }
                 }
             }
             "loop" => {
-                let task = require_str!(params, "task", " for loop").to_string();
+                let task = match params.get("task").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "'task' parameter is required for loop".to_string(),
+                        })
+                    }
+                };
                 let max_rounds = params
                     .get("max_rounds")
                     .and_then(|v| v.as_u64())
@@ -405,21 +483,34 @@ impl Tool for SpawnTool {
                     Some(cb) => {
                         let cb = cb.clone();
                         drop(cb_guard);
-                        cb(
-                            task,
-                            max_rounds,
-                            tools_filter,
-                            stop_condition,
-                            model,
-                            working_dir,
+                        into_result(
+                            cb(
+                                task,
+                                max_rounds,
+                                tools_filter,
+                                stop_condition,
+                                model,
+                                working_dir,
+                            )
+                            .await,
                         )
-                        .await
                     }
-                    None => "Error: Loop callback not configured".to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "Loop callback not configured".to_string(),
+                        })
+                    }
                 }
             }
             "spawn" | _ => {
-                let task = require_str!(params, "task").to_string();
+                let task = match params.get("task").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "'task' parameter is required".to_string(),
+                        })
+                    }
+                };
 
                 let label = params
                     .get("label")
@@ -451,12 +542,16 @@ impl Tool for SpawnTool {
                 let callback_guard = self.spawn_callback.lock().await;
                 let callback = match callback_guard.as_ref() {
                     Some(cb) => cb.clone(),
-                    None => return "Error: Spawn callback not configured".to_string(),
+                    None => {
+                        return Err(ToolError::Execution {
+                            message: "Spawn callback not configured".to_string(),
+                        })
+                    }
                 };
                 // Drop the lock before awaiting.
                 drop(callback_guard);
 
-                callback(task, label, agent, model, channel, chat_id, working_dir).await
+                into_result(callback(task, label, agent, model, channel, chat_id, working_dir).await)
             }
         }
     }

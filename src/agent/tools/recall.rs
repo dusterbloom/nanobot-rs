@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{Tool, ToolExecutionResult};
+use super::base::{Tool, ToolExecutionContext, ToolResult};
 use crate::agent::knowledge_store::{KnowledgeStore, SearchHit};
 
 /// Cap (chars) on the merged search output so a broad query can't blow context.
@@ -712,12 +712,15 @@ impl Tool for RecallTool {
         "Error: recall needs one of: 'query' (to search), 'session' or 'message_ids' (to fetch), or mode=\"latest\".".to_string()
     }
 
-    /// Empty-arg is self-correcting: enumerate the three entry params with a
-    /// worked call shape instead of looping on the same bare call.
-    async fn execute_with_result(
+    /// Empty-arg is self-correcting: produce a structural
+    /// [`crate::errors::ToolError::MissingArg`] (model-fixable) whose render
+    /// carries a worked call shape instead of looping on the same bare call.
+    /// Everything else funnels through the legacy string path unchanged.
+    async fn execute_typed(
         &self,
         params: HashMap<String, Value>,
-    ) -> ToolExecutionResult {
+        ctx: &ToolExecutionContext,
+    ) -> ToolResult {
         let has_query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -739,15 +742,12 @@ impl Tool for RecallTool {
             || has_message_ids;
 
         if !is_fetch && !has_query {
-            return ToolExecutionResult::failure_with_kind(
-                "Error: recall needs one of: 'query' (to search), 'session' or 'message_ids' (to fetch), or mode=\"latest\".".to_string(),
-                crate::errors::ToolErrorKind::MissingArg {
-                    param: "query".to_string(),
-                    example: r#"recall({"query":"..."})"#.to_string(),
-                },
-            );
+            return Err(crate::errors::ToolError::MissingArg {
+                param: "query".to_string(),
+                example: r#"recall({"query":"..."})"#.to_string(),
+            });
         }
-        ToolExecutionResult::from_output(self.execute(params).await)
+        Tool::execute_typed(self, params, ctx).await
     }
 }
 
@@ -867,10 +867,14 @@ mod tests {
             res.error_kind(),
             Some(crate::errors::ToolErrorKind::MissingArg { ref param, .. }) if param == "query"
         ));
-        // The data string enumerates the three entry params.
-        assert!(res.data().contains("query"), "{}", res.data());
-        assert!(res.data().contains("session"), "{}", res.data());
-        assert!(res.data().contains("message_ids"), "{}", res.data());
+        // Canonical MissingArg render names the required param and carries
+        // the worked call shape (error protocol Phase 2 canonicalization).
+        assert!(
+            res.data().contains("'query' parameter is required"),
+            "{}",
+            res.data()
+        );
+        assert!(res.data().contains("call as recall("), "{}", res.data());
     }
 
     #[tokio::test]

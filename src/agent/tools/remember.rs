@@ -8,7 +8,7 @@ use chrono::Local;
 use serde_json::{json, Value};
 use tokio::fs;
 
-use super::base::{PermissionLevel, Tool, ToolExecutionResult};
+use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolResult};
 
 const MAX_FACT_CHARS: usize = 180;
 
@@ -326,11 +326,16 @@ impl Tool for RememberTool {
         message
     }
 
-    /// Structured empty-arg path: an `add` with no facts sets `MissingArg` so
-    /// the registry appends a corrective worked example. Without this, a
-    /// zero-temp model emitting `remember({})` got a silent success (the old
-    /// list default) and looped. Other actions delegate to the default.
-    async fn execute_with_result(&self, args: HashMap<String, Value>) -> ToolExecutionResult {
+    /// Structured empty-arg path: an `add` with no facts returns
+    /// [`crate::errors::ToolError::MissingArg`] (model-fixable) whose render
+    /// carries a corrective worked example. Without this, a zero-temp model
+    /// emitting `remember({})` got a silent success (the old list default)
+    /// and looped. Other actions funnel through the legacy string path.
+    async fn execute_typed(
+        &self,
+        args: HashMap<String, Value>,
+        ctx: &ToolExecutionContext,
+    ) -> ToolResult {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -339,16 +344,13 @@ impl Tool for RememberTool {
         if action == "add" {
             let has_input = args.contains_key("facts") || args.contains_key("fact");
             if !has_input {
-                return ToolExecutionResult::failure_with_kind(
-                    "Error: nothing to remember.".to_string(),
-                    crate::errors::ToolErrorKind::MissingArg {
-                        param: "facts".to_string(),
-                        example: r#"remember({"facts":["a concise fact"]})"#.to_string(),
-                    },
-                );
+                return Err(crate::errors::ToolError::MissingArg {
+                    param: "facts".to_string(),
+                    example: r#"remember({"facts":["a concise fact"]})"#.to_string(),
+                });
             }
         }
-        ToolExecutionResult::from_output(self.execute(args).await)
+        Tool::execute_typed(self, args, ctx).await
     }
 }
 

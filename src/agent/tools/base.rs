@@ -119,29 +119,14 @@ impl ToolExecutionResult {
         self.error_kind.as_ref().map_or(false, |k| k.is_retryable())
     }
 
-    /// Map a raw tool output string to a structured result.
-    /// Outputs starting with `Error:` are treated as failures.
-    #[must_use]
-    pub fn from_output(out: String) -> Self {
-        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
-            let error_kind = crate::errors::classify_tool_error(&err);
-            Self {
-                ok: false,
-                data: out,
-                error: Some(err),
-                error_kind,
-            }
-        } else {
-            Self::success(out)
-        }
-    }
-
     /// Build a failure from a message plus a structural classification.
     ///
     /// The `data` is the full model-visible string (already `Error:`-prefixed);
     /// `error_kind` is produced at the source instead of by substring
-    /// classification. Used by tools that set `MissingArg` structurally.
+    /// classification. Transitional: used by the legacy registry
+    /// example-append path until Phase 3 deletes the legacy channel.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn failure_with_kind(data: String, error_kind: crate::errors::ToolErrorKind) -> Self {
         Self {
             ok: false,
