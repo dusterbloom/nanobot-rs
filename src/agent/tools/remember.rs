@@ -17,7 +17,7 @@ use chrono::Local;
 use serde_json::{json, Value};
 use tokio::fs;
 
-use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolResult};
+use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
 
 const MAX_FACT_CHARS: usize = 180;
 
@@ -343,7 +343,7 @@ impl Tool for RememberTool {
     async fn execute_typed(
         &self,
         args: HashMap<String, Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> ToolResult {
         let action = args
             .get("action")

@@ -20,7 +20,7 @@ use reqwest::Client;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::base::{require_str, PermissionLevel, Tool, ToolConcurrency, ToolExecutionContext};
+use super::base::{require_str, PermissionLevel, Tool, ToolConcurrency, ToolContext};
 use crate::agent::audit::ToolEvent;
 
 /// Shared user-agent string.
@@ -297,13 +297,13 @@ impl Tool for WebSearchTool {
     async fn execute_with_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> String {
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
-        let _ = ctx.event_tx.send(ToolEvent::Progress {
+        let _ = ctx.emit(ToolEvent::Progress {
             tool_name: "web_search".to_string(),
-            tool_call_id: ctx.tool_call_id.clone(),
+            tool_call_id: ctx.call_id().to_string(),
             elapsed_ms: 0,
             output_preview: Some(format!("Searching: {}", query)),
         });
@@ -797,22 +797,22 @@ impl Tool for WebFetchTool {
     async fn execute_with_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> String {
         let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("");
 
-        let _ = ctx.event_tx.send(ToolEvent::Progress {
+        let _ = ctx.emit(ToolEvent::Progress {
             tool_name: "web_fetch".to_string(),
-            tool_call_id: ctx.tool_call_id.clone(),
+            tool_call_id: ctx.call_id().to_string(),
             elapsed_ms: 0,
             output_preview: Some(format!("Fetching: {}", url)),
         });
 
         let result = self.execute(params).await;
 
-        let _ = ctx.event_tx.send(ToolEvent::Progress {
+        let _ = ctx.emit(ToolEvent::Progress {
             tool_name: "web_fetch".to_string(),
-            tool_call_id: ctx.tool_call_id.clone(),
+            tool_call_id: ctx.call_id().to_string(),
             elapsed_ms: 0,
             output_preview: Some("Extracting content...".to_string()),
         });
@@ -1668,7 +1668,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     #[tokio::test]
     async fn test_web_search_emits_start_progress_event() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = WebSearchTool::new(
             Some(String::new()),
@@ -1679,11 +1679,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_search".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_search".to_string());
 
         let mut params = HashMap::new();
         params.insert(
@@ -1716,17 +1712,13 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     #[tokio::test]
     async fn test_web_fetch_emits_fetch_and_extract_progress_events() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = WebFetchTool::new(50000);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_fetch".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_fetch".to_string());
 
         let mut params = HashMap::new();
         params.insert(
@@ -1760,17 +1752,13 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     #[tokio::test]
     async fn test_web_fetch_emits_extracting_progress_after_fetch() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = WebFetchTool::new(50000);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_fetch2".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_fetch2".to_string());
 
         let mut params = HashMap::new();
         params.insert(

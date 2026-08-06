@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolOutput, ToolResult};
+use super::base::{PermissionLevel, Tool, ToolContext, ToolOutput, ToolResult};
 use crate::errors::ToolError;
 use crate::bus::events::OutboundMessage;
 
@@ -98,7 +98,7 @@ impl Tool for MessageTool {
     async fn execute_typed(
         &self,
         params: HashMap<String, serde_json::Value>,
-        _ctx: &ToolExecutionContext,
+        _ctx: &ToolContext,
     ) -> ToolResult {
         let content = match params.get("content").and_then(|v| v.as_str()) {
             Some(c) => c.to_string(),

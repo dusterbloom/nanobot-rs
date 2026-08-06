@@ -1176,19 +1176,20 @@ async fn execute_with_retry(
     cancel: Option<&tokio_util::sync::CancellationToken>,
     max_retries: u32,
 ) -> crate::agent::tools::base::ToolExecutionResult {
-    use crate::agent::tools::base::{ToolExecutionContext, ToolExecutionResult};
+    use crate::agent::tools::base::{ToolContext, ToolExecutionResult};
 
     let mut attempts = 0u32;
     loop {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         drop(event_rx);
-        let ctx = ToolExecutionContext {
+        let ctx = ToolContext::new(
+            None,
             event_tx,
-            cancellation_token: cancel
+            cancel
                 .map(|token| token.child_token())
                 .unwrap_or_else(tokio_util::sync::CancellationToken::new),
-            tool_call_id: tool_call_id.to_string(),
-        };
+            tool_call_id,
+        );
         let result = tools
             .execute_with_context(name, arguments.clone(), &ctx)
             .await;
