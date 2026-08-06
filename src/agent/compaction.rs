@@ -1252,6 +1252,36 @@ mod tests {
             .to_string();
         assert!(error.contains("repetition"), "{error}");
     }
+
+    #[tokio::test]
+    async fn test_summarize_text_fails_on_provider_failure() {
+        // Dead-stream case (was the literal "error" finish_reason, now the
+        // typed FinishReason::ProviderFailure): summarize_text must bail
+        // with the LLM error rather than accept a broken summary.
+        let provider = Arc::new(FinishReasonProvider {
+            response: "stream died mid-response".to_string(),
+            finish_reason: FinishReason::ProviderFailure,
+        });
+        let compactor = ContextCompactor::new(provider, "test".into(), 4096);
+
+        let error = compactor
+            .summarize_text(
+                &"A factual source. ".repeat(200),
+                SUMMARIZE_PROMPT,
+                SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Summarization provider error"),
+            "provider failure must surface as a summarization error: {error}"
+        );
+        assert!(
+            error.contains("stream died mid-response"),
+            "error must carry the provider's detail payload: {error}"
+        );
+    }
 }
 
 #[cfg(test)]

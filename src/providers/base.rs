@@ -320,11 +320,9 @@ mod tests {
         }
         // Unknown provider values round-trip via Other(String).
         for wire in ["function_call", "content_filter", "eos_token", ""] {
-            assert_eq!(
-                FinishReason::parse_finish_reason(wire).wire_str(),
-                wire,
-                "unknown wire value {wire:?} must round-trip"
-            );
+            let parsed = FinishReason::parse_finish_reason(wire);
+            assert_eq!(parsed.wire_str(), wire, "unknown wire value {wire:?} must round-trip");
+            assert_eq!(parsed.to_string(), wire, "Display for unknown value {wire:?}");
         }
     }
 }
