@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::agent::tools::base::Tool;
+use crate::providers::base::FinishReason;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,7 +41,7 @@ impl LLMProvider for MockProvider {
             Ok(crate::providers::base::LLMResponse {
                 content: Some("Done.".to_string()),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: HashMap::new(),
             })
         } else {
@@ -143,7 +144,7 @@ async fn test_run_tool_loop_executes_tools() {
         crate::providers::base::LLMResponse {
             content: Some("All done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -197,7 +198,7 @@ async fn test_run_tool_loop_respects_max_iterations() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         });
     }
@@ -247,7 +248,7 @@ async fn test_run_tool_loop_detects_duplicate_calls() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         });
     }
@@ -290,7 +291,7 @@ async fn test_run_tool_loop_returns_on_no_more_tool_calls() {
         crate::providers::base::LLMResponse {
             content: Some("Summary: found 3 files.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -410,7 +411,7 @@ impl LLMProvider for CapturingProvider {
         Ok(crate::providers::base::LLMResponse {
             content: Some("Done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         })
     }
@@ -489,14 +490,14 @@ async fn test_tool_loop_continuation_present_in_chained_calls() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         },
         // Second response: done
         crate::providers::base::LLMResponse {
             content: Some("Chained done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -752,7 +753,7 @@ async fn test_tool_loop_id_mapping_preserves_originals() {
         crate::providers::base::LLMResponse {
             content: Some("Done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -992,7 +993,7 @@ async fn test_short_circuit_disabled_when_zero() {
         crate::providers::base::LLMResponse {
             content: Some("Summarized.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -1068,7 +1069,7 @@ async fn test_tool_filtering_blocks_uninvited_tools() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         },
     ]));
@@ -1127,14 +1128,14 @@ async fn test_tool_filtering_allows_same_tool_different_args() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         },
         // Done
         crate::providers::base::LLMResponse {
             content: Some("All done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -1239,14 +1240,14 @@ async fn test_micro_tool_results_not_in_all_results() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         },
         // Then it summarizes
         crate::providers::base::LLMResponse {
             content: Some("Length is 16.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -1332,7 +1333,7 @@ async fn test_delegation_receives_micro_tool_defs() {
                             m
                         },
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: HashMap::new(),
                 })
             } else {
@@ -1340,7 +1341,7 @@ async fn test_delegation_receives_micro_tool_defs() {
                 Ok(crate::providers::base::LLMResponse {
                     content: Some("Done.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 })
             }
@@ -1555,7 +1556,7 @@ async fn test_ctx_summarize_produces_summary() {
                                 m
                             },
                         }],
-                        finish_reason: "tool_calls".to_string(),
+                        finish_reason: FinishReason::ToolCalls,
                         usage: HashMap::new(),
                     })
                 }
@@ -1564,7 +1565,7 @@ async fn test_ctx_summarize_produces_summary() {
                     Ok(crate::providers::base::LLMResponse {
                         content: Some("The content discusses Rust programming.".to_string()),
                         tool_calls: vec![],
-                        finish_reason: "stop".to_string(),
+                        finish_reason: FinishReason::Stop,
                         usage: HashMap::new(),
                     })
                 }
@@ -1573,7 +1574,7 @@ async fn test_ctx_summarize_produces_summary() {
                     Ok(crate::providers::base::LLMResponse {
                         content: Some("Based on the summary: Rust programming.".to_string()),
                         tool_calls: vec![],
-                        finish_reason: "stop".to_string(),
+                        finish_reason: FinishReason::Stop,
                         usage: HashMap::new(),
                     })
                 }
@@ -1717,14 +1718,14 @@ async fn test_cancellation_mid_iteration() {
                             m
                         },
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: HashMap::new(),
                 })
             } else {
                 Ok(crate::providers::base::LLMResponse {
                     content: Some("Should not reach here.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 })
             }
@@ -1786,7 +1787,7 @@ async fn test_cancellation_none_token_works() {
         crate::providers::base::LLMResponse {
             content: Some("All done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -1874,7 +1875,7 @@ async fn test_verbatim_false_calls_delegation() {
         crate::providers::base::LLMResponse {
             content: Some("Summarized.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -2187,7 +2188,7 @@ async fn test_scratch_pad_memory_accumulates_across_rounds() {
                                 m
                             },
                         }],
-                        finish_reason: "tool_calls".to_string(),
+                        finish_reason: FinishReason::ToolCalls,
                         usage: HashMap::new(),
                     })
                 }
@@ -2196,14 +2197,14 @@ async fn test_scratch_pad_memory_accumulates_across_rounds() {
                     Ok(crate::providers::base::LLMResponse {
                         content: Some("Found 5 endpoints in the API.".to_string()),
                         tool_calls: vec![],
-                        finish_reason: "stop".to_string(),
+                        finish_reason: FinishReason::Stop,
                         usage: HashMap::new(),
                     })
                 }
                 _ => Ok(crate::providers::base::LLMResponse {
                     content: Some("Unexpected call.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 }),
             }

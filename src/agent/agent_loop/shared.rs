@@ -476,7 +476,7 @@ mod lcm_checkpoint_tests {
     use crate::agent::compaction::ContextCompactor;
     use crate::agent::lcm::{CompactionFailureMode, LcmConfig, LcmEngine};
     use crate::agent::token_budget::TokenBudget;
-    use crate::providers::base::{LLMProvider, LLMResponse};
+    use crate::providers::base::{FinishReason, LLMProvider, LLMResponse};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -528,7 +528,7 @@ mod lcm_checkpoint_tests {
             Ok(LLMResponse {
                 content: Some(bullets.join("\n")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
