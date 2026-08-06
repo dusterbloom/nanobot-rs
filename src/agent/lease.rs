@@ -239,13 +239,22 @@ impl Lease {
 
     /// Format the progress signal for inclusion in tool results.
     ///
-    /// `L = max_renewals - renewals_used` (future leases still obtainable
-    /// this turn). The call index `N` is `iterations_used` — the call that
-    /// just executed (record_tool_call* was already called by the time
-    /// tool_engine adds the result). For the first call this is 1, etc.
+    /// Reports the MINIMUM of the two remaining-lease counters (checkpoint
+    /// and read-only auto-renewal). Both are capped at `max_renewals`; the
+    /// model must see the binding constraint so it can plan tool use before
+    /// hitting a hard block with no warning.
+    ///
+    /// `N` is `iterations_used` — the call that just executed
+    /// (`record_tool_call` was already called by the time `tool_engine`
+    /// adds the result). For the first call this is 1, etc.
     pub fn progress_signal(&self) -> String {
         let current_call = self.iterations_used;
-        let leases_remaining = self.max_renewals.saturating_sub(self.renewals_used);
+        let checkpoint_remaining =
+            self.max_renewals.saturating_sub(self.renewals_used);
+        let read_only_remaining =
+            self.max_renewals.saturating_sub(self.read_only_renewals_used);
+        let leases_remaining =
+            std::cmp::min(checkpoint_remaining, read_only_remaining);
         format!(
             "[Tool call {} of {} this lease — {} leases remaining]",
             current_call, self.lease_size, leases_remaining

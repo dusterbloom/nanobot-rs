@@ -2761,6 +2761,13 @@ impl AgentLoopShared {
                 // without a checkpoint — they can't loop destructively and
                 // the rejection+renewal dance wastes 3 round-trips on
                 // legitimate multi-file exploration.
+                //
+                // Re-record after renewal: auto_renew_for_read_only resets
+                // iterations_used to 0 but the call that triggered the
+                // renewal is not yet counted against the new lease.
+                // Without this the first call after every auto-renewal is
+                // free, granting lease_size+1 per renewal.
+                let _ = ctx.flow.lease.record_tool_call();
                 tracing::info!(
                     session = %ctx.session_key,
                     tool = %tc.name,

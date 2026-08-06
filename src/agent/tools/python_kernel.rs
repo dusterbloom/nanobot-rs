@@ -128,11 +128,23 @@ impl Tool for PythonKernel {
                     return format!("Error: capture setup failed: {e}");
                 }
                 let run_err = py.run(&c_code, Some(g), None).err();
+                // Stop the watchdog BEFORE teardown: teardown is real Python
+                // bytecode with GIL release points; a `SetAsyncExc` landing
+                // there would cause teardown to raise, leaving `sys.stdout`
+                // pointed at a dead StringIO — the exact leak we claim to fix.
+                done.store(true, Ordering::SeqCst);
+                // Clear any pending async exception the watchdog may have just
+                // raised, so teardown runs cleanly.
+                #[allow(unsafe_code)]
+                unsafe {
+                    let id = current_python_thread_id(py);
+                    // null → clear pending exception for this thread
+                    pyo3::ffi::PyThreadState_SetAsyncExc(id, std::ptr::null_mut());
+                }
                 // Unconditional teardown: on the error path this is what
                 // restores sys.stdout and refreshes `__capture_result`. Skipping
                 // it left the next call reading the previous call's buffers.
                 let teardown_err = py.run(&teardown, Some(g), None).err();
-                done.store(true, Ordering::SeqCst);
 
                 if let Some(e) = teardown_err {
                     return format!("Error: capture teardown failed: {e}");
@@ -182,6 +194,16 @@ fn spawn_watchdog(
     timeout: Duration,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        // Wait for the blocking task to publish its thread_id. A prior call
+        // still holding the mutex + GIL causes the current task to queue;
+        // starting the deadline immediately would let it expire before the
+        // queued task ever runs (thread_id == 0 → return → no timeout at all).
+        while thread_id.load(Ordering::SeqCst) == 0 {
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if done.load(Ordering::SeqCst) {

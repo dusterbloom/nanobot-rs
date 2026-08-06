@@ -25,11 +25,6 @@ static HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
 /// never populate `tool_calls`. Distinct from `[Called ...]` narration: there
 /// is no verb, just the call.
 ///
-/// Markdown links are safe — `[text](url)` puts the paren outside the bracket.
-static BRACKET_CALL_LITERAL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\[\s*[a-z][a-z0-9_]{2,}\s*\([^()\[\]]*\)\s*\]").expect("bracket call literal regex")
-});
-
 static XML_HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r#"(?isx)
@@ -127,7 +122,6 @@ pub(crate) fn has_claimed_tool_intent(content: &str) -> bool {
 pub(crate) fn has_hallucinated_tool_call(content: &str) -> bool {
     HALLUCINATED_CALL_RE.is_match(content)
         || XML_HALLUCINATED_CALL_RE.is_match(content)
-        || BRACKET_CALL_LITERAL_RE.is_match(content)
         || raw_json_tool_call_span(content).is_some()
 }
 
@@ -277,7 +271,6 @@ pub fn strip_hallucinated_text(content: &str) -> String {
     while let Some((start, end)) = raw_json_tool_call_span(&content) {
         content.replace_range(start..end, "");
     }
-    let content = BRACKET_CALL_LITERAL_RE.replace_all(&content, "");
     HALLUCINATED_CALL_RE
         .replace_all(&content, "")
         .trim()
@@ -325,38 +318,29 @@ mod tests {
         ));
     }
 
-    /// The lfm2 phantom shape: a bare call literal as content, no verb around
-    /// it, no `tool_calls` on the wire. Markdown links must not trip it.
+    /// Rust attributes, macros, and indexing must never be flagged as
+    /// hallucinated tool calls. The old `BRACKET_CALL_LITERAL_RE` matched
+    /// `#[cfg(test)]`, `vec![foo()]`, and `items[len(items)]` — retracting
+    /// correct final answers. Those shapes are now handled by
+    /// `HALLUCINATED_CALL_RE` (verb-based) and `NAMED_TOOL_INTENT_RE`.
     #[test]
-    fn test_bracket_call_literal_is_hallucinated_not_prose() {
+    fn rust_attributes_and_code_patterns_are_not_hallucinated() {
         for content in [
-            "[get_skills()]",
-            "Let me check the time.[exec(command='date')]",
-            "[read_file(path='/tmp/x')]",
-        ] {
-            assert!(
-                matches!(
-                    validate_response(content, &[], false, false),
-                    ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
-                ),
-                "{content:?} must read as a phantom tool call"
-            );
-            assert!(
-                !strip_hallucinated_text(content).contains('('),
-                "{content:?} must have the call literal stripped"
-            );
-        }
-
-        for content in [
-            "See [the docs](https://example.com) for details.",
-            "The array is [1, 2, 3] and that is all.",
+            "Use `#[cfg(test)]` above the module.",
+            "The attribute #[derive(Debug, Clone)] is common.",
+            "#[allow(dead_code)]",
+            "#[serde(rename_all = camelCase)]",
+            "#[cfg(feature = python-kernel)]",
+            "You can write let v = vec![foo()]; in Rust.",
+            "items[len(items)]",
+            "arr[max(a,b)]",
         ] {
             assert!(
                 matches!(
                     validate_response(content, &[], false, false),
                     ValidationOutcome::Ok
                 ),
-                "{content:?} is prose, not a phantom call"
+                "{content:?} must not be flagged as a hallucinated tool call"
             );
         }
     }
