@@ -2263,6 +2263,12 @@ fn reconstruct_message(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+// Narrow per-test-module escape hatch (research doc §3.6): the two
+// `unreachable!()` assertions below assert exhaustive-match invariants in
+// import tests. The crate-root test hatch no longer exempts
+// `clippy::unreachable` (it masks incomplete coverage); this module's tests
+// still use it legitimately, so it is allowed here alone.
+#[allow(clippy::unreachable)]
 mod tests {
     use super::*;
     use crate::agent::lcm::ManifestItem;

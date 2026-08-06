@@ -3,13 +3,15 @@
 // production deny regime (unwrap/expect/panic/indexing/as_conversions/...)
 // applies to `cargo clippy` lib/bin builds; test modules may keep their
 // pragmatic unwraps without blocking the flip.
+//
+// `todo!` / `unimplemented!` / `unreachable!` are deliberately NOT exempted
+// here: they mask incomplete coverage even under `cfg(test)`. Modules whose
+// tests still need them carry a narrow per-test-module allow (doc §3.6's
+// approach) instead.
 #![cfg_attr(test, allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
     clippy::dbg_macro,
     clippy::indexing_slicing,
     clippy::as_conversions,
