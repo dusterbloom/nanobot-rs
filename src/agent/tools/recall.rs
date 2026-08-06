@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{Tool, ToolExecutionContext, ToolResult};
+use super::base::{Tool, ToolContext, ToolResult};
 use crate::agent::knowledge_store::{KnowledgeStore, SearchHit};
 
 /// Cap (chars) on the merged search output so a broad query can't blow context.
@@ -728,7 +728,7 @@ impl Tool for RecallTool {
     async fn execute_typed(
         &self,
         params: HashMap<String, Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> ToolResult {
         let has_query = params
             .get("query")

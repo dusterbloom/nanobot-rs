@@ -1018,7 +1018,7 @@ async fn execute_single_tool(
         };
 
         let execution = async {
-            use crate::agent::tools::base::ToolExecutionContext;
+            use crate::agent::tools::base::ToolContext;
 
             // Tool-call identity is part of the execution contract, not a UI
             // concern. A closed channel keeps headless calls event-free while
@@ -1028,14 +1028,15 @@ async fn execute_single_tool(
                 drop(rx);
                 tx
             });
-            let exec_ctx = ToolExecutionContext {
+            let exec_ctx = ToolContext::new(
+                None,
                 event_tx,
-                cancellation_token: cancellation_token
+                cancellation_token
                     .as_ref()
                     .map(|t| t.child_token())
                     .unwrap_or_else(tokio_util::sync::CancellationToken::new),
-                tool_call_id: tc.id.clone(),
-            };
+                tc.id.clone(),
+            );
             tools
                 .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
                 .await

@@ -17,7 +17,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use super::base::{
-    PermissionLevel, Tool, ToolConcurrency, ToolExecutionContext, ToolExecutionResult,
+    PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolExecutionResult,
 };
 use super::filesystem::MAX_WRITE_FILE_PIECE_CHARS;
 use super::{
@@ -102,6 +102,10 @@ pub struct ToolRegistry {
     max_permission: PermissionLevel,
     /// Optional hook scripts that run before/after tool calls.
     hooks: Option<crate::config::schema::HooksConfig>,
+    /// Typed host bridge injected at the registry boundary (research §3.5).
+    /// `None` in sandboxed registries (scripts, tests) — tools that require
+    /// the host fail with a typed `ToolError::Execution`.
+    host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
 }
 
 /// Fully decoded meaning of the compact `tool` proxy envelope.
@@ -272,6 +276,7 @@ impl ToolRegistry {
             tools: HashMap::new(),
             max_permission: PermissionLevel::System,
             hooks: None,
+            host: None,
         }
     }
 
@@ -284,12 +289,21 @@ impl ToolRegistry {
             tools: HashMap::new(),
             max_permission: max,
             hooks: None,
+            host: None,
         }
     }
 
     /// Set the maximum permission level for this registry.
     pub fn set_max_permission(&mut self, max: PermissionLevel) {
         self.max_permission = max;
+    }
+
+    /// Inject the typed host bridge (spawn/pipeline/loop/message). Builder
+    /// style so the registry stays immutable after construction; the single
+    /// production injection point is `tool_wiring::build_tools`.
+    pub fn with_host(mut self, host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>) -> Self {
+        self.host = host;
+        self
     }
 
     /// Configure hook scripts that run before/after tool calls.
@@ -623,7 +637,7 @@ impl ToolRegistry {
         .await;
     }
 
-    /// Execute a tool by name with a [`ToolExecutionContext`] for progress
+    /// Execute a tool by name with a [`ToolContext`] for progress
     /// reporting and cancellation support.
     ///
     /// Same as [`Self::execute`] but passes the context through to the tool.
@@ -631,7 +645,7 @@ impl ToolRegistry {
         &self,
         name: &str,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> ToolExecutionResult {
         // Proxy intercept: "get_tools" (alias "tool") is the meta-tool, not a registered tool.
         if name == "get_tools" || name == "tool" {
@@ -647,11 +661,27 @@ impl ToolRegistry {
         &self,
         name: &str,
         params: HashMap<String, serde_json::Value>,
-        ctx: Option<&ToolExecutionContext>,
+        ctx: Option<&ToolContext>,
     ) -> ToolExecutionResult {
         let (name, params) = match Self::normalize_tool_request(name, params) {
             Ok(v) => v,
             Err(e) => return ToolExecutionResult::failure(e),
+        };
+        // The registry is the single ToolContext builder (research §3.5):
+        // the host is injected here, once, at the boundary. A caller-supplied
+        // context (streaming tools) keeps its event/cancel/call_id parts;
+        // sandboxed callers get a fresh default context.
+        let ctx = match ctx {
+            Some(c) => c.clone().with_host(self.host.clone()),
+            None => {
+                let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                ToolContext::new(
+                    self.host.clone(),
+                    event_tx,
+                    tokio_util::sync::CancellationToken::new(),
+                    String::new(),
+                )
+            }
         };
 
         let tool = match self.tools.get(&name) {
@@ -674,18 +704,10 @@ impl ToolRegistry {
             return blocked;
         }
 
-        let unwound = match ctx {
-            Some(ctx) => {
-                let fut = std::panic::AssertUnwindSafe(
-                    tool.execute_with_result_and_context(params.clone(), ctx),
-                );
-                futures_util::FutureExt::catch_unwind(fut).await
-            }
-            None => {
-                let fut = std::panic::AssertUnwindSafe(tool.execute_with_result(params.clone()));
-                futures_util::FutureExt::catch_unwind(fut).await
-            }
-        };
+        let unwound = std::panic::AssertUnwindSafe(
+            tool.execute_with_result_and_context(params.clone(), &ctx),
+        );
+        let unwound = futures_util::FutureExt::catch_unwind(unwound).await;
         let mut result = match unwound {
             Ok(result) => result,
             Err(_) => {
@@ -1289,7 +1311,7 @@ impl ToolRegistry {
     async fn execute_proxy(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: Option<&ToolExecutionContext>,
+        ctx: Option<&ToolContext>,
     ) -> ToolExecutionResult {
         match self.resolve_proxy_call(&params) {
             ProxyCall::Catalog | ProxyCall::MissingSelector => self.missing_name_result(&params),
@@ -2233,18 +2255,14 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_context() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("echo")));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_ctx".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_ctx");
 
         let mut params = HashMap::new();
         params.insert(
@@ -2260,16 +2278,12 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_context_missing_tool() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let registry = ToolRegistry::new();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_missing".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_missing");
 
         let result = registry
             .execute_with_context("nonexistent", HashMap::new(), &ctx)
@@ -3386,9 +3400,10 @@ mod tests {
             async fn execute(&self, _: HashMap<String, serde_json::Value>) -> String {
                 "Error: provide facts".to_string() // NOTE: no "is required" substring
             }
-            async fn execute_with_result(
+            async fn execute_with_result_and_context(
                 &self,
                 _: HashMap<String, serde_json::Value>,
+                _ctx: &ToolContext,
             ) -> ToolExecutionResult {
                 ToolExecutionResult::failure_with_kind(
                     "Error: provide facts".to_string(),

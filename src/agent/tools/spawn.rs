@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::{PermissionLevel, Tool, ToolExecutionContext, ToolOutput, ToolResult};
+use super::base::{PermissionLevel, Tool, ToolContext, ToolOutput, ToolResult};
 use crate::errors::ToolError;
 
 /// Type alias for the spawn callback.
@@ -311,7 +311,7 @@ impl Tool for SpawnTool {
     async fn execute_typed(
         &self,
         params: HashMap<String, serde_json::Value>,
-        _ctx: &ToolExecutionContext,
+        _ctx: &ToolContext,
     ) -> ToolResult {
         /// Funnel a callback's legacy `String` output into the typed channel:
         /// `Error:`-prefixed strings become [`crate::errors::ToolError`]

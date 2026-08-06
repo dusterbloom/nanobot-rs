@@ -1,6 +1,7 @@
 //! Base class for agent tools.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -190,15 +191,75 @@ impl From<ToolResult> for ToolExecutionResult {
     }
 }
 
-/// Context passed to tools during execution for progress reporting
-/// and cancellation support.
-pub struct ToolExecutionContext {
-    /// Channel for emitting progress events to the REPL.
-    pub event_tx: UnboundedSender<ToolEvent>,
-    /// Token that signals the tool should abort gracefully.
-    pub cancellation_token: tokio_util::sync::CancellationToken,
-    /// The tool call ID for correlating events.
-    pub tool_call_id: String,
+/// Everything a tool may depend on, composed once at the registry boundary
+/// (research §3.5). Tools depend on this type — never on globals, never on
+/// concrete managers, never on `Arc<Mutex<Option<…>>>` callback slots.
+#[derive(Clone)]
+pub struct ToolContext {
+    /// Typed host bridge (spawn/pipeline/loop/message). `None` in sandboxed
+    /// registries (scripts, tests) — tools that require it fail with a typed
+    /// [`crate::errors::ToolError::Execution`] instead of
+    /// `"Error: Spawn callback not configured"`.
+    host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
+    /// Progress/audit event sink.
+    events: UnboundedSender<ToolEvent>,
+    /// Cooperative cancellation (the existing token, unchanged).
+    cancel: tokio_util::sync::CancellationToken,
+    /// Correlates this call across audit + REPL.
+    call_id: String,
+}
+
+impl ToolContext {
+    /// The single constructor — the registry is the only builder in
+    /// production; tests and streaming tools pass their own parts with
+    /// `host: None` (the registry injects its host).
+    pub fn new(
+        host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
+        events: UnboundedSender<ToolEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+        call_id: impl Into<String>,
+    ) -> Self {
+        Self { host, events, cancel, call_id: call_id.into() }
+    }
+
+    /// The typed host bridge, or a typed error when this registry is
+    /// sandboxed. Replaces the `"… callback not configured"` string path.
+    #[cfg_attr(not(test), allow(dead_code))] // API of the composable context (doc §3.5); consumed by tests now, tools adopt it when the bridge lands in their execute path
+    pub fn host(&self) -> Result<&dyn crate::agent::host_bridge::HostBridge, crate::errors::ToolError> {
+        self.host.as_deref().ok_or_else(|| crate::errors::ToolError::Execution {
+            message: "host capability not available in this context".to_string(),
+        })
+    }
+
+    /// Emit a progress/audit event.
+    pub fn emit(&self, event: ToolEvent) -> Result<(), crate::errors::ToolError> {
+        self.events.send(event).map_err(|_| crate::errors::ToolError::Execution {
+            message: "event channel closed".to_string(),
+        })
+    }
+
+    /// Whether cooperative cancellation has been requested.
+    #[cfg_attr(not(test), allow(dead_code))] // same transitional status as `host` — streaming tools adopt it with the context migration
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// The cooperative cancellation token.
+    pub fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.cancel
+    }
+
+    /// The tool call ID correlating this call across audit + REPL.
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    /// Registry seam: rebind the host on a caller-supplied context (the
+    /// registry is the single builder — see `ToolRegistry::execute_inner`).
+    pub(crate) fn with_host(mut self, host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>) -> Self {
+        self.host = host;
+        self
+    }
 }
 
 /// Abstract base trait for agent tools.
@@ -231,7 +292,7 @@ pub trait Tool: Send + Sync {
     async fn execute_with_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        _ctx: &ToolExecutionContext,
+        _ctx: &ToolContext,
     ) -> String {
         self.execute(params).await
     }
@@ -248,7 +309,7 @@ pub trait Tool: Send + Sync {
     async fn execute_typed(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> ToolResult {
         let out = self.execute_with_context(params, ctx).await;
         if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
@@ -267,11 +328,12 @@ pub trait Tool: Send + Sync {
         params: HashMap<String, serde_json::Value>,
     ) -> ToolExecutionResult {
         let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolExecutionContext {
+        let ctx = ToolContext::new(
+            None,
             event_tx,
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tool_call_id: String::new(),
-        };
+            tokio_util::sync::CancellationToken::new(),
+            String::new(),
+        );
         ToolExecutionResult::from(self.execute_typed(params, &ctx).await)
     }
 
@@ -282,7 +344,7 @@ pub trait Tool: Send + Sync {
     async fn execute_with_result_and_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> ToolExecutionResult {
         ToolExecutionResult::from(self.execute_typed(params, ctx).await)
     }
@@ -480,11 +542,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_1".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_1");
 
         let tool = MockTool;
         let mut params = HashMap::new();
@@ -506,11 +564,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_1".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_1");
 
         let tool = MockTool;
         let mut params = HashMap::new();
@@ -531,19 +585,15 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
 
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token.clone(),
-            tool_call_id: "call_123".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token.clone(), "call_123");
 
-        // Verify fields are accessible
-        assert_eq!(ctx.tool_call_id, "call_123");
-        assert!(!ctx.cancellation_token.is_cancelled());
+        // Verify accessors
+        assert_eq!(ctx.call_id(), "call_123");
+        assert!(!ctx.cancellation_token().is_cancelled());
+        assert!(!ctx.is_cancelled());
 
-        // Can send events through the channel
-        ctx.event_tx
-            .send(ToolEvent::Progress {
+        // Can emit events through the channel
+        ctx.emit(ToolEvent::Progress {
                 tool_name: "exec".to_string(),
                 tool_call_id: "call_123".to_string(),
                 elapsed_ms: 1000,
@@ -565,15 +615,101 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
 
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token.clone(),
-            tool_call_id: "call_456".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token.clone(), "call_456");
 
-        assert!(!ctx.cancellation_token.is_cancelled());
+        assert!(!ctx.is_cancelled());
         token.cancel();
-        assert!(ctx.cancellation_token.is_cancelled());
+        assert!(ctx.is_cancelled());
+    }
+
+    #[test]
+    fn test_tool_context_composition() {
+        use crate::agent::host_bridge::{
+            CancelRequest, CheckRequest, HostBridge, HostDispatcher, ListReply, LoopHost,
+            LoopRequest, LoopReply, MessageHost, PipelineHost, PipelineRequest, PipelineReply,
+            SendMessageReply, SendMessageRequest, SpawnHost, SpawnReply, SpawnRequest, WaitReply,
+            WaitRequest,
+        };
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct NoopSpawn;
+        #[async_trait]
+        impl SpawnHost for NoopSpawn {
+            async fn spawn(&self, _r: SpawnRequest) -> Result<SpawnReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            }
+            async fn list_subagents(&self) -> Result<ListReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            }
+            async fn cancel(&self, _r: CancelRequest) -> Result<crate::agent::host_bridge::CancelReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            }
+            async fn wait(&self, _r: WaitRequest) -> Result<WaitReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            }
+            async fn check(&self, _r: CheckRequest) -> Result<crate::agent::host_bridge::CheckReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            }
+        }
+        struct NoopPipeline;
+        #[async_trait]
+        impl PipelineHost for NoopPipeline {
+            async fn run_pipeline(&self, _r: PipelineRequest) -> Result<PipelineReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            }
+        }
+        struct NoopLoop;
+        #[async_trait]
+        impl LoopHost for NoopLoop {
+            async fn run_loop(&self, _r: LoopRequest) -> Result<LoopReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            }
+        }
+        struct NoopMessage;
+        #[async_trait]
+        impl MessageHost for NoopMessage {
+            async fn send(&self, _r: SendMessageRequest) -> Result<SendMessageReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            }
+        }
+
+        let host: Arc<dyn HostBridge> = Arc::new(HostDispatcher::new(
+            Arc::new(NoopSpawn),
+            Arc::new(NoopPipeline),
+            Arc::new(NoopLoop),
+            Arc::new(NoopMessage),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolContext::new(Some(host), tx, token.clone(), "call_composed");
+
+        // host is reachable through the context.
+        assert!(ctx.host().is_ok());
+        // events flow through emit().
+        ctx.emit(ToolEvent::Progress {
+            tool_name: "t".to_string(),
+            tool_call_id: "call_composed".to_string(),
+            elapsed_ms: 5,
+            output_preview: None,
+        })
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(ToolEvent::Progress { elapsed_ms: 5, .. })));
+        // cancellation + correlation id.
+        assert!(!ctx.is_cancelled());
+        token.cancel();
+        assert!(ctx.is_cancelled());
+        assert!(ctx.cancellation_token().is_cancelled());
+        assert_eq!(ctx.call_id(), "call_composed");
+
+        // A sandboxed context reports the typed host error.
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let sandboxed = ToolContext::new(None, tx2, tokio_util::sync::CancellationToken::new(), "s");
+        let err = match sandboxed.host() {
+            Err(e) => e,
+            Ok(_) => panic!("expected typed host error"),
+        };
+        assert_eq!(err.render(), "Error: host capability not available in this context");
     }
 
     #[test]
