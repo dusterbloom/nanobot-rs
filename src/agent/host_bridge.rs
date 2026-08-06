@@ -17,12 +17,13 @@
 //!   traits by invoking the *legacy* callback slots, so the dispatcher can be
 //!   exercised end-to-end against the pre-bridge wiring byte-for-byte.
 
-// Additive module landing ahead of its consumers: the protocol types are
-// exercised by the tests in this commit; production wiring (AgentHost in
-// `tool_wiring`, `ToolRegistry::with_host`) consumes them in the next steps.
-// Remove this allow when the wiring lands (scoped-allow style, error
-// protocol §2.5).
-#![allow(dead_code)]
+// The bridge is wired at the registry boundary (build_tools → with_host) but
+// dormant until the tool-adoption step (doc §3.7 Steps 2-3) puts requests on
+// the wire: no tool calls `HostDispatcher` in production yet, so the protocol
+// types are only constructed by the test suite. Scoped-allow style, error
+// protocol §2.5 — remove when a tool executes through the host.
+#![cfg_attr(not(test), allow(dead_code))]
+
 
 use std::sync::Arc;
 
@@ -493,7 +494,7 @@ impl MessageHost for HostBridgeAdapter {
 /// [`ToolError::from_legacy`] (byte-identical classification); anything else
 /// is the model-visible text of a success reply. Mirrors `spawn.rs`'s
 /// `into_result`.
-fn into_model_text(out: String) -> Result<String, ToolError> {
+pub(crate) fn into_model_text(out: String) -> Result<String, ToolError> {
     out.strip_prefix("Error:")
         .map(|s| s.trim().to_string())
         .map_or(Ok(out), |err| Err(ToolError::from_legacy(&err)))
