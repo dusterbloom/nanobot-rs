@@ -137,6 +137,7 @@ impl ToolExecutionResult {
     }
 
     #[must_use]
+    #[allow(clippy::disallowed_methods)] // legacy constructor — deleted in Phase 3
     pub fn failure(message: String) -> Self {
         let error_kind = crate::errors::classify_tool_error(&message);
         Self {

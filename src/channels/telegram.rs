@@ -2,6 +2,7 @@
 //!
 //! Uses long polling (`getUpdates`) so no public IP or webhook is needed.
 
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

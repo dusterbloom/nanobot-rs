@@ -3,6 +3,7 @@
 //! Typed errors at module boundaries replace string-encoded errors and
 //! enable structured error handling via pattern matching.
 
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -305,6 +306,7 @@ impl ToolError {
     /// The single legacy bridge. Called only by the migration adapter
     /// (default `Tool::execute_typed`). Maps the exact strings
     /// `classify_tool_error` matched today, so retry behavior is preserved.
+    #[allow(clippy::disallowed_methods)] // legacy bridge — deleted in Phase 3
     pub fn from_legacy(msg: &str) -> Self {
         if let Some(kind) = classify_tool_error(msg) {
             return match kind {
@@ -348,6 +350,7 @@ pub fn legacy_kind_from_tool_error(e: &ToolError) -> Option<ToolErrorKind> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests pin classify_tool_error's mapping; deleted in Phase 3
 mod tests {
     use super::*;
 

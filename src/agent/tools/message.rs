@@ -15,6 +15,7 @@ use crate::errors::ToolError;
 use crate::bus::events::OutboundMessage;
 
 /// Type alias for the send callback.
+#[allow(clippy::disallowed_types)] // anyhow at the callback boundary — replaced by MessageHost (host bridge, Topic 2)
 pub type SendCallback =
     Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 

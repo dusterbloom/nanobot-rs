@@ -7,6 +7,7 @@
 //! Bridge files are embedded at compile time and extracted to
 //! `~/.nanobot/bridge/whatsapp/` on first run.
 
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};

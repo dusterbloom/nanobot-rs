@@ -3,6 +3,7 @@
 //! Receives messages by polling IMAP INBOX for UNSEEN messages, sends replies
 //! via SMTP with proper threading headers (`In-Reply-To`, `References`).
 
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
