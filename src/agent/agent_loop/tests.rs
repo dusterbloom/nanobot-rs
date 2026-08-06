@@ -10,8 +10,8 @@ use crate::agent::router::{
     extract_json_object, parse_lenient_router_decision, request_strict_router_decision,
 };
 use crate::config::schema::{
-    AdaptiveTokenConfig, MemoryConfig, ProvenanceConfig, ProviderConfig, ToolDelegationConfig,
-    TrioConfig,
+    AdaptiveTokenConfig, CodeExecutionConfig, MemoryConfig, ProvenanceConfig, ProviderConfig,
+    PythonKernelConfig, ToolDelegationConfig, TrioConfig,
 };
 use crate::providers::base::LLMProvider;
 use crate::providers::openai_compat::OpenAICompatProvider;
@@ -163,6 +163,8 @@ fn build_test_core(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(sessions_db),
     })
@@ -503,6 +505,8 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -570,6 +574,8 @@ fn test_delegation_with_is_local_true() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -639,6 +645,8 @@ fn test_delegation_with_is_local_false_cloud() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -725,6 +733,8 @@ fn test_local_reflection_and_delegation_providers_do_not_reroute_lcm() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -792,6 +802,8 @@ fn test_cloud_memory_and_delegation_do_not_reroute_lcm() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -902,6 +914,8 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1184,6 +1198,8 @@ fn build_trio_e2e_harness(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1644,6 +1660,8 @@ async fn test_trio_e2e_router_unreachable() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1760,6 +1778,8 @@ async fn test_trio_e2e_specialist_unreachable() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2433,6 +2453,8 @@ fn build_trio_offline_harness(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2505,6 +2527,8 @@ fn build_local_inline_harness_with_iters(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2614,6 +2638,8 @@ fn build_local_inline_harness_with_memory_and_reflection(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2685,6 +2711,8 @@ fn build_cloud_inline_harness_with_memory(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -5159,6 +5187,8 @@ async fn test_trio_offline_e2e_health_gate() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -5652,6 +5682,8 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -5711,6 +5743,8 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -5768,6 +5802,8 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -5826,6 +5862,8 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -5871,6 +5909,8 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -5947,6 +5987,8 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -5999,6 +6041,8 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -6070,16 +6114,17 @@ mod runtime_mode_parity_tests {
                 self.saw_tools_absent
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            // Distinct path per call: the cached-duplicate breaker cannot arm,
-            // so the lease read-family cap is the only thing that can stop the
-            // run — exactly the 2026-07-30 incident path.
+            // Distinct command per call: the cached-duplicate breaker cannot
+            // arm, so the lease exhaustion → sticky strip is the only path that
+            // can stop the run. Uses `exec` (side-effect) not `list_dir`
+            // (read-only) because read-only tools now auto-renew the lease.
             let mut args = std::collections::HashMap::new();
-            args.insert("path".to_string(), json!(format!("dir{n}")));
+            args.insert("command".to_string(), json!(format!("echo {n}")));
             Ok(crate::providers::base::LLMResponse {
                 content: Some(String::new()),
                 tool_calls: vec![crate::providers::base::ToolCallRequest {
                     id: format!("tc_loop_{n}"),
-                    name: "list_dir".to_string(),
+                    name: "exec".to_string(),
                     arguments: args,
                 }],
                 finish_reason: "tool_calls".to_string(),
@@ -6090,6 +6135,104 @@ mod runtime_mode_parity_tests {
         fn get_default_model(&self) -> &str {
             &self.name
         }
+    }
+
+    /// A model that narrates a tool call it never emits (`higgs` + lfm2-2.6b
+    /// returns `[exec(command='date')]` as plain content with no `tool_calls`,
+    /// even under `tool_choice=required`). Nothing executes, so the narration
+    /// must NOT be left standing on the stream as if it were a result: it has
+    /// to be retracted and replaced by an explicit failure. Before the fix the
+    /// give-up message was suppressed by `content_was_streamed` and the user
+    /// saw only the phantom call.
+    struct PhantomToolProvider {
+        name: String,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PhantomToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::providers::base::LLMResponse {
+                content: Some(
+                    "Let me use the exec tool to run a command that will give me the current time.\
+                     [exec(command='date')]"
+                        .to_string(),
+                ),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[tokio::test]
+    async fn phantom_tool_narration_is_retracted_not_surfaced_as_answer() {
+        let provider = Arc::new(PhantomToolProvider {
+            name: "local-main".to_string(),
+            calls: std::sync::atomic::AtomicU32::new(0),
+        });
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let session_key = format!("phantom-tool-{}", uuid::Uuid::new_v4());
+
+        let final_text = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent_loop.process_direct_streaming(
+                "what is the time?",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                tx,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("turn must terminate");
+
+        let mut deltas = Vec::new();
+        while let Ok(d) = rx.try_recv() {
+            deltas.push(d);
+        }
+        let streamed = deltas.join("");
+
+        assert!(
+            streamed.contains(&crate::turn_stream::ControlMarker::RetractReply.encode()),
+            "phantom narration must be retracted from the stream, got: {streamed:?}"
+        );
+        let tail = streamed
+            .rsplit(&crate::turn_stream::ControlMarker::RetractReply.encode())
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !tail.contains("[exec(command='date')]"),
+            "phantom call survived the retraction: {tail:?}"
+        );
+        assert!(
+            final_text.contains("narrated a tool action"),
+            "turn must end with an explicit no-execution failure, got: {final_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     /// Adversarial convergence: the model emits a fresh list_dir every turn

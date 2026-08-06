@@ -171,7 +171,7 @@ mod tests {
             let frozen = if freeze { watermark } else { 0 };
             with_frozen_prefix(&mut messages, frozen, |m| {
                 crate::agent::context_hygiene::hygiene_pipeline(m, keep_last);
-                crate::agent::anti_drift::pre_completion_pipeline(m, iter, &cfg);
+                crate::agent::anti_drift::pre_completion_pipeline(m, iter, &cfg, false);
             });
 
             let fp = fingerprint(&messages);
@@ -235,7 +235,7 @@ mod tests {
             user("still nothing"),
         ];
         with_frozen_prefix(&mut messages, 0, |m| {
-            crate::agent::anti_drift::pre_completion_pipeline(m, 1, &cfg);
+            crate::agent::anti_drift::pre_completion_pipeline(m, 1, &cfg, false);
         });
         // At w==0 the pass is unrestricted: earlier identical calls collapse,
         // exactly as the direct-call anti_drift tests assert.

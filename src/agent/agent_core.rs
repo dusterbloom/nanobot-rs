@@ -102,6 +102,11 @@ pub struct SwappableCore {
     pub specialist_output_schema: bool,
     pub trace_log: bool,
     pub reasoning_config: crate::config::schema::ReasoningConfig,
+    /// Code execution tool config.
+    pub code_execution: crate::config::schema::CodeExecutionConfig,
+    /// Python kernel tool config (feature: python-kernel).
+    #[allow(dead_code)]
+    pub python_kernel: crate::config::schema::PythonKernelConfig,
     /// Interval in seconds between tool-heartbeat progress ticks (default: 2).
     pub tool_heartbeat_secs: u64,
     /// Timeout in seconds for a single health-check HTTP request (default: 2).
@@ -580,6 +585,10 @@ pub struct SwappableCoreConfig {
     /// `Some(workspace.join("sessions.db"))` so parallel tests don't contend
     /// on the user's real session DB.
     pub sessions_db_path: Option<PathBuf>,
+    /// Code execution (Python RPC) tool settings.
+    pub code_execution: crate::config::schema::CodeExecutionConfig,
+    /// Python kernel tool (PyO3, feature: python-kernel).
+    pub python_kernel: crate::config::schema::PythonKernelConfig,
 }
 
 /// Build a `SwappableCore` from the given config.
@@ -619,6 +628,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         health_check_timeout_secs,
         adaptive_tokens,
         sessions_db_path,
+        code_execution,
+        python_kernel,
     } = cfg;
     let model_capabilities =
         crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
@@ -770,6 +781,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         search_max_results,
         exec_timeout,
         restrict_to_workspace,
+        code_execution,
+        python_kernel,
         memory_enabled: memory_config.enabled,
         memory_provider,
         memory_model,

@@ -1260,6 +1260,7 @@ impl ContextBuilder {
                      Other tools via `get_tools` proxy: omit tool_name to list; \
                      {{\"tool_name\":\"X\"}} inspect; {{\"tool_name\":\"X\",\"tool_args\":{{...}}}} invoke. \
                       get_skills: omit name to list, name to read; recall (memory + files + past sessions). \
+                     TOOL_RESULT_HANDLE v1 receipt → fetch the body with recall_tool_result({{\"tool_call_id\":\"<id>\"}}). \
                      Quote exact tool errors; never invent causes or tool results. \
                      edit_file uses path, old_text, new_text—not content. \
                      Never pass read_file line prefixes as args. \
@@ -1301,7 +1302,9 @@ impl ContextBuilder {
                 ),
                 format!("Home: {home_dir}\n"),
                 "\n- Reply directly for conversation; use 'message' tool only for chat channels.\n\
-                 - Use absolute paths or paths relative to the project directory."
+                 - Use absolute paths or paths relative to the project directory.\n\
+                 - Tool results may arrive as TOOL_RESULT_HANDLE v1 receipts (body stashed to save context); \
+                 fetch the full body with recall_tool_result({\"tool_call_id\":\"<id>\"})."
                     .to_string(),
                 format!(
                     "## Memory\n\
@@ -2074,7 +2077,9 @@ mod tests {
     fn test_local_system_prompt_under_180_tokens_without_inlined_catalog() {
         // Headline property: with a real workspace and a realistic long GGUF
         // model name, the assembled local system prompt stays small. The ceiling
-        // accommodates path interpolation + long model filenames.
+        // accommodates path interpolation + long model filenames + the
+        // TOOL_RESULT_HANDLE protocol line (which prevents local models from
+        // misrouting handle fetches to `recall` — session 20260804_204406_c16eb0).
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("AGENTS.md"),
@@ -2100,8 +2105,8 @@ mod tests {
         let tokens = TokenBudget::estimate_str_tokens(&prompt);
 
         assert!(
-            tokens <= 220,
-            "local system prompt must stay <= 220 tokens with realistic model name (got {tokens}):\n{prompt}"
+            tokens <= 260,
+            "local system prompt must stay <= 260 tokens with realistic model name (got {tokens}):\n{prompt}"
         );
 
         // Bootstrap catalog content must NOT be inlined — model fetches on demand.

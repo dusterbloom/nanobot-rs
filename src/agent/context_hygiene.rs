@@ -49,7 +49,14 @@ pub enum ToolBodyPolicy {
 /// The same cap must apply before a tool result enters live `ctx.messages` and
 /// when session history is loaded from SQLite. Otherwise a same-turn prompt can
 /// warm the server cache with bytes that the next turn will never replay.
-pub(crate) const TOOL_RESULT_REPLAY_MAX_BYTES: usize = 8000;
+///
+/// Sized above `config::schema::DEFAULT_MAX_TOOL_RESULT_CHARS` (10_000) so a
+/// result that fits the user-visible char cap (near-ASCII) also fits the byte
+/// cap and stays inline instead of degrading to a stashed handle. A static cap
+/// can't track per-agent char caps exactly (UTF-8 multibyte), but 12_000 keeps
+/// the 8-10KB dead band — where a sub-cap result became an unresolvable handle
+/// (session 20260804_204406_c16eb0) — inside the inline contract.
+pub(crate) const TOOL_RESULT_REPLAY_MAX_BYTES: usize = 12_000;
 
 pub(crate) fn cap_tool_result_for_replay(content: &str) -> String {
     shrink_tool_body(

@@ -376,6 +376,27 @@ pub(crate) fn is_side_effect_tool(name: &str) -> bool {
     matches!(name, "exec" | "write_file" | "edit_file" | "apply_patch")
 }
 
+/// Local reads that cost nothing but a syscall. These auto-renew the tool
+/// lease without a checkpoint — they can't cause destructive loops, and
+/// blocking them behind a manual renewal ceremony wastes 3 round-trips on
+/// legitimate multi-file exploration.
+///
+/// Network tools (`web_search`, `web_fetch`) are deliberately NOT here.
+/// They mutate nothing locally, but they spend money, burn rate limits, and
+/// paginate in loops — bounding exactly that is what the lease is for.
+pub(crate) fn is_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "list_dir"
+            | "find_files"
+            | "search_files"
+            | "file_info"
+            | "file_preview"
+            | "get_skills"
+    )
+}
+
 /// Tools whose result must be consumed and reported before another call of
 /// the same class. Memory reads/writes are included because silently chaining
 /// them was observed to leave a turn with no final answer and to amplify bad
@@ -708,9 +729,10 @@ pub(crate) async fn execute_tools_delegated(
             && !is_explicit_retrieval_tool(&tc.name)
             && full_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES
         {
-            // Genuinely oversized (>8KB) non-retrieval delegated output →
-            // handle only. Body lives in the stash; model recalls it. (A 95KB
-            // result replayed raw was the cache-break class.)
+            // Genuinely oversized (over the replay byte cap) non-retrieval
+            // delegated output → handle only. Body lives in the stash; model
+            // recalls it. (A 95KB result replayed raw was the cache-break
+            // class.)
             render_tool_result_handle(
                 &tc.id,
                 &tc.name,
@@ -719,7 +741,8 @@ pub(crate) async fn execute_tools_delegated(
                 &tc.arguments,
             )
         } else {
-            // Medium (over hot-prompt cap but ≤8KB), retrieval tools (bounded
+            // Medium (over the hot-prompt char cap but within the replay byte
+            // cap), retrieval tools (bounded excerpt by design), or small —
             // excerpt by design), or small — show actual CONTENT via the
             // deterministic head+tail preview. Handling medium results starved
             // the model of normal read/exec bytes (2026-07-31 regression).
@@ -1217,10 +1240,10 @@ async fn inject_tool_result(
             }
         };
         if stashed_raw && result_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES {
-            // GENUINELY oversized (>8KB): handle only. A single 95KB result
-            // replayed raw was the cache-break class (token_mismatch under
-            // ExactBootstrap). The body lives in the stash, fetchable via
-            // recall_tool_result.
+            // GENUINELY oversized (over the replay byte cap): handle only. A
+            // single 95KB result replayed raw was the cache-break class
+            // (token_mismatch under ExactBootstrap). The body lives in the
+            // stash, fetchable via recall_tool_result.
             let handle = render_tool_result_handle(
                 &r.tool_id,
                 &r.tool_name,
@@ -1230,11 +1253,12 @@ async fn inject_tool_result(
             );
             ctx.content_gate.admit_simple(&handle).into_text()
         } else if stashed_raw {
-            // Medium (over the hot-prompt char cap but ≤8KB replay cap): show
-            // actual CONTENT via a deterministic head+tail preview. Handling
-            // these deprived the model of normal read/exec bytes and forced
-            // hallucination (2026-07-31 regression after the handles uproot).
-            // Stable per-result (body doesn't change) → no cache drift.
+            // Medium (over the hot-prompt char cap but within the replay byte
+            // cap): show actual CONTENT via a deterministic head+tail preview.
+            // Handling these deprived the model of normal read/exec bytes and
+            // forced hallucination (2026-07-31 regression after the handles
+            // uproot). Stable per-result (body doesn't change) → no cache
+            // drift.
             build_tool_result_preview(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id)
         } else {
             // Small result, not stashed — small enough to carry inline raw
@@ -1786,14 +1810,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_byte_cap_stashes_even_below_configured_char_cap() {
+    async fn replay_byte_cap_stashes_multibyte_below_char_cap() {
         let temp = tempfile::tempdir().unwrap();
         let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
         let session = sessions.create_session("test:replay-byte-cap").await;
+        // Multibyte UTF-8: below the configured char cap but over the byte cap,
+        // so the byte cap (the replay ceiling) is what forces the stash.
         let data = format!(
             "{}MIDDLE_SECRET{}",
-            "head\n".repeat(1200),
-            "tail\n".repeat(600)
+            "あ".repeat(3000),
+            "い".repeat(3000)
         );
         assert!(data.len() > TOOL_RESULT_REPLAY_MAX_BYTES);
         assert!(data.chars().count() < 10_000);
@@ -1818,22 +1844,70 @@ mod tests {
         );
 
         assert!(stashed);
-        assert!(injected.contains("recall_tool_result"));
-        assert!(injected.contains("call_replay_cap"));
-        assert!(!injected.contains("MIDDLE_SECRET"));
+        // A sub-char-cap body is CONTENT, not a handle: the digest shows it
+        // (fit-case passthrough), and replay truncation is bounded by the byte
+        // cap. The old 8-10KB band regressed to unresolvable handles (session
+        // 20260804_204406_c16eb0); the cap raise closed it.
+        assert!(injected.contains("MIDDLE_SECRET"));
         let replay_body = crate::agent::context_hygiene::cap_tool_result_for_replay(&injected);
         assert!(
             replay_body.len() <= TOOL_RESULT_REPLAY_MAX_BYTES + 40,
             "final prompt body must be replay-cap stable"
         );
-        assert!(replay_body.contains("recall_tool_result"));
-        assert!(replay_body.contains("call_replay_cap"));
         assert_eq!(
             sessions
                 .load_tool_result(&session.id, "call_replay_cap")
                 .await
                 .as_deref(),
             Some(data.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn byte_cap_band_below_char_cap_stays_inline() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("test:inline-band").await;
+        // The old dead band: ASCII body under the configured char cap but over
+        // the old 8KB byte cap degraded to a handle. It must now stay inline.
+        let data = format!(
+            "{}MIDDLE_SECRET{}",
+            "head\n".repeat(1200),
+            "tail\n".repeat(600)
+        );
+        assert!(data.chars().count() <= 10_000);
+        assert!(data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES);
+
+        let stashed = stash_tool_result_for_prompt_shaping(
+            &sessions,
+            &session.id,
+            "call_inline",
+            "read_file",
+            &data,
+            10_000,
+            false,
+        )
+        .await
+        .expect("sub-cap body needs no stash");
+        let injected = digest_tool_result(
+            "read_file",
+            &HashMap::new(),
+            &data,
+            10_000,
+            "call_inline",
+        );
+
+        assert!(
+            !stashed,
+            "sub-cap ASCII body must stay inline, not stashed as a handle"
+        );
+        assert!(
+            injected.contains("MIDDLE_SECRET"),
+            "inline body must be fully visible, not truncated: {injected}"
+        );
+        assert!(
+            sessions.load_tool_result(&session.id, "call_inline").await.is_none(),
+            "nothing stashed, nothing to recall"
         );
     }
 

@@ -16,6 +16,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::agent::agent_loop::heuristics::{
     adaptive_max_tokens_for_artifact_action, evaluate_repeated_tool_round, RepeatBreakerAction,
 };
+use crate::agent::anti_drift;
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::context::ContextBuilder;
 use crate::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
@@ -1104,10 +1105,15 @@ impl AgentLoopShared {
         // anti-drift quality cleanup. Single owner: `agent::retention`.
         let run_anti_drift =
             ctx.core.mode().needs_anti_drift() && ctx.core.retention.anti_drift.enabled;
+        // Compute tool activity on the FULL array before the frozen-prefix
+        // split — `recent_assistant_used_tools` inside `inject_format_anchor`
+        // would otherwise only see the tail (post-watermark messages) and miss
+        // recent assistant tool calls trapped in the cached prefix.
+        let tools_active = anti_drift::recent_assistant_used_tools(&ctx.messages);
         prefix_guard::with_frozen_prefix(&mut ctx.messages, frozen_prefix, |m| {
             ctx.core
                 .retention
-                .apply_shaping(m, iteration, run_anti_drift);
+                .apply_shaping(m, iteration, run_anti_drift, tools_active);
         });
 
         // --- Proprioception: update SystemState ---
@@ -2747,6 +2753,19 @@ impl AgentLoopShared {
             // separately — record_tool_call is the single source of truth.
             let result = ctx.flow.lease.record_tool_call();
             if result.allowed {
+                allowed_calls.push(tc);
+            } else if crate::agent::tool_engine::is_read_only_tool(&tc.name)
+                && ctx.flow.lease.auto_renew_for_read_only()
+            {
+                // Read-only tools (read_file, list_dir, etc.) auto-renew
+                // without a checkpoint — they can't loop destructively and
+                // the rejection+renewal dance wastes 3 round-trips on
+                // legitimate multi-file exploration.
+                tracing::info!(
+                    session = %ctx.session_key,
+                    tool = %tc.name,
+                    "tool_lease_auto_renewed_read_only"
+                );
                 allowed_calls.push(tc);
             } else {
                 let reason = result.reason.unwrap_or("lease_blocked");

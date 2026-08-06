@@ -879,6 +879,39 @@ impl Default for CodeExecutionConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Python kernel config
+// ---------------------------------------------------------------------------
+
+/// Stateful Python kernel tool settings.
+///
+/// Unlike `execute_code` which spawns a fresh python3 per call,
+/// the kernel holds a persistent CPython interpreter in-process
+/// via PyO3. Variables, imports, and function definitions survive
+/// across calls. Feature: `python-kernel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PythonKernelConfig {
+    /// When false (default), the `python` tool is not registered.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Per-call timeout in seconds (default: 30).
+    #[serde(default = "default_kernel_timeout")]
+    pub timeout: u64,
+}
+
+fn default_kernel_timeout() -> u64 {
+    30
+}
+
+impl Default for PythonKernelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout: default_kernel_timeout(),
+        }
+    }
+}
+
 /// Tools configuration.
 ///
 /// Note: the `exec` field from Python is renamed to `exec_` in Rust to avoid
@@ -896,6 +929,9 @@ pub struct ToolsConfig {
     /// Code execution (Python RPC) tool settings.
     #[serde(default)]
     pub code_execution: CodeExecutionConfig,
+    /// Stateful Python kernel tool (PyO3). Feature: `python-kernel`.
+    #[serde(default)]
+    pub python_kernel: PythonKernelConfig,
 }
 
 // ---------------------------------------------------------------------------

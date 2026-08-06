@@ -4,6 +4,8 @@ pub mod apply_patch;
 pub mod base;
 pub mod browser;
 pub mod code_execution;
+#[cfg(feature = "python-kernel")]
+pub mod python_kernel;
 pub mod cron_tool;
 pub mod email;
 pub mod file_preview;
@@ -27,6 +29,8 @@ pub use apply_patch::ApplyPatchTool;
 pub use base::Tool;
 pub use browser::BrowserTool;
 pub use code_execution::CodeExecutionTool;
+#[cfg(feature = "python-kernel")]
+pub use python_kernel::PythonKernel;
 pub use cron_tool::CronScheduleTool;
 pub use email::{CheckInboxTool, SendEmailTool};
 pub use file_preview::FilePreviewTool;

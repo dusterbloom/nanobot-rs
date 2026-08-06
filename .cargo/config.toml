@@ -1,2 +1,7 @@
 [env]
 LIBTORCH_USE_PYTORCH = "1"
+# PyO3: suppress Python 3.14+ check when using abi3 stable ABI.
+# nanobot uses `python-kernel` feature (pyo3 0.23) with PyO3's
+# stable ABI mode so it works with Python 3.14+ despite the
+# 0.23 release only officially supporting up to 3.13.
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"

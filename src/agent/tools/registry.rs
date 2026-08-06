@@ -19,6 +19,8 @@ use super::{
     WorkspaceDiffTool, WriteFileTool,
 };
 use crate::config::schema::CodeExecutionConfig;
+#[cfg(feature = "python-kernel")]
+use crate::config::schema::PythonKernelConfig;
 
 /// Configuration for building a standard tool registry.
 ///
@@ -49,6 +51,9 @@ pub struct ToolConfig {
     pub db_path: Option<PathBuf>,
     /// Code execution tool config. Disabled by default.
     pub code_execution: CodeExecutionConfig,
+    /// Stateful Python kernel tool config. Feature: `python-kernel`.
+    #[cfg(feature = "python-kernel")]
+    pub python_kernel: PythonKernelConfig,
     /// Optional health-registry handle. When set, the web_search tool checks
     /// the "searxng" probe before calling SearXNG and returns a clear
     /// "degraded, restart the container" message instead of silent zero results.
@@ -73,6 +78,8 @@ impl ToolConfig {
             search_max_results: 5,
             db_path: None,
             code_execution: CodeExecutionConfig::default(),
+            #[cfg(feature = "python-kernel")]
+            python_kernel: PythonKernelConfig::default(),
             health_registry: None,
         }
     }
@@ -409,6 +416,12 @@ impl ToolRegistry {
                 config.code_execution.max_tool_calls,
                 available_tools,
                 None, // No nested tool_config — scripts get a stub-only registry.
+            )));
+        }
+        #[cfg(feature = "python-kernel")]
+        if config.python_kernel.enabled && should_include("python") {
+            self.register(Box::new(crate::agent::tools::PythonKernel::new(
+                config.python_kernel.timeout,
             )));
         }
     }
@@ -760,6 +773,11 @@ impl ToolRegistry {
     /// save cold-prefill tokens. Empirically 0 invocations across 17 days of
     /// sessions and peripheral to the hot path. `remember` and `lcm_expand` are
     /// intentionally NOT here (core to memory formation / LCM expansion).
+    ///
+    /// `recall_tool_result` is advertised because `TOOL_RESULT_HANDLE v1`
+    /// receipts point the model at it (`fetch:"recall_tool_result"`); an
+    /// unadvertised target made local models substitute `recall` and burn turns
+    /// failing to resolve handles (session 20260804_204406_c16eb0).
     const RARELY_ADVERTISED_TOOLS: &'static [&'static str] = &[
         "file_preview",
         "file_info",
@@ -767,7 +785,6 @@ impl ToolRegistry {
         "system_info",
         "tool_status",
         "browser",
-        "recall_tool_result",
         "search_tool_result",
         "slice_tool_result",
     ];

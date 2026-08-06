@@ -84,6 +84,9 @@ impl AgentLoopShared {
                 .map(|p| p.to_string_lossy().to_string()),
             db_path: Some(db_path),
             health_registry: self.health_registry.clone(),
+            code_execution: core.code_execution.clone(),
+            #[cfg(feature = "python-kernel")]
+            python_kernel: core.python_kernel.clone(),
             ..ToolConfig::new(&core.workspace)
         };
         let mut tools = ToolRegistry::with_standard_tools(&tool_config);

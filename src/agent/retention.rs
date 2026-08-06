@@ -77,10 +77,21 @@ impl RetentionPolicy {
     /// `run_anti_drift` mirrors the original
     /// `ctx.core.mode().needs_anti_drift() && ctx.core.anti_drift.enabled`
     /// gate, which depends on runtime mode this module doesn't own.
-    pub fn apply_shaping(&self, messages: &mut Vec<Value>, iteration: u32, run_anti_drift: bool) {
+    pub fn apply_shaping(
+        &self,
+        messages: &mut Vec<Value>,
+        iteration: u32,
+        run_anti_drift: bool,
+        tools_active: bool,
+    ) {
         context_hygiene::hygiene_pipeline(messages, self.keep_last_messages);
         if run_anti_drift {
-            anti_drift::pre_completion_pipeline(messages, iteration, &self.anti_drift);
+            anti_drift::pre_completion_pipeline(
+                messages,
+                iteration,
+                &self.anti_drift,
+                tools_active,
+            );
         }
     }
 
@@ -166,7 +177,7 @@ mod tests {
             json!({"role": "assistant", "content": "ok2"}),
         ];
 
-        p.apply_shaping(&mut messages, 1, true);
+        p.apply_shaping(&mut messages, 1, true, false);
 
         assert!(
             !messages
@@ -197,7 +208,7 @@ mod tests {
         ];
         let before = messages.clone();
 
-        p.apply_shaping(&mut messages, 1, false);
+        p.apply_shaping(&mut messages, 1, false, false);
 
         // Hygiene alone is a no-op on this already-clean conversation, and
         // anti-drift never ran, so nothing should have changed.
