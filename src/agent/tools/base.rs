@@ -172,6 +172,24 @@ pub struct ToolOutput {
 /// The one result type of the tool layer.
 pub type ToolResult = Result<ToolOutput, crate::errors::ToolError>;
 
+/// The shared legacy->typed funnel (error protocol §2.2): a tool's legacy
+/// `String` output becomes the typed [`ToolResult`], classifying `Error: ...`
+/// strings structurally via [`crate::errors::ToolError::from_legacy`].
+///
+/// NOTE: this must be a free function, NOT a call to the trait default.
+/// Calling `Tool::execute_typed(self, ...)` from inside an override of the
+/// same method dispatches back to the override under `#[async_trait]`
+/// (async-trait resolves the qualified call to the concrete impl), which
+/// recurses until the stack overflows. Overrides must call
+/// `self.execute_with_context(...)` and then this helper instead.
+pub fn funnel_legacy(out: String) -> ToolResult {
+    if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+        Err(crate::errors::ToolError::from_legacy(&err))
+    } else {
+        Ok(ToolOutput { text: out })
+    }
+}
+
 impl From<ToolResult> for ToolExecutionResult {
     fn from(r: ToolResult) -> Self {
         match r {
@@ -312,11 +330,7 @@ pub trait Tool: Send + Sync {
         ctx: &ToolContext,
     ) -> ToolResult {
         let out = self.execute_with_context(params, ctx).await;
-        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
-            Err(crate::errors::ToolError::from_legacy(&err))
-        } else {
-            Ok(ToolOutput { text: out })
-        }
+        funnel_legacy(out)
     }
 
     /// Execute and return a structured outcome.

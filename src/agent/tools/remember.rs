@@ -359,7 +359,11 @@ impl Tool for RememberTool {
                 });
             }
         }
-        Tool::execute_typed(self, args, ctx).await
+        // Funnel through the legacy string path via the shared helper —
+        // NOT `Tool::execute_typed(self, ...)` (async_trait qualified-call
+        // recursion trap, see funnel_legacy docs).
+        let out = self.execute_with_context(args, ctx).await;
+        crate::agent::tools::base::funnel_legacy(out)
     }
 }
 

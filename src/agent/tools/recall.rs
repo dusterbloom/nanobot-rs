@@ -757,7 +757,12 @@ impl Tool for RecallTool {
                 example: r#"recall({"query":"..."})"#.to_string(),
             });
         }
-        Tool::execute_typed(self, params, ctx).await
+        // Funnel through the legacy string path (error protocol §2.2).
+        // NB: call the shared helper, NOT `Tool::execute_typed(self, ...)` —
+        // under #[async_trait] that qualified call re-dispatches to this
+        // override and recurses until stack overflow (see funnel_legacy docs).
+        let out = self.execute_with_context(params, ctx).await;
+        crate::agent::tools::base::funnel_legacy(out)
     }
 }
 
@@ -1236,5 +1241,24 @@ mod tests {
             result.contains("not available") || result.contains("Error"),
             "fetch without db_path must error clearly: {result}"
         );
+    }
+
+
+    #[tokio::test]
+    async fn test_recall_full_typed_chain_with_query_does_not_recurse() {
+        let (tmp, tool) = make_tool();
+        std::fs::write(
+            tmp.path().join("memory").join("MEMORY.md"),
+            "- User prefers dark mode\n- Favorite language is Rust\n",
+        )
+        .unwrap();
+        let mut params = HashMap::new();
+        params.insert("query".to_string(), json!("Rust"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolContext::new(None, tx, token, "test-call");
+        let res = tool.execute_with_result_and_context(params, &ctx).await;
+        assert!(res.ok(), "should succeed via typed chain: {:?}", res.error());
+        assert!(res.data().contains("Rust"), "should find Rust: {}", res.data());
     }
 }
