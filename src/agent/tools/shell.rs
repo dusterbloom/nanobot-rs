@@ -687,11 +687,11 @@ mod tests {
 
         let result = tool.execute_with_result(params).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "non-zero shell exit must be a failed tool result"
         );
-        assert!(result.data.starts_with("Error:"), "{:?}", result.data);
-        assert!(result.data.contains("Exit code: 7"), "{:?}", result.data);
+        assert!(result.data().starts_with("Error:"), "{:?}", result.data());
+        assert!(result.data().contains("Exit code: 7"), "{:?}", result.data());
     }
 
     // -----------------------------------------------------------------------

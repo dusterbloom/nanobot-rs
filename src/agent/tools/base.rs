@@ -61,16 +61,49 @@ pub enum ToolConcurrency {
 }
 
 /// Structured outcome for a tool invocation.
+///
+/// Invariant: `ok == true` implies `error.is_none()`, and every failure
+/// carries a model-visible `Error: ...` string in `data`. The fields are
+/// private so the invariant cannot be violated from outside this module —
+/// the only ways to build a value are the constructors (all `#[must_use]`)
+/// and the `From<ToolResult>` conversion introduced with the typed error
+/// protocol. Readers use the accessors.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionResult {
-    pub ok: bool,
-    pub data: String,
-    pub error: Option<String>,
+    ok: bool,
+    data: String,
+    error: Option<String>,
     /// Structured error classification when available.
-    pub error_kind: Option<crate::errors::ToolErrorKind>,
+    error_kind: Option<crate::errors::ToolErrorKind>,
 }
 
 impl ToolExecutionResult {
+    /// Whether the tool call succeeded.
+    #[must_use]
+    pub fn ok(&self) -> bool {
+        self.ok
+    }
+
+    /// The model-facing output text. On failure this carries the rendered
+    /// `Error: ...` wire string.
+    #[must_use]
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+
+    /// The failure detail, when this is a failure.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// The structured error classification, when known.
+    #[must_use]
+    pub fn error_kind(&self) -> Option<&crate::errors::ToolErrorKind> {
+        self.error_kind.as_ref()
+    }
+
+    #[must_use]
     pub fn success(data: String) -> Self {
         Self {
             ok: true,
@@ -81,12 +114,14 @@ impl ToolExecutionResult {
     }
 
     /// Whether this result represents a retryable (transient) error.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         self.error_kind.as_ref().map_or(false, |k| k.is_retryable())
     }
 
     /// Map a raw tool output string to a structured result.
     /// Outputs starting with `Error:` are treated as failures.
+    #[must_use]
     pub fn from_output(out: String) -> Self {
         if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
             let error_kind = crate::errors::classify_tool_error(&err);
@@ -101,6 +136,22 @@ impl ToolExecutionResult {
         }
     }
 
+    /// Build a failure from a message plus a structural classification.
+    ///
+    /// The `data` is the full model-visible string (already `Error:`-prefixed);
+    /// `error_kind` is produced at the source instead of by substring
+    /// classification. Used by tools that set `MissingArg` structurally.
+    #[must_use]
+    pub fn failure_with_kind(data: String, error_kind: crate::errors::ToolErrorKind) -> Self {
+        Self {
+            ok: false,
+            data,
+            error: None,
+            error_kind: Some(error_kind),
+        }
+    }
+
+    #[must_use]
     pub fn failure(message: String) -> Self {
         let error_kind = crate::errors::classify_tool_error(&message);
         Self {
@@ -109,6 +160,14 @@ impl ToolExecutionResult {
             error: Some(message),
             error_kind,
         }
+    }
+
+    /// Append a corrective worked example to a failure's model-visible text
+    /// (the registry's MissingArg path: `"... is required. Call as X."`).
+    /// Only meaningful on failures.
+    pub fn append_worked_example(&mut self, example: &str) {
+        let base = self.data.trim_end_matches('.');
+        self.data = format!("{}. Call as {}.", base, example);
     }
 }
 
@@ -334,9 +393,9 @@ mod tests {
             serde_json::Value::String("hello".to_string()),
         );
         let result = tool.execute_with_result(params).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "executed with: hello");
-        assert!(result.error.is_none());
+        assert!(result.ok());
+        assert_eq!(result.data(), "executed with: hello");
+        assert!(result.error().is_none());
     }
 
     #[tokio::test]
@@ -361,9 +420,9 @@ mod tests {
 
         let tool = ErrorTool;
         let result = tool.execute_with_result(HashMap::new()).await;
-        assert!(!result.ok);
-        assert_eq!(result.data, "Error: bad input");
-        assert_eq!(result.error.as_deref(), Some("bad input"));
+        assert!(!result.ok());
+        assert_eq!(result.data(), "Error: bad input");
+        assert_eq!(result.error().as_deref(), Some("bad input"));
     }
 
     #[tokio::test]
@@ -412,8 +471,8 @@ mod tests {
         );
 
         let result = tool.execute_with_result_and_context(params, &ctx).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "executed with: test");
+        assert!(result.ok());
+        assert_eq!(result.data(), "executed with: test");
     }
 
     #[test]

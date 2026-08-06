@@ -429,10 +429,10 @@ async fn analyze_via_scratch_pad(
                         TOOL_MAX_RETRIES,
                     )
                     .await;
-                    let (_, _metadata) = context_store.store(result.data.clone());
+                    let (_, _metadata) = context_store.store(result.data().to_string());
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
-                    all_results.push((original_id, tc.name.clone(), result.data));
+                    all_results.push((original_id, tc.name.clone(), result.data().to_string()));
                 }
             }
             // Continue to next round — fresh call with updated state.
@@ -511,7 +511,7 @@ pub async fn process_tool_response(
 
     for tc in &response.tool_calls {
         let result = tools.execute(&tc.name, tc.arguments.clone()).await;
-        ContextBuilder::add_tool_result(messages, &tc.id, &tc.name, &result.data);
+        ContextBuilder::add_tool_result(messages, &tc.id, &tc.name, result.data());
     }
 
     true
@@ -982,9 +982,9 @@ pub async fn run_tool_loop(
                 // For web_fetch/web_search: unwrap the JSON envelope so the model
                 // sees clean article text rather than a JSON metadata summary.
                 let raw_data = if tc.name == "web_fetch" || tc.name == "web_search" {
-                    crate::agent::tools::web::extract_web_content(&result.data)
+                    crate::agent::tools::web::extract_web_content(result.data())
                 } else {
-                    result.data.clone()
+                    result.data().to_string()
                 };
                 let stripped = strip_tool_output(&raw_data);
                 let (_, metadata) = context_store.store(stripped.clone());
@@ -1003,7 +1003,7 @@ pub async fn run_tool_loop(
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 tc.name.hash(&mut hasher);
-                result.data.hash(&mut hasher);
+                result.data().hash(&mut hasher);
                 let result_hash = hasher.finish();
                 if !seen_results.insert(result_hash) {
                     warn!(
@@ -1203,7 +1203,7 @@ async fn execute_with_retry(
             attempts,
             max_retries + 1,
             backoff,
-            result.data
+            result.data()
         );
 
         // Sleep with cancellation awareness.

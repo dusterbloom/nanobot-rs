@@ -112,7 +112,7 @@ async fn retry_path_preserves_identity_across_transactional_write_pieces() {
             0,
         )
         .await;
-        assert!(result.ok, "{:?}", result.error);
+        assert!(result.ok(), "{:?}", result.error());
     }
 
     assert_eq!(std::fs::read_to_string(path).unwrap(), "first-second-done");

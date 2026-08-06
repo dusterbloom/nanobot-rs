@@ -739,15 +739,13 @@ impl Tool for RecallTool {
             || has_message_ids;
 
         if !is_fetch && !has_query {
-            return ToolExecutionResult {
-                ok: false,
-                data: "Error: recall needs one of: 'query' (to search), 'session' or 'message_ids' (to fetch), or mode=\"latest\".".to_string(),
-                error: None,
-                error_kind: Some(crate::errors::ToolErrorKind::MissingArg {
+            return ToolExecutionResult::failure_with_kind(
+                "Error: recall needs one of: 'query' (to search), 'session' or 'message_ids' (to fetch), or mode=\"latest\".".to_string(),
+                crate::errors::ToolErrorKind::MissingArg {
                     param: "query".to_string(),
                     example: r#"recall({"query":"..."})"#.to_string(),
-                }),
-            };
+                },
+            );
         }
         ToolExecutionResult::from_output(self.execute(params).await)
     }
@@ -864,15 +862,15 @@ mod tests {
     async fn test_recall_empty_arg_returns_structural_missing_arg() {
         let (_tmp, tool) = make_tool();
         let res = tool.execute_with_result(HashMap::new()).await;
-        assert!(!res.ok);
+        assert!(!res.ok());
         assert!(matches!(
-            res.error_kind,
+            res.error_kind(),
             Some(crate::errors::ToolErrorKind::MissingArg { ref param, .. }) if param == "query"
         ));
         // The data string enumerates the three entry params.
-        assert!(res.data.contains("query"), "{}", res.data);
-        assert!(res.data.contains("session"), "{}", res.data);
-        assert!(res.data.contains("message_ids"), "{}", res.data);
+        assert!(res.data().contains("query"), "{}", res.data());
+        assert!(res.data().contains("session"), "{}", res.data());
+        assert!(res.data().contains("message_ids"), "{}", res.data());
     }
 
     #[tokio::test]

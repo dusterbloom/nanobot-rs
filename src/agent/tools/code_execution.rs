@@ -158,10 +158,10 @@ fn run_rpc_server(
                                     .block_on(registry.execute(&tool_name, params)),
                             };
 
-                            if result.ok {
-                                json!({"result": result.data})
+                            if result.ok() {
+                                json!({"result": result.data()})
                             } else {
-                                json!({"error": result.error.unwrap_or(result.data)})
+                                json!({"error": result.error().unwrap_or_else(|| result.data())})
                             }
                         }
                     }

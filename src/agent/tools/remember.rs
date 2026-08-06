@@ -339,15 +339,13 @@ impl Tool for RememberTool {
         if action == "add" {
             let has_input = args.contains_key("facts") || args.contains_key("fact");
             if !has_input {
-                return ToolExecutionResult {
-                    ok: false,
-                    data: "Error: nothing to remember.".to_string(),
-                    error: None,
-                    error_kind: Some(crate::errors::ToolErrorKind::MissingArg {
+                return ToolExecutionResult::failure_with_kind(
+                    "Error: nothing to remember.".to_string(),
+                    crate::errors::ToolErrorKind::MissingArg {
                         param: "facts".to_string(),
                         example: r#"remember({"facts":["a concise fact"]})"#.to_string(),
-                    }),
-                };
+                    },
+                );
             }
         }
         ToolExecutionResult::from_output(self.execute(args).await)
@@ -522,14 +520,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
         let res = tool.execute_with_result(HashMap::new()).await;
-        assert!(!res.ok, "empty add must not be a silent success (old list-default loop)");
+        assert!(!res.ok(), "empty add must not be a silent success (old list-default loop)");
         assert!(
             matches!(
-                res.error_kind,
+                res.error_kind(),
                 Some(crate::errors::ToolErrorKind::MissingArg { ref param, .. }) if param == "facts"
             ),
             "empty add must set structural MissingArg on `facts`: {:?}",
-            res.error_kind
+            res.error_kind()
         );
     }
 
