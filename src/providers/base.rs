@@ -294,3 +294,37 @@ pub trait LLMProvider: Send + Sync {
         false
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::FinishReason;
+
+    /// Wire-stability guard (error-protocol doc §2.3 / §4): every wire string
+    /// the streaming layer can produce must parse and re-serialize to the
+    /// byte-identical value, including unknown provider values.
+    #[test]
+    fn finish_reason_wire_round_trip_is_byte_identical() {
+        let known = [
+            ("stop", FinishReason::Stop),
+            ("length", FinishReason::Length),
+            ("tool_calls", FinishReason::ToolCalls),
+            ("error", FinishReason::ProviderFailure),
+            ("aborted", FinishReason::Aborted),
+            ("cancelled", FinishReason::Cancelled),
+        ];
+        for (wire, reason) in known {
+            assert_eq!(FinishReason::parse_finish_reason(wire), reason, "parse {wire}");
+            assert_eq!(reason.wire_str(), wire, "wire_str for {wire}");
+            assert_eq!(reason.to_string(), wire, "Display for {wire}");
+        }
+        // Unknown provider values round-trip via Other(String).
+        for wire in ["function_call", "content_filter", "eos_token", ""] {
+            assert_eq!(
+                FinishReason::parse_finish_reason(wire).wire_str(),
+                wire,
+                "unknown wire value {wire:?} must round-trip"
+            );
+        }
+    }
+}
