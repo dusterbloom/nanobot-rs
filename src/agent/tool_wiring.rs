@@ -4,8 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(
-    clippy::as_conversions,
-    clippy::format_push_string,
     clippy::shadow_reuse,
     clippy::shadow_unrelated,
 )]
@@ -214,7 +212,9 @@ impl PipelineHost for AgentHost {
                         .filter_map(|v| v.as_str().map(|s| s.to_string()))
                         .collect()
                 }),
-                max_iterations: s["max_iterations"].as_u64().map(|n| n as u32),
+                max_iterations: s["max_iterations"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok()),
             })
             .collect();
         if pipeline_steps.is_empty() {

@@ -66,7 +66,7 @@ Check a module off as its `#![allow(...)]` block is deleted and the module passe
 | [`src/agent/token_budget.rs`](src/agent/token_budget.rs) | `clippy::as_conversions`, `clippy::indexing_slicing` | [ ] |
 | [`src/agent/tool_engine.rs`](src/agent/tool_engine.rs) | `clippy::as_conversions`, `clippy::indexing_slicing`, `clippy::shadow_reuse`, `clippy::format_push_string` | [ ] |
 | [`src/agent/tool_runner/mod.rs`](src/agent/tool_runner/mod.rs) | `clippy::as_conversions` | [ ] |
-| [`src/agent/tool_wiring.rs`](src/agent/tool_wiring.rs) | `clippy::as_conversions`, `clippy::shadow_reuse`, `clippy::shadow_unrelated`, `clippy::format_push_string` | [x] — cleared in Phase 3 (host bridge): `as u32` → `try_from`, `push_str(&format!(…))` → `writeln!` |
+| [`src/agent/tool_wiring.rs`](src/agent/tool_wiring.rs) | `clippy::shadow_reuse`, `clippy::shadow_unrelated` | [~] — partially cleared in Phase 3: `as_conversions` (→ `u32::try_from`) and `format_push_string` (→ `writeln!`) removed; `shadow_*` remain |
 | [`src/agent/tools/apply_patch.rs`](src/agent/tools/apply_patch.rs) | `clippy::indexing_slicing`, `clippy::shadow_reuse` | [ ] |
 | [`src/agent/tools/browser.rs`](src/agent/tools/browser.rs) | `clippy::shadow_reuse` | [ ] |
 | [`src/agent/tools/cron_tool.rs`](src/agent/tools/cron_tool.rs) | `clippy::shadow_reuse` | [ ] |

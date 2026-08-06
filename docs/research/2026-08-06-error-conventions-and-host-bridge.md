@@ -965,7 +965,7 @@ callback-coupled tool can be written.
 
 | File | Change |
 |---|---|
-| `src/errors.rs` | Add `ToolError` (+`render`, `is_retryable`, `is_model_fixable`, `from_legacy`); add `ProviderError::EmptyStream`; keep `ToolErrorKind` during migration, delete at Phase 3 |
+| `src/errors.rs` | Add `ToolError` (+`render`, `is_retryable`, `is_model_fixable`, `from_legacy`); add `ProviderError::EmptyStream`; keep `ToolErrorKind` during migration, delete at Phase 4 (after `ToolExecutionResult` retirement — still used by `classify_tool_error` via `ToolExecutionResult::failure` and `ToolError::from_legacy`) |
 | `src/agent/tools/base.rs` | `Tool` trait returns `ToolResult`; `ToolOutput`; `ToolContext` replaces `ToolExecutionContext`; `ToolExecutionResult` becomes private-fields + `From<ToolResult>` |
 | `src/agent/host_bridge.rs` | **new** — wire protocol, 5 capability traits, `HostBridge`, `HostDispatcher`, `HostReply` |
 | `src/agent/tools/spawn.rs` | `SpawnTool::new(Arc<dyn HostBridge>)`; `SpawnAction` derive; delete 7 callbacks + `set_context` |
