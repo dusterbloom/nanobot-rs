@@ -296,9 +296,9 @@ async fn execute_step_with_tools(
             }
         };
 
-        if let Some(err) = response.error_detail() {
-            error!("Pipeline step {} LLM error: {}", step.index, err);
-            return format!("Error: {}", err);
+        if let Err(crate::errors::ProviderError::EmptyStream(detail)) = response.outcome() {
+            error!("Pipeline step {} LLM error: {}", step.index, detail);
+            return format!("Error: {}", detail);
         }
 
         if crate::agent::tool_runner::process_tool_response(&response, &mut messages, &tools).await
@@ -441,7 +441,7 @@ fn load_completed_steps(workspace: &Path, pipeline_id: &str) -> Vec<StepResult> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::base::LLMResponse;
+    use crate::providers::base::{FinishReason, LLMResponse};
     use async_trait::async_trait;
     use std::collections::HashMap;
 
@@ -482,7 +482,7 @@ mod tests {
             Ok(LLMResponse {
                 content: Some(answer),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: HashMap::new(),
             })
         }

@@ -27,7 +27,8 @@ use crate::agent::protocol::{
 };
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::validation;
-use crate::providers::base::{LLMResponse, ToolCallRequest};
+use crate::errors::ProviderError;
+use crate::providers::base::{FinishReason, LLMResponse, ToolCallRequest};
 use crate::turn_stream::ControlMarker;
 
 use super::{AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnContext};
@@ -129,9 +130,9 @@ pub(crate) fn classify_response(
     retries: &RetryState,
     thinking_was_on: bool,
 ) -> ResponseKind {
-    // Provider error takes absolute priority.
-    if let Some(err_msg) = response.error_detail() {
-        return ResponseKind::ProviderError(err_msg.to_string());
+    // Provider error takes absolute priority (error-protocol doc §2.3).
+    if let Err(ProviderError::EmptyStream(detail)) = response.outcome() {
+        return ResponseKind::ProviderError(detail);
     }
 
     let content = response.content.as_deref().unwrap_or("");
@@ -203,7 +204,7 @@ pub(crate) fn classify_response(
     // Empty response handling.
     if !has_visible_text {
         // Local model + truncated + thinking consumed output → rescue or retry.
-        if is_local && response.finish_reason == "length" && !retries.rescue_attempted {
+        if is_local && response.finish_reason == FinishReason::Length && !retries.rescue_attempted {
             return ResponseKind::EmptyAfterThink;
         }
         if thinking_was_on && !retries.empty_think_retried {
@@ -214,7 +215,7 @@ pub(crate) fn classify_response(
 
     // A provider length stop is transport truncation even if a marker-like
     // suffix survived. Continue/retry it before considering finality.
-    let is_truncated = response.finish_reason == "length";
+    let is_truncated = response.finish_reason == FinishReason::Length;
     if is_truncated && retries.continuations < 10 {
         // Only classify as Truncated if there's room to continue.
         // (Actual cap is checked in the handler via core.max_continuations.)
@@ -611,7 +612,7 @@ impl AgentLoopShared {
                     send_delta(&ctx.text_delta_tx, &content);
                     ctx.flow.content_was_streamed = true;
                 }
-                send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
+                send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
                 StepResult::Done(IterationOutcome::Finished(content))
             }
 
@@ -632,7 +633,7 @@ impl AgentLoopShared {
                     send_retract_reply(&ctx.text_delta_tx);
                     ctx.flow.content_was_streamed = false;
                 }
-                send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
+                send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
                 StepResult::Done(IterationOutcome::Error(
                     "The local model produced malformed or repetitive protocol text, so I discarded that response. Try the request again; if it repeats, restart the local backend.".to_string(),
                 ))
@@ -661,7 +662,7 @@ impl AgentLoopShared {
                 );
                 let content =
                     "I couldn't produce a response in this turn. Please try again.".to_string();
-                send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
+                send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
                 StepResult::Done(IterationOutcome::Finished(content))
             }
         }
@@ -867,14 +868,14 @@ impl AgentLoopShared {
 
         while ctx.flow.retries.continuations < max_cont {
             // Check if still truncated.
-            let is_truncated = finish_reason == "length"
-                || (finish_reason == "stop" && super::appears_incomplete(&accumulated));
+            let is_truncated = finish_reason == FinishReason::Length
+                || (finish_reason == FinishReason::Stop && super::appears_incomplete(&accumulated));
             if !is_truncated {
                 break;
             }
 
             ctx.flow.retries.continuations += 1;
-            if finish_reason == "stop" {
+            if finish_reason == FinishReason::Stop {
                 info!("auto_continue: heuristic detected incomplete response despite finish_reason='stop'");
             }
             info!(
@@ -956,7 +957,7 @@ impl AgentLoopShared {
         // Try rescue pass first (forced finalize for local models).
         // migrated from swappable().is_local — phase 09-03
         if ctx.core.mode().is_local()
-            && response.finish_reason == "length"
+            && response.finish_reason == FinishReason::Length
             && !ctx.flow.retries.rescue_attempted
         {
             ctx.flow.retries.rescue_attempted = true;
@@ -982,7 +983,7 @@ impl AgentLoopShared {
                 Ok(r) => {
                     let content = r.content.unwrap_or_default();
                     if !content.trim().is_empty() {
-                        send_finish_reason(&ctx.text_delta_tx, &r.finish_reason);
+                        send_finish_reason(&ctx.text_delta_tx, r.finish_reason.wire_str());
                         return StepResult::Done(IterationOutcome::Finished(content));
                     }
                     // Rescue also empty — fall through to thinking-off retry.
@@ -1013,7 +1014,7 @@ impl AgentLoopShared {
             "empty_llm_response: all recovery attempts exhausted, injecting fallback"
         );
         let content = "I couldn't produce a response in this turn. Please try again.".to_string();
-        send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
+        send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
         StepResult::Done(IterationOutcome::Finished(content))
     }
 
@@ -1030,7 +1031,8 @@ impl AgentLoopShared {
             .content
             .as_deref()
             .map_or(true, |c| c.trim().is_empty());
-        if response.is_error() || matches!(response.finish_reason.as_str(), "aborted" | "cancelled")
+        if response.outcome().is_err()
+            || matches!(response.finish_reason, FinishReason::Aborted | FinishReason::Cancelled)
         {
             "error"
         } else if no_content && response.tool_calls.is_empty() {
@@ -1137,7 +1139,10 @@ impl AgentLoopShared {
             cache_read_tokens,
             cache_creation_tokens,
             status: Self::response_status(response).into(),
-            error_detail: response.error_detail().map(str::to_owned),
+            error_detail: match response.outcome() {
+                Err(ProviderError::EmptyStream(detail)) => Some(detail),
+                _ => None,
+            },
             raw_response: Self::raw_pathological_response(response).map(str::to_owned),
             anti_drift_score: None,
             anti_drift_signals: None,
@@ -1189,7 +1194,7 @@ mod tests {
             LLMResponse {
                 content: content.map(str::to_string),
                 tool_calls,
-                finish_reason: finish_reason.to_string(),
+                finish_reason: FinishReason::parse_finish_reason(finish_reason),
                 usage: std::collections::HashMap::new(),
             }
         };
@@ -1333,7 +1338,7 @@ mod tests {
         LLMResponse {
             content: content.map(|s| s.to_string()),
             tool_calls: vec![],
-            finish_reason: finish_reason.to_string(),
+            finish_reason: FinishReason::parse_finish_reason(finish_reason),
             usage: HashMap::new(),
         }
     }
@@ -1355,7 +1360,7 @@ mod tests {
         LLMResponse {
             content: content.map(|s| s.to_string()),
             tool_calls,
-            finish_reason: finish_reason.to_string(),
+            finish_reason: FinishReason::parse_finish_reason(finish_reason),
             usage: HashMap::new(),
         }
     }
@@ -1457,15 +1462,43 @@ mod tests {
 
     #[test]
     fn test_classify_provider_error() {
-        let mut resp = make_response(Some(""), "stop");
-        resp.usage.insert("error".to_string(), -1);
-        // Provider errors are detected by error_detail() on LLMResponse.
-        // We test the path by checking that our kind logic handles it.
-        // Since error_detail() checks specific fields, let's test via the
-        // known error pattern.
+        // A dead stream (`finish_reason = "error"`) must classify as
+        // ProviderError via `outcome()` with the provider's payload intact.
+        let resp = make_response(
+            Some("LLM stream ended before the backend produced any response content or tool-call payload."),
+            "error",
+        );
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
-        // Without an actual error field this falls through to EmptyFinal.
-        assert!(matches!(kind, ResponseKind::EmptyFinal));
+        assert!(matches!(
+            kind,
+            ResponseKind::ProviderError(ref msg)
+                if msg == "LLM stream ended before the backend produced any response content or tool-call payload."
+        ));
+
+        // No payload -> the legacy "Unknown LLM error" fallback, byte-identical.
+        let kind = classify_response(
+            &make_response(None, "error"),
+            false,
+            false,
+            false,
+            &default_retries(),
+            false,
+        );
+        assert!(matches!(
+            kind,
+            ResponseKind::ProviderError(ref msg) if msg == "Unknown LLM error"
+        ));
+
+        // A healthy stop response is NOT a provider error.
+        let kind = classify_response(
+            &make_response(Some("hi"), "stop"),
+            false,
+            false,
+            false,
+            &default_retries(),
+            false,
+        );
+        assert!(!matches!(kind, ResponseKind::ProviderError(_)));
     }
 
     #[test]

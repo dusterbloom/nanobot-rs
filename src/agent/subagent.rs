@@ -1117,9 +1117,9 @@ impl SubagentManager {
                 Err(e) => return Err(e),
             };
 
-            if let Some(err_msg) = response.error_detail() {
-                error!("Subagent {} LLM provider error: {}", task_id, err_msg);
-                return Err(anyhow::anyhow!("[LLM Error] {}", err_msg));
+            if let Err(crate::errors::ProviderError::EmptyStream(detail)) = response.outcome() {
+                error!("Subagent {} LLM provider error: {}", task_id, detail);
+                return Err(anyhow::anyhow!("[LLM Error] {}", detail));
             }
 
             if crate::agent::tool_runner::process_tool_response(&response, &mut messages, &tools)
@@ -1395,7 +1395,7 @@ pub fn format_status_block(running: &[SubagentInfo], recent_completed: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::base::{LLMResponse, ToolCallRequest};
+    use crate::providers::base::{FinishReason, LLMResponse, ToolCallRequest};
     use async_trait::async_trait;
 
     #[test]
@@ -1567,7 +1567,7 @@ mod tests {
                             m
                         },
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: HashMap::new(),
                 })
             } else {
@@ -1575,7 +1575,7 @@ mod tests {
                 Ok(LLMResponse {
                     content: Some("Task complete.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 })
             }
@@ -1670,7 +1670,7 @@ mod tests {
                 Ok(LLMResponse {
                     content: Some("Immediate answer.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 })
             }
