@@ -15,6 +15,7 @@
 
 #![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -122,20 +123,21 @@ impl SpawnHost for AgentHost {
         if running.is_empty() {
             out.push_str("No subagents currently running.\n");
         } else {
-            out.push_str(&format!("{} subagent(s) running:\n", running.len()));
+            let _ = writeln!(out, "{} subagent(s) running:", running.len());
             for info in &running {
                 let elapsed = info.started_at.elapsed().as_secs();
-                out.push_str(&format!(
-                    "  • {} (id: {}) — running for {}s\n",
+                let _ = writeln!(
+                    out,
+                    "  • {} (id: {}) — running for {}s",
                     info.label, info.task_id, elapsed
-                ));
+                );
             }
         }
 
         // Recently completed (from events.jsonl)
         let recent = SubagentManager::read_recent_completed(&self.workspace, 10);
         if !recent.is_empty() {
-            out.push_str(&format!("\nRecently completed ({}):\n", recent.len()));
+            let _ = writeln!(out, "\nRecently completed ({}):", recent.len());
             for entry in &recent {
                 out.push_str(entry);
                 out.push('\n');
@@ -249,16 +251,17 @@ impl PipelineHost for AgentHost {
                 Some(false) => " ✗",
                 None => "",
             };
-            output.push_str(&format!(
-                "  Step {}: {}{} ({}ms, {} voters)\n",
+            let _ = writeln!(
+                output,
+                "  Step {}: {}{} ({}ms, {} voters)",
                 sr.index,
                 sr.answer.chars().take(200).collect::<String>(),
                 correct_str,
                 sr.duration_ms,
                 sr.voters_used
-            ));
+            );
         }
-        output.push_str(&format!("Total time: {}ms", result.total_duration_ms));
+        let _ = write!(output, "Total time: {}ms", result.total_duration_ms);
         Ok(PipelineReply { text: output })
     }
 }

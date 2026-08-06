@@ -4,8 +4,6 @@
 //! delegation. Also supports listing running subagents and cancelling them.
 
 use std::collections::HashMap;
-use std::future::Future; // transitional callback aliases (deleted with HostBridgeAdapter, doc §3.7 Step 3)
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,60 +14,6 @@ use crate::agent::host_bridge::{
     PipelineRequest, SpawnRequest, WaitRequest,
 };
 use crate::errors::ToolError;
-
-// Transitional callback aliases — consumed only by HostBridgeAdapter and its
-// byte-stability tests (doc §3.7 Step 1); deleted in Step 3 once the adapter
-// is gone. No production tool uses them.
-/// Type alias for the spawn callback.
-///
-/// Arguments: (task, label, agent_name, model_override, origin_channel, origin_chat_id, working_dir) -> result string.
-pub type SpawnCallback = Arc<
-    dyn Fn(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            Option<String>,
-        ) -> Pin<Box<dyn Future<Output = String> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Type alias for the list callback. Returns formatted list of running subagents.
-pub type ListCallback = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the cancel callback. Takes task_id prefix, returns success message.
-pub type CancelCallback =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the wait callback. Takes task_id prefix + timeout secs, returns result.
-pub type WaitCallback =
-    Arc<dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the check callback. Takes task_id prefix, returns result without blocking.
-pub type CheckCallback =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the pipeline callback. Takes (steps_json, ahead_by_k) -> result string.
-pub type PipelineCallback =
-    Arc<dyn Fn(String, usize) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the loop callback.
-/// Takes (task, max_rounds, tools, stop_condition, model, working_dir) -> result string.
-pub type LoopCallback = Arc<
-    dyn Fn(
-            String,
-            u32,
-            Option<Vec<String>>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) -> Pin<Box<dyn Future<Output = String> + Send>>
-        + Send
-        + Sync,
->;
 
 /// Tool to spawn a subagent for background task execution.
 ///

@@ -21,6 +21,19 @@ disallowed-methods = [
     { path = "crate::agent::tools::base::ToolExecutionResult::from_output", reason = "legacy string-error adapter — migrate to ToolResult" },
     # Substring classification is fragile; return typed ToolError variants.
     { path = "crate::errors::classify_tool_error", reason = "string classification — produce ToolError at the source" },
+    # Legacy callback slots on SpawnTool (deleted in Phase 3, host bridge
+    # doc §3.7 Step 3) — the typed HostBridge trait replaced them. Entries are
+    # inert (methods no longer exist) but block reintroducing a callback-
+    # coupled tool.
+    { path = "crate::agent::tools::spawn::SpawnTool::set_callback", reason = "legacy callback slot — deleted in Phase 3; use HostBridge" },
+    { path = "crate::agent::tools::spawn::SpawnTool::set_list_callback", reason = "legacy callback slot — deleted in Phase 3; use HostBridge" },
+    { path = "crate::agent::tools::spawn::SpawnTool::set_cancel_callback", reason = "legacy callback slot — deleted in Phase 3; use HostBridge" },
+    { path = "crate::agent::tools::spawn::SpawnTool::set_wait_callback", reason = "legacy callback slot — deleted in Phase 3; use HostBridge" },
+    { path = "crate::agent::tools::spawn::SpawnTool::set_check_callback", reason = "legacy callback slot — deleted in Phase 3; use HostBridge" },
+    { path = "crate::agent::tools::spawn::SpawnTool::set_pipeline_callback", reason = "legacy callback slot — deleted in Phase 3; use HostBridge" },
+    { path = "crate::agent::tools::spawn::SpawnTool::set_loop_callback", reason = "legacy callback slot — deleted in Phase 3; use HostBridge" },
+    # Legacy send callback on MessageTool (deleted in Phase 3) — use MessageHost.
+    { path = "crate::agent::tools::message::MessageTool::set_send_callback", reason = "legacy callback slot — deleted in Phase 3; use MessageHost" },
 ]
 
 disallowed-types = [

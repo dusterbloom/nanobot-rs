@@ -1,26 +1,13 @@
-#![allow(dead_code)]
 //! Message tool for sending messages to users.
 
 use std::collections::HashMap;
-use std::future::Future; // transitional callback alias (deleted with HostBridgeAdapter, doc §3.7 Step 3)
-use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::Result; // transitional callback alias boundary only
 use async_trait::async_trait;
 
 use super::base::{PermissionLevel, Tool, ToolContext, ToolOutput, ToolResult};
-use crate::bus::events::OutboundMessage;
 use crate::agent::host_bridge::{MessageHost, SendMessageRequest};
 use crate::errors::ToolError;
-
-// Transitional callback alias — consumed only by HostBridgeAdapter and its
-// byte-stability tests (doc §3.7 Step 1); deleted in Step 3 once the adapter
-// is gone. No production tool uses it.
-/// Type alias for the legacy send callback.
-#[allow(clippy::disallowed_types)] // anyhow at the callback boundary — transitional adapter only (host bridge, doc §3.7 Step 3)
-pub type SendCallback =
-    Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
 /// Tool to send messages to users on chat channels.
 ///
