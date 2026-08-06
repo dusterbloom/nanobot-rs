@@ -240,7 +240,40 @@ pub trait MessageHost: Send + Sync {
 /// Composite capability set. Blanket impl: any type implementing all four
 /// traits IS a [`HostBridge`] (DIP: depend on this, never on
 /// `SubagentManager` or callback slots).
-pub trait HostBridge: SpawnHost + PipelineHost + LoopHost + MessageHost {}
+#[async_trait]
+pub trait HostBridge: SpawnHost + PipelineHost + LoopHost + MessageHost {
+    /// Typed in-process call — the tool-facing entry point (research §3.4:
+    /// "one call, no locks, no Option, no stringify"). The OCP `match` over
+    /// the request enum routes each variant to the matching capability
+    /// method (shared by every host implementation), builds the reply
+    /// envelope, and round-trips the error channel byte-losslessly: an
+    /// `Error` envelope's rendered string converts back through
+    /// [`ToolError::from_legacy`] and re-renders identically, so a tool
+    /// that `?`-propagates never double-prefixes or rewrites it.
+    async fn call(&self, req: HostRequest) -> Result<serde_json::Value, ToolError> {
+        let reply: HostReply = match req {
+            HostRequest::Spawn(r) => self.spawn(r).await.into(),
+            HostRequest::ListSubagents(_) => self.list_subagents().await.into(),
+            HostRequest::CancelSubagent(r) => self.cancel(r).await.into(),
+            HostRequest::WaitSubagent(r) => self.wait(r).await.into(),
+            HostRequest::CheckSubagent(r) => self.check(r).await.into(),
+            HostRequest::RunPipeline(r) => self.run_pipeline(r).await.into(),
+            HostRequest::RunLoop(r) => self.run_loop(r).await.into(),
+            HostRequest::SendMessage(r) => self.send(r).await.into(),
+        };
+        match reply {
+            HostReply::Ok { data } => Ok(data),
+            HostReply::Error { error } => {
+                let message = error
+                    .strip_prefix("Error:")
+                    .map(str::trim)
+                    .unwrap_or(&error)
+                    .to_string();
+                Err(ToolError::from_legacy(&message))
+            }
+        }
+    }
+}
 impl<T: SpawnHost + PipelineHost + LoopHost + MessageHost> HostBridge for T {}
 
 // ---------------------------------------------------------------------------
@@ -292,18 +325,11 @@ impl HostDispatcher {
     /// carries `ToolError::render()` output, and converting it back through
     /// [`ToolError::from_legacy`] re-renders the identical string, so a tool
     /// that `?`-propagates the error never double-prefixes or rewrites it.
+    ///
+    /// Canonical implementation on [`HostBridge::call`]; this inherent alias
+    /// keeps the concrete-typed API stable for dispatcher-level callers.
     pub async fn call(&self, req: HostRequest) -> Result<serde_json::Value, ToolError> {
-        match self.dispatch(req).await {
-            HostReply::Ok { data } => Ok(data),
-            HostReply::Error { error } => {
-                let message = error
-                    .strip_prefix("Error:")
-                    .map(str::trim)
-                    .unwrap_or(&error)
-                    .to_string();
-                Err(ToolError::from_legacy(&message))
-            }
-        }
+        <Self as HostBridge>::call(self, req).await
     }
 }
 
@@ -888,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatcher_over_legacy_callbacks_matches_spawn_tool_output() {
+    async fn dispatcher_over_legacy_callbacks_matches_raw_legacy_output() {
         let (spawn, list, cancel, wait, check, pipeline, loop_, send) = legacy_callbacks();
         let dispatcher = adapter_dispatcher(
             spawn.clone(),
@@ -901,23 +927,28 @@ mod tests {
             send.clone(),
         );
 
-        // Legacy surface: the same callbacks wired into SpawnTool.
-        let tool = SpawnTool::new();
-        tool.set_callback(spawn).await;
-        tool.set_list_callback(list).await;
-        tool.set_cancel_callback(cancel).await;
-        tool.set_wait_callback(wait).await;
-        tool.set_check_callback(check).await;
-        tool.set_pipeline_callback(pipeline).await;
-        tool.set_loop_callback(loop_).await;
-        tool.set_context("telegram", "42").await;
+        // Reference: invoke the legacy callbacks directly — these strings are
+        // the pre-bridge model-visible wire format (the adapter must funnel
+        // them through unchanged).
+        let spawn_ref = spawn(
+            "do x".to_string(),
+            Some("explore".to_string()),
+            None,
+            Some("haiku".to_string()),
+            "telegram".to_string(),
+            "42".to_string(),
+            None,
+        )
+        .await;
+        let list_ref = list().await;
+        let cancel_ref = cancel("abc12345".to_string()).await;
+        let wait_ref = wait("abc12345".to_string(), 10).await;
+        let check_ref = check("abc12345".to_string()).await;
+        let pipeline_ref =
+            pipeline(r#"[{"prompt":"one"},{"prompt":"two"}]"#.to_string(), 2).await;
+        let loop_ref = loop_("refine".to_string(), 3, None, None, None, None).await;
 
-        // spawn
-        let mut p = HashMap::new();
-        p.insert("task".to_string(), json!("do x"));
-        p.insert("label".to_string(), json!("explore"));
-        p.insert("model".to_string(), json!("haiku"));
-        let legacy = tool.execute(p).await;
+        // The dispatcher over the adapter must reproduce each string exactly.
         let reply = dispatcher
             .dispatch(HostRequest::Spawn(SpawnRequest {
                 task: "do x".to_string(),
@@ -931,77 +962,45 @@ mod tests {
             .await;
         match reply {
             HostReply::Ok { data } => {
-                assert_eq!(data["text"].as_str().unwrap(), legacy, "spawn text diverged");
+                assert_eq!(data["text"].as_str().unwrap(), spawn_ref, "spawn text diverged");
                 assert_eq!(data["task_id"].as_str().unwrap(), "abc12345");
             }
             other => panic!("expected Ok, got {other:?}"),
         }
 
-        // list
-        let mut p = HashMap::new();
-        p.insert("action".to_string(), json!("list"));
-        let legacy = tool.execute(p).await;
         let reply = dispatcher.dispatch(HostRequest::ListSubagents(ListSubagentsRequest {})).await;
-        assert_eq!(reply_text(&reply), legacy, "list text diverged");
+        assert_eq!(reply_text(&reply), list_ref, "list text diverged");
 
-        // cancel
-        let mut p = HashMap::new();
-        p.insert("action".to_string(), json!("cancel"));
-        p.insert("task_id".to_string(), json!("abc12345"));
-        let legacy = tool.execute(p).await;
         let reply = dispatcher
             .dispatch(HostRequest::CancelSubagent(CancelRequest {
                 task_id: "abc12345".to_string(),
             }))
             .await;
-        assert_eq!(reply_text(&reply), legacy, "cancel text diverged");
+        assert_eq!(reply_text(&reply), cancel_ref, "cancel text diverged");
 
-        // wait
-        let mut p = HashMap::new();
-        p.insert("action".to_string(), json!("wait"));
-        p.insert("task_id".to_string(), json!("abc12345"));
-        p.insert("timeout".to_string(), json!(10));
-        let legacy = tool.execute(p).await;
         let reply = dispatcher
             .dispatch(HostRequest::WaitSubagent(WaitRequest {
                 task_id: "abc12345".to_string(),
                 timeout_secs: 10,
             }))
             .await;
-        assert_eq!(reply_text(&reply), legacy, "wait text diverged");
+        assert_eq!(reply_text(&reply), wait_ref, "wait text diverged");
 
-        // check
-        let mut p = HashMap::new();
-        p.insert("action".to_string(), json!("check"));
-        p.insert("task_id".to_string(), json!("abc12345"));
-        let legacy = tool.execute(p).await;
         let reply = dispatcher
             .dispatch(HostRequest::CheckSubagent(CheckRequest {
                 task_id: "abc12345".to_string(),
             }))
             .await;
-        assert_eq!(reply_text(&reply), legacy, "check text diverged");
+        assert_eq!(reply_text(&reply), check_ref, "check text diverged");
 
-        // pipeline
-        let mut p = HashMap::new();
-        p.insert("action".to_string(), json!("pipeline"));
-        p.insert("steps".to_string(), json!([{"prompt": "one"}, {"prompt": "two"}]));
-        p.insert("ahead_by_k".to_string(), json!(2));
-        let legacy = tool.execute(p).await;
         let reply = dispatcher
             .dispatch(HostRequest::RunPipeline(PipelineRequest {
                 steps: vec![json!({"prompt": "one"}), json!({"prompt": "two"})],
                 ahead_by_k: 2,
             }))
             .await;
-        assert_eq!(reply_text(&reply), legacy, "pipeline text diverged");
+        assert_eq!(reply_text(&reply), pipeline_ref, "pipeline text diverged");
 
-        // loop
-        let mut p = HashMap::new();
-        p.insert("action".to_string(), json!("loop"));
-        p.insert("task".to_string(), json!("refine"));
-        p.insert("max_rounds".to_string(), json!(3));
-        let legacy = tool.execute(p).await;
         let reply = dispatcher
             .dispatch(HostRequest::RunLoop(LoopRequest {
                 task: "refine".to_string(),
@@ -1012,7 +1011,7 @@ mod tests {
                 working_dir: None,
             }))
             .await;
-        assert_eq!(reply_text(&reply), legacy, "loop text diverged");
+        assert_eq!(reply_text(&reply), loop_ref, "loop text diverged");
     }
 
     #[tokio::test]
@@ -1089,6 +1088,174 @@ mod tests {
             }))
             .await;
         assert_eq!(reply_text(&reply), legacy, "message text diverged");
+    }
+
+    // -----------------------------------------------------------------------
+    // Permanent byte-stability proof — tools through the bridge
+    // (doc §3.7 Steps 2-3: once the adapter and the legacy callback surface
+    // are deleted, these tests pin the tool→bridge→model path to the exact
+    // pre-bridge wire strings, so adopting the bridge cannot change what the
+    // model sees.)
+    // -----------------------------------------------------------------------
+
+    /// Mock host emitting the exact pre-bridge wire formats (the strings the
+    /// legacy `build_tools` closures produced), used to prove the tool→bridge
+    /// path is byte-stable end-to-end.
+    struct LegacyWireHost;
+
+    #[async_trait]
+    impl SpawnHost for LegacyWireHost {
+        async fn spawn(&self, req: SpawnRequest) -> Result<SpawnReply, ToolError> {
+            Ok(SpawnReply {
+                task_id: "abc12345".to_string(),
+                text: format!(
+                    "Subagent '{}' spawned (id: abc12345, model: {}). It will announce results when done.",
+                    req.label.unwrap_or_default(),
+                    req.model.unwrap_or_else(|| "default".to_string())
+                ),
+            })
+        }
+        async fn list_subagents(&self) -> Result<ListReply, ToolError> {
+            Ok(ListReply { text: "No subagents currently running.".to_string() })
+        }
+        async fn cancel(&self, req: CancelRequest) -> Result<CancelReply, ToolError> {
+            Ok(CancelReply { text: format!("Subagent '{}' cancelled.", req.task_id) })
+        }
+        async fn wait(&self, req: WaitRequest) -> Result<WaitReply, ToolError> {
+            Ok(WaitReply { text: format!("waited {} for {}s", req.task_id, req.timeout_secs) })
+        }
+        async fn check(&self, req: CheckRequest) -> Result<CheckReply, ToolError> {
+            Ok(CheckReply { text: format!("checked {}", req.task_id) })
+        }
+    }
+
+    #[async_trait]
+    impl PipelineHost for LegacyWireHost {
+        async fn run_pipeline(&self, req: PipelineRequest) -> Result<PipelineReply, ToolError> {
+            let steps = serde_json::to_string(&req.steps).unwrap_or_default();
+            Ok(PipelineReply { text: format!("pipeline over {steps} ahead {}", req.ahead_by_k) })
+        }
+    }
+
+    #[async_trait]
+    impl LoopHost for LegacyWireHost {
+        async fn run_loop(&self, req: LoopRequest) -> Result<LoopReply, ToolError> {
+            Ok(LoopReply { text: format!("loop {} r{}", req.task, req.max_rounds) })
+        }
+    }
+
+    #[async_trait]
+    impl MessageHost for LegacyWireHost {
+        async fn send(&self, req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
+            Ok(SendMessageReply {
+                text: format!("Message sent to {}:{}", req.channel, req.chat_id),
+            })
+        }
+    }
+
+    fn legacy_wire_dispatcher() -> Arc<HostDispatcher> {
+        let host = Arc::new(LegacyWireHost);
+        Arc::new(HostDispatcher::new(
+            host.clone(),
+            host.clone(),
+            host.clone(),
+            host.clone(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn spawn_tool_through_bridge_matches_legacy_wire_strings() {
+        let tool = SpawnTool::new(legacy_wire_dispatcher());
+
+        // spawn — the exact legacy confirmation line.
+        let mut p = HashMap::new();
+        p.insert("task".to_string(), json!("do x"));
+        p.insert("label".to_string(), json!("explore"));
+        p.insert("model".to_string(), json!("haiku"));
+        assert_eq!(
+            tool.execute(p).await,
+            "Subagent 'explore' spawned (id: abc12345, model: haiku). It will announce results when done."
+        );
+
+        // list / cancel / wait / check
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("list"));
+        assert_eq!(tool.execute(p).await, "No subagents currently running.");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("cancel"));
+        p.insert("task_id".to_string(), json!("abc12345"));
+        assert_eq!(tool.execute(p).await, "Subagent 'abc12345' cancelled.");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("wait"));
+        p.insert("task_id".to_string(), json!("abc12345"));
+        p.insert("timeout".to_string(), json!(10));
+        assert_eq!(tool.execute(p).await, "waited abc12345 for 10s");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("check"));
+        p.insert("task_id".to_string(), json!("abc12345"));
+        assert_eq!(tool.execute(p).await, "checked abc12345");
+
+        // pipeline / loop
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("pipeline"));
+        p.insert("steps".to_string(), json!([{"prompt": "one"}, {"prompt": "two"}]));
+        p.insert("ahead_by_k".to_string(), json!(2));
+        assert_eq!(
+            tool.execute(p).await,
+            "pipeline over [{\"prompt\":\"one\"},{\"prompt\":\"two\"}] ahead 2"
+        );
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("loop"));
+        p.insert("task".to_string(), json!("refine"));
+        p.insert("max_rounds".to_string(), json!(3));
+        assert_eq!(tool.execute(p).await, "loop refine r3");
+    }
+
+    #[tokio::test]
+    async fn spawn_tool_through_bridge_preserves_legacy_error_strings() {
+        // Host errors must reach the model byte-identically: the envelope
+        // round-trips through ToolError::from_legacy and re-renders the same
+        // "Error: …" string.
+        let d = HostDispatcher::new(
+            Arc::new(FailingSpawn),
+            Arc::new(MockPipeline),
+            Arc::new(MockLoop),
+            Arc::new(MockMessage),
+        );
+        let tool = SpawnTool::new(Arc::new(d));
+        let mut p = HashMap::new();
+        p.insert("task".to_string(), json!("t"));
+        assert_eq!(tool.execute(p).await, "Error: Command timed out after 30s");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("check"));
+        p.insert("task_id".to_string(), json!("x"));
+        assert_eq!(tool.execute(p).await, "Error: Network error: dns");
+    }
+
+    #[tokio::test]
+    async fn spawn_tool_parse_errors_match_legacy_strings() {
+        let tool = SpawnTool::new(legacy_wire_dispatcher());
+        // Tool-level validation errors are the exact legacy strings (no host
+        // round-trip involved).
+        let p = HashMap::new();
+        assert_eq!(tool.execute(p).await, "Error: 'task' parameter is required");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("wait"));
+        assert_eq!(tool.execute(p).await, "Error: 'task_id' parameter is required for wait");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("pipeline"));
+        assert_eq!(tool.execute(p).await, "Error: 'steps' parameter is required for pipeline");
+
+        let mut p = HashMap::new();
+        p.insert("action".to_string(), json!("loop"));
+        assert_eq!(tool.execute(p).await, "Error: 'task' parameter is required for loop");
     }
 
     // -----------------------------------------------------------------------
