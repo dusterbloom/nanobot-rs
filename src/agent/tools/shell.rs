@@ -387,14 +387,12 @@ impl Tool for ExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its output.\n\
-         Safe: ls, pwd, cat, grep, find, python, cargo, git, echo, curl.\n\
-         Blocked: rm -rf, sudo, eval, shred (destructive commands are rejected).\n\
-         Prefer read_file over cat, list_dir over ls when available.\n\
-         Prefer write_file for generated file content and edit_file for targeted file edits.\n\
-         Bulk edits (\u{2265}3 files): use `ambr 'old' 'new'` for codebase-wide replace,\n\
-         or `fd -e rs | xargs sd 'old' 'new'` for a typed subset.\n\
-         Don't loop edit_file across many files when one pipeline does it."
+        "Execute a shell command and return its output. \
+         Skills (installed in the workspace) are invoked through exec. Call get_skills first to read a skill's instructions, then follow its Quick start command. \
+         Other patterns: cargo build, git status, python script.py. \
+         Blocked: rm -rf, sudo, eval, shred (destructive commands rejected). \
+         Bulk edits: use ambr for codebase-wide replacements or sd for targeted replacements. \
+         Prefer write_file + edit_file over shell pipelines for text content."
     }
 
     fn permission(&self) -> PermissionLevel {
@@ -407,7 +405,7 @@ impl Tool for ExecTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "Shell command with arguments. Examples: webradio play jazz, cargo test, git log --oneline, python script.py"
                 },
                 "working_dir": {
                     "type": "string",
