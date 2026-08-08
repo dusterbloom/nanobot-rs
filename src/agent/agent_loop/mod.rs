@@ -26,7 +26,7 @@ use serde_json::json;
 use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::agent::reflector::Reflector;
 use crate::agent::subagent::SubagentManager;
@@ -492,15 +492,86 @@ impl AgentLoop {
             .await
     }
 
-    /// Clear the LCM engine for a session (e.g. on /clear command).
-    ///
-    /// This resets the summary DAG and active context so stale summaries
-    /// don't pollute fresh conversations after /clear.
-    pub async fn clear_lcm_engine(&self, session_id: &str) {
-        let mut engines = self.shared.lcm_engines.lock().await;
-        if engines.remove(session_id).is_some() {
+    /// Cancel generation and join every compaction job owned by this loop.
+    pub(crate) async fn drain_compaction_jobs(&self) {
+        let handles = {
+            let handles = self.shared.compaction_handles.lock().await;
+            handles.values().cloned().collect::<Vec<_>>()
+        };
+        futures_util::future::join_all(handles.iter().map(|handle| handle.cancel_and_reap())).await;
+    }
+
+    /// Atomically clear all state owned by one concrete interactive session.
+    pub async fn clear_session_state(&self, session_key: &str) {
+        let core = self.shared.core_handle.swappable();
+        let session = core.sessions.get_or_resume(session_key).await;
+        let session_id = session.id;
+        let (compaction, closing) = self.begin_session_clear(&session_id).await;
+
+        compaction.cancel_and_reap().await;
+        *compaction.slot.lock().await = None;
+        if self
+            .shared
+            .lcm_engines
+            .lock()
+            .await
+            .remove(&session_id)
+            .is_some()
+        {
             debug!(%session_id, "LCM engine cleared");
         }
+        if core.memory_enabled {
+            if let Err(error) = core.working_memory.clear(&session_id).await {
+                warn!(%error, %session_id, "failed to clear working memory");
+            }
+        }
+        core.sessions.clear_history(&session_id).await;
+
+        let counters = &self.shared.core_handle.counters;
+        counters.reset_session_prompt_state(session_key);
+        counters.last_context_used.store(0, Ordering::Relaxed);
+        counters.last_message_count.store(0, Ordering::Relaxed);
+        counters
+            .last_working_memory_tokens
+            .store(0, Ordering::Relaxed);
+        self.retire_session_clear(&session_id, &compaction, closing)
+            .await;
+    }
+
+    async fn begin_session_clear(
+        &self,
+        session_id: &str,
+    ) -> (CompactionHandle, compaction::CompactionClosingAdmission) {
+        loop {
+            let candidate = self.shared.compaction_handle_for_session(session_id).await;
+            if let Some(closing) = candidate.begin_close().await {
+                return (candidate, closing);
+            }
+            self.shared
+                .remove_compaction_handle_if_owned(session_id, &candidate)
+                .await;
+        }
+    }
+
+    async fn retire_session_clear(
+        &self,
+        session_id: &str,
+        compaction: &CompactionHandle,
+        closing: compaction::CompactionClosingAdmission,
+    ) {
+        // Retire and remove only the handle whose closing admission spans this
+        // clear. Releasing the permit last wakes preparations against a fully
+        // cleared durable session; stale waiters then retry through the map.
+        let mut handles = self.shared.compaction_handles.lock().await;
+        closing.retire();
+        if handles
+            .get(session_id)
+            .is_some_and(|current| current.same_owner(compaction))
+        {
+            handles.remove(session_id);
+        }
+        drop(handles);
+        drop(closing);
     }
 
     /// Signal the agent loop to stop.

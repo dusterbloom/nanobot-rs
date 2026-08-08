@@ -2591,6 +2591,8 @@ pub(crate) fn cmd_agent(
                 }
             }
 
+            ctx.agent_loop.drain_compaction_jobs().await;
+
             // Stop any active background channels
             for ch in &ctx.active_channels {
                 ch.stop.store(true, Ordering::Relaxed);

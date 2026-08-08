@@ -18,7 +18,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
@@ -52,8 +51,8 @@ use crate::errors::is_retryable_provider_error;
 use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
 
 use crate::agent::agent_core::{
-    append_to_system_prompt, apply_compaction_result, stable_higgs_session_id, RuntimeCounters,
-    SharedCoreHandle, SwappableCore,
+    append_to_system_prompt, apply_compaction_result, stable_higgs_session_id, PendingCompaction,
+    RuntimeCounters, SharedCoreHandle, SwappableCore,
 };
 
 use super::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
@@ -181,6 +180,8 @@ pub(crate) struct TurnContext {
 
     // --- Budget/compaction ---
     pub(crate) compaction: CompactionHandle,
+    /// Set during pre-call accounting and consumed only after foreground work ends.
+    pub(crate) soft_compaction_requested: bool,
     pub(crate) content_gate: crate::agent::context_gate::ContentGate,
 
     // --- Observability ---
@@ -199,6 +200,46 @@ pub(crate) struct TurnContext {
     // --- Reasoning ---
     /// Shared reasoning engine for plan-guided execution and backtracking.
     pub(crate) reasoning: SharedEngine,
+}
+
+struct SoftCompactionRequest {
+    core: Arc<SwappableCore>,
+    session_id: String,
+    compaction: CompactionHandle,
+    turn_cancellation: Option<tokio_util::sync::CancellationToken>,
+    prompt_prefix: Vec<Value>,
+}
+
+impl SoftCompactionRequest {
+    fn take(ctx: &mut TurnContext) -> Option<Self> {
+        if !std::mem::take(&mut ctx.soft_compaction_requested) || ctx.is_cancelled() {
+            return None;
+        }
+        let prompt_prefix = ctx
+            .messages
+            .iter()
+            .take_while(|message| {
+                matches!(
+                    message.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                )
+            })
+            .cloned()
+            .collect();
+        Some(Self {
+            core: ctx.core.clone(),
+            session_id: ctx.session_id.clone(),
+            compaction: ctx.compaction.clone(),
+            turn_cancellation: ctx.cancellation_token.clone(),
+            prompt_prefix,
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.turn_cancellation
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
 }
 
 impl TurnContext {
@@ -267,6 +308,37 @@ impl TurnContext {
             self.messages[index]["_db_id"] = json!(row_id);
         }
         self.new_start = self.messages.len();
+    }
+
+}
+
+/// Signal generation cancellation from either owner without dropping the
+/// execution future. Once publication is claimed, execution ignores the signal
+/// and this waiter continues through durable publication and pending handoff.
+async fn await_compaction_with_cancellation(
+    execution: impl std::future::Future<Output = Option<PendingCompaction>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    job_cancellation: tokio_util::sync::CancellationToken,
+    turn_cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Option<PendingCompaction> {
+    let turn_cancelled = async move {
+        match turn_cancellation {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(execution);
+    tokio::select! {
+        biased;
+        () = job_cancellation.cancelled() => {
+            cancellation.cancel();
+            execution.await
+        }
+        () = turn_cancelled => {
+            cancellation.cancel();
+            execution.await
+        }
+        result = &mut execution => result,
     }
 }
 
@@ -683,6 +755,31 @@ fn should_attempt_forced_recovery(
 }
 
 impl AgentLoopShared {
+    pub(crate) async fn compaction_handle_for_session(
+        &self,
+        session_id: &str,
+    ) -> CompactionHandle {
+        let mut handles = self.compaction_handles.lock().await;
+        handles
+            .entry(session_id.to_string())
+            .or_insert_with(|| CompactionHandle::for_session(session_id))
+            .clone()
+    }
+
+    pub(crate) async fn remove_compaction_handle_if_owned(
+        &self,
+        session_id: &str,
+        candidate: &CompactionHandle,
+    ) {
+        let mut handles = self.compaction_handles.lock().await;
+        if handles
+            .get(session_id)
+            .is_some_and(|current| current.same_owner(candidate))
+        {
+            handles.remove(session_id);
+        }
+    }
+
     /// Process an inbound message through the agent loop.
     ///
     /// When `text_delta_tx` is `Some`, text deltas are streamed to the sender
@@ -724,7 +821,12 @@ impl AgentLoopShared {
         ctx.persist_pending_protocol_messages().await;
 
         self.run_agent_loop(&mut ctx).await;
-        self.finalize_response(ctx).await
+        let soft_compaction = SoftCompactionRequest::take(&mut ctx);
+        let response = self.finalize_response(ctx).await;
+        if let Some(request) = soft_compaction {
+            self.spawn_requested_soft_compaction(request).await;
+        }
+        response
     }
 
     /// Phase 2: Run the main agent loop (LLM calls + tool execution).
@@ -1340,8 +1442,11 @@ impl AgentLoopShared {
             self.install_pending_compaction(ctx, true).await;
         }
 
-        // Spawn background compaction when threshold exceeded.
+        // Account for compaction pressure; soft work is only requested here.
         self.manage_compaction(ctx, tool_def_tokens).await;
+        if ctx.is_cancelled() {
+            return StepResult::Done(IterationOutcome::Finished(String::new()));
+        }
 
         // Proactive grounding: inject relevant knowledge before LLM call.
         //
@@ -1719,11 +1824,95 @@ impl AgentLoopShared {
         true
     }
 
-    /// Spawn background compaction when threshold exceeded.
-    ///
-    /// Uses the LCM engine's control loop with its persisted DAG and
-    /// deterministic hard-pressure fallback.
+    /// Start requested soft work only after the complete foreground loop.
+    async fn spawn_requested_soft_compaction(&self, request: SoftCompactionRequest) {
+        if request.is_cancelled() {
+            return;
+        }
+        let Some(admission) = request.compaction.admit().await else {
+            return;
+        };
+        if request.compaction.has_pending().await || request.compaction.has_job().await {
+            return;
+        }
+        let max_messages = crate::agent::agent_core::history_limit_lcm(
+            request.core.token_budget.max_context(),
+        );
+        let history = request
+            .core
+            .sessions
+            .get_history(
+                &request.session_id,
+                max_messages,
+                request.core.max_history_turns,
+            )
+            .await;
+        if request.is_cancelled() {
+            return;
+        }
+        let Some(lcm_engine) = self
+            .lcm_engines
+            .lock()
+            .await
+            .get(&request.session_id)
+            .cloned()
+        else {
+            return;
+        };
+        {
+            let mut engine = lcm_engine.lock().await;
+            for message in &history {
+                engine.ingest(message.clone());
+            }
+        }
+        if request.is_cancelled() {
+            return;
+        }
+        let session_turn = request
+            .core
+            .sessions
+            .get_session(&request.session_id)
+            .await
+            .map_or(0, |session| session.message_count as u64);
+        if request.is_cancelled() {
+            return;
+        }
+
+        let core = request.core;
+        let session_id = request.session_id;
+        let mut messages = request.prompt_prefix;
+        messages.extend(history);
+        let turn_cancellation = request.turn_cancellation;
+        let _ = request
+            .compaction
+            .try_start_admitted(&admission, move |job_cancellation, publication| {
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let execution = execute_lcm_compaction(
+                    core,
+                    session_id,
+                    lcm_engine,
+                    messages,
+                    session_turn,
+                    CompactionFailureMode::PreserveContext,
+                    cancellation.clone(),
+                    publication,
+                );
+                await_compaction_with_cancellation(
+                    execution,
+                    cancellation,
+                    job_cancellation,
+                    turn_cancellation,
+                )
+            })
+            .await;
+    }
+
+    /// Apply hard pressure now or record soft pressure for post-loop execution.
     async fn manage_compaction(&self, ctx: &mut TurnContext, tool_def_tokens: usize) {
+        let Some(admission) = ctx.compaction.admit().await else {
+            return;
+        };
+        ctx.compaction.cancel_and_reap().await;
         {
             // LCM path: get or create per-session engine, check thresholds.
             //
@@ -1781,21 +1970,7 @@ impl AgentLoopShared {
                 )
             };
 
-            // A soft job may finish after the raw foreground context has
-            // crossed the hard threshold. At that point foreground inference
-            // waits for it and installs its checkpoint before doing anything
-            // else. Each model request has a sliding inactivity deadline, so
-            // the whole multi-request compaction must not have a wall clock
-            // timeout that can cancel otherwise healthy progress.
             let mut raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
-            if raw_hard && ctx.compaction.in_flight.load(Ordering::Acquire) {
-                let wait_for_soft_job = async {
-                    while ctx.compaction.in_flight.load(Ordering::Acquire) {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                };
-                wait_for_soft_job.await;
-            }
             if raw_hard {
                 self.install_pending_compaction(ctx, true).await;
                 raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
@@ -1805,11 +1980,13 @@ impl AgentLoopShared {
                 };
             }
 
-            let has_pending = ctx.compaction.slot.lock().await.is_some();
-            let in_flight = ctx.compaction.in_flight.load(Ordering::Acquire);
+            let has_pending = ctx.compaction.has_pending().await;
             let must_block = raw_hard || action == CompactionAction::Blocking;
+            if must_block {
+                ctx.soft_compaction_requested = false;
+            }
 
-            if must_block && !in_flight {
+            let blocking_started = if must_block {
                 tracing::info!(
                     compaction_type = "lcm_blocking",
                     msg_count = ctx.messages.len(),
@@ -1819,7 +1996,6 @@ impl AgentLoopShared {
                     soft_limit,
                     "lcm_compaction_triggered"
                 );
-                ctx.compaction.in_flight.store(true, Ordering::Release);
                 let core = ctx.core.clone();
                 let session_id = ctx.session_id.clone();
                 let messages = ctx.messages.clone();
@@ -1840,28 +2016,32 @@ impl AgentLoopShared {
                         messages: ctx.messages.len() as u32,
                     },
                 );
-                let pending = execute_lcm_compaction(
-                    core,
-                    session_id,
-                    lcm_engine.clone(),
-                    messages,
-                    session_turn,
-                    CompactionFailureMode::Deterministic,
-                )
-                .await;
-                if let Some(pending) = pending {
-                    *ctx.compaction.slot.lock().await = Some(pending);
-                }
-                ctx.compaction.in_flight.store(false, Ordering::Release);
-                self.install_pending_compaction(ctx, true).await;
-                // Clear the compaction indicator. The next event (prefill,
-                // cache reset, etc.) replaces the Activity row, but in case
-                // the turn finishes here we don't want a stuck "compacting".
-                send_compaction_marker(
-                    &ctx.text_delta_tx,
-                    crate::turn_stream::CompactionStatus::Finished,
-                );
-            } else if action == CompactionAction::Async && !has_pending && !in_flight {
+                let compaction_engine = lcm_engine.clone();
+                let turn_cancellation = ctx.cancellation_token.clone();
+                let started = ctx
+                    .compaction
+                    .try_start_admitted(&admission, move |job_cancellation, publication| {
+                        let cancellation = tokio_util::sync::CancellationToken::new();
+                        let execution = execute_lcm_compaction(
+                            core,
+                            session_id,
+                            compaction_engine,
+                            messages,
+                            session_turn,
+                            CompactionFailureMode::Deterministic,
+                            cancellation.clone(),
+                            publication,
+                        );
+                        await_compaction_with_cancellation(
+                            execution,
+                            cancellation,
+                            job_cancellation,
+                            turn_cancellation,
+                        )
+                    })
+                    .await;
+                Some(started)
+            } else if action == CompactionAction::Async && !has_pending {
                 tracing::info!(
                     compaction_type = "lcm_async",
                     msg_count = ctx.messages.len(),
@@ -1871,35 +2051,36 @@ impl AgentLoopShared {
                     soft_limit,
                     "lcm_compaction_triggered"
                 );
-                {
-                    let mut engine = lcm_engine.lock().await;
-                    engine.request_async_compaction();
-                }
-                let slot = ctx.compaction.slot.clone();
-                let in_flight = ctx.compaction.in_flight.clone();
-                let session_turn = ctx
-                    .core
-                    .sessions
-                    .get_session(&ctx.session_id)
-                    .await
-                    .map_or(0, |session| session.message_count as u64);
-                let task = execute_lcm_compaction(
-                    ctx.core.clone(),
-                    ctx.session_id.clone(),
-                    lcm_engine.clone(),
-                    ctx.messages.clone(),
-                    session_turn,
-                    CompactionFailureMode::PreserveContext,
-                );
-                in_flight.store(true, Ordering::Release);
-                tokio::spawn(async move {
-                    if let Some(pending) = task.await {
-                        *slot.lock().await = Some(pending);
-                    }
-                    in_flight.store(false, Ordering::Release);
-                });
+                ctx.soft_compaction_requested = true;
+                None
             } else if has_pending {
                 debug!("LCM compaction deferred: checkpoint is waiting for a safe install");
+                None
+            } else {
+                None
+            };
+
+            // A blocking caller waits for completion, but never owns the job
+            // future. Dropping the caller therefore cannot cancel publication
+            // or the pending-slot handoff. Release admission first so clear can
+            // close the session and cancel generation while this waiter sleeps.
+            drop(admission);
+            if let Some(started) = blocking_started {
+                if started {
+                    ctx.compaction.wait_for_completion().await;
+                }
+                self.install_pending_compaction(ctx, true).await;
+                // Clear the compaction indicator. The next event (prefill,
+                // cache reset, etc.) replaces the Activity row, but in case
+                // the turn finishes here we don't want a stuck "compacting".
+                send_compaction_marker(
+                    &ctx.text_delta_tx,
+                    crate::turn_stream::CompactionStatus::Finished,
+                );
+            }
+
+            if ctx.is_cancelled() {
+                return;
             }
 
             // Auto-expand relevant summaries before the LLM call. The system,

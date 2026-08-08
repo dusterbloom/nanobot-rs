@@ -937,10 +937,21 @@ pub(crate) fn history_limit_lcm(max_context_tokens: usize) -> usize {
 /// Pending compaction result ready to be swapped into the conversation.
 pub(crate) struct PendingCompaction {
     pub result: crate::agent::compaction::CompactionResult,
-    /// Exact live array that LCM compacted. Installation is allowed only when
-    /// the current array still starts with these bytes; that makes appended
-    /// tool traffic safe without guessing from a stale numeric watermark.
+    /// Exact live array that LCM compacted. Its leading system/developer prefix
+    /// is non-durable and may change; the durable conversation bytes may not.
     pub snapshot: Vec<Value>,
+}
+
+fn prompt_prefix_len(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .take_while(|message| {
+            matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            )
+        })
+        .count()
 }
 
 impl PendingCompaction {
@@ -948,8 +959,17 @@ impl PendingCompaction {
         self.snapshot.len()
     }
 
+    fn live_conversation_watermark(&self, messages: &[Value]) -> Option<usize> {
+        let snapshot_prefix_len = prompt_prefix_len(&self.snapshot);
+        let live_prefix_len = prompt_prefix_len(messages);
+        let snapshot_conversation = &self.snapshot[snapshot_prefix_len..];
+        messages[live_prefix_len..]
+            .starts_with(snapshot_conversation)
+            .then_some(live_prefix_len + snapshot_conversation.len())
+    }
+
     pub(crate) fn matches_snapshot_prefix(&self, messages: &[Value]) -> bool {
-        messages.starts_with(&self.snapshot)
+        self.live_conversation_watermark(messages).is_some()
     }
 }
 
@@ -959,26 +979,15 @@ pub(crate) fn apply_compaction_result(
     messages: &mut Vec<Value>,
     pending: PendingCompaction,
 ) -> bool {
-    if !pending.matches_snapshot_prefix(messages) {
+    let Some(live_conversation_watermark) = pending.live_conversation_watermark(messages) else {
         return false;
-    }
+    };
 
-    let new_messages = messages[pending.watermark()..].to_vec();
+    let new_messages = messages[live_conversation_watermark..].to_vec();
     // The result carries the complete snapshot prompt prefix. Preserve the
     // current copy of that non-durable prefix, then append every compacted LCM
     // conversation entry. In particular, result[0] is not assumed to be a
     // system message: LCM's active context itself deliberately has no system.
-    let prompt_prefix_len = |values: &[Value]| {
-        values
-            .iter()
-            .take_while(|message| {
-                matches!(
-                    message.get("role").and_then(Value::as_str),
-                    Some("system" | "developer")
-                )
-            })
-            .count()
-    };
     let live_prefix_len = prompt_prefix_len(messages);
     let result_prefix_len = prompt_prefix_len(&pending.result.messages);
     let mut swapped = Vec::with_capacity(
@@ -1042,10 +1051,14 @@ mod tests {
     fn compaction_swap_preserves_prompt_prefix_summary_and_appended_suffix() {
         let snapshot = vec![
             serde_json::json!({"role": "system", "content": "system"}),
-            serde_json::json!({"role": "developer", "content": "developer"}),
+            serde_json::json!({"role": "developer", "content": "old developer"}),
             serde_json::json!({"role": "user", "content": "old", "_db_id": 1}),
         ];
-        let mut live = snapshot.clone();
+        let mut live = vec![
+            serde_json::json!({"role": "system", "content": "current system"}),
+            serde_json::json!({"role": "developer", "content": "current working memory"}),
+            snapshot[2].clone(),
+        ];
         live.push(serde_json::json!({
             "role": "tool",
             "content": "new result",
@@ -1065,10 +1078,41 @@ mod tests {
         };
 
         assert!(apply_compaction_result(&mut live, pending));
-        assert_eq!(live[0]["role"], "system");
-        assert_eq!(live[1]["role"], "developer");
+        assert_eq!(live[0]["content"], "current system");
+        assert_eq!(live[1]["content"], "current working memory");
         assert_eq!(live[2], summary);
         assert_eq!(live[3]["content"], "new result");
+    }
+
+    #[test]
+    fn compaction_swap_accepts_an_added_developer_prefix() {
+        let snapshot = vec![
+            serde_json::json!({"role": "system", "content": "system"}),
+            serde_json::json!({"role": "user", "content": "old", "_db_id": 1}),
+        ];
+        let summary = serde_json::json!({
+            "role": "user",
+            "content": "summary",
+            "_lcm_summary": true
+        });
+        let mut live = vec![
+            serde_json::json!({"role": "system", "content": "current system"}),
+            serde_json::json!({"role": "developer", "content": "new working memory"}),
+            snapshot[1].clone(),
+            serde_json::json!({"role": "assistant", "content": "new tail", "_db_id": 2}),
+        ];
+        let pending = PendingCompaction {
+            result: crate::agent::compaction::CompactionResult {
+                messages: vec![snapshot[0].clone(), summary.clone()],
+            },
+            snapshot,
+        };
+
+        assert!(apply_compaction_result(&mut live, pending));
+        assert_eq!(live[0]["content"], "current system");
+        assert_eq!(live[1]["content"], "new working memory");
+        assert_eq!(live[2], summary);
+        assert_eq!(live[3]["content"], "new tail");
     }
 
     #[test]
@@ -1078,7 +1122,8 @@ mod tests {
             serde_json::json!({"role": "user", "content": "old", "_db_id": 1}),
         ];
         let mut live = vec![
-            snapshot[0].clone(),
+            serde_json::json!({"role": "system", "content": "current system"}),
+            serde_json::json!({"role": "developer", "content": "current working memory"}),
             serde_json::json!({"role": "user", "content": "rewritten", "_db_id": 2}),
         ];
         let before = live.clone();

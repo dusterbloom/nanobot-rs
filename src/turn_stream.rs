@@ -31,12 +31,17 @@
 //! This is the rule both frontends previously enforced with ad-hoc
 //! `drain_pending_deltas` helpers / biased select arms.
 
+use std::time::Duration;
+
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::audit::ToolEvent;
+
+const CANCEL_GRACE: Duration = Duration::from_millis(500);
 
 /// One observable step of a streaming turn.
 #[derive(Debug)]
@@ -96,6 +101,7 @@ pub(crate) struct TurnStream {
     pending_tool: Option<ToolEvent>,
     handle: HandleState,
     cancel: Option<CancellationToken>,
+    cancel_deadline: Option<Instant>,
     phase: Phase,
 }
 
@@ -116,6 +122,7 @@ impl TurnStream {
             pending_tool: None,
             handle,
             cancel,
+            cancel_deadline: None,
             phase: Phase::Streaming,
         }
     }
@@ -129,7 +136,18 @@ impl TurnStream {
         if let Some(token) = &self.cancel {
             token.cancel();
         }
+        self.cancel_deadline
+            .get_or_insert_with(|| Instant::now() + CANCEL_GRACE);
         self.phase = Phase::Cancelled;
+    }
+
+    /// Cancel the turn and immediately abort its pending agent task. The
+    /// handle remains owned and is joined by [`TurnStream::next`].
+    pub(crate) fn abort(&mut self) {
+        self.cancel();
+        if let HandleState::Pending(handle) = &self.handle {
+            handle.abort();
+        }
     }
 
     /// Yield the next event of the turn. Cancel-safe: dropping the returned
@@ -207,12 +225,21 @@ impl TurnStream {
         TurnEvent::Finished(response)
     }
 
-    /// Cancelled wind-down: wait for the agent task we own (the TUI's old
-    /// loop kept selecting until the join arm fired), then discard whatever
-    /// is buffered and finish empty.
+    /// Cancelled wind-down: allow a bounded cooperative shutdown, then abort
+    /// and join a task that remains pending. Discard everything and finish
+    /// empty either way.
     async fn finish_cancelled(&mut self) -> TurnEvent {
         if matches!(self.handle, HandleState::Pending(_)) {
-            let _ = join_agent(&mut self.handle).await;
+            let deadline = *self
+                .cancel_deadline
+                .get_or_insert_with(|| Instant::now() + CANCEL_GRACE);
+            if tokio::time::timeout_at(deadline, join_agent(&mut self.handle))
+                .await
+                .is_err()
+            {
+                self.abort();
+                let _ = join_agent(&mut self.handle).await;
+            }
         }
         self.discard_buffers();
         self.phase = Phase::Done;
@@ -563,8 +590,17 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tokio::sync::mpsc::unbounded_channel;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     fn tool_event(id: &str) -> ToolEvent {
         ToolEvent::CallStart {
@@ -768,6 +804,25 @@ mod tests {
         delta_tx.send("late delta".into()).unwrap();
 
         assert!(matches!(ev(&mut stream).await, TurnEvent::Finished(r) if r.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_non_cooperative_agent_within_bound() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<String>().await
+        });
+        let (_tx, rx) = unbounded_channel();
+        let token = CancellationToken::new();
+        let mut stream = TurnStream::new(rx, None, Completion::AgentHandle(handle), Some(token));
+        stream.cancel();
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("cancel must be bounded");
+        assert!(matches!(event, TurnEvent::Finished(text) if text.is_empty()));
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[tokio::test]

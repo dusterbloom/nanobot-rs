@@ -287,6 +287,8 @@ pub(crate) enum Action {
 pub(crate) enum StreamingAction {
     Continue,
     Cancel,
+    CancelOrQuit,
+    Quit,
     CancelAndSubmit(SubmittedTurn),
 }
 
@@ -1540,15 +1542,60 @@ impl App {
         }
     }
 
-    /// Finalize the turn. `resp` is the agent's full return string; it backfills
-    /// a `Reply` when the provider didn't stream any deltas, and pins a metadata
-    /// line beneath the turn's output.
-    pub(crate) fn finish_turn(&mut self, resp: String) {
+    fn reset_live_turn(&mut self) {
         self.streaming = false;
         self.awaiting_first = false;
         self.prefill = None;
         self.prefill_estimate = None;
+        self.prefill_tps = None;
+        self.prefill_started = None;
+        self.prefill_last = None;
         self.in_thinking_stream = false;
+        self.remove_trailing_activity();
+    }
+
+    /// Finish a cancelled turn without retaining its tentative assistant output.
+    pub(crate) fn cancel_turn(&mut self) {
+        self.reset_live_turn();
+        if let Some(turn_start) = self
+            .transcript
+            .iter()
+            .rposition(|cell| matches!(cell, Cell::User(_)))
+        {
+            let current_turn = self.transcript.split_off(turn_start + 1);
+            self.transcript
+                .extend(current_turn.into_iter().filter(|cell| {
+                    !matches!(
+                        cell,
+                        Cell::Activity { .. }
+                            | Cell::Reply(_)
+                            | Cell::Thinking(_)
+                            | Cell::Tool {
+                                state: ToolState::Running,
+                                ..
+                            }
+                            | Cell::Meta { .. }
+                    )
+                }));
+        }
+        self.got_text = false;
+        self.turn_produced = false;
+        self.turn_start = None;
+        self.ttft = None;
+        self.turn_tokens = 0;
+        self.turn_prompt_tokens = 0;
+        self.turn_prefill_estimate = 0;
+        self.turn_cache = None;
+        self.turn_prefill_tps = None;
+        self.turn_decode_secs = 0.0;
+        self.turn_text.clear();
+    }
+
+    /// Finalize the turn. `resp` is the agent's full return string; it backfills
+    /// a `Reply` when the provider didn't stream any deltas, and pins a metadata
+    /// line beneath the turn's output.
+    pub(crate) fn finish_turn(&mut self, resp: String) {
+        self.reset_live_turn();
         if !self.turn_produced && !resp.trim().is_empty() {
             // Non-streaming providers return the whole string at once; stamp ttft
             // so the metadata line still shows all three fields.
@@ -1560,7 +1607,6 @@ impl App {
             self.transcript.push(Cell::Reply(resp));
             self.turn_produced = true;
         }
-        self.remove_trailing_activity();
         if let Some(Cell::Reply(t)) = self.transcript.last() {
             if t.trim().is_empty() {
                 self.transcript.pop();
@@ -2087,10 +2133,7 @@ impl App {
     pub(crate) fn on_streaming_event(&mut self, ev: Event) -> StreamingAction {
         match ev {
             Event::Key(k) if is_press(&k) => {
-                if self.show_help {
-                    self.show_help = false;
-                    return StreamingAction::Continue;
-                }
+                let help_open = std::mem::take(&mut self.show_help);
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                 match k.code {
                     KeyCode::Esc => {
@@ -2099,8 +2142,10 @@ impl App {
                     }
                     KeyCode::Char('c') if ctrl => {
                         self.clear_input();
-                        StreamingAction::Cancel
+                        StreamingAction::CancelOrQuit
                     }
+                    KeyCode::Char('d') if ctrl => StreamingAction::Quit,
+                    _ if help_open => StreamingAction::Continue,
                     KeyCode::Char('t') if ctrl => {
                         self.toggle_thinking_display();
                         StreamingAction::Continue
@@ -4601,6 +4646,54 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_turn_discards_its_assistant_output_without_touching_prior_turns_or_tools() {
+        let mut app = App::new();
+        app.begin_turn("earlier question");
+        app.on_delta("earlier answer");
+        app.finish_turn(String::new());
+
+        app.begin_turn("cancel this question");
+        app.on_delta("\x1b[90m\x1b[2m");
+        app.on_delta("private partial reasoning");
+        app.on_delta("\x1b[0m\n\n");
+        app.on_delta("partial answer before tool");
+        app.on_tool_event(ToolEvent::CallStart {
+            tool_name: "read_file".into(),
+            tool_call_id: "cancelled-turn-tool".into(),
+            arguments_preview: "src/lib.rs".into(),
+        });
+        app.on_tool_event(ToolEvent::CallEnd {
+            tool_name: "read_file".into(),
+            tool_call_id: "cancelled-turn-tool".into(),
+            result_data: "tool completed".into(),
+            ok: true,
+            duration_ms: 4,
+        });
+        app.on_delta("partial answer after tool");
+        app.on_tool_event(ToolEvent::CallStart {
+            tool_name: "shell".into(),
+            tool_call_id: "still-running".into(),
+            arguments_preview: "sleep 10".into(),
+        });
+
+        app.cancel_turn();
+
+        assert_eq!(kinds(&app), vec!["user", "reply", "meta", "user", "tool"]);
+        assert_eq!(reply_text(&app), "earlier answer");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Cell::Tool {
+                state: ToolState::Ok,
+                ..
+            })
+        ));
+
+        app.begin_turn("next question");
+        app.finish_turn("next answer".to_string());
+        assert_eq!(reply_text(&app), "earlier answer|next answer");
+    }
+
+    #[test]
     fn orphan_tool_callend_does_not_strand_activity_row() {
         let mut app = App::new();
         app.begin_turn("run it");
@@ -5679,6 +5772,71 @@ mod tests {
             ))),
             StreamingAction::Cancel
         ));
+    }
+
+    #[test]
+    fn streaming_ctrl_c_requests_cancel_or_quit() {
+        let mut app = App::new();
+        app.begin_turn("long task");
+        assert!(matches!(
+            app.on_streaming_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+            StreamingAction::CancelOrQuit
+        ));
+    }
+
+    #[test]
+    fn streaming_ctrl_d_quits() {
+        let mut app = App::new();
+        app.begin_turn("long task");
+        assert!(matches!(
+            app.on_streaming_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            ))),
+            StreamingAction::Quit
+        ));
+    }
+
+    #[test]
+    fn streaming_emergency_keys_take_precedence_over_help() {
+        let cases = [
+            (
+                "Escape",
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+                StreamingAction::Cancel,
+            ),
+            (
+                "Ctrl-C",
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                StreamingAction::CancelOrQuit,
+            ),
+            (
+                "Ctrl-D",
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                StreamingAction::Quit,
+            ),
+        ];
+
+        for (label, code, modifiers, expected) in cases {
+            let mut app = App::new();
+            app.begin_turn("long task");
+            app.show_help = true;
+
+            let action = app.on_streaming_event(Event::Key(KeyEvent::new(code, modifiers)));
+
+            assert_eq!(
+                std::mem::discriminant(&action),
+                std::mem::discriminant(&expected),
+                "{label} must retain its emergency action"
+            );
+            assert!(!app.show_help, "{label} must also close help");
+        }
     }
 
     #[test]

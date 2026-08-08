@@ -19,7 +19,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::agent::agent_core::SwappableCore;
-use crate::agent::agent_loop::{AgentLoopShared, CompactionHandle, FlowControl, TurnContext};
+use crate::agent::agent_loop::{AgentLoopShared, FlowControl, TurnContext};
 use crate::agent::audit::AuditLog;
 use crate::agent::context::PromptBlock;
 use crate::agent::context_gate::ContentGate;
@@ -280,16 +280,19 @@ impl AgentLoopShared {
             .get_or_resume_with_idle(&session_key, core.session_complete_after_secs)
             .await;
         let session_id = session_meta.id.clone();
-        let compaction = {
-            let mut handles = self.compaction_handles.lock().await;
-            handles
-                .entry(session_id.clone())
-                .or_insert_with(|| CompactionHandle {
-                    slot: Arc::new(tokio::sync::Mutex::new(None)),
-                    in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                })
-                .clone()
+        let (compaction, compaction_admission) = loop {
+            let candidate = self.compaction_handle_for_session(&session_id).await;
+            if let Some(admission) = candidate.admit().await {
+                break (candidate, admission);
+            }
+
+            // A waiter may have cloned the old handle before clear retired and
+            // removed it. Never replace a newer handle installed by a waiter
+            // that reached the map first.
+            self.remove_compaction_handle_if_owned(&session_id, &candidate)
+                .await;
         };
+        compaction.cancel_and_reap().await;
         if tools.contains("recall") {
             // recall absorbed session_search; re-register it bound to the
             // concrete session so the fetch/search legs exclude the turn in
@@ -344,7 +347,7 @@ impl AgentLoopShared {
             }
         };
         use crate::agent::lcm::LcmExpandTool;
-        tools.register(Box::new(LcmExpandTool::new(lcm_engine)));
+        tools.register(Box::new(LcmExpandTool::new(lcm_engine.clone())));
 
         let lcm_setup_ms = lap_ms();
 
@@ -408,30 +411,26 @@ impl AgentLoopShared {
         // trim would gut recent turns instead. Ingest first (idempotent by
         // `_db_id`) so a live session's rows are in the store, then adopt.
         let history = {
-            let engine_arc = self.lcm_engines.lock().await.get(&session_id).cloned();
-            if let Some(engine_arc) = engine_arc {
-                let mut engine = engine_arc.lock().await;
-                for msg in &history {
-                    engine.ingest(msg.clone());
-                }
-                // The background compactor mutates the shared DAG before it
-                // publishes the checkpoint that rotates Higgs's session ID.
-                // Keep raw SQLite history authoritative across that window;
-                // the existing checkpoint installer is the sole publication
-                // point for both the prompt rewrite and cache rotation.
-                let rewrite_unpublished = compaction.in_flight.load(Ordering::Acquire)
-                    || compaction.slot.lock().await.is_some();
-                if engine.dag().is_empty() || rewrite_unpublished {
-                    history
-                } else {
-                    engine
-                        .active_context()
-                        .into_iter()
-                        .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
-                        .collect()
-                }
-            } else {
+            // The session admission held above prevents a new compaction start
+            // between reaping and this normal cancellation-safe lock await.
+            let rewrite_unpublished = compaction.has_pending().await;
+            let mut engine = lcm_engine.lock().await;
+            for msg in &history {
+                engine.ingest(msg.clone());
+            }
+            // The background compactor mutates the shared DAG before it
+            // publishes the checkpoint that rotates Higgs's session ID.
+            // Keep raw SQLite history authoritative across that window;
+            // the existing checkpoint installer is the sole publication
+            // point for both the prompt rewrite and cache rotation.
+            if engine.dag().is_empty() || rewrite_unpublished {
                 history
+            } else {
+                engine
+                    .active_context()
+                    .into_iter()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
+                    .collect()
             }
         };
         let lcm_ingest_ms = lap_ms();
@@ -603,6 +602,7 @@ impl AgentLoopShared {
             RuntimeMode::Local { .. } | RuntimeMode::Cloud => Arc::new(CloudProtocol),
         };
 
+        drop(compaction_admission);
         TurnContext {
             core,
             request_id,
@@ -634,6 +634,7 @@ impl AgentLoopShared {
             iterations_used: 0,
             turn_start: std::time::Instant::now(),
             compaction,
+            soft_compaction_requested: false,
             content_gate,
             counters: self.core_handle.counters.clone(),
             flow: FlowControl {

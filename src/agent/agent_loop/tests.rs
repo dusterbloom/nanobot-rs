@@ -2678,10 +2678,11 @@ fn build_local_inline_harness_with_memory_and_reflection(
 fn build_cloud_inline_harness_with_memory(
     main: Arc<dyn LLMProvider>,
     model: &str,
+    max_context_tokens: usize,
+    lcm_config: LcmSchemaConfig,
     memory_config: MemoryConfig,
 ) -> (AgentLoop, std::path::PathBuf) {
     let workspace = tempfile::tempdir().unwrap().keep();
-    let max_context_tokens = 128_000;
     let core = build_swappable_core(SwappableCoreConfig {
         provider: main,
         workspace: workspace.clone(),
@@ -2736,7 +2737,7 @@ fn build_cloud_inline_harness_with_memory(
         None,
         None,
         ProprioceptionConfig::default(),
-        LcmSchemaConfig::default(),
+        lcm_config,
         None,
     );
 
@@ -2762,6 +2763,8 @@ async fn memory_md_appears_exactly_once_in_assembled_cloud_messages() {
     let (agent_loop, workspace) = build_cloud_inline_harness_with_memory(
         provider,
         "cloud-memory-dedup-test",
+        128_000,
+        LcmSchemaConfig::default(),
         MemoryConfig::default(),
     );
 
@@ -3113,6 +3116,1721 @@ async fn soft_lcm_uses_main_provider_and_preserves_foreground_context() {
     );
 }
 
+fn is_lcm_compaction_request(messages: &[Value]) -> bool {
+    messages
+        .first()
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .is_some_and(|content| content.contains("conversation-state compressor"))
+}
+
+async fn seed_compaction_history(
+    core: &SwappableCore,
+    session_id: &str,
+    turns: u64,
+    detail_repetitions: usize,
+) {
+    for turn in 0..turns {
+        core.sessions
+            .add_message(
+                session_id,
+                &json!({
+                    "role": "user",
+                    "content": format!(
+                        "turn {turn}: {}",
+                        "persistent project detail with decisions and constraints "
+                            .repeat(detail_repetitions)
+                    ),
+                    "_turn": turn,
+                }),
+            )
+            .await;
+        core.sessions
+            .add_message(
+                session_id,
+                &json!({
+                    "role": "assistant",
+                    "content": format!("acknowledged retained project detail for turn {turn}"),
+                    "_turn": turn,
+                }),
+            )
+            .await;
+    }
+}
+
+async fn persist_prior_summary(core: &SwappableCore, session_id: &str) {
+    let raw = core.sessions.get_all_messages(session_id).await;
+    let source_ids = raw
+        .iter()
+        .take(4)
+        .map(|message| message["_db_id"].as_u64().unwrap() as usize)
+        .collect::<Vec<_>>();
+    assert_eq!(source_ids.len(), 4, "prior summary needs four source rows");
+    let text = "Prior project details, decisions, constraints, and acknowledged outcomes.";
+    core.sessions
+        .save_compaction_checkpoint(
+            session_id,
+            0,
+            &source_ids,
+            &[],
+            text,
+            crate::agent::token_budget::TokenBudget::estimate_str_tokens(text),
+            1,
+            &crate::agent::lcm::SummaryManifest::default(),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+struct ForegroundPriorityProvider {
+    first_foreground_started: Arc<tokio::sync::Notify>,
+    release_first_foreground: Arc<tokio::sync::Notify>,
+    soft_generation_started: Arc<tokio::sync::Notify>,
+    foreground_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for ForegroundPriorityProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            self.soft_generation_started.notify_one();
+            return std::future::pending().await;
+        }
+
+        let call = self
+            .foreground_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if call == 0 {
+            self.first_foreground_started.notify_one();
+            self.release_first_foreground.notified().await;
+            return Ok(WireRecordingProvider::text_response("turn one reply"));
+        }
+        Ok(WireRecordingProvider::text_response("turn two reply"))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "foreground-priority-compaction-test"
+    }
+}
+
+#[tokio::test]
+async fn soft_compaction_waits_for_turn_end_and_next_foreground_preempts_generation() {
+    let first_foreground_started = Arc::new(tokio::sync::Notify::new());
+    let release_first_foreground = Arc::new(tokio::sync::Notify::new());
+    let soft_generation_started = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(ForegroundPriorityProvider {
+        first_foreground_started: first_foreground_started.clone(),
+        release_first_foreground: release_first_foreground.clone(),
+        soft_generation_started: soft_generation_started.clone(),
+        foreground_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider as Arc<dyn LLMProvider>,
+        "foreground-priority-compaction-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("foreground-priority-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    let mut turn_one = Box::pin(agent_loop.process_direct(
+        "Finish this foreground turn before compacting.",
+        &session_key,
+        "test",
+        "offline",
+    ));
+    await_compaction_sync("turn one to enter its foreground provider call", async {
+        tokio::select! {
+            response = turn_one.as_mut() => {
+                panic!("turn one returned before its provider barrier: {response}");
+            }
+            () = first_foreground_started.notified() => {}
+        }
+    })
+    .await;
+
+    assert!(
+        tokio::time::timeout(
+            COMPACTION_BLOCKED_OBSERVATION,
+            soft_generation_started.notified(),
+        )
+        .await
+        .is_err(),
+        "soft generation raced the still-running foreground model call"
+    );
+
+    release_first_foreground.notify_one();
+    assert_eq!(
+        await_compaction_sync("turn one to finish", turn_one.as_mut()).await,
+        "turn one reply"
+    );
+    await_compaction_sync(
+        "soft generation to start after the full foreground loop",
+        soft_generation_started.notified(),
+    )
+    .await;
+
+    let turn_two = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        agent_loop.process_direct(
+            "Foreground work must preempt soft generation.",
+            &session_key,
+            "test",
+            "offline",
+        ),
+    )
+    .await
+    .expect("turn two did not cancel soft generation and reach the foreground provider");
+    assert_eq!(turn_two, "turn two reply");
+}
+
+struct ReplayStableSoftProvider {
+    foreground_calls: std::sync::Mutex<Vec<Vec<Value>>>,
+}
+
+impl ReplayStableSoftProvider {
+    fn foreground_calls(&self) -> Vec<Vec<Value>> {
+        self.foreground_calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for ReplayStableSoftProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            return Ok(WireRecordingProvider::plain_text_response(
+                "- Persistent project details, decisions, constraints, acknowledged outcomes, and follow-up context remain available.",
+            ));
+        }
+
+        let call = {
+            let mut calls = self.foreground_calls.lock().unwrap();
+            calls.push(messages.to_vec());
+            calls.len()
+        };
+        Ok(WireRecordingProvider::text_response(if call == 1 {
+            "turn one reply"
+        } else {
+            "turn two reply"
+        }))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "replay-stable-soft-compaction-test"
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        Some("http://127.0.0.1:1234/v1")
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn published_soft_checkpoint_replays_and_installs_on_next_turn() {
+    let provider = Arc::new(ReplayStableSoftProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "replay-stable-soft-compaction-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("replay-stable-soft-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    persist_prior_summary(&core, &session.id).await;
+
+    let mut probe = InboundMessage::new("test", "user", "offline", "probe prior summary");
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    assert!(prepared
+        .messages
+        .iter()
+        .any(|message| message.get("_lcm_summary").is_some()));
+    let compaction = prepared.compaction.clone();
+    drop(prepared);
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    await_compaction_sync("soft checkpoint publication and pending handoff", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(core.sessions.load_summary_nodes(&session.id).await.len() >= 2);
+
+    let epoch_before = agent_loop
+        .shared
+        .core_handle
+        .counters
+        .session_prompt_epoch(&session_key);
+    let installs_before = agent_loop
+        .shared
+        .core_handle
+        .counters
+        .lcm_compaction_count
+        .load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        agent_loop
+            .process_direct("Continue on turn two.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+
+    assert!(!compaction.has_pending().await);
+    assert!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .session_prompt_epoch(&session_key)
+            > epoch_before,
+        "installing the replayable soft checkpoint did not rotate the prompt cache"
+    );
+    assert!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .lcm_compaction_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > installs_before,
+        "the pending soft checkpoint was not installed"
+    );
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("To read the exact originals call"))
+    }));
+}
+
+#[tokio::test]
+async fn cloud_working_memory_prefix_change_allows_soft_checkpoint_install() {
+    let provider = Arc::new(ReplayStableSoftProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_cloud_inline_harness_with_memory(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "cloud-working-memory-soft-compaction-test",
+        1_000_000,
+        lcm_config,
+        MemoryConfig::default(),
+    );
+    let session_key = format!(
+        "cloud-working-memory-soft-{}",
+        uuid::Uuid::new_v4()
+    );
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    persist_prior_summary(&core, &session.id).await;
+
+    let mut probe = InboundMessage::new("test", "user", "offline", "probe cloud prefix");
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    let developer_before = prepared
+        .messages
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("developer"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .expect("cloud prompt must have a developer prefix")
+        .to_string();
+    let compaction = prepared.compaction.clone();
+    drop(prepared);
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish cloud turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    await_compaction_sync("cloud soft checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        core.working_memory
+            .get_context(&session.id, usize::MAX)
+            .await
+            .unwrap(),
+        "- Persistent project details, decisions, constraints, acknowledged outcomes, and follow-up context remain available."
+    );
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .lcm_compaction_count
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "publication must not install the checkpoint before the next turn"
+    );
+
+    let mut next_probe = InboundMessage::new("test", "user", "offline", "probe changed prefix");
+    next_probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&next_probe, None, None, None, None)
+        .await;
+    let developer_after = prepared
+        .messages
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("developer"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .expect("working memory must remain in the developer prefix");
+    assert_ne!(developer_after, developer_before);
+    assert!(developer_after.contains("Working Memory (Current Session)"));
+    assert!(developer_after.contains("Persistent project details"));
+    assert!(compaction.has_pending().await);
+    drop(prepared);
+
+    let (text_delta_tx, mut text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(
+        agent_loop
+            .process_direct_streaming(
+                "Continue cloud turn two.",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                text_delta_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await,
+        "turn two reply"
+    );
+
+    assert!(!compaction.has_pending().await);
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .lcm_compaction_count
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the pending cloud checkpoint was not installed exactly once"
+    );
+    assert!(
+        std::iter::from_fn(|| text_delta_rx.try_recv().ok())
+            .any(|delta| delta == "\0cache:reset:lcm_checkpoint"),
+        "installing after a developer-prefix change did not reset the prompt cache"
+    );
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("To read the exact originals call"))
+    }));
+}
+
+struct SoftTurnCancellationProvider {
+    generation_started: Arc<tokio::sync::Notify>,
+    generation_dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl LLMProvider for SoftTurnCancellationProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            let _drop = CompactionTaskDrop(self.generation_dropped.clone());
+            self.generation_started.notify_one();
+            return std::future::pending().await;
+        }
+        Ok(WireRecordingProvider::text_response("foreground reply"))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "soft-turn-cancellation-test"
+    }
+}
+
+#[tokio::test]
+async fn turn_cancellation_after_soft_start_rolls_back_without_checkpoint() {
+    let generation_started = Arc::new(tokio::sync::Notify::new());
+    let generation_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = Arc::new(SoftTurnCancellationProvider {
+        generation_started: generation_started.clone(),
+        generation_dropped: generation_dropped.clone(),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider as Arc<dyn LLMProvider>,
+        "soft-turn-cancellation-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("soft-turn-cancellation-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    let mut probe = InboundMessage::new("test", "user", "offline", "probe soft state");
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    let compaction = prepared.compaction.clone();
+    let engine = agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .unwrap();
+    let (active_before, dag_before, store_before) = {
+        let engine = engine.lock().await;
+        (
+            engine.active_context(),
+            serde_json::to_value(engine.dag()).unwrap(),
+            engine.store_len(),
+        )
+    };
+    drop(prepared);
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut turn = agent_loop.spawn_direct_streaming(
+        "Finish foreground work, then start soft generation.".to_string(),
+        session_key,
+        "test".to_string(),
+        "offline".to_string(),
+        None,
+        text_delta_tx,
+        None,
+        Some(cancellation.clone()),
+        None,
+    );
+    await_compaction_sync(
+        "soft generation to start after foreground work",
+        generation_started.notified(),
+    )
+    .await;
+    cancellation.cancel();
+    let _ = await_compaction_sync("foreground turn to finish", &mut turn)
+        .await
+        .unwrap();
+    await_compaction_sync(
+        "turn cancellation to finish owned soft generation",
+        compaction.wait_for_completion(),
+    )
+    .await;
+
+    assert!(generation_dropped.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!compaction.has_job().await);
+    assert!(!compaction.has_pending().await);
+    let engine = engine.lock().await;
+    assert_eq!(serde_json::to_value(engine.dag()).unwrap(), dag_before);
+    let active_after = engine.active_context();
+    let durable_turn_tail = active_after
+        .strip_prefix(active_before.as_slice())
+        .expect("cancellation changed the pre-turn active context");
+    assert_eq!(
+        durable_turn_tail
+            .iter()
+            .map(|message| (
+                message.get("role").and_then(Value::as_str),
+                message.get("content").and_then(Value::as_str),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                Some("user"),
+                Some("Finish foreground work, then start soft generation."),
+            ),
+            (Some("assistant"), Some("foreground reply")),
+        ]
+    );
+    assert_eq!(engine.store_len(), store_before + durable_turn_tail.len());
+    drop(engine);
+    assert!(core.sessions.load_summary_nodes(&session.id).await.is_empty());
+}
+
+struct HardCancellationProvider {
+    compaction_started: Arc<tokio::sync::Notify>,
+    foreground_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for HardCancellationProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            self.compaction_started.notify_one();
+            return std::future::pending().await;
+        }
+        self.foreground_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(WireRecordingProvider::text_response(
+            "cancelled turn reached foreground inference",
+        ))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "hard-compaction-cancellation-test"
+    }
+}
+
+#[tokio::test]
+async fn cancelling_hard_compaction_restores_engine_without_publishing_checkpoint() {
+    const CANCELLATION_PROMPT: &str = "persistent project detail decisions constraints";
+    let compaction_started = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(HardCancellationProvider {
+        compaction_started: compaction_started.clone(),
+        foreground_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.05,
+        tau_hard: 0.10,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "hard-compaction-cancellation-test",
+        8192,
+        lcm_config,
+    );
+    let session_key = format!("hard-cancellation-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 20, 12).await;
+    persist_prior_summary(&core, &session.id).await;
+
+    let mut probe = InboundMessage::new(
+        "test",
+        "user",
+        "offline",
+        CANCELLATION_PROMPT,
+    );
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    let compaction = prepared.compaction.clone();
+    let engine = agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .expect("hard-pressure session must own an LCM engine");
+    let (active_before, dag_before, store_before) = {
+        let engine = engine.lock().await;
+        (
+            engine.active_context(),
+            serde_json::to_value(engine.dag()).unwrap(),
+            engine.store_len(),
+        )
+    };
+    let durable_before = core.sessions.load_summary_nodes(&session.id).await;
+    drop(prepared);
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut turn = agent_loop.spawn_direct_streaming(
+        CANCELLATION_PROMPT.to_string(),
+        session_key,
+        "test".to_string(),
+        "offline".to_string(),
+        None,
+        text_delta_tx,
+        None,
+        Some(cancellation.clone()),
+        None,
+    );
+    await_compaction_sync(
+        "hard compaction to enter provider generation",
+        compaction_started.notified(),
+    )
+    .await;
+
+    cancellation.cancel();
+    let response = match tokio::time::timeout(std::time::Duration::from_secs(2), &mut turn).await {
+        Ok(joined) => joined.expect("hard-cancelled foreground task panicked"),
+        Err(_) => {
+            turn.abort();
+            let _ = await_compaction_sync("timed-out hard turn to abort", &mut turn).await;
+            panic!("hard compaction ignored the current turn cancellation token");
+        }
+    };
+    assert!(response.is_empty(), "cancelled turn returned: {response}");
+    assert_eq!(
+        provider
+            .foreground_calls
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a cancelled hard-compaction turn must not make a foreground model request"
+    );
+    assert!(!compaction.has_job().await);
+    assert!(!compaction.has_pending().await);
+
+    let mut engine = await_compaction_sync("restored LCM engine lock", engine.lock()).await;
+    assert_eq!(serde_json::to_value(engine.dag()).unwrap(), dag_before);
+    let active_after = engine.active_context();
+    assert!(
+        active_after.starts_with(&active_before),
+        "cancelled compaction did not restore the pre-existing active context"
+    );
+    assert_eq!(
+        active_after.len(),
+        active_before.len() + 1,
+        "only the eagerly persisted current user turn may extend active context"
+    );
+    assert_eq!(engine.store_len(), store_before + 1);
+    let expanded = engine.auto_expand(&core.token_budget, 0, 0);
+    assert!(
+        expanded.iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("persistent project detail"))
+        }),
+        "hard cancellation consumed prior-summary auto-expand eligibility"
+    );
+    drop(engine);
+    assert_eq!(
+        core.sessions.load_summary_nodes(&session.id).await,
+        durable_before,
+        "cancelled hard compaction changed durable summary checkpoints"
+    );
+}
+
+const COMPACTION_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const COMPACTION_BLOCKED_OBSERVATION: std::time::Duration = std::time::Duration::from_millis(250);
+
+async fn await_compaction_sync<T>(
+    context: &str,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::time::timeout(COMPACTION_SYNC_TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("timed out after {COMPACTION_SYNC_TIMEOUT:?} while waiting for {context}")
+        })
+}
+
+#[tokio::test]
+async fn cancelled_before_engine_lock_keeps_soft_compaction_retryable() {
+    use crate::agent::agent_loop::compaction::{execute_lcm_compaction, CompactionPublication};
+    use crate::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
+    use tokio_util::sync::CancellationToken;
+
+    let provider = MockLLM::named("cancelled-before-engine-lock-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_or_resume("cancelled-before-engine-lock")
+        .await;
+    let message = json!({
+        "role": "user",
+        "content": "soft pressure context ".repeat(100),
+        "_db_id": 1,
+    });
+    let messages = vec![message.clone()];
+    let mut engine = LcmEngine::new(LcmConfig {
+        tau_soft: 0.01,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+    });
+    engine.ingest(message);
+    assert_eq!(
+        engine.check_thresholds(&core.token_budget, 0),
+        CompactionAction::Async
+    );
+    let engine = Arc::new(tokio::sync::Mutex::new(engine));
+
+    let engine_guard = engine.lock().await;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let result = await_compaction_sync(
+        "pre-lock cancellation to finish without acquiring the engine",
+        execute_lcm_compaction(
+            core.clone(),
+            session.id,
+            engine.clone(),
+            messages,
+            1,
+            CompactionFailureMode::PreserveContext,
+            cancellation,
+            Arc::new(CompactionPublication::new()),
+        ),
+    )
+    .await;
+    assert!(result.is_none());
+    drop(engine_guard);
+
+    assert_eq!(
+        engine.lock().await.check_thresholds(&core.token_budget, 0),
+        CompactionAction::Async,
+        "cancellation before acquisition must leave soft compaction retryable"
+    );
+}
+
+struct BlockingCompactionProvider {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl LLMProvider for BlockingCompactionProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.started.notify_one();
+        await_compaction_sync(
+            "blocking compaction provider to receive its release",
+            self.release.notified(),
+        )
+        .await;
+        Ok(WireRecordingProvider::plain_text_response(
+            "- Prior turns retain project details, decisions, constraints, and follow-up context.",
+        ))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "owned-blocking-publication-test"
+    }
+}
+
+#[tokio::test]
+async fn blocking_compaction_publication_survives_foreground_abort() {
+    let compaction_started = Arc::new(tokio::sync::Notify::new());
+    let release_compaction = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(BlockingCompactionProvider {
+        started: compaction_started.clone(),
+        release: release_compaction.clone(),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.05,
+        tau_hard: 0.10,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider as Arc<dyn LLMProvider>,
+        "owned-blocking-publication-test",
+        8192,
+        lcm_config,
+    );
+    let session_key = format!("owned-blocking-publication-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    for turn in 0..20_u64 {
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({
+                    "role": "user",
+                    "content": format!(
+                        "turn {turn}: {}",
+                        "persistent project detail with decisions and constraints ".repeat(12)
+                    ),
+                }),
+            )
+            .await;
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({
+                    "role": "assistant",
+                    "content": format!("acknowledged retained project detail for turn {turn}"),
+                }),
+            )
+            .await;
+    }
+
+    let mut msg = InboundMessage::new(
+        "test",
+        "user",
+        "offline",
+        "Use the retained project details to answer briefly.",
+    );
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key));
+    let context = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    let slot = context.compaction.slot.clone();
+    let compaction = context.compaction.clone();
+    let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = agent_loop.spawn_direct_streaming(
+        "Use the retained project details to answer briefly.".to_string(),
+        session_key,
+        "test".to_string(),
+        "offline".to_string(),
+        None,
+        text_delta_tx,
+        None,
+        None,
+        None,
+    );
+    await_compaction_sync(
+        "real turn to enter LCM generation",
+        compaction_started.notified(),
+    )
+    .await;
+    let slot_guard = slot.lock().await;
+    release_compaction.notify_one();
+
+    await_compaction_sync("actual compaction to publish to SQLite", async {
+        loop {
+            if !core
+                .sessions
+                .load_summary_nodes(&session.id)
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    // Dropping the foreground waiter models Escape/Ctrl-C after durable
+    // publication but before the pending-slot handoff can acquire its lock.
+    turn.abort();
+    assert!(
+        await_compaction_sync("aborted foreground turn to join", turn)
+            .await
+            .unwrap_err()
+            .is_cancelled()
+    );
+    assert!(
+        compaction.has_job().await,
+        "blocking publication must remain owned after its foreground waiter is dropped"
+    );
+    drop(slot_guard);
+    await_compaction_sync("owned publication to finish pending-slot handoff", async {
+        loop {
+            if compaction.has_pending().await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    await_compaction_sync(
+        "blocking publication job to reap after handoff",
+        compaction.cancel_and_reap(),
+    )
+    .await;
+    assert!(!compaction.has_job().await);
+}
+
+#[tokio::test]
+async fn dropped_reaper_leaves_job_owned_for_next_reaper() {
+    let handle = CompactionHandle::new();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let cancellation_seen = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let task_started = started.clone();
+    let task_cancellation_seen = cancellation_seen.clone();
+    let task_release = release.clone();
+    let task_completed = completed.clone();
+    assert!(
+        handle
+            .try_start(move |cancellation, _publication| async move {
+                task_started.notify_one();
+                cancellation.cancelled().await;
+                task_cancellation_seen.notify_one();
+                await_compaction_sync(
+                    "retained owned job to receive its release",
+                    task_release.notified(),
+                )
+                .await;
+                task_completed.store(true, std::sync::atomic::Ordering::Release);
+                None
+            })
+            .await
+    );
+    await_compaction_sync("owned task to start", started.notified()).await;
+
+    let first_handle = handle.clone();
+    let first_reaper = tokio::spawn(async move {
+        await_compaction_sync(
+            "first reaper to finish after cancellation",
+            first_handle.cancel_and_reap(),
+        )
+        .await;
+    });
+    await_compaction_sync(
+        "first reaper to cancel generation",
+        cancellation_seen.notified(),
+    )
+    .await;
+    first_reaper.abort();
+    assert!(
+        await_compaction_sync("aborted first reaper to join", first_reaper)
+            .await
+            .unwrap_err()
+            .is_cancelled()
+    );
+    assert!(
+        handle.has_job().await,
+        "cancelling a reaper must not detach the job it was joining"
+    );
+
+    release.notify_one();
+    await_compaction_sync(
+        "later reaper to join the retained task",
+        handle.cancel_and_reap(),
+    )
+    .await;
+    assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!handle.has_job().await);
+}
+
+#[derive(Clone)]
+struct CompactionLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CompactionLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn panicked_owned_job_reaps_with_session_phase_context() {
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || CompactionLogWriter(writer.clone()))
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let provider = MockLLM::named("panic-session-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let session_key = format!("panic-session-{}", uuid::Uuid::new_v4());
+    let mut msg = InboundMessage::new("test", "user", "offline", "panic");
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key));
+    let context = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    let handle = context.compaction;
+    let session_id = context.session_id;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let task_started = started.clone();
+    assert!(
+        handle
+            .try_start(move |_cancellation, _publication| async move {
+                task_started.notify_one();
+                panic!("compaction panic");
+                #[allow(unreachable_code)]
+                None
+            })
+            .await
+    );
+    await_compaction_sync("panicking owned job to start", started.notified()).await;
+    await_compaction_sync("panicked owned job to reap", handle.cancel_and_reap()).await;
+
+    assert!(!handle.has_job().await, "a panicked job must be reaped");
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("owned compaction task failed"), "{logs}");
+    assert!(logs.contains(&format!("session_id={session_id}")), "{logs}");
+    assert!(logs.contains("phase=generating"), "{logs}");
+    assert!(
+        handle
+            .try_start(|_cancellation, _publication| async move { None })
+            .await,
+        "panic cleanup must leave the session restartable"
+    );
+    await_compaction_sync(
+        "restarted owned job to reap after panic cleanup",
+        handle.cancel_and_reap(),
+    )
+    .await;
+}
+
+struct CompactionTaskDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CompactionTaskDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[tokio::test]
+async fn final_handle_drop_aborts_generation_but_preserves_publication_handoff() {
+    let generation = CompactionHandle::new();
+    let generation_started = Arc::new(tokio::sync::Notify::new());
+    let generation_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_started = generation_started.clone();
+    let task_dropped = generation_dropped.clone();
+    assert!(
+        generation
+            .try_start(move |_cancellation, _publication| async move {
+                let _drop = CompactionTaskDrop(task_dropped);
+                task_started.notify_one();
+                std::future::pending::<Option<crate::agent::agent_core::PendingCompaction>>().await
+            })
+            .await
+    );
+    await_compaction_sync(
+        "generation job to start before final-owner drop",
+        generation_started.notified(),
+    )
+    .await;
+    drop(generation);
+    await_compaction_sync("final-owner drop to abort generation", async {
+        while !generation_dropped.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    let publishing = CompactionHandle::new();
+    let slot = publishing.slot.clone();
+    let enter_publication = Arc::new(tokio::sync::Notify::new());
+    let publication_claimed = Arc::new(tokio::sync::Notify::new());
+    let task_slot = slot.clone();
+    let task_enter_publication = enter_publication.clone();
+    let task_publication_claimed = publication_claimed.clone();
+    assert!(
+        publishing
+            .try_start(move |_cancellation, publication| async move {
+                await_compaction_sync(
+                    "publishing job to receive its entry signal",
+                    task_enter_publication.notified(),
+                )
+                .await;
+                assert!(publication.begin_publication());
+                task_publication_claimed.notify_one();
+                let guard = task_slot.lock().await;
+                drop(guard);
+                Some(crate::agent::agent_core::PendingCompaction {
+                    result: crate::agent::compaction::CompactionResult {
+                        messages: vec![json!({
+                            "role": "assistant",
+                            "content": "published-checkpoint",
+                        })],
+                    },
+                    snapshot: Vec::new(),
+                })
+            })
+            .await
+    );
+
+    let slot_guard = slot.lock().await;
+    enter_publication.notify_one();
+    await_compaction_sync(
+        "owned job to claim publication before final-owner drop",
+        publication_claimed.notified(),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    drop(publishing);
+    drop(slot_guard);
+
+    await_compaction_sync("publication to complete pending-slot handoff", async {
+        loop {
+            if slot.lock().await.as_ref().is_some_and(|pending| {
+                pending
+                    .result
+                    .messages
+                    .first()
+                    .and_then(|message| message.get("content"))
+                    .and_then(Value::as_str)
+                    == Some("published-checkpoint")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn compaction_shutdown_waits_for_publication_and_reaps_generation() {
+    let provider = MockLLM::named("compaction-shutdown-drain-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let publishing = CompactionHandle::for_session("shutdown-publishing");
+    let generating = CompactionHandle::for_session("shutdown-generating");
+    {
+        let mut handles = agent_loop.shared.compaction_handles.lock().await;
+        handles.insert("shutdown-publishing".to_string(), publishing.clone());
+        handles.insert("shutdown-generating".to_string(), generating.clone());
+    }
+
+    let slot = publishing.slot.clone();
+    let enter_publication = Arc::new(tokio::sync::Notify::new());
+    let publication_claimed = Arc::new(tokio::sync::Notify::new());
+    let task_enter_publication = enter_publication.clone();
+    let task_publication_claimed = publication_claimed.clone();
+    assert!(
+        publishing
+            .try_start(move |_cancellation, publication| async move {
+                task_enter_publication.notified().await;
+                assert!(publication.begin_publication());
+                task_publication_claimed.notify_one();
+                Some(crate::agent::agent_core::PendingCompaction {
+                    result: crate::agent::compaction::CompactionResult {
+                        messages: vec![json!({
+                            "role": "assistant",
+                            "content": "shutdown-published-checkpoint",
+                        })],
+                    },
+                    snapshot: Vec::new(),
+                })
+            })
+            .await
+    );
+    let slot_guard = slot.lock().await;
+    enter_publication.notify_one();
+    await_compaction_sync(
+        "shutdown publication to claim its atomic boundary",
+        publication_claimed.notified(),
+    )
+    .await;
+
+    let generation_cancelled = Arc::new(tokio::sync::Notify::new());
+    let task_generation_cancelled = generation_cancelled.clone();
+    assert!(
+        generating
+            .try_start(move |cancellation, _publication| async move {
+                cancellation.cancelled().await;
+                task_generation_cancelled.notify_one();
+                None
+            })
+            .await
+    );
+
+    let mut drain = Box::pin(agent_loop.drain_compaction_jobs());
+    await_compaction_sync(
+        "shutdown drain to cancel generation while publication stays blocked",
+        async {
+            tokio::select! {
+                () = drain.as_mut() => {
+                    panic!("shutdown drain returned before pending handoff was released");
+                }
+                () = generation_cancelled.notified() => {}
+            }
+        },
+    )
+    .await;
+
+    drop(slot_guard);
+    await_compaction_sync(
+        "shutdown drain to join publication after pending handoff",
+        drain.as_mut(),
+    )
+    .await;
+
+    assert!(!publishing.has_job().await);
+    assert!(!generating.has_job().await);
+    assert_eq!(
+        slot.lock()
+            .await
+            .as_ref()
+            .and_then(|pending| pending.result.messages.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str),
+        Some("shutdown-published-checkpoint")
+    );
+}
+
+#[tokio::test]
+async fn agent_clear_reaps_job_and_discards_pending_checkpoint() {
+    let provider = MockLLM::named("clear-owned-compaction-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let session_key = format!("clear-owned-compaction-{}", uuid::Uuid::new_v4());
+    let mut msg = InboundMessage::new("test", "user", "offline", "first");
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let context = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    let compaction = context.compaction.clone();
+    let publication_claimed = Arc::new(tokio::sync::Notify::new());
+    let release_publication = Arc::new(tokio::sync::Notify::new());
+    let task_publication_claimed = publication_claimed.clone();
+    let task_release_publication = release_publication.clone();
+    assert!(
+        compaction
+            .try_start(move |_cancellation, publication| async move {
+                assert!(publication.begin_publication());
+                task_publication_claimed.notify_one();
+                await_compaction_sync(
+                    "agent-clear publication barrier to release",
+                    task_release_publication.notified(),
+                )
+                .await;
+                Some(crate::agent::agent_core::PendingCompaction {
+                    result: crate::agent::compaction::CompactionResult {
+                        messages: vec![json!({
+                            "role": "assistant",
+                            "content": "pending checkpoint before agent clear",
+                        })],
+                    },
+                    snapshot: Vec::new(),
+                })
+            })
+            .await
+    );
+    await_compaction_sync(
+        "clear-owned compaction to claim publication",
+        publication_claimed.notified(),
+    )
+    .await;
+
+    let mut clear = Box::pin(agent_loop.clear_session_state(&session_key));
+    await_compaction_sync("agent clear to block while reaping publication", async {
+        tokio::select! {
+            () = clear.as_mut() => {
+                panic!("agent clear returned before publication handoff was released");
+            }
+            () = tokio::time::sleep(COMPACTION_BLOCKED_OBSERVATION) => {}
+        }
+    })
+    .await;
+    release_publication.notify_one();
+    await_compaction_sync(
+        "agent clear to reap publication and discard its checkpoint",
+        clear.as_mut(),
+    )
+    .await;
+
+    assert!(!compaction.has_job().await);
+    assert!(!compaction.has_pending().await);
+    assert!(!agent_loop
+        .shared
+        .compaction_handles
+        .lock()
+        .await
+        .contains_key(&context.session_id));
+    assert!(!agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .contains_key(&context.session_id));
+}
+
+fn repl_context_for_clear_test(
+    agent_loop: AgentLoop,
+    core_handle: SharedCoreHandle,
+    session_id: String,
+    workspace: std::path::PathBuf,
+) -> crate::repl::commands::ReplContext {
+    let (display_tx, display_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::repl::commands::ReplContext {
+        config: crate::config::schema::Config::default(),
+        core_handle,
+        agent_loop,
+        session_id,
+        lang: None,
+        srv: crate::repl::ServerState::new("0".to_string()),
+        current_model_path: workspace.clone(),
+        active_channels: Vec::new(),
+        display_tx,
+        display_rx,
+        cron_service: Arc::new(crate::cron::service::CronService::new(
+            workspace.join("cron.json"),
+        )),
+        email_config: None,
+        rl: None,
+        watchdog_handle: None,
+        restart_tx,
+        restart_rx,
+        health_registry: None,
+        #[cfg(feature = "voice")]
+        voice_session: None,
+        #[cfg(feature = "cluster")]
+        cluster_state: None,
+    }
+}
+
+#[tokio::test]
+async fn interactive_clear_is_atomic_against_session_admission() {
+    let provider = MockLLM::named("interactive-clear-admission-test");
+    let (agent_loop, workspace) = build_local_inline_harness_with_memory(
+        provider,
+        "interactive-clear-admission-test",
+        4096,
+        LcmSchemaConfig::default(),
+        MemoryConfig::default(),
+    );
+    let core_handle = agent_loop.shared.core_handle.clone();
+    let core = core_handle.swappable();
+    let session_key = format!("interactive-clear-admission-{}", uuid::Uuid::new_v4());
+    let session = core.sessions.get_or_resume(&session_key).await;
+    core.sessions
+        .add_message(
+            &session.id,
+            &json!({"role": "user", "content": "history before clear"}),
+        )
+        .await;
+    core.sessions
+        .save_working_memory(&session.id, "working memory before clear", "active", 1)
+        .await
+        .unwrap();
+
+    let mut first_msg = InboundMessage::new("test", "user", "offline", "first");
+    first_msg
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let first = agent_loop
+        .shared
+        .prepare_context(&first_msg, None, None, None, None)
+        .await;
+    let old_compaction = first.compaction.clone();
+    let old_engine = agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .unwrap();
+    let publication_claimed = Arc::new(tokio::sync::Notify::new());
+    let release_publication = Arc::new(tokio::sync::Notify::new());
+    let pending_handoff: Arc<
+        std::sync::Mutex<Option<crate::agent::agent_core::PendingCompaction>>,
+    > = Arc::new(std::sync::Mutex::new(None));
+    let task_publication_claimed = publication_claimed.clone();
+    let task_release_publication = release_publication.clone();
+    let task_pending_handoff = pending_handoff.clone();
+    assert!(
+        old_compaction
+            .try_start(move |_cancellation, publication| async move {
+                let pending = crate::agent::agent_core::PendingCompaction {
+                    result: crate::agent::compaction::CompactionResult {
+                        messages: vec![json!({
+                            "role": "assistant",
+                            "content": "pending checkpoint before interactive clear",
+                        })],
+                    },
+                    snapshot: Vec::new(),
+                };
+                assert!(publication.begin_publication());
+                *task_pending_handoff.lock().unwrap() = Some(pending);
+                task_publication_claimed.notify_one();
+                await_compaction_sync(
+                    "interactive-clear publication barrier to release",
+                    task_release_publication.notified(),
+                )
+                .await;
+                let pending = task_pending_handoff.lock().unwrap().take();
+                pending
+            })
+            .await
+    );
+    await_compaction_sync(
+        "interactive-clear fixture to claim real publication",
+        publication_claimed.notified(),
+    )
+    .await;
+
+    let counters = core_handle.counters.clone();
+    let stale_prompt_epoch = counters.reset_session_prompt_state(&session_key);
+    let stale_higgs_session_id = 9_001;
+    counters.record_higgs_session_id(&session_key, stale_higgs_session_id);
+    counters
+        .last_context_used
+        .store(123, std::sync::atomic::Ordering::Relaxed);
+    counters
+        .last_message_count
+        .store(45, std::sync::atomic::Ordering::Relaxed);
+    counters
+        .last_working_memory_tokens
+        .store(67, std::sync::atomic::Ordering::Relaxed);
+
+    let repl = repl_context_for_clear_test(
+        agent_loop,
+        core_handle.clone(),
+        session_key.clone(),
+        workspace,
+    );
+    let mut clear = Box::pin(repl.agent_loop.clear_session_state(&session_key));
+    await_compaction_sync(
+        "interactive clear to block while reaping publication",
+        async {
+            tokio::select! {
+                () = clear.as_mut() => {
+                    panic!("interactive clear returned before publication handoff was released");
+                }
+                () = tokio::time::sleep(COMPACTION_BLOCKED_OBSERVATION) => {}
+            }
+        },
+    )
+    .await;
+
+    let retained_history = core
+        .sessions
+        .get_history(&session.id, usize::MAX, usize::MAX)
+        .await;
+    assert!(retained_history.iter().any(|message| {
+        message.get("content").and_then(Value::as_str) == Some("history before clear")
+    }));
+    assert_eq!(
+        core.working_memory
+            .get_context(&session.id, usize::MAX)
+            .await
+            .unwrap(),
+        "working memory before clear"
+    );
+    {
+        // The real owned wrapper writes `slot` only after this publishing
+        // future returns. Holding the actual checkpoint here models the
+        // reachable pre-handoff state without fabricating job + populated slot.
+        let pending = pending_handoff.lock().unwrap();
+        let pending = pending
+            .as_ref()
+            .expect("publishing job must retain its pending checkpoint");
+        assert_eq!(
+            pending
+                .result
+                .messages
+                .first()
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str),
+            Some("pending checkpoint before interactive clear")
+        );
+    }
+    assert!(
+        !old_compaction.has_pending().await,
+        "the slot must remain empty until the publishing future hands off its checkpoint"
+    );
+    let retained_engine = repl
+        .agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .expect("old engine must remain installed while clear is reaping");
+    assert!(Arc::ptr_eq(&old_engine, &retained_engine));
+
+    let mut second_msg = InboundMessage::new("test", "user", "offline", "second");
+    second_msg
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let waiter_counters = counters.clone();
+    let waiter_session_key = session_key.clone();
+    let mut prepare = Box::pin(async {
+        let fresh = repl
+            .agent_loop
+            .shared
+            .prepare_context(&second_msg, None, None, None, None)
+            .await;
+        let observed = (
+            waiter_counters.session_prompt_epoch(&waiter_session_key),
+            waiter_counters
+                .last_context_used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            waiter_counters
+                .last_message_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            waiter_counters
+                .last_working_memory_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            waiter_counters.pending_higgs_session_drop_ids(&waiter_session_key),
+        );
+        (fresh, observed)
+    });
+    await_compaction_sync(
+        "new preparation to remain blocked by interactive clear",
+        async {
+            tokio::select! {
+                _ = prepare.as_mut() => {
+                    panic!("preparation entered before interactive clear retired the old handle");
+                }
+                () = tokio::time::sleep(COMPACTION_BLOCKED_OBSERVATION) => {}
+            }
+        },
+    )
+    .await;
+
+    release_publication.notify_one();
+    let ((), (fresh, observed)) = await_compaction_sync(
+        "interactive clear and waiting preparation to finish after retirement",
+        async { tokio::join!(clear.as_mut(), prepare.as_mut()) },
+    )
+    .await;
+
+    assert_eq!(
+        observed.0,
+        stale_prompt_epoch.saturating_add(1),
+        "the admitted waiter observed the pre-clear prompt epoch"
+    );
+    assert_eq!(
+        (observed.1, observed.2, observed.3),
+        (0, 0, 0),
+        "the admitted waiter observed stale aggregate context counters"
+    );
+    assert!(
+        observed.4.contains(&stale_higgs_session_id),
+        "the admitted waiter did not observe the cleared Higgs session handoff"
+    );
+
+    let remaining_history = core
+        .sessions
+        .get_history(&session.id, usize::MAX, usize::MAX)
+        .await;
+    assert!(
+        remaining_history.is_empty(),
+        "history remained after clear: {}",
+        serde_json::to_string(&remaining_history).unwrap()
+    );
+    assert_eq!(
+        core.working_memory
+            .get_context(&session.id, usize::MAX)
+            .await
+            .unwrap(),
+        ""
+    );
+    assert!(pending_handoff.lock().unwrap().is_none());
+    assert!(!old_compaction.has_job().await);
+    assert!(!old_compaction.has_pending().await);
+    assert!(
+        !old_compaction
+            .try_start(|_cancellation, _publication| async move { None })
+            .await,
+        "the retired pre-clear handle must reject new compaction"
+    );
+    assert!(!Arc::ptr_eq(&old_compaction.slot, &fresh.compaction.slot));
+    let fresh_engine = repl
+        .agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old_engine, &fresh_engine));
+}
+
 #[tokio::test]
 async fn concrete_session_reuses_compaction_checkpoint_handle() {
     let provider = MockLLM::named("local-compaction-checkpoint-handle-test");
@@ -3138,9 +4856,24 @@ async fn concrete_session_reuses_compaction_checkpoint_handle() {
         "the pending checkpoint must remain visible across turns in one concrete session"
     );
     assert!(
-        Arc::ptr_eq(&first.compaction.in_flight, &second.compaction.in_flight),
-        "the in-flight barrier must remain visible across turns in one concrete session"
+        first
+            .compaction
+            .try_start(|cancellation, _publication| async move {
+                cancellation.cancelled().await;
+                None
+            })
+            .await
     );
+    assert!(
+        second.compaction.has_job().await,
+        "the owned job must remain visible across turns in one concrete session"
+    );
+    await_compaction_sync(
+        "shared session compaction job to reap",
+        second.compaction.cancel_and_reap(),
+    )
+    .await;
+    assert!(!first.compaction.has_job().await);
 }
 
 #[tokio::test]
@@ -3178,14 +4911,29 @@ async fn idle_rollover_does_not_reuse_compaction_checkpoint_handle() {
         &first.compaction.slot,
         &second.compaction.slot
     ));
-    assert!(!Arc::ptr_eq(
-        &first.compaction.in_flight,
-        &second.compaction.in_flight
-    ));
+    assert!(
+        first
+            .compaction
+            .try_start(|cancellation, _publication| async move {
+                cancellation.cancelled().await;
+                None
+            })
+            .await
+    );
+    assert!(first.compaction.has_job().await);
+    assert!(
+        !second.compaction.has_job().await,
+        "an idle rollover must own an independent compaction lifecycle"
+    );
+    await_compaction_sync(
+        "rolled-over session compaction job to reap",
+        first.compaction.cancel_and_reap(),
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn in_flight_compaction_checkpoint_hides_unpublished_dag() {
+async fn pending_compaction_checkpoint_hides_unpublished_dag() {
     let provider = MockLLM::named("local-compaction-checkpoint-visibility-test");
     let (agent_loop, _workspace) = build_local_inline_harness(provider);
     let session_key = format!("compaction-checkpoint-visibility-{}", uuid::Uuid::new_v4());
@@ -3242,31 +4990,7 @@ async fn in_flight_compaction_checkpoint_hides_unpublished_dag() {
         .unwrap();
     *engine.lock().await = rebuilt;
 
-    first
-        .compaction
-        .in_flight
-        .store(true, std::sync::atomic::Ordering::Release);
-    msg.content = "second".to_string();
-    let second = agent_loop
-        .shared
-        .prepare_context(&msg, None, None, None, None)
-        .await;
-    first
-        .compaction
-        .in_flight
-        .store(false, std::sync::atomic::Ordering::Release);
-
-    let assembled = serde_json::to_string(&second.messages).unwrap();
-    assert!(
-        assembled.contains("raw-source-marker"),
-        "raw history remains authoritative until the checkpoint is published"
-    );
-    assert!(
-        !assembled.contains("checkpoint-summary-marker"),
-        "an in-flight DAG mutation must not become prompt-visible before checkpoint publication"
-    );
-
-    let snapshot = second.messages[..second.new_start].to_vec();
+    let snapshot = first.messages[..first.new_start].to_vec();
     *first.compaction.slot.lock().await = Some(crate::agent::agent_core::PendingCompaction {
         result: crate::agent::compaction::CompactionResult {
             messages: vec![json!({
@@ -3276,14 +5000,14 @@ async fn in_flight_compaction_checkpoint_hides_unpublished_dag() {
         },
         snapshot,
     });
-    msg.content = "third".to_string();
-    let third = agent_loop
+    msg.content = "second".to_string();
+    let second = agent_loop
         .shared
         .prepare_context(&msg, None, None, None, None)
         .await;
     *first.compaction.slot.lock().await = None;
 
-    let assembled = serde_json::to_string(&third.messages).unwrap();
+    let assembled = serde_json::to_string(&second.messages).unwrap();
     assert!(
         assembled.contains("raw-source-marker"),
         "raw history remains authoritative while the checkpoint is pending"
