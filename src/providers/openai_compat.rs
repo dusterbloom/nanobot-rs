@@ -466,17 +466,12 @@ fn apply_local_reasoning_controls(
     }
 
     if let Some(budget) = thinking_budget {
-        // Reasoning templates are tuned for high-entropy sampling; several
-        // local reasoning models (including VibeThinker) degrade or loop when
-        // driven with nanobot's calmer default temperature.
-        body["temperature"] = serde_json::json!(1.0);
         body["chat_template_kwargs"] = serde_json::json!({
             "enable_thinking": true
         });
         body["reasoning_budget"] = serde_json::json!(budget);
         body["reasoning_format"] = serde_json::json!("deepseek");
     } else if model_prefers_hidden_reasoning(model) {
-        body["temperature"] = serde_json::json!(1.0);
         body["chat_template_kwargs"] = serde_json::json!({
             "enable_thinking": true
         });
@@ -887,6 +882,16 @@ impl OpenAICompatProvider {
             "max_tokens": max_tokens,
             "temperature": temperature,
         });
+        if is_local_api_base(&self.api_base) {
+            // Local servers own per-model sampling: higgs' config.toml
+            // generation_defaults (and LM Studio presets) carry the
+            // model-tuned temperature. A client-side value silently
+            // overrides it — nanobot's generic 0.7 was beating the
+            // Liquid-recommended 0.1 on LFM2.5. Cloud APIs keep ours.
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("temperature");
+            }
+        }
         match kind {
             // Explicit non-streaming: the OpenAI spec defaults `stream` to
             // false, but Apple FM's `fm serve` defaults to SSE when the field
@@ -1374,6 +1379,169 @@ fn parse_tool_arguments(s: &str) -> Result<HashMap<String, serde_json::Value>, S
 }
 
 /// Parse the OpenAI-compatible JSON response into an `LLMResponse`.
+
+/// Parse LFM2-format tool calls from model content text.
+///
+/// LFM2 models (LFM2.5, Macaw) output Pythonic function calls between
+/// `<|tool_call_start|>` and `<|tool_call_end|>` tokens:
+///   `<|tool_call_start|>[func(arg='val')]<|tool_call_end|>`
+///
+/// When the model is trained with its native template (which renders
+/// tool-call history in this format), its live output also uses this
+/// format rather than OpenAI JSON `tool_calls`.
+fn parse_lfm2_tool_calls(content: &str) -> Vec<crate::providers::base::ToolCallRequest> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static LFM2_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"<\|tool_call_start\|>\s*\[(.*?)\]\s*<\|tool_call_end\|>"
+        ).unwrap()
+    });
+
+    let mut out = Vec::new();
+    let Some(caps) = LFM2_RE.captures(content) else {
+        return out;
+    };
+    let raw = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+    // Split comma-separated calls.  The list is Pythonic:
+    //   func1(), func2(arg='val')
+    // Commas inside quotes are not call separators.
+    let calls = split_lfm2_calls(raw);
+    for (idx, call) in calls.iter().enumerate() {
+        let call = call.trim();
+        if call.is_empty() {
+            continue;
+        }
+        let (name, args_str) = match call.split_once('(') {
+            Some((n, rest)) => {
+                let rest = rest.strip_suffix(')').unwrap_or(rest);
+                (n.trim().to_string(), rest.trim().to_string())
+            }
+            None => continue,
+        };
+        if !is_valid_tool_call_name(&name) {
+            continue;
+        }
+        let args_map = parse_lfm2_kwargs(&args_str);
+        out.push(crate::providers::base::ToolCallRequest {
+            id: format!("lfm2_call_{}_{}", idx, uuid::Uuid::new_v4().to_string().chars().take(8).collect::<String>()),
+            name,
+            arguments: args_map,
+        });
+    }
+    out
+}
+
+/// Split "func1(), func2(a='b')" into ["func1()", "func2(a='b')"].
+/// Strip LFM2 tool-call markers from content so the model doesn't
+/// see its own tool calls as raw text when they're echoed in history.
+fn strip_lfm2_markers(content: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static LFM2_STRIP: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"<\|tool_call_start\|>.*?<\|tool_call_end\|>").unwrap()
+    });
+    LFM2_STRIP.replace_all(content, "").trim().to_string()
+}
+
+fn split_lfm2_calls(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut start = 0;
+    for (i, ch) in raw.char_indices() {
+        match ch {
+            '\'' | '\"' => in_string = !in_string,
+            '(' => if !in_string { depth += 1 },
+            ')' => if !in_string { depth = depth.saturating_sub(1) },
+            ',' => if depth == 0 && !in_string {
+                out.push(raw[start..i].to_string());
+                start = i + 1;
+            },
+            _ => {}
+        }
+    }
+    if start < raw.len() {
+        out.push(raw[start..].to_string());
+    }
+    out
+}
+
+/// Parse keyword-style arguments: `a='val', b=42, c=True` -> HashMap.
+fn parse_lfm2_kwargs(args: &str) -> std::collections::HashMap<String, serde_json::Value> {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    if args.is_empty() {
+        return map;
+    }
+    let mut key = String::new();
+    let mut val = String::new();
+    let mut in_key = true;
+    let mut in_string = false;
+    let mut string_char = '"';
+    for ch in args.chars() {
+        if in_string {
+            if ch == string_char {
+                in_string = false;
+            } else {
+                val.push(ch);
+            }
+            continue;
+        }
+        if in_key && ch == '=' {
+            in_key = false;
+            continue;
+        }
+        if !in_key && (ch == '\'' || ch == '"') {
+            in_string = true;
+            string_char = ch;
+            continue;
+        }
+        if ch == ',' && !in_string {
+            let k = key.trim().to_string();
+            let v = val.trim().to_string();
+            if !k.is_empty() {
+                // Try as number/bool, fall back to string
+                if let Ok(n) = v.parse::<i64>() {
+                    map.insert(k, serde_json::Value::Number(n.into()));
+                } else if v == "True" || v == "true" {
+                    map.insert(k, serde_json::Value::Bool(true));
+                } else if v == "False" || v == "false" {
+                    map.insert(k, serde_json::Value::Bool(false));
+                } else {
+                    map.insert(k, serde_json::Value::String(v));
+                }
+            }
+            key.clear();
+            val.clear();
+            in_key = true;
+            continue;
+        }
+        if in_key {
+            key.push(ch);
+        } else {
+            val.push(ch);
+        }
+    }
+    // Last arg
+    let k = key.trim().to_string();
+    let v = val.trim().to_string();
+    if !k.is_empty() {
+        let parsed = if let Ok(n) = v.parse::<i64>() {
+            serde_json::Value::Number(n.into())
+        } else if v == "True" || v == "true" {
+            serde_json::Value::Bool(true)
+        } else if v == "False" || v == "false" {
+            serde_json::Value::Bool(false)
+        } else {
+            serde_json::Value::String(v)
+        };
+        map.insert(k, parsed);
+    }
+    map
+}
+
 fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
     let choices = data
         .get("choices")
@@ -1528,6 +1696,20 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
             });
         }
     }
+
+    // LFM2 fallback: models with native templates (Macaw, LFM2.5)
+    // output `<|tool_call_start|>[func(args)]<|tool_call_end|>` in the
+    // content text body.  When the OpenAI `tool_calls` array is empty
+    // but the content carries LFM2 markers, parse them.
+    let (content, tool_calls) = if tool_calls.is_empty()
+        && content.as_ref().is_some_and(|c| c.contains("<|tool_call_start|>"))
+    {
+        let lfm2_calls = parse_lfm2_tool_calls(content.as_deref().unwrap_or(""));
+        let cleaned = strip_lfm2_markers(content.as_deref().unwrap_or(""));
+        (Some(cleaned), lfm2_calls)
+    } else {
+        (content, tool_calls)
+    };
 
     // Extract usage.
     let mut usage = HashMap::new();
@@ -1698,6 +1880,17 @@ async fn parse_sse_stream(
                         arguments,
                     });
                 }
+
+                // LFM2 fallback: same as parse_response path.
+                let (content, tool_calls) = if tool_calls.is_empty()
+                    && content.as_ref().is_some_and(|c| c.contains("<|tool_call_start|>"))
+                {
+                    let lfm2_calls = parse_lfm2_tool_calls(content.as_deref().unwrap_or(""));
+                    let cleaned = strip_lfm2_markers(content.as_deref().unwrap_or(""));
+                    (Some(cleaned), lfm2_calls)
+                } else {
+                    (content, tool_calls)
+                };
 
                 let _ = tx.send(StreamChunk::Done(LLMResponse {
                     content,
@@ -3185,7 +3378,6 @@ mod tests {
         assert_eq!(body["reasoning_budget"], 1024);
         assert_eq!(body["reasoning_format"], "deepseek");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
-        assert_eq!(body["temperature"], 1.0);
     }
 
     #[test]
@@ -3221,15 +3413,52 @@ mod tests {
             body.get("reasoning_budget").is_none(),
             "default-on hidden reasoning must not impose a nanobot budget"
         );
-        assert_eq!(body["temperature"], 1.0);
     }
 
     #[test]
-    fn test_non_reasoning_local_model_keeps_configured_temperature() {
-        let mut body =
-            serde_json::json!({"model": "nanbeige-16b", "messages": [], "temperature": 0.2});
-        apply_local_reasoning_controls(&mut body, "http://localhost:1234", "nanbeige-16b", None);
-        assert_eq!(body["temperature"], 0.2);
+    fn test_build_chat_request_omits_temperature_for_local_servers() {
+        // Local servers own per-model sampling (higgs config.toml
+        // generation_defaults, LM Studio presets); a client-side temperature
+        // would silently override the model-tuned value. Cloud keeps ours.
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+
+        let local = OpenAICompatProvider::new(
+            "local",
+            Some("http://127.0.0.1:9000/v1"),
+            Some("lfm2.5-2.6b-8bit"),
+        );
+        let (_, body) = local.build_chat_request(
+            &messages,
+            None,
+            Some("lfm2.5-2.6b-8bit"),
+            256,
+            0.7,
+            None,
+            None,
+            RequestKind::Streaming,
+        );
+        assert!(
+            body.get("temperature").is_none(),
+            "local requests must not carry a client temperature"
+        );
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"],
+            true,
+            "LFM2.5 always thinks; the tracker must stay in sync"
+        );
+
+        let remote = OpenAICompatProvider::new("sk-test", Some(OPENAI_API_BASE), Some("gpt-4o"));
+        let (_, body) = remote.build_chat_request(
+            &messages,
+            None,
+            Some("gpt-4o"),
+            256,
+            0.7,
+            None,
+            None,
+            RequestKind::Streaming,
+        );
+        assert_eq!(body["temperature"], serde_json::json!(0.7));
     }
 
     #[test]

@@ -34,6 +34,42 @@ static HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
 /// never populate `tool_calls`. Distinct from `[Called ...]` narration: there
 /// is no verb, just the call.
 ///
+/// This doc previously sat on `XML_HALLUCINATED_CALL_RE`, which only matches
+/// `<xml><bigtag>` envelopes — so the bare literal it describes had no
+/// structural matcher at all and was caught incidentally by the prose list
+/// (`NAMED_TOOL_INTENT_RE`). It now has its own.
+///
+/// A markdown link cannot match: `[label](url)` puts `(` after the `]`, while
+/// this requires the parenthesised args *inside* the brackets and a closing
+/// `)]`.
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static BARE_CALL_LITERAL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\[[a-z][a-z0-9_]*\([^)]*\)\]").expect("bare call literal regex")
+});
+
+/// Characters that, immediately before the `[`, prove the bracket is ordinary
+/// code rather than a fabricated call:
+/// - `#` → Rust attribute (`#[cfg(test)]`, `#[derive(Debug)]`)
+/// - `!` → macro invocation (`vec![foo()]`)
+/// - identifier char → an index expression (`items[len(items)]`, `arr[max(a,b)]`)
+///
+/// A real narrated call sits at a token boundary: start of content, whitespace,
+/// or after sentence punctuation (`…current time.[exec(command='date')]`).
+fn bracket_is_code_context(prefix: &str) -> bool {
+    prefix
+        .chars()
+        .next_back()
+        .is_some_and(|c| c == '#' || c == '!' || c.is_alphanumeric() || c == '_')
+}
+
+fn has_bare_call_literal(content: &str) -> bool {
+    BARE_CALL_LITERAL_RE
+        .find_iter(content)
+        .any(|m| !bracket_is_code_context(&content[..m.start()]))
+}
+
+/// An invented `<xml><bigtag name="tool"><arguments>…` envelope emitted as
+/// plain content instead of a structured tool call.
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static XML_HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -94,12 +130,16 @@ const RAW_JSON_TOOL_NAMES: &[&str] = &[
 // ValidationError
 // ---------------------------------------------------------------------------
 
+/// A response that failed structural validation.
+///
+/// Phrase-list "sounds like tool intent" is deliberately NOT a variant here:
+/// it cannot be distinguished from a finished answer summarising earlier work,
+/// so it must never cost the user that answer. Only fabricated call *syntax*
+/// qualifies. See the note in `validate_response`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationError {
     #[error("HallucinatedToolCall")]
     HallucinatedToolCall,
-    #[error("ClaimedButNotExecuted")]
-    ClaimedButNotExecuted,
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +172,7 @@ pub(crate) fn has_claimed_tool_intent(content: &str) -> bool {
 
 pub(crate) fn has_hallucinated_tool_call(content: &str) -> bool {
     HALLUCINATED_CALL_RE.is_match(content)
+        || has_bare_call_literal(content)
         || XML_HALLUCINATED_CALL_RE.is_match(content)
         || raw_json_tool_call_span(content).is_some()
 }
@@ -266,12 +307,18 @@ pub fn validate_response(
         }
     }
 
-    if actual_tool_calls.is_empty() {
-        if has_claimed_tool_intent(content) {
-            return ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted);
-        }
-    }
-
+    // Prose that merely *sounds* like tool intent is NOT an error.
+    //
+    // `has_claimed_tool_intent` is a phrase list ("let me check", "the result
+    // shows", "i found that"). Those phrases are equally natural in a finished
+    // answer that summarises work from earlier turns, and returning an Error
+    // here discards that answer: the caller retracts the streamed text and
+    // re-issues the turn. Session 20260810_081050_8306f8 lost a 2637-token
+    // answer (9m35s of generation) to the sibling detector in `provenance`.
+    //
+    // A fabricated call still errors — but only on structural evidence
+    // (`has_hallucinated_tool_call`: `[Called foo(...)]`, XML, raw JSON
+    // envelopes), handled above. A phrase list never gets to throw work away.
     ValidationOutcome::Ok
 }
 
@@ -292,11 +339,6 @@ pub fn generate_retry_prompt(error: &ValidationError, attempt: u8) -> String {
     match error {
         ValidationError::HallucinatedToolCall => format!(
             "[system] Your previous response described a tool call in text instead of emitting a structured tool_call. \
-             Retry {}/3: emit a structured tool_call now, or provide a final answer with no tool-action wording.",
-            attempt
-        ),
-        ValidationError::ClaimedButNotExecuted => format!(
-            "[system] Your previous response described future tool use but did not emit a structured tool_call. \
              Retry {}/3: emit a structured tool_call now, or provide a final answer with no tool-action wording.",
             attempt
         ),
@@ -356,14 +398,60 @@ mod tests {
         }
     }
 
+    /// Prose that sounds like tool intent must never be an error.
+    ///
+    /// The caller reacts to a validation Error by retracting the streamed
+    /// response and re-issuing the turn. These phrases occur just as often in
+    /// a finished answer summarising earlier work as in a stall, so treating
+    /// them as errors throws away completed answers — which is exactly what
+    /// happened in session 20260810_081050_8306f8 (2637 tokens, 9m35s, lost).
+    /// Structural fabrication is a separate signal and still errors.
     #[test]
-    fn test_reject_claimed_but_not_executed() {
-        let content = "Let me check that file for you.";
-        let result = validate_response(content, &[], false, false);
-        assert!(matches!(
-            result,
-            ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)
-        ));
+    fn tool_intent_prose_is_never_an_error() {
+        let prose = [
+            "Let me check that file for you.",
+            "LET ME CHECK that for you.", // case-insensitive path
+            "```\nlet me check this\n```", // inside a code block
+            "the file contains important data",
+            "the result shows that",
+            "i found that the answer",
+            "i can see that it works",
+            "I'll check this now",
+            "let me look at the code",
+            "let me read the file",
+            "I can use the `web_fetch` tool to get the content of that URL. Which part?",
+        ];
+        for content in prose {
+            assert_eq!(
+                validate_response(content, &[], false, false),
+                ValidationOutcome::Ok,
+                "phrase-list prose must not be an error: {content:?}"
+            );
+        }
+
+        // The counterpart: fabricated call SYNTAX is still rejected, so this
+        // change loosens the phrase list without blinding the real detector.
+        let fabricated = [
+            "[I called: recall({\"q\": \"x\"})]",
+            // Bare call literal — the lfm2 shape. Prose alone is fine, but the
+            // same sentence WITH the literal is a fabricated call.
+            "Let me use the exec tool.[exec(command='date')]",
+            "[get_skills()]",
+        ];
+        for content in fabricated {
+            assert_eq!(
+                validate_response(content, &[], false, false),
+                ValidationOutcome::Error(ValidationError::HallucinatedToolCall),
+                "fabricated call syntax must still be rejected: {content:?}"
+            );
+        }
+
+        // Markdown links share the bracket but are not calls.
+        assert_eq!(
+            validate_response("See [the docs](https://x.dev/a(b)) for detail.", &[], false, false),
+            ValidationOutcome::Ok,
+            "markdown link must not read as a fabricated call"
+        );
     }
 
     #[test]
@@ -389,54 +477,6 @@ mod tests {
             result,
             ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
         ));
-    }
-
-    #[test]
-    fn test_case_insensitive_patterns() {
-        let content = "LET ME CHECK that for you.";
-        let result = validate_response(content, &[], false, false);
-        assert!(matches!(
-            result,
-            ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)
-        ));
-    }
-
-    #[test]
-    fn test_detect_claimed_intent_patterns() {
-        let test_cases = [
-            "the file contains important data",
-            "the result shows that",
-            "i found that the answer",
-            "i can see that it works",
-            "I'll check this now",
-            "let me look at the code",
-            "let me read the file",
-        ];
-
-        for content in test_cases {
-            let result = validate_response(content, &[], false, false);
-            assert!(
-                matches!(
-                    result,
-                    ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)
-                ),
-                "Failed to detect intent in: {}",
-                content
-            );
-        }
-    }
-
-    #[test]
-    fn test_detect_named_tool_future_action() {
-        let content = "I can use the `web_fetch` tool to get the content of that URL. Which part?";
-        let result = validate_response(content, &[], false, false);
-        assert!(
-            matches!(
-                result,
-                ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)
-            ),
-            "Named tool narration should be treated as claimed tool intent"
-        );
     }
 
     #[test]
@@ -521,13 +561,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_retry_prompt_claimed() {
-        let prompt = generate_retry_prompt(&ValidationError::ClaimedButNotExecuted, 2);
-        assert!(prompt.contains("future tool use"));
-        assert!(prompt.contains("2/3"));
-    }
-
-    #[test]
     fn test_empty_content_passes() {
         let result = validate_response("", &[], false, false);
         assert_eq!(result, ValidationOutcome::Ok);
@@ -544,19 +577,6 @@ mod tests {
         let content = "Here's the code:\n```rust\nfn main() {}\n```";
         let result = validate_response(content, &[], false, false);
         assert_eq!(result, ValidationOutcome::Ok);
-    }
-
-    #[test]
-    fn test_tool_intent_in_code_block_still_detected() {
-        let content = "```\nlet me check this\n```";
-        let result = validate_response(content, &[], false, false);
-        assert!(
-            matches!(
-                result,
-                ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)
-            ),
-            "Tool intent in code blocks should still be detected"
-        );
     }
 
     #[test]

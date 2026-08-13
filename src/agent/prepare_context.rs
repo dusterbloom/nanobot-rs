@@ -387,15 +387,26 @@ impl AgentLoopShared {
             .sessions
             .get_history(&session_id, max_messages, core.max_history_turns)
             .await;
-        // get_history applies byte-changing transformations (recall_tool_result
-        // raw→digest at filters.rs:236, tool-body cap, message windowing) that
-        // make the previous turn's stored fingerprint/watermark invalid. Without
-        // clearing here, the first LLM call of each new user turn compares
-        // against stale bytes and logs a false prompt_prefix_diverged — forcing
-        // a full re-prefill. The Higgs radix cache is unaffected (it matches by
-        // content, not by nanobot's fingerprint); this only prevents false
-        // divergence diagnostics and the stale-watermark frozen-prefix miscalc.
-        counters.prompt_fingerprints.lock().remove(&session_key);
+        // The fingerprint deliberately SURVIVES the reload so the first call of
+        // each new user turn is compared against the last call of the previous
+        // one. That cross-turn comparison is the only thing that can catch a
+        // reload whose bytes differ from what was already sent.
+        //
+        // It used to be cleared here, justified by "get_history applies
+        // byte-changing transformations … the Higgs radix cache is unaffected
+        // (it matches by content, not by nanobot's fingerprint)". The first
+        // half was true and the second half was not: higgs matches on content,
+        // the content had changed, and it re-prefilled. Clearing the
+        // fingerprint only removed the evidence. Session
+        // 20260810_081050_8306f8 lost 124.54s that way with an empty log.
+        //
+        // The byte-changing transformations are gone (`session::filters` is now
+        // a pure function of the stored rows), so a divergence reported here is
+        // real and worth the WARN.
+        //
+        // The WATERMARK still must go: it is an index into the message array,
+        // and history windowing renumbers those. A stale watermark would freeze
+        // the wrong prefix range.
         counters
             .prompt_cache_watermark
             .lock()

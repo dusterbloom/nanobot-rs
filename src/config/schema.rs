@@ -313,10 +313,6 @@ pub struct AgentDefaults {
     /// Number of draft tokens per speculative decoding step (default: 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_draft_tokens: Option<u32>,
-    /// Path to model used for ANE training (e.g. 0.8B for 32GB machines).
-    /// MLX model config preset: "qwen3-1.7b" or "qwen3.5-2b". Default: "qwen3.5-2b".
-    #[serde(default = "default_mlx_preset")]
-    pub mlx_preset: String,
     /// Path to a YAML instruction profiles file for model-specific prompt
     /// engineering. When set, profiles are loaded at startup and applied to
     /// every LLM call based on the active model name and task kind.
@@ -332,12 +328,6 @@ pub struct AgentDefaults {
     /// keeps appending rather than finishing.
     #[serde(default = "default_max_continuations")]
     pub max_continuations: u32,
-    /// Tokens reserved from completion budget for thinking overhead on local models (default: 512).
-    #[serde(default = "default_local_thinking_reserve_tokens")]
-    pub local_thinking_reserve_tokens: u32,
-    /// Minimum completion tokens guaranteed after thinking reserve is subtracted on local models (default: 256).
-    #[serde(default = "default_local_thinking_min_completion_tokens")]
-    pub local_thinking_min_completion_tokens: u32,
     /// Hard cap on thinking budget tokens for small local models (default: 256).
     #[serde(default = "default_local_thinking_small_model_cap")]
     pub local_thinking_small_model_cap: u32,
@@ -451,18 +441,6 @@ pub enum LocalAutostart {
     Off,
 }
 
-fn default_mlx_preset() -> String {
-    "qwen3.5-2b".to_string()
-}
-
-fn default_local_thinking_reserve_tokens() -> u32 {
-    512
-}
-
-fn default_local_thinking_min_completion_tokens() -> u32 {
-    256
-}
-
 fn default_local_thinking_small_model_cap() -> u32 {
     256
 }
@@ -516,11 +494,8 @@ impl Default for AgentDefaults {
             mlx_model_dir: None,
             higgs_draft_model: None,
             num_draft_tokens: None,
-            mlx_preset: default_mlx_preset(),
             instructions_path: None,
             skip_jit_gate: false,
-            local_thinking_reserve_tokens: default_local_thinking_reserve_tokens(),
-            local_thinking_min_completion_tokens: default_local_thinking_min_completion_tokens(),
             local_thinking_small_model_cap: default_local_thinking_small_model_cap(),
             adaptive_long_mode_min_tokens: default_adaptive_long_mode_min_tokens(),
             adaptive_long_form_min_tokens: default_adaptive_long_form_min_tokens(),
@@ -548,10 +523,6 @@ pub struct AgentsConfig {
 /// as a single field without requiring callers to populate 8 separate fields.
 #[derive(Debug, Clone)]
 pub struct AdaptiveTokenConfig {
-    #[allow(dead_code)] // kept for config.json backwards compat
-    pub local_thinking_reserve_tokens: u32,
-    #[allow(dead_code)] // kept for config.json backwards compat
-    pub local_thinking_min_completion_tokens: u32,
     pub local_thinking_small_model_cap: u32,
     pub adaptive_long_mode_min_tokens: u32,
     pub adaptive_long_form_min_tokens: u32,
@@ -563,8 +534,6 @@ pub struct AdaptiveTokenConfig {
 impl Default for AdaptiveTokenConfig {
     fn default() -> Self {
         Self {
-            local_thinking_reserve_tokens: 512,
-            local_thinking_min_completion_tokens: 256,
             local_thinking_small_model_cap: 256,
             adaptive_long_mode_min_tokens: 12288,
             adaptive_long_form_min_tokens: 6144,
@@ -579,8 +548,6 @@ impl AdaptiveTokenConfig {
     /// Build from `AgentDefaults`, keeping all values in sync.
     pub fn from_defaults(d: &AgentDefaults) -> Self {
         Self {
-            local_thinking_reserve_tokens: d.local_thinking_reserve_tokens,
-            local_thinking_min_completion_tokens: d.local_thinking_min_completion_tokens,
             local_thinking_small_model_cap: d.local_thinking_small_model_cap,
             adaptive_long_mode_min_tokens: d.adaptive_long_mode_min_tokens,
             adaptive_long_form_min_tokens: d.adaptive_long_form_min_tokens,

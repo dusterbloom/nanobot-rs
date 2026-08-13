@@ -321,7 +321,10 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "Write a file atomically. A state=complete call may contain the whole file at any size. For voluntary multi-call writes, keep each non-final state=more piece to 4096 characters or less; the final state=complete piece may be any size. Use state=append to add content, omit state for a complete one-call write, and never send offsets, hashes, IDs, or temporary paths. After publication, validate the artifact before claiming completion."
+        "Write or create a file with the given content at path. \
+         Omit state for a complete one-call write. Use state=more for multi-call pieces (≤4096 chars each), \
+         state=complete for the final piece, or state=append to add to an existing file. \
+         After writing, validate the file before claiming completion."
     }
 
     fn permission(&self) -> PermissionLevel {
@@ -561,12 +564,11 @@ mod tests {
         let description = tool.description();
 
         assert!(description.contains("complete"));
-        assert!(description.contains("any size"));
-        assert!(description.contains("4096 characters or less"));
         assert!(description.contains("state=more"));
         assert!(description.contains("state=complete"));
-        assert!(description.contains("never send offsets"));
-        assert!(description.contains("hashes"));
+        assert!(description.contains("state=append"));
+        assert!(description.contains("4096 chars"));
+        assert!(description.contains("validate"));
         assert!(
             schema.pointer("/properties/content/maxLength").is_none(),
             "the 4096 advisory applies only to state=more"

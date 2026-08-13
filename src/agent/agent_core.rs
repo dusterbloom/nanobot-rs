@@ -222,6 +222,15 @@ pub struct RuntimeCounters {
     pub prompt_fingerprints: parking_lot::Mutex<
         std::collections::HashMap<String, crate::agent::prompt_fingerprint::PromptFingerprint>,
     >,
+    /// Per-session hash of the rendered `messages[0]` (the system prompt).
+    ///
+    /// Six places mutate the prompt head or insert ahead of the tail, each
+    /// previously guarded only by a doc comment ("callers must pass the SAME
+    /// note on every turn"). Chat templates render the head first, so a single
+    /// changed byte there re-prefills the entire context. This turns those six
+    /// comment-contracts into one checked invariant — see
+    /// `agent::prefix_guard::assert_stable_head`.
+    pub prompt_head_hashes: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
     /// Per-session hash of the tool-definition array sent to the provider.
     /// The message fingerprint deliberately excludes tool schemas, so this
     /// catches the case where messages are append-only but the rendered token
@@ -260,6 +269,27 @@ pub struct RuntimeCounters {
     pub lcm_tokens_after: AtomicU64,
     /// Epoch ms of the most recently installed compaction (0 = never).
     pub lcm_last_compaction_ms: AtomicU64,
+    /// Responses that matched the phantom phrase list with zero tool calls.
+    /// Observe-only: the response is still delivered (annotated). Tracks the
+    /// detector's false-positive pressure without letting it discard work.
+    pub phantom_claims_observed: AtomicU64,
+    /// Prompt-prefix divergences the loop did NOT sanction — a message whose
+    /// rendered bytes changed across turns. Always a full server re-prefill.
+    pub cache_diverged: AtomicU64,
+    /// Prompt-prefix resets the loop DID sanction (trim, compaction, history
+    /// reload). Also a full re-prefill — counted so a "sanctioned" reset can
+    /// never again be silently free. See `agent::prompt_fingerprint`.
+    pub cache_sanctioned_resets: AtomicU64,
+    /// Why this session's prompt fingerprint was last cleared, pending
+    /// attribution at the next provider call.
+    ///
+    /// Clearing the fingerprint makes the next comparison report `First`,
+    /// which reads identically to a genuine cold start — so a sanctioned
+    /// rewrite used to cost a full re-prefill and leave no trace at all. In
+    /// session 20260810_081050_8306f8 that hid 124.54s of prefill. Recording
+    /// the reason here lets the next call log the reset instead of silently
+    /// treating it as turn one.
+    pending_cache_reset: parking_lot::Mutex<std::collections::HashMap<String, &'static str>>,
 }
 
 impl RuntimeCounters {
@@ -289,6 +319,7 @@ impl RuntimeCounters {
                 crate::agent::router::SpecialistMemory::default(),
             ),
             prompt_fingerprints: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            prompt_head_hashes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_tool_hashes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_cache_watermark: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_session_epoch: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -301,7 +332,25 @@ impl RuntimeCounters {
             lcm_tokens_before: AtomicU64::new(0),
             lcm_tokens_after: AtomicU64::new(0),
             lcm_last_compaction_ms: AtomicU64::new(0),
+            phantom_claims_observed: AtomicU64::new(0),
+            cache_diverged: AtomicU64::new(0),
+            cache_sanctioned_resets: AtomicU64::new(0),
+            pending_cache_reset: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Record why this session's prompt prefix was invalidated. Consumed by
+    /// the next provider call via [`Self::take_cache_reset`].
+    pub fn note_cache_reset(&self, session_key: &str, reason: &'static str) {
+        self.pending_cache_reset
+            .lock()
+            .insert(session_key.to_string(), reason);
+    }
+
+    /// Take the pending reset reason, if the prefix was deliberately dropped
+    /// since the last provider call. `None` means a genuine cold start.
+    pub fn take_cache_reset(&self, session_key: &str) -> Option<&'static str> {
+        self.pending_cache_reset.lock().remove(session_key)
     }
 
     /// Reset all prompt-cache bookkeeping for a session and advance its prompt epoch.
@@ -314,6 +363,7 @@ impl RuntimeCounters {
         self.prompt_tool_hashes.lock().remove(session_key);
         self.prompt_cache_watermark.lock().remove(session_key);
         self.clear_local_artifact_intent(session_key);
+        self.note_cache_reset(session_key, "session_reset");
 
         let mut epochs = self.prompt_session_epoch.lock();
         if let Some(drop_id) = self.active_higgs_session_ids.lock().remove(session_key) {
@@ -1139,6 +1189,37 @@ mod tests {
 
         assert!(!apply_compaction_result(&mut live, pending));
         assert_eq!(live, before);
+    }
+
+    /// A sanctioned reset must be attributable exactly once, per session.
+    ///
+    /// Once, because the reason is consumed by the next provider call — if it
+    /// lingered, every later call in the session would re-report the same
+    /// re-prefill and the ledger would overcount. Per session, because one
+    /// session's `/clear` must not be blamed on another's next turn.
+    #[test]
+    fn cache_reset_reason_is_taken_once_per_session() {
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+
+        // Never reset → nothing to attribute; this is a genuine cold start.
+        assert_eq!(counters.take_cache_reset("a"), None);
+
+        counters.note_cache_reset("a", "trim");
+        assert_eq!(counters.take_cache_reset("a"), Some("trim"));
+        assert_eq!(
+            counters.take_cache_reset("a"),
+            None,
+            "a reset must not be reported twice"
+        );
+
+        // Sessions are independent.
+        counters.note_cache_reset("a", "history_reload");
+        assert_eq!(counters.take_cache_reset("b"), None);
+        assert_eq!(counters.take_cache_reset("a"), Some("history_reload"));
+
+        // The real reset paths record a reason, not just clear state.
+        counters.reset_session_prompt_state("c");
+        assert_eq!(counters.take_cache_reset("c"), Some("session_reset"));
     }
 
     #[test]

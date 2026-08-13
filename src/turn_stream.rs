@@ -443,7 +443,7 @@ pub(crate) enum CacheResetReason {
 }
 
 impl CacheResetReason {
-    fn as_wire(self) -> &'static str {
+    pub(crate) fn as_wire(self) -> &'static str {
         match self {
             CacheResetReason::Trim => "trim",
             CacheResetReason::EmergencyTrim => "emergency_trim",

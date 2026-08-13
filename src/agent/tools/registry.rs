@@ -925,9 +925,13 @@ impl ToolRegistry {
         // a proxy round-trip.
         const KEEP_PARAM_DESCRIPTIONS: &[&str] = &[
             "read_file",
+            "edit_file",
+            "write_file",
+            "exec",
             "get_skills",
             "recall",
             "remember",
+            "recall_tool_result",
         ];
         for def in &mut defs {
             Self::remove_local_hot_model_hazards(def);
@@ -1119,8 +1123,8 @@ impl ToolRegistry {
                         // 20260727_173522_263450) showed this 3× in a row.
                         // Back-compat: the dispatcher still accepts the
                         // legacy `name`/`args` keys for in-flight sessions.
-                        "tool_name": { "type": "string", "description": "Name of the tool to invoke (omit to list all available tools)" },
-                        "tool_args": { "type": "object", "description": "Arguments object for the tool named above (omit to inspect its schema)" }
+                        "tool_name": { "type": "string", "description": "Tool name to call (e.g. exec, webradio, newsreader). Omit to list all tools." },
+                        "tool_args": { "type": "object", "description": "Arguments for the tool (e.g. {\"command\":\"webradio play jazz\"}). Omit to inspect schema." }
                     }
                 }
             }

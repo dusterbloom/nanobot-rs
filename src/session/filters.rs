@@ -17,9 +17,7 @@ use tracing::warn;
 
 #[cfg(test)]
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
-use crate::agent::context_hygiene::{
-    cap_tool_result_for_replay, recall_tool_result_replay_reference, tool_result_ok,
-};
+use crate::agent::context_hygiene::cap_tool_result_for_replay;
 
 /// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
 ///
@@ -87,52 +85,6 @@ fn is_cache_replay_synthetic(msg: &Value) -> bool {
         || content.starts_with("[System notice]")
         || content.starts_with("[System] Loop detected:")
         || content.starts_with("[system] Report what the previous tool results showed before")
-}
-
-fn recalled_source_tool_call_id(messages: &[Value], tool_msg_index: usize) -> Option<String> {
-    let recall_call_id = messages
-        .get(tool_msg_index)?
-        .get("tool_call_id")
-        .and_then(|v| v.as_str())?;
-
-    messages[..tool_msg_index]
-        .iter()
-        .rev()
-        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-        .filter_map(|m| m.get("tool_calls").and_then(|v| v.as_array()))
-        .flat_map(|calls| calls.iter())
-        .find(|call| call.get("id").and_then(|v| v.as_str()) == Some(recall_call_id))
-        .and_then(recall_tool_call_source_id)
-}
-
-fn recall_tool_call_source_id(call: &Value) -> Option<String> {
-    if call
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(|v| v.as_str())
-        != Some("recall_tool_result")
-    {
-        return None;
-    }
-
-    let args = call
-        .get("function")
-        .and_then(|f| f.get("arguments"))
-        .or_else(|| call.get("arguments"))?;
-    if let Some(raw) = args.as_str() {
-        let parsed: Value = serde_json::from_str(raw).ok()?;
-        return parsed
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-    }
-    args.get("tool_call_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-}
-
-fn failed_recall_tool_result(content: &str) -> bool {
-    !tool_result_ok(content)
 }
 
 /// Advance an index past leading `role: "tool"` messages whose parent
@@ -229,27 +181,29 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
                 // Skip internal LCM summary entries — not valid wire format.
                 && m.get("role").and_then(|r| r.as_str()) != Some("summary")
         })
-        .map(|(offset, m)| {
+        .map(|(_offset, m)| {
             let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             // Tool results are the bulkiest, lowest-value-once-stale part of
             // history (web_fetch / skill dumps). Cap their body to a generous,
             // FIXED size so one large dump can't crowd conversation out of the
             // token budget. The cap is applied identically on every reload (not
             // age-based), so it never shifts the prompt prefix — no extra
-            // re-prefill, unlike dropping or sliding truncation. Recalled raw
-            // outputs are one-shot: the requesting turn saw exact bytes, but
-            // replay gets only a stable digest/handle so recall cannot become
-            // a permanent prompt balloon.
+            // re-prefill, unlike dropping or sliding truncation.
+            //
+            // `recall_tool_result` bodies get NO special treatment. They used
+            // to be swapped for a short "[recalled earlier…]" receipt here, on
+            // the reasoning that a one-shot recall shouldn't balloon the
+            // prompt forever. That swap is a read-time byte change: the turn
+            // that recalled saw ~10 KB, the next turn replayed ~120 bytes, and
+            // the inference server — which matches on content — lost its KV
+            // prefix and re-prefilled everything. Measured in session
+            // 20260810_081050_8306f8: 8 tool messages 24907 → 15060 bytes,
+            // higgs `boundary_splice_failed` → 124.54s of cold prefill on a
+            // 9267-token prompt. The comment that justified it claimed "the
+            // Higgs radix cache is unaffected"; the log says otherwise.
+            // A recalled body is now just a tool result, capped like the rest.
             let raw = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let tool_name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let content = if role == "tool" && tool_name == "recall_tool_result" {
-                if failed_recall_tool_result(raw) {
-                    raw.to_string()
-                } else {
-                    let source_id = recalled_source_tool_call_id(messages, safe_start + offset);
-                    recall_tool_result_replay_reference(raw, source_id.as_deref())
-                }
-            } else if role == "tool"
+            let content = if role == "tool"
                 && raw.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
             {
                 // Handles are write-once-stable: pass through byte-identical
@@ -1244,59 +1198,77 @@ mod tests {
         );
     }
 
+    /// Reload must be byte-stable: `filter_history` is applied to the SAME
+    /// stored rows on every turn, so running it twice must produce identical
+    /// content. A `recall_tool_result` body used to shrink to a short receipt
+    /// here, which meant turn N sent ~10 KB and turn N+1 sent ~120 bytes —
+    /// the inference server matches on content, so it dropped its KV prefix
+    /// and re-prefilled (124.54s measured, session 20260810_081050_8306f8).
+    ///
+    /// Asserted for a recalled body and a plain oversized body together: the
+    /// invariant is "reload is a pure function of stored bytes", not a fact
+    /// about one tool name.
     #[test]
-    fn test_recall_tool_result_body_becomes_one_shot_replay_reference() {
+    fn reload_is_byte_stable_for_tool_bodies() {
         let big = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5000);
         let messages = vec![
             user("recall it"),
             json!({
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{
-                    "id": "recall_1",
-                    "type": "function",
-                    "function": {
-                        "name": "recall_tool_result",
-                        "arguments": "{\"tool_call_id\":\"original_tool_call\"}"
+                "tool_calls": [
+                    {
+                        "id": "recall_1",
+                        "type": "function",
+                        "function": {
+                            "name": "recall_tool_result",
+                            "arguments": "{\"tool_call_id\":\"original_tool_call\"}"
+                        }
+                    },
+                    {
+                        "id": "fetch_1",
+                        "type": "function",
+                        "function": { "name": "web_fetch", "arguments": "{}" }
                     }
-                }]
+                ]
             }),
             json!({
                 "role": "tool",
                 "tool_call_id": "recall_1",
                 "name": "recall_tool_result",
+                "content": big.clone(),
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "fetch_1",
+                "name": "web_fetch",
                 "content": big,
             }),
         ];
 
-        let result = filter_history(&messages, 0, 0);
-        let tool = result
-            .iter()
-            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "recall_1")
-            .unwrap();
-        let content = tool["content"].as_str().unwrap();
-        assert!(
-            content.len() < 512,
-            "replay reference must stay compact, got {} bytes",
-            content.len()
+        let first = filter_history(&messages, 0, 0);
+        let second = filter_history(&messages, 0, 0);
+        assert_eq!(first, second, "reload must be deterministic");
+
+        let body = |out: &[Value], id: &str| -> String {
+            out.iter()
+                .find(|m| role_of(m) == "tool" && m["tool_call_id"] == id)
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // A recalled body is capped exactly like any other tool body — no
+        // tool-name-specific shrink that the live wire never applied.
+        assert_eq!(
+            body(&first, "recall_1"),
+            body(&first, "fetch_1"),
+            "recall_tool_result must not be treated differently from web_fetch"
         );
         assert!(
-            content.contains("recalled earlier"),
-            "replay reference must be the short receipt: {content}"
+            !body(&first, "recall_1").contains("recalled earlier"),
+            "the one-shot receipt must be gone"
         );
-        assert!(
-            !content.contains("TOOL_OUTPUT_DIGEST"),
-            "replay reference must not embed the noisy digest hash: {content}"
-        );
-        assert!(
-            !content.contains("len:"),
-            "replay reference must not embed byte length: {content}"
-        );
-        assert!(
-            content.contains("original_tool_call"),
-            "replay reference must keep the recovery tool_call_id: {content}"
-        );
-        assert!(!content.contains(&"x".repeat(100)));
     }
 
     #[test]

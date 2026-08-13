@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use std::sync::LazyLock;
 
 use super::turn::{ToolCall, Turn};
-use crate::agent::model_capabilities::{lookup_default, ModelSizeClass};
+use crate::agent::model_capabilities::lookup_default;
 
 // Matches the outer `[I called: ...]` or `[Called: ...]` or `[called ...]` or
 // `[Calling tool: ...]` bracket. Captures the inner content.
@@ -219,7 +219,7 @@ impl LocalProtocol {
 
     pub fn auto_for_model(model: &str) -> Self {
         let caps = lookup_default(model);
-        if !caps.tool_calling || caps.size_class == ModelSizeClass::Small {
+        if !caps.tool_calling {
             Self::textual()
         } else {
             Self::native()
@@ -1311,8 +1311,18 @@ mod tests {
     }
 
     #[test]
-    fn local_protocol_is_derived_from_small_model_capabilities() {
-        assert!(LocalProtocol::auto_for_model("nanbeige-3b").is_textual_replay());
+    fn native_tool_capability_wins_over_model_size() {
+        for model in ["nanbeige-3b", "functiongemma-2b", "lfm2.5-2.6b-8bit"] {
+            assert!(
+                !LocalProtocol::auto_for_model(model).is_textual_replay(),
+                "{model} advertises native tool calling and must replay native tool history"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_averse_model_uses_textual_replay() {
+        assert!(LocalProtocol::auto_for_model("vibethinker-3b").is_textual_replay());
     }
 
     #[test]

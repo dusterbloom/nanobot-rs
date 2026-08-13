@@ -6287,19 +6287,26 @@ async fn test_local_streaming_cache_markers_append_only_across_turns() {
         cache_markers[0].starts_with("\u{0}cache:first:"),
         "first turn should establish the cache: {cache_markers:?}"
     );
-    // Each new turn reloads history from DB via filter_history, which applies
-    // byte-changing transformations (recall_tool_result raw→digest, etc.).
-    // The fingerprint is cleared at the start of each turn to prevent false
-    // divergences — the first call of each turn shows First, not AppendOnly.
-    // The Higgs radix cache still hits (content-based, not fingerprint-based).
-    assert!(
-        cache_markers[1].starts_with("\u{0}cache:first:"),
-        "second turn starts fresh (fingerprint cleared on DB reload): {cache_markers:?}"
-    );
-    assert!(
-        cache_markers[2].starts_with("\u{0}cache:first:"),
-        "third turn starts fresh: {cache_markers:?}"
-    );
+    // Later turns must report AppendOnly, not First.
+    //
+    // The DB reload between turns is a pure function of the stored rows, so
+    // turn N+1's prompt is turn N's prompt plus the new messages. The
+    // fingerprint therefore survives the reload and the comparison is made
+    // ACROSS the turn boundary — which is the only place a reload that
+    // silently rewrote history can be caught.
+    //
+    // This previously asserted `first:` on every turn, because the fingerprint
+    // was cleared on each reload. That made cross-turn divergence structurally
+    // undetectable: session 20260810_081050_8306f8 shrank 8 tool results by
+    // ~9.8KB at a turn boundary, cost 124.54s of re-prefill on the server, and
+    // produced no nanobot log line at all.
+    for (i, marker) in cache_markers.iter().enumerate().skip(1) {
+        assert!(
+            marker.starts_with("\u{0}cache:append:"),
+            "turn {} must continue the previous turn's prefix, got {marker:?} in {cache_markers:?}",
+            i + 1
+        );
+    }
     assert!(
         cache_markers
             .iter()

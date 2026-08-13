@@ -85,11 +85,6 @@ pub(crate) struct RetryState {
     pub(crate) rescue_attempted: bool,
     /// One-shot: agent-level retry for transient LLM errors (per iteration).
     pub(crate) api_retried: bool,
-    /// One-shot: already retried a phantom-tool-claim text response by
-    /// looping back to PreCall with tools attached. Bounded to one extra
-    /// provider call; a second phantom finishes via the annotation path
-    /// in `finalize_response`.
-    pub(crate) phantom_claim_retried: bool,
     /// Consecutive lease-renewal rejections (the model emitted a PARTIAL
     /// checkpoint — some labels, missing a field — and was nudged what to
     /// add). Without a cap a small model that keeps emitting partial
@@ -108,7 +103,6 @@ impl RetryState {
             empty_think_retried: false,
             rescue_attempted: false,
             api_retried: false,
-            phantom_claim_retried: false,
             lease_renewal_rejections: 0,
         }
     }
@@ -559,54 +553,34 @@ impl AgentLoopShared {
                         );
                     }
                 }
-                // One-shot phantom-claim retry. Local models sometimes
-                // narrate a tool action as prose ("here's what I found",
-                // "let me read ...") instead of emitting a tool_call, then
-                // end the turn having done zero useful work. Give the model
-                // exactly one chance to correct while tools are still
-                // attached. Bounded — not a loop.
+                // Provenance is observe-only here — it never retracts a
+                // completed response and never re-prompts.
                 //
-                // The structural gates (no tools ran + tools advertised +
-                // lease live + local/provenance) define WHEN a phantom is
-                // possible; the phrase-list detector (`detect_phantom_claims`)
-                // is the content discriminator that says the text actually
-                // claimed a tool action. Both are required — the structural
-                // signal alone fires on every normal text answer, which is
-                // why `plain_text_response_is_final_answer` exists.
+                // This used to retract the streamed text and loop back to
+                // PreCall when the phrase list matched with zero tool calls
+                // this turn. That gate is wrong for retrospective questions
+                // ("what went wrong last turn?"), which are answered by
+                // narrating EARLIER tool calls in past tense and legitimately
+                // need no new tools. In session 20260810_081050_8306f8 it
+                // discarded a 2637-token answer that took 9m35s to generate,
+                // on the substring "I executed", and never persisted it.
                 //
-                // The lease guard (`!lease.is_exhausted()`) is what keeps
-                // this retry from fighting the lease: a lease-forced
-                // text-only call MUST finish, never be retried with tools
-                // it cannot have.
-                let tools_this_turn: Vec<String> = ctx.used_tools.iter().cloned().collect();
-                if !ctx.flow.retries.phantom_claim_retried
-                    && tools_this_turn.is_empty()
-                    && ctx
-                        .advertised_tool_names
-                        .as_ref()
-                        .map_or(false, |s| !s.is_empty())
-                    && !ctx.flow.lease.is_exhausted()
-                    && ctx.core.provenance_config.enabled
-                    && ctx.core.mode().is_local()
+                // A phantom now costs a warning header, not the answer:
+                // `finalize_response` annotates via `annotate_phantom_response`
+                // and the response is delivered. Detection stays; the blast
+                // radius is gone.
+                if ctx.core.provenance_config.enabled
+                    && ctx.used_tools.is_empty()
+                    && crate::agent::provenance::detect_phantom_claims(&content, &[]).is_some()
                 {
-                    if let Some(detection) =
-                        crate::agent::provenance::detect_phantom_claims(&content, &tools_this_turn)
-                    {
-                        ctx.flow.retries.phantom_claim_retried = true;
-                        if ctx.flow.content_was_streamed {
-                            send_retract_reply(&ctx.text_delta_tx);
-                            ctx.flow.content_was_streamed = false;
-                        }
-                        tracing::info!(
-                            session = %ctx.session_key,
-                            model = %ctx.core.model,
-                            patterns = detection.matched_patterns.len(),
-                            "phantom_tool_claims_retry"
-                        );
-                        ctx.messages
-                            .push(crate::agent::markers::scaffold_user(detection.system_warning));
-                        return StepResult::Next(IterationPhase::PreCall);
-                    }
+                    counters
+                        .phantom_claims_observed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        model = %ctx.core.model,
+                        "phantom_tool_claims_observed — response delivered with annotation"
+                    );
                 }
                 if !ctx.flow.content_was_streamed {
                     send_delta(&ctx.text_delta_tx, &content);
@@ -791,12 +765,12 @@ impl AgentLoopShared {
 
         let hint = validation::generate_retry_prompt(error, retry_num as u8);
 
-        if !matches!(error, validation::ValidationError::ClaimedButNotExecuted) {
-            ctx.messages.push(json!({
-                "role": "assistant",
-                "content": raw_content
-            }));
-        }
+        // Keep the fabricated-call text in history so the retry hint below has
+        // an antecedent (and the wire keeps alternating roles).
+        ctx.messages.push(json!({
+            "role": "assistant",
+            "content": raw_content
+        }));
 
         // Cache-replay tagged: a validation hint sent live must survive
         // session reload byte-identical, otherwise the warm prompt prefix
@@ -1439,17 +1413,16 @@ mod tests {
         ));
     }
 
+    /// Tool-intent prose is a final answer, not a validation error — the loop
+    /// must deliver it rather than retract and re-issue the turn.
     #[test]
-    fn test_classify_validation_error_claimed() {
+    fn test_classify_tool_intent_prose_as_final_text() {
         let resp = make_response(Some("Let me check that file for you."), "stop");
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
-        assert!(matches!(
-            kind,
-            ResponseKind::ValidationError {
-                error: validation::ValidationError::ClaimedButNotExecuted,
-                ..
-            }
-        ));
+        assert!(
+            matches!(kind, ResponseKind::Text(_)),
+            "tool-intent prose must classify as final text, got {kind:?}"
+        );
     }
 
     #[test]

@@ -737,10 +737,7 @@ fn should_attempt_forced_recovery(
     let outcome = validation::validate_response(content, &[], is_textual_replay, had_blocked_calls);
     if matches!(
         outcome,
-        validation::ValidationOutcome::Error(
-            validation::ValidationError::ClaimedButNotExecuted
-                | validation::ValidationError::HallucinatedToolCall
-        )
+        validation::ValidationOutcome::Error(validation::ValidationError::HallucinatedToolCall)
     ) {
         return true;
     }
@@ -2269,6 +2266,23 @@ impl AgentLoopShared {
         use crate::agent::prompt_fingerprint::{self, PromptDelta};
         let diag_t0 = std::time::Instant::now();
         let prompt_fp = prompt_fingerprint::fingerprint(&messages_for_llm);
+        // One checked invariant covering the five sites that write the prompt
+        // HEAD: prepare_context's continuity note and stable-prompt assignment,
+        // agent_core::append_to_system_prompt, context.rs's developer-message
+        // rewrite, and openai_compat's developer→system fold. Each was
+        // previously held only by a doc comment. Runs on the RENDERED array
+        // immediately before the call, so it sees what the server sees no
+        // matter which layer did the writing.
+        //
+        // The sixth site, `context.rs::insert_tail_before_user`, inserts before
+        // the LAST message rather than at the head; it is covered by the
+        // append-only fingerprint comparison just below, which now spans turn
+        // boundaries.
+        prefix_guard::assert_stable_head(
+            &ctx.session_key,
+            &messages_for_llm,
+            &counters.prompt_head_hashes,
+        );
         let prompt_msg_count = messages_for_llm.len();
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
         let prompt_total_estimate =
@@ -2387,6 +2401,7 @@ impl AgentLoopShared {
                             }
                         })
                         .unwrap_or("unknown");
+                    counters.cache_diverged.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         session = %ctx.session_key,
                         at_msg = first_divergent_msg,
@@ -2418,10 +2433,38 @@ impl AgentLoopShared {
                     })
                     .encode()
                 }
-                PromptDelta::First => ControlMarker::CacheStatus(CacheStatus::First {
-                    messages: prompt_msg_count,
-                })
-                .encode(),
+                PromptDelta::First => {
+                    // `First` means "no fingerprint to compare against". That
+                    // is turn one — OR a deliberate mid-session clear, which
+                    // costs exactly the same full re-prefill but used to be
+                    // reported as a fresh start and therefore never appeared
+                    // in the log at all. `take_cache_reset` tells the two
+                    // apart so a sanctioned reset is priced, not hidden.
+                    match counters.take_cache_reset(&ctx.session_key) {
+                        Some(reason) => {
+                            counters
+                                .cache_sanctioned_resets
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                session = %ctx.session_key,
+                                reason,
+                                messages = prompt_msg_count,
+                                prefill_estimate,
+                                "prompt_cache_sanctioned_reset — prefix dropped on purpose; server re-prefills the whole context"
+                            );
+                        }
+                        None => debug!(
+                            session = %ctx.session_key,
+                            messages = prompt_msg_count,
+                            prefill_estimate,
+                            "prompt_cache_cold_start"
+                        ),
+                    }
+                    ControlMarker::CacheStatus(CacheStatus::First {
+                        messages: prompt_msg_count,
+                    })
+                    .encode()
+                }
             };
             if let Some(ref delta_tx) = ctx.text_delta_tx {
                 let _ = delta_tx.send(cache_marker);
@@ -3514,13 +3557,17 @@ mod forced_recovery_tests {
     use super::should_attempt_forced_recovery;
 
     // Real trigger strings (mirror src/agent/validation.rs tests).
-    const CLAIMED: &str = "Let me check that file for you."; // ClaimedButNotExecuted
+    const CLAIMED: &str = "Let me check that file for you."; // prose only — NOT an error
     const HALLUCINATED: &str = "I'll read it.\n[Called read_file({\"path\":\"/x\"})]"; // HallucinatedToolCall
     const CLEAN: &str = "The answer is 42."; // Ok — a genuine final answer
 
+    /// Forced recovery re-issues the turn with `tool_choice=required`, which
+    /// throws away whatever the model just wrote. Prose that merely sounds
+    /// like tool intent is indistinguishable from a finished answer, so it
+    /// must NOT trigger that. Only fabricated call syntax does.
     #[test]
-    fn fires_on_claimed_tool_intent() {
-        assert!(should_attempt_forced_recovery(
+    fn does_not_fire_on_tool_intent_prose() {
+        assert!(!should_attempt_forced_recovery(
             false,
             true,
             0,

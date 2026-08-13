@@ -906,6 +906,59 @@ fn is_routed_call(tool_call_id: &str, routed_tool_calls: &[ToolCallRequest]) -> 
 
 /// Collects everything produced by a single tool execution, ready for
 /// sequential post-processing by `inject_tool_result`.
+/// Detect API error bodies in tool results and convert them to failures.
+///
+/// Tools like `web_fetch` may return `ok=true` with JSON bodies like
+/// `{"status":"error","message":"API key missing"}`. The model sees
+/// `ok=true` and cannot self-correct. This converts known API error
+/// patterns to `Error: ...` failures.
+fn detect_api_error_body(
+    result: crate::agent::tools::base::ToolExecutionResult,
+) -> crate::agent::tools::base::ToolExecutionResult {
+    if !result.ok() {
+        return result;
+    }
+    let body = result.data().to_string();
+    // Fast path: only parse JSON if it contains error-like keys.
+    let has_status_error = body.contains("\"status\": \"error\"")
+        || body.contains("\"status\":\"error\"");
+    let has_error_key = body.contains("\"error\"");
+    if !has_status_error && !has_error_key {
+        return result;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+        // Pattern 1: {"status": "error", "message": "...", "code": "..."}
+        if v.get("status").and_then(|s| s.as_str()) == Some("error") {
+            if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+                let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
+                let with_code = if code.is_empty() {
+                    msg.to_string()
+                } else {
+                    format!("{} [{}]", msg, code)
+                };
+                return crate::agent::tools::base::ToolExecutionResult::failure(with_code);
+            }
+        }
+        // Pattern 2: {"error": {"message": "...", "code": "..."}}
+        if let Some(err) = v.get("error") {
+            if let Some(msg) = err.get("message").and_then(|m| m.as_str()) {
+                let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("");
+                let with_code = if code.is_empty() {
+                    msg.to_string()
+                } else {
+                    format!("{} [{}]", msg, code)
+                };
+                return crate::agent::tools::base::ToolExecutionResult::failure(with_code);
+            }
+            // {"error": "message string"}
+            if let Some(msg) = err.as_str() {
+                return crate::agent::tools::base::ToolExecutionResult::failure(msg.to_string());
+            }
+        }
+    }
+    result
+}
+
 struct SingleToolResult {
     tool_name: String,
     tool_id: String,
@@ -1058,6 +1111,10 @@ async fn execute_single_tool(
         if let Some(hb) = heartbeat {
             hb.abort();
         }
+
+        // Surface API errors: web_fetch etc return ok=true with
+        // {"status":"error",...} bodies. Convert so the model sees Error: ...
+        let result = detect_api_error_body(result);
 
         let duration_ms = start.elapsed().as_millis() as u64;
         tracing::Span::current().record("ok", result.ok());

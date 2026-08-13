@@ -93,27 +93,6 @@ pub(crate) fn tool_result_ok(content: &str) -> bool {
         || normalized == "(no result)")
 }
 
-/// Replace a persisted `recall_tool_result` body with a stable replay receipt.
-///
-/// The live turn that requested recall sees the raw bytes. On later SQLite
-/// reloads, replaying those bytes would turn a one-time explicit recall into a
-/// permanent prompt balloon. Keep only identity and the exact re-recall handle.
-pub(crate) fn recall_tool_result_replay_reference(
-    _content: &str,
-    source_tool_call_id: Option<&str>,
-) -> String {
-    let recall_hint = source_tool_call_id.map(|id| {
-        let encoded_id = serde_json::to_string(id).unwrap_or_else(|_| "\"<tool_call_id>\"".into());
-        format!(
-            r#", re-call recall_tool_result({{"tool_call_id": {encoded_id}}}) for bytes"#
-        )
-    });
-    format!(
-        "[recalled earlier; raw output omitted from replay{}]",
-        recall_hint.unwrap_or_default()
-    )
-}
-
 /// Shrink a tool-result body according to `policy`.
 ///
 /// Returns `Some(replacement)` when the body was shrunk, `None` when it is

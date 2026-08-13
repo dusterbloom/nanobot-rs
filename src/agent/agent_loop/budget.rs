@@ -62,6 +62,8 @@ pub(super) fn invalidate_prompt_cache_for_rewrite(
     let rotate = ctx.core.mode().is_local() && ctx.core.provider.supports_higgs_session_cache();
     ctx.counters
         .invalidate_prompt_cache(&ctx.session_key, rotate);
+    ctx.counters
+        .note_cache_reset(&ctx.session_key, reason.as_wire());
     send_cache_reset_marker(&ctx.text_delta_tx, reason);
     rotate
 }
