@@ -18,7 +18,7 @@
     clippy::shadow_unrelated,
     clippy::shadow_same,
     clippy::format_push_string,
-    clippy::string_add,
+    clippy::string_add
 )]
 use std::sync::atomic::Ordering;
 use std::time::Duration;

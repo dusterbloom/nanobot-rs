@@ -23,7 +23,7 @@
     clippy::shadow_unrelated,
     clippy::shadow_same,
     clippy::format_push_string,
-    clippy::string_add,
+    clippy::string_add
 )]
 use std::io::Write as _;
 use std::time::Instant;

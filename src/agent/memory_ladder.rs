@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::shadow_reuse)]
 //! Memory Ladder: priority-ordered memory layer facade.
 //!
 //! Provides a unified query interface over 4 named memory layers with

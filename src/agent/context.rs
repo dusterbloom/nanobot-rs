@@ -8,7 +8,7 @@
     clippy::format_push_string,
     clippy::indexing_slicing,
     clippy::shadow_reuse,
-    clippy::string_add,
+    clippy::string_add
 )]
 #![allow(dead_code)]
 //! Context builder for assembling agent prompts.

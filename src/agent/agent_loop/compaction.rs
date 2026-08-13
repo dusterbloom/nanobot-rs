@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::indexing_slicing,
-)]
+#![allow(clippy::indexing_slicing)]
 //! LCM compaction execution: cancellation-safe engine mutation and checkpoint
 //! persistence through the foreground provider/model.
 //!
@@ -504,12 +502,17 @@ pub(super) async fn execute_lcm_compaction(
     // omits system/developer messages.
     let reduced =
         TokenBudget::estimate_tokens(&compacted_messages) < TokenBudget::estimate_tokens(&messages);
-    let pending = (summary_turn.is_some() && reduced).then(|| PendingCompaction {
-        result: crate::agent::compaction::CompactionResult {
-            messages: compacted_messages,
-        },
-        snapshot: messages,
-    });
+    let summary_node_id = summary_node.as_ref().map(|node| node.0);
+    let pending = match (summary_node_id, reduced) {
+        (Some(summary_node_id), true) => Some(PendingCompaction {
+            result: crate::agent::compaction::CompactionResult {
+                messages: compacted_messages,
+            },
+            snapshot: messages,
+            summary_node_id,
+        }),
+        _ => None,
+    };
 
     if pending.is_some() && (cancellation.is_cancelled() || !publication.begin_publication()) {
         return None;

@@ -237,23 +237,34 @@ impl ToolContext {
         cancel: tokio_util::sync::CancellationToken,
         call_id: impl Into<String>,
     ) -> Self {
-        Self { host, events, cancel, call_id: call_id.into() }
+        Self {
+            host,
+            events,
+            cancel,
+            call_id: call_id.into(),
+        }
     }
 
     /// The typed host bridge, or a typed error when this registry is
     /// sandboxed. Replaces the `"… callback not configured"` string path.
     #[cfg_attr(not(test), allow(dead_code))] // API of the composable context (doc §3.5); consumed by tests now, tools adopt it when the bridge lands in their execute path
-    pub fn host(&self) -> Result<&dyn crate::agent::host_bridge::HostBridge, crate::errors::ToolError> {
-        self.host.as_deref().ok_or_else(|| crate::errors::ToolError::Execution {
-            message: "host capability not available in this context".to_string(),
-        })
+    pub fn host(
+        &self,
+    ) -> Result<&dyn crate::agent::host_bridge::HostBridge, crate::errors::ToolError> {
+        self.host
+            .as_deref()
+            .ok_or_else(|| crate::errors::ToolError::Execution {
+                message: "host capability not available in this context".to_string(),
+            })
     }
 
     /// Emit a progress/audit event.
     pub fn emit(&self, event: ToolEvent) -> Result<(), crate::errors::ToolError> {
-        self.events.send(event).map_err(|_| crate::errors::ToolError::Execution {
-            message: "event channel closed".to_string(),
-        })
+        self.events
+            .send(event)
+            .map_err(|_| crate::errors::ToolError::Execution {
+                message: "event channel closed".to_string(),
+            })
     }
 
     /// Whether cooperative cancellation has been requested.
@@ -274,7 +285,10 @@ impl ToolContext {
 
     /// Registry seam: rebind the host on a caller-supplied context (the
     /// registry is the single builder — see `ToolRegistry::execute_inner`).
-    pub(crate) fn with_host(mut self, host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>) -> Self {
+    pub(crate) fn with_host(
+        mut self,
+        host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
+    ) -> Self {
         self.host = host;
         self
     }
@@ -608,12 +622,12 @@ mod tests {
 
         // Can emit events through the channel
         ctx.emit(ToolEvent::Progress {
-                tool_name: "exec".to_string(),
-                tool_call_id: "call_123".to_string(),
-                elapsed_ms: 1000,
-                output_preview: None,
-            })
-            .unwrap();
+            tool_name: "exec".to_string(),
+            tool_call_id: "call_123".to_string(),
+            elapsed_ms: 1000,
+            output_preview: None,
+        })
+        .unwrap();
 
         let event = rx.try_recv().unwrap();
         match event {
@@ -640,7 +654,7 @@ mod tests {
     fn test_tool_context_composition() {
         use crate::agent::host_bridge::{
             CancelRequest, CheckRequest, HostBridge, HostDispatcher, ListReply, LoopHost,
-            LoopRequest, LoopReply, MessageHost, PipelineHost, PipelineRequest, PipelineReply,
+            LoopReply, LoopRequest, MessageHost, PipelineHost, PipelineReply, PipelineRequest,
             SendMessageReply, SendMessageRequest, SpawnHost, SpawnReply, SpawnRequest, WaitReply,
             WaitRequest,
         };
@@ -650,41 +664,77 @@ mod tests {
         struct NoopSpawn;
         #[async_trait]
         impl SpawnHost for NoopSpawn {
-            async fn spawn(&self, _r: SpawnRequest) -> Result<SpawnReply, crate::errors::ToolError> {
-                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            async fn spawn(
+                &self,
+                _r: SpawnRequest,
+            ) -> Result<SpawnReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
             }
             async fn list_subagents(&self) -> Result<ListReply, crate::errors::ToolError> {
-                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
             }
-            async fn cancel(&self, _r: CancelRequest) -> Result<crate::agent::host_bridge::CancelReply, crate::errors::ToolError> {
-                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            async fn cancel(
+                &self,
+                _r: CancelRequest,
+            ) -> Result<crate::agent::host_bridge::CancelReply, crate::errors::ToolError>
+            {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
             }
             async fn wait(&self, _r: WaitRequest) -> Result<WaitReply, crate::errors::ToolError> {
-                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
             }
-            async fn check(&self, _r: CheckRequest) -> Result<crate::agent::host_bridge::CheckReply, crate::errors::ToolError> {
-                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            async fn check(
+                &self,
+                _r: CheckRequest,
+            ) -> Result<crate::agent::host_bridge::CheckReply, crate::errors::ToolError>
+            {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
             }
         }
         struct NoopPipeline;
         #[async_trait]
         impl PipelineHost for NoopPipeline {
-            async fn run_pipeline(&self, _r: PipelineRequest) -> Result<PipelineReply, crate::errors::ToolError> {
-                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            async fn run_pipeline(
+                &self,
+                _r: PipelineRequest,
+            ) -> Result<PipelineReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
             }
         }
         struct NoopLoop;
         #[async_trait]
         impl LoopHost for NoopLoop {
-            async fn run_loop(&self, _r: LoopRequest) -> Result<LoopReply, crate::errors::ToolError> {
-                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            async fn run_loop(
+                &self,
+                _r: LoopRequest,
+            ) -> Result<LoopReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
             }
         }
         struct NoopMessage;
         #[async_trait]
         impl MessageHost for NoopMessage {
-            async fn send(&self, _r: SendMessageRequest) -> Result<SendMessageReply, crate::errors::ToolError> {
-                Err(crate::errors::ToolError::Execution { message: "noop".to_string() })
+            async fn send(
+                &self,
+                _r: SendMessageRequest,
+            ) -> Result<SendMessageReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
             }
         }
 
@@ -708,7 +758,10 @@ mod tests {
             output_preview: None,
         })
         .unwrap();
-        assert!(matches!(rx.try_recv(), Ok(ToolEvent::Progress { elapsed_ms: 5, .. })));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ToolEvent::Progress { elapsed_ms: 5, .. })
+        ));
         // cancellation + correlation id.
         assert!(!ctx.is_cancelled());
         token.cancel();
@@ -718,12 +771,16 @@ mod tests {
 
         // A sandboxed context reports the typed host error.
         let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
-        let sandboxed = ToolContext::new(None, tx2, tokio_util::sync::CancellationToken::new(), "s");
+        let sandboxed =
+            ToolContext::new(None, tx2, tokio_util::sync::CancellationToken::new(), "s");
         let err = match sandboxed.host() {
             Err(e) => e,
             Ok(_) => panic!("expected typed host error"),
         };
-        assert_eq!(err.render(), "Error: host capability not available in this context");
+        assert_eq!(
+            err.render(),
+            "Error: host capability not available in this context"
+        );
     }
 
     #[test]

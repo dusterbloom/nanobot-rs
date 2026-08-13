@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::indexing_slicing,
-)]
+#![allow(clippy::indexing_slicing)]
 //! Event types for the message bus.
 
 use std::collections::HashMap;

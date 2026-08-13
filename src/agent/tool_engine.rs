@@ -7,7 +7,7 @@
     clippy::as_conversions,
     clippy::format_push_string,
     clippy::indexing_slicing,
-    clippy::shadow_reuse,
+    clippy::shadow_reuse
 )]
 //! Tool execution engine: delegated and inline paths.
 //!
@@ -188,7 +188,9 @@ fn render_tool_result_handle(
 /// Fixed-scalar allowlist for the handle's `args` field, in a fixed order.
 /// Only these keys are surfaced (deterministic + compact); everything else is
 /// dropped. JSON-escaped by the caller via `serde_json::to_string`.
-fn tool_arg_summary(args: &std::collections::HashMap<String, Value>) -> Vec<(&'static str, String)> {
+fn tool_arg_summary(
+    args: &std::collections::HashMap<String, Value>,
+) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     for key in &["path", "command", "query"] {
         if let Some(v) = args.get(*key) {
@@ -823,10 +825,11 @@ pub(crate) async fn execute_tools_delegated(
             } else {
                 TOOL_RUNNER_SUMMARY_PREFIX
             };
-            ctx.messages.push(crate::agent::markers::scaffold_user(format!(
-                "{} {}",
-                prefix, summary_text
-            )));
+            ctx.messages
+                .push(crate::agent::markers::scaffold_user(format!(
+                    "{} {}",
+                    prefix, summary_text
+                )));
             ctx.persist_pending_protocol_messages().await;
         }
     }
@@ -920,8 +923,8 @@ fn detect_api_error_body(
     }
     let body = result.data().to_string();
     // Fast path: only parse JSON if it contains error-like keys.
-    let has_status_error = body.contains("\"status\": \"error\"")
-        || body.contains("\"status\":\"error\"");
+    let has_status_error =
+        body.contains("\"status\": \"error\"") || body.contains("\"status\":\"error\"");
     let has_error_key = body.contains("\"error\"");
     if !has_status_error && !has_error_key {
         return result;
@@ -1894,11 +1897,7 @@ mod tests {
         let session = sessions.create_session("test:replay-byte-cap").await;
         // Multibyte UTF-8: below the configured char cap but over the byte cap,
         // so the byte cap (the replay ceiling) is what forces the stash.
-        let data = format!(
-            "{}MIDDLE_SECRET{}",
-            "あ".repeat(3000),
-            "い".repeat(3000)
-        );
+        let data = format!("{}MIDDLE_SECRET{}", "あ".repeat(3000), "い".repeat(3000));
         assert!(data.len() > TOOL_RESULT_REPLAY_MAX_BYTES);
         assert!(data.chars().count() < 10_000);
 
@@ -1967,13 +1966,8 @@ mod tests {
         )
         .await
         .expect("sub-cap body needs no stash");
-        let injected = digest_tool_result(
-            "read_file",
-            &HashMap::new(),
-            &data,
-            10_000,
-            "call_inline",
-        );
+        let injected =
+            digest_tool_result("read_file", &HashMap::new(), &data, 10_000, "call_inline");
 
         assert!(
             !stashed,
@@ -1984,7 +1978,10 @@ mod tests {
             "inline body must be fully visible, not truncated: {injected}"
         );
         assert!(
-            sessions.load_tool_result(&session.id, "call_inline").await.is_none(),
+            sessions
+                .load_tool_result(&session.id, "call_inline")
+                .await
+                .is_none(),
             "nothing stashed, nothing to recall"
         );
     }
@@ -2627,10 +2624,7 @@ mod tests {
     fn render_tool_result_handle_is_deterministic_and_hides_body() {
         let body = "line one with specific content\nline two\nline three";
         let mut args = HashMap::new();
-        args.insert(
-            "path".to_string(),
-            Value::String("src/main.rs".to_string()),
-        );
+        args.insert("path".to_string(), Value::String("src/main.rs".to_string()));
         args.insert(
             "ignored_thing".to_string(),
             Value::String("should not appear".to_string()),

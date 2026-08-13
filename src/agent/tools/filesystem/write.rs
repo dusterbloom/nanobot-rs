@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-)]
+#![allow(clippy::as_conversions)]
 //! `write_file` tool.
 
 use std::collections::{HashMap, HashSet};
@@ -658,7 +656,12 @@ mod tests {
         std::fs::write(&file_path, "old").unwrap();
         let tool = WriteFileTool::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolContext::new(None, event_tx, tokio_util::sync::CancellationToken::new(), "call-oversized".to_string());
+        let ctx = ToolContext::new(
+            None,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            "call-oversized".to_string(),
+        );
 
         let content = "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1);
         let result = tool
@@ -789,7 +792,12 @@ mod tests {
         std::fs::write(&file_path, "old").unwrap();
         let tool = WriteFileTool::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolContext::new(None, event_tx, tokio_util::sync::CancellationToken::new(), "call-1".to_string());
+        let ctx = ToolContext::new(
+            None,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            "call-1".to_string(),
+        );
 
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
@@ -822,7 +830,12 @@ mod tests {
         std::fs::write(&file_path, "<script>run()").unwrap();
         let tool = WriteFileTool::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolContext::new(None, event_tx, tokio_util::sync::CancellationToken::new(), "call-append".to_string());
+        let ctx = ToolContext::new(
+            None,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            "call-append".to_string(),
+        );
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("content", "</script></html>"),
@@ -846,8 +859,18 @@ mod tests {
         let file_path = dir.path().join("artifact.html");
         let tool = WriteFileTool::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let first_ctx = ToolContext::new(None, event_tx.clone(), tokio_util::sync::CancellationToken::new(), "call-1".to_string());
-        let final_ctx = ToolContext::new(None, event_tx, tokio_util::sync::CancellationToken::new(), "call-2".to_string());
+        let first_ctx = ToolContext::new(
+            None,
+            event_tx.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            "call-1".to_string(),
+        );
+        let final_ctx = ToolContext::new(
+            None,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            "call-2".to_string(),
+        );
 
         tool.execute_with_context(
             make_params(&[

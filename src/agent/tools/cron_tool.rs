@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::shadow_reuse)]
 //! Cron tool for scheduling reminders and tasks.
 
 use std::collections::HashMap;

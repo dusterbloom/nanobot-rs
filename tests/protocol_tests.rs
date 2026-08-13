@@ -18,7 +18,7 @@
     clippy::print_stdout,
     clippy::print_stderr,
     clippy::pedantic,
-    clippy::nursery,
+    clippy::nursery
 )]
 // Phase 1 & 2: Tests for Turn enum and ConversationProtocol — written FIRST (Red).
 // These will fail until Turn and the protocol modules are implemented.

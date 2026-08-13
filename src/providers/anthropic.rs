@@ -7,7 +7,7 @@
     clippy::as_conversions,
     clippy::indexing_slicing,
     clippy::shadow_reuse,
-    clippy::shadow_unrelated,
+    clippy::shadow_unrelated
 )]
 //! Native Anthropic Messages API provider.
 //!
@@ -28,7 +28,9 @@ use tracing::{debug, info, instrument, warn};
 
 use backon::Retryable;
 
-use super::base::{FinishReason, LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
+use super::base::{
+    FinishReason, LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest,
+};
 use super::retry;
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
@@ -873,7 +875,9 @@ async fn parse_anthropic_sse(
                     let mut indices: Vec<u64> = tool_blocks.keys().copied().collect();
                     indices.sort();
                     for idx in indices {
-                        let Some((id, name, args_str)) = tool_blocks.remove(&idx) else { continue; };
+                        let Some((id, name, args_str)) = tool_blocks.remove(&idx) else {
+                            continue;
+                        };
                         let arguments: HashMap<String, Value> =
                             serde_json::from_str(&args_str).unwrap_or_default();
                         tool_calls.push(ToolCallRequest {
@@ -907,7 +911,9 @@ async fn parse_anthropic_sse(
     let mut indices: Vec<u64> = tool_blocks.keys().copied().collect();
     indices.sort();
     for idx in indices {
-        let Some((id, name, args_str)) = tool_blocks.remove(&idx) else { continue; };
+        let Some((id, name, args_str)) = tool_blocks.remove(&idx) else {
+            continue;
+        };
         let arguments: HashMap<String, Value> = serde_json::from_str(&args_str).unwrap_or_default();
         tool_calls.push(ToolCallRequest {
             id,

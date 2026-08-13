@@ -8,23 +8,26 @@
 // here: they mask incomplete coverage even under `cfg(test)`. Modules whose
 // tests still need them carry a narrow per-test-module allow (doc §3.6's
 // approach) instead.
-#![cfg_attr(test, allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::dbg_macro,
-    clippy::indexing_slicing,
-    clippy::as_conversions,
-    clippy::shadow_reuse,
-    clippy::shadow_unrelated,
-    clippy::shadow_same,
-    clippy::string_add,
-    clippy::format_push_string,
-    clippy::print_stdout,
-    clippy::print_stderr,
-    clippy::pedantic,
-    clippy::nursery,
-))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::indexing_slicing,
+        clippy::as_conversions,
+        clippy::shadow_reuse,
+        clippy::shadow_unrelated,
+        clippy::shadow_same,
+        clippy::string_add,
+        clippy::format_push_string,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::pedantic,
+        clippy::nursery,
+    )
+)]
 //! nanobot library — exposes internal modules for the trio_bench binary.
 
 pub(crate) const VERSION: &str = "0.1.0";

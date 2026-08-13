@@ -7,7 +7,7 @@
     clippy::as_conversions,
     clippy::indexing_slicing,
     clippy::shadow_reuse,
-    clippy::shadow_unrelated,
+    clippy::shadow_unrelated
 )]
 //! `AgentLoopShared` struct, supporting types, and the `impl AgentLoopShared` block
 //! containing the main agent loop step methods.
@@ -30,7 +30,9 @@ use crate::agent::agent_loop::heuristics::{
 use crate::agent::anti_drift;
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::context::ContextBuilder;
-use crate::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
+use crate::agent::lcm::{
+    AutoExpansionCandidate, CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine,
+};
 use crate::agent::lease::Lease;
 use crate::agent::policy;
 use crate::agent::prefix_guard;
@@ -47,12 +49,14 @@ use crate::agent::validation;
 use crate::bus::events::OutboundMessage;
 use crate::config::schema::{EmailConfig, LcmSchemaConfig, ProprioceptionConfig};
 use crate::cron::service::CronService;
-use crate::errors::is_retryable_provider_error;
+use crate::errors::{
+    classify_retained_session_error, is_retryable_provider_error, RetainedSessionErrorKind,
+};
 use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
 
 use crate::agent::agent_core::{
-    append_to_system_prompt, apply_compaction_result, stable_higgs_session_id, PendingCompaction,
-    RuntimeCounters, SharedCoreHandle, SwappableCore,
+    append_to_system_prompt, apply_compaction_result, ExpansionCheckpoint, PendingCompaction,
+    RuntimeCounters, SessionRetirement, SharedCoreHandle, SwappableCore, ToolPresentationMode,
 };
 
 use super::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
@@ -63,10 +67,11 @@ use super::response::RetryState;
 use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, ControlMarker};
 
 use super::budget::{
-    advertised_tool_names, attach_higgs_session_marker, clear_prompt_cache_state,
+    advertised_tool_names, attach_higgs_session_control, clear_prompt_cache_state,
     conversation_token_count, divergent_message_digest, invalidate_prompt_cache_for_rewrite,
     proactive_grounding_preserves_prefix_cache, send_cache_reset_marker, send_compaction_marker,
     send_retract_reply_marker, should_allow_checkpoint, should_inject_heartbeat_grounding,
+    strip_higgs_session_lease_control,
 };
 use super::compaction::execute_lcm_compaction;
 use super::local_stream::{
@@ -83,6 +88,26 @@ pub(crate) use super::compaction::CompactionHandle;
 // ---------------------------------------------------------------------------
 // Per-instance state (different per agent)
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderRequestRetryPolicy {
+    Standard,
+    OneShotLease,
+}
+
+enum ForcedToolRecoveryOutcome {
+    Response(LLMResponse),
+    ProviderError {
+        original: LLMResponse,
+        error: anyhow::Error,
+    },
+}
+
+impl ProviderRequestRetryPolicy {
+    fn allows_retry(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+}
 
 /// Per-instance state that differs between the REPL agent and gateway agents.
 pub(crate) struct AgentLoopShared {
@@ -182,6 +207,16 @@ pub(crate) struct TurnContext {
     pub(crate) compaction: CompactionHandle,
     /// Set during pre-call accounting and consumed only after foreground work ends.
     pub(crate) soft_compaction_requested: bool,
+    /// Planned LCM nodes carried by the current provider request. They remain
+    /// eligible until that request completes successfully.
+    pub(crate) staged_auto_expansion: Option<AppliedAutoExpansion>,
+    /// Higgs cache route selected once for this turn and retained across every
+    /// tool iteration until terminal cleanup.
+    pub(crate) higgs_session_route: HiggsSessionRoute,
+    /// Synchronous fail-safe for cancellation or task abort after retained
+    /// preflight. Normal terminal/fallback paths disarm it after explicit
+    /// checkpoint retirement.
+    pub(crate) retained_route_cleanup: RetainedRouteCleanupGuard,
     pub(crate) content_gate: crate::agent::context_gate::ContentGate,
 
     // --- Observability ---
@@ -200,6 +235,481 @@ pub(crate) struct TurnContext {
     // --- Reasoning ---
     /// Shared reasoning engine for plan-guided execution and backtracking.
     pub(crate) reasoning: SharedEngine,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoExpansionMaterializationKind {
+    ExactCheckpoint,
+    FlattenedFallback,
+}
+
+struct AutoExpansionMaterialization {
+    messages: Vec<Value>,
+    kind: AutoExpansionMaterializationKind,
+}
+
+pub(crate) struct AppliedAutoExpansion {
+    logical_messages: Vec<Value>,
+    rendered_messages: Vec<Value>,
+    node_ids: Vec<usize>,
+    exact_count: usize,
+    estimated_added_tokens: usize,
+    retained_plan: Option<RetainedExpansionPlan>,
+}
+
+#[derive(Clone)]
+struct RetainedExpansionPlan {
+    checkpoint: ExpansionCheckpoint,
+    compacted_prefix: Vec<Value>,
+    fallback_prefix: Option<Vec<Value>>,
+    exact_prefix_len: usize,
+}
+
+impl AppliedAutoExpansion {
+    fn retained_plan(&self) -> Option<RetainedExpansionPlan> {
+        self.retained_plan.clone()
+    }
+
+    fn use_flattened_fallback(&mut self, protocol: &dyn ConversationProtocol) -> bool {
+        let Some(plan) = self.retained_plan.take() else {
+            return false;
+        };
+        let Some(fallback_prefix) = plan.fallback_prefix else {
+            return false;
+        };
+        self.logical_messages = fallback_prefix;
+        self.rendered_messages = render_via_protocol(protocol, &self.logical_messages);
+        self.exact_count = 0;
+        true
+    }
+}
+
+struct CommittedAutoExpansion(AppliedAutoExpansion);
+
+#[derive(Clone, Default)]
+pub(crate) struct PromptCacheSnapshot {
+    fingerprint: Option<crate::agent::prompt_fingerprint::PromptFingerprint>,
+    watermark: Option<usize>,
+    route_identity: (Option<u64>, u64, Option<u64>),
+}
+
+impl PromptCacheSnapshot {
+    fn capture(counters: &RuntimeCounters, session_key: &str) -> Self {
+        let _transition = counters.lock_prompt_cache_transition();
+        let route_identity = counters.prompt_cache_route_identity(session_key);
+        let fingerprints = counters.prompt_fingerprints.lock();
+        let watermarks = counters.prompt_cache_watermark.lock();
+        Self {
+            fingerprint: fingerprints.get(session_key).cloned(),
+            watermark: watermarks.get(session_key).copied(),
+            route_identity,
+        }
+    }
+
+    fn capture_and_clear(counters: &RuntimeCounters, session_key: &str) -> Self {
+        let _transition = counters.lock_prompt_cache_transition();
+        let route_identity = counters.prompt_cache_route_identity(session_key);
+        let mut fingerprints = counters.prompt_fingerprints.lock();
+        let mut watermarks = counters.prompt_cache_watermark.lock();
+        Self {
+            fingerprint: fingerprints.remove(session_key),
+            watermark: watermarks.remove(session_key),
+            route_identity,
+        }
+    }
+
+    fn restore(self, counters: &RuntimeCounters, session_key: &str) {
+        self.restore_inner(counters, session_key, || {});
+    }
+
+    fn restore_inner<F>(self, counters: &RuntimeCounters, session_key: &str, observe_identity: F)
+    where
+        F: FnOnce(),
+    {
+        let _transition = counters.lock_prompt_cache_transition();
+        if counters.prompt_cache_route_identity(session_key) != self.route_identity {
+            return;
+        }
+        observe_identity();
+        let mut fingerprints = counters.prompt_fingerprints.lock();
+        let mut watermarks = counters.prompt_cache_watermark.lock();
+        match self.fingerprint {
+            Some(fingerprint) => {
+                fingerprints.insert(session_key.to_string(), fingerprint);
+            }
+            None => {
+                fingerprints.remove(session_key);
+            }
+        }
+        match self.watermark {
+            Some(watermark) => {
+                watermarks.insert(session_key.to_string(), watermark);
+            }
+            None => {
+                watermarks.remove(session_key);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn restore_observed<F>(self, counters: &RuntimeCounters, session_key: &str, observe_identity: F)
+    where
+        F: FnOnce(),
+    {
+        self.restore_inner(counters, session_key, observe_identity);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RetainedRouteCleanupGuard {
+    armed: Option<(
+        Arc<RuntimeCounters>,
+        String,
+        ExpansionCheckpoint,
+        PromptCacheSnapshot,
+    )>,
+}
+
+impl RetainedRouteCleanupGuard {
+    fn arm(
+        &mut self,
+        counters: Arc<RuntimeCounters>,
+        session_key: String,
+        checkpoint: ExpansionCheckpoint,
+        active_prompt_cache: PromptCacheSnapshot,
+    ) {
+        self.armed = Some((counters, session_key, checkpoint, active_prompt_cache));
+    }
+
+    fn disarm(&mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for RetainedRouteCleanupGuard {
+    fn drop(&mut self) {
+        let Some((counters, session_key, checkpoint, active_prompt_cache)) = self.armed.take()
+        else {
+            return;
+        };
+        active_prompt_cache.restore(&counters, &session_key);
+        counters.discard_expansion_checkpoint(
+            &session_key,
+            checkpoint.old_higgs_session_id,
+            checkpoint.summary_node_id,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActiveCompactedRoute {
+    Active,
+    Fallback,
+    OverflowSummary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedExpansionFailure {
+    Unavailable,
+    ContextOverflow,
+}
+
+/// One cache route for the whole foreground turn. The retained variant keeps
+/// both active fallbacks so a later tool-iteration failure can replace the
+/// exact prefix without disturbing assistant/tool messages appended after it.
+pub(crate) enum HiggsSessionRoute {
+    ActiveCompacted {
+        route: ActiveCompactedRoute,
+    },
+    RetainedExpansion {
+        checkpoint: ExpansionCheckpoint,
+        compacted_prefix: Vec<Value>,
+        fallback_prefix: Option<Vec<Value>>,
+        exact_prefix_len: usize,
+        expansion_published: bool,
+        active_prompt_cache: PromptCacheSnapshot,
+    },
+}
+
+impl Default for HiggsSessionRoute {
+    fn default() -> Self {
+        Self::ActiveCompacted {
+            route: ActiveCompactedRoute::Active,
+        }
+    }
+}
+
+impl HiggsSessionRoute {
+    fn retained_expansion(
+        checkpoint: ExpansionCheckpoint,
+        compacted_prefix: Vec<Value>,
+        fallback_prefix: Option<Vec<Value>>,
+        exact_prefix_len: usize,
+        active_prompt_cache: PromptCacheSnapshot,
+    ) -> Self {
+        Self::RetainedExpansion {
+            checkpoint,
+            compacted_prefix,
+            fallback_prefix,
+            exact_prefix_len,
+            expansion_published: false,
+            active_prompt_cache,
+        }
+    }
+
+    pub(super) fn cache_route(&self) -> &'static str {
+        match self {
+            Self::ActiveCompacted {
+                route: ActiveCompactedRoute::Active,
+            } => "active",
+            Self::ActiveCompacted {
+                route: ActiveCompactedRoute::Fallback | ActiveCompactedRoute::OverflowSummary,
+            } => "fallback",
+            Self::RetainedExpansion { .. } => "retained_expansion",
+        }
+    }
+
+    fn mark_expansion_published(&mut self) {
+        if let Self::RetainedExpansion {
+            expansion_published,
+            ..
+        } = self
+        {
+            *expansion_published = true;
+        }
+    }
+
+    fn permits_auto_expansion(&self) -> bool {
+        matches!(
+            self,
+            Self::ActiveCompacted {
+                route: ActiveCompactedRoute::Active | ActiveCompactedRoute::Fallback
+            }
+        )
+    }
+
+    fn retained_checkpoint(&self) -> Option<&ExpansionCheckpoint> {
+        match self {
+            Self::RetainedExpansion { checkpoint, .. } => Some(checkpoint),
+            Self::ActiveCompacted { .. } => None,
+        }
+    }
+
+    fn take_retained_checkpoint(&mut self) -> Option<(ExpansionCheckpoint, PromptCacheSnapshot)> {
+        let retained = std::mem::take(self);
+        match retained {
+            Self::RetainedExpansion {
+                checkpoint,
+                active_prompt_cache,
+                ..
+            } => Some((checkpoint, active_prompt_cache)),
+            active => {
+                *self = active;
+                None
+            }
+        }
+    }
+
+    fn fallback_from_retained(
+        &mut self,
+        failure: RetainedExpansionFailure,
+        logical_messages: &mut Vec<Value>,
+        rendered_messages: &mut Vec<Value>,
+        protocol: &dyn ConversationProtocol,
+    ) -> Option<(ExpansionCheckpoint, PromptCacheSnapshot)> {
+        let retained = std::mem::take(self);
+        let Self::RetainedExpansion {
+            checkpoint,
+            compacted_prefix,
+            fallback_prefix,
+            exact_prefix_len,
+            expansion_published,
+            active_prompt_cache,
+        } = retained
+        else {
+            return None;
+        };
+        let use_flattened =
+            matches!(failure, RetainedExpansionFailure::Unavailable) && fallback_prefix.is_some();
+        *self = Self::ActiveCompacted {
+            route: if use_flattened {
+                ActiveCompactedRoute::Fallback
+            } else {
+                ActiveCompactedRoute::OverflowSummary
+            },
+        };
+        if expansion_published {
+            let tail = logical_messages
+                .get(exact_prefix_len..)
+                .unwrap_or_default()
+                .to_vec();
+            *logical_messages = if use_flattened {
+                fallback_prefix.unwrap_or(compacted_prefix)
+            } else {
+                compacted_prefix
+            };
+            logical_messages.extend(tail);
+            *rendered_messages = render_via_protocol(protocol, logical_messages);
+        }
+        Some((checkpoint, active_prompt_cache))
+    }
+}
+
+impl CommittedAutoExpansion {
+    /// Publish the prompt and its cache identity as one synchronous operation.
+    /// The only constructor first commits every planned LCM node, so callers
+    /// cannot expose reconstructed messages while their summaries stay eligible.
+    fn publish(
+        self,
+        logical_messages: &mut Vec<Value>,
+        rendered_messages: &mut Vec<Value>,
+        counters: &RuntimeCounters,
+        session_key: &str,
+        prompt_fingerprint: crate::agent::prompt_fingerprint::PromptFingerprint,
+    ) {
+        *logical_messages = self.0.logical_messages;
+        *rendered_messages = self.0.rendered_messages;
+        let _transition = counters.lock_prompt_cache_transition();
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session_key.to_string(), prompt_fingerprint);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session_key.to_string(), logical_messages.len());
+    }
+}
+
+/// Resolve and lock the per-session engine before mutating either eligibility
+/// or the turn prompt. Once the awaited lock is acquired, the batch commit and
+/// returned publication capability are produced in the same poll; cancellation
+/// before that point therefore leaves both engine and prompt state untouched.
+async fn commit_staged_auto_expansion(
+    staged: AppliedAutoExpansion,
+    lcm_engines: &Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<LcmEngine>>>>>,
+    session_id: &str,
+) -> Option<CommittedAutoExpansion> {
+    let engine = { lcm_engines.lock().await.get(session_id).cloned() }?;
+    let mut engine = engine.lock().await;
+    engine
+        .commit_auto_expansions(&staged.node_ids)
+        .then_some(CommittedAutoExpansion(staged))
+}
+
+/// Materialize a planned candidate without touching LCM eligibility state.
+/// Exact reuse requires one matching summary and complete, ordered durable IDs;
+/// every uncertain shape preserves the compacted prompt and appends the current
+/// bounded flattened representation instead.
+fn materialize_auto_expansion(
+    messages: &[Value],
+    candidate: &AutoExpansionCandidate,
+    checkpoint: Option<&ExpansionCheckpoint>,
+) -> AutoExpansionMaterialization {
+    let exact_span = checkpoint.and_then(|checkpoint| {
+        if !checkpoint.lease_confirmed || checkpoint.summary_node_id != candidate.node_id {
+            return None;
+        }
+        let replaced_source_ids = checkpoint
+            .replaced_span
+            .iter()
+            .map(|message| {
+                message
+                    .get("_db_id")
+                    .and_then(Value::as_u64)
+                    .and_then(|id| usize::try_from(id).ok())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (replaced_source_ids == candidate.source_ids).then_some(&checkpoint.replaced_span)
+    });
+    if let Some(replaced_span) = exact_span {
+        let mut positions = messages.iter().enumerate().filter_map(|(index, message)| {
+            (message == &candidate.summary_message).then_some(index)
+        });
+        if let Some(summary_index) = positions.next() {
+            if positions.next().is_none() {
+                let mut exact =
+                    Vec::with_capacity(messages.len().saturating_sub(1) + replaced_span.len());
+                exact.extend_from_slice(&messages[..summary_index]);
+                exact.extend(replaced_span.iter().cloned());
+                exact.extend_from_slice(&messages[summary_index + 1..]);
+                return AutoExpansionMaterialization {
+                    messages: exact,
+                    kind: AutoExpansionMaterializationKind::ExactCheckpoint,
+                };
+            }
+        }
+    }
+
+    let mut flattened = messages.to_vec();
+    flattened.push(candidate.flattened_fallback.clone());
+    AutoExpansionMaterialization {
+        messages: flattened,
+        kind: AutoExpansionMaterializationKind::FlattenedFallback,
+    }
+}
+
+/// Build and protocol-render the complete candidate prompt before publishing
+/// any mutation to the turn. Returning `None` leaves the compacted logical
+/// prompt untouched, which prevents an oversized expansion from triggering the
+/// ordinary emergency-trim/session-rotation path.
+fn apply_auto_expansion_candidates(
+    protocol: &dyn ConversationProtocol,
+    messages: &[Value],
+    candidates: &[AutoExpansionCandidate],
+    checkpoint: Option<&ExpansionCheckpoint>,
+    tool_def_tokens: usize,
+    prompt_token_limit: usize,
+) -> Option<AppliedAutoExpansion> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut logical_messages = messages.to_vec();
+    let mut exact_count = 0;
+    for candidate in candidates {
+        let materialized = materialize_auto_expansion(&logical_messages, candidate, checkpoint);
+        if materialized.kind == AutoExpansionMaterializationKind::ExactCheckpoint {
+            exact_count += 1;
+        }
+        logical_messages = materialized.messages;
+    }
+    let rendered_messages = render_via_protocol(protocol, &logical_messages);
+    let estimated_tokens =
+        TokenBudget::estimate_tokens(&rendered_messages).saturating_add(tool_def_tokens);
+    if estimated_tokens > prompt_token_limit {
+        return None;
+    }
+    let retained_plan = if candidates.len() == 1 && exact_count == 1 {
+        checkpoint.cloned().map(|checkpoint| {
+            let fallback_prefix =
+                materialize_auto_expansion(messages, &candidates[0], None).messages;
+            let fallback_rendered = render_via_protocol(protocol, &fallback_prefix);
+            let fallback_tokens =
+                TokenBudget::estimate_tokens(&fallback_rendered).saturating_add(tool_def_tokens);
+            RetainedExpansionPlan {
+                checkpoint,
+                compacted_prefix: messages.to_vec(),
+                fallback_prefix: (fallback_tokens <= prompt_token_limit).then_some(fallback_prefix),
+                exact_prefix_len: logical_messages.len(),
+            }
+        })
+    } else {
+        None
+    };
+    Some(AppliedAutoExpansion {
+        logical_messages,
+        rendered_messages,
+        node_ids: candidates
+            .iter()
+            .map(|candidate| candidate.node_id)
+            .collect(),
+        exact_count,
+        estimated_added_tokens: candidates
+            .iter()
+            .map(|candidate| candidate.estimated_tokens)
+            .fold(0usize, usize::saturating_add),
+        retained_plan,
+    })
 }
 
 struct SoftCompactionRequest {
@@ -309,7 +819,6 @@ impl TurnContext {
         }
         self.new_start = self.messages.len();
     }
-
 }
 
 /// Signal generation cancellation from either owner without dropping the
@@ -405,6 +914,29 @@ fn advance_response_boundary(
 pub(crate) const LEASE_BLOCKS_BEFORE_STRIP: u32 = 2;
 pub(crate) const NO_PROGRESS_HARD_STOP: u32 = 4;
 pub(crate) const MAX_LEASE_RENEWAL_REJECTIONS: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeasePresentationPolicy {
+    forced_text: bool,
+    stripped_definitions: bool,
+}
+
+fn apply_lease_presentation_policy(
+    consecutive_lease_blocks: u32,
+    tool_defs: &mut Vec<Value>,
+    mode: &mut ToolPresentationMode,
+) -> LeasePresentationPolicy {
+    let forced_text = consecutive_lease_blocks >= LEASE_BLOCKS_BEFORE_STRIP;
+    let stripped_definitions = forced_text && !tool_defs.is_empty();
+    if forced_text {
+        tool_defs.clear();
+        *mode = ToolPresentationMode::ForcedText;
+    }
+    LeasePresentationPolicy {
+        forced_text,
+        stripped_definitions,
+    }
+}
 
 /// Per-turn flow control flags.
 ///
@@ -752,10 +1284,7 @@ fn should_attempt_forced_recovery(
 }
 
 impl AgentLoopShared {
-    pub(crate) async fn compaction_handle_for_session(
-        &self,
-        session_id: &str,
-    ) -> CompactionHandle {
+    pub(crate) async fn compaction_handle_for_session(&self, session_id: &str) -> CompactionHandle {
         let mut handles = self.compaction_handles.lock().await;
         handles
             .entry(session_id.to_string())
@@ -1011,10 +1540,8 @@ impl AgentLoopShared {
                     // forces a final answer regardless of the reason. This is the
                     // universal convergence invariant — without it the loop spins.
                     if ctx.flow.round_executed_no_tools {
-                        ctx.flow.consecutive_no_progress_rounds = ctx
-                            .flow
-                            .consecutive_no_progress_rounds
-                            .saturating_add(1);
+                        ctx.flow.consecutive_no_progress_rounds =
+                            ctx.flow.consecutive_no_progress_rounds.saturating_add(1);
                         if ctx.flow.consecutive_no_progress_rounds >= NO_PROGRESS_HARD_STOP {
                             warn!(
                                 rounds = ctx.flow.consecutive_no_progress_rounds,
@@ -1133,6 +1660,18 @@ impl AgentLoopShared {
                     break;
                 }
             }
+        }
+
+        if let Some((checkpoint, active_prompt_cache)) =
+            ctx.higgs_session_route.take_retained_checkpoint()
+        {
+            active_prompt_cache.restore(&ctx.counters, &ctx.session_key);
+            ctx.counters.discard_expansion_checkpoint(
+                &ctx.session_key,
+                checkpoint.old_higgs_session_id,
+                checkpoint.summary_node_id,
+            );
+            ctx.retained_route_cleanup.disarm();
         }
 
         // If the loop exited via a non-streaming path (e.g. router preflight
@@ -1376,7 +1915,17 @@ impl AgentLoopShared {
         // unique-UUID receipts. One cache miss here stops the churn and
         // forces a text answer. The counter resets as soon as any tool
         // succeeds (renewal, new lease, etc.).
-        let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx);
+        let (mut tool_defs, saved_tool_defs, mut tool_presentation_mode) =
+            self.select_tool_definitions(ctx);
+        // Reuse only a catalog previously installed from a final provider
+        // array. First-use candidates are not installed until router policy
+        // below has had its chance to restore native definitions.
+        if let Some(frozen) = ctx
+            .counters
+            .frozen_tool_definitions(&ctx.session_key, tool_presentation_mode)
+        {
+            tool_defs = frozen;
+        }
         // `lease_forced_text_only` is computed from the same counter the
         // strip below uses, and is honored by the router-passthrough
         // restore further down. Without this hand-off the strip is undone
@@ -1385,15 +1934,18 @@ impl AgentLoopShared {
         // lease then blocks — the 6× strip/restore churn documented in
         // session 20260729_155613_2b65f0. Router passthrough may reverse
         // trio stripping; it must never reverse lease enforcement.
-        let lease_forced_text_only =
-            ctx.flow.consecutive_lease_blocks >= LEASE_BLOCKS_BEFORE_STRIP && !tool_defs.is_empty();
-        if lease_forced_text_only {
+        let lease_policy = apply_lease_presentation_policy(
+            ctx.flow.consecutive_lease_blocks,
+            &mut tool_defs,
+            &mut tool_presentation_mode,
+        );
+        let lease_forced_text_only = lease_policy.forced_text;
+        if lease_policy.stripped_definitions {
             tracing::info!(
                 session = %ctx.session_key,
                 consecutive_blocks = ctx.flow.consecutive_lease_blocks,
                 "tool_lease_stripping_after_blocks — model ignored receipts, forcing text-only iteration"
             );
-            tool_defs.clear();
         }
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
@@ -1559,8 +2111,8 @@ impl AgentLoopShared {
         // enforcement (the 20260729_155613_2b65f0 failure). Gating the
         // whole block makes trio-off absent from the hot path instead of
         // present-but-inert.
-        let trio_active = ctx.core.mode().is_local()
-            && ctx.core.tool_delegation_config.strict_no_tools_main();
+        let trio_active =
+            ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main();
         if trio_active {
             match crate::agent::router::router_preflight(ctx, self.health_registry.as_deref()).await
             {
@@ -1579,15 +2131,20 @@ impl AgentLoopShared {
                     {
                         debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
                         tool_defs = saved_tool_defs;
+                        tool_presentation_mode = ToolPresentationMode::Native;
                     }
                 }
             }
         }
 
+        tool_defs = self.freeze_final_tool_catalog(ctx, tool_presentation_mode, tool_defs);
+
         ctx.advertised_tool_names = Some(advertised_tool_names(&tool_defs));
 
         // Adaptive max_tokens: size the response budget to the task.
         let effective_max_tokens = self.compute_adaptive_max_tokens(ctx);
+        self.apply_planned_auto_expansion(ctx, &tool_defs, effective_max_tokens)
+            .await;
 
         StepResult::Next(IterationPhase::Calling {
             tool_defs,
@@ -1597,30 +2154,32 @@ impl AgentLoopShared {
 
     /// Select and filter tool definitions for this turn.
     ///
-    /// Returns `(active_defs, saved_defs)` where `saved_defs` preserves the
-    /// pre-trio-stripping state for router passthrough fallback.
-    fn select_tool_definitions(&self, ctx: &mut TurnContext) -> (Vec<Value>, Vec<Value>) {
+    /// Returns `(active_defs, saved_defs, mode)` where `saved_defs` preserves
+    /// the native post-policy state for router passthrough fallback.
+    fn select_tool_definitions(
+        &self,
+        ctx: &mut TurnContext,
+    ) -> (Vec<Value>, Vec<Value>, ToolPresentationMode) {
         // One protocol for local and cloud: hot tools have native schemas and
         // the proxy exposes the long tail. Bonsai otherwise mixes the proxy
         // envelope with native calls (for example exec(args={command: ...})).
         // The larger schema prefix is stable and retained by local backends;
         // paying it once is cheaper than repeated malformed generations.
         let mut tool_defs = ctx.tools.get_core_plus_proxy_definitions();
+        let mut mode = ToolPresentationMode::Native;
         // Tool-averse models (no tool-calling training, e.g. VibeThinker):
         // the native `tools` parameter confuses or errors their chat
         // templates, and nothing else would teach them the textual syntax the
         // response parser expects. Move the tool catalog into the system
         // prompt as a textual-protocol lesson and send no `tools` at all.
-        if ctx.protocol.is_textual_replay()
-            && !ctx.core.model_capabilities.tool_calling
-            && !tool_defs.is_empty()
-        {
+        if ctx.protocol.is_textual_replay() && !ctx.core.model_capabilities.tool_calling {
+            mode = ToolPresentationMode::Textual;
             let already_taught = ctx
                 .messages
                 .first()
                 .and_then(|m| m["content"].as_str())
                 .is_some_and(|s| s.contains(crate::agent::protocol::TEXTUAL_TOOLS_MARKER));
-            if !already_taught {
+            if !already_taught && !tool_defs.is_empty() {
                 append_to_system_prompt(
                     &mut ctx.messages,
                     &crate::agent::protocol::textual_tools_block(&tool_defs),
@@ -1631,8 +2190,14 @@ impl AgentLoopShared {
         // Save tool_defs before potential stripping so we can restore them if
         // the router preflight returns Passthrough (router said "respond") — in
         // that case the main model must have tools as fallback.
-        let saved_tool_defs = tool_defs.clone();
-        if ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main() {
+        let saved_tool_defs = ctx
+            .counters
+            .frozen_tool_definitions(&ctx.session_key, ToolPresentationMode::Native)
+            .unwrap_or_else(|| tool_defs.clone());
+        if mode == ToolPresentationMode::Native
+            && ctx.core.mode().is_local()
+            && ctx.core.tool_delegation_config.strict_no_tools_main()
+        {
             // Hard separation (local trio only): main model is conversation/orchestration only.
             // Cloud providers handle tools natively and must never have them stripped.
             // BUT: if trio routing is degraded, keep tools so main model can still act.
@@ -1662,6 +2227,7 @@ impl AgentLoopShared {
                 ctx.counters
                     .set_trio_state(crate::agent::agent_core::TrioState::Active);
                 tool_defs.clear();
+                mode = ToolPresentationMode::Trio;
                 // Tell the main model it's in orchestration mode (tools stripped).
                 append_to_system_prompt(
                     &mut ctx.messages,
@@ -1708,7 +2274,40 @@ impl AgentLoopShared {
             }
         }
 
-        (tool_defs, saved_tool_defs)
+        (tool_defs, saved_tool_defs, mode)
+    }
+
+    /// Freeze the exact array that will be passed to the provider. The catalog
+    /// lock is released before a mode-change rotation, then reacquired only to
+    /// install the new final array; no reset runs while holding it.
+    fn freeze_final_tool_catalog(
+        &self,
+        ctx: &mut TurnContext,
+        mode: ToolPresentationMode,
+        candidate: Vec<Value>,
+    ) -> Vec<Value> {
+        if let Some(frozen) = ctx.counters.frozen_tool_definitions(&ctx.session_key, mode) {
+            return frozen;
+        }
+
+        if ctx
+            .counters
+            .tool_presentation_mode_changed(&ctx.session_key, mode)
+        {
+            let previous_mode = ctx.counters.tool_presentation_mode(&ctx.session_key);
+            let rotated =
+                invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::ToolBlockChange);
+            warn!(
+                session = %ctx.session_key,
+                ?previous_mode,
+                ?mode,
+                rotated,
+                "tool_block_changed — rotating before installing final provider catalog"
+            );
+        }
+        ctx.counters
+            .install_tool_catalog(&ctx.session_key, mode, candidate.clone());
+        candidate
     }
 
     /// Install a finished compaction result only when it cannot invalidate a
@@ -1775,7 +2374,34 @@ impl AgentLoopShared {
         // no-op; the next call recomputes it as `First` instead of
         // `AppendOnly` (a one-time cheap re-prefill, not an unsanctioned
         // divergence).
-        let rotated = invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::LcmCheckpoint);
+        let higgs_capable =
+            ctx.core.mode().is_local() && ctx.core.provider.supports_higgs_session_cache();
+        let rotated = if higgs_capable {
+            let frozen_tool_hash = ctx
+                .counters
+                .prompt_tool_hashes
+                .lock()
+                .get(&ctx.session_key)
+                .copied()
+                .unwrap_or(0);
+            let checkpoint_context = ctx.counters.expansion_checkpoint_context(
+                &ctx.session_key,
+                &ctx.core.model,
+                frozen_tool_hash,
+                RuntimeCounters::now_epoch_ms().saturating_add(300_000),
+            );
+            let retirement = checkpoint_context
+                .and_then(|context| pending.expansion_retirement(context))
+                .unwrap_or(SessionRetirement::Drop);
+            ctx.counters
+                .retire_higgs_session(&ctx.session_key, retirement);
+            ctx.counters
+                .note_cache_reset(&ctx.session_key, CacheResetReason::LcmCheckpoint.as_wire());
+            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::LcmCheckpoint);
+            true
+        } else {
+            invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::LcmCheckpoint)
+        };
         if rotated {
             warn!(
                 session = %ctx.session_key,
@@ -1832,9 +2458,8 @@ impl AgentLoopShared {
         if request.compaction.has_pending().await || request.compaction.has_job().await {
             return;
         }
-        let max_messages = crate::agent::agent_core::history_limit_lcm(
-            request.core.token_budget.max_context(),
-        );
+        let max_messages =
+            crate::agent::agent_core::history_limit_lcm(request.core.token_budget.max_context());
         let history = request
             .core
             .sessions
@@ -2079,53 +2704,100 @@ impl AgentLoopShared {
             if ctx.is_cancelled() {
                 return;
             }
-
-            // Auto-expand relevant summaries before the LLM call. The system,
-            // not the model, decides when to surface older detail. Expansions are
-            // APPENDED to the tail (after any frozen cache prefix), so this runs
-            // even on warm sessions without invalidating the prompt cache.
-            {
-                let mut engine = lcm_engine.lock().await;
-                if !engine.dag().is_empty() {
-                    let expand_t0 = std::time::Instant::now();
-                    // Stamp the current turn so freshly-created summaries
-                    // become eligible for auto_expand only after
-                    // FRESH_SUMMARY_COOLDOWN_TURNS. Without this, a summary
-                    // created by compaction at turn N can be reinjected at
-                    // turn N+1, undoing the compaction (live failure
-                    // 2026-07-27 12:13:06 saw +12463 tokens reinjected 24s
-                    // after a successful 12463→1398 compaction).
-                    let current_turn = ctx
-                        .core
-                        .sessions
-                        .get_session(&ctx.session_id)
-                        .await
-                        .map_or(0, |session| session.message_count as u64);
-                    engine.set_current_turn(current_turn);
-                    // wire_tokens = actual rendered prompt size. Counting the
-                    // wire (not the engine's internal active) is what stops
-                    // reinjection from pushing the prompt past the active
-                    // model's τ_hard context threshold.
-                    let wire_tokens = TokenBudget::estimate_tokens(&ctx.rendered_messages);
-                    let appended =
-                        engine.auto_expand(&ctx.core.token_budget, tool_def_tokens, wire_tokens);
-                    tracing::info!(
-                        target: "turn_timing",
-                        auto_expand_ms = expand_t0.elapsed().as_millis() as u64,
-                        summaries = engine.dag().len(),
-                        "auto_expand_timing"
-                    );
-                    if !appended.is_empty() {
-                        debug!(
-                            session = %ctx.session_key,
-                            count = appended.len(),
-                            "LCM auto_expand: appended expanded originals to tail"
-                        );
-                        ctx.messages.extend(appended);
-                    }
-                }
-            }
         }
+    }
+
+    /// Select and materialize expansion candidates for one provider attempt.
+    /// The LCM engine remains unchanged until `step_call_llm` commits the node
+    /// IDs after a successful response.
+    async fn apply_planned_auto_expansion(
+        &self,
+        ctx: &mut TurnContext,
+        tool_defs: &[Value],
+        max_tokens: u32,
+    ) {
+        if !ctx.higgs_session_route.permits_auto_expansion() {
+            return;
+        }
+        ctx.staged_auto_expansion = None;
+        let Some(lcm_engine) = self.lcm_engines.lock().await.get(&ctx.session_id).cloned() else {
+            return;
+        };
+        let current_turn = ctx
+            .core
+            .sessions
+            .get_session(&ctx.session_id)
+            .await
+            .map_or(0, |session| session.message_count as u64);
+        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs);
+        let wire_tokens = TokenBudget::estimate_tokens(&ctx.rendered_messages);
+        let expand_t0 = std::time::Instant::now();
+        let (candidates, prompt_token_limit, summary_count) = {
+            let mut engine = lcm_engine.lock().await;
+            if engine.dag().is_empty() {
+                return;
+            }
+            engine.set_current_turn(current_turn);
+            let available = ctx.core.token_budget.available_budget(tool_def_tokens);
+            let hard_message_limit = (available as f64 * engine.tau_hard()) as usize;
+            let provider_prompt_limit = ctx
+                .core
+                .token_budget
+                .max_context()
+                .saturating_sub(max_tokens as usize);
+            (
+                engine.plan_auto_expansion(&ctx.core.token_budget, tool_def_tokens, wire_tokens),
+                hard_message_limit
+                    .saturating_add(tool_def_tokens)
+                    .min(provider_prompt_limit),
+                engine.dag().len(),
+            )
+        };
+        tracing::info!(
+            target: "turn_timing",
+            auto_expand_ms = expand_t0.elapsed().as_millis() as u64,
+            summaries = summary_count,
+            "auto_expand_timing"
+        );
+        if candidates.is_empty() {
+            return;
+        }
+
+        let frozen_tool_hash = crate::agent::prompt_fingerprint::hash_tools(tool_defs);
+        let checkpoint = ctx.core.provider.supports_higgs_session_cache().then(|| {
+            ctx.counters.confirmed_expansion_checkpoint(
+                &ctx.session_key,
+                &ctx.core.model,
+                frozen_tool_hash,
+                RuntimeCounters::now_epoch_ms(),
+            )
+        });
+        let checkpoint = checkpoint.flatten();
+        let Some(applied) = apply_auto_expansion_candidates(
+            &*ctx.protocol,
+            &ctx.messages,
+            &candidates,
+            checkpoint.as_ref(),
+            tool_def_tokens,
+            prompt_token_limit,
+        ) else {
+            debug!(
+                session = %ctx.session_key,
+                candidates = candidates.len(),
+                prompt_token_limit,
+                "LCM auto-expand: reconstructed prompt is oversized; preserving summary"
+            );
+            return;
+        };
+
+        debug!(
+            session = %ctx.session_key,
+            count = applied.node_ids.len(),
+            exact_count = applied.exact_count,
+            estimated_added_tokens = applied.estimated_added_tokens,
+            "LCM auto-expand: planned expansion for provider response"
+        );
+        ctx.staged_auto_expansion = Some(applied);
     }
 
     /// Compute effective max_tokens for this LLM call.
@@ -2190,8 +2862,12 @@ impl AgentLoopShared {
         ctx: &mut TurnContext,
         counters: &RuntimeCounters,
         label: &str,
+        retry_policy: ProviderRequestRetryPolicy,
     ) -> StepResult {
-        if !ctx.flow.retries.api_retried && is_retryable_provider_error(&e) {
+        if retry_policy.allows_retry()
+            && !ctx.flow.retries.api_retried
+            && is_retryable_provider_error(&e)
+        {
             ctx.flow.retries.api_retried = true;
             warn!(model = %ctx.core.model, error = %e, "{label}_retrying");
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -2203,6 +2879,200 @@ impl AgentLoopShared {
             "I encountered an error: {}",
             e
         )))
+    }
+
+    fn discard_selected_expansion_checkpoint(
+        ctx: &mut TurnContext,
+        checkpoint: &ExpansionCheckpoint,
+        failure: RetainedExpansionFailure,
+    ) {
+        let used_flattened = matches!(failure, RetainedExpansionFailure::Unavailable)
+            && ctx
+                .staged_auto_expansion
+                .as_mut()
+                .is_some_and(|staged| staged.use_flattened_fallback(&*ctx.protocol));
+        if !used_flattened {
+            ctx.staged_auto_expansion = None;
+        }
+        ctx.higgs_session_route = HiggsSessionRoute::ActiveCompacted {
+            route: if used_flattened {
+                ActiveCompactedRoute::Fallback
+            } else {
+                ActiveCompactedRoute::OverflowSummary
+            },
+        };
+        ctx.counters.discard_expansion_checkpoint(
+            &ctx.session_key,
+            checkpoint.old_higgs_session_id,
+            checkpoint.summary_node_id,
+        );
+    }
+
+    fn fallback_retained_expansion_route(ctx: &mut TurnContext, failure: RetainedExpansionFailure) {
+        let checkpoint = ctx.higgs_session_route.fallback_from_retained(
+            failure,
+            &mut ctx.messages,
+            &mut ctx.rendered_messages,
+            &*ctx.protocol,
+        );
+        if let Some((checkpoint, active_prompt_cache)) = checkpoint {
+            match failure {
+                RetainedExpansionFailure::Unavailable => {
+                    let used_flattened = ctx
+                        .staged_auto_expansion
+                        .as_mut()
+                        .is_some_and(|staged| staged.use_flattened_fallback(&*ctx.protocol));
+                    if !used_flattened {
+                        ctx.staged_auto_expansion = None;
+                    }
+                }
+                RetainedExpansionFailure::ContextOverflow => {
+                    ctx.staged_auto_expansion = None;
+                }
+            }
+            active_prompt_cache.restore(&ctx.counters, &ctx.session_key);
+            ctx.counters.discard_expansion_checkpoint(
+                &ctx.session_key,
+                checkpoint.old_higgs_session_id,
+                checkpoint.summary_node_id,
+            );
+            ctx.retained_route_cleanup.disarm();
+        }
+    }
+
+    fn handle_retained_route_error(ctx: &mut TurnContext, error: &anyhow::Error) -> bool {
+        if ctx.higgs_session_route.retained_checkpoint().is_none() {
+            return false;
+        }
+        let Some(failure) = classify_retained_session_error(error).map(|kind| match kind {
+            RetainedSessionErrorKind::Unavailable => RetainedExpansionFailure::Unavailable,
+            RetainedSessionErrorKind::ContextOverflow => RetainedExpansionFailure::ContextOverflow,
+        }) else {
+            return false;
+        };
+        warn!(
+            session = %ctx.session_key,
+            error = %error,
+            "retained_expansion_foreground_failed_falling_back"
+        );
+        Self::fallback_retained_expansion_route(ctx, failure);
+        true
+    }
+
+    /// Validate the retained server state without generating tokens. This uses
+    /// the same provider object and request construction as foreground calls;
+    /// only the retained route control and zero completion budget differ.
+    async fn prepare_retained_expansion_route(
+        &self,
+        ctx: &mut TurnContext,
+        tool_defs_opt: Option<&[Value]>,
+        max_tokens: u32,
+    ) {
+        if !ctx.core.provider.supports_higgs_session_cache()
+            || !matches!(
+                ctx.higgs_session_route,
+                HiggsSessionRoute::ActiveCompacted { .. }
+            )
+        {
+            return;
+        }
+        let Some(plan) = ctx
+            .staged_auto_expansion
+            .as_ref()
+            .and_then(AppliedAutoExpansion::retained_plan)
+        else {
+            return;
+        };
+        let max_prompt_tokens = ctx
+            .core
+            .token_budget
+            .max_context()
+            .saturating_sub(max_tokens as usize)
+            .min(u32::MAX as usize) as u32;
+        let frozen_tool_hash =
+            crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
+        let Some(reservation) = ctx.counters.reserve_retained_expansion_request(
+            &ctx.session_key,
+            &plan.checkpoint,
+            &ctx.core.model,
+            frozen_tool_hash,
+            max_prompt_tokens,
+            RuntimeCounters::now_epoch_ms(),
+        ) else {
+            Self::discard_selected_expansion_checkpoint(
+                ctx,
+                &plan.checkpoint,
+                RetainedExpansionFailure::Unavailable,
+            );
+            return;
+        };
+        let sent_drop_ids = reservation.drop_ids().to_vec();
+        let mut messages = ctx
+            .staged_auto_expansion
+            .as_ref()
+            .map(|staged| staged.rendered_messages.clone())
+            .unwrap_or_else(|| render_via_protocol(&*ctx.protocol, &ctx.messages));
+        attach_higgs_session_control(&mut messages, reservation.control());
+        let result = ctx
+            .core
+            .provider
+            .chat(
+                &messages,
+                tool_defs_opt,
+                Some(&ctx.core.model),
+                0,
+                ctx.core.temperature,
+                None,
+                None,
+            )
+            .await;
+        let failure = match result {
+            Ok(response) => response.outcome().err().map(anyhow::Error::new),
+            Err(error) => Some(error),
+        };
+        drop(reservation);
+        if let Some(error) = failure {
+            let failure = classify_retained_session_error(&error).map_or(
+                RetainedExpansionFailure::Unavailable,
+                |kind| match kind {
+                    RetainedSessionErrorKind::Unavailable => RetainedExpansionFailure::Unavailable,
+                    RetainedSessionErrorKind::ContextOverflow => {
+                        RetainedExpansionFailure::ContextOverflow
+                    }
+                },
+            );
+            warn!(
+                session = %ctx.session_key,
+                error = %error,
+                "retained_expansion_preflight_failed"
+            );
+            Self::discard_selected_expansion_checkpoint(ctx, &plan.checkpoint, failure);
+            return;
+        }
+        if !sent_drop_ids.is_empty() {
+            ctx.counters
+                .clear_pending_higgs_session_drop_ids(&ctx.session_key, &sent_drop_ids);
+        }
+        // The retained request targets a different physical Higgs session.
+        // Snapshot and clear the active route's cache identity together so the
+        // first retained foreground call cannot be diagnosed against the
+        // compacted session's fingerprint. Later retained tool iterations then
+        // compare against the retained fingerprint installed by step_call_llm.
+        let active_prompt_cache =
+            PromptCacheSnapshot::capture_and_clear(&ctx.counters, &ctx.session_key);
+        ctx.higgs_session_route = HiggsSessionRoute::retained_expansion(
+            plan.checkpoint.clone(),
+            plan.compacted_prefix,
+            plan.fallback_prefix,
+            plan.exact_prefix_len,
+            active_prompt_cache.clone(),
+        );
+        ctx.retained_route_cleanup.arm(
+            Arc::clone(&ctx.counters),
+            ctx.session_key.clone(),
+            plan.checkpoint,
+            active_prompt_cache,
+        );
     }
 
     /// Thinking budget calculation, inference_active flag, streaming path
@@ -2250,14 +3120,69 @@ impl AgentLoopShared {
                 None
             }
         };
-        // Use the protocol-rendered wire format for the provider call.
-        // `ctx.rendered_messages` was computed by `render_via_protocol()` in step_pre_call.
-        let mut messages_for_llm = if ctx.rendered_messages.is_empty() {
+        self.prepare_retained_expansion_route(ctx, tool_defs_opt, max_tokens)
+            .await;
+        // Expansion materialization is request-local until this call succeeds;
+        // retries continue from the unchanged compacted logical conversation.
+        let mut messages_for_llm = if let Some(staged) = &ctx.staged_auto_expansion {
+            staged.rendered_messages.clone()
+        } else if ctx.rendered_messages.is_empty() {
             // Fallback: render now if step_pre_call was bypassed (should not happen in practice).
             render_via_protocol(&*ctx.protocol, &ctx.messages)
         } else {
             ctx.rendered_messages.clone()
         };
+
+        let mut pending_higgs_drop = Vec::new();
+        let mut higgs_control = None;
+        let mut higgs_request_reservation = None;
+        if ctx.core.provider.supports_higgs_session_cache() {
+            let frozen_tool_hash =
+                crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
+            let max_prompt_tokens = ctx
+                .core
+                .token_budget
+                .max_context()
+                .saturating_sub(max_tokens as usize)
+                .min(u32::MAX as usize) as u32;
+            let retained_checkpoint = ctx.higgs_session_route.retained_checkpoint().cloned();
+            let reservation = retained_checkpoint.as_ref().and_then(|checkpoint| {
+                counters.reserve_retained_expansion_request(
+                    &ctx.session_key,
+                    checkpoint,
+                    &ctx.core.model,
+                    frozen_tool_hash,
+                    max_prompt_tokens,
+                    RuntimeCounters::now_epoch_ms(),
+                )
+            });
+            let reservation = if let Some(reservation) = reservation {
+                reservation
+            } else {
+                if retained_checkpoint.is_some() {
+                    Self::fallback_retained_expansion_route(
+                        ctx,
+                        RetainedExpansionFailure::Unavailable,
+                    );
+                    messages_for_llm = if let Some(staged) = &ctx.staged_auto_expansion {
+                        staged.rendered_messages.clone()
+                    } else {
+                        ctx.rendered_messages.clone()
+                    };
+                }
+                counters.reserve_higgs_session_request(
+                    &ctx.session_key,
+                    &ctx.session_id,
+                    &ctx.core.model,
+                    frozen_tool_hash,
+                    max_prompt_tokens,
+                    RuntimeCounters::now_epoch_ms(),
+                )
+            };
+            pending_higgs_drop = reservation.drop_ids().to_vec();
+            higgs_control = Some(reservation.control().clone());
+            higgs_request_reservation = Some(reservation);
+        }
 
         // Prefix-divergence diagnostic: a prompt that is not an append-only
         // extension of this session's previous call forces the server to
@@ -2482,6 +3407,7 @@ impl AgentLoopShared {
         {
             let tool_count = tool_defs_opt.map_or(0, |t| t.len());
             let new_tool_hash = prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
+            let _transition = counters.lock_prompt_cache_transition();
             let mut tool_store = counters.prompt_tool_hashes.lock();
             if let Some(prev) = tool_store.get(&ctx.session_key) {
                 if *prev != new_tool_hash {
@@ -2503,18 +3429,14 @@ impl AgentLoopShared {
             "prefix_diag_timing"
         );
 
-        let mut pending_higgs_drop = Vec::new();
-        let mut higgs_session_marker = None;
-        if ctx.core.mode().is_local() && ctx.core.provider.get_api_base().is_some() {
-            let provider_session_id = stable_higgs_session_id(
-                &ctx.session_id,
-                counters.session_prompt_epoch(&ctx.session_key),
-            );
-            higgs_session_marker = Some(provider_session_id);
-            counters.record_higgs_session_id(&ctx.session_key, provider_session_id);
-            pending_higgs_drop = counters.pending_higgs_session_drop_ids(&ctx.session_key);
-            attach_higgs_session_marker(&mut messages_for_llm, provider_session_id, &[]);
-        }
+        let retry_policy = if higgs_control
+            .as_ref()
+            .is_some_and(|control| control.session_lease.is_some())
+        {
+            ProviderRequestRetryPolicy::OneShotLease
+        } else {
+            ProviderRequestRetryPolicy::Standard
+        };
 
         let request_hash = crate::agent::prompt_fingerprint::hash_provider_request(
             &messages_for_llm,
@@ -2548,13 +3470,8 @@ impl AgentLoopShared {
         ctx.flow.llm_call_start = Some(std::time::Instant::now());
         ctx.flow.ttft_ms = None;
 
-        if let Some(provider_session_id) = higgs_session_marker {
-            let drop_session_ids = pending_higgs_drop.iter().copied().collect::<Vec<_>>();
-            attach_higgs_session_marker(
-                &mut messages_for_llm,
-                provider_session_id,
-                &drop_session_ids,
-            );
+        if let Some(control) = &higgs_control {
+            attach_higgs_session_control(&mut messages_for_llm, control);
         }
 
         let no_progress_timeout = local_stream_no_progress_timeout(ctx);
@@ -2582,7 +3499,18 @@ impl AgentLoopShared {
                 match tokio::time::timeout(timeout, stream_call).await {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
-                        return Self::handle_llm_error(e, ctx, counters, "llm_stream_call").await;
+                        if Self::handle_retained_route_error(ctx, &e) {
+                            counters.mark_inference_finished();
+                            return StepResult::Done(IterationOutcome::Continue);
+                        }
+                        return Self::handle_llm_error(
+                            e,
+                            ctx,
+                            counters,
+                            "llm_stream_call",
+                            retry_policy,
+                        )
+                        .await;
                     }
                     Err(_) => {
                         counters.mark_inference_finished();
@@ -2600,7 +3528,18 @@ impl AgentLoopShared {
                 match stream_call.await {
                     Ok(s) => s,
                     Err(e) => {
-                        return Self::handle_llm_error(e, ctx, counters, "llm_stream_call").await;
+                        if Self::handle_retained_route_error(ctx, &e) {
+                            counters.mark_inference_finished();
+                            return StepResult::Done(IterationOutcome::Continue);
+                        }
+                        return Self::handle_llm_error(
+                            e,
+                            ctx,
+                            counters,
+                            "llm_stream_call",
+                            retry_policy,
+                        )
+                        .await;
                     }
                 }
             };
@@ -2783,7 +3722,12 @@ impl AgentLoopShared {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    return Self::handle_llm_error(e, ctx, counters, "llm_call").await;
+                    if Self::handle_retained_route_error(ctx, &e) {
+                        counters.mark_inference_finished();
+                        return StepResult::Done(IterationOutcome::Continue);
+                    }
+                    return Self::handle_llm_error(e, ctx, counters, "llm_call", retry_policy)
+                        .await;
                 }
             }
         };
@@ -2795,35 +3739,88 @@ impl AgentLoopShared {
         // Inference complete — allow watchdog health checks again.
         counters.mark_inference_finished();
 
-        // Only valid completed provider calls seed Nanobot's local prompt-cache
-        // model. A 600s zero-token stall can arrive as `finish_reason=stop`,
-        // so share the metrics classifier instead of keying only on
-        // `finish_reason=error`.
-        if Self::response_status(&response) == "ok" {
-            counters
-                .prompt_fingerprints
-                .lock()
-                .insert(ctx.session_key.clone(), prompt_fp);
-            counters
-                .prompt_cache_watermark
-                .lock()
-                .insert(ctx.session_key.clone(), ctx.messages.len());
+        if let Err(error) = response.outcome().map_err(anyhow::Error::new) {
+            if Self::handle_retained_route_error(ctx, &error) {
+                return StepResult::Done(IterationOutcome::Continue);
+            }
         }
+
+        // A lease is a one-shot operation. Resolve the response that actually
+        // carried it before any forced-tool recovery can issue a second call.
+        if let Some(reservation) = higgs_request_reservation.as_mut() {
+            reservation.resolve_lease(response.usage.get("higgs_session_lease_active").copied());
+        }
+        let mut recovery_messages = messages_for_llm.clone();
+        strip_higgs_session_lease_control(&mut recovery_messages);
 
         // Tier-2 forced-tool recovery: if a local model botched a tool call
         // (intent prose / hallucinated syntax / empty block) instead of emitting
         // one, re-issue once with tool_choice=required so the Higgs backend
         // grammar-constrains a valid call — replacing the old hint-and-loop.
-        let response = self
+        let recovery = self
             .maybe_recover_botched_tool_call(
                 ctx,
                 response,
-                &messages_for_llm,
+                &recovery_messages,
                 tool_defs_opt,
                 max_tokens,
             )
             .await;
+        let response = match recovery {
+            ForcedToolRecoveryOutcome::Response(response) => response,
+            ForcedToolRecoveryOutcome::ProviderError { original, error } => {
+                if Self::handle_retained_route_error(ctx, &error) {
+                    if ctx.flow.content_was_streamed {
+                        send_retract_reply_marker(&ctx.text_delta_tx);
+                    }
+                    return StepResult::Done(IterationOutcome::Continue);
+                }
+                warn!(
+                    model = %ctx.core.model,
+                    error = %error,
+                    "forced_tool_recovery_provider_error_using_original_response"
+                );
+                original
+            }
+        };
 
+        let response_ok = Self::response_status(&response) == "ok";
+        if response_ok {
+            if let Some(staged) = ctx.staged_auto_expansion.take() {
+                if let Some(committed) =
+                    commit_staged_auto_expansion(staged, &self.lcm_engines, &ctx.session_id).await
+                {
+                    committed.publish(
+                        &mut ctx.messages,
+                        &mut ctx.rendered_messages,
+                        counters,
+                        &ctx.session_key,
+                        prompt_fp,
+                    );
+                    ctx.higgs_session_route.mark_expansion_published();
+                } else {
+                    Self::fallback_retained_expansion_route(
+                        ctx,
+                        RetainedExpansionFailure::Unavailable,
+                    );
+                }
+            } else {
+                let _transition = counters.lock_prompt_cache_transition();
+                counters
+                    .prompt_fingerprints
+                    .lock()
+                    .insert(ctx.session_key.clone(), prompt_fp);
+                counters
+                    .prompt_cache_watermark
+                    .lock()
+                    .insert(ctx.session_key.clone(), ctx.messages.len());
+            }
+        } else {
+            ctx.staged_auto_expansion = None;
+            Self::fallback_retained_expansion_route(ctx, RetainedExpansionFailure::Unavailable);
+        }
+
+        drop(higgs_request_reservation);
         StepResult::Next(IterationPhase::Processing { response })
     }
 
@@ -2841,7 +3838,7 @@ impl AgentLoopShared {
         messages_for_llm: &[Value],
         tool_defs_opt: Option<&[Value]>,
         max_tokens: u32,
-    ) -> LLMResponse {
+    ) -> ForcedToolRecoveryOutcome {
         if !should_attempt_forced_recovery(
             response.has_tool_calls(),
             ctx.core.mode().is_local(),
@@ -2851,7 +3848,7 @@ impl AgentLoopShared {
             ctx.protocol.is_textual_replay(),
             ctx.flow.tool_guard.had_blocked_calls,
         ) {
-            return response;
+            return ForcedToolRecoveryOutcome::Response(response);
         }
 
         info!(
@@ -2878,11 +3875,15 @@ impl AgentLoopShared {
                 if ctx.flow.content_was_streamed {
                     send_retract_reply_marker(&ctx.text_delta_tx);
                 }
-                recovered
+                ForcedToolRecoveryOutcome::Response(recovered)
             }
-            // No tool call (e.g. constraint disabled server-side) or error:
-            // fall back to the original response and the hint-retry path.
-            Ok(_) | Err(_) => response,
+            // No tool call (e.g. constraint disabled server-side): fall back
+            // to the original response and the hint-retry path.
+            Ok(_) => ForcedToolRecoveryOutcome::Response(response),
+            Err(error) => ForcedToolRecoveryOutcome::ProviderError {
+                original: response,
+                error,
+            },
         }
     }
 
@@ -3262,12 +4263,942 @@ impl AgentLoopShared {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_response_boundary, attach_higgs_session_marker, divergent_message_digest,
-        proactive_grounding_preserves_prefix_cache, ResponseBoundary,
+        advance_response_boundary, apply_auto_expansion_candidates,
+        apply_lease_presentation_policy, commit_staged_auto_expansion, divergent_message_digest,
+        materialize_auto_expansion, proactive_grounding_preserves_prefix_cache,
+        AppliedAutoExpansion, AutoExpansionMaterializationKind, HiggsSessionRoute,
+        PromptCacheSnapshot, ResponseBoundary, RetainedExpansionFailure, LEASE_BLOCKS_BEFORE_STRIP,
     };
-    use crate::agent::agent_core::{stable_higgs_session_id, RuntimeCounters};
+    use crate::agent::agent_core::{
+        stable_higgs_session_id, ExpansionCheckpoint, RuntimeCounters, SessionRetirement,
+        ToolPresentationMode,
+    };
+    use crate::agent::agent_loop::budget::attach_higgs_session_marker;
+    use crate::agent::lcm::AutoExpansionCandidate;
+    use crate::agent::protocol::CloudProtocol;
+    use crate::agent::token_budget::TokenBudget;
     use crate::config::schema::CircuitBreakerConfig;
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    #[test]
+    fn exact_auto_expansion_replaces_one_summary_in_place_with_original_tool_sequence() {
+        let summary = json!({
+            "role": "user",
+            "content": "summary placeholder",
+            "_lcm_summary": true,
+        });
+        let replaced_span = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"},
+                }],
+                "_db_id": 11,
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "content": "exact bytes",
+                "_db_id": 12,
+            }),
+            json!({
+                "role": "assistant",
+                "content": "The file contains exact bytes.",
+                "_db_id": 13,
+            }),
+        ];
+        let logical = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "before", "_db_id": 10}),
+            summary.clone(),
+            json!({"role": "user", "content": "after", "_db_id": 14}),
+        ];
+        let candidate = AutoExpansionCandidate {
+            node_id: 7,
+            source_ids: vec![11, 12, 13],
+            estimated_tokens: 42,
+            flattened_fallback: json!({
+                "role": "user",
+                "content": "flattened fallback",
+                "_synthetic": true,
+            }),
+            summary_message: summary,
+        };
+        let checkpoint = ExpansionCheckpoint {
+            old_higgs_session_id: 91,
+            summary_node_id: 7,
+            replaced_span: replaced_span.clone(),
+            frozen_tool_hash: 1,
+            model: "bonsai".to_string(),
+            presentation_mode: ToolPresentationMode::Native,
+            catalog_generation: 1,
+            expires_at_ms: 900_000,
+            lease_confirmed: true,
+        };
+
+        let materialized = materialize_auto_expansion(&logical, &candidate, Some(&checkpoint));
+
+        assert_eq!(
+            materialized.kind,
+            AutoExpansionMaterializationKind::ExactCheckpoint
+        );
+        assert_eq!(
+            materialized.messages,
+            vec![
+                json!({"role": "system", "content": "system"}),
+                json!({"role": "user", "content": "before", "_db_id": 10}),
+                replaced_span[0].clone(),
+                replaced_span[1].clone(),
+                replaced_span[2].clone(),
+                json!({"role": "user", "content": "after", "_db_id": 14}),
+            ],
+            "exact expansion must preserve the original assistant/tool ordering at the summary index"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_mismatched_or_incomplete_checkpoint_uses_flattened_fallback() {
+        let summary = json!({
+            "role": "user",
+            "content": "summary placeholder",
+            "_lcm_summary": true,
+        });
+        let logical = vec![
+            json!({"role": "system", "content": "system"}),
+            summary.clone(),
+            json!({"role": "user", "content": "latest"}),
+        ];
+        let candidate = AutoExpansionCandidate {
+            node_id: 7,
+            source_ids: vec![11, 12],
+            estimated_tokens: 20,
+            flattened_fallback: json!({
+                "role": "user",
+                "content": "flattened fallback",
+                "_synthetic": true,
+            }),
+            summary_message: summary,
+        };
+        let base = ExpansionCheckpoint {
+            old_higgs_session_id: 91,
+            summary_node_id: 7,
+            replaced_span: vec![
+                json!({"role": "user", "content": "raw one", "_db_id": 11}),
+                json!({"role": "assistant", "content": "raw two", "_db_id": 12}),
+            ],
+            frozen_tool_hash: 1,
+            model: "bonsai".to_string(),
+            presentation_mode: ToolPresentationMode::Native,
+            catalog_generation: 1,
+            expires_at_ms: 900_000,
+            lease_confirmed: true,
+        };
+        let mut unconfirmed = base.clone();
+        unconfirmed.lease_confirmed = false;
+        let mut node_mismatch = base.clone();
+        node_mismatch.summary_node_id = 8;
+        let mut incomplete = base.clone();
+        incomplete.replaced_span.pop();
+
+        for (case, checkpoint) in [
+            ("absent", None),
+            ("unconfirmed", Some(&unconfirmed)),
+            ("node mismatch", Some(&node_mismatch)),
+            ("incomplete raw coverage", Some(&incomplete)),
+        ] {
+            let materialized = materialize_auto_expansion(&logical, &candidate, checkpoint);
+            assert_eq!(
+                materialized.kind,
+                AutoExpansionMaterializationKind::FlattenedFallback,
+                "case {case}"
+            );
+            assert_eq!(
+                materialized.messages[..logical.len()],
+                logical,
+                "case {case}"
+            );
+            assert_eq!(
+                materialized.messages.last(),
+                Some(&candidate.flattened_fallback),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_expansion_application_renders_the_whole_prompt_and_rejects_overflow() {
+        let summary = json!({
+            "role": "user",
+            "content": "summary placeholder",
+            "_lcm_summary": true,
+        });
+        let logical = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "before", "_db_id": 10}),
+            summary.clone(),
+            json!({"role": "user", "content": "after", "_db_id": 13}),
+        ];
+        let candidate = AutoExpansionCandidate {
+            node_id: 7,
+            source_ids: vec![11, 12],
+            estimated_tokens: 20,
+            flattened_fallback: json!({
+                "role": "user",
+                "content": "flattened fallback",
+                "_synthetic": true,
+            }),
+            summary_message: summary,
+        };
+        let checkpoint = ExpansionCheckpoint {
+            old_higgs_session_id: 91,
+            summary_node_id: 7,
+            replaced_span: vec![
+                json!({"role": "assistant", "content": "exact answer", "_db_id": 11}),
+                json!({"role": "user", "content": "exact follow-up", "_db_id": 12}),
+            ],
+            frozen_tool_hash: 1,
+            model: "bonsai".to_string(),
+            presentation_mode: ToolPresentationMode::Native,
+            catalog_generation: 1,
+            expires_at_ms: 900_000,
+            lease_confirmed: true,
+        };
+
+        let applied = apply_auto_expansion_candidates(
+            &CloudProtocol,
+            &logical,
+            &[candidate.clone()],
+            Some(&checkpoint),
+            0,
+            10_000,
+        )
+        .expect("the exact reconstructed prompt fits");
+        assert_eq!(applied.node_ids, vec![7]);
+        assert_eq!(
+            applied.rendered_messages,
+            vec![
+                json!({"role": "system", "content": "system"}),
+                json!({"role": "user", "content": "before"}),
+                json!({"role": "assistant", "content": "exact answer"}),
+                json!({"role": "user", "content": "exact follow-up"}),
+                json!({"role": "user", "content": "after"}),
+            ],
+            "the entire reconstructed logical array must pass through CloudProtocol"
+        );
+
+        assert!(apply_auto_expansion_candidates(
+            &CloudProtocol,
+            &logical,
+            &[candidate],
+            Some(&checkpoint),
+            0,
+            1,
+        )
+        .is_none());
+        assert_eq!(
+            logical,
+            vec![
+                json!({"role": "system", "content": "system"}),
+                json!({"role": "user", "content": "before", "_db_id": 10}),
+                json!({"role": "user", "content": "summary placeholder", "_lcm_summary": true}),
+                json!({"role": "user", "content": "after", "_db_id": 13}),
+            ],
+            "oversize planning must not rewrite the compacted logical prompt"
+        );
+    }
+
+    #[test]
+    fn retained_route_fallback_preserves_post_expansion_tool_tail() {
+        let checkpoint = ExpansionCheckpoint {
+            old_higgs_session_id: 91,
+            summary_node_id: 7,
+            replaced_span: vec![json!({"role": "user", "content": "exact", "_db_id": 11})],
+            frozen_tool_hash: 1,
+            model: "bonsai".to_string(),
+            presentation_mode: ToolPresentationMode::Native,
+            catalog_generation: 1,
+            expires_at_ms: 900_000,
+            lease_confirmed: true,
+        };
+        let compacted_prefix = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "summary"}),
+        ];
+        let fallback_prefix = vec![
+            compacted_prefix[0].clone(),
+            compacted_prefix[1].clone(),
+            json!({"role": "user", "content": "flattened fallback", "_synthetic": true}),
+        ];
+        let exact_prefix = vec![
+            compacted_prefix[0].clone(),
+            json!({"role": "user", "content": "exact", "_db_id": 11}),
+        ];
+        let tail = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "tc", "type": "function", "function": {"name": "read", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "tc", "content": "result"}),
+        ];
+
+        for (failure, expected_prefix) in [
+            (RetainedExpansionFailure::Unavailable, &fallback_prefix),
+            (RetainedExpansionFailure::ContextOverflow, &compacted_prefix),
+        ] {
+            let mut route = HiggsSessionRoute::retained_expansion(
+                checkpoint.clone(),
+                compacted_prefix.clone(),
+                Some(fallback_prefix.clone()),
+                exact_prefix.len(),
+                PromptCacheSnapshot::default(),
+            );
+            route.mark_expansion_published();
+            let mut logical = exact_prefix.clone();
+            logical.extend(tail.clone());
+            let mut rendered = Vec::new();
+
+            let retired = route
+                .fallback_from_retained(failure, &mut logical, &mut rendered, &CloudProtocol)
+                .expect("retained route must return its checkpoint for deletion");
+
+            assert_eq!(retired.0, checkpoint);
+            assert_eq!(route.cache_route(), "fallback");
+            assert_eq!(
+                &logical[..expected_prefix.len()],
+                expected_prefix.as_slice()
+            );
+            assert_eq!(&logical[expected_prefix.len()..], tail.as_slice());
+            assert_eq!(
+                rendered,
+                crate::agent::agent_loop::render_via_protocol(&CloudProtocol, &logical)
+            );
+        }
+    }
+
+    #[test]
+    fn exact_fit_with_oversized_flattened_variant_keeps_summary_only_fallback() {
+        let summary = json!({
+            "role": "user",
+            "content": "summary placeholder",
+            "_lcm_summary": true,
+        });
+        let compacted = vec![
+            json!({"role": "system", "content": "system"}),
+            summary.clone(),
+            json!({"role": "user", "content": "latest"}),
+        ];
+        let candidate = AutoExpansionCandidate {
+            node_id: 7,
+            source_ids: vec![11],
+            estimated_tokens: 1,
+            flattened_fallback: json!({
+                "role": "user",
+                "content": "oversized flattened detail ".repeat(4_000),
+                "_synthetic": true,
+            }),
+            summary_message: summary,
+        };
+        let checkpoint = ExpansionCheckpoint {
+            old_higgs_session_id: 91,
+            summary_node_id: 7,
+            replaced_span: vec![json!({
+                "role": "user",
+                "content": "tiny exact detail",
+                "_db_id": 11,
+            })],
+            frozen_tool_hash: 1,
+            model: "bonsai".to_string(),
+            presentation_mode: ToolPresentationMode::Native,
+            catalog_generation: 1,
+            expires_at_ms: 900_000,
+            lease_confirmed: true,
+        };
+        let exact = materialize_auto_expansion(&compacted, &candidate, Some(&checkpoint));
+        let exact_limit = TokenBudget::estimate_tokens(
+            &crate::agent::agent_loop::render_via_protocol(&CloudProtocol, &exact.messages),
+        );
+        let mut applied = apply_auto_expansion_candidates(
+            &CloudProtocol,
+            &compacted,
+            &[candidate],
+            Some(&checkpoint),
+            0,
+            exact_limit,
+        )
+        .expect("the exact route fits its authoritative prompt limit");
+        let plan = applied
+            .retained_plan()
+            .expect("exact route must be retained");
+        assert!(
+            plan.fallback_prefix.is_none(),
+            "the independently oversized flattened variant must not be staged"
+        );
+        assert!(!applied.use_flattened_fallback(&CloudProtocol));
+        assert_eq!(applied.logical_messages, exact.messages);
+    }
+
+    #[test]
+    fn leaving_retained_route_restores_active_fingerprint_and_watermark_together() {
+        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let session = "cli:retained-cache-snapshot";
+        let active = crate::agent::prompt_fingerprint::fingerprint(&[
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "summary"}),
+        ]);
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session.to_string(), active.clone());
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session.to_string(), 2);
+        let snapshot = PromptCacheSnapshot::capture(&counters, session);
+
+        counters.prompt_fingerprints.lock().insert(
+            session.to_string(),
+            crate::agent::prompt_fingerprint::fingerprint(&[
+                json!({"role": "system", "content": "system"}),
+                json!({"role": "user", "content": "exact"}),
+            ]),
+        );
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session.to_string(), 99);
+        snapshot.restore(&counters, session);
+
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(session),
+            Some(&active)
+        );
+        assert_eq!(
+            counters.prompt_cache_watermark.lock().get(session),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn reset_before_retained_fallback_does_not_restore_stale_active_cache_state() {
+        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let session = "cli:retained-cache-reset";
+        let durable = "sqlite:retained-cache-reset";
+        counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
+        let old_active = counters.activate_higgs_session_id(session, durable);
+        let fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "summary"}),
+        ]);
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session.to_string(), fingerprint);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session.to_string(), 2);
+        let snapshot = PromptCacheSnapshot::capture_and_clear(&counters, session);
+
+        counters.reset_session_prompt_state(session);
+        counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
+        let fresh_active = counters.activate_higgs_session_id(session, durable);
+        assert_ne!(fresh_active, old_active);
+        snapshot.restore(&counters, session);
+
+        assert_eq!(counters.prompt_fingerprints.lock().get(session), None);
+        assert_eq!(counters.prompt_cache_watermark.lock().get(session), None);
+    }
+
+    #[test]
+    fn concurrent_reset_after_snapshot_identity_observation_wins_restore_transaction() {
+        let counters = Arc::new(RuntimeCounters::new_with_config(
+            32_768,
+            &CircuitBreakerConfig::default(),
+        ));
+        let session = "cli:retained-cache-restore-race";
+        let durable = "sqlite:retained-cache-restore-race";
+        counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
+        counters.activate_higgs_session_id(session, durable);
+        let stale_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
+            json!({"role": "system", "content": "stale system"}),
+            json!({"role": "user", "content": "stale summary"}),
+        ]);
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session.to_string(), stale_fingerprint);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session.to_string(), 2);
+        let snapshot = PromptCacheSnapshot::capture_and_clear(&counters, session);
+        let identity_observed = Arc::new(std::sync::Barrier::new(2));
+        let release_restore = Arc::new(std::sync::Barrier::new(2));
+        let restore_thread = {
+            let counters = Arc::clone(&counters);
+            let identity_observed = Arc::clone(&identity_observed);
+            let release_restore = Arc::clone(&release_restore);
+            std::thread::spawn(move || {
+                snapshot.restore_observed(&counters, session, || {
+                    identity_observed.wait();
+                    release_restore.wait();
+                });
+            })
+        };
+        identity_observed.wait();
+
+        let reset_started = Arc::new(std::sync::Barrier::new(2));
+        let (reset_done_tx, reset_done_rx) = std::sync::mpsc::channel();
+        let reset_thread = {
+            let counters = Arc::clone(&counters);
+            let reset_started = Arc::clone(&reset_started);
+            std::thread::spawn(move || {
+                reset_started.wait();
+                counters.reset_session_prompt_state(session);
+                counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
+                counters.activate_higgs_session_id(session, durable);
+                reset_done_tx.send(()).unwrap();
+            })
+        };
+        reset_started.wait();
+        // Without a shared transition lock the reset completes inside the
+        // observed check→write gap. With the fixed transaction it blocks here
+        // until restore is released, then clears the just-restored state.
+        let _ = reset_done_rx.recv_timeout(std::time::Duration::from_millis(100));
+        release_restore.wait();
+        restore_thread.join().unwrap();
+        reset_thread.join().unwrap();
+
+        assert_eq!(counters.prompt_fingerprints.lock().get(session), None);
+        assert_eq!(counters.prompt_cache_watermark.lock().get(session), None);
+
+        let fresh_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
+            json!({"role": "system", "content": "fresh system"}),
+            json!({"role": "user", "content": "fresh prompt"}),
+        ]);
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session.to_string(), fresh_fingerprint.clone());
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session.to_string(), 2);
+        let fresh_snapshot = PromptCacheSnapshot::capture_and_clear(&counters, session);
+        fresh_snapshot.restore(&counters, session);
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(session),
+            Some(&fresh_fingerprint)
+        );
+        assert_eq!(
+            counters.prompt_cache_watermark.lock().get(session),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn concurrent_colliding_reservation_cannot_publish_prior_route_cache_state() {
+        let counters = Arc::new(RuntimeCounters::new_with_config(
+            32_768,
+            &CircuitBreakerConfig::default(),
+        ));
+        let session = "cli:retained-cache-reservation-race";
+        let prior_durable = "sqlite:retained-cache-prior";
+        let changed_durable = "sqlite:retained-cache-changed";
+        let model = "bonsai";
+        let definitions = Vec::new();
+        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
+        counters.install_tool_catalog(session, ToolPresentationMode::Native, definitions);
+
+        // Retirement advances the epoch to one. Retain exactly the ID the
+        // changed durable identity would derive at that epoch, forcing request
+        // activation to advance the epoch again while selecting its active ID.
+        let colliding_id = stable_higgs_session_id(changed_durable, 1);
+        assert!(counters.record_higgs_session_id(session, colliding_id));
+        counters.retire_higgs_session(
+            session,
+            SessionRetirement::LeaseForExpansion {
+                summary_node_id: 73,
+                replaced_span: vec![json!({"role": "user", "content": "exact raw"})],
+                checkpoint_context: counters
+                    .expansion_checkpoint_context(session, model, tool_hash, 900_000)
+                    .unwrap(),
+            },
+        );
+        let prior_active = counters.activate_higgs_session_id(session, prior_durable);
+        assert_ne!(prior_active, colliding_id);
+
+        let stale_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
+            json!({"role": "system", "content": "prior system"}),
+            json!({"role": "user", "content": "prior summary"}),
+        ]);
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session.to_string(), stale_fingerprint);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session.to_string(), 2);
+        let snapshot = PromptCacheSnapshot::capture_and_clear(&counters, session);
+
+        let identity_observed = Arc::new(std::sync::Barrier::new(2));
+        let release_restore = Arc::new(std::sync::Barrier::new(2));
+        let restore_thread = {
+            let counters = Arc::clone(&counters);
+            let identity_observed = Arc::clone(&identity_observed);
+            let release_restore = Arc::clone(&release_restore);
+            std::thread::spawn(move || {
+                snapshot.restore_observed(&counters, session, || {
+                    identity_observed.wait();
+                    release_restore.wait();
+                });
+            })
+        };
+        identity_observed.wait();
+
+        let reservation_started = Arc::new(std::sync::Barrier::new(2));
+        let (reservation_done_tx, reservation_done_rx) = std::sync::mpsc::channel();
+        let reservation_thread = {
+            let counters = Arc::clone(&counters);
+            let reservation_started = Arc::clone(&reservation_started);
+            std::thread::spawn(move || {
+                reservation_started.wait();
+                let reservation = counters.reserve_higgs_session_request(
+                    session,
+                    changed_durable,
+                    model,
+                    tool_hash,
+                    31_744,
+                    600_000,
+                );
+                reservation_done_tx.send(reservation.active_id()).unwrap();
+            })
+        };
+        reservation_started.wait();
+        // The unfixed reservation can complete in this check→write gap. The
+        // fixed path waits for the transition, then invalidates the old route's
+        // restored cache maps as part of installing the changed active ID.
+        let completed_before_release = reservation_done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .ok();
+        release_restore.wait();
+        restore_thread.join().unwrap();
+        let active_id =
+            completed_before_release.unwrap_or_else(|| reservation_done_rx.recv().unwrap());
+        reservation_thread.join().unwrap();
+
+        assert_eq!(active_id, stable_higgs_session_id(changed_durable, 2));
+        assert_eq!(counters.session_prompt_epoch(session), 2);
+        assert_eq!(counters.active_higgs_session_id(session), Some(active_id));
+        assert_eq!(counters.prompt_fingerprints.lock().get(session), None);
+        assert_eq!(counters.prompt_cache_watermark.lock().get(session), None);
+    }
+
+    #[test]
+    fn failed_empty_and_retried_expansion_attempts_remain_request_local() {
+        let summary = json!({
+            "role": "user",
+            "content": "summary placeholder",
+            "_lcm_summary": true,
+        });
+        let compacted = vec![
+            json!({"role": "system", "content": "system"}),
+            summary.clone(),
+            json!({"role": "user", "content": "latest"}),
+        ];
+        let compacted_wire =
+            crate::agent::agent_loop::render_via_protocol(&CloudProtocol, &compacted);
+        let candidate = AutoExpansionCandidate {
+            node_id: 7,
+            source_ids: vec![11],
+            estimated_tokens: 10,
+            flattened_fallback: json!({
+                "role": "user",
+                "content": "flattened fallback",
+                "_synthetic": true,
+            }),
+            summary_message: summary,
+        };
+
+        for terminal_path in ["provider error", "empty response", "retry"] {
+            let logical = compacted.clone();
+            let rendered = compacted_wire.clone();
+            let staged = apply_auto_expansion_candidates(
+                &CloudProtocol,
+                &logical,
+                &[candidate.clone()],
+                None,
+                0,
+                10_000,
+            )
+            .unwrap();
+            assert!(staged.rendered_messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains("flattened fallback"))
+            }));
+
+            drop(staged);
+
+            assert_eq!(logical, compacted, "case {terminal_path}");
+            assert_eq!(rendered, compacted_wire, "case {terminal_path}");
+        }
+    }
+
+    fn expansion_engine(node_ids: &[usize]) -> crate::agent::lcm::LcmEngine {
+        let raw_messages = node_ids
+            .iter()
+            .map(|node_id| {
+                json!({
+                    "role": "user",
+                    "content": format!("source for node {node_id}"),
+                    "_db_id": node_id + 100,
+                })
+            })
+            .collect::<Vec<_>>();
+        let nodes = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    *node_id,
+                    vec![node_id + 100],
+                    Vec::new(),
+                    format!("summary node {node_id}"),
+                    4,
+                    1,
+                    crate::agent::lcm::SummaryManifest::default(),
+                    "db_id".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        crate::agent::lcm::LcmEngine::rebuild_from_db_nodes(
+            &raw_messages,
+            &nodes,
+            crate::agent::lcm::LcmConfig::default(),
+        )
+    }
+
+    fn staged_expansion(node_ids: Vec<usize>) -> AppliedAutoExpansion {
+        AppliedAutoExpansion {
+            logical_messages: vec![json!({"role": "user", "content": "expanded logical"})],
+            rendered_messages: vec![json!({"role": "user", "content": "expanded wire"})],
+            node_ids,
+            exact_count: 0,
+            estimated_added_tokens: 4,
+            retained_plan: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_expansion_engine_lock_preserves_all_public_state() {
+        let session_id = "cancelled-expansion";
+        let session_key = "cli:cancelled-expansion";
+        let engine = std::sync::Arc::new(tokio::sync::Mutex::new(expansion_engine(&[7])));
+        let engines =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
+                (session_id.to_string(), std::sync::Arc::clone(&engine)),
+            ])));
+        let engine_guard = engine.lock().await;
+        let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
+        let compacted = vec![json!({"role": "user", "content": "compacted"})];
+        let compacted_wire = compacted.clone();
+        let old_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&compacted_wire);
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session_key.to_string(), old_fingerprint.clone());
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session_key.to_string(), compacted.len());
+
+        let mut commit = Box::pin(commit_staged_auto_expansion(
+            staged_expansion(vec![7]),
+            &engines,
+            session_id,
+        ));
+        std::future::poll_fn(|cx| match std::future::Future::poll(commit.as_mut(), cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(_) => {
+                panic!("commit completed while the per-session engine lock was held")
+            }
+        })
+        .await;
+        drop(commit);
+
+        assert_eq!(
+            compacted,
+            vec![json!({"role": "user", "content": "compacted"})]
+        );
+        assert_eq!(compacted_wire, compacted);
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(session_key),
+            Some(&old_fingerprint)
+        );
+        assert_eq!(
+            counters
+                .prompt_cache_watermark
+                .lock()
+                .get(session_key)
+                .copied(),
+            Some(1)
+        );
+
+        drop(engine_guard);
+        assert!(engine.lock().await.commit_auto_expansion(7));
+    }
+
+    #[tokio::test]
+    async fn missing_or_false_expansion_commit_keeps_compacted_prompt_and_cache() {
+        let session_key = "cli:failed-expansion-commit";
+        let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
+        let logical = vec![json!({"role": "user", "content": "compacted"})];
+        let rendered = logical.clone();
+        let old_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&rendered);
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session_key.to_string(), old_fingerprint.clone());
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session_key.to_string(), 1);
+
+        let empty_engines =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        assert!(
+            commit_staged_auto_expansion(staged_expansion(vec![7]), &empty_engines, "missing",)
+                .await
+                .is_none()
+        );
+
+        let mut engine = expansion_engine(&[7, 8]);
+        assert!(engine.commit_auto_expansion(7));
+        let engine = std::sync::Arc::new(tokio::sync::Mutex::new(engine));
+        let engines =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
+                ("present".to_string(), std::sync::Arc::clone(&engine)),
+            ])));
+        assert!(
+            commit_staged_auto_expansion(staged_expansion(vec![8, 7]), &engines, "present",)
+                .await
+                .is_none()
+        );
+
+        assert_eq!(
+            logical,
+            vec![json!({"role": "user", "content": "compacted"})]
+        );
+        assert_eq!(rendered, logical);
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(session_key),
+            Some(&old_fingerprint)
+        );
+        assert_eq!(
+            counters
+                .prompt_cache_watermark
+                .lock()
+                .get(session_key)
+                .copied(),
+            Some(1)
+        );
+        assert!(
+            engine.lock().await.commit_auto_expansion(8),
+            "a failed batch must not partially consume another node"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_expansion_commit_publishes_prompt_and_cache_once() {
+        let session_id = "successful-expansion";
+        let session_key = "cli:successful-expansion";
+        let engine = std::sync::Arc::new(tokio::sync::Mutex::new(expansion_engine(&[7])));
+        let engines =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
+                (session_id.to_string(), std::sync::Arc::clone(&engine)),
+            ])));
+        let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
+        let mut logical = vec![json!({"role": "user", "content": "compacted"})];
+        let mut rendered = logical.clone();
+        let compacted_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&rendered);
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session_key.to_string(), compacted_fingerprint.clone());
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session_key.to_string(), logical.len());
+        let expanded_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
+            json!({"role": "user", "content": "expanded wire"}),
+        ]);
+
+        let committed =
+            commit_staged_auto_expansion(staged_expansion(vec![7]), &engines, session_id)
+                .await
+                .expect("known eligible node commits");
+        assert_eq!(
+            logical,
+            vec![json!({"role": "user", "content": "compacted"})]
+        );
+        assert_eq!(rendered, logical);
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(session_key),
+            Some(&compacted_fingerprint),
+            "the awaitable commit phase must not publish cache state"
+        );
+
+        committed.publish(
+            &mut logical,
+            &mut rendered,
+            &counters,
+            session_key,
+            expanded_fingerprint.clone(),
+        );
+
+        assert_eq!(
+            logical,
+            vec![json!({"role": "user", "content": "expanded logical"})]
+        );
+        assert_eq!(
+            rendered,
+            vec![json!({"role": "user", "content": "expanded wire"})]
+        );
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(session_key),
+            Some(&expanded_fingerprint)
+        );
+        assert_eq!(
+            counters
+                .prompt_cache_watermark
+                .lock()
+                .get(session_key)
+                .copied(),
+            Some(1)
+        );
+        assert!(!engine.lock().await.commit_auto_expansion(7));
+    }
+
+    #[test]
+    fn forced_text_mode_is_stable_when_available_definitions_are_empty() {
+        let mut definitions = Vec::new();
+        let mut mode = ToolPresentationMode::Native;
+
+        let policy =
+            apply_lease_presentation_policy(LEASE_BLOCKS_BEFORE_STRIP, &mut definitions, &mut mode);
+
+        assert!(policy.forced_text);
+        assert!(
+            !policy.stripped_definitions,
+            "there were no physical definitions to remove"
+        );
+        assert_eq!(mode, ToolPresentationMode::ForcedText);
+        assert!(definitions.is_empty());
+    }
 
     /// The divergence diagnostic must name the divergent message's STRUCTURAL
     /// kind, not just its role, so the cache-busting class is identifiable from
@@ -3379,6 +5310,67 @@ mod tests {
         assert_eq!(
             messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
             json!(original_drop_id)
+        );
+    }
+
+    #[test]
+    fn unsent_higgs_request_id_is_not_repurposed_as_expansion_checkpoint() {
+        let counters = std::sync::Arc::new(RuntimeCounters::new_with_config(
+            16_384,
+            &CircuitBreakerConfig::default(),
+        ));
+        let session_key = "cli:reserved-request";
+        let definitions = vec![json!({"type": "function", "name": "read"})];
+        counters.install_tool_catalog(
+            session_key,
+            ToolPresentationMode::Native,
+            definitions.clone(),
+        );
+        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
+        let reservation = counters.reserve_higgs_session_request(
+            session_key,
+            "sqlite:reserved-request",
+            "bonsai",
+            tool_hash,
+            15_000,
+            600_000,
+        );
+        let emitted_active_id = reservation.active_id();
+
+        let retiring = std::sync::Arc::clone(&counters);
+        std::thread::spawn(move || {
+            retiring.retire_higgs_session(
+                session_key,
+                SessionRetirement::LeaseForExpansion {
+                    summary_node_id: 41,
+                    replaced_span: vec![json!({"role": "user", "content": "exact raw"})],
+                    checkpoint_context: retiring
+                        .expansion_checkpoint_context(session_key, "bonsai", tool_hash, 900_000)
+                        .unwrap(),
+                },
+            );
+        })
+        .join()
+        .unwrap();
+
+        let mut messages = vec![json!({"role": "system", "content": "system"})];
+        attach_higgs_session_marker(&mut messages, emitted_active_id, reservation.drop_ids());
+        let wire_active_id = messages[0]
+            [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
+            .as_u64()
+            .unwrap();
+
+        assert_eq!(wire_active_id, emitted_active_id);
+        assert_ne!(
+            counters
+                .expansion_checkpoint(session_key)
+                .map(|checkpoint| checkpoint.old_higgs_session_id),
+            Some(wire_active_id),
+            "an ID reserved for an unsent request became the expansion checkpoint"
+        );
+        assert!(
+            !reservation.drop_ids().contains(&wire_active_id),
+            "the same request must not emit its active ID as a drop"
         );
     }
 
@@ -3554,12 +5546,18 @@ mod tests {
 
 #[cfg(test)]
 mod forced_recovery_tests {
-    use super::should_attempt_forced_recovery;
+    use super::{should_attempt_forced_recovery, ProviderRequestRetryPolicy};
 
     // Real trigger strings (mirror src/agent/validation.rs tests).
     const CLAIMED: &str = "Let me check that file for you."; // prose only — NOT an error
     const HALLUCINATED: &str = "I'll read it.\n[Called read_file({\"path\":\"/x\"})]"; // HallucinatedToolCall
     const CLEAN: &str = "The answer is 42."; // Ok — a genuine final answer
+
+    #[test]
+    fn one_shot_lease_request_disables_outer_retry() {
+        assert!(!ProviderRequestRetryPolicy::OneShotLease.allows_retry());
+        assert!(ProviderRequestRetryPolicy::Standard.allows_retry());
+    }
 
     /// Forced recovery re-issues the turn with `tool_choice=required`, which
     /// throws away whatever the model just wrote. Prose that merely sounds

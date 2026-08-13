@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::indexing_slicing,
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::indexing_slicing, clippy::shadow_reuse)]
 //! Model-specific instruction profiles for prompt engineering.
 //!
 //! Profiles are loaded from a YAML file and resolved at runtime by matching

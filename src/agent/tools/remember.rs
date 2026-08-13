@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::indexing_slicing,
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::indexing_slicing, clippy::shadow_reuse)]
 //! Remember tool: manage facts and preferences in long-term memory (MEMORY.md).
 
 use std::collections::{HashMap, HashSet};
@@ -252,7 +249,11 @@ impl Tool for RememberTool {
                 let message = if added == 0 {
                     format!(
                         "Already remembered: {}",
-                        facts.iter().map(|s| s.trim()).collect::<Vec<_>>().join("; ")
+                        facts
+                            .iter()
+                            .map(|s| s.trim())
+                            .collect::<Vec<_>>()
+                            .join("; ")
                     )
                 } else if facts.len() == 1 && skipped == 0 {
                     format!("Remembered: {}", facts[0].trim())
@@ -309,9 +310,7 @@ impl Tool for RememberTool {
                     true,
                 )
             }
-            _ => {
-                return "Error: action must be one of: add, replace, delete, dedupe".to_string()
-            }
+            _ => return "Error: action must be one of: add, replace, delete, dedupe".to_string(),
         };
 
         if !should_write {
@@ -340,11 +339,7 @@ impl Tool for RememberTool {
     /// carries a corrective worked example. Without this, a zero-temp model
     /// emitting `remember({})` got a silent success (the old list default)
     /// and looped. Other actions funnel through the legacy string path.
-    async fn execute_typed(
-        &self,
-        args: HashMap<String, Value>,
-        ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute_typed(&self, args: HashMap<String, Value>, ctx: &ToolContext) -> ToolResult {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -535,7 +530,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
         let res = tool.execute_with_result(HashMap::new()).await;
-        assert!(!res.ok(), "empty add must not be a silent success (old list-default loop)");
+        assert!(
+            !res.ok(),
+            "empty add must not be a silent success (old list-default loop)"
+        );
         assert!(
             matches!(
                 res.error_kind(),

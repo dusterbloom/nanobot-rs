@@ -6,7 +6,7 @@
 #![allow(
     clippy::as_conversions,
     clippy::format_push_string,
-    clippy::indexing_slicing,
+    clippy::indexing_slicing
 )]
 #![allow(dead_code)]
 //! Pipeline runner: Rust-level orchestration for multi-step pipelines.

@@ -295,7 +295,6 @@ pub trait LLMProvider: Send + Sync {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::FinishReason;
@@ -314,15 +313,27 @@ mod tests {
             ("cancelled", FinishReason::Cancelled),
         ];
         for (wire, reason) in known {
-            assert_eq!(FinishReason::parse_finish_reason(wire), reason, "parse {wire}");
+            assert_eq!(
+                FinishReason::parse_finish_reason(wire),
+                reason,
+                "parse {wire}"
+            );
             assert_eq!(reason.wire_str(), wire, "wire_str for {wire}");
             assert_eq!(reason.to_string(), wire, "Display for {wire}");
         }
         // Unknown provider values round-trip via Other(String).
         for wire in ["function_call", "content_filter", "eos_token", ""] {
             let parsed = FinishReason::parse_finish_reason(wire);
-            assert_eq!(parsed.wire_str(), wire, "unknown wire value {wire:?} must round-trip");
-            assert_eq!(parsed.to_string(), wire, "Display for unknown value {wire:?}");
+            assert_eq!(
+                parsed.wire_str(),
+                wire,
+                "unknown wire value {wire:?} must round-trip"
+            );
+            assert_eq!(
+                parsed.to_string(),
+                wire,
+                "Display for unknown value {wire:?}"
+            );
         }
     }
 }

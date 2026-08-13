@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::indexing_slicing,
-)]
+#![allow(clippy::indexing_slicing)]
 //! Thin wrapper around fastembed for local ONNX text embeddings.
 //!
 //! Single responsibility: text → f32 vector. Lazy-loads the model on first use.

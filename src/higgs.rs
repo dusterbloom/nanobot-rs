@@ -7,7 +7,7 @@
     clippy::as_conversions,
     clippy::indexing_slicing,
     clippy::shadow_reuse,
-    clippy::shadow_same,
+    clippy::shadow_same
 )]
 //! Higgs inference server sidecar management.
 //!

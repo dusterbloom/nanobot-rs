@@ -23,18 +23,15 @@ pub struct MessageTool {
 
 impl MessageTool {
     /// Create a new message tool wired to a typed message host.
-    pub fn new(
-        host: Arc<dyn MessageHost>,
-        default_channel: &str,
-        default_chat_id: &str,
-    ) -> Self {
+    pub fn new(host: Arc<dyn MessageHost>, default_channel: &str, default_chat_id: &str) -> Self {
         Self {
             host,
             default_channel: default_channel.to_string(),
             default_chat_id: default_chat_id.to_string(),
         }
     }
-}#[async_trait]
+}
+#[async_trait]
 impl Tool for MessageTool {
     fn name(&self) -> &str {
         "message"
@@ -118,7 +115,11 @@ impl Tool for MessageTool {
 
         let reply = self
             .host
-            .send(SendMessageRequest { channel, chat_id, content })
+            .send(SendMessageRequest {
+                channel,
+                chat_id,
+                content,
+            })
             .await?;
         Ok(ToolOutput { text: reply.text })
     }
@@ -190,7 +191,10 @@ mod tests {
     async fn test_execute_empty_channel_and_chat() {
         let tool = MessageTool::new(Arc::new(MockHost), "", "");
         let mut params = HashMap::new();
-        params.insert("content".to_string(), serde_json::Value::String("hello".to_string()));
+        params.insert(
+            "content".to_string(),
+            serde_json::Value::String("hello".to_string()),
+        );
         let result = tool.execute(params).await;
         assert_eq!(result, "Error: No target channel/chat specified");
     }
@@ -199,7 +203,10 @@ mod tests {
     async fn test_execute_uses_baked_defaults() {
         let tool = MessageTool::new(Arc::new(MockHost), "telegram", "12345");
         let mut params = HashMap::new();
-        params.insert("content".to_string(), serde_json::Value::String("hello!".to_string()));
+        params.insert(
+            "content".to_string(),
+            serde_json::Value::String("hello!".to_string()),
+        );
         let result = tool.execute(params).await;
         assert_eq!(result, "Message sent to telegram:12345");
     }
@@ -208,7 +215,10 @@ mod tests {
     async fn test_execute_with_failing_host() {
         let tool = MessageTool::new(Arc::new(FailingHost), "discord", "999");
         let mut params = HashMap::new();
-        params.insert("content".to_string(), serde_json::Value::String("hello".to_string()));
+        params.insert(
+            "content".to_string(),
+            serde_json::Value::String("hello".to_string()),
+        );
         let result = tool.execute(params).await;
         assert!(result.contains("Error sending message"));
         assert!(result.contains("network error"));
@@ -218,9 +228,18 @@ mod tests {
     async fn test_execute_with_channel_override() {
         let tool = MessageTool::new(Arc::new(MockHost), "default_chan", "default_chat");
         let mut params = HashMap::new();
-        params.insert("content".to_string(), serde_json::Value::String("hello".to_string()));
-        params.insert("channel".to_string(), serde_json::Value::String("override_chan".to_string()));
-        params.insert("chat_id".to_string(), serde_json::Value::String("override_chat".to_string()));
+        params.insert(
+            "content".to_string(),
+            serde_json::Value::String("hello".to_string()),
+        );
+        params.insert(
+            "channel".to_string(),
+            serde_json::Value::String("override_chan".to_string()),
+        );
+        params.insert(
+            "chat_id".to_string(),
+            serde_json::Value::String("override_chat".to_string()),
+        );
         let result = tool.execute(params).await;
         assert_eq!(result, "Message sent to override_chan:override_chat");
     }
@@ -231,9 +250,18 @@ mod tests {
         // same filter as the legacy surface.
         let tool = MessageTool::new(Arc::new(MockHost), "telegram", "42");
         let mut params = HashMap::new();
-        params.insert("content".to_string(), serde_json::Value::String("hi".to_string()));
-        params.insert("channel".to_string(), serde_json::Value::String("".to_string()));
-        params.insert("chat_id".to_string(), serde_json::Value::String("".to_string()));
+        params.insert(
+            "content".to_string(),
+            serde_json::Value::String("hi".to_string()),
+        );
+        params.insert(
+            "channel".to_string(),
+            serde_json::Value::String("".to_string()),
+        );
+        params.insert(
+            "chat_id".to_string(),
+            serde_json::Value::String("".to_string()),
+        );
         let result = tool.execute(params).await;
         assert_eq!(result, "Message sent to telegram:42");
     }

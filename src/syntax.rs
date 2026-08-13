@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::format_push_string,
-    clippy::indexing_slicing,
-)]
+#![allow(clippy::format_push_string, clippy::indexing_slicing)]
 //! Unified text rendering pipeline for LLM responses.
 //!
 //! Combines termimad prose formatting (headers, bold, lists, links) with

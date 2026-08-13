@@ -7,7 +7,7 @@
     clippy::as_conversions,
     clippy::format_push_string,
     clippy::indexing_slicing,
-    clippy::string_add,
+    clippy::string_add
 )]
 //! Pure helper functions for the agent loop (no IO — fully unit-testable).
 //!

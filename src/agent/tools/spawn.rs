@@ -116,7 +116,10 @@ pub enum SpawnAction {
     /// `action: "wait"` — block until completion (default timeout 120s).
     Wait { task_id: String, timeout_secs: u64 },
     /// `action: "pipeline"` — multi-step pipeline (MAKER voting).
-    Pipeline { steps: Vec<serde_json::Value>, ahead_by_k: usize },
+    Pipeline {
+        steps: Vec<serde_json::Value>,
+        ahead_by_k: usize,
+    },
     /// `action: "loop"` — autonomous refinement loop (default 5 rounds).
     Loop {
         task: String,
@@ -210,7 +213,10 @@ impl SpawnAction {
                     .get("stop_condition")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
-                model: params.get("model").and_then(|v| v.as_str()).map(str::to_string),
+                model: params
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 working_dir: params
                     .get("working_dir")
                     .and_then(|v| v.as_str())
@@ -218,7 +224,10 @@ impl SpawnAction {
             }),
             "spawn" | _ => Ok(SpawnAction::Spawn {
                 task: required_str(params, "task", "spawn")?,
-                label: params.get("label").and_then(|v| v.as_str()).map(str::to_string),
+                label: params
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 // 'profile' and 'agent' are synonyms; 'profile' wins when both
                 // are given (legacy resolution, unchanged).
                 profile: params
@@ -226,7 +235,10 @@ impl SpawnAction {
                     .or_else(|| params.get("agent"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
-                model: params.get("model").and_then(|v| v.as_str()).map(str::to_string),
+                model: params
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 working_dir: params
                     .get("working_dir")
                     .and_then(|v| v.as_str())
@@ -261,7 +273,13 @@ fn required_str(
 impl From<SpawnAction> for HostRequest {
     fn from(action: SpawnAction) -> Self {
         match action {
-            SpawnAction::Spawn { task, label, profile, model, working_dir } => {
+            SpawnAction::Spawn {
+                task,
+                label,
+                profile,
+                model,
+                working_dir,
+            } => {
                 HostRequest::Spawn(SpawnRequest {
                     task,
                     label,
@@ -276,28 +294,35 @@ impl From<SpawnAction> for HostRequest {
                 })
             }
             SpawnAction::List => HostRequest::ListSubagents(ListSubagentsRequest {}),
-            SpawnAction::Check { task_id } => {
-                HostRequest::CheckSubagent(CheckRequest { task_id })
-            }
+            SpawnAction::Check { task_id } => HostRequest::CheckSubagent(CheckRequest { task_id }),
             SpawnAction::Cancel { task_id } => {
                 HostRequest::CancelSubagent(CancelRequest { task_id })
             }
-            SpawnAction::Wait { task_id, timeout_secs } => {
-                HostRequest::WaitSubagent(WaitRequest { task_id, timeout_secs })
-            }
+            SpawnAction::Wait {
+                task_id,
+                timeout_secs,
+            } => HostRequest::WaitSubagent(WaitRequest {
+                task_id,
+                timeout_secs,
+            }),
             SpawnAction::Pipeline { steps, ahead_by_k } => {
                 HostRequest::RunPipeline(PipelineRequest { steps, ahead_by_k })
             }
-            SpawnAction::Loop { task, max_rounds, tools, stop_condition, model, working_dir } => {
-                HostRequest::RunLoop(LoopRequest {
-                    task,
-                    max_rounds,
-                    tools,
-                    stop_condition,
-                    model,
-                    working_dir,
-                })
-            }
+            SpawnAction::Loop {
+                task,
+                max_rounds,
+                tools,
+                stop_condition,
+                model,
+                working_dir,
+            } => HostRequest::RunLoop(LoopRequest {
+                task,
+                max_rounds,
+                tools,
+                stop_condition,
+                model,
+                working_dir,
+            }),
         }
     }
 }
@@ -470,16 +495,24 @@ mod tests {
             })
         }
         async fn list_subagents(&self) -> Result<ListReply, ToolError> {
-            Ok(ListReply { text: "No subagents currently running.".to_string() })
+            Ok(ListReply {
+                text: "No subagents currently running.".to_string(),
+            })
         }
         async fn cancel(&self, req: CancelRequest) -> Result<CancelReply, ToolError> {
-            Ok(CancelReply { text: format!("Cancelled {}", req.task_id) })
+            Ok(CancelReply {
+                text: format!("Cancelled {}", req.task_id),
+            })
         }
         async fn wait(&self, req: WaitRequest) -> Result<WaitReply, ToolError> {
-            Ok(WaitReply { text: format!("waited {} {}s", req.task_id, req.timeout_secs) })
+            Ok(WaitReply {
+                text: format!("waited {} {}s", req.task_id, req.timeout_secs),
+            })
         }
         async fn check(&self, req: CheckRequest) -> Result<CheckReply, ToolError> {
-            Ok(CheckReply { text: format!("checking {}", req.task_id) })
+            Ok(CheckReply {
+                text: format!("checking {}", req.task_id),
+            })
         }
     }
 
@@ -487,21 +520,27 @@ mod tests {
     impl PipelineHost for EchoHost {
         async fn run_pipeline(&self, req: PipelineRequest) -> Result<PipelineReply, ToolError> {
             let steps = serde_json::to_string(&req.steps).unwrap_or_default();
-            Ok(PipelineReply { text: format!("pipeline {steps} ahead {}", req.ahead_by_k) })
+            Ok(PipelineReply {
+                text: format!("pipeline {steps} ahead {}", req.ahead_by_k),
+            })
         }
     }
 
     #[async_trait]
     impl LoopHost for EchoHost {
         async fn run_loop(&self, req: LoopRequest) -> Result<LoopReply, ToolError> {
-            Ok(LoopReply { text: format!("loop {} r{}", req.task, req.max_rounds) })
+            Ok(LoopReply {
+                text: format!("loop {} r{}", req.task, req.max_rounds),
+            })
         }
     }
 
     #[async_trait]
     impl MessageHost for EchoHost {
         async fn send(&self, req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
-            Ok(SendMessageReply { text: format!("sent {}:{}", req.channel, req.chat_id) })
+            Ok(SendMessageReply {
+                text: format!("sent {}:{}", req.channel, req.chat_id),
+            })
         }
     }
 
@@ -512,40 +551,56 @@ mod tests {
     #[async_trait]
     impl SpawnHost for FailingHost {
         async fn spawn(&self, _req: SpawnRequest) -> Result<SpawnReply, ToolError> {
-            Err(ToolError::Execution { message: "spawn exploded".to_string() })
+            Err(ToolError::Execution {
+                message: "spawn exploded".to_string(),
+            })
         }
         async fn list_subagents(&self) -> Result<ListReply, ToolError> {
-            Err(ToolError::Execution { message: "list exploded".to_string() })
+            Err(ToolError::Execution {
+                message: "list exploded".to_string(),
+            })
         }
         async fn cancel(&self, _req: CancelRequest) -> Result<CancelReply, ToolError> {
-            Err(ToolError::Execution { message: "cancel exploded".to_string() })
+            Err(ToolError::Execution {
+                message: "cancel exploded".to_string(),
+            })
         }
         async fn wait(&self, _req: WaitRequest) -> Result<WaitReply, ToolError> {
-            Err(ToolError::Execution { message: "wait exploded".to_string() })
+            Err(ToolError::Execution {
+                message: "wait exploded".to_string(),
+            })
         }
         async fn check(&self, _req: CheckRequest) -> Result<CheckReply, ToolError> {
-            Err(ToolError::Execution { message: "check exploded".to_string() })
+            Err(ToolError::Execution {
+                message: "check exploded".to_string(),
+            })
         }
     }
 
     #[async_trait]
     impl PipelineHost for FailingHost {
         async fn run_pipeline(&self, _req: PipelineRequest) -> Result<PipelineReply, ToolError> {
-            Err(ToolError::Execution { message: "pipeline exploded".to_string() })
+            Err(ToolError::Execution {
+                message: "pipeline exploded".to_string(),
+            })
         }
     }
 
     #[async_trait]
     impl LoopHost for FailingHost {
         async fn run_loop(&self, _req: LoopRequest) -> Result<LoopReply, ToolError> {
-            Err(ToolError::Execution { message: "loop exploded".to_string() })
+            Err(ToolError::Execution {
+                message: "loop exploded".to_string(),
+            })
         }
     }
 
     #[async_trait]
     impl MessageHost for FailingHost {
         async fn send(&self, _req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
-            Err(ToolError::Execution { message: "send exploded".to_string() })
+            Err(ToolError::Execution {
+                message: "send exploded".to_string(),
+            })
         }
     }
 
@@ -598,7 +653,9 @@ mod tests {
         let tool = SpawnTool::new(test_host(EchoHost));
         let params = tool.parameters();
         assert!(params["properties"]["profile"].is_object());
-        let desc = params["properties"]["profile"]["description"].as_str().unwrap();
+        let desc = params["properties"]["profile"]["description"]
+            .as_str()
+            .unwrap();
         // The model must learn where profiles are listed and what overrides them.
         assert!(desc.to_lowercase().contains("system prompt"));
         assert!(desc.contains("model"));

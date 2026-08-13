@@ -7,7 +7,7 @@
     clippy::as_conversions,
     clippy::format_push_string,
     clippy::indexing_slicing,
-    clippy::shadow_reuse,
+    clippy::shadow_reuse
 )]
 //! Router decision parsing and dispatch functions.
 //!

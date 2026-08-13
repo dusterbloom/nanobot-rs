@@ -18,11 +18,10 @@
     clippy::print_stdout,
     clippy::print_stderr,
     clippy::pedantic,
-    clippy::nursery,
+    clippy::nursery
 )]
 // Audio input diagnostic test for macOS
 // Run with: cargo test --features voice audio_diagnostic -- --nocapture
-
 #![cfg(feature = "voice")]
 
 use std::sync::mpsc::channel;

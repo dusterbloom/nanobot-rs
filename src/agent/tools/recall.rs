@@ -6,7 +6,7 @@
 #![allow(
     clippy::as_conversions,
     clippy::format_push_string,
-    clippy::shadow_reuse,
+    clippy::shadow_reuse
 )]
 //! Unified retrieval tool: trust-ranked search across curated memory, indexed
 //! knowledge docs, workspace files, and past conversations, plus fetch modes
@@ -562,7 +562,10 @@ impl RecallTool {
                 .to_string();
         }
 
-        let scope = params.get("scope").and_then(|v| v.as_str()).unwrap_or("all");
+        let scope = params
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("all");
         // `n` is the documented per-source cap; accept the legacy `limit` alias
         // so old `session_search`/`search_context` calls (now aliased to recall)
         // keep working without a param rewrite.
@@ -685,10 +688,7 @@ impl Tool for RecallTool {
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let mode = params
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("");
         let session = params
             .get("session")
             .and_then(|v| v.as_str())
@@ -726,11 +726,7 @@ impl Tool for RecallTool {
     /// [`crate::errors::ToolError::MissingArg`] (model-fixable) whose render
     /// carries a worked call shape instead of looping on the same bare call.
     /// Everything else funnels through the legacy string path unchanged.
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute_typed(&self, params: HashMap<String, Value>, ctx: &ToolContext) -> ToolResult {
         let has_query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -743,10 +739,7 @@ impl Tool for RecallTool {
             .get("message_ids")
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.trim().is_empty());
-        let mode = params
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("");
         let is_fetch = matches!(mode, "latest" | "session" | "in_session" | "extract")
             || has_session
             || has_message_ids;
@@ -1100,7 +1093,10 @@ mod tests {
             .await;
         let mem_pos = result.find("## Curated memory");
         let sess_pos = result.find("## Past conversations");
-        assert!(mem_pos.is_some(), "curated section must be present: {result}");
+        assert!(
+            mem_pos.is_some(),
+            "curated section must be present: {result}"
+        );
         assert!(
             sess_pos.is_some(),
             "sessions section must be present (both matched): {result}"
@@ -1227,8 +1223,14 @@ mod tests {
             ]))
             .await;
         assert!(out.contains("returned in full"), "got: {out}");
-        assert!(out.contains("Diary of Two Threads Entry 1 nano32"), "got: {out}");
-        assert!(!out.contains("... (truncated"), "in_session must not truncate: {out}");
+        assert!(
+            out.contains("Diary of Two Threads Entry 1 nano32"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("... (truncated"),
+            "in_session must not truncate: {out}"
+        );
     }
 
     #[tokio::test]
@@ -1242,7 +1244,6 @@ mod tests {
             "fetch without db_path must error clearly: {result}"
         );
     }
-
 
     #[tokio::test]
     async fn test_recall_full_typed_chain_with_query_does_not_recurse() {
@@ -1258,7 +1259,15 @@ mod tests {
         let token = tokio_util::sync::CancellationToken::new();
         let ctx = ToolContext::new(None, tx, token, "test-call");
         let res = tool.execute_with_result_and_context(params, &ctx).await;
-        assert!(res.ok(), "should succeed via typed chain: {:?}", res.error());
-        assert!(res.data().contains("Rust"), "should find Rust: {}", res.data());
+        assert!(
+            res.ok(),
+            "should succeed via typed chain: {:?}",
+            res.error()
+        );
+        assert!(
+            res.data().contains("Rust"),
+            "should find Rust: {}",
+            res.data()
+        );
     }
 }

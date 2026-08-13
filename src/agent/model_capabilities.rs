@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::indexing_slicing,
-)]
+#![allow(clippy::as_conversions, clippy::indexing_slicing)]
 //! Model capability detection: replaces scattered model-name string matching
 //! with a centralized registry. Built-in patterns cover known models; config
 //! overrides let users customize for new/custom models.

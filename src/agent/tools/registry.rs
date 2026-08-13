@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::indexing_slicing,
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::indexing_slicing, clippy::shadow_reuse)]
 #![allow(dead_code)]
 //! Tool registry for dynamic tool management.
 
@@ -17,9 +14,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::warn;
 
-use super::base::{
-    PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolExecutionResult,
-};
+use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolExecutionResult};
 use super::filesystem::MAX_WRITE_FILE_PIECE_CHARS;
 use super::{
     ApplyPatchTool, BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, FileInfoTool,
@@ -302,7 +297,10 @@ impl ToolRegistry {
     /// Inject the typed host bridge (spawn/pipeline/loop/message). Builder
     /// style so the registry stays immutable after construction; the single
     /// production injection point is `tool_wiring::build_tools`.
-    pub fn with_host(mut self, host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>) -> Self {
+    pub fn with_host(
+        mut self,
+        host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
+    ) -> Self {
         self.host = host;
         self
     }
@@ -691,6 +689,9 @@ impl ToolRegistry {
                 return ToolExecutionResult::failure(format!("Tool '{}' not found", name));
             }
         };
+        if !tool.is_available() {
+            return ToolExecutionResult::failure(format!("Tool '{}' is unavailable", name));
+        }
 
         if tool.permission() > self.max_permission {
             return ToolExecutionResult::failure(format!(
@@ -795,13 +796,8 @@ impl ToolRegistry {
     /// See commit f03c6e8 for the prior pure-proxy attempt; this is the
     /// middle ground that avoids the proxy/native arg confusion that killed
     /// pure-proxy while still cutting cold-start prefill by ~60%.
-    const CORE_NATIVE_TOOLS: &'static [&'static str] = &[
-        "read_file",
-        "edit_file",
-        "write_file",
-        "exec",
-        "get_skills",
-    ];
+    const CORE_NATIVE_TOOLS: &'static [&'static str] =
+        &["read_file", "edit_file", "write_file", "exec", "get_skills"];
 
     /// Tools kept registered and reachable via the `get_tools` proxy (call with
     /// no `tool_name` to list) but omitted from the per-turn prompt catalog to
@@ -1087,7 +1083,11 @@ impl ToolRegistry {
             .filter(|t| t.is_available())
             .map(|t| Self::tool_hint(t.as_ref()))
             .filter(|h| !exclude.iter().any(|e| h.starts_with(e)))
-            .filter(|h| !Self::RARELY_ADVERTISED_TOOLS.iter().any(|r| h.starts_with(r)))
+            .filter(|h| {
+                !Self::RARELY_ADVERTISED_TOOLS
+                    .iter()
+                    .any(|r| h.starts_with(r))
+            })
             .collect();
         hints.sort();
 
@@ -1496,13 +1496,7 @@ mod tests {
             "core+proxy must be 5 native + 1 proxy, got {names:?}"
         );
         assert!(names.contains(&"get_tools"), "missing proxy: {names:?}");
-        for expected in [
-            "read_file",
-            "edit_file",
-            "write_file",
-            "exec",
-            "get_skills",
-        ] {
+        for expected in ["read_file", "edit_file", "write_file", "exec", "get_skills"] {
             assert!(
                 names.contains(&expected),
                 "core missing {expected}: {names:?}"
@@ -1523,7 +1517,10 @@ mod tests {
             .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("get_tools"))
             .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
             .unwrap_or("");
-        assert!(proxy_desc.contains("Omit tool_name to list"), "{proxy_desc}");
+        assert!(
+            proxy_desc.contains("Omit tool_name to list"),
+            "{proxy_desc}"
+        );
         assert!(proxy_desc.contains("read_file"), "{proxy_desc}");
         assert!(proxy_desc.contains("todo"), "{proxy_desc}");
         assert!(proxy_desc.contains("validate"), "{proxy_desc}");
@@ -1572,7 +1569,11 @@ mod tests {
         // Lazy-load contract: exactly ONE tool advertised at turn 1.
         assert_eq!(lean.len(), 1, "lean surface must be the single proxy tool");
         let name = lean[0].pointer("/function/name").and_then(|v| v.as_str());
-        assert_eq!(name, Some("get_tools"), "only the proxy meta-tool is advertised");
+        assert_eq!(
+            name,
+            Some("get_tools"),
+            "only the proxy meta-tool is advertised"
+        );
 
         let desc = lean[0]
             .pointer("/function/description")
@@ -1953,10 +1954,7 @@ mod tests {
         assert!(!result.ok());
         assert!(result.data().contains("Error"));
         assert!(result.data().contains("nonexistent"));
-        assert!(result
-            .error()
-            .unwrap_or_default()
-            .contains("not found"));
+        assert!(result.error().unwrap_or_default().contains("not found"));
     }
 
     #[tokio::test]
@@ -2428,18 +2426,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unavailable_tool_can_still_be_executed() {
+    async fn test_unavailable_tool_is_rejected_by_every_execution_path() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolContext;
+
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(UnavailableTool));
 
-        // The tool is registered but not in definitions; execute() should still work.
-        let result = registry.execute("unavailable_test", HashMap::new()).await;
-        assert!(
-            result.ok(),
-            "Unavailable tool should still execute when called directly: {:?}",
-            result.error()
+        let direct = registry.execute("unavailable_test", HashMap::new()).await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let ctx = ToolContext::new(
+            None,
+            tx,
+            tokio_util::sync::CancellationToken::new(),
+            "unavailable-call",
         );
-        assert_eq!(result.data(), "executed");
+        let contextual = registry
+            .execute_with_context("unavailable_test", HashMap::new(), &ctx)
+            .await;
+
+        let mut proxy_params = HashMap::new();
+        proxy_params.insert("name".to_string(), serde_json::json!("unavailable_test"));
+        proxy_params.insert("args".to_string(), serde_json::json!({}));
+        let proxied = registry.execute("tool", proxy_params).await;
+
+        for result in [direct, contextual, proxied] {
+            assert!(!result.ok(), "unavailable tool must not execute");
+            assert_eq!(
+                result.data(),
+                "Error: Tool 'unavailable_test' is unavailable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_available_tool_execution_remains_unchanged() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("available_tool")));
+        let mut params = HashMap::new();
+        params.insert("value".to_string(), serde_json::json!("still-runs"));
+
+        let result = registry.execute("available_tool", params).await;
+        assert!(result.ok());
+        assert_eq!(result.data(), "available_tool:still-runs");
     }
 
     #[test]
@@ -3042,7 +3072,11 @@ mod tests {
         let result = registry.execute("get_tools", params).await;
 
         assert!(!result.ok(), "oversized state=more must be rejected");
-        assert!(result.data().contains("state=\"more\""), "{}", result.data());
+        assert!(
+            result.data().contains("state=\"more\""),
+            "{}",
+            result.data()
+        );
         assert!(!file_path.exists());
     }
 
@@ -3303,9 +3337,8 @@ mod tests {
             "type": "object",
             "properties": {"query": {"type": "string"}, "mode": {"type": "string"}}
         });
-        let example =
-            ToolRegistry::worked_example_call("session_search", &schema_no_required)
-                .expect("first-property fallback must yield an example");
+        let example = ToolRegistry::worked_example_call("session_search", &schema_no_required)
+            .expect("first-property fallback must yield an example");
         assert!(
             example.starts_with("session_search({\""),
             "fallback example must include a property: {example}"
@@ -3313,7 +3346,10 @@ mod tests {
 
         // Genuinely no-arg tool → None (no augmentation possible).
         let no_args = serde_json::json!({"type": "object", "properties": {}});
-        assert_eq!(ToolRegistry::worked_example_call("system_info", &no_args), None);
+        assert_eq!(
+            ToolRegistry::worked_example_call("system_info", &no_args),
+            None
+        );
     }
 
     /// Old tool names from prior sessions must keep resolving to their dissolved
@@ -3322,10 +3358,7 @@ mod tests {
     /// a separate follow-up — not yet applied — so they aren't aliased here.)
     #[test]
     fn normalize_routes_old_tool_names_to_new_targets() {
-        for (old, new) in [
-            ("session_search", "recall"),
-            ("search_context", "recall"),
-        ] {
+        for (old, new) in [("session_search", "recall"), ("search_context", "recall")] {
             let (c, _) = ToolRegistry::normalize_tool_request(old, HashMap::new()).unwrap();
             assert_eq!(c, new, "alias {old} -> {new}");
         }
@@ -3370,7 +3403,9 @@ mod tests {
         );
         // The corrective shape, derived from the schema's required params:
         assert!(
-            result.data().contains("Call as require_query({\"query\":\"...\"})"),
+            result
+                .data()
+                .contains("Call as require_query({\"query\":\"...\"})"),
             "missing-arg error must echo the schema-derived worked example: {}",
             result.data()
         );
@@ -3428,7 +3463,9 @@ mod tests {
             .await;
         assert!(!result.ok(), "must still report failure");
         assert!(
-            result.data().contains(r#"Call as structured_missing_arg({"facts":["..."]})"#),
+            result
+                .data()
+                .contains(r#"Call as structured_missing_arg({"facts":["..."]})"#),
             "structural MissingArg must append the example from error_kind: {}",
             result.data()
         );

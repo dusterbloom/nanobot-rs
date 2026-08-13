@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::indexing_slicing,
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::indexing_slicing, clippy::shadow_reuse)]
 //! Background reflector that distills working sessions into long-term factual memory.
 //!
 //! When completed working sessions accumulate past a token threshold, the

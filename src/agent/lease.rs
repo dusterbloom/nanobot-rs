@@ -12,7 +12,6 @@
 //! impossible without a coarse-family cap (retired 2026-07-30 — it over-fired
 //! on legitimate exploration and busted the prefix cache).
 
-
 /// Default per-lease tool budget. Tuned for coding tasks where the
 /// model needs to read multiple files, run searches, and exec commands
 /// in one turn. 12 is enough for a typical "explore 3-4 files +
@@ -249,12 +248,11 @@ impl Lease {
     /// adds the result). For the first call this is 1, etc.
     pub fn progress_signal(&self) -> String {
         let current_call = self.iterations_used;
-        let checkpoint_remaining =
-            self.max_renewals.saturating_sub(self.renewals_used);
-        let read_only_remaining =
-            self.max_renewals.saturating_sub(self.read_only_renewals_used);
-        let leases_remaining =
-            std::cmp::min(checkpoint_remaining, read_only_remaining);
+        let checkpoint_remaining = self.max_renewals.saturating_sub(self.renewals_used);
+        let read_only_remaining = self
+            .max_renewals
+            .saturating_sub(self.read_only_renewals_used);
+        let leases_remaining = std::cmp::min(checkpoint_remaining, read_only_remaining);
         format!(
             "[Tool call {} of {} this lease — {} leases remaining]",
             current_call, self.lease_size, leases_remaining
@@ -314,7 +312,7 @@ mod tests {
         // Three tools consumed the lease; the 4th call must be rejected.
         assert!(
             !tick(&mut lease),
-             "lease must be exhausted after lease_size tool calls"
+            "lease must be exhausted after lease_size tool calls"
         );
         assert!(lease.is_exhausted());
     }
@@ -493,7 +491,10 @@ mod tests {
         }
         // The 6th exhausts the lease — that is the only block path now.
         let blocked = lease.record_tool_call();
-        assert!(!blocked.allowed, "lease_size+1 must be blocked by exhaustion");
+        assert!(
+            !blocked.allowed,
+            "lease_size+1 must be blocked by exhaustion"
+        );
         assert_eq!(
             blocked.reason,
             Some("lease_exhausted"),

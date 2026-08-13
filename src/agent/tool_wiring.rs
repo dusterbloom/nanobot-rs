@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::shadow_reuse,
-    clippy::shadow_unrelated,
-)]
+#![allow(clippy::shadow_reuse, clippy::shadow_unrelated)]
 //! Tool registry construction and wiring.
 //!
 //! Extracted from `agent_loop.rs` to isolate the callback-heavy tool setup.
@@ -289,16 +286,14 @@ impl LoopHost for AgentHost {
 impl MessageHost for AgentHost {
     async fn send(&self, req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
         let msg = OutboundMessage::new(&req.channel, &req.chat_id, &req.content);
-        self.outbound
-            .send(msg)
-            .map_err(|e| ToolError::Execution {
-                // Byte-identical to the legacy send closure: it wrapped the
-                // bus error in anyhow as "Failed to send outbound message: {e}"
-                // and the old MessageTool prefixed "Error sending message: ".
-                // The merged host must reproduce both prefixes so the model
-                // sees the same string after the message swap.
-                message: format!("Error sending message: Failed to send outbound message: {e}"),
-            })?;
+        self.outbound.send(msg).map_err(|e| ToolError::Execution {
+            // Byte-identical to the legacy send closure: it wrapped the
+            // bus error in anyhow as "Failed to send outbound message: {e}"
+            // and the old MessageTool prefixed "Error sending message: ".
+            // The merged host must reproduce both prefixes so the model
+            // sees the same string after the message swap.
+            message: format!("Error sending message: Failed to send outbound message: {e}"),
+        })?;
         Ok(SendMessageReply {
             text: format!("Message sent to {}:{}", req.channel, req.chat_id),
         })
@@ -588,11 +583,9 @@ mod agent_host_tests {
             })
             .await
             .unwrap();
-        assert!(
-            reply
-                .text
-                .contains("No running or completed result found for task_id 'nope'.")
-        );
+        assert!(reply
+            .text
+            .contains("No running or completed result found for task_id 'nope'."));
     }
 
     #[tokio::test]
@@ -606,7 +599,9 @@ mod agent_host_tests {
             })
             .await
             .unwrap();
-        assert!(reply.text.contains("No running subagent found matching 'nope'."));
+        assert!(reply
+            .text
+            .contains("No running subagent found matching 'nope'."));
     }
 
     #[tokio::test]
@@ -627,7 +622,9 @@ mod agent_host_tests {
             .unwrap();
         // The exact wire format the legacy closure produced.
         assert!(reply.text.starts_with("Subagent 'explore' spawned (id: "));
-        assert!(reply.text.contains(", model: mock-model). It will announce results when done."));
+        assert!(reply
+            .text
+            .contains(", model: mock-model). It will announce results when done."));
         assert_eq!(reply.task_id.len(), 8);
         assert!(reply.text.contains(&format!("(id: {}", reply.task_id)));
     }
@@ -656,6 +653,9 @@ mod agent_host_tests {
         let HostReply::Ok { data } = reply else {
             panic!("expected ok");
         };
-        assert!(data["text"].as_str().unwrap().contains("No subagents currently running."));
+        assert!(data["text"]
+            .as_str()
+            .unwrap()
+            .contains("No subagents currently running."));
     }
 }

@@ -25,7 +25,7 @@
     clippy::shadow_unrelated,
     clippy::shadow_same,
     clippy::format_push_string,
-    clippy::string_add,
+    clippy::string_add
 )]
 #![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::path::PathBuf;

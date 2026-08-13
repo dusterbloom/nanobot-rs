@@ -18,7 +18,7 @@
     clippy::print_stdout,
     clippy::print_stderr,
     clippy::pedantic,
-    clippy::nursery,
+    clippy::nursery
 )]
 //! Named regression track: message-array protocol invariants.
 //!

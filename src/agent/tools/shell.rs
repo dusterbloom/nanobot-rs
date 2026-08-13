@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::as_conversions, clippy::shadow_reuse)]
 //! Shell execution tool.
 
 use std::collections::HashMap;
@@ -22,11 +19,13 @@ use tokio::process::Command;
 
 // Static regexes for command normalization (compiled once).
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
-static RE_ESCAPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([^nrtav\\0])").expect("static regex"));
+static RE_ESCAPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\([^nrtav\\0])").expect("static regex"));
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("static regex"));
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
-static RE_POSIX_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/[^\s"']+"#).expect("static regex"));
+static RE_POSIX_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"/[^\s"']+"#).expect("static regex"));
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_WIN_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).expect("static regex"));
@@ -703,7 +702,11 @@ mod tests {
             "non-zero shell exit must be a failed tool result"
         );
         assert!(result.data().starts_with("Error:"), "{:?}", result.data());
-        assert!(result.data().contains("Exit code: 7"), "{:?}", result.data());
+        assert!(
+            result.data().contains("Exit code: 7"),
+            "{:?}",
+            result.data()
+        );
     }
 
     // -----------------------------------------------------------------------

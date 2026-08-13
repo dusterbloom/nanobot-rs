@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::as_conversions, clippy::shadow_reuse)]
 //! Response classification and handler methods for `step_process_response`.
 //!
 //! Extracted from `agent_shared.rs` as a `#[path]` submodule.
@@ -502,8 +499,7 @@ impl AgentLoopShared {
                                 ctx.flow.lease.lease_size()
                             )));
                         return StepResult::Next(IterationPhase::PreCall);
-                    } else if renewal.was_attempted()
-                        && renewal.missing_field() != "out_of_leases"
+                    } else if renewal.was_attempted() && renewal.missing_field() != "out_of_leases"
                     {
                         // Renewal attempted but missing a field. Tell the
                         // model exactly what's missing so the next attempt
@@ -1006,7 +1002,10 @@ impl AgentLoopShared {
             .as_deref()
             .map_or(true, |c| c.trim().is_empty());
         if response.outcome().is_err()
-            || matches!(response.finish_reason, FinishReason::Aborted | FinishReason::Cancelled)
+            || matches!(
+                response.finish_reason,
+                FinishReason::Aborted | FinishReason::Cancelled
+            )
         {
             "error"
         } else if no_content && response.tool_calls.is_empty() {
@@ -1100,6 +1099,8 @@ impl AgentLoopShared {
         let metrics = crate::agent::metrics::RequestMetrics {
             timestamp: chrono::Local::now().to_rfc3339(),
             request_id: ctx.request_id.clone(),
+            logical_session: ctx.session_id.clone(),
+            cache_route: ctx.higgs_session_route.cache_route().into(),
             role: "main".into(),
             model: ctx.core.model.clone(),
             provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),
@@ -1124,6 +1125,12 @@ impl AgentLoopShared {
             tool_calls_executed: 0,
             validation_result: None,
         };
+        counters.record_cache_metrics(
+            &metrics.logical_session,
+            metrics.prompt_tokens,
+            metrics.cache_read_tokens,
+            metrics.cache_creation_tokens,
+        );
         if defer_until_tool_execution {
             debug_assert!(ctx.flow.pending_request_metrics.is_none());
             ctx.flow.pending_request_metrics = Some(metrics);
@@ -1266,7 +1273,8 @@ mod tests {
     /// substring check fired before textual detection and discarded it ×4.
     #[test]
     fn classify_recovers_truncated_tool_call_not_pathological() {
-        let raw = "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
+        let raw =
+            "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
         let resp = make_response(Some(raw), "stop");
 
         let kind = classify_response(&resp, true, false, false, &default_retries(), false);
@@ -1476,10 +1484,7 @@ mod tests {
 
     #[test]
     fn test_classify_text_with_stop_and_complete() {
-        let resp = make_response(
-            Some("All done. Here is your answer."),
-            "stop",
-        );
+        let resp = make_response(Some("All done. Here is your answer."), "stop");
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
         assert!(matches!(kind, ResponseKind::Text(ref s) if s == "All done. Here is your answer."));
     }

@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::shadow_reuse)]
 //! Typed replacement for `SwappableCore::is_local`.
 //!
 //! `RuntimeMode` distinguishes a `Cloud` managed API from any locally-reachable

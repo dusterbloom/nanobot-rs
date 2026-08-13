@@ -3,11 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::shadow_reuse,
-    clippy::shadow_unrelated,
-)]
+#![allow(clippy::as_conversions, clippy::shadow_reuse, clippy::shadow_unrelated)]
 //! Phase 1 of message processing: build the [`TurnContext`] from an inbound message.
 //!
 //! Extracted from `agent_loop.rs` to keep that file focused on the iteration
@@ -340,9 +336,9 @@ impl AgentLoopShared {
                 // only if the invariant broke; fall back to a fresh engine.
                 None => {
                     use crate::agent::lcm::{LcmConfig, LcmEngine};
-                    std::sync::Arc::new(tokio::sync::Mutex::new(LcmEngine::new(
-                        LcmConfig::from(&self.lcm_config),
-                    )))
+                    std::sync::Arc::new(tokio::sync::Mutex::new(LcmEngine::new(LcmConfig::from(
+                        &self.lcm_config,
+                    ))))
                 }
             }
         };
@@ -407,10 +403,9 @@ impl AgentLoopShared {
         // The WATERMARK still must go: it is an index into the message array,
         // and history windowing renumbers those. A stale watermark would freeze
         // the wrong prefix range.
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .remove(&session_key);
+        let _prompt_cache_transition = counters.lock_prompt_cache_transition();
+        counters.prompt_cache_watermark.lock().remove(&session_key);
+        drop(_prompt_cache_transition);
         let history_ms = lap_ms();
         // LCM history adoption: when the engine holds a summary DAG, the
         // engine's active context IS the conversation history — summary
@@ -646,6 +641,9 @@ impl AgentLoopShared {
             turn_start: std::time::Instant::now(),
             compaction,
             soft_compaction_requested: false,
+            staged_auto_expansion: None,
+            higgs_session_route: Default::default(),
+            retained_route_cleanup: Default::default(),
             content_gate,
             counters: self.core_handle.counters.clone(),
             flow: FlowControl {

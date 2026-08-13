@@ -20,6 +20,13 @@ pub enum ProviderError {
     #[error("HTTP request failed: {0}")]
     HttpError(String),
 
+    #[error("HTTP request failed: HTTP {status}: {message}")]
+    HttpStatus {
+        status: u16,
+        code: Option<String>,
+        message: String,
+    },
+
     #[error("Failed to read response body: {0}")]
     ResponseReadError(String),
 
@@ -53,6 +60,7 @@ impl ProviderError {
             Self::RateLimited { .. } => true,
             Self::ServerError { .. } => true,
             Self::HttpError(msg) => is_transient_http_error(msg),
+            Self::HttpStatus { .. } => false,
             Self::ResponseReadError(_)
             | Self::JsonParseError(_)
             | Self::AuthError { .. }
@@ -62,10 +70,86 @@ impl ProviderError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedSessionErrorKind {
+    Unavailable,
+    ContextOverflow,
+}
+
+/// Classify only structured provider status/code data. Retained routing must
+/// not be selected by arbitrary text from an untyped transport error.
+pub(crate) fn classify_retained_session_error(
+    error: &anyhow::Error,
+) -> Option<RetainedSessionErrorKind> {
+    let ProviderError::HttpStatus {
+        status,
+        code,
+        message,
+    } = error.downcast_ref::<ProviderError>()?
+    else {
+        return None;
+    };
+    let code = code.as_deref().unwrap_or_default().to_ascii_lowercase();
+    let response_message = serde_json::from_str::<serde_json::Value>(message)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| message.clone())
+        .to_ascii_lowercase();
+    let coded_context_overflow = code.contains("context")
+        && (code.contains("length")
+            || code.contains("size")
+            || code.contains("overflow")
+            || code.contains("exceed"));
+    let names_context_limit = response_message.contains("maximum context length")
+        || response_message.contains("context length")
+        || response_message.contains("available context size")
+        || response_message.contains("exceed_context_size_error");
+    let reports_request_overrun = response_message.contains("exceed")
+        || response_message.contains("too many tokens")
+        || response_message.contains("requested tokens")
+        || response_message.contains("requested") && response_message.contains("tokens")
+        || response_message.contains("request has") && response_message.contains("tokens")
+        || response_message.contains("input is too long");
+    let reports_messages_token_count =
+        response_message.contains("messages resulted in") && response_message.contains("tokens");
+    let context_overflow = coded_context_overflow
+        || *status == 400
+            && (names_context_limit && reports_request_overrun || reports_messages_token_count);
+    if context_overflow {
+        return Some(RetainedSessionErrorKind::ContextOverflow);
+    }
+    if *status == 409
+        || code.contains("retained_session")
+        || code.contains("session_expired")
+        || code.contains("prompt_mismatch")
+        || code.contains("token_mismatch")
+    {
+        return Some(RetainedSessionErrorKind::Unavailable);
+    }
+    None
+}
+
 /// Downcast an `anyhow::Error` and check retryability.
 pub fn is_retryable_provider_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ProviderError>()
         .map_or(false, |pe| pe.is_retryable())
+}
+
+/// Detect provider-side context overflow errors across OpenAI-compatible
+/// servers. Providers do not expose one stable structured code for this yet,
+/// so the hot path recognizes the small set of wire strings we receive.
+pub(crate) fn is_context_overflow_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_lowercase();
+    message.contains("exceed_context_size_error")
+        || message.contains("exceeds the available context size")
+        || message.contains("context size")
+        || message.contains("context length")
 }
 
 /// Check if an HTTP error message indicates a transient/retryable condition.
@@ -297,7 +381,10 @@ impl ToolError {
     pub fn render(&self) -> String {
         match self {
             Self::MissingArg { param, example } => {
-                format!("Error: '{}' parameter is required; call as {}", param, example)
+                format!(
+                    "Error: '{}' parameter is required; call as {}",
+                    param, example
+                )
             }
             Self::Execution { message }
             | Self::InvalidArgs { message }
@@ -330,7 +417,9 @@ impl ToolError {
                 ToolErrorKind::MissingArg { param, example } => Self::MissingArg { param, example },
             };
         }
-        Self::Execution { message: msg.to_string() }
+        Self::Execution {
+            message: msg.to_string(),
+        }
     }
 }
 
@@ -393,6 +482,106 @@ mod tests {
             downcasted.unwrap(),
             ProviderError::AuthError { status: 401, .. }
         ));
+    }
+
+    #[test]
+    fn retained_session_failures_use_typed_http_status_and_error_code() {
+        for (error, expected) in [
+            (
+                ProviderError::HttpStatus {
+                    status: 409,
+                    code: None,
+                    message: "conflict".into(),
+                },
+                RetainedSessionErrorKind::Unavailable,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: Some("context_length_exceeded".into()),
+                    message: "too large".into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: Some("token_mismatch".into()),
+                    message: "continuation mismatch".into(),
+                },
+                RetainedSessionErrorKind::Unavailable,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: None,
+                    message: r#"{"error":{"message":"maximum context length exceeded"}}"#.into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: None,
+                    message: "prompt exceeds the available context size".into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: None,
+                    message:
+                        "maximum context length is 8192 tokens; however, you requested 9000 tokens"
+                            .into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: None,
+                    message: "messages resulted in 9000 tokens".into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 409,
+                    code: None,
+                    message: r#"{"error":{"message":"retained session expired"}}"#.into(),
+                },
+                RetainedSessionErrorKind::Unavailable,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 409,
+                    code: None,
+                    message: "prompt mismatch: retained session unavailable".into(),
+                },
+                RetainedSessionErrorKind::Unavailable,
+            ),
+        ] {
+            let error = anyhow::Error::new(error);
+            assert_eq!(classify_retained_session_error(&error), Some(expected));
+        }
+        assert_eq!(
+            classify_retained_session_error(&anyhow::anyhow!(
+                "HTTP 409: retained_session_unavailable"
+            )),
+            None,
+            "flattened strings must not select retained-session recovery"
+        );
+        assert_eq!(
+            classify_retained_session_error(&anyhow::Error::new(ProviderError::HttpStatus {
+                status: 400,
+                code: None,
+                message: "max_prompt_tokens must be below maximum context length for this model"
+                    .into(),
+            })),
+            None,
+            "typed configuration validation is not evidence that this request overflowed"
+        );
     }
 
     // -- classify_tool_error tests --
@@ -673,11 +862,17 @@ mod tests {
             example: "recall({\"query\":\"...\"})".into(),
         }
         .is_model_fixable());
-        assert!(ToolError::InvalidArgs { message: "bad".into() }.is_model_fixable());
+        assert!(ToolError::InvalidArgs {
+            message: "bad".into()
+        }
+        .is_model_fixable());
         // Neither.
         assert!(!ToolError::NotFound("x".into()).is_retryable());
         assert!(!ToolError::NotFound("x".into()).is_model_fixable());
-        assert!(!ToolError::Execution { message: "boom".into() }.is_retryable());
+        assert!(!ToolError::Execution {
+            message: "boom".into()
+        }
+        .is_retryable());
     }
 
     #[test]
@@ -695,7 +890,9 @@ mod tests {
             Some(ToolErrorKind::Timeout(42))
         ));
         assert_eq!(
-            legacy_kind_from_tool_error(&ToolError::Execution { message: "x".into() }),
+            legacy_kind_from_tool_error(&ToolError::Execution {
+                message: "x".into()
+            }),
             None
         );
     }

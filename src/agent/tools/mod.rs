@@ -4,13 +4,13 @@ pub mod apply_patch;
 pub mod base;
 pub mod browser;
 pub mod code_execution;
-#[cfg(feature = "python-kernel")]
-pub mod python_kernel;
 pub mod cron_tool;
 pub mod email;
 pub mod file_preview;
 pub mod filesystem;
 pub mod message;
+#[cfg(feature = "python-kernel")]
+pub mod python_kernel;
 pub mod read_skill;
 pub mod reasoning_tools;
 pub mod recall;
@@ -29,8 +29,6 @@ pub use apply_patch::ApplyPatchTool;
 pub use base::Tool;
 pub use browser::BrowserTool;
 pub use code_execution::CodeExecutionTool;
-#[cfg(feature = "python-kernel")]
-pub use python_kernel::PythonKernel;
 pub use cron_tool::CronScheduleTool;
 pub use email::{CheckInboxTool, SendEmailTool};
 pub use file_preview::FilePreviewTool;
@@ -39,6 +37,8 @@ pub use filesystem::{
     WorkspaceDiffTool, WriteFileTool,
 };
 pub use message::MessageTool;
+#[cfg(feature = "python-kernel")]
+pub use python_kernel::PythonKernel;
 pub use read_skill::ReadSkillTool;
 pub use recall::RecallTool;
 pub use registry::ToolRegistry;

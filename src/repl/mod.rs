@@ -21,7 +21,7 @@
     clippy::shadow_unrelated,
     clippy::shadow_same,
     clippy::format_push_string,
-    clippy::string_add,
+    clippy::string_add
 )]
 pub(crate) mod commands;
 mod incremental;
@@ -554,7 +554,10 @@ pub(crate) fn higgs_keepalive_secs(
         return None;
     }
     let secs = match env {
-        Some(v) => v.trim().parse::<u64>().unwrap_or(DEFAULT_HIGGS_KEEPALIVE_SECS),
+        Some(v) => v
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_HIGGS_KEEPALIVE_SECS),
         None => DEFAULT_HIGGS_KEEPALIVE_SECS,
     };
     // 0 disables — from the env var or from the default. Never return Some(0):

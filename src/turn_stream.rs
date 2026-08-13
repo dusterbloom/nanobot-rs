@@ -440,6 +440,7 @@ pub(crate) enum CacheResetReason {
     EmergencyTrim,
     LcmCheckpoint,
     StalledProviderRequest,
+    ToolBlockChange,
 }
 
 impl CacheResetReason {
@@ -449,6 +450,7 @@ impl CacheResetReason {
             CacheResetReason::EmergencyTrim => "emergency_trim",
             CacheResetReason::LcmCheckpoint => "lcm_checkpoint",
             CacheResetReason::StalledProviderRequest => "stalled_provider_request",
+            CacheResetReason::ToolBlockChange => "tool_block_change",
         }
     }
 }
@@ -569,6 +571,7 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
                     "emergency_trim" => CacheResetReason::EmergencyTrim,
                     "lcm_checkpoint" => CacheResetReason::LcmCheckpoint,
                     "stalled_provider_request" => CacheResetReason::StalledProviderRequest,
+                    "tool_block_change" => CacheResetReason::ToolBlockChange,
                     _ => return None,
                 };
                 Some(ControlMarker::CacheStatus(CacheStatus::Reset { reason }))
@@ -577,8 +580,7 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
         };
     }
     if let Some(compaction) = rest.strip_prefix("compaction:") {
-        return CompactionStatus::from_wire(compaction)
-            .map(ControlMarker::Compaction);
+        return CompactionStatus::from_wire(compaction).map(ControlMarker::Compaction);
     }
     None
 }
@@ -680,6 +682,9 @@ mod tests {
             }),
             ControlMarker::CacheStatus(CacheStatus::Reset {
                 reason: CacheResetReason::StalledProviderRequest,
+            }),
+            ControlMarker::CacheStatus(CacheStatus::Reset {
+                reason: CacheResetReason::ToolBlockChange,
             }),
             ControlMarker::Compaction(CompactionStatus::Started { messages: 48 }),
             ControlMarker::Compaction(CompactionStatus::Finished),

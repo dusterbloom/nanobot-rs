@@ -18,8 +18,9 @@ static RE_FILE_REF: LazyLock<Regex> = LazyLock::new(|| {
     .expect("static regex")
 });
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
-static RE_CMD_REF: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`").expect("static regex"));
+static RE_CMD_REF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`").expect("static regex")
+});
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_QUOTED_OUTPUT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(output|result|returns?|shows?|returned|produced)\b[:\s]*\n?```[^\n]*\n([\s\S]*?)```").expect("static regex")
@@ -35,7 +36,8 @@ static RE_ACTION_PRESENT: LazyLock<Regex> = LazyLock::new(|| {
 });
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_ACTION_WHEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b").expect("static regex")
+    Regex::new(r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b")
+        .expect("static regex")
 });
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
@@ -51,8 +53,9 @@ static RE_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(build|compile|install|copy|cp|mv|mkdir|chmod|sudo|cargo|npm|pip|make|test|deploy|push|pull|merge)\b[^.\n]{0,30}\b(succeeded|failed|worked|completed|finished|passed|done|ready|updated|error|broke|broken|permission denied|not found|timed? ?out)\b").expect("static regex")
 });
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
-static RE_TIMESTAMP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").expect("static regex"));
+static RE_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").expect("static regex")
+});
 
 const ACTION_CLAIM_MAX_TAIL_CHARS: usize = 240;
 

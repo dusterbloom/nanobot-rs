@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::indexing_slicing,
-)]
+#![allow(clippy::as_conversions, clippy::indexing_slicing)]
 //! Phase 3 of message processing: finalize and emit the [`OutboundMessage`].
 //!
 //! Extracted from `agent_loop.rs` to keep that file focused on the iteration
@@ -15,7 +12,7 @@
 use std::sync::atomic::Ordering;
 
 use serde_json::json;
-use tracing::{instrument, warn};
+use tracing::{info, instrument, warn};
 
 use crate::agent::agent_loop::{AgentLoopShared, TurnContext};
 use crate::agent::token_budget::TokenBudget;
@@ -154,8 +151,9 @@ impl AgentLoopShared {
                 // Inject warning for the next turn. Cache-replay tagged;
                 // user role for the same reason as the fabrication warning
                 // above.
-                ctx.messages
-                    .push(crate::agent::markers::scaffold_user(detection.system_warning));
+                ctx.messages.push(crate::agent::markers::scaffold_user(
+                    detection.system_warning,
+                ));
             }
         }
 
@@ -231,6 +229,18 @@ impl AgentLoopShared {
         ctx.persist_pending_protocol_messages().await;
 
         ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
+
+        let cache = counters.session_cache_metrics(&ctx.session_id);
+        info!(
+            logical_session = %ctx.session_id,
+            calls = cache.calls,
+            prompt_tokens = cache.prompt_tokens,
+            cache_read_tokens = cache.cache_read_tokens,
+            cache_creation_tokens = cache.cache_creation_tokens,
+            cold_calls = cache.cold_calls,
+            efficiency_pct = cache.efficiency_pct(),
+            "cache_efficiency"
+        );
 
         if ctx.final_content.is_empty() {
             None

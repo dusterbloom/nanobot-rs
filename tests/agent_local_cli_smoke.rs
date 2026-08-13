@@ -18,7 +18,7 @@
     clippy::print_stdout,
     clippy::print_stderr,
     clippy::pedantic,
-    clippy::nursery,
+    clippy::nursery
 )]
 //! Local CLI smoke test for `nanobot agent -l`.
 //!

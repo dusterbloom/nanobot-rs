@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::format_push_string,
-)]
+#![allow(clippy::as_conversions, clippy::format_push_string)]
 //! File preview tool: metadata, snippets, outline, and ranged-read hints.
 
 use std::collections::HashMap;

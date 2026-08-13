@@ -163,7 +163,10 @@ macro_rules! text_reply {
     };
 }
 
-text_reply!(ListReply, "Formatted listing of running + recently completed subagents.");
+text_reply!(
+    ListReply,
+    "Formatted listing of running + recently completed subagents."
+);
 text_reply!(CancelReply, "Cancellation confirmation text.");
 text_reply!(WaitReply, "Blocking wait result text.");
 text_reply!(CheckReply, "Non-blocking status/result text.");
@@ -185,7 +188,9 @@ pub enum HostReply {
         #[serde(flatten)]
         data: serde_json::Value,
     },
-    Error { error: String },
+    Error {
+        error: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +288,12 @@ impl HostDispatcher {
         loop_: Arc<dyn LoopHost>,
         message: Arc<dyn MessageHost>,
     ) -> Self {
-        Self { spawn, pipeline, loop_, message }
+        Self {
+            spawn,
+            pipeline,
+            loop_,
+            message,
+        }
     }
 
     // Transport seam (research doc §3.7 Step 4): a future UDS/ZeroMQ server
@@ -541,30 +551,42 @@ mod tests {
             })
         }
         async fn list_subagents(&self) -> Result<ListReply, ToolError> {
-            Ok(ListReply { text: "list".to_string() })
+            Ok(ListReply {
+                text: "list".to_string(),
+            })
         }
         async fn cancel(&self, _req: CancelRequest) -> Result<CancelReply, ToolError> {
-            Ok(CancelReply { text: "cancelled".to_string() })
+            Ok(CancelReply {
+                text: "cancelled".to_string(),
+            })
         }
         async fn wait(&self, _req: WaitRequest) -> Result<WaitReply, ToolError> {
-            Ok(WaitReply { text: "waited".to_string() })
+            Ok(WaitReply {
+                text: "waited".to_string(),
+            })
         }
         async fn check(&self, _req: CheckRequest) -> Result<CheckReply, ToolError> {
-            Ok(CheckReply { text: "checked".to_string() })
+            Ok(CheckReply {
+                text: "checked".to_string(),
+            })
         }
     }
 
     #[async_trait]
     impl PipelineHost for MockPipeline {
         async fn run_pipeline(&self, _req: PipelineRequest) -> Result<PipelineReply, ToolError> {
-            Ok(PipelineReply { text: "pipeline done".to_string() })
+            Ok(PipelineReply {
+                text: "pipeline done".to_string(),
+            })
         }
     }
 
     #[async_trait]
     impl LoopHost for MockLoop {
         async fn run_loop(&self, _req: LoopRequest) -> Result<LoopReply, ToolError> {
-            Ok(LoopReply { text: "loop done".to_string() })
+            Ok(LoopReply {
+                text: "loop done".to_string(),
+            })
         }
     }
 
@@ -629,7 +651,9 @@ mod tests {
             })
         }
         async fn cancel(&self, _req: CancelRequest) -> Result<CancelReply, ToolError> {
-            Err(ToolError::PermissionDenied("Permission denied: no".to_string()))
+            Err(ToolError::PermissionDenied(
+                "Permission denied: no".to_string(),
+            ))
         }
         async fn wait(&self, _req: WaitRequest) -> Result<WaitReply, ToolError> {
             Err(ToolError::MissingArg {
@@ -696,7 +720,10 @@ mod tests {
             Arc::new(MockLoop),
             Arc::new(MockMessage),
         );
-        let err = d.call(HostRequest::Spawn(spawn_request())).await.unwrap_err();
+        let err = d
+            .call(HostRequest::Spawn(spawn_request()))
+            .await
+            .unwrap_err();
         assert_eq!(err.render(), "Error: Command timed out after 30s");
     }
 
@@ -726,16 +753,24 @@ mod tests {
             })
         }
         async fn list_subagents(&self) -> Result<ListReply, ToolError> {
-            Ok(ListReply { text: "No subagents currently running.".to_string() })
+            Ok(ListReply {
+                text: "No subagents currently running.".to_string(),
+            })
         }
         async fn cancel(&self, req: CancelRequest) -> Result<CancelReply, ToolError> {
-            Ok(CancelReply { text: format!("Subagent '{}' cancelled.", req.task_id) })
+            Ok(CancelReply {
+                text: format!("Subagent '{}' cancelled.", req.task_id),
+            })
         }
         async fn wait(&self, req: WaitRequest) -> Result<WaitReply, ToolError> {
-            Ok(WaitReply { text: format!("waited {} for {}s", req.task_id, req.timeout_secs) })
+            Ok(WaitReply {
+                text: format!("waited {} for {}s", req.task_id, req.timeout_secs),
+            })
         }
         async fn check(&self, req: CheckRequest) -> Result<CheckReply, ToolError> {
-            Ok(CheckReply { text: format!("checked {}", req.task_id) })
+            Ok(CheckReply {
+                text: format!("checked {}", req.task_id),
+            })
         }
     }
 
@@ -743,14 +778,18 @@ mod tests {
     impl PipelineHost for LegacyWireHost {
         async fn run_pipeline(&self, req: PipelineRequest) -> Result<PipelineReply, ToolError> {
             let steps = serde_json::to_string(&req.steps).unwrap_or_default();
-            Ok(PipelineReply { text: format!("pipeline over {steps} ahead {}", req.ahead_by_k) })
+            Ok(PipelineReply {
+                text: format!("pipeline over {steps} ahead {}", req.ahead_by_k),
+            })
         }
     }
 
     #[async_trait]
     impl LoopHost for LegacyWireHost {
         async fn run_loop(&self, req: LoopRequest) -> Result<LoopReply, ToolError> {
-            Ok(LoopReply { text: format!("loop {} r{}", req.task, req.max_rounds) })
+            Ok(LoopReply {
+                text: format!("loop {} r{}", req.task, req.max_rounds),
+            })
         }
     }
 
@@ -811,7 +850,10 @@ mod tests {
         // pipeline / loop
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("pipeline"));
-        p.insert("steps".to_string(), json!([{"prompt": "one"}, {"prompt": "two"}]));
+        p.insert(
+            "steps".to_string(),
+            json!([{"prompt": "one"}, {"prompt": "two"}]),
+        );
         p.insert("ahead_by_k".to_string(), json!(2));
         assert_eq!(
             tool.execute(p).await,
@@ -857,15 +899,24 @@ mod tests {
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("wait"));
-        assert_eq!(tool.execute(p).await, "Error: 'task_id' parameter is required for wait");
+        assert_eq!(
+            tool.execute(p).await,
+            "Error: 'task_id' parameter is required for wait"
+        );
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("pipeline"));
-        assert_eq!(tool.execute(p).await, "Error: 'steps' parameter is required for pipeline");
+        assert_eq!(
+            tool.execute(p).await,
+            "Error: 'steps' parameter is required for pipeline"
+        );
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("loop"));
-        assert_eq!(tool.execute(p).await, "Error: 'task' parameter is required for loop");
+        assert_eq!(
+            tool.execute(p).await,
+            "Error: 'task' parameter is required for loop"
+        );
     }
 
     #[tokio::test]

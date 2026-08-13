@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::as_conversions, clippy::shadow_reuse)]
 //! Todo tool: session-scoped working-memory scratchpad.
 //!
 //! Small local models juggling multiple concurrent tasks routinely conflate

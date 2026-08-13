@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::indexing_slicing,
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::indexing_slicing, clippy::shadow_reuse)]
 //! Pure filtering functions for session message history.
 //!
 //! Extracted from the JSONL `SessionManager` for reuse by the SQLite
@@ -15,9 +12,9 @@
 use serde_json::Value;
 use tracing::warn;
 
+use crate::agent::context_hygiene::cap_tool_result_for_replay;
 #[cfg(test)]
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
-use crate::agent::context_hygiene::cap_tool_result_for_replay;
 
 /// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
 ///

@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::shadow_reuse)]
 //! Browser automation tool backed by the `agent-browser` CLI
 //! (<https://github.com/vercel-labs/agent-browser>).
 //!

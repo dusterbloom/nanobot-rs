@@ -6,7 +6,7 @@
 #![allow(
     clippy::as_conversions,
     clippy::format_push_string,
-    clippy::shadow_reuse,
+    clippy::shadow_reuse
 )]
 //! Tool status: summarize tool health, audit history, and skill validation.
 

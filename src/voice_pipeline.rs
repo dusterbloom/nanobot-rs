@@ -16,7 +16,7 @@
     clippy::shadow_unrelated,
     clippy::shadow_same,
     clippy::format_push_string,
-    clippy::string_add,
+    clippy::string_add
 )]
 #![cfg(feature = "voice")]
 #![allow(unsafe_code)]

@@ -2093,10 +2093,7 @@ async fn plain_text_response_is_final_answer() {
     ));
     let main_dyn: Arc<dyn LLMProvider> = main.clone();
     let (agent_loop, workspace) = build_local_inline_harness(main_dyn);
-    let session_key = format!(
-        "test-no-attestation-{}",
-        uuid::Uuid::new_v4().to_string()
-    );
+    let session_key = format!("test-no-attestation-{}", uuid::Uuid::new_v4().to_string());
 
     let response = agent_loop
         .process_direct("hi", &session_key, "test", "offline")
@@ -3304,11 +3301,17 @@ async fn soft_compaction_waits_for_turn_end_and_next_foreground_preempts_generat
 
 struct ReplayStableSoftProvider {
     foreground_calls: std::sync::Mutex<Vec<Vec<Value>>>,
+    foreground_max_tokens: std::sync::Mutex<Vec<u32>>,
+    force_recovery_on_second: bool,
 }
 
 impl ReplayStableSoftProvider {
     fn foreground_calls(&self) -> Vec<Vec<Value>> {
         self.foreground_calls.lock().unwrap().clone()
+    }
+
+    fn foreground_max_tokens(&self) -> Vec<u32> {
+        self.foreground_max_tokens.lock().unwrap().clone()
     }
 }
 
@@ -3319,7 +3322,7 @@ impl LLMProvider for ReplayStableSoftProvider {
         messages: &[Value],
         _tools: Option<&[Value]>,
         _model: Option<&str>,
-        _max_tokens: u32,
+        max_tokens: u32,
         _temperature: f64,
         _thinking_budget: Option<u32>,
         _top_p: Option<f64>,
@@ -3333,13 +3336,39 @@ impl LLMProvider for ReplayStableSoftProvider {
         let call = {
             let mut calls = self.foreground_calls.lock().unwrap();
             calls.push(messages.to_vec());
+            self.foreground_max_tokens.lock().unwrap().push(max_tokens);
             calls.len()
         };
-        Ok(WireRecordingProvider::text_response(if call == 1 {
-            "turn one reply"
+        let mut response = if self.force_recovery_on_second && call == 2 {
+            WireRecordingProvider::plain_text_response(
+                "I'll read it.\n[Called read_file({\"path\":\"/x\"})]",
+            )
+        } else if self.force_recovery_on_second && call == 3 {
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("path".to_string(), json!("."));
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_lease_recovery".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments,
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            }
         } else {
-            "turn two reply"
-        }))
+            WireRecordingProvider::text_response(if call == 1 {
+                "turn one reply"
+            } else {
+                "turn two reply"
+            })
+        };
+        if call == 2 {
+            response
+                .usage
+                .insert("higgs_session_lease_active".to_string(), 1);
+        }
+        Ok(response)
     }
 
     fn get_default_model(&self) -> &str {
@@ -3359,6 +3388,8 @@ impl LLMProvider for ReplayStableSoftProvider {
 async fn published_soft_checkpoint_replays_and_installs_on_next_turn() {
     let provider = Arc::new(ReplayStableSoftProvider {
         foreground_calls: std::sync::Mutex::new(Vec::new()),
+        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
+        force_recovery_on_second: false,
     });
     let lcm_config = LcmSchemaConfig {
         tau_soft: 0.0001,
@@ -3456,9 +3487,1107 @@ async fn published_soft_checkpoint_replays_and_installs_on_next_turn() {
 }
 
 #[tokio::test]
+async fn exact_soft_compaction_leases_old_higgs_id_before_fresh_rotation() {
+    let provider = Arc::new(ReplayStableSoftProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
+        force_recovery_on_second: true,
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "exact-soft-checkpoint-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("exact-soft-checkpoint-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("exact soft checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let old_epoch = counters.session_prompt_epoch(&session_key);
+    let old_id = crate::agent::agent_core::stable_higgs_session_id(&session.id, old_epoch);
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+
+    let checkpoint = counters
+        .expansion_checkpoint(&session_key)
+        .expect("exact raw replacement must retain an expansion checkpoint");
+    assert_eq!(checkpoint.old_higgs_session_id, old_id);
+    assert!(checkpoint.lease_confirmed);
+    assert!(!checkpoint.replaced_span.is_empty());
+    assert!(checkpoint
+        .replaced_span
+        .iter()
+        .all(|message| message.get("_db_id").is_some()));
+    assert_eq!(counters.pending_higgs_session_lease(&session_key), None);
+    assert_ne!(
+        crate::agent::agent_core::stable_higgs_session_id(
+            &session.id,
+            counters.session_prompt_epoch(&session_key),
+        ),
+        old_id
+    );
+    assert!(!counters.record_higgs_session_id(&session_key, old_id));
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 4);
+    let second_request_id = calls[1][0]
+        .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD)
+        .and_then(Value::as_u64)
+        .expect("the second provider request must carry an active Higgs marker");
+    assert_ne!(second_request_id, old_id);
+    assert_eq!(
+        counters.active_higgs_session_id(&session_key),
+        Some(second_request_id)
+    );
+    assert_eq!(
+        calls[1][0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD],
+        json!({"session_id": old_id, "ttl_seconds": 300})
+    );
+    assert_eq!(
+        calls[1][0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+        json!("best_effort")
+    );
+    assert_eq!(
+        calls[1][0][crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD],
+        json!(1_000_000_u32.saturating_sub(provider.foreground_max_tokens()[1]))
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|messages| {
+                messages[0]
+                    .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD)
+                    .is_some()
+            })
+            .count(),
+        1,
+        "forced recovery and later tool iterations must not replay the one-shot lease"
+    );
+    assert!(calls[2][0]
+        .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD)
+        .is_none());
+}
+
+#[derive(Clone)]
+struct RetainedRouteCapture {
+    messages: Vec<Value>,
+    max_tokens: u32,
+}
+
+struct RetainedRouteProvider {
+    foreground_calls: std::sync::Mutex<Vec<RetainedRouteCapture>>,
+    route_failure: Option<RetainedRouteFailure>,
+}
+
+struct RetainedAbortProvider {
+    foreground_calls: std::sync::Mutex<usize>,
+    foreground_entered: tokio::sync::Notify,
+    preflight_watermark: std::sync::Mutex<
+        Option<(
+            Arc<crate::agent::agent_core::RuntimeCounters>,
+            String,
+            usize,
+        )>,
+    >,
+}
+
+#[async_trait]
+impl LLMProvider for RetainedAbortProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            return Ok(WireRecordingProvider::plain_text_response(
+                "- Persistent project details, decisions, constraints, acknowledged outcomes, and follow-up context remain available.",
+            ));
+        }
+        let call = {
+            let mut calls = self.foreground_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        match call {
+            1 => Ok(WireRecordingProvider::text_response("turn one reply")),
+            2 => {
+                let mut response = WireRecordingProvider::text_response("turn two reply");
+                response
+                    .usage
+                    .insert("higgs_session_lease_active".to_string(), 1);
+                Ok(response)
+            }
+            3 => {
+                if let Some((counters, session_key, watermark)) =
+                    self.preflight_watermark.lock().unwrap().take()
+                {
+                    counters
+                        .prompt_cache_watermark
+                        .lock()
+                        .insert(session_key, watermark);
+                }
+                Ok(crate::providers::base::LLMResponse {
+                    content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: FinishReason::Stop,
+                    usage: std::collections::HashMap::new(),
+                })
+            }
+            _ => {
+                self.foreground_entered.notify_one();
+                std::future::pending().await
+            }
+        }
+    }
+
+    fn get_default_model(&self) -> &str {
+        "retained-abort-test"
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        Some("http://127.0.0.1:1234/v1")
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RetainedRouteFailure {
+    PreflightUnavailable,
+    PreflightContextOverflow,
+    ForegroundUnavailable,
+    RecoveryUnavailable,
+    RecoveryContextOverflow,
+    PostToolUnavailable,
+    PostToolContextOverflow,
+}
+
+fn retained_route_provider_error(failure: RetainedRouteFailure) -> anyhow::Error {
+    let (status, message) = match failure {
+        RetainedRouteFailure::PreflightContextOverflow
+        | RetainedRouteFailure::RecoveryContextOverflow
+        | RetainedRouteFailure::PostToolContextOverflow => (
+            400,
+            r#"{"error":{"message":"maximum context length exceeded"}}"#,
+        ),
+        _ => (409, "retained session expired: prompt mismatch"),
+    };
+    crate::errors::ProviderError::HttpStatus {
+        status,
+        code: None,
+        message: message.to_string(),
+    }
+    .into()
+}
+
+impl RetainedRouteProvider {
+    fn foreground_calls(&self) -> Vec<RetainedRouteCapture> {
+        self.foreground_calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for RetainedRouteProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            return Ok(WireRecordingProvider::plain_text_response(
+                "- Persistent project details, decisions, constraints, acknowledged outcomes, and follow-up context remain available.",
+            ));
+        }
+
+        let call = {
+            let mut calls = self.foreground_calls.lock().unwrap();
+            calls.push(RetainedRouteCapture {
+                messages: messages.to_vec(),
+                max_tokens,
+            });
+            calls.len()
+        };
+        match call {
+            1 => Ok(WireRecordingProvider::text_response("turn one reply")),
+            2 => {
+                let mut response = WireRecordingProvider::text_response("turn two reply");
+                response
+                    .usage
+                    .insert("higgs_session_lease_active".to_string(), 1);
+                Ok(response)
+            }
+            3 => match self.route_failure {
+                Some(RetainedRouteFailure::PreflightUnavailable) => Err(
+                    retained_route_provider_error(RetainedRouteFailure::PreflightUnavailable),
+                ),
+                Some(RetainedRouteFailure::PreflightContextOverflow) => Err(
+                    retained_route_provider_error(RetainedRouteFailure::PreflightContextOverflow),
+                ),
+                Some(
+                    RetainedRouteFailure::ForegroundUnavailable
+                    | RetainedRouteFailure::RecoveryUnavailable
+                    | RetainedRouteFailure::RecoveryContextOverflow
+                    | RetainedRouteFailure::PostToolUnavailable
+                    | RetainedRouteFailure::PostToolContextOverflow,
+                )
+                | None => Ok(crate::providers::base::LLMResponse {
+                    content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: FinishReason::Stop,
+                    usage: std::collections::HashMap::new(),
+                }),
+            },
+            4 if matches!(
+                self.route_failure,
+                Some(
+                    RetainedRouteFailure::PreflightUnavailable
+                        | RetainedRouteFailure::PreflightContextOverflow
+                )
+            ) =>
+            {
+                Ok(WireRecordingProvider::text_response(
+                    "active fallback answer",
+                ))
+            }
+            4 if matches!(
+                self.route_failure,
+                Some(RetainedRouteFailure::ForegroundUnavailable)
+            ) =>
+            {
+                Err(retained_route_provider_error(
+                    RetainedRouteFailure::ForegroundUnavailable,
+                ))
+            }
+            4 if matches!(
+                self.route_failure,
+                Some(
+                    RetainedRouteFailure::RecoveryUnavailable
+                        | RetainedRouteFailure::RecoveryContextOverflow
+                )
+            ) =>
+            {
+                Ok(WireRecordingProvider::plain_text_response(
+                    "I'll read it.\n[Called read_file({\"path\":\"/x\"})]",
+                ))
+            }
+            4 => {
+                let mut arguments = std::collections::HashMap::new();
+                arguments.insert("path".to_string(), json!("."));
+                Ok(crate::providers::base::LLMResponse {
+                    content: None,
+                    tool_calls: vec![crate::providers::base::ToolCallRequest {
+                        id: "tc_retained_list".to_string(),
+                        name: "list_dir".to_string(),
+                        arguments,
+                    }],
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: std::collections::HashMap::new(),
+                })
+            }
+            5 if matches!(
+                self.route_failure,
+                Some(RetainedRouteFailure::ForegroundUnavailable)
+            ) =>
+            {
+                Ok(WireRecordingProvider::text_response(
+                    "active fallback answer",
+                ))
+            }
+            5 if matches!(
+                self.route_failure,
+                Some(
+                    RetainedRouteFailure::RecoveryUnavailable
+                        | RetainedRouteFailure::RecoveryContextOverflow
+                        | RetainedRouteFailure::PostToolUnavailable
+                        | RetainedRouteFailure::PostToolContextOverflow
+                )
+            ) =>
+            {
+                Err(retained_route_provider_error(self.route_failure.unwrap()))
+            }
+            5 => Ok(WireRecordingProvider::text_response(
+                "retained final answer",
+            )),
+            6 if matches!(
+                self.route_failure,
+                Some(
+                    RetainedRouteFailure::RecoveryUnavailable
+                        | RetainedRouteFailure::RecoveryContextOverflow
+                        | RetainedRouteFailure::PostToolUnavailable
+                        | RetainedRouteFailure::PostToolContextOverflow
+                )
+            ) =>
+            {
+                Ok(WireRecordingProvider::text_response(
+                    "active fallback answer",
+                ))
+            }
+            _ => Ok(WireRecordingProvider::text_response("next active answer")),
+        }
+    }
+
+    fn get_default_model(&self) -> &str {
+        "retained-route-e2e-test"
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        Some("http://127.0.0.1:1234/v1")
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        true
+    }
+}
+
+async fn confirmed_retained_route_harness(
+    failure: RetainedRouteFailure,
+) -> (
+    AgentLoop,
+    Arc<RetainedRouteProvider>,
+    String,
+    Arc<crate::agent::agent_core::RuntimeCounters>,
+    u64,
+    u64,
+) {
+    let provider = Arc::new(RetainedRouteProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        route_failure: Some(failure),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "retained-route-e2e-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("retained-route-review-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("review checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let old_id = crate::agent::agent_core::stable_higgs_session_id(
+        &session.id,
+        counters.session_prompt_epoch(&session_key),
+    );
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+    let fresh_id = counters.active_higgs_session_id(&session_key).unwrap();
+    (
+        agent_loop,
+        provider,
+        session_key,
+        counters,
+        old_id,
+        fresh_id,
+    )
+}
+
+fn without_higgs_control(mut messages: Vec<Value>) -> Vec<Value> {
+    if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
+        for field in [
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD,
+        ] {
+            first.remove(field);
+        }
+    }
+    messages
+}
+
+#[tokio::test]
+async fn retained_expansion_preflight_persists_old_route_through_tools_then_deletes() {
+    let provider = Arc::new(RetainedRouteProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        route_failure: None,
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "retained-route-e2e-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("retained-route-e2e-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("retained-route soft checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let old_id = crate::agent::agent_core::stable_higgs_session_id(
+        &session.id,
+        counters.session_prompt_epoch(&session_key),
+    );
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+    let checkpoint = counters
+        .expansion_checkpoint(&session_key)
+        .expect("turn two must leave a confirmed checkpoint");
+    assert!(checkpoint.lease_confirmed);
+    assert_eq!(checkpoint.old_higgs_session_id, old_id);
+    let fresh_id = counters
+        .active_higgs_session_id(&session_key)
+        .expect("compaction must activate a fresh compacted ID");
+    assert_ne!(fresh_id, old_id);
+
+    let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(
+        agent_loop
+            .process_direct_streaming(
+                "Use the persistent project detail decisions and constraints, inspect the workspace, then answer.",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                text_delta_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await,
+        "retained final answer"
+    );
+
+    assert_eq!(
+        agent_loop
+            .process_direct(
+                "Start the next active turn.",
+                &session_key,
+                "test",
+                "offline"
+            )
+            .await,
+        "next active answer"
+    );
+
+    let calls = provider.foreground_calls();
+    assert_eq!(
+        calls.len(),
+        6,
+        "unexpected foreground/preflight call sequence"
+    );
+    assert_eq!(
+        calls[2].max_tokens, 0,
+        "retained preflight must be non-generating"
+    );
+    for call in &calls[2..5] {
+        assert_eq!(
+            call.messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        assert_eq!(
+            call.messages[0]
+                [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+            json!("require_continuation")
+        );
+        assert!(call.messages[0]
+            .get(crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD)
+            .is_none());
+    }
+    let authoritative_limit = 1_000_000_u32.saturating_sub(calls[3].max_tokens);
+    assert_eq!(
+        calls[2].messages[0]
+            [crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD],
+        json!(authoritative_limit)
+    );
+    assert!(calls[2].messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("persistent project detail"))
+    }));
+    assert_eq!(
+        calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+        json!(fresh_id)
+    );
+    assert_eq!(
+        calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
+        json!(old_id),
+        "old retained ID must first be deleted after the terminal retained response"
+    );
+    assert_eq!(
+        counters.active_higgs_session_id(&session_key),
+        Some(fresh_id)
+    );
+    assert_eq!(counters.expansion_checkpoint(&session_key), None);
+}
+
+#[tokio::test]
+async fn retained_preflight_failures_fall_back_without_rotating_active_session() {
+    for failure in [
+        RetainedRouteFailure::PreflightUnavailable,
+        RetainedRouteFailure::PreflightContextOverflow,
+    ] {
+        let provider = Arc::new(RetainedRouteProvider {
+            foreground_calls: std::sync::Mutex::new(Vec::new()),
+            route_failure: Some(failure),
+        });
+        let lcm_config = LcmSchemaConfig {
+            tau_soft: 0.0001,
+            tau_hard: 10.0,
+            deterministic_target: 64,
+            ..Default::default()
+        };
+        let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+            provider.clone() as Arc<dyn LLMProvider>,
+            "retained-route-fallback-test",
+            1_000_000,
+            lcm_config,
+        );
+        let session_key = format!("retained-route-fallback-{}", uuid::Uuid::new_v4());
+        let core = agent_loop.shared.core_handle.swappable();
+        let counters = agent_loop.shared.core_handle.counters.clone();
+        let session = core.sessions.get_or_resume(&session_key).await;
+        seed_compaction_history(&core, &session.id, 12, 40).await;
+
+        assert_eq!(
+            agent_loop
+                .process_direct("Finish turn one.", &session_key, "test", "offline")
+                .await,
+            "turn one reply"
+        );
+        let compaction = agent_loop
+            .shared
+            .compaction_handle_for_session(&session.id)
+            .await;
+        await_compaction_sync("retained fallback checkpoint publication", async {
+            while !compaction.has_pending().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let old_id = crate::agent::agent_core::stable_higgs_session_id(
+            &session.id,
+            counters.session_prompt_epoch(&session_key),
+        );
+        assert_eq!(
+            agent_loop
+                .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+                .await,
+            "turn two reply"
+        );
+        let fresh_id = counters
+            .active_higgs_session_id(&session_key)
+            .expect("compaction must leave a fresh active session");
+        let epoch = counters.session_prompt_epoch(&session_key);
+
+        assert_eq!(
+            agent_loop
+                .process_direct(
+                    "Use the persistent project detail decisions and constraints.",
+                    &session_key,
+                    "test",
+                    "offline",
+                )
+                .await,
+            "active fallback answer"
+        );
+
+        let calls = provider.foreground_calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[2].max_tokens, 0);
+        assert_eq!(
+            calls[2].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        assert_eq!(
+            calls[2].messages[0]
+                [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+            json!("require_continuation")
+        );
+        assert_eq!(
+            calls[3].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(fresh_id)
+        );
+        assert_eq!(
+            calls[3].messages[0]
+                [crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        let active_prompt = serde_json::to_string(&calls[3].messages).unwrap();
+        match failure {
+            RetainedRouteFailure::PreflightUnavailable => assert!(
+                active_prompt.contains("[Auto-expanded originals"),
+                "409 fallback must use the bounded flattened reconstruction"
+            ),
+            RetainedRouteFailure::PreflightContextOverflow => assert!(
+                !active_prompt.contains("[Auto-expanded originals")
+                    && !active_prompt.contains("turn 0: persistent project detail"),
+                "overflow fallback must answer from the compacted summary"
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(counters.session_prompt_epoch(&session_key), epoch);
+        assert_eq!(
+            counters.active_higgs_session_id(&session_key),
+            Some(fresh_id)
+        );
+        assert_eq!(counters.expansion_checkpoint(&session_key), None);
+    }
+}
+
+#[tokio::test]
+async fn retained_foreground_409_retries_once_on_fresh_active_route() {
+    let provider = Arc::new(RetainedRouteProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        route_failure: Some(RetainedRouteFailure::ForegroundUnavailable),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "retained-route-foreground-409-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("retained-route-foreground-409-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("retained foreground checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let old_id = crate::agent::agent_core::stable_higgs_session_id(
+        &session.id,
+        counters.session_prompt_epoch(&session_key),
+    );
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+    let fresh_id = counters
+        .active_higgs_session_id(&session_key)
+        .expect("compaction must leave a fresh active session");
+    let epoch = counters.session_prompt_epoch(&session_key);
+
+    assert_eq!(
+        agent_loop
+            .process_direct(
+                "Use the persistent project detail decisions and constraints.",
+                &session_key,
+                "test",
+                "offline",
+            )
+            .await,
+        "active fallback answer"
+    );
+
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 5);
+    for call in &calls[2..4] {
+        assert_eq!(
+            call.messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        assert_eq!(
+            call.messages[0]
+                [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+            json!("require_continuation")
+        );
+    }
+    assert_eq!(
+        calls[4].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+        json!(fresh_id)
+    );
+    assert_eq!(
+        calls[4].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
+        json!(old_id)
+    );
+    assert!(serde_json::to_string(&calls[4].messages)
+        .unwrap()
+        .contains("[Auto-expanded originals"));
+    assert_eq!(counters.session_prompt_epoch(&session_key), epoch);
+    assert_eq!(
+        counters.active_higgs_session_id(&session_key),
+        Some(fresh_id)
+    );
+    assert_eq!(counters.expansion_checkpoint(&session_key), None);
+}
+
+#[tokio::test]
+async fn retained_forced_recovery_error_retries_on_active_bounded_route() {
+    for failure in [
+        RetainedRouteFailure::RecoveryUnavailable,
+        RetainedRouteFailure::RecoveryContextOverflow,
+    ] {
+        let (agent_loop, provider, session_key, counters, old_id, fresh_id) =
+            confirmed_retained_route_harness(failure).await;
+        assert_eq!(
+            agent_loop
+                .process_direct(
+                    "Use the persistent project detail decisions and constraints.",
+                    &session_key,
+                    "test",
+                    "offline",
+                )
+                .await,
+            "active fallback answer"
+        );
+        let calls = provider.foreground_calls();
+        assert_eq!(calls.len(), 6);
+        for call in &calls[2..5] {
+            assert_eq!(
+                call.messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+                json!(old_id)
+            );
+        }
+        assert_eq!(
+            calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(fresh_id)
+        );
+        let active_prompt = serde_json::to_string(&calls[5].messages).unwrap();
+        match failure {
+            RetainedRouteFailure::RecoveryUnavailable => {
+                assert!(active_prompt.contains("[Auto-expanded originals"));
+            }
+            RetainedRouteFailure::RecoveryContextOverflow => {
+                assert!(!active_prompt.contains("[Auto-expanded originals"));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(counters.expansion_checkpoint(&session_key), None);
+        assert_eq!(
+            counters.active_higgs_session_id(&session_key),
+            Some(fresh_id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn streamed_retained_recovery_failure_retracts_before_active_fallback() {
+    let (agent_loop, provider, session_key, _counters, old_id, fresh_id) =
+        confirmed_retained_route_harness(RetainedRouteFailure::RecoveryUnavailable).await;
+    let (text_delta_tx, mut text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(
+        agent_loop
+            .process_direct_streaming(
+                "Use the persistent project detail decisions and constraints.",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                text_delta_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await,
+        "active fallback answer"
+    );
+    let mut deltas = Vec::new();
+    while let Ok(delta) = text_delta_rx.try_recv() {
+        deltas.push(delta);
+    }
+    let streamed = deltas.join("");
+    let retract = crate::turn_stream::ControlMarker::RetractReply.encode();
+    let retract_at = streamed
+        .find(&retract)
+        .expect("malformed retained text must be retracted before fallback");
+    assert!(streamed[..retract_at].contains("I'll read it."));
+    let tail = &streamed[retract_at + retract.len()..];
+    assert_eq!(tail.matches("active fallback answer").count(), 1);
+    assert!(!tail.contains("I'll read it."));
+
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 6);
+    assert_eq!(
+        calls[4].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+        json!(old_id)
+    );
+    assert_eq!(
+        calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+        json!(fresh_id)
+    );
+}
+
+#[tokio::test]
+async fn post_tool_stream_failure_restores_active_cache_and_bounded_prompt() {
+    for failure in [
+        RetainedRouteFailure::PostToolUnavailable,
+        RetainedRouteFailure::PostToolContextOverflow,
+    ] {
+        let (agent_loop, provider, session_key, counters, old_id, fresh_id) =
+            confirmed_retained_route_harness(failure).await;
+        let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            agent_loop
+                .process_direct_streaming(
+                    "Use the persistent project detail decisions and constraints, inspect the workspace, then answer.",
+                    &session_key,
+                    "test",
+                    "offline",
+                    None,
+                    text_delta_tx,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+            "active fallback answer"
+        );
+        let calls = provider.foreground_calls();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(
+            calls[4].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        assert_eq!(
+            calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(fresh_id)
+        );
+        let active_prompt = serde_json::to_string(&calls[5].messages).unwrap();
+        match failure {
+            RetainedRouteFailure::PostToolUnavailable => {
+                assert!(active_prompt.contains("[Auto-expanded originals"));
+            }
+            RetainedRouteFailure::PostToolContextOverflow => {
+                assert!(!active_prompt.contains("[Auto-expanded originals"));
+            }
+            _ => unreachable!(),
+        }
+        let expected_fingerprint = crate::agent::prompt_fingerprint::fingerprint(
+            &without_higgs_control(calls[5].messages.clone()),
+        );
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(&session_key),
+            Some(&expected_fingerprint)
+        );
+        assert_eq!(
+            counters.prompt_cache_watermark.lock().get(&session_key),
+            Some(&match failure {
+                RetainedRouteFailure::PostToolUnavailable => 21,
+                RetainedRouteFailure::PostToolContextOverflow => 20,
+                _ => unreachable!(),
+            }),
+            "the watermark must track the selected bounded logical prompt"
+        );
+        assert_eq!(
+            counters
+                .cache_diverged
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "leaving the retained route must not manufacture a cache divergence"
+        );
+        assert_eq!(counters.expansion_checkpoint(&session_key), None);
+        assert_eq!(
+            counters.active_higgs_session_id(&session_key),
+            Some(fresh_id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn abort_after_retained_preflight_discards_checkpoint_via_context_drop() {
+    let provider = Arc::new(RetainedAbortProvider {
+        foreground_calls: std::sync::Mutex::new(0),
+        foreground_entered: tokio::sync::Notify::new(),
+        preflight_watermark: std::sync::Mutex::new(None),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "retained-abort-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("retained-abort-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("retained abort checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+    let checkpoint = counters.expansion_checkpoint(&session_key).unwrap();
+    let active_fingerprint = counters
+        .prompt_fingerprints
+        .lock()
+        .get(&session_key)
+        .cloned()
+        .expect("the compacted active route must have a fingerprint");
+    let active_watermark = counters
+        .prompt_cache_watermark
+        .lock()
+        .get(&session_key)
+        .copied()
+        .expect("the compacted active route must have a watermark");
+    *provider.preflight_watermark.lock().unwrap() =
+        Some((Arc::clone(&counters), session_key.clone(), active_watermark));
+
+    let mut retained_turn = Box::pin(agent_loop.process_direct(
+        "Use the persistent project detail decisions and constraints.",
+        &session_key,
+        "test",
+        "offline",
+    ));
+    tokio::select! {
+        () = provider.foreground_entered.notified() => {}
+        result = &mut retained_turn => panic!("retained foreground unexpectedly completed: {result}"),
+    }
+    drop(retained_turn);
+
+    assert_eq!(counters.expansion_checkpoint(&session_key), None);
+    assert_eq!(
+        counters.pending_higgs_session_drop_ids(&session_key),
+        vec![checkpoint.old_higgs_session_id]
+    );
+    assert_eq!(
+        counters.prompt_fingerprints.lock().get(&session_key),
+        Some(&active_fingerprint)
+    );
+    assert_eq!(
+        counters.prompt_cache_watermark.lock().get(&session_key),
+        Some(&active_watermark)
+    );
+}
+
+#[tokio::test]
 async fn cloud_working_memory_prefix_change_allows_soft_checkpoint_install() {
     let provider = Arc::new(ReplayStableSoftProvider {
         foreground_calls: std::sync::Mutex::new(Vec::new()),
+        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
+        force_recovery_on_second: false,
     });
     let lcm_config = LcmSchemaConfig {
         tau_soft: 0.0001,
@@ -3473,10 +4602,7 @@ async fn cloud_working_memory_prefix_change_allows_soft_checkpoint_install() {
         lcm_config,
         MemoryConfig::default(),
     );
-    let session_key = format!(
-        "cloud-working-memory-soft-{}",
-        uuid::Uuid::new_v4()
-    );
+    let session_key = format!("cloud-working-memory-soft-{}", uuid::Uuid::new_v4());
     let core = agent_loop.shared.core_handle.swappable();
     let session = core.sessions.get_or_resume(&session_key).await;
     seed_compaction_history(&core, &session.id, 12, 40).await;
@@ -3734,7 +4860,11 @@ async fn turn_cancellation_after_soft_start_rolls_back_without_checkpoint() {
     );
     assert_eq!(engine.store_len(), store_before + durable_turn_tail.len());
     drop(engine);
-    assert!(core.sessions.load_summary_nodes(&session.id).await.is_empty());
+    assert!(core
+        .sessions
+        .load_summary_nodes(&session.id)
+        .await
+        .is_empty());
 }
 
 struct HardCancellationProvider {
@@ -3796,12 +4926,7 @@ async fn cancelling_hard_compaction_restores_engine_without_publishing_checkpoin
     seed_compaction_history(&core, &session.id, 20, 12).await;
     persist_prior_summary(&core, &session.id).await;
 
-    let mut probe = InboundMessage::new(
-        "test",
-        "user",
-        "offline",
-        CANCELLATION_PROMPT,
-    );
+    let mut probe = InboundMessage::new("test", "user", "offline", CANCELLATION_PROMPT);
     probe
         .metadata
         .insert("session_key".to_string(), json!(session_key.clone()));
@@ -3868,7 +4993,7 @@ async fn cancelling_hard_compaction_restores_engine_without_publishing_checkpoin
     assert!(!compaction.has_job().await);
     assert!(!compaction.has_pending().await);
 
-    let mut engine = await_compaction_sync("restored LCM engine lock", engine.lock()).await;
+    let engine = await_compaction_sync("restored LCM engine lock", engine.lock()).await;
     assert_eq!(serde_json::to_value(engine.dag()).unwrap(), dag_before);
     let active_after = engine.active_context();
     assert!(
@@ -3881,10 +5006,11 @@ async fn cancelling_hard_compaction_restores_engine_without_publishing_checkpoin
         "only the eagerly persisted current user turn may extend active context"
     );
     assert_eq!(engine.store_len(), store_before + 1);
-    let expanded = engine.auto_expand(&core.token_budget, 0, 0);
+    let expanded = engine.plan_auto_expansion(&core.token_budget, 0, 0);
     assert!(
         expanded.iter().any(|message| {
             message
+                .flattened_fallback
                 .get("content")
                 .and_then(Value::as_str)
                 .is_some_and(|content| content.contains("persistent project detail"))
@@ -4332,6 +5458,7 @@ async fn final_handle_drop_aborts_generation_but_preserves_publication_handoff()
                         })],
                     },
                     snapshot: Vec::new(),
+                    summary_node_id: 0,
                 })
             })
             .await
@@ -4398,6 +5525,7 @@ async fn compaction_shutdown_waits_for_publication_and_reaps_generation() {
                         })],
                     },
                     snapshot: Vec::new(),
+                    summary_node_id: 0,
                 })
             })
             .await
@@ -4491,6 +5619,7 @@ async fn agent_clear_reaps_job_and_discards_pending_checkpoint() {
                         })],
                     },
                     snapshot: Vec::new(),
+                    summary_node_id: 0,
                 })
             })
             .await
@@ -4630,6 +5759,7 @@ async fn interactive_clear_is_atomic_against_session_admission() {
                         })],
                     },
                     snapshot: Vec::new(),
+                    summary_node_id: 0,
                 };
                 assert!(publication.begin_publication());
                 *task_pending_handoff.lock().unwrap() = Some(pending);
@@ -4999,6 +6129,7 @@ async fn pending_compaction_checkpoint_hides_unpublished_dag() {
             })],
         },
         snapshot,
+        summary_node_id: 0,
     });
     msg.content = "second".to_string();
     let second = agent_loop
@@ -5443,7 +6574,10 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
             .load_tool_result(&session.id, "tc_conflict")
             .await;
         assert!(
-            stashed.as_deref().map(|s| s.contains("alpha")).unwrap_or(false),
+            stashed
+                .as_deref()
+                .map(|s| s.contains("alpha"))
+                .unwrap_or(false),
             "seed turn must have stashed body A under tc_conflict; got {stashed:?}"
         );
     }
@@ -5639,7 +6773,10 @@ async fn medium_tool_result_shows_content_not_handle() {
                 && m.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_medium")
         })
         .expect("tc_medium tool message must exist");
-    let content = tool_msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let content = tool_msg
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     assert!(
         !content.starts_with(TOOL_RESULT_HANDLE_MARKER),
@@ -7822,7 +8959,8 @@ mod runtime_mode_parity_tests {
         }
 
         fn saw_tools_absent(&self) -> bool {
-            self.saw_tools_absent.load(std::sync::atomic::Ordering::Relaxed)
+            self.saw_tools_absent
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -8024,7 +9162,8 @@ mod runtime_mode_parity_tests {
         // `tools == None` (the sticky-strip signal). Without this, a blind
         // sequence dequeue would pass even if the 7th call were capped.
         struct ExploringProvider {
-            responses: parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
+            responses:
+                parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
             calls: std::sync::atomic::AtomicU32,
             saw_tools_absent: std::sync::atomic::AtomicBool,
         }
@@ -8040,7 +9179,8 @@ mod runtime_mode_parity_tests {
                 _thinking_budget: Option<u32>,
                 _top_p: Option<f64>,
             ) -> anyhow::Result<crate::providers::base::LLMResponse> {
-                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if tools.is_none() {
                     self.saw_tools_absent
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -8110,7 +9250,6 @@ mod runtime_mode_parity_tests {
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
-
 
     /// dropped the warm cache). The model runs a command whose output is huge
     /// (stashed under its tool_call_id), then recalls it. The recalled result

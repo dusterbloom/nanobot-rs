@@ -7,7 +7,7 @@
     clippy::as_conversions,
     clippy::format_push_string,
     clippy::shadow_reuse,
-    clippy::shadow_unrelated,
+    clippy::shadow_unrelated
 )]
 //! Web tools: web_search and web_fetch.
 
@@ -38,7 +38,8 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").expect("static regex"));
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
-static RE_NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").expect("static regex"));
+static RE_NEWLINES: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n{3,}").expect("static regex"));
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -8,7 +8,7 @@
     clippy::format_push_string,
     clippy::indexing_slicing,
     clippy::shadow_reuse,
-    clippy::shadow_unrelated,
+    clippy::shadow_unrelated
 )]
 //! File system tools: read, write, edit, list, search, metadata, and diffs.
 //!

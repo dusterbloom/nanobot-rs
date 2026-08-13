@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-)]
+#![allow(clippy::as_conversions)]
 //! Slash command dispatch for gateway mode (Telegram/WhatsApp/Email).
 //!
 //! All output is plain text — no ANSI escape codes, because channels render

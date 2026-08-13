@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::indexing_slicing,
-)]
+#![allow(clippy::as_conversions, clippy::indexing_slicing)]
 //! Reasoning tools: checkpoint, backtrack, and plan.
 //!
 //! These tools expose the ReasoningEngine to the LLM so it can save

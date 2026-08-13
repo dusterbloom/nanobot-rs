@@ -21,7 +21,7 @@
     clippy::shadow_unrelated,
     clippy::shadow_same,
     clippy::format_push_string,
-    clippy::string_add,
+    clippy::string_add
 )]
 use std::collections::HashSet;
 use std::path::PathBuf;

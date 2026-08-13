@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::indexing_slicing,
-)]
+#![allow(clippy::as_conversions, clippy::indexing_slicing)]
 //! Context Gate: intelligent content management for LLM agents.
 //!
 //! Instead of uniform char-limit truncation, the gate makes context-aware

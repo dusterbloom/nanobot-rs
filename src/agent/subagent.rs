@@ -7,7 +7,7 @@
     clippy::as_conversions,
     clippy::format_push_string,
     clippy::indexing_slicing,
-    clippy::shadow_reuse,
+    clippy::shadow_reuse
 )]
 #![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 #![allow(dead_code)]
@@ -90,14 +90,6 @@ fn local_response_token_limit(
     let adaptive =
         (ctx_limit / 6).clamp(min_response_tokens as usize, max_response_tokens as usize);
     adaptive as u32
-}
-
-/// Detect provider-side context overflow errors in a robust way.
-fn is_context_overflow_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_lowercase();
-    msg.contains("exceed_context_size_error")
-        || msg.contains("exceeds the available context size")
-        || msg.contains("context size")
 }
 
 /// Info about a running subagent task (cheaply cloneable).
@@ -1079,7 +1071,10 @@ impl SubagentManager {
                 .await
             {
                 Ok(r) => r,
-                Err(e) if local_ctx_limit.is_some() && is_context_overflow_error(&e) => {
+                Err(e)
+                    if local_ctx_limit.is_some()
+                        && crate::errors::is_context_overflow_error(&e) =>
+                {
                     let ctx_limit = local_ctx_limit.unwrap_or(tuning.local_fallback_context);
                     let retry_ctx = ((ctx_limit as f64) * 0.85).round() as usize;
                     let retry_ctx = retry_ctx.max(tuning.local_min_context);
@@ -1519,9 +1514,9 @@ mod tests {
         );
         let e3 = anyhow::anyhow!("network timeout");
 
-        assert!(is_context_overflow_error(&e1));
-        assert!(is_context_overflow_error(&e2));
-        assert!(!is_context_overflow_error(&e3));
+        assert!(crate::errors::is_context_overflow_error(&e1));
+        assert!(crate::errors::is_context_overflow_error(&e2));
+        assert!(!crate::errors::is_context_overflow_error(&e3));
     }
 
     /// Mock provider that captures messages and returns a tool call on first

@@ -7,7 +7,7 @@
     clippy::format_push_string,
     clippy::indexing_slicing,
     clippy::shadow_reuse,
-    clippy::string_add,
+    clippy::string_add
 )]
 //! Conversation protocol — renders canonical `Turn` history to LLM wire format.
 //!
@@ -367,7 +367,11 @@ impl ConversationProtocol for LocalProtocol {
         // logs shared the literal sentinel hash 6787951084353679885).
         // Native tool-calling chat templates handle `tool → assistant` without
         // help; textual replay folds tool results into user messages already.
-        if out.last().map(|m| m["role"] == "assistant").unwrap_or(false) {
+        if out
+            .last()
+            .map(|m| m["role"] == "assistant")
+            .unwrap_or(false)
+        {
             out.push(json!({"role": "user", "content": CONTINUE_SENTINEL}));
         }
 
@@ -604,18 +608,17 @@ fn parse_xml_tool_calls_lenient(text: &str) -> Vec<ParsedToolCall> {
         while let Some(po_rel) = inner[p..].find("<parameter=") {
             let po = p + po_rel;
             let key_start = po + "<parameter=".len();
-            let Some(key_end_rel) = inner[key_start..].find('>') else { break };
+            let Some(key_end_rel) = inner[key_start..].find('>') else {
+                break;
+            };
             let key = inner[key_start..key_start + key_end_rel].trim();
             let val_start = key_start + key_end_rel + 1;
             let tail = &inner[val_start..];
-            let val_end_rel = [
-                tail.find("</parameter>"),
-                tail.find("<parameter="),
-            ]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(tail.len());
+            let val_end_rel = [tail.find("</parameter>"), tail.find("<parameter=")]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(tail.len());
             let value = tail[..val_end_rel].trim();
             if !key.is_empty() {
                 let json_val = serde_json::from_str::<Value>(value)
@@ -1526,7 +1529,8 @@ And also:
     /// recover it. This is the exact bytes from the incident.
     #[test]
     fn parse_xml_recovers_truncated_unclosed_block() {
-        let text = "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
+        let text =
+            "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
         let calls = parse_xml_tool_calls(text);
         assert_eq!(calls.len(), 1, "truncated unclosed block must be recovered");
         assert_eq!(calls[0].tool, "exec");
@@ -1576,7 +1580,11 @@ And also:
         let text = "<tool_call>\n<function=exec>\n<parameter=a>1<parameter=b>2</parameter>";
         let calls = parse_xml_tool_calls(text);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].args["a"], serde_json::json!(1), "a must not swallow sibling b");
+        assert_eq!(
+            calls[0].args["a"],
+            serde_json::json!(1),
+            "a must not swallow sibling b"
+        );
         assert_eq!(calls[0].args["b"], serde_json::json!(2));
     }
 

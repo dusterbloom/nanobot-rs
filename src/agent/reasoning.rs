@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::shadow_reuse)]
 //! Branching reasoning engine for plan-guided execution and backtracking.
 //!
 //! Provides checkpointing, plan decomposition (as a DAG), and step-by-step

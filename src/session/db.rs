@@ -7,7 +7,7 @@
     clippy::as_conversions,
     clippy::indexing_slicing,
     clippy::shadow_reuse,
-    clippy::shadow_unrelated,
+    clippy::shadow_unrelated
 )]
 //! SQLite-backed session store.
 //!
@@ -1037,7 +1037,13 @@ impl SessionDb {
             "INSERT OR IGNORE INTO tool_results \
              (session_id, tool_call_id, tool_name, content, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id, tool_call_id, tool_name, content, Utc::now().to_rfc3339()],
+            params![
+                session_id,
+                tool_call_id,
+                tool_name,
+                content,
+                Utc::now().to_rfc3339()
+            ],
         ) {
             Ok(n) => n,
             Err(error) => {
@@ -2602,8 +2608,13 @@ mod tests {
             let db = SessionDb::new(&db_path);
             let session = db.create_session("cli:durable-tool-result").await;
             assert!(matches!(
-                db.store_tool_result_immutable(&session.id, "call_42", "read_file", "full exact body")
-                    .await,
+                db.store_tool_result_immutable(
+                    &session.id,
+                    "call_42",
+                    "read_file",
+                    "full exact body"
+                )
+                .await,
                 StoredResult::Stored { .. }
             ));
             session.id

@@ -3,11 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::shadow_reuse,
-    clippy::shadow_same,
-)]
+#![allow(clippy::as_conversions, clippy::shadow_reuse, clippy::shadow_same)]
 //! Prompt-cache invalidation markers, token accounting, and compaction
 //! checkpoint policy.
 //!
@@ -17,6 +13,9 @@ use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
+use crate::agent::agent_core::HiggsSessionControl;
+#[cfg(test)]
+use crate::agent::agent_core::HiggsSessionReusePolicy;
 use crate::agent::system_state;
 use crate::agent::token_budget::TokenBudget;
 use crate::turn_stream::{CacheResetReason, CacheStatus, ControlMarker};
@@ -127,17 +126,13 @@ pub(super) fn divergent_message_digest(msg: &Value) -> String {
     }
 }
 
-pub(super) fn attach_higgs_session_marker(
-    messages: &mut [Value],
-    session_id: u64,
-    drop_session_ids: &[u64],
-) {
+pub(super) fn attach_higgs_session_control(messages: &mut [Value], control: &HiggsSessionControl) {
     if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
         first.insert(
             crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD.to_string(),
-            json!(session_id),
+            json!(control.active_id),
         );
-        match drop_session_ids {
+        match control.drop_ids.as_slice() {
             [] => {}
             [drop_session_id] => {
                 first.insert(
@@ -154,6 +149,82 @@ pub(super) fn attach_higgs_session_marker(
                 );
             }
         }
+        if let Some(lease) = control.session_lease {
+            first.insert(
+                crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD.to_string(),
+                json!({
+                    "session_id": lease.session_id,
+                    "ttl_seconds": lease.ttl_seconds,
+                }),
+            );
+        }
+        first.insert(
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD.to_string(),
+            json!(control.reuse_policy.as_wire()),
+        );
+        first.insert(
+            crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD.to_string(),
+            json!(control.max_prompt_tokens),
+        );
+    }
+}
+
+pub(super) fn strip_higgs_session_lease_control(messages: &mut [Value]) {
+    if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
+        first.remove(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn attach_higgs_session_marker(
+    messages: &mut [Value],
+    session_id: u64,
+    drop_session_ids: &[u64],
+) {
+    attach_higgs_session_control(
+        messages,
+        &HiggsSessionControl {
+            active_id: session_id,
+            drop_ids: drop_session_ids.to_vec(),
+            session_lease: None,
+            reuse_policy: HiggsSessionReusePolicy::BestEffort,
+            max_prompt_tokens: 0,
+        },
+    );
+}
+
+#[cfg(test)]
+mod lease_control_tests {
+    use super::strip_higgs_session_lease_control;
+    use serde_json::json;
+
+    #[test]
+    fn forced_recovery_messages_strip_only_the_one_shot_lease() {
+        let mut messages = vec![json!({
+            "role": "system",
+            "content": "stable prefix",
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD: {
+                "session_id": 41_u64,
+                "ttl_seconds": 300_u32,
+            },
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "best_effort",
+            crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: 31_744_u32,
+        })];
+
+        strip_higgs_session_lease_control(&mut messages);
+
+        assert!(messages[0]
+            .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD)
+            .is_none());
+        assert_eq!(
+            messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(42)
+        );
+        assert_eq!(
+            messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+            json!("best_effort")
+        );
     }
 }
 

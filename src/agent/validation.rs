@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::shadow_reuse)]
 #![allow(dead_code)]
 //! Response validation to detect hallucinated tool calls and context drift.
 //!
@@ -43,9 +41,8 @@ static HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
 /// this requires the parenthesised args *inside* the brackets and a closing
 /// `)]`.
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
-static BARE_CALL_LITERAL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\[[a-z][a-z0-9_]*\([^)]*\)\]").expect("bare call literal regex")
-});
+static BARE_CALL_LITERAL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\[[a-z][a-z0-9_]*\([^)]*\)\]").expect("bare call literal regex"));
 
 /// Characters that, immediately before the `[`, prove the bracket is ordinary
 /// code rather than a fabricated call:
@@ -410,7 +407,7 @@ mod tests {
     fn tool_intent_prose_is_never_an_error() {
         let prose = [
             "Let me check that file for you.",
-            "LET ME CHECK that for you.", // case-insensitive path
+            "LET ME CHECK that for you.",  // case-insensitive path
             "```\nlet me check this\n```", // inside a code block
             "the file contains important data",
             "the result shows that",
@@ -448,7 +445,12 @@ mod tests {
 
         // Markdown links share the bracket but are not calls.
         assert_eq!(
-            validate_response("See [the docs](https://x.dev/a(b)) for detail.", &[], false, false),
+            validate_response(
+                "See [the docs](https://x.dev/a(b)) for detail.",
+                &[],
+                false,
+                false
+            ),
             ValidationOutcome::Ok,
             "markdown link must not read as a fabricated call"
         );

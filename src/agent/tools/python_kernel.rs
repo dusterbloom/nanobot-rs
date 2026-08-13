@@ -254,23 +254,17 @@ fn format_exception(py: Python<'_>, e: &PyErr, captured: &str) -> String {
 }
 
 fn extract_output(py: Python<'_>, g: &pyo3::Bound<'_, PyDict>) -> String {
-    let out: String = py.eval(
-        &CString::new("__capture_result[0]").unwrap(),
-        Some(g),
-        None,
-    )
-    .ok()
-    .and_then(|v| v.extract::<String>().ok())
-    .unwrap_or_default();
+    let out: String = py
+        .eval(&CString::new("__capture_result[0]").unwrap(), Some(g), None)
+        .ok()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default();
 
-    let err: String = py.eval(
-        &CString::new("__capture_result[1]").unwrap(),
-        Some(g),
-        None,
-    )
-    .ok()
-    .and_then(|v| v.extract::<String>().ok())
-    .unwrap_or_default();
+    let err: String = py
+        .eval(&CString::new("__capture_result[1]").unwrap(), Some(g), None)
+        .ok()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default();
 
     match (out.is_empty(), err.is_empty()) {
         (true, true) => "(no output)".to_string(),
@@ -336,7 +330,10 @@ mod tests {
     async fn function_definition_persistence() {
         let k = kernel();
         let mut params = HashMap::new();
-        params.insert("code".to_string(), json!("def double(n):\n    return n * 2"));
+        params.insert(
+            "code".to_string(),
+            json!("def double(n):\n    return n * 2"),
+        );
         k.execute(params.clone()).await;
         params.insert("code".to_string(), json!("print(double(21))"));
         let result = k.execute(params).await;
@@ -395,7 +392,10 @@ mod tests {
 
         params.insert("code".to_string(), json!("print('alive')"));
         let after = k.execute(params).await;
-        assert!(after.contains("alive"), "kernel wedged after timeout: {after}");
+        assert!(
+            after.contains("alive"),
+            "kernel wedged after timeout: {after}"
+        );
     }
 
     /// An exception must not leave sys.stdout redirected or `__capture_result`

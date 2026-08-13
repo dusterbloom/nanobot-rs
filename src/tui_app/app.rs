@@ -30,7 +30,7 @@
     clippy::shadow_unrelated,
     clippy::shadow_same,
     clippy::format_push_string,
-    clippy::string_add,
+    clippy::string_add
 )]
 use std::path::Path;
 use std::time::Instant;
@@ -467,7 +467,10 @@ enum ActivityPhase {
     /// summarized; `started` lets the render compute a compaction-specific
     /// elapsed (independent of the turn-wide elapsed, which may have been
     /// running for many seconds of normal flow before compaction triggered).
-    Compacting { messages: u32, started: Instant },
+    Compacting {
+        messages: u32,
+        started: Instant,
+    },
 }
 
 /// One chronological entry in the transcript.
@@ -2801,6 +2804,9 @@ fn cache_status_label(status: CacheStatus) -> (String, Color) {
             CacheResetReason::StalledProviderRequest => {
                 ("cache reset · stalled request".to_string(), WARN_COLOR)
             }
+            CacheResetReason::ToolBlockChange => {
+                ("cache reset · tool block".to_string(), WARN_COLOR)
+            }
         },
     }
 }
@@ -3582,9 +3588,10 @@ fn cell_lines_with_reply_mark(
                     // Braille spinner: 10 frames at ~8fps, smoother than the
                     // 4-frame quadrant used elsewhere. Reads universally as
                     // "in progress" and the rotation rate signals activity.
-                    const FRAMES: [&str; 10] =
-                        ["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}",
-                         "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
+                    const FRAMES: [&str; 10] = [
+                        "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}",
+                        "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}",
+                    ];
                     let compaction_elapsed = started.elapsed().as_secs_f32();
                     let frame = FRAMES[((compaction_elapsed * 8.0) as usize) % 10];
                     // Override the default quadrant spinner with our Braille frame.
@@ -3599,8 +3606,13 @@ fn cell_lines_with_reply_mark(
                     let dot_pos = (compaction_elapsed * 2.0) as usize % 5;
                     let dots: String = (0..5)
                         .map(|i| {
-                            if i == dot_pos { '\u{25cf}' } // ● bright
-                            else { '\u{00b7}' } // · dim
+                            if i == dot_pos {
+                                '\u{25cf}'
+                            }
+                            // ● bright
+                            else {
+                                '\u{00b7}'
+                            } // · dim
                         })
                         .collect();
                     segs.push((" ".to_string(), Style::default()));
@@ -5198,6 +5210,15 @@ mod tests {
             "stalled provider request should not be labeled as LCM: {rendered}"
         );
         assert!(!rendered.contains("lcm checkpoint"));
+    }
+
+    #[test]
+    fn tool_block_change_reset_has_exact_label() {
+        let (label, color) = cache_status_label(CacheStatus::Reset {
+            reason: CacheResetReason::ToolBlockChange,
+        });
+        assert_eq!(label, "cache reset · tool block");
+        assert_eq!(color, WARN_COLOR);
     }
 
     #[test]

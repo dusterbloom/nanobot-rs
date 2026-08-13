@@ -18,7 +18,7 @@
     clippy::print_stdout,
     clippy::print_stderr,
     clippy::pedantic,
-    clippy::nursery,
+    clippy::nursery
 )]
 //! Verify that VoiceConfig.tts_voice and VoiceConfig.language reach the
 //! TTS engine via with_voice_config().

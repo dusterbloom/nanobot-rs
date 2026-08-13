@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-)]
+#![allow(clippy::as_conversions)]
 //! System information tool: quick runtime, process, and disk snapshots.
 
 use std::collections::HashMap;

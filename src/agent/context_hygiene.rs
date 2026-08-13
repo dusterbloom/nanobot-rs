@@ -3,9 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::indexing_slicing,
-)]
+#![allow(clippy::indexing_slicing)]
 #![allow(dead_code)]
 //! Context hygiene pipeline for cleaning up conversation history.
 //!
@@ -45,7 +43,7 @@ const TRUNCATED_ASSISTANT_PLACEHOLDER: &str = "[assistant message truncated]";
 #[derive(Clone, Copy, Debug)]
 pub enum ToolBodyPolicy {
     /// Cap the body to at most this many bytes (backed off to a UTF-8 char
-///   boundary), appending the `...[tool output truncated]` marker.
+    ///   boundary), appending the `...[tool output truncated]` marker.
     ByteCap(usize),
     /// Replace bodies longer than `preview_len` bytes with a digest marker
     /// (sha256 prefix + original length + single-line preview).

@@ -3,10 +3,7 @@
 // violations of the lints below. Remove this allow as the module migrates onto
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
-#![allow(
-    clippy::as_conversions,
-    clippy::shadow_reuse,
-)]
+#![allow(clippy::as_conversions, clippy::shadow_reuse)]
 //! Local-backend stream progress tracking, backend-activity heartbeat, and
 //! stream-abort diagnostics.
 //!
@@ -202,9 +199,11 @@ pub(super) fn local_no_stream_progress_error(timeout: Duration) -> String {
 }
 
 pub(super) fn emit_stream_abort_metrics(ctx: &TurnContext, detail: &str) {
-    crate::agent::metrics::emit(&crate::agent::metrics::RequestMetrics {
+    let metrics = crate::agent::metrics::RequestMetrics {
         timestamp: chrono::Local::now().to_rfc3339(),
         request_id: ctx.request_id.clone(),
+        logical_session: ctx.session_id.clone(),
+        cache_route: "active".into(),
         role: "main".into(),
         model: ctx.core.model.clone(),
         provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),
@@ -225,7 +224,14 @@ pub(super) fn emit_stream_abort_metrics(ctx: &TurnContext, detail: &str) {
         tool_calls_requested: 0,
         tool_calls_executed: 0,
         validation_result: None,
-    });
+    };
+    ctx.counters.record_cache_metrics(
+        &metrics.logical_session,
+        metrics.prompt_tokens,
+        metrics.cache_read_tokens,
+        metrics.cache_creation_tokens,
+    );
+    crate::agent::metrics::emit(&metrics);
 }
 
 #[cfg(test)]

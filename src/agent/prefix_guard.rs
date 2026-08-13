@@ -401,7 +401,11 @@ mod tests {
         }
 
         // A second session carrying a DIFFERENT head must not clobber the first.
-        assert!(assert_stable_head("s2", &headed("you are someone else"), &store));
+        assert!(assert_stable_head(
+            "s2",
+            &headed("you are someone else"),
+            &store
+        ));
         assert!(
             assert_stable_head("s1", &messages, &store),
             "sessions must be keyed independently"
