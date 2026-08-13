@@ -4155,6 +4155,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn captured_http_requests_preserve_higgs_route_and_strip_other_backends() {
+        use crate::config::schema::ProviderConfig;
+        use crate::providers::factory::{create_openai_compat, ProviderSpec};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind request capture server");
+        let address = listener.local_addr().expect("request capture address");
+        let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let server_captured = Arc::clone(&captured);
+        let server = tokio::spawn(async move {
+            for request_index in 0..4 {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("capture request timeout")
+                        .expect("accept capture request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let read = socket
+                        .read(&mut buffer)
+                        .await
+                        .expect("read capture request");
+                    assert_ne!(read, 0, "capture request ended before headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break index + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .expect("capture request content-length");
+                while request.len() - header_end < content_length {
+                    let read = socket.read(&mut buffer).await.expect("read capture body");
+                    assert_ne!(read, 0, "capture request ended before body");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .expect("captured JSON request");
+                server_captured.lock().unwrap().push(body);
+
+                let (status, response_body) = if request_index == 0 {
+                    (
+                        "409 Conflict",
+                        r#"{"error":{"code":"retained_session_unavailable","message":"retained session 41 unavailable"}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"id":"chatcmpl-capture","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":1,"total_tokens":13}}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write capture response");
+            }
+        });
+
+        let api_base = format!("http://{address}/v1");
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List a directory",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        })];
+        let retained_messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "stable system prompt",
+                NANOBOT_HIGGS_SESSION_ID_FIELD: 41_u64,
+                NANOBOT_HIGGS_DROP_SESSION_ID_FIELD: 43_u64,
+                NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: [44_u64, 43_u64],
+                NANOBOT_HIGGS_SESSION_LEASE_FIELD: {"session_id": 41_u64, "ttl_seconds": 300_u32},
+                NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "require_continuation",
+                NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: 31_744_u32,
+            }),
+            serde_json::json!({"role": "user", "content": "inspect the workspace"}),
+        ];
+        let higgs = create_openai_compat(
+            ProviderSpec::local(&api_base, Some("model")).with_higgs_session_cache(true),
+        );
+        assert!(higgs
+            .chat(
+                &retained_messages,
+                Some(&tools),
+                None,
+                1_024,
+                0.0,
+                None,
+                None
+            )
+            .await
+            .is_err());
+
+        let fallback_messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "stable system prompt",
+                NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+                NANOBOT_HIGGS_DROP_SESSION_ID_FIELD: 41_u64,
+                NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: [41_u64, 43_u64],
+                NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "best_effort",
+                NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: 31_744_u32,
+            }),
+            retained_messages[1].clone(),
+        ];
+        assert_eq!(
+            higgs
+                .chat(
+                    &fallback_messages,
+                    Some(&tools),
+                    None,
+                    1_024,
+                    0.0,
+                    None,
+                    None
+                )
+                .await
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("ok")
+        );
+
+        let non_higgs = create_openai_compat(ProviderSpec::local(&api_base, Some("model")));
+        non_higgs
+            .chat(
+                &retained_messages,
+                Some(&tools),
+                None,
+                1_024,
+                0.0,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let cloud_config = ProviderConfig {
+            api_key: "sk-cloud-test".to_owned(),
+            api_base: Some(api_base.clone()),
+        };
+        let mut cloud_spec = ProviderSpec::from_config(&cloud_config, None);
+        cloud_spec.model = Some("gpt-5".to_owned());
+        let cloud = create_openai_compat(cloud_spec);
+        cloud
+            .chat(
+                &retained_messages,
+                Some(&tools),
+                None,
+                1_024,
+                0.0,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 4);
+        let expected_messages = serde_json::json!([
+            {"role": "system", "content": "stable system prompt"},
+            {"role": "user", "content": "inspect the workspace"}
+        ]);
+        let expected_base = |model: &str| {
+            serde_json::json!({
+                "model": model,
+                "messages": expected_messages,
+                "max_tokens": 1_024,
+                "stream": false,
+                "chat_template_kwargs": {"enable_thinking": false},
+                "repeat_penalty": 1.1,
+                "tools": tools,
+                "tool_choice": "auto"
+            })
+        };
+        let mut expected_retained = expected_base("model");
+        expected_retained["session_id"] = serde_json::json!(41);
+        expected_retained["drop_session_ids"] = serde_json::json!([43, 44]);
+        assert!(!expected_retained["drop_session_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(41)));
+        expected_retained["session_lease"] =
+            serde_json::json!({"session_id": 41, "ttl_seconds": 300});
+        expected_retained["session_cache_policy"] = serde_json::json!("require_continuation");
+        expected_retained["max_prompt_tokens"] = serde_json::json!(31_744);
+        assert_eq!(captured[0], expected_retained);
+
+        let mut expected_fallback = expected_base("model");
+        expected_fallback["session_id"] = serde_json::json!(42);
+        expected_fallback["drop_session_ids"] = serde_json::json!([41, 43]);
+        expected_fallback["session_cache_policy"] = serde_json::json!("best_effort");
+        expected_fallback["max_prompt_tokens"] = serde_json::json!(31_744);
+        assert_eq!(captured[1], expected_fallback);
+
+        assert_eq!(captured[2], expected_base("model"));
+        assert_eq!(captured[3], expected_base("gpt-5"));
+    }
+
+    #[tokio::test]
     async fn test_stream_read_timeout_slides_on_heartbeats_and_bounds_inactivity() {
         use std::time::{Duration, Instant};
 
