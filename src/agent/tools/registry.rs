@@ -17,7 +17,7 @@ use tracing::warn;
 use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolExecutionResult};
 use super::filesystem::MAX_WRITE_FILE_PIECE_CHARS;
 use super::{
-    ApplyPatchTool, BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, FileInfoTool,
+    ApplyPatchTool, BrowserTool, CodeExecutionTool, CuaTool, EditFileTool, ExecTool, FileInfoTool,
     FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool,
     RememberTool, SearchFilesTool, SystemInfoTool, ToolStatusTool, WebFetchTool, WebSearchTool,
     WorkspaceDiffTool, WriteFileTool,
@@ -409,6 +409,9 @@ impl ToolRegistry {
         }
         if should_include("browser") {
             self.register(Box::new(BrowserTool::new(config.max_tool_result_chars)));
+        }
+        if should_include("cua") && config.cua.enabled {
+            self.register(Box::new(CuaTool::new(&config.cua, &config.workspace)));
         }
         if should_include("recall") {
             // recall is the unified retrieval tool: it absorbs the dissolved
@@ -3642,5 +3645,36 @@ mod tests {
         assert_eq!(registry.max_permission, PermissionLevel::System);
         registry.set_max_permission(PermissionLevel::Write);
         assert_eq!(registry.max_permission, PermissionLevel::Write);
+    }
+
+    // -----------------------------------------------------------------------
+    // cua registration gating (register behind config.cua.enabled)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cua_registered_when_enabled() {
+        let ws = std::path::Path::new("/tmp");
+        let mut cfg = ToolConfig::new(ws);
+        cfg.cua.enabled = true;
+        let reg = ToolRegistry::with_standard_tools(&cfg);
+        assert!(reg.has("cua"), "cua should be registered when enabled");
+    }
+
+    #[test]
+    fn test_cua_not_registered_when_disabled() {
+        let ws = std::path::Path::new("/tmp");
+        let mut cfg = ToolConfig::new(ws);
+        cfg.cua.enabled = false;
+        let reg = ToolRegistry::with_standard_tools(&cfg);
+        assert!(!reg.has("cua"), "cua should be absent when disabled");
+    }
+
+    #[test]
+    fn test_cua_excluded_by_tools_filter() {
+        let ws = std::path::Path::new("/tmp");
+        let mut cfg = ToolConfig::new(ws);
+        cfg.tools_filter = Some(vec!["read_file".to_string()]);
+        let reg = ToolRegistry::with_standard_tools(&cfg);
+        assert!(!reg.has("cua"));
     }
 }

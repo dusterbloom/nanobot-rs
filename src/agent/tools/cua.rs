@@ -14,8 +14,6 @@ use tokio::process::Command;
 use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext};
 use crate::config::schema::CuaToolConfig;
 
-// Only consumed via `CuaTool::new`, which the registry wires up next task.
-#[allow(dead_code)]
 const DEFAULT_BINARY: &str = "cua-driver";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DAEMON_READY_POLLS: u32 = 10;
@@ -30,8 +28,6 @@ pub struct CuaTool {
 }
 
 impl CuaTool {
-    // Consumed by the registry when the cua tool is registered (next task).
-    #[allow(dead_code)]
     pub fn new(config: &CuaToolConfig, workspace: &Path) -> Self {
         let screenshot_dir = config
             .screenshot_dir

@@ -31,8 +31,6 @@ pub use base::Tool;
 pub use browser::BrowserTool;
 pub use code_execution::CodeExecutionTool;
 pub use cron_tool::CronScheduleTool;
-// Consumed by the registry when the cua tool is registered (next task).
-#[allow(unused_imports)]
 pub use cua::CuaTool;
 pub use email::{CheckInboxTool, SendEmailTool};
 pub use file_preview::FilePreviewTool;
