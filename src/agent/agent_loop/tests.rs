@@ -10,8 +10,8 @@ use crate::agent::router::{
     extract_json_object, parse_lenient_router_decision, request_strict_router_decision,
 };
 use crate::config::schema::{
-    AdaptiveTokenConfig, CodeExecutionConfig, MemoryConfig, ProvenanceConfig, ProviderConfig,
-    PythonKernelConfig, ToolDelegationConfig, TrioConfig,
+    AdaptiveTokenConfig, CodeExecutionConfig, CuaToolConfig, MemoryConfig, ProvenanceConfig,
+    ProviderConfig, PythonKernelConfig, ToolDelegationConfig, TrioConfig,
 };
 use crate::providers::base::{FinishReason, LLMProvider};
 use crate::providers::openai_compat::OpenAICompatProvider;
@@ -165,6 +165,7 @@ fn build_test_core(
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(sessions_db),
     })
@@ -547,6 +548,7 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -616,6 +618,7 @@ fn test_delegation_with_is_local_true() {
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -687,6 +690,7 @@ fn test_delegation_with_is_local_false_cloud() {
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -775,6 +779,7 @@ fn test_local_reflection_and_delegation_providers_do_not_reroute_lcm() {
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -844,6 +849,7 @@ fn test_cloud_memory_and_delegation_do_not_reroute_lcm() {
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -956,6 +962,7 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1240,6 +1247,7 @@ fn build_trio_e2e_harness(
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1702,6 +1710,7 @@ async fn test_trio_e2e_router_unreachable() {
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1820,6 +1829,7 @@ async fn test_trio_e2e_specialist_unreachable() {
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2492,6 +2502,7 @@ fn build_trio_offline_harness(
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2566,6 +2577,7 @@ fn build_local_inline_harness_with_iters(
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2677,6 +2689,7 @@ fn build_local_inline_harness_with_memory_and_reflection(
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2751,6 +2764,7 @@ fn build_cloud_inline_harness_with_memory(
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -8513,6 +8527,7 @@ async fn test_trio_offline_e2e_health_gate() {
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9008,6 +9023,7 @@ mod runtime_mode_parity_tests {
             health_check_timeout_secs: 2,
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9069,6 +9085,7 @@ mod runtime_mode_parity_tests {
             health_check_timeout_secs: 2,
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9128,6 +9145,7 @@ mod runtime_mode_parity_tests {
             health_check_timeout_secs: 2,
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9188,6 +9206,7 @@ mod runtime_mode_parity_tests {
             health_check_timeout_secs: 2,
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9235,6 +9254,7 @@ mod runtime_mode_parity_tests {
             health_check_timeout_secs: 2,
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9313,6 +9333,7 @@ mod runtime_mode_parity_tests {
             health_check_timeout_secs: 2,
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9367,6 +9388,7 @@ mod runtime_mode_parity_tests {
             health_check_timeout_secs: 2,
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),

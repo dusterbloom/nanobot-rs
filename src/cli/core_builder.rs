@@ -455,6 +455,7 @@ fn core_config_from(
         sessions_db_path: None,
         code_execution: config.tools.code_execution.clone(),
         python_kernel: config.tools.python_kernel.clone(),
+        cua: config.tools.cua.clone(),
     }
 }
 

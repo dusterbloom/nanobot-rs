@@ -58,6 +58,8 @@ pub struct ToolConfig {
     /// Stateful Python kernel tool config. Feature: `python-kernel`.
     #[cfg(feature = "python-kernel")]
     pub python_kernel: PythonKernelConfig,
+    /// Cua driver (local desktop computer-use) tool settings.
+    pub cua: crate::config::schema::CuaToolConfig,
     /// Optional health-registry handle. When set, the web_search tool checks
     /// the "searxng" probe before calling SearXNG and returns a clear
     /// "degraded, restart the container" message instead of silent zero results.
@@ -84,6 +86,7 @@ impl ToolConfig {
             code_execution: CodeExecutionConfig::default(),
             #[cfg(feature = "python-kernel")]
             python_kernel: PythonKernelConfig::default(),
+            cua: crate::config::schema::CuaToolConfig::default(),
             health_registry: None,
         }
     }

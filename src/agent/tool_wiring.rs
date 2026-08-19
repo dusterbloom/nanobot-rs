@@ -341,6 +341,7 @@ impl AgentLoopShared {
             code_execution: core.code_execution.clone(),
             #[cfg(feature = "python-kernel")]
             python_kernel: core.python_kernel.clone(),
+            cua: core.cua.clone(),
             ..ToolConfig::new(&core.workspace)
         };
         let mut tools = ToolRegistry::with_standard_tools(&tool_config);

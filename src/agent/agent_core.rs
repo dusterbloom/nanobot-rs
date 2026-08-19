@@ -117,6 +117,8 @@ pub struct SwappableCore {
     /// Python kernel tool config (feature: python-kernel).
     #[allow(dead_code)]
     pub python_kernel: crate::config::schema::PythonKernelConfig,
+    /// Cua driver (local desktop computer-use) tool settings.
+    pub cua: crate::config::schema::CuaToolConfig,
     /// Interval in seconds between tool-heartbeat progress ticks (default: 2).
     pub tool_heartbeat_secs: u64,
     /// Timeout in seconds for a single health-check HTTP request (default: 2).
@@ -1377,6 +1379,8 @@ pub struct SwappableCoreConfig {
     pub code_execution: crate::config::schema::CodeExecutionConfig,
     /// Python kernel tool (PyO3, feature: python-kernel).
     pub python_kernel: crate::config::schema::PythonKernelConfig,
+    /// Cua driver (local desktop computer-use) tool settings.
+    pub cua: crate::config::schema::CuaToolConfig,
 }
 
 /// Build a `SwappableCore` from the given config.
@@ -1418,6 +1422,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         sessions_db_path,
         code_execution,
         python_kernel,
+        cua,
     } = cfg;
     let model_capabilities =
         crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
@@ -1571,6 +1576,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         restrict_to_workspace,
         code_execution,
         python_kernel,
+        cua,
         memory_enabled: memory_config.enabled,
         memory_provider,
         memory_model,
