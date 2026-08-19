@@ -133,9 +133,10 @@ Execution path (`execute_with_context`, honoring cancellation):
    platform launch command.
 2. **Invoke**: `cua-driver call <tool> <args-json>` via
    `std::process::Command` (argv array — never a shell). Apply `exec_timeout`.
-   For image-producing tools (`screenshot`, `get_window_state`), pass
-   `--screenshot-out-file <workspace>/cua/<call_id>.png`; return the file path
-   alongside any text output.
+   Always pass `--screenshot-out-file <workspace>/cua/<call_id>.png` (the flag
+   only writes when the response contains an image block, so passing it
+   unconditionally is harmless for non-image tools); if the file was created,
+   return its path alongside any text output.
 3. **Bound output** to `max_tool_result_chars` like every other tool.
 4. **Discovery fallback**: if `tool` is missing/unknown, run
    `cua-driver list-tools` and return the list so the agent can self-correct.
