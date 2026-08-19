@@ -28,9 +28,15 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, types::Value as SqlValue, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    params,
+    types::{Type, Value as SqlValue},
+    Connection, OptionalExtension, Transaction,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -152,6 +158,27 @@ CREATE INDEX IF NOT EXISTS idx_legacy_imports_session
     ON legacy_imports(session_id);
 CREATE INDEX IF NOT EXISTS idx_legacy_imports_content
     ON legacy_imports(content_sha256);
+
+CREATE TABLE IF NOT EXISTS session_replay_artifacts (
+    session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    digest        TEXT NOT NULL,
+    media_type    TEXT NOT NULL,
+    content       BLOB NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (session_id, digest)
+);
+
+CREATE TABLE IF NOT EXISTS session_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_request_id TEXT NOT NULL,
+    turn_tag        INTEGER NOT NULL,
+    event_kind      TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_events_order
+    ON session_events(session_id, id);
 "#;
 
 const WORKING_MEMORY_COLUMNS: &str = "\
@@ -252,6 +279,632 @@ pub struct WorkingMemoryRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Why a model call was made during a foreground turn.
+///
+/// This is persisted instead of inferred from the surrounding messages so a
+/// replay can distinguish ordinary inference from recovery without consulting
+/// the current agent implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCallPurpose {
+    Main,
+    ForcedToolRecovery,
+    RetainedExpansionPreflight,
+    Continuation,
+    EmptyResponseRescue,
+    Router,
+    Specialist,
+    ToolRunner,
+    ToolResultSummary,
+    Compaction,
+}
+
+/// Exact normalized arguments passed to an [`LLMProvider`](crate::providers::base::LLMProvider).
+/// Transport headers are deliberately absent because they are not model-visible
+/// and may contain credentials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RecordedProviderRequest {
+    pub(crate) messages: Vec<Value>,
+    pub(crate) tools: Option<Vec<Value>>,
+    pub(crate) model: String,
+    pub(crate) max_tokens: u32,
+    pub(crate) temperature: f64,
+    pub(crate) thinking_budget: Option<u32>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) tool_choice: String,
+    pub(crate) streaming: bool,
+}
+
+/// Exact terminal provider response consumed by the turn state machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RecordedProviderResponse {
+    pub(crate) content: Option<String>,
+    pub(crate) tool_calls: Vec<crate::providers::base::ToolCallRequest>,
+    pub(crate) finish_reason: String,
+    pub(crate) usage: HashMap<String, i64>,
+}
+
+/// Durable decision made before entering a tool implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolPreExecuteDecision {
+    Ready,
+    Rejected { reason: String },
+}
+
+impl From<&crate::providers::base::LLMResponse> for RecordedProviderResponse {
+    fn from(response: &crate::providers::base::LLMResponse) -> Self {
+        Self {
+            content: response.content.clone(),
+            tool_calls: response.tool_calls.clone(),
+            finish_reason: response.finish_reason.wire_str().to_string(),
+            usage: response.usage.clone(),
+        }
+    }
+}
+
+/// One append-only event in the exact session replay log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionEventPayload {
+    TurnStarted {
+        prior_unrecorded_history: bool,
+    },
+    ModelRequest {
+        call_id: String,
+        purpose: ModelCallPurpose,
+        request_digest: String,
+    },
+    ModelResponse {
+        call_id: String,
+        response_digest: String,
+    },
+    ModelFailed {
+        call_id: String,
+        error_digest: String,
+    },
+    ToolPreExecute {
+        tool_call_id: String,
+        tool_name: String,
+        arguments_digest: String,
+        decision: ToolPreExecuteDecision,
+    },
+    ToolExecute {
+        tool_call_id: String,
+        raw_result_digest: String,
+        ok: bool,
+        duration_ms: u64,
+    },
+    ToolPostExecute {
+        tool_call_id: String,
+        model_result_digest: String,
+        message_id: i64,
+    },
+    TurnFinished {
+        outcome: String,
+    },
+}
+
+impl SessionEventPayload {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::TurnStarted { .. } => "turn_started",
+            Self::ModelRequest { .. } => "model_request",
+            Self::ModelResponse { .. } => "model_response",
+            Self::ModelFailed { .. } => "model_failed",
+            Self::ToolPreExecute { .. } => "tool_pre_execute",
+            Self::ToolExecute { .. } => "tool_execute",
+            Self::ToolPostExecute { .. } => "tool_post_execute",
+            Self::TurnFinished { .. } => "turn_finished",
+        }
+    }
+}
+
+/// Persisted event plus its durable ordering metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub id: i64,
+    pub turn_request_id: String,
+    pub turn_tag: u64,
+    pub payload: SessionEventPayload,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Whether the stored prefix is sufficient for deterministic replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayAvailability {
+    Exact,
+    Unavailable,
+    Partial { first_event: i64 },
+    Incomplete { reason: String },
+}
+
+/// Exact recorded bytes for one provider call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedModelCall {
+    pub call_id: String,
+    pub purpose: ModelCallPurpose,
+    pub request: Vec<u8>,
+    pub response: Option<Vec<u8>>,
+    pub failure: Option<Vec<u8>>,
+}
+
+/// Read-only fold of one session's durable replay events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionReplay {
+    pub availability: ReplayAvailability,
+    pub events: Vec<SessionEvent>,
+    pub model_calls: Vec<RecordedModelCall>,
+}
+
+/// Cloneable turn-local handle used by auxiliary provider boundaries that do
+/// not otherwise own the full agent turn context.
+#[derive(Clone)]
+pub struct TurnReplayRecorder {
+    sessions: std::sync::Arc<SessionDb>,
+    session_id: String,
+    turn_request_id: String,
+    turn_tag: u64,
+}
+
+impl TurnReplayRecorder {
+    pub(crate) fn new(
+        sessions: std::sync::Arc<SessionDb>,
+        session_id: String,
+        turn_request_id: String,
+        turn_tag: u64,
+    ) -> Self {
+        Self {
+            sessions,
+            session_id,
+            turn_request_id,
+            turn_tag,
+        }
+    }
+
+    pub(crate) async fn request(
+        &self,
+        purpose: ModelCallPurpose,
+        request: &RecordedProviderRequest,
+    ) -> Result<String, ReplayError> {
+        self.sessions
+            .record_model_request(
+                &self.session_id,
+                &self.turn_request_id,
+                self.turn_tag,
+                purpose,
+                request,
+            )
+            .await
+    }
+
+    pub(crate) async fn response(
+        &self,
+        call_id: &str,
+        response: &RecordedProviderResponse,
+    ) -> Result<(), ReplayError> {
+        self.sessions
+            .record_model_response(
+                &self.session_id,
+                &self.turn_request_id,
+                self.turn_tag,
+                call_id,
+                response,
+            )
+            .await
+    }
+
+    pub(crate) async fn failure(&self, call_id: &str, error: &str) -> Result<(), ReplayError> {
+        self.sessions
+            .record_model_failure(
+                &self.session_id,
+                &self.turn_request_id,
+                self.turn_tag,
+                call_id,
+                error,
+            )
+            .await
+    }
+
+    pub(crate) async fn turn_finished(&self, outcome: &str) -> Result<(), ReplayError> {
+        self.sessions
+            .record_turn_finished(
+                &self.session_id,
+                &self.turn_request_id,
+                self.turn_tag,
+                outcome,
+            )
+            .await
+    }
+}
+
+/// Closes a streamed model call's journal entry when its forward task is
+/// aborted (consumer dropped the stream handle mid-stream). Inline recording
+/// cannot run in that case: task abortion unwinds the future without
+/// executing the code after the loop.
+struct StreamCancelGuard {
+    armed: bool,
+    replay: TurnReplayRecorder,
+    call_id: String,
+}
+
+impl Drop for StreamCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let replay = self.replay.clone();
+            let call_id = std::mem::take(&mut self.call_id);
+            tokio::spawn(async move {
+                let _ = replay
+                    .failure(&call_id, "stream cancelled before terminal response")
+                    .await;
+            });
+        }
+    }
+}
+
+/// Provider decorator that makes every call durable before it crosses the
+/// provider boundary and records its terminal response before returning it.
+pub(crate) struct ReplayRecordingProvider {
+    inner: std::sync::Arc<dyn crate::providers::base::LLMProvider>,
+    replay: TurnReplayRecorder,
+    purpose: ModelCallPurpose,
+}
+
+impl ReplayRecordingProvider {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn crate::providers::base::LLMProvider>,
+        replay: TurnReplayRecorder,
+        purpose: ModelCallPurpose,
+    ) -> Self {
+        Self {
+            inner,
+            replay,
+            purpose,
+        }
+    }
+
+    fn request(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+        thinking_budget: Option<u32>,
+        top_p: Option<f64>,
+        tool_choice: crate::providers::base::ToolChoice,
+        streaming: bool,
+    ) -> RecordedProviderRequest {
+        let tool_choice = match tool_choice {
+            crate::providers::base::ToolChoice::Auto => "auto",
+            crate::providers::base::ToolChoice::Required => "required",
+            crate::providers::base::ToolChoice::None => "none",
+        };
+        RecordedProviderRequest {
+            messages: messages.to_vec(),
+            tools: tools.map(<[Value]>::to_vec),
+            model: model
+                .unwrap_or_else(|| self.inner.get_default_model())
+                .to_string(),
+            max_tokens,
+            temperature,
+            thinking_budget,
+            top_p,
+            tool_choice: tool_choice.to_string(),
+            streaming,
+        }
+    }
+
+    async fn finish(
+        &self,
+        call_id: &str,
+        result: anyhow::Result<crate::providers::base::LLMResponse>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        match result {
+            Ok(response) => {
+                self.replay
+                    .response(call_id, &RecordedProviderResponse::from(&response))
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("model response replay persistence failed: {error}")
+                    })?;
+                Ok(response)
+            }
+            Err(error) => {
+                self.replay
+                    .failure(call_id, &error.to_string())
+                    .await
+                    .map_err(|record_error| {
+                        anyhow::anyhow!(
+                            "provider failed with {error}; replay failure persistence also failed: {record_error}"
+                        )
+                    })?;
+                Err(error)
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::providers::base::LLMProvider for ReplayRecordingProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+        thinking_budget: Option<u32>,
+        top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        let call_id = self
+            .replay
+            .request(
+                self.purpose,
+                &self.request(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    temperature,
+                    thinking_budget,
+                    top_p,
+                    crate::providers::base::ToolChoice::Auto,
+                    false,
+                ),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("model request replay persistence failed: {error}"))?;
+        self.finish(
+            &call_id,
+            self.inner
+                .chat(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    temperature,
+                    thinking_budget,
+                    top_p,
+                )
+                .await,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_choice(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+        thinking_budget: Option<u32>,
+        top_p: Option<f64>,
+        tool_choice: crate::providers::base::ToolChoice,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        let call_id = self
+            .replay
+            .request(
+                self.purpose,
+                &self.request(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    temperature,
+                    thinking_budget,
+                    top_p,
+                    tool_choice,
+                    false,
+                ),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("model request replay persistence failed: {error}"))?;
+        self.finish(
+            &call_id,
+            self.inner
+                .chat_with_tool_choice(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    temperature,
+                    thinking_budget,
+                    top_p,
+                    tool_choice,
+                )
+                .await,
+        )
+        .await
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+        thinking_budget: Option<u32>,
+        top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::StreamHandle> {
+        let call_id = self
+            .replay
+            .request(
+                self.purpose,
+                &self.request(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    temperature,
+                    thinking_budget,
+                    top_p,
+                    crate::providers::base::ToolChoice::Auto,
+                    true,
+                ),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("model request replay persistence failed: {error}"))?;
+        let mut inner_stream = match self
+            .inner
+            .chat_stream(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                thinking_budget,
+                top_p,
+            )
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.replay
+                    .failure(&call_id, &error.to_string())
+                    .await
+                    .map_err(|record_error| {
+                        anyhow::anyhow!(
+                            "stream failed with {error}; replay failure persistence also failed: {record_error}"
+                        )
+                    })?;
+                return Err(error);
+            }
+        };
+        let replay = self.replay.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let forward = tokio::spawn(async move {
+            let mut saw_terminal = false;
+            // Dropping the consumer aborts this task at its next await point,
+            // so inline post-loop recording never runs on cancellation. This
+            // guard is the only reliable close for that path; the spawned
+            // task bridges the sync Drop into the async journal write.
+            let mut cancel_guard = StreamCancelGuard {
+                armed: true,
+                replay: replay.clone(),
+                call_id: call_id.clone(),
+            };
+            while let Some(chunk) = inner_stream.rx.recv().await {
+                match chunk {
+                    crate::providers::base::StreamChunk::Done(response) => {
+                        saw_terminal = true;
+                        match replay
+                            .response(&call_id, &RecordedProviderResponse::from(&response))
+                            .await
+                        {
+                            Ok(()) => {
+                                cancel_guard.armed = false;
+                                let _ =
+                                    tx.send(crate::providers::base::StreamChunk::Done(response));
+                            }
+                            Err(error) => {
+                                // Fail-closed: an unjournaled terminal response
+                                // must not drive the consumer. The channel
+                                // cannot carry errors, so the stream just ends
+                                // and the consumer's no-terminal path reports
+                                // it. Close the journal as a model failure.
+                                warn!(%error, "stream terminal response replay persistence failed");
+                                cancel_guard.armed = false;
+                                let _ = replay
+                                    .failure(
+                                        &call_id,
+                                        &format!(
+                                            "stream terminal response replay persistence failed: {error}"
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        }
+                        break;
+                    }
+                    other => {
+                        if tx.send(other).is_err() {
+                            // Consumer gone; the guard records the failure.
+                            break;
+                        }
+                    }
+                }
+            }
+            if !saw_terminal {
+                cancel_guard.armed = false;
+                let _ = replay
+                    .failure(&call_id, "stream ended without terminal response")
+                    .await;
+            }
+        });
+        Ok(crate::providers::base::StreamHandle {
+            rx,
+            abort_on_drop: Some(forward),
+        })
+    }
+
+    fn get_default_model(&self) -> &str {
+        self.inner.get_default_model()
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        self.inner.get_api_base()
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        self.inner.supports_higgs_session_cache()
+    }
+}
+
+/// A replay cannot silently regenerate missing or malformed recorded bytes.
+#[derive(Debug)]
+pub enum ReplayError {
+    Database(rusqlite::Error),
+    Serialization(serde_json::Error),
+    MissingArtifact { digest: String },
+    CorruptArtifact { digest: String },
+    InvalidTransition { detail: String },
+}
+
+impl fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Database(error) => write!(f, "replay database error: {error}"),
+            Self::Serialization(error) => write!(f, "replay serialization error: {error}"),
+            Self::MissingArtifact { digest } => {
+                write!(f, "replay artifact {digest} is missing")
+            }
+            Self::CorruptArtifact { digest } => {
+                write!(f, "replay artifact {digest} failed its SHA-256 check")
+            }
+            Self::InvalidTransition { detail } => {
+                write!(f, "invalid replay transition: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            Self::Serialization(error) => Some(error),
+            Self::MissingArtifact { .. }
+            | Self::CorruptArtifact { .. }
+            | Self::InvalidTransition { .. } => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for ReplayError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Database(value)
+    }
+}
+
+impl From<serde_json::Error> for ReplayError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Serialization(value)
+    }
+}
+
 /// Result of importing one legacy JSONL session file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacyImportOutcome {
@@ -344,6 +997,62 @@ impl From<rusqlite::Error> for LegacyImportError {
 pub struct SessionDb {
     conn: Mutex<Connection>,
     path: PathBuf,
+    #[cfg(test)]
+    test_journal_faults: JournalFaultsForTests,
+}
+
+/// Test-only one-shot write failures at specific journal boundaries. These
+/// simulate transient SQLite errors so tests can prove the release path
+/// degrades (warn + `ReplayAvailability::Incomplete`) instead of discarding
+/// already-durable work. Each arm consumes N journal writes of that kind.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct JournalFaultsForTests {
+    turn_finished: AtomicUsize,
+    model_request: AtomicUsize,
+    model_response: AtomicUsize,
+}
+
+#[cfg(test)]
+impl SessionDb {
+    /// Make the next `count` `turn_finished` journal writes fail.
+    pub(crate) fn fail_turn_finished_writes_for_tests(&self, count: usize) {
+        self.test_journal_faults
+            .turn_finished
+            .store(count, AtomicOrdering::SeqCst);
+    }
+
+    /// Make the next `count` `model_request` journal writes fail.
+    pub(crate) fn fail_model_request_writes_for_tests(&self, count: usize) {
+        self.test_journal_faults
+            .model_request
+            .store(count, AtomicOrdering::SeqCst);
+    }
+
+    /// Make the next `count` `model_response` journal writes fail.
+    pub(crate) fn fail_model_response_writes_for_tests(&self, count: usize) {
+        self.test_journal_faults
+            .model_response
+            .store(count, AtomicOrdering::SeqCst);
+    }
+
+    fn consume_test_fault(&self, arm: &AtomicUsize) -> Result<(), ReplayError> {
+        // Synthetic one-shot failure standing in for a transient SQLite
+        // error. `fetch_update` returns Ok(previous) only when it consumed
+        // one unit of the remaining count.
+        let armed = arm
+            .fetch_update(
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        if armed {
+            Err(ReplayError::Database(rusqlite::Error::InvalidQuery))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Outcome of [`SessionDb::store_tool_result_immutable`]. The tool-result
@@ -494,6 +1203,8 @@ impl SessionDb {
         Self {
             conn: Mutex::new(conn),
             path: db_path.to_path_buf(),
+            #[cfg(test)]
+            test_journal_faults: JournalFaultsForTests::default(),
         }
     }
 
@@ -501,6 +1212,658 @@ impl SessionDb {
     /// that open a short-lived read handle without sharing the live mutex.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    // -----------------------------------------------------------------------
+    // Exact replay log
+    // -----------------------------------------------------------------------
+
+    /// Store exact replay bytes once per session and return their SHA-256 id.
+    ///
+    /// Artifacts are session-scoped so normal session deletion also removes
+    /// prompts and tool data that may contain private conversation content.
+    pub(crate) async fn store_replay_artifact(
+        &self,
+        session_id: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> rusqlite::Result<String> {
+        let digest = sha256_hex(content);
+        let conn = self.conn.lock().await;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO session_replay_artifacts \
+             (session_id, digest, media_type, content, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_id,
+                digest,
+                media_type,
+                content,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+
+        // A digest must identify one immutable byte string. Fresh inserts
+        // (rows affected == 1) are already the exact bytes; only when the
+        // insert was ignored does the collision contract need the stored
+        // bytes re-read and compared.
+        if inserted == 0 {
+            let stored: Vec<u8> = conn.query_row(
+                "SELECT content FROM session_replay_artifacts \
+                 WHERE session_id = ?1 AND digest = ?2",
+                params![session_id, digest],
+                |row| row.get(0),
+            )?;
+            if stored != content {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+        }
+        Ok(digest)
+    }
+
+    /// Load exact replay bytes by their session-scoped digest.
+    pub async fn load_replay_artifact(
+        &self,
+        session_id: &str,
+        digest: &str,
+    ) -> rusqlite::Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT content FROM session_replay_artifacts \
+             WHERE session_id = ?1 AND digest = ?2",
+            params![session_id, digest],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    async fn resolve_replay_artifact(
+        &self,
+        session_id: &str,
+        digest: &str,
+    ) -> Result<Vec<u8>, ReplayError> {
+        let content = self
+            .load_replay_artifact(session_id, digest)
+            .await?
+            .ok_or_else(|| ReplayError::MissingArtifact {
+                digest: digest.to_string(),
+            })?;
+        if sha256_hex(&content) != digest {
+            return Err(ReplayError::CorruptArtifact {
+                digest: digest.to_string(),
+            });
+        }
+        Ok(content)
+    }
+
+    /// Durably record a provider request before any model-visible call occurs.
+    pub(crate) async fn record_model_request(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        purpose: ModelCallPurpose,
+        request: &RecordedProviderRequest,
+    ) -> Result<String, ReplayError> {
+        #[cfg(test)]
+        self.consume_test_fault(&self.test_journal_faults.model_request)?;
+        let bytes = serde_json::to_vec(request)?;
+        let digest = self
+            .store_replay_artifact(session_id, "application/json", &bytes)
+            .await?;
+        self.ensure_turn_started(session_id, turn_request_id, turn_tag)
+            .await?;
+        let call_id = uuid::Uuid::new_v4().to_string();
+        self.append_session_event(
+            session_id,
+            turn_request_id,
+            turn_tag,
+            &SessionEventPayload::ModelRequest {
+                call_id: call_id.clone(),
+                purpose,
+                request_digest: digest,
+            },
+        )
+        .await?;
+        Ok(call_id)
+    }
+
+    async fn ensure_turn_started(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+    ) -> Result<(), ReplayError> {
+        let turn_tag = i64::try_from(turn_tag)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let conn = self.conn.lock().await;
+        let already_started: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events \
+             WHERE session_id = ?1 AND turn_request_id = ?2 AND event_kind = 'turn_started')",
+            params![session_id, turn_request_id],
+            |row| row.get(0),
+        )?;
+        if already_started {
+            return Ok(());
+        }
+        let has_replay_events: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id = ?1)",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        let prior_unrecorded_history = !has_replay_events
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages \
+                 WHERE session_id = ?1 AND role = 'assistant')",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+        let payload = SessionEventPayload::TurnStarted {
+            prior_unrecorded_history,
+        };
+        let payload_json = serde_json::to_string(&payload)?;
+        conn.execute(
+            "INSERT INTO session_events \
+             (session_id, turn_request_id, turn_tag, event_kind, payload_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id,
+                turn_request_id,
+                turn_tag,
+                payload.kind(),
+                payload_json,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Durably record the terminal response before it can drive tools or a
+    /// subsequent provider request.
+    pub(crate) async fn record_model_response(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        call_id: &str,
+        response: &RecordedProviderResponse,
+    ) -> Result<(), ReplayError> {
+        #[cfg(test)]
+        self.consume_test_fault(&self.test_journal_faults.model_response)?;
+        let bytes = serde_json::to_vec(response)?;
+        let digest = self
+            .store_replay_artifact(session_id, "application/json", &bytes)
+            .await?;
+        self.append_session_event(
+            session_id,
+            turn_request_id,
+            turn_tag,
+            &SessionEventPayload::ModelResponse {
+                call_id: call_id.to_string(),
+                response_digest: digest,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Close a recorded provider request whose transport or provider call
+    /// failed before a terminal response was available.
+    pub(crate) async fn record_model_failure(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        call_id: &str,
+        error: &str,
+    ) -> Result<(), ReplayError> {
+        let error_digest = self
+            .store_replay_artifact(session_id, "text/plain; charset=utf-8", error.as_bytes())
+            .await?;
+        self.append_session_event(
+            session_id,
+            turn_request_id,
+            turn_tag,
+            &SessionEventPayload::ModelFailed {
+                call_id: call_id.to_string(),
+                error_digest,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Mark the durable end of a foreground turn after all model/tool effects
+    /// that can affect its outcome have been journaled.
+    pub(crate) async fn record_turn_finished(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        outcome: &str,
+    ) -> Result<(), ReplayError> {
+        #[cfg(test)]
+        self.consume_test_fault(&self.test_journal_faults.turn_finished)?;
+        self.ensure_turn_started(session_id, turn_request_id, turn_tag)
+            .await?;
+        self.append_session_event(
+            session_id,
+            turn_request_id,
+            turn_tag,
+            &SessionEventPayload::TurnFinished {
+                outcome: outcome.to_string(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Record validation and policy disposition before entering a tool.
+    pub(crate) async fn record_tool_pre_execute(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &HashMap<String, Value>,
+        decision: ToolPreExecuteDecision,
+    ) -> Result<(), ReplayError> {
+        let bytes = serde_json::to_vec(arguments)?;
+        let arguments_digest = self
+            .store_replay_artifact(session_id, "application/json", &bytes)
+            .await?;
+        self.ensure_turn_started(session_id, turn_request_id, turn_tag)
+            .await?;
+        self.append_session_event(
+            session_id,
+            turn_request_id,
+            turn_tag,
+            &SessionEventPayload::ToolPreExecute {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                arguments_digest,
+                decision,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Record the raw tool outcome immediately after the implementation exits.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_tool_execute(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        tool_call_id: &str,
+        raw_result: &str,
+        ok: bool,
+        duration_ms: u64,
+    ) -> Result<(), ReplayError> {
+        let raw_result_digest = self
+            .store_replay_artifact(
+                session_id,
+                "text/plain; charset=utf-8",
+                raw_result.as_bytes(),
+            )
+            .await?;
+        self.append_session_event(
+            session_id,
+            turn_request_id,
+            turn_tag,
+            &SessionEventPayload::ToolExecute {
+                tool_call_id: tool_call_id.to_string(),
+                raw_result_digest,
+                ok,
+                duration_ms,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Record the exact result bytes committed to model-visible history.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_tool_post_execute(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        tool_call_id: &str,
+        model_result: &str,
+        message_id: i64,
+    ) -> Result<(), ReplayError> {
+        let model_result_digest = self
+            .store_replay_artifact(
+                session_id,
+                "text/plain; charset=utf-8",
+                model_result.as_bytes(),
+            )
+            .await?;
+        self.append_session_event(
+            session_id,
+            turn_request_id,
+            turn_tag,
+            &SessionEventPayload::ToolPostExecute {
+                tool_call_id: tool_call_id.to_string(),
+                model_result_digest,
+                message_id,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Append one typed event to the durable per-session replay order.
+    pub(crate) async fn append_session_event(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        payload: &SessionEventPayload,
+    ) -> rusqlite::Result<i64> {
+        let payload_json = serde_json::to_string(payload)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let turn_tag = i64::try_from(turn_tag)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO session_events \
+             (session_id, turn_request_id, turn_tag, event_kind, payload_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id,
+                turn_request_id,
+                turn_tag,
+                payload.kind(),
+                payload_json,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Load typed replay events in the exact order they were committed.
+    pub async fn load_session_events(
+        &self,
+        session_id: &str,
+    ) -> rusqlite::Result<Vec<SessionEvent>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, turn_request_id, turn_tag, payload_json, created_at \
+             FROM session_events WHERE session_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            let id = row.get(0)?;
+            let turn_request_id = row.get(1)?;
+            let stored_turn: i64 = row.get(2)?;
+            let turn_tag = u64::try_from(stored_turn).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error))
+            })?;
+            let payload_json: String = row.get(3)?;
+            let payload = serde_json::from_str(&payload_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
+            })?;
+            let created_text: String = row.get(4)?;
+            let created_at = DateTime::parse_from_rfc3339(&created_text)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(error))
+                })?;
+            Ok(SessionEvent {
+                id,
+                turn_request_id,
+                turn_tag,
+                payload,
+                created_at,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Reconstruct recorded provider calls without consulting current prompts,
+    /// tools, configuration, or a live model.
+    pub async fn load_session_replay(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionReplay, ReplayError> {
+        let events = self.load_session_events(session_id).await?;
+        if events.is_empty() {
+            return Ok(SessionReplay {
+                availability: ReplayAvailability::Unavailable,
+                events,
+                model_calls: Vec::new(),
+            });
+        }
+
+        let mut calls = Vec::<RecordedModelCall>::new();
+        let mut call_indices = HashMap::<String, usize>::new();
+        #[derive(Clone, Copy)]
+        enum ToolPhase {
+            Ready,
+            Rejected,
+            Executed,
+            Posted,
+        }
+        let mut tool_phases = HashMap::<String, ToolPhase>::new();
+        let mut tool_order = Vec::<String>::new();
+        let mut turn_finished = HashMap::<String, bool>::new();
+        let mut turn_order = Vec::<String>::new();
+        for event in &events {
+            if !matches!(
+                &event.payload,
+                SessionEventPayload::TurnStarted { .. } | SessionEventPayload::TurnFinished { .. }
+            ) {
+                match turn_finished.get(&event.turn_request_id) {
+                    None => {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!(
+                                "{} precedes turn start {}",
+                                event.payload.kind(),
+                                event.turn_request_id
+                            ),
+                        });
+                    }
+                    Some(true) => {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!(
+                                "{} follows turn finish {}",
+                                event.payload.kind(),
+                                event.turn_request_id
+                            ),
+                        });
+                    }
+                    Some(false) => {}
+                }
+            }
+            match &event.payload {
+                SessionEventPayload::TurnStarted { .. } => {
+                    if turn_finished
+                        .insert(event.turn_request_id.clone(), false)
+                        .is_some()
+                    {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("duplicate turn start {}", event.turn_request_id),
+                        });
+                    }
+                    turn_order.push(event.turn_request_id.clone());
+                }
+                SessionEventPayload::TurnFinished { .. } => {
+                    let Some(finished) = turn_finished.get_mut(&event.turn_request_id) else {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("turn finish {} has no start", event.turn_request_id),
+                        });
+                    };
+                    if *finished {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("duplicate turn finish {}", event.turn_request_id),
+                        });
+                    }
+                    *finished = true;
+                }
+                SessionEventPayload::ModelRequest {
+                    call_id,
+                    purpose,
+                    request_digest,
+                } => {
+                    if call_indices.contains_key(call_id) {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("duplicate model request {call_id}"),
+                        });
+                    }
+                    let request = self
+                        .resolve_replay_artifact(session_id, request_digest)
+                        .await?;
+                    call_indices.insert(call_id.clone(), calls.len());
+                    calls.push(RecordedModelCall {
+                        call_id: call_id.clone(),
+                        purpose: *purpose,
+                        request,
+                        response: None,
+                        failure: None,
+                    });
+                }
+                SessionEventPayload::ModelResponse {
+                    call_id,
+                    response_digest,
+                } => {
+                    let Some(index) = call_indices.get(call_id).copied() else {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("model response {call_id} has no request"),
+                        });
+                    };
+                    if calls[index].response.is_some() || calls[index].failure.is_some() {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("model call {call_id} has two terminal events"),
+                        });
+                    }
+                    calls[index].response = Some(
+                        self.resolve_replay_artifact(session_id, response_digest)
+                            .await?,
+                    );
+                }
+                SessionEventPayload::ModelFailed {
+                    call_id,
+                    error_digest,
+                } => {
+                    let Some(index) = call_indices.get(call_id).copied() else {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("model failure {call_id} has no request"),
+                        });
+                    };
+                    if calls[index].response.is_some() || calls[index].failure.is_some() {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("model call {call_id} has two terminal events"),
+                        });
+                    }
+                    calls[index].failure = Some(
+                        self.resolve_replay_artifact(session_id, error_digest)
+                            .await?,
+                    );
+                }
+                SessionEventPayload::ToolPreExecute {
+                    tool_call_id,
+                    arguments_digest,
+                    decision,
+                    ..
+                } => {
+                    if tool_phases.contains_key(tool_call_id) {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("duplicate tool pre-execute {tool_call_id}"),
+                        });
+                    }
+                    self.resolve_replay_artifact(session_id, arguments_digest)
+                        .await?;
+                    tool_phases.insert(
+                        tool_call_id.clone(),
+                        match decision {
+                            ToolPreExecuteDecision::Ready => ToolPhase::Ready,
+                            ToolPreExecuteDecision::Rejected { .. } => ToolPhase::Rejected,
+                        },
+                    );
+                    tool_order.push(tool_call_id.clone());
+                }
+                SessionEventPayload::ToolExecute {
+                    tool_call_id,
+                    raw_result_digest,
+                    ..
+                } => {
+                    if !matches!(tool_phases.get(tool_call_id), Some(ToolPhase::Ready)) {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!(
+                                "tool execute {tool_call_id} does not follow a ready pre-execute"
+                            ),
+                        });
+                    }
+                    self.resolve_replay_artifact(session_id, raw_result_digest)
+                        .await?;
+                    tool_phases.insert(tool_call_id.clone(), ToolPhase::Executed);
+                }
+                SessionEventPayload::ToolPostExecute {
+                    tool_call_id,
+                    model_result_digest,
+                    ..
+                } => {
+                    if !matches!(tool_phases.get(tool_call_id), Some(ToolPhase::Executed)) {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!(
+                                "tool post-execute {tool_call_id} does not follow execution"
+                            ),
+                        });
+                    }
+                    self.resolve_replay_artifact(session_id, model_result_digest)
+                        .await?;
+                    tool_phases.insert(tool_call_id.clone(), ToolPhase::Posted);
+                }
+            }
+        }
+
+        let incomplete = calls
+            .iter()
+            .find(|call| call.response.is_none() && call.failure.is_none())
+            .map(|call| ReplayAvailability::Incomplete {
+                reason: format!("model call {} has no terminal event", call.call_id),
+            })
+            .or_else(|| {
+                tool_order
+                    .iter()
+                    .find_map(|tool_call_id| match tool_phases.get(tool_call_id) {
+                        Some(ToolPhase::Ready) => Some(ReplayAvailability::Incomplete {
+                            reason: format!("tool call {tool_call_id} has no execute event"),
+                        }),
+                        Some(ToolPhase::Executed) => Some(ReplayAvailability::Incomplete {
+                            reason: format!("tool call {tool_call_id} has no post-execute event"),
+                        }),
+                        Some(ToolPhase::Rejected | ToolPhase::Posted) | None => None,
+                    })
+            })
+            .or_else(|| {
+                turn_order.iter().find_map(|turn_request_id| {
+                    (!turn_finished[turn_request_id]).then(|| ReplayAvailability::Incomplete {
+                        reason: format!("turn {turn_request_id} has no finished event"),
+                    })
+                })
+            });
+        let availability = incomplete.unwrap_or_else(|| {
+            events
+                .iter()
+                .find_map(|event| match event.payload {
+                    SessionEventPayload::TurnStarted {
+                        prior_unrecorded_history: true,
+                    } => Some(ReplayAvailability::Partial {
+                        first_event: event.id,
+                    }),
+                    _ => None,
+                })
+                .unwrap_or(ReplayAvailability::Exact)
+        });
+        Ok(SessionReplay {
+            availability,
+            events,
+            model_calls: calls,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -919,6 +2282,71 @@ impl SessionDb {
         max_turns: usize,
     ) -> Vec<Value> {
         let mut raw = self.get_all_messages(session_id).await;
+
+        // Upgrade legacy ordinary tool messages at the replay boundary. Older
+        // binaries persisted medium bodies inline, so merely fixing new
+        // ingestion would leave a 7 KB web/file result replaying forever from
+        // an existing session. Reuse the same store-then-render chokepoint as
+        // live tool execution; handles remain deterministic across reloads.
+        for message in &mut raw {
+            if message.get("role").and_then(Value::as_str) != Some("tool") {
+                continue;
+            }
+            let Some(raw_content) = message.get("content").and_then(Value::as_str) else {
+                continue;
+            };
+            if raw_content.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER) {
+                continue;
+            }
+            // These are protocol/infrastructure receipts, not ordinary tool
+            // output. Rewriting them would make a live boundary rejection
+            // become a handle on the next reload and bust the prefix cache.
+            if raw_content.starts_with("response boundary:")
+                || raw_content.starts_with("Error: result for ")
+            {
+                continue;
+            }
+            let Some(tool_call_id) = message.get("tool_call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(tool_name) = message.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+
+            // A previous batch path may already have stored the exact body
+            // while persisting a bounded preview. Prefer that durable body;
+            // otherwise the legacy message itself is the only available exact
+            // input and is stored before it is hidden behind a handle.
+            let exact_body = self
+                .load_tool_result(session_id, tool_call_id)
+                .await
+                .unwrap_or_else(|| raw_content.to_string());
+            let ok = message
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(!exact_body.starts_with("Error:"));
+            match crate::agent::tool_engine::store_then_render_tool_result(
+                self,
+                session_id,
+                tool_call_id,
+                tool_name,
+                &HashMap::new(),
+                &exact_body,
+                ok,
+                crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES,
+            )
+            .await
+            {
+                Ok(rendered) => message["content"] = Value::String(rendered),
+                Err(error) => warn!(
+                    session_id,
+                    tool_call_id,
+                    tool_name,
+                    ?error,
+                    "Could not upgrade legacy tool result during history replay"
+                ),
+            }
+        }
 
         // The history filter still performs text-specific truncation and token
         // estimation. Give it a JSON text projection for structured content,
@@ -2279,6 +3707,7 @@ fn reconstruct_message(
 mod tests {
     use super::*;
     use crate::agent::lcm::ManifestItem;
+    use crate::providers::base::LLMProvider;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -2328,6 +3757,777 @@ mod tests {
         let loaded = db.get_session(&meta.id).await.expect("session must exist");
         assert_eq!(loaded.id, meta.id);
         assert_eq!(loaded.session_key, "cli:default");
+    }
+
+    #[tokio::test]
+    async fn replay_artifacts_are_byte_exact_deduplicated_and_session_scoped() {
+        // Break caught: storing the same provider payload twice creates duplicate
+        // rows, changes its bytes, or leaves replay data behind after deletion.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:replay-artifact").await;
+        let body = br#"{"messages":[{"role":"system","content":"exact"}]}"#;
+
+        let first = db
+            .store_replay_artifact(&meta.id, "application/json", body)
+            .await
+            .expect("first replay artifact");
+        let second = db
+            .store_replay_artifact(&meta.id, "application/json", body)
+            .await
+            .expect("deduplicated replay artifact");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            db.load_replay_artifact(&meta.id, &first)
+                .await
+                .expect("load replay artifact")
+                .expect("artifact exists"),
+            body
+        );
+
+        assert!(db.delete_session(&meta.id).await.expect("delete session"));
+        assert!(db
+            .load_replay_artifact(&meta.id, &first)
+            .await
+            .expect("load deleted artifact")
+            .is_none());
+    }
+
+    /// Fake provider whose stream emits text deltas then one Done response.
+    /// `hang_after_first` parks the inner stream forever after the first
+    /// delta so a test can deterministically drop the consumer mid-stream.
+    struct SequencedStreamFakeProvider {
+        hang_after_first: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::LLMProvider for SequencedStreamFakeProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            unreachable!("stream fake only supports chat_stream")
+        }
+
+        async fn chat_with_tool_choice(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+            _tool_choice: crate::providers::base::ToolChoice,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            unreachable!("stream fake only supports chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::StreamHandle> {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let hang_after_first = self.hang_after_first;
+            let task = tokio::spawn(async move {
+                let _ = tx.send(crate::providers::base::StreamChunk::TextDelta(
+                    "part ".to_string(),
+                ));
+                if hang_after_first {
+                    std::future::pending::<()>().await;
+                }
+                let _ = tx.send(crate::providers::base::StreamChunk::TextDelta(
+                    "two ".to_string(),
+                ));
+                let _ = tx.send(crate::providers::base::StreamChunk::Done(
+                    crate::providers::base::LLMResponse {
+                        content: Some("part two final".to_string()),
+                        tool_calls: vec![],
+                        finish_reason: crate::providers::base::FinishReason::Stop,
+                        usage: std::collections::HashMap::new(),
+                    },
+                ));
+            });
+            Ok(crate::providers::base::StreamHandle {
+                rx,
+                abort_on_drop: Some(task),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "fake-stream-model"
+        }
+    }
+
+    async fn recorded_stream_failure_text(
+        db: &SessionDb,
+        session_id: &str,
+    ) -> Option<(String, String)> {
+        let events = db.load_session_events(session_id).await.ok()?;
+        for event in events {
+            if let SessionEventPayload::ModelFailed {
+                call_id,
+                error_digest,
+            } = &event.payload
+            {
+                let text = db
+                    .load_replay_artifact(session_id, error_digest)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                    .unwrap_or_default();
+                return Some((call_id.clone(), text));
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn chat_stream_terminal_persist_failure_ends_stream_and_closes_journal() {
+        // Break caught: a terminal response whose journal write fails was
+        // silently dropped, leaving the consumer with a stream that just ends
+        // and a model call pending forever in the replay journal.
+        let dir = tempdir().expect("tempdir");
+        let db = std::sync::Arc::new(SessionDb::new(&dir.path().join("sessions.db")));
+        let meta = db.create_session("cli:stream-fault").await;
+        db.fail_model_response_writes_for_tests(1);
+
+        let provider = ReplayRecordingProvider::new(
+            std::sync::Arc::new(SequencedStreamFakeProvider {
+                hang_after_first: false,
+            }),
+            TurnReplayRecorder::new(
+                std::sync::Arc::clone(&db),
+                meta.id.clone(),
+                "turn-1".to_string(),
+                1,
+            ),
+            ModelCallPurpose::ToolRunner,
+        );
+        let mut handle = provider
+            .chat_stream(
+                &[json!({"role":"user","content":"hi"})],
+                None,
+                None,
+                8,
+                0.1,
+                None,
+                None,
+            )
+            .await
+            .expect("stream must start");
+
+        let mut saw_done = false;
+        while let Some(chunk) = handle.rx.recv().await {
+            if matches!(chunk, crate::providers::base::StreamChunk::Done(_)) {
+                saw_done = true;
+            }
+        }
+        assert!(
+            !saw_done,
+            "an unjournaled terminal response must not be delivered"
+        );
+
+        let (call_id, failure) = recorded_stream_failure_text(&db, &meta.id)
+            .await
+            .expect("journal must close the failed call instead of leaving it pending");
+        assert!(!call_id.is_empty());
+        assert!(
+            failure.contains("replay persistence failed"),
+            "failure text should name the persist failure, got: {failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_consumer_drop_records_cancellation_failure() {
+        // Break caught: dropping the stream handle mid-stream aborted the
+        // forward task without recording anything, leaving the call pending.
+        let dir = tempdir().expect("tempdir");
+        let db = std::sync::Arc::new(SessionDb::new(&dir.path().join("sessions.db")));
+        let meta = db.create_session("cli:stream-drop").await;
+
+        let provider = ReplayRecordingProvider::new(
+            std::sync::Arc::new(SequencedStreamFakeProvider {
+                hang_after_first: true,
+            }),
+            TurnReplayRecorder::new(
+                std::sync::Arc::clone(&db),
+                meta.id.clone(),
+                "turn-1".to_string(),
+                1,
+            ),
+            ModelCallPurpose::ToolRunner,
+        );
+        let mut handle = provider
+            .chat_stream(
+                &[json!({"role":"user","content":"hi"})],
+                None,
+                None,
+                8,
+                0.1,
+                None,
+                None,
+            )
+            .await
+            .expect("stream must start");
+
+        let first = handle.rx.recv().await;
+        assert!(matches!(
+            first,
+            Some(crate::providers::base::StreamChunk::TextDelta(_))
+        ));
+        drop(handle);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some((_call_id, failure)) = recorded_stream_failure_text(&db, &meta.id).await {
+                assert!(
+                    failure.contains("cancelled"),
+                    "drop should record a cancellation, got: {failure}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "journal never recorded the cancelled stream"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn session_events_round_trip_in_append_order() {
+        // Break caught: event persistence reorders correlated model calls or
+        // loses exact request/response artifact references across a DB read.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:replay-events").await;
+        let request = SessionEventPayload::ModelRequest {
+            call_id: "model-1".to_string(),
+            purpose: ModelCallPurpose::Main,
+            request_digest: "request-digest".to_string(),
+        };
+        let response = SessionEventPayload::ModelResponse {
+            call_id: "model-1".to_string(),
+            response_digest: "response-digest".to_string(),
+        };
+
+        let first = db
+            .append_session_event(&meta.id, "turn-1", 7, &request)
+            .await
+            .expect("append request");
+        let second = db
+            .append_session_event(&meta.id, "turn-1", 7, &response)
+            .await
+            .expect("append response");
+        let loaded = db.load_session_events(&meta.id).await.expect("load events");
+
+        assert!(first < second);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].payload, request);
+        assert_eq!(loaded[1].payload, response);
+        assert_eq!(loaded[0].turn_request_id, "turn-1");
+        assert_eq!(loaded[0].turn_tag, 7);
+    }
+
+    #[tokio::test]
+    async fn exact_replay_resolves_recorded_model_call_bytes_without_live_inputs() {
+        // Break caught: replay regenerates a prompt from current state instead
+        // of resolving the exact request and response bytes recorded at call time.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:exact-replay").await;
+        let request_bytes =
+            br#"{"messages":[{"role":"system","content":"old prompt"}],"temperature":0.2}"#;
+        let response_bytes =
+            br#"{"content":"done","tool_calls":[],"finish_reason":"stop","usage":{}}"#;
+        let request_digest = db
+            .store_replay_artifact(&meta.id, "application/json", request_bytes)
+            .await
+            .unwrap();
+        let response_digest = db
+            .store_replay_artifact(&meta.id, "application/json", response_bytes)
+            .await
+            .unwrap();
+        db.append_session_event(
+            &meta.id,
+            "turn-exact",
+            1,
+            &SessionEventPayload::TurnStarted {
+                prior_unrecorded_history: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.append_session_event(
+            &meta.id,
+            "turn-exact",
+            1,
+            &SessionEventPayload::ModelRequest {
+                call_id: "call-1".to_string(),
+                purpose: ModelCallPurpose::Main,
+                request_digest,
+            },
+        )
+        .await
+        .unwrap();
+        db.append_session_event(
+            &meta.id,
+            "turn-exact",
+            1,
+            &SessionEventPayload::ModelResponse {
+                call_id: "call-1".to_string(),
+                response_digest,
+            },
+        )
+        .await
+        .unwrap();
+        db.record_turn_finished(&meta.id, "turn-exact", 1, "finished")
+            .await
+            .unwrap();
+
+        let replay = db.load_session_replay(&meta.id).await.unwrap();
+        assert_eq!(replay.availability, ReplayAvailability::Exact);
+        assert_eq!(replay.model_calls.len(), 1);
+        assert_eq!(replay.model_calls[0].request, request_bytes);
+        assert_eq!(
+            replay.model_calls[0].response.as_deref(),
+            Some(response_bytes.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replay_marks_unanswered_model_request_incomplete() {
+        // Break caught: a crash between durable request and provider completion
+        // is reported as a complete replay or silently drops the pending call.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:incomplete-replay").await;
+        let request_digest = db
+            .store_replay_artifact(&meta.id, "application/json", b"{}")
+            .await
+            .unwrap();
+        db.append_session_event(
+            &meta.id,
+            "turn-incomplete",
+            2,
+            &SessionEventPayload::TurnStarted {
+                prior_unrecorded_history: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.append_session_event(
+            &meta.id,
+            "turn-incomplete",
+            2,
+            &SessionEventPayload::ModelRequest {
+                call_id: "pending-call".to_string(),
+                purpose: ModelCallPurpose::Main,
+                request_digest,
+            },
+        )
+        .await
+        .unwrap();
+
+        let replay = db.load_session_replay(&meta.id).await.unwrap();
+        assert_eq!(
+            replay.availability,
+            ReplayAvailability::Incomplete {
+                reason: "model call pending-call has no terminal event".to_string()
+            }
+        );
+        assert_eq!(replay.model_calls.len(), 1);
+        assert!(replay.model_calls[0].response.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_replay_marks_unfinished_turn_incomplete_after_terminal_call() {
+        // Break caught: a crash after the final provider response but before
+        // turn finalization is incorrectly advertised as an exact full turn.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:unfinished-turn").await;
+        let request = RecordedProviderRequest {
+            messages: vec![json!({"role":"user","content":"almost done"})],
+            tools: None,
+            model: "model".to_string(),
+            max_tokens: 16,
+            temperature: 0.0,
+            thinking_budget: None,
+            top_p: None,
+            tool_choice: "auto".to_string(),
+            streaming: false,
+        };
+        let call_id = db
+            .record_model_request(
+                &meta.id,
+                "turn-unfinished",
+                1,
+                ModelCallPurpose::Main,
+                &request,
+            )
+            .await
+            .unwrap();
+        db.record_model_response(
+            &meta.id,
+            "turn-unfinished",
+            1,
+            &call_id,
+            &RecordedProviderResponse {
+                content: Some("terminal".to_string()),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let replay = db.load_session_replay(&meta.id).await.unwrap();
+        assert_eq!(
+            replay.availability,
+            ReplayAvailability::Incomplete {
+                reason: "turn turn-unfinished has no finished event".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replay_accepts_model_failure_as_a_terminal_event() {
+        // Break caught: a provider error is recorded only as a pending request,
+        // making a completely observed failed call look like crash corruption.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:failed-model-call").await;
+        let request = RecordedProviderRequest {
+            messages: vec![json!({"role":"user","content":"fail exactly"})],
+            tools: None,
+            model: "model".to_string(),
+            max_tokens: 64,
+            temperature: 0.0,
+            thinking_budget: None,
+            top_p: None,
+            tool_choice: "auto".to_string(),
+            streaming: false,
+        };
+        let call_id = db
+            .record_model_request(&meta.id, "turn-failed", 1, ModelCallPurpose::Main, &request)
+            .await
+            .unwrap();
+        db.record_model_failure(&meta.id, "turn-failed", 1, &call_id, "provider_timeout")
+            .await
+            .unwrap();
+        db.record_turn_finished(&meta.id, "turn-failed", 1, "provider_error")
+            .await
+            .unwrap();
+
+        let replay = db.load_session_replay(&meta.id).await.unwrap();
+        assert_eq!(replay.availability, ReplayAvailability::Exact);
+        assert_eq!(
+            replay.model_calls[0].failure.as_deref(),
+            Some(b"provider_timeout".as_slice())
+        );
+        assert!(replay.model_calls[0].response.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_replay_rejects_corrupted_artifact_bytes() {
+        // Break caught: SQLite bytes no longer match the digest carried by an
+        // event, but replay trusts the row and silently feeds altered content.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:corrupt-replay").await;
+        let digest = db
+            .store_replay_artifact(&meta.id, "application/json", b"{\"exact\":true}")
+            .await
+            .unwrap();
+        db.append_session_event(
+            &meta.id,
+            "turn-corrupt",
+            1,
+            &SessionEventPayload::TurnStarted {
+                prior_unrecorded_history: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.append_session_event(
+            &meta.id,
+            "turn-corrupt",
+            1,
+            &SessionEventPayload::ModelRequest {
+                call_id: "call-corrupt".to_string(),
+                purpose: ModelCallPurpose::Main,
+                request_digest: digest.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE session_replay_artifacts SET content = ?3 \
+                 WHERE session_id = ?1 AND digest = ?2",
+                params![meta.id, digest, b"{\"exact\":false}"],
+            )
+            .unwrap();
+        }
+
+        let error = db.load_session_replay(&meta.id).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ReplayError::CorruptArtifact { digest: actual } if actual == digest
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_validates_tool_lifecycle_transitions() {
+        // Break caught: execution can appear without a durable pre-execute
+        // decision, or a ready tool can vanish before post-execute persistence.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:tool-transition").await;
+        db.record_tool_execute(&meta.id, "turn-tools", 1, "tc-orphan", "orphan", true, 1)
+            .await
+            .unwrap();
+        let error = db.load_session_replay(&meta.id).await.unwrap_err();
+        assert!(matches!(error, ReplayError::InvalidTransition { .. }));
+
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:tool-incomplete").await;
+        db.record_tool_pre_execute(
+            &meta.id,
+            "turn-tools",
+            1,
+            "tc-ready",
+            "read_file",
+            &HashMap::new(),
+            ToolPreExecuteDecision::Ready,
+        )
+        .await
+        .unwrap();
+        db.record_tool_execute(&meta.id, "turn-tools", 1, "tc-ready", "raw", true, 2)
+            .await
+            .unwrap();
+        let replay = db.load_session_replay(&meta.id).await.unwrap();
+        assert_eq!(
+            replay.availability,
+            ReplayAvailability::Incomplete {
+                reason: "tool call tc-ready has no post-execute event".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_turn_snapshot_preserves_model_bytes_and_phase_order() {
+        // Break caught: a schema/refactor changes the stable whole-turn replay
+        // projection or drops bytes that were visible at a provider boundary.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:whole-turn-snapshot").await;
+        let request = RecordedProviderRequest {
+            messages: vec![json!({"role":"user","content":"list it"})],
+            tools: Some(vec![
+                json!({"type":"function","function":{"name":"list_dir"}}),
+            ]),
+            model: "snapshot-model".to_string(),
+            max_tokens: 128,
+            temperature: 0.25,
+            thinking_budget: None,
+            top_p: Some(0.9),
+            tool_choice: "auto".to_string(),
+            streaming: false,
+        };
+        let call_id = db
+            .record_model_request(
+                &meta.id,
+                "turn-snapshot",
+                4,
+                ModelCallPurpose::Main,
+                &request,
+            )
+            .await
+            .unwrap();
+        db.record_model_response(
+            &meta.id,
+            "turn-snapshot",
+            4,
+            &call_id,
+            &RecordedProviderResponse {
+                content: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: HashMap::from([("completion_tokens".to_string(), 1)]),
+            },
+        )
+        .await
+        .unwrap();
+        db.record_turn_finished(&meta.id, "turn-snapshot", 4, "finished")
+            .await
+            .unwrap();
+
+        let replay = db.load_session_replay(&meta.id).await.unwrap();
+        let phases = replay
+            .events
+            .iter()
+            .map(|event| event.payload.kind())
+            .collect::<Vec<_>>();
+        let snapshot = json!({
+            "availability": match replay.availability {
+                ReplayAvailability::Exact => "exact",
+                _ => "unexpected",
+            },
+            "phases": phases,
+            "request": serde_json::from_slice::<Value>(&replay.model_calls[0].request).unwrap(),
+            "response": serde_json::from_slice::<Value>(
+                replay.model_calls[0].response.as_deref().unwrap()
+            ).unwrap(),
+        });
+        assert_eq!(
+            snapshot,
+            json!({
+                "availability": "exact",
+                "phases": ["turn_started", "model_request", "model_response", "turn_finished"],
+                "request": {
+                    "messages": [{"role":"user","content":"list it"}],
+                    "tools": [{"type":"function","function":{"name":"list_dir"}}],
+                    "model": "snapshot-model",
+                    "max_tokens": 128,
+                    "temperature": 0.25,
+                    "thinking_budget": null,
+                    "top_p": 0.9,
+                    "tool_choice": "auto",
+                    "streaming": false
+                },
+                "response": {
+                    "content": "done",
+                    "tool_calls": [],
+                    "finish_reason": "stop",
+                    "usage": {"completion_tokens": 1}
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replay_survives_database_reopen() {
+        // Break caught: replay depends on in-memory turn state and cannot be
+        // reconstructed after a process restart from SQLite alone.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.db");
+        let db = SessionDb::new(&path);
+        let meta = db.create_session("cli:restart-replay").await;
+        let request = RecordedProviderRequest {
+            messages: vec![json!({"role":"user","content":"survive restart"})],
+            tools: None,
+            model: "model".to_string(),
+            max_tokens: 32,
+            temperature: 0.1,
+            thinking_budget: None,
+            top_p: None,
+            tool_choice: "auto".to_string(),
+            streaming: false,
+        };
+        let call_id = db
+            .record_model_request(
+                &meta.id,
+                "turn-restart",
+                1,
+                ModelCallPurpose::Main,
+                &request,
+            )
+            .await
+            .unwrap();
+        db.record_model_response(
+            &meta.id,
+            "turn-restart",
+            1,
+            &call_id,
+            &RecordedProviderResponse {
+                content: Some("persisted".to_string()),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        db.record_turn_finished(&meta.id, "turn-restart", 1, "finished")
+            .await
+            .unwrap();
+        let before = db.load_session_replay(&meta.id).await.unwrap();
+        drop(db);
+
+        let reopened = SessionDb::new(&path);
+        let after = reopened.load_session_replay(&meta.id).await.unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn first_recorded_turn_marks_preexisting_conversation_partial() {
+        // Break caught: a legacy session with historical assistant output is
+        // falsely advertised as exactly replayable from its beginning.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:legacy-prefix").await;
+        db.add_messages(
+            &meta.id,
+            &[
+                json!({"role":"user","content":"old question"}),
+                json!({"role":"assistant","content":"old answer"}),
+                json!({"role":"user","content":"new recorded turn"}),
+            ],
+        )
+        .await;
+        let request = RecordedProviderRequest {
+            messages: vec![json!({"role":"user","content":"new recorded turn"})],
+            tools: None,
+            model: "model".to_string(),
+            max_tokens: 64,
+            temperature: 0.0,
+            thinking_budget: None,
+            top_p: None,
+            tool_choice: "auto".to_string(),
+            streaming: false,
+        };
+        let call_id = db
+            .record_model_request(&meta.id, "turn-new", 3, ModelCallPurpose::Main, &request)
+            .await
+            .unwrap();
+        db.record_model_response(
+            &meta.id,
+            "turn-new",
+            3,
+            &call_id,
+            &RecordedProviderResponse {
+                content: Some("new answer".to_string()),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        db.record_turn_finished(&meta.id, "turn-new", 3, "finished")
+            .await
+            .unwrap();
+
+        let replay = db.load_session_replay(&meta.id).await.unwrap();
+        assert!(matches!(
+            replay.availability,
+            ReplayAvailability::Partial { first_event } if first_event > 0
+        ));
+        assert!(matches!(
+            replay.events.first().map(|event| &event.payload),
+            Some(SessionEventPayload::TurnStarted {
+                prior_unrecorded_history: true
+            })
+        ));
     }
 
     #[tokio::test]
@@ -2521,6 +4721,56 @@ mod tests {
         assert_eq!(history[0]["content"], "hello");
         assert_eq!(history[1]["role"], "assistant");
         assert_eq!(history[1]["content"], "hi there");
+    }
+
+    #[tokio::test]
+    async fn get_history_upgrades_legacy_medium_tool_body_to_handle() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:legacy-tool-handle").await;
+        let body = "nytimes article line\n".repeat(400);
+
+        db.add_messages(
+            &meta.id,
+            &[
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "legacy_web_fetch",
+                        "type": "function",
+                        "function": {"name": "web_fetch", "arguments": "{}"}
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "legacy_web_fetch",
+                    "name": "web_fetch",
+                    "ok": true,
+                    "content": body
+                }),
+            ],
+        )
+        .await;
+
+        let first = db.get_history(&meta.id, 100, 0).await;
+        let first_tool = first
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .expect("legacy tool message must remain in the complete turn");
+        let first_content = first_tool["content"].as_str().unwrap();
+        assert!(first_content.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER));
+        assert!(!first_content.contains("nytimes article line\nnytimes article line"));
+        assert_eq!(
+            db.load_tool_result(&meta.id, "legacy_web_fetch").await,
+            Some(body.clone())
+        );
+
+        let second = db.get_history(&meta.id, 100, 0).await;
+        let second_tool = second
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .expect("upgraded tool message must remain replayable");
+        assert_eq!(second_tool["content"], first_tool["content"]);
     }
 
     #[tokio::test]

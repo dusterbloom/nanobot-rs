@@ -22,12 +22,13 @@ use tracing::{debug, info, instrument, warn, Instrument};
 use crate::agent::agent_core::RuntimeCounters;
 use crate::agent::audit::ToolEvent;
 use crate::agent::context::ContextBuilder;
-use crate::agent::markers::{
-    TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_OUTPUT_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
-};
+use crate::agent::markers::{TOOL_RUNNER_OUTPUT_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX};
 use crate::agent::role_policy;
 use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
-use crate::providers::base::{LLMResponse, ToolCallRequest};
+use crate::providers::base::{LLMProvider, LLMResponse, ToolCallRequest};
+use crate::session::db::{
+    ModelCallPurpose, ReplayRecordingProvider, ToolPreExecuteDecision, TurnReplayRecorder,
+};
 use std::sync::Arc;
 
 use super::agent_loop::{ResponseBoundary, TurnContext};
@@ -147,6 +148,20 @@ fn is_explicit_retrieval_tool(name: &str) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolResultExposure {
+    Handle,
+    ExplicitExcerpt,
+}
+
+fn tool_result_exposure(name: &str) -> ToolResultExposure {
+    if is_explicit_retrieval_tool(name) {
+        ToolResultExposure::ExplicitExcerpt
+    } else {
+        ToolResultExposure::Handle
+    }
+}
+
 /// Render the canonical, write-once-stable handle for a tool result. Pure and
 /// deterministic: identical inputs always produce byte-identical output, so a
 /// handle rendered live at ingestion is identical to the one persisted to
@@ -183,6 +198,42 @@ fn render_tool_result_handle(
         args_j = serde_json::to_string(&tool_arg_summary(args)).unwrap_or_else(|_| "{}".into()),
         excerpt_j = serde_json::to_string(&excerpt).unwrap_or_else(|_| "\"\"".into()),
     )
+}
+
+/// The provider-facing ingestion chokepoint for completed tool output.
+///
+/// Store the exact bytes before rendering anything for the model. Ordinary
+/// results become deterministic handles; explicit retrieval tools remain
+/// bounded excerpts so a slice/search continuation can show the bytes it
+/// deliberately requested. A storage failure never falls back to raw output.
+pub(crate) async fn store_then_render_tool_result(
+    sessions: &crate::session::SessionDb,
+    session_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    args: &std::collections::HashMap<String, Value>,
+    exact_body: &str,
+    ok: bool,
+    cap: usize,
+) -> Result<String, crate::session::db::StoredResult> {
+    use crate::session::db::StoredResult;
+
+    match sessions
+        .store_tool_result_immutable(session_id, tool_call_id, tool_name, exact_body)
+        .await
+    {
+        StoredResult::Stored { .. } | StoredResult::Identical { .. } => {}
+        outcome @ (StoredResult::Conflict { .. } | StoredResult::Failed) => return Err(outcome),
+    }
+
+    Ok(match tool_result_exposure(tool_name) {
+        ToolResultExposure::Handle => {
+            render_tool_result_handle(tool_call_id, tool_name, ok, exact_body.as_bytes(), args)
+        }
+        ToolResultExposure::ExplicitExcerpt => {
+            digest_tool_result(tool_name, args, exact_body, cap, tool_call_id)
+        }
+    })
 }
 
 /// Fixed-scalar allowlist for the handle's `args` field, in a fixed order.
@@ -473,6 +524,17 @@ pub(crate) async fn execute_tools_delegated(
             return false;
         }
     };
+    let replay = TurnReplayRecorder::new(
+        Arc::clone(&ctx.core.sessions),
+        ctx.session_id.clone(),
+        ctx.request_id.clone(),
+        ctx.turn_count,
+    );
+    let tr_provider: Arc<dyn LLMProvider> = Arc::new(ReplayRecordingProvider::new(
+        tr_provider,
+        replay,
+        ModelCallPurpose::ToolRunner,
+    ));
 
     let tool_names_summary: String = routed_tool_calls
         .iter()
@@ -616,6 +678,29 @@ pub(crate) async fn execute_tools_delegated(
     );
     ctx.persist_pending_protocol_messages().await;
 
+    for tc in routed_tool_calls {
+        if let Err(error) = ctx
+            .core
+            .sessions
+            .record_tool_pre_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                &tc.name,
+                &tc.arguments,
+                ToolPreExecuteDecision::Ready,
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "delegated tool {} was not started because its pre-execution decision could not be recorded: {error}",
+                tc.id
+            ));
+            return true;
+        }
+    }
+
     let run_result =
         tool_runner::run_tool_loop(&runner_config, routed_tool_calls, &ctx.tools, &task_desc).await;
     let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
@@ -630,8 +715,12 @@ pub(crate) async fn execute_tools_delegated(
         let results_preview: String = run_result
             .tool_results
             .first()
-            .map(|(_, name, data)| {
-                format!("[{}]: {}", name, data.chars().take(200).collect::<String>())
+            .map(|outcome| {
+                format!(
+                    "[{}]: {}",
+                    outcome.tool_name,
+                    outcome.data.chars().take(200).collect::<String>()
+                )
             })
             .unwrap_or_default();
         warn!(
@@ -673,67 +762,56 @@ pub(crate) async fn execute_tools_delegated(
     let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
     let routed_result_cap =
         inline_hot_prompt_result_cap_for_ctx_batch(ctx, routed_tool_calls.len());
-    let force_routed_stash = routed_tool_calls.len() > 1;
 
     for tc in routed_tool_calls {
-        let full_data = run_result
+        let routed_result = run_result
             .tool_results
             .iter()
-            .find(|(id, _, _)| id == &tc.id)
-            .map(|(_, _, data)| data.as_str())
+            .find(|outcome| outcome.tool_call_id == tc.id);
+        let full_data = routed_result
+            .map(|outcome| outcome.data.as_str())
             .unwrap_or("(no result)");
+        let raw_ok = routed_result.is_some() && tool_result_ok(full_data);
+        // Implementation-exit timing as measured by the runner; 0 when the
+        // runner produced no outcome for this call.
+        let routed_duration_ms = routed_result
+            .map(|outcome| outcome.duration_ms)
+            .unwrap_or(0);
+        if let Err(error) = ctx
+            .core
+            .sessions
+            .record_tool_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                full_data,
+                raw_ok,
+                routed_duration_ms,
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "delegated tool execution result for {} could not be recorded: {error}",
+                tc.id
+            ));
+            return true;
+        }
 
-        let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
-
-        let threshold = summary_threshold_tokens(&tc.name);
         let cap = routed_result_cap;
-        let injected_raw = if let Some(ref summary) = run_result.summary {
-            // Summary exists from scratch-pad analysis.
-            if full_tokens > threshold {
-                // Large data + good summary available: use the summary so compaction
-                // can never destroy the content by proportional truncation.
-                format!(
-                    "{}\n{}\n\n[Full output: {} chars, cached in context store]",
-                    TOOL_ANALYSIS_SUMMARY_PREFIX,
-                    summary,
-                    full_data.len()
-                )
-            } else {
-                // Small data — raw injection is safe; compaction won't truncate it.
-                ctx.content_gate.admit_simple(full_data).into_text()
-            }
-        } else if full_tokens > threshold {
-            if let Some(specialist) = ctx.core.specialist_provider.as_ref() {
-                ctx.content_gate
-                    .admit_with_specialist(
-                        full_data,
-                        specialist.as_ref(),
-                        ctx.core.specialist_model.as_deref().unwrap_or(""),
-                    )
-                    .await
-                    .into_text()
-            } else {
-                ctx.content_gate.admit_simple(full_data).into_text()
-            }
-        } else {
-            ctx.content_gate.admit_simple(full_data).into_text()
-        };
-        // Stash the RAW delegated output (pre-runner-summary / pre-gate) for
-        // lossless recall — digesting `injected_raw` directly would store the
-        // summary instead of the original. Then preview injected_raw and add a
-        // recall pointer when the raw was stashed.
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
+        let mut injected = match store_then_render_tool_result(
             &ctx.core.sessions,
             &ctx.session_id,
             &tc.id,
             &tc.name,
+            &tc.arguments,
             full_data,
+            raw_ok,
             cap,
-            force_routed_stash,
         )
         .await
         {
-            Ok(b) => b,
+            Ok(rendered) => ctx.content_gate.admit_simple(&rendered).into_text(),
             Err(sr) => {
                 abort_turn_on_stash_failure(ctx, &tc.id, &tc.name, &sr);
                 // Skip this iteration's post-stash shaping (the abort helper
@@ -741,29 +819,6 @@ pub(crate) async fn execute_tools_delegated(
                 // infra_error check in step_execute_tools finalizes the turn.
                 continue;
             }
-        };
-        let mut injected = if stashed_raw
-            && !is_explicit_retrieval_tool(&tc.name)
-            && full_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES
-        {
-            // Genuinely oversized (over the replay byte cap) non-retrieval
-            // delegated output → handle only. Body lives in the stash; model
-            // recalls it. (A 95KB result replayed raw was the cache-break
-            // class.)
-            render_tool_result_handle(
-                &tc.id,
-                &tc.name,
-                tool_result_ok(full_data),
-                full_data.as_bytes(),
-                &tc.arguments,
-            )
-        } else {
-            // Medium (over the hot-prompt char cap but within the replay byte
-            // cap), retrieval tools (bounded excerpt by design), or small —
-            // excerpt by design), or small — show actual CONTENT via the
-            // deterministic head+tail preview. Handling medium results starved
-            // the model of normal read/exec bytes (2026-07-31 regression).
-            build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
         };
         // Prepend the per-lease progress signal so the model can see
         // remaining budget inline (B3 of the lease design — visible,
@@ -799,6 +854,41 @@ pub(crate) async fn execute_tools_delegated(
         );
         ctx.used_tools.insert(tc.name.clone());
         ctx.persist_pending_protocol_messages().await;
+        let persisted_message_id = ctx
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.get("tool_call_id").and_then(Value::as_str) == Some(tc.id.as_str())
+            })
+            .and_then(|message| message.get("_db_id"))
+            .and_then(Value::as_i64);
+        let Some(persisted_message_id) = persisted_message_id else {
+            ctx.flow.infra_error = Some(format!(
+                "model-visible delegated tool result for {} was not durably persisted",
+                tc.id
+            ));
+            return true;
+        };
+        if let Err(error) = ctx
+            .core
+            .sessions
+            .record_tool_post_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                &injected,
+                persisted_message_id,
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "delegated tool post-execution result for {} could not be recorded: {error}",
+                tc.id
+            ));
+            return true;
+        }
     }
 
     // Inject the runner's summary so the main LLM knows what
@@ -836,21 +926,20 @@ pub(crate) async fn execute_tools_delegated(
 
     // Record learning + audit for all tool results.
     let executor = format!("tool_runner:{}", tr_model);
-    let n_results = run_result.tool_results.len().max(1) as u64;
-    for (tool_call_id, tool_name, data) in &run_result.tool_results {
-        let ok = !data.starts_with("Error:");
-        let per_tool_ms = delegation_elapsed_ms / n_results;
+    for outcome in &run_result.tool_results {
+        let ok = !outcome.data.starts_with("Error:");
+        let per_tool_ms = outcome.duration_ms;
 
         // Only render CallEnd in the TUI for results that the caller asked
-        // for. Internal scratchpad calls the runner made on its own already
+        // for. Internal scratchpad calls the runner made on their own already
         // roll up into the runner-summary user message — emitting a CallEnd
         // for them produces a duplicate identical-duration block per tool.
         if let Some(ref tx) = ctx.tool_event_tx {
-            if is_routed_call(tool_call_id, routed_tool_calls) {
+            if is_routed_call(&outcome.tool_call_id, routed_tool_calls) {
                 let _ = tx.send(ToolEvent::CallEnd {
-                    tool_name: tool_name.clone(),
-                    tool_call_id: tool_call_id.clone(),
-                    result_data: data.clone(),
+                    tool_name: outcome.tool_name.clone(),
+                    tool_call_id: outcome.tool_call_id.clone(),
+                    result_data: outcome.data.clone(),
                     ok,
                     duration_ms: per_tool_ms,
                 });
@@ -859,29 +948,29 @@ pub(crate) async fn execute_tools_delegated(
 
         if let Some(ref audit) = ctx.audit {
             let _ = audit.record(
-                tool_name,
-                tool_call_id,
+                &outcome.tool_name,
+                &outcome.tool_call_id,
                 &json!({}),
-                data,
+                &outcome.data,
                 ok,
                 per_tool_ms,
                 &executor,
             );
         }
 
-        ctx.used_tools.insert(tool_name.clone());
+        ctx.used_tools.insert(outcome.tool_name.clone());
         ctx.turn_tool_entries
             .push(crate::agent::audit::TurnToolEntry {
-                name: tool_name.clone(),
-                id: tool_call_id.clone(),
+                name: outcome.tool_name.clone(),
+                id: outcome.tool_call_id.clone(),
                 ok,
                 duration_ms: per_tool_ms,
-                result_chars: data.len(),
+                result_chars: outcome.data.len(),
             });
 
         // Taint tracking: mark context tainted when a web tool ran via delegation.
         // We don't have the original arguments here, so pass None for detail.
-        ctx.taint_state.mark_tainted(tool_name, None);
+        ctx.taint_state.mark_tainted(&outcome.tool_name, None);
     }
 
     // Behavioral response-boundary arming (mirrors execute_tools_inline).
@@ -889,7 +978,7 @@ pub(crate) async fn execute_tools_delegated(
     let executed: Vec<&str> = run_result
         .tool_results
         .iter()
-        .map(|(_, tool_name, _)| tool_name.as_str())
+        .map(|outcome| outcome.tool_name.as_str())
         .collect();
     if should_arm_boundary(response.content.as_deref(), &executed) {
         ctx.flow.boundary = ResponseBoundary::Pending;
@@ -968,6 +1057,39 @@ struct SingleToolResult {
     arguments: std::collections::HashMap<String, serde_json::Value>,
     result: crate::agent::tools::base::ToolExecutionResult,
     duration_ms: u64,
+    replay_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct ToolReplayRecorder {
+    sessions: Arc<crate::session::SessionDb>,
+    session_id: String,
+    turn_request_id: String,
+    turn_tag: u64,
+}
+
+async fn record_completed_tool(
+    mut result: SingleToolResult,
+    recorder: Option<&ToolReplayRecorder>,
+) -> SingleToolResult {
+    if let Some(recorder) = recorder {
+        if let Err(error) = recorder
+            .sessions
+            .record_tool_execute(
+                &recorder.session_id,
+                &recorder.turn_request_id,
+                recorder.turn_tag,
+                &result.tool_id,
+                result.result.data(),
+                result.result.ok(),
+                result.duration_ms,
+            )
+            .await
+        {
+            result.replay_error = Some(error.to_string());
+        }
+    }
+    result
 }
 
 fn completed_reportable_tool(result: &SingleToolResult) -> Option<&str> {
@@ -998,6 +1120,7 @@ async fn execute_single_tool(
     cancellation_token: &Option<tokio_util::sync::CancellationToken>,
     tool_heartbeat_secs: u64,
     taint_warning: Option<String>,
+    replay_recorder: Option<&ToolReplayRecorder>,
 ) -> SingleToolResult {
     let tool_span = tracing::info_span!(
         "execute_tool_inline",
@@ -1039,15 +1162,20 @@ async fn execute_single_tool(
             .as_ref()
             .is_some_and(|token| token.is_cancelled())
         {
-            return SingleToolResult {
-                tool_name: tc.name.clone(),
-                tool_id: tc.id.clone(),
-                arguments: tc.arguments.clone(),
-                result: crate::agent::tools::base::ToolExecutionResult::failure(
-                    "tool call cancelled".to_string(),
-                ),
-                duration_ms: 0,
-            };
+            return record_completed_tool(
+                SingleToolResult {
+                    tool_name: tc.name.clone(),
+                    tool_id: tc.id.clone(),
+                    arguments: tc.arguments.clone(),
+                    result: crate::agent::tools::base::ToolExecutionResult::failure(
+                        "tool call cancelled".to_string(),
+                    ),
+                    duration_ms: 0,
+                    replay_error: None,
+                },
+                replay_recorder,
+            )
+            .await;
         }
 
         // Spawn heartbeat that emits Progress ticks until the tool finishes.
@@ -1129,13 +1257,18 @@ async fn execute_single_tool(
             duration_ms
         );
 
-        SingleToolResult {
-            tool_name: tc.name.clone(),
-            tool_id: tc.id.clone(),
-            arguments: tc.arguments.clone(),
-            result,
-            duration_ms,
-        }
+        record_completed_tool(
+            SingleToolResult {
+                tool_name: tc.name.clone(),
+                tool_id: tc.id.clone(),
+                arguments: tc.arguments.clone(),
+                result,
+                duration_ms,
+                replay_error: None,
+            },
+            replay_recorder,
+        )
+        .await
     }
     .instrument(tool_span)
     .await
@@ -1151,6 +1284,7 @@ async fn execute_tool_calls_ordered(
     cancellation_token: &Option<tokio_util::sync::CancellationToken>,
     tool_heartbeat_secs: u64,
     taints: Vec<Option<String>>,
+    replay_recorder: Option<&ToolReplayRecorder>,
 ) -> Vec<SingleToolResult> {
     let mut results = Vec::with_capacity(calls.len());
     let mut start = 0;
@@ -1176,6 +1310,7 @@ async fn execute_tool_calls_ordered(
                             cancellation_token,
                             tool_heartbeat_secs,
                             taint,
+                            replay_recorder,
                         )
                     });
                 results.extend(futures_util::future::join_all(futures).await);
@@ -1190,6 +1325,7 @@ async fn execute_tool_calls_ordered(
                     cancellation_token,
                     tool_heartbeat_secs,
                     taints[start].clone(),
+                    replay_recorder,
                 )
                 .await,
             );
@@ -1205,12 +1341,15 @@ async fn execute_tool_calls_ordered(
 ///
 /// This function must run sequentially (one result at a time) because it
 /// mutates `ctx`.
-async fn inject_tool_result(
-    ctx: &mut TurnContext,
-    r: &SingleToolResult,
-    prompt_cap: usize,
-    force_stash_raw: bool,
-) {
+async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_cap: usize) {
+    if let Some(record_error) = &r.replay_error {
+        ctx.flow.infra_error = Some(format!(
+            "tool execution result for {} could not be recorded: {record_error}",
+            r.tool_id
+        ));
+        return;
+    }
+
     // For web_fetch/web_search: unwrap the JSON envelope so the model
     // sees clean article text rather than a JSON metadata summary.
     let result_data = if r.tool_name == "web_fetch" || r.tool_name == "web_search" {
@@ -1219,133 +1358,23 @@ async fn inject_tool_result(
         r.result.data().to_string()
     };
 
-    // Gate tool result through context budget.
-    let threshold = summary_threshold_tokens(&r.tool_name);
     let cap = prompt_cap.max(1);
-    let data = if r.tool_name == "recall_tool_result" {
-        // A recalled body is verbatim what the model asked for, but a large
-        // one cannot enter live context raw: a 172KB recall inflated a
-        // session to 77k tokens and triggered a cache-dropping compaction
-        // (session 20260730_094531_508b68, 2026-07-30). Route it through the
-        // same stash+digest as any other oversized result — the full body is
-        // stashed under this recall's id and the model queries it via
-        // slice_tool_result / search_tool_result.
-        let _stashed_raw = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &r.tool_id,
-            &r.tool_name,
-            &result_data,
-            cap,
-            force_stash_raw,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
-                return;
-            }
-        };
-        // Recall is an explicit-retrieval tool: its result carries a bounded
-        // excerpt (digest_tool_result handles small-as-passthrough + large as
-        // head+tail preview). The full body is stashed for slice/search.
-        let prompt_data =
-            digest_tool_result(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id);
-        ctx.content_gate.admit_simple(&prompt_data).into_text()
-    } else if ctx.core.specialist_provider.is_some()
-        && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > threshold
+    let data = match store_then_render_tool_result(
+        &ctx.core.sessions,
+        &ctx.session_id,
+        &r.tool_id,
+        &r.tool_name,
+        &r.arguments,
+        &result_data,
+        r.result.ok(),
+        cap,
+    )
+    .await
     {
-        // Specialist path: stash the RAW (pre-specialist) output for lossless
-        // recall — without this, recall would return the specialist's summary
-        // instead of the original. Then summarize and preview the summary.
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &r.tool_id,
-            &r.tool_name,
-            &result_data,
-            cap,
-            force_stash_raw,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
-                return;
-            }
-        };
-        let summarized = match ctx.core.specialist_provider.as_ref() {
-            Some(specialist) => ctx
-                .content_gate
-                .admit_with_specialist(
-                    &result_data,
-                    specialist.as_ref(),
-                    ctx.core.specialist_model.as_deref().unwrap_or(""),
-                )
-                .await
-                .into_text(),
-            // Defensive: the caller previously panicked here if the provider
-            // was None; fall back to the simple admit instead.
-            None => ctx.content_gate.admit_simple(&result_data).into_text(),
-        };
-        let mut preview =
-            build_tool_result_preview(&r.tool_name, &r.arguments, &summarized, cap, &r.tool_id);
-        // If the summary fit under cap, build_tool_result_preview returned it
-        // unchanged with no recall pointer — but the raw IS stashed, so tell
-        // the model it can still recover the original.
-        if stashed_raw && !preview.contains("recall_tool_result") {
-            preview.push_str(&format!(
-                "\n[full original output retrievable via recall_tool_result({{\"tool_call_id\": \"{}\"}})]",
-                r.tool_id
-            ));
-        }
-        preview
-    } else {
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &r.tool_id,
-            &r.tool_name,
-            &result_data,
-            cap,
-            force_stash_raw,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
-                return;
-            }
-        };
-        if stashed_raw && result_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES {
-            // GENUINELY oversized (over the replay byte cap): handle only. A
-            // single 95KB result replayed raw was the cache-break class
-            // (token_mismatch under ExactBootstrap). The body lives in the
-            // stash, fetchable via recall_tool_result.
-            let handle = render_tool_result_handle(
-                &r.tool_id,
-                &r.tool_name,
-                r.result.ok(),
-                result_data.as_bytes(),
-                &r.arguments,
-            );
-            ctx.content_gate.admit_simple(&handle).into_text()
-        } else if stashed_raw {
-            // Medium (over the hot-prompt char cap but within the replay byte
-            // cap): show actual CONTENT via a deterministic head+tail preview.
-            // Handling these deprived the model of normal read/exec bytes and
-            // forced hallucination (2026-07-31 regression after the handles
-            // uproot). Stable per-result (body doesn't change) → no cache
-            // drift.
-            build_tool_result_preview(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id)
-        } else {
-            // Small result, not stashed — small enough to carry inline raw
-            // (under both the char cap and the replay byte cap). A handle
-            // would be larger than the body itself.
-            ctx.content_gate.admit_simple(&result_data).into_text()
+        Ok(rendered) => ctx.content_gate.admit_simple(&rendered).into_text(),
+        Err(sr) => {
+            abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
+            return;
         }
     };
 
@@ -1367,6 +1396,41 @@ async fn inject_tool_result(
         );
     }
     ctx.persist_pending_protocol_messages().await;
+    let persisted_message_id = ctx
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some(r.tool_id.as_str())
+        })
+        .and_then(|message| message.get("_db_id"))
+        .and_then(Value::as_i64);
+    let Some(persisted_message_id) = persisted_message_id else {
+        ctx.flow.infra_error = Some(format!(
+            "model-visible tool result for {} was not durably persisted",
+            r.tool_id
+        ));
+        return;
+    };
+    if let Err(record_error) = ctx
+        .core
+        .sessions
+        .record_tool_post_execute(
+            &ctx.session_id,
+            &ctx.request_id,
+            ctx.turn_count,
+            &r.tool_id,
+            &data,
+            persisted_message_id,
+        )
+        .await
+    {
+        ctx.flow.infra_error = Some(format!(
+            "tool post-execution result for {} could not be recorded: {record_error}",
+            r.tool_id
+        ));
+        return;
+    }
     ctx.flow.tool_guard.record_result_with_status(
         &r.tool_name,
         &r.arguments,
@@ -1562,6 +1626,28 @@ pub(crate) async fn execute_tools_inline(
         .iter()
         .partition(|tc| blocks && requires_result_report(&tc.name));
     for tc in &blocked {
+        if let Err(record_error) = ctx
+            .core
+            .sessions
+            .record_tool_pre_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                &tc.name,
+                &tc.arguments,
+                ToolPreExecuteDecision::Rejected {
+                    reason: "response_boundary".to_string(),
+                },
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "tool {} rejection could not be recorded: {record_error}",
+                tc.id
+            ));
+            return;
+        }
         inject_boundary_rejection(ctx, tc);
     }
     ctx.persist_pending_protocol_messages().await;
@@ -1578,6 +1664,38 @@ pub(crate) async fn execute_tools_inline(
         })
         .collect();
 
+    // All policy checks are complete and the assistant carrier is already
+    // durable. Record each ready decision before any tool implementation can
+    // produce a side effect. A storage failure aborts the batch fail-closed.
+    for tc in &allowed {
+        if let Err(record_error) = ctx
+            .core
+            .sessions
+            .record_tool_pre_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                &tc.name,
+                &tc.arguments,
+                ToolPreExecuteDecision::Ready,
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "tool {} was not started because its pre-execution decision could not be recorded: {record_error}",
+                tc.id
+            ));
+            return;
+        }
+    }
+
+    let replay_recorder = ToolReplayRecorder {
+        sessions: Arc::clone(&ctx.core.sessions),
+        session_id: ctx.session_id.clone(),
+        turn_request_id: ctx.request_id.clone(),
+        turn_tag: ctx.turn_count,
+    };
     let ordered_results = execute_tool_calls_ordered(
         &allowed,
         &ctx.tools,
@@ -1585,12 +1703,12 @@ pub(crate) async fn execute_tools_inline(
         &ctx.cancellation_token,
         ctx.core.tool_heartbeat_secs,
         taints,
+        Some(&replay_recorder),
     )
     .await;
     let result_cap = inline_hot_prompt_result_cap_for_ctx_batch(ctx, ordered_results.len());
-    let force_stash_raw = ordered_results.len() > 1;
     for result in &ordered_results {
-        inject_tool_result(ctx, result, result_cap, force_stash_raw).await;
+        inject_tool_result(ctx, result, result_cap).await;
     }
 
     // Behavioral response-boundary arming. `parallel`/`sequential` hold only the
@@ -1726,6 +1844,7 @@ mod tests {
             &cancellation,
             60,
             vec![None; calls.len()],
+            None,
         )
         .await
     }
@@ -2224,6 +2343,7 @@ mod tests {
                 arguments,
                 result: crate::agent::tools::base::ToolExecutionResult::success("ok".to_string()),
                 duration_ms: 0,
+                replay_error: None,
             }
         };
 
@@ -2254,7 +2374,8 @@ mod tests {
             ]),
         };
         for _ in 0..2 {
-            let result = execute_single_tool(&staged, &registry, &None, &None, 60, None).await;
+            let result =
+                execute_single_tool(&staged, &registry, &None, &None, 60, None, None).await;
             assert!(result.result.ok(), "{:?}", result.result.error());
         }
 
@@ -2267,7 +2388,8 @@ mod tests {
                 ("state".to_string(), json!("complete")),
             ]),
         };
-        let result = execute_single_tool(&final_piece, &registry, &None, &None, 60, None).await;
+        let result =
+            execute_single_tool(&final_piece, &registry, &None, &None, 60, None, None).await;
         assert!(result.result.ok(), "{:?}", result.result.error());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "once-done");
     }
@@ -2330,6 +2452,103 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
+    }
+
+    #[tokio::test]
+    async fn tool_execute_events_follow_actual_parallel_completion_order() {
+        // Break caught: raw execution exits are journaled later during
+        // provider-order message injection, obscuring which parallel tool
+        // actually completed first.
+        let state = ProbeState::new();
+        let slow_gate = tokio_util::sync::CancellationToken::new();
+        let fast_gate = tokio_util::sync::CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        register_probe(
+            &mut registry,
+            "slow",
+            ToolConcurrency::ParallelSafe,
+            &state,
+            Some(slow_gate.clone()),
+            false,
+        );
+        register_probe(
+            &mut registry,
+            "fast",
+            ToolConcurrency::ParallelSafe,
+            &state,
+            Some(fast_gate.clone()),
+            false,
+        );
+        let calls = vec![make_tc("slow", "tc-slow"), make_tc("fast", "tc-fast")];
+
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(crate::session::SessionDb::new(
+            &dir.path().join("sessions.db"),
+        ));
+        let session = sessions.create_session("cli:completion-order").await;
+        for call in &calls {
+            sessions
+                .record_tool_pre_execute(
+                    &session.id,
+                    "turn-tools",
+                    1,
+                    &call.id,
+                    &call.name,
+                    &call.arguments,
+                    ToolPreExecuteDecision::Ready,
+                )
+                .await
+                .unwrap();
+        }
+        let recorder = ToolReplayRecorder {
+            sessions: Arc::clone(&sessions),
+            session_id: session.id.clone(),
+            turn_request_id: "turn-tools".to_string(),
+            turn_tag: 1,
+        };
+        let refs = calls.iter().collect::<Vec<_>>();
+        let execution = execute_tool_calls_ordered(
+            &refs,
+            &registry,
+            &None,
+            &None,
+            60,
+            vec![None; calls.len()],
+            Some(&recorder),
+        );
+        let release =
+            async {
+                tokio::time::timeout(Duration::from_secs(1), state.wait_for_started(2))
+                    .await
+                    .expect("parallel calls did not start");
+                fast_gate.cancel();
+                loop {
+                    let events = sessions.load_session_events(&session.id).await.unwrap();
+                    if events.iter().any(|event| matches!(
+                    &event.payload,
+                    crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. }
+                        if tool_call_id == "tc-fast"
+                )) {
+                    break;
+                }
+                    tokio::task::yield_now().await;
+                }
+                slow_gate.cancel();
+            };
+        let (_results, ()) = tokio::join!(execution, release);
+        let completion_order = sessions
+            .load_session_events(&session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. } => {
+                    Some(tool_call_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completion_order, vec!["tc-fast", "tc-slow"]);
     }
 
     #[tokio::test]
@@ -2613,6 +2832,41 @@ mod tests {
             Some(body_a.as_str()),
             "conflicting write must not replace the stored body"
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_result_size_classes_store_before_rendering_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("cli:handle-size-classes").await;
+        let args = HashMap::new();
+
+        for (index, size) in [0usize, 2, 7_400, 8_000, 172_000].into_iter().enumerate() {
+            let body = "x".repeat(size);
+            let id = format!("call_size_{index}");
+            let rendered = store_then_render_tool_result(
+                &sessions,
+                &session.id,
+                &id,
+                "web_fetch",
+                &args,
+                &body,
+                true,
+                4_096,
+            )
+            .await
+            .expect("ordinary result must be stored before rendering");
+
+            assert!(
+                rendered.starts_with(TOOL_RESULT_HANDLE_MARKER),
+                "size {size} must use the ordinary handle wire: {rendered}"
+            );
+            assert_eq!(
+                sessions.load_tool_result(&session.id, &id).await.as_deref(),
+                Some(body.as_str()),
+                "size {size} must remain losslessly recoverable"
+            );
+        }
     }
 
     /// STEP 2: the canonical handle must be a pure deterministic function of

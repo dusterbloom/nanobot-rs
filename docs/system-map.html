@@ -1,0 +1,858 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanobot-rs · isometric system map</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#11151f; --panel2:#161b28; --line:#232a3a;
+    --txt:#dbe2ef; --dim:#8b94a7; --faint:#5b6474;
+    --ctl:#e6edf3; --dat:#22d3ee; --hot:#facc15; --acc:#7aa2f7;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font:14px/1.45 ui-monospace,'SF Mono',Menlo,Consolas,monospace;overflow:hidden}
+  header{display:flex;align-items:center;gap:10px;padding:8px 14px;
+    border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+  header h1{font-size:14px;margin:0;font-weight:600;letter-spacing:.4px;white-space:nowrap}
+  .chip{font-size:11px;color:var(--dim);border:1px solid var(--line);
+    border-radius:99px;padding:2px 9px;white-space:nowrap}
+  .chip b{color:var(--txt);font-weight:600}
+  #q{background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+    color:var(--txt);padding:4px 9px;font:inherit;font-size:12.5px;width:200px;outline:none;margin-left:auto}
+  #q:focus{border-color:var(--acc)}
+
+  #chips{display:flex;gap:6px;align-items:center;padding:6px 14px;border-bottom:1px solid var(--line);
+    background:var(--panel);flex-wrap:wrap}
+  .dchip{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim);cursor:pointer;
+    border:1px solid var(--line);border-radius:99px;padding:2px 10px;user-select:none;white-space:nowrap}
+  .dchip .dot{width:9px;height:9px;border-radius:3px}
+  .dchip.on{color:var(--txt);border-color:#394661;background:var(--panel2)}
+  .dchip.off{opacity:.38;text-decoration:line-through}
+  .ksep{color:var(--faint);font-size:11px;margin:0 4px}
+  .ktog{font-size:11.5px;color:var(--dim);display:flex;gap:4px;align-items:center;cursor:pointer;user-select:none}
+  .ktog input{accent-color:var(--acc)}
+
+  main{position:relative;height:calc(100% - 84px)}
+  #stage{position:absolute;inset:0;overflow:hidden;cursor:grab;touch-action:none}
+  #stage.drag{cursor:grabbing}
+  svg#iso{width:100%;height:100%;display:block}
+  #tooltip{position:absolute;pointer-events:none;background:#0b0e14e8;border:1px solid var(--line);
+    border-radius:8px;padding:6px 11px;font-size:12px;display:none;z-index:6;max-width:340px;white-space:normal}
+  #tooltip .loc{color:var(--dim)}
+  #tooltip .tc{color:#9ecbff;font-size:11px;margin-top:2px;line-height:1.5}
+
+  /* control cluster */
+  #ctrls{position:absolute;right:14px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:5}
+  #ctrls .row{display:flex;gap:6px}
+  #ctrls button{width:38px;height:34px;background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    color:var(--txt);font:inherit;font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+  #ctrls button:hover{border-color:var(--acc);color:#9ecbff}
+  #ctrls .zbar{display:flex;flex-direction:column;gap:2px;background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:4px}
+  #ctrls .zbar button{border:none;background:none;width:30px;height:26px;border-radius:5px}
+  #compass{width:38px;height:34px;background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    display:flex;align-items:center;justify-content:center;position:relative}
+  #compass .needle{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    transition:transform .1s linear}
+  #compass .needle b{font-size:12px;color:#f87171;font-weight:700}
+  #ctrls .hint{font-size:10px;color:var(--faint);text-align:center}
+
+  /* minimap */
+  #mmwrap{position:absolute;left:14px;bottom:14px;z-index:5;background:#000a;border:1px solid var(--line);
+    border-radius:10px;padding:6px;cursor:crosshair}
+  #mmwrap .t{font-size:10px;color:var(--faint);text-align:center;margin-bottom:2px;letter-spacing:.6px}
+  #mm{display:block}
+
+  /* help overlay */
+  #help{position:absolute;inset:0;background:#000b;z-index:10;display:none;align-items:center;justify-content:center}
+  #help.show{display:flex}
+  #help .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 26px;max-width:560px}
+  #help h2{margin:0 0 10px;font-size:15px}
+  #help table{border-collapse:collapse;font-size:12.5px}
+  #help td{padding:3px 12px 3px 0;color:var(--dim)}
+  #help td:first-child{color:var(--txt);white-space:nowrap}
+  kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;
+    padding:0 5px;font:inherit;font-size:11px}
+
+  /* header buttons */
+  .hbtn{background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--txt);
+    font:inherit;font-size:12px;padding:4px 11px;cursor:pointer;white-space:nowrap}
+  .hbtn:hover{border-color:var(--acc);color:#9ecbff}
+
+  /* slide-over drawer: full details + explainer (overlays the map) */
+  #drawer{position:absolute;top:0;right:0;bottom:0;width:420px;max-width:92vw;
+    border-left:1px solid var(--line);background:var(--panel);overflow-y:auto;padding:16px;
+    transform:translateX(103%);transition:transform .22s ease;z-index:8;box-shadow:-24px 0 60px #000a}
+  #drawer.show{transform:translateX(0)}
+  #drawer .dclose{float:right;background:none;border:1px solid var(--line);border-radius:6px;
+    color:var(--dim);cursor:pointer;font:inherit;font-size:13px;padding:1px 9px}
+  #drawer .dclose:hover{color:var(--txt);border-color:var(--acc)}
+  #drawer h2{font-size:14px;margin:0 0 4px}
+  #drawer h3{font-size:12px;margin:18px 0 6px;color:var(--dim);text-transform:uppercase;
+    letter-spacing:.8px;border-bottom:1px solid var(--line);padding-bottom:4px}
+
+  /* pinned floating inspector: non-intrusive building details */
+  #inspector{position:absolute;top:14px;right:14px;width:350px;max-width:calc(100% - 28px);
+    max-height:calc(100% - 200px);overflow:auto;background:var(--panel);border:1px solid var(--line);
+    border-radius:12px;padding:14px 16px;z-index:7;display:none;box-shadow:0 14px 44px #000b}
+  #inspector .head{display:flex;align-items:flex-start;gap:10px}
+  #inspector h2{font-size:14px;margin:0;flex:1}
+  #inspector .x{background:none;border:none;color:var(--dim);cursor:pointer;font:inherit;font-size:16px;padding:0 2px}
+  #inspector .x:hover{color:var(--txt)}
+  #inspector h3{font-size:11px;margin:12px 0 4px;color:var(--dim);text-transform:uppercase;
+    letter-spacing:.8px;border-bottom:1px solid var(--line);padding-bottom:3px;display:flex;justify-content:space-between;align-items:center}
+  #inspector h3 .ct{font-size:10px;color:var(--faint);cursor:pointer;text-transform:none;letter-spacing:0}
+  #inspector h3 .ct:hover{color:#9ecbff}
+  #inspector .fbody.collapsed{display:none}
+  #inspector .desc{color:var(--dim);font-size:12px;margin:6px 0 0}
+  #inspector .ft{display:flex;gap:8px;margin-top:10px}
+  #inspector .ft button{flex:1;margin-top:0}
+  .back{color:var(--acc);cursor:pointer;font-size:12px;display:inline-block;margin-bottom:8px}
+  .back:hover{text-decoration:underline}
+  .file{margin:7px 0}
+  .file .path{color:var(--txt);font-size:12.5px}
+  .file .loc{color:var(--faint);font-size:11px;margin-left:6px}
+  .cite{display:inline-block;font-size:11px;color:#9ecbff;background:#1a2333;
+    border:1px solid #26334a;border-radius:4px;padding:1px 6px;margin:2px 4px 0 0}
+  .flows .flow{font-size:12px;margin:3px 0;color:var(--dim)}
+  .flows .flow b{color:var(--txt);font-weight:500;cursor:pointer}
+  .flows .flow b:hover{color:#9ecbff}
+  .walk{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0;background:var(--panel2)}
+  .walk .wt{font-size:12.5px;font-weight:600;margin-bottom:3px}
+  .walk .wb{font-size:12px;color:var(--dim)}
+  .walk button{margin-top:6px;background:#1a2333;color:#9ecbff;border:1px solid #26334a;
+    border-radius:6px;padding:3px 10px;font:inherit;font-size:11.5px;cursor:pointer}
+  .walk button:hover{border-color:var(--acc)}
+  .walk button.on{background:#233046;border-color:var(--acc)}
+  .iso-btn{margin-top:8px;background:#1a2333;color:#9ecbff;border:1px solid #26334a;border-radius:6px;
+    padding:3px 10px;font:inherit;font-size:11.5px;cursor:pointer}
+  .iso-btn:hover{border-color:var(--acc)}
+  .lg-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim);margin:4px 0}
+  .sw{width:14px;height:14px;border-radius:3px;flex:none}
+  .tag{font-size:10px;border-radius:4px;padding:0 5px;margin-left:6px;vertical-align:middle}
+  .tag.new{color:#4ade80;border:1px solid #2f5d3f;background:#12241a}
+  .tag.hot{color:var(--hot);border:1px solid #5d512f;background:#241f12}
+  .badge-district{font-size:10.5px;padding:1px 8px;border-radius:99px;display:inline-block}
+
+  /* svg state */
+  .bld{cursor:pointer}
+  .bld .top{transition:filter .12s}
+  .bld:hover .top{filter:brightness(1.4);stroke-width:3}
+  .bld.sel .top{filter:brightness(1.5);stroke-width:3}
+  .bld.dim{opacity:.16}
+  .bld.dim2{opacity:.35}
+  .edge{fill:none;stroke-width:1.6;pointer-events:stroke;cursor:pointer}
+  .edge.ctl{stroke:var(--ctl);opacity:.5}
+  .edge.dat{stroke:var(--dat);stroke-dasharray:5 4;opacity:.55}
+  .edge.hl{opacity:1;stroke-width:2.6}
+  .edge.dim{opacity:.05;pointer-events:none}
+  .edge.sel{opacity:1;stroke-width:3}
+  .elabel{font-size:10px;fill:#9ecbff;paint-order:stroke;stroke:#0b0e14;stroke-width:3px;pointer-events:none}
+  .bl-label{font-size:11.5px;fill:var(--txt);text-anchor:middle;paint-order:stroke;
+    stroke:#0b0e14;stroke-width:3.5px;font-weight:600;pointer-events:none}
+  .bl-sub{font-size:9.5px;fill:var(--dim);text-anchor:middle;paint-order:stroke;
+    stroke:#0b0e14;stroke-width:3px;pointer-events:none}
+  .pdot{pointer-events:none}
+  .hidden{display:none}
+  #iso.rot .lb,#iso.rot .elabel,#iso.rot .pdot,#iso.rot .pdot2{display:none}
+  ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:#2a3348;border-radius:9px}
+</style>
+</head>
+<body>
+<header>
+  <h1>nanobot-rs · isometric system map</h1>
+  <span class="chip">branch <b>refactoring/maximum-speed-with-less-code</b> @ <b>c4a0d9b</b></span>
+  <span class="chip">vs main <b>+20,045 / −2,744</b> · 151 files</span>
+  <input id="q" type="search" placeholder="filter buildings / files…  ( / )">
+  <button class="hbtn" id="b-explain">ⓘ explain &amp; legend</button>
+</header>
+<div id="chips"></div>
+<main>
+  <div id="stage">
+    <svg id="iso" width="100%" height="100%">
+      <defs>
+        <marker id="arr-ctl" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#e6edf3"/>
+        </marker>
+        <marker id="arr-dat" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#22d3ee"/>
+        </marker>
+      </defs>
+      <g id="world"></g>
+    </svg>
+    <div id="tooltip"></div>
+
+    <div id="inspector"></div>
+
+    <div id="mmwrap"><div class="t">MINIMAP</div><svg id="mm" width="190" height="130"></svg></div>
+
+    <div id="ctrls">
+      <div class="row">
+        <button id="b-ccw" title="rotate counter-clockwise (Q)">⟲</button>
+        <button id="b-cw" title="rotate clockwise (E)">⟳</button>
+        <div id="compass" title="north"><div class="needle" id="needle"><b>N</b></div></div>
+      </div>
+      <div class="row">
+        <div class="zbar">
+          <button id="b-zi" title="zoom in (+)">＋</button>
+          <button id="b-zo" title="zoom out (−)">－</button>
+        </div>
+        <button id="b-fit" title="fit to view (F)">⤢</button>
+        <button id="b-help" title="help (?)">?</button>
+      </div>
+      <div class="hint">Q/E rotate</div>
+    </div>
+
+    <div id="help">
+      <div class="card">
+        <h2>controls</h2>
+        <table>
+          <tr><td>drag / <kbd>WASD</kbd> <kbd>←↑↓→</kbd></td><td>pan</td></tr>
+          <tr><td>wheel / <kbd>+</kbd> <kbd>−</kbd></td><td>zoom (to cursor)</td></tr>
+          <tr><td><kbd>Q</kbd> / <kbd>E</kbd> or ⟲ ⟳</td><td>rotate the city 90°</td></tr>
+          <tr><td><kbd>F</kbd> or ⤢</td><td>fit everything to view</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>clear selection → filters → close help</td></tr>
+          <tr><td>click building</td><td>pin compact inspector (files, lines, flows)</td></tr>
+          <tr><td>“full details” / ⓘ explain</td><td>slide-over drawer (walks, legend)</td></tr>
+          <tr><td>double-click building</td><td>isolate its district</td></tr>
+          <tr><td>click a path</td><td>inspect that control/data edge</td></tr>
+          <tr><td>district chips</td><td>toggle visibility · double-click = solo</td></tr>
+          <tr><td><kbd>/</kbd></td><td>focus the search box</td></tr>
+          <tr><td>▸ trace (explainer)</td><td>animate one payload walk</td></tr>
+        </table>
+        <p style="color:var(--faint);font-size:11.5px;margin:14px 0 0">solid ═▶ control (invocation) · dashed ┄▶ + moving dot = data/payload · height ∝ LOC · ★ branch-hot · ◄NEW new on branch</p>
+      </div>
+    </div>
+  </div>
+  <aside id="drawer"></aside>
+</main>
+
+<script>
+"use strict";
+// ═══════════════════ data (verified vs repo @ c4a0d9b) ═══════════════════
+const D={
+  entry:  {c:'#818cf8', n:'entry / UI'},
+  chan:   {c:'#2dd4bf', n:'channels'},
+  bus:    {c:'#f97316', n:'message bus'},
+  core:   {c:'#a78bfa', n:'agent core'},
+  cache:  {c:'#facc15', n:'cache / prefix'},
+  prov:   {c:'#fb7185', n:'providers'},
+  tools:  {c:'#4ade80', n:'tool execution'},
+  session:{c:'#22d3ee', n:'session store'},
+  memory: {c:'#e879f9', n:'memory campus'},
+  ops:    {c:'#94a3b8', n:'ops / infra'},
+};
+const BLD=[
+ {id:'cli',n:'CLI',x:4,y:2,w:2,d:1,h:1.6,dis:'entry',loc:1591,
+  desc:'clap command surface; `nanobot` subcommands (sessions, skills, voice, provider).',
+  files:[['src/cli/mod.rs',1591,[['—','Cli parse → app::run']]],['src/cli/core_builder.rs',0,[]]]},
+ {id:'repl',n:'REPL',x:7,y:1,w:2,d:2,h:3.2,dis:'entry',loc:5144,
+  desc:'interactive terminal loop; lifecycle commands (/local, model switching, resume).',
+  files:[['src/repl/mod.rs',3195,[]],['src/repl/commands/mod.rs',2009,[]],['src/repl/commands/lifecycle.rs',1639,[['—','/local toggle, Higgs supervision']]]]},
+ {id:'tui',n:'TUI',x:10,y:0,w:2,d:2,h:6.5,dis:'entry',loc:8019,
+  desc:'full-screen terminal UI; owns the terminal, transcript and input box.',
+  files:[['src/tui_app/app.rs',6709,[[223,'pal()']]],['src/tui_app/mod.rs',1310,[]]]},
+ {id:'app',n:'APP',x:6,y:3.2,w:3,d:1,h:1.0,dis:'entry',loc:926,
+  desc:'process entry: pid cleanup, panic hook, tracing setup, dispatch to REPL/TUI/serve.',
+  files:[['src/app.rs',926,[[328,'run()']]],['src/main.rs',23,[[21,'fn main → nanobot::run()']]]]},
+ {id:'telegram',n:'TELEGRAM',x:2,y:5,w:2,d:2,h:1.2,dis:'chan',
+  files:[['src/channels/telegram.rs',0,[[680,'markdown_to_telegram_html()']]]],
+  desc:'Telegram Bot API adapter; markdown → Telegram HTML on the way out.'},
+ {id:'whatsapp',n:'WHATSAPP',x:4.2,y:6,w:2,d:1,h:1.0,dis:'chan',
+  files:[['src/channels/whatsapp.rs',0,[]],['bridge/whatsapp/index.js',0,[['—','node bridge entry']]]],
+  desc:'WhatsApp adapter + node.js bridge process.'},
+ {id:'email',n:'EMAIL',x:2,y:7.2,w:2,d:2,h:1.5,dis:'chan',loc:1479,
+  files:[['src/channels/email.rs',1479,[[468,'send_email()']]]],
+  desc:'SMTP/IMAP channel; MIME compose + send.'},
+ {id:'chanmgr',n:'CH MGR',x:2.2,y:3.6,w:1,d:1,h:0.7,dis:'chan',
+  files:[['src/channels/manager.rs',0,[[45,'struct ChannelManager']]]],
+  desc:'owns/starts all channel adapters.'},
+ {id:'bus',n:'BUS',x:7,y:6,w:1.4,d:1.4,h:0.8,dis:'bus',
+  desc:'in-process message bus: bounded queues, one dispatcher.',
+  files:[['src/bus/queue.rs',0,[[31,'struct MessageBus'],[62,'publish_inbound()']]],['src/bus/events.rs',0,[[17,'InboundMessage'],[68,'OutboundMessage'],[108,'coalesce_messages()'],[151,'should_coalesce()']]]]},
+ {id:'core',n:'AGENT CORE',x:9,y:4,w:3,d:3,h:6.5,dis:'core',loc:14199,
+  desc:'the hot path: builds context, calls the LLM, runs tools, emits reply. One loop, no fallback pipelines.',
+  files:[['src/agent/agent_loop/mod.rs',0,[[86,'struct AgentLoop']]],['src/agent/agent_loop/shared.rs',6046,[[292,'prompt fingerprint tracking'],[569,'fingerprint insert']]],['src/agent/agent_core.rs',3350,[]],['src/agent/context.rs',3020,[[1766,'make_context()']]],['src/agent/protocol.rs',1683,[]],['src/agent/router.rs',2801,[[273,'parse_lenient_router_decision()']]]]},
+ {id:'spire',n:'RESP·BUDGET',x:10,y:5,w:1,d:1,h:1.2,dis:'core',z0:6.5,
+  desc:'agent_loop spire: response finalisation + turn token budget.',
+  files:[['src/agent/agent_loop/response.rs',1650,[]],['src/agent/agent_loop/budget.rs',0,[]]]},
+ {id:'hostbridge',n:'HOST BRIDGE',x:12.3,y:5,w:1,d:1,h:1.0,dis:'core',tag:'new',loc:958,
+  desc:'NEW on this branch: host-side bridge for delegated calls (error-protocol layer).',
+  files:[['src/agent/host_bridge.rs',958,[]]]},
+ {id:'higgs',n:'HIGGS',x:8,y:8.2,dome:1.0,dis:'cache',tag:'hot',
+  desc:'★ local Higgs model-server supervision + session-cache gate.',
+  files:[['src/higgs.rs',1516,[[297,'find_existing_higgs_process()'],[425,'higgs_config_paths()']]],['src/session/db.rs',0,[[851,'supports_higgs_session_cache()']]]]},
+ {id:'prefix',n:'PREFIX GUARD',x:6.8,y:9.2,w:1,d:1,h:0.8,dis:'cache',tag:'hot',
+  desc:'★ guards prompt-prefix identity between session replay and provider.',
+  files:[['src/agent/prefix_guard.rs',0,[]]]},
+ {id:'fingerprint',n:'FINGERPRINT',x:9.2,y:9.2,w:1,d:1,h:1.0,dis:'cache',tag:'hot',
+  desc:'★ per-session PromptFingerprint; enables exact-prefix cache retention (3c9133d, c4a0d9b).',
+  files:[['src/agent/prompt_fingerprint.rs',0,[]]]},
+ {id:'factory',n:'FACTORY',x:18,y:1,w:1,d:1,h:0.8,dis:'prov',
+  desc:'selects provider: OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM.',
+  files:[['src/providers/factory.rs',0,[[25,'struct ProviderSpec']]]]},
+ {id:'jitgate',n:'JIT GATE',x:18,y:3,w:1,d:1,h:0.7,dis:'prov',
+  desc:'JIT model-loading gate for local runtimes.',
+  files:[['src/providers/jit_gate.rs',0,[[27,'struct JitGate']]]]},
+ {id:'openai',n:'OPENAI COMPAT',x:15,y:1,w:2,d:2,h:4.8,dis:'prov',loc:4814,
+  desc:'one HTTP client for 9 OpenAI-compatible providers (OR/DS/OAI/Gemini/Zhipu/Groq/vLLM/LM Studio).',
+  files:[['src/providers/openai_compat.rs',4814,[[40,'struct OpenAICompatProvider'],[572,'ensure_required_keys()'],[1627,'parse_response()']]]]},
+ {id:'anthropic',n:'ANTHROPIC',x:17,y:4,w:2,d:2,h:1.3,dis:'prov',loc:1266,
+  desc:'native Anthropic Messages API client.',
+  files:[['src/providers/anthropic.rs',1266,[[54,'struct AnthropicProvider']]]]},
+ {id:'engine',n:'TOOL ENGINE',x:13,y:5.2,w:2,d:2,h:4.4,dis:'tools',loc:4371,
+  desc:'runs tool calls from the loop: dispatch, guards, result shaping.',
+  files:[['src/agent/tool_engine.rs',3067,[]],['src/agent/tool_runner/mod.rs',1304,[]]]},
+ {id:'registry',n:'REGISTRY',x:14,y:8,w:2,d:1,h:3.6,dis:'tools',loc:3643,
+  desc:'tool registry: names → implementations, schema assembly.',
+  files:[['src/agent/tools/registry.rs',3643,[]],['src/agent/tools/base.rs',0,[]],['src/agent/tool_wiring.rs',0,[]]]},
+ {id:'shell',n:'SHELL',x:11,y:10,w:1,d:1,h:1.6,dis:'tools',loc:1614,
+  files:[['src/agent/tools/shell.rs',1614,[[606,'make_exec_tool()'],[611,'guard() — deny-pattern check']]]],
+  desc:'shell exec with deny-pattern guard (AGENTS.md safety rule).'},
+ {id:'fs',n:'FILE SYS',x:13,y:10,w:1,d:1,h:2.7,dis:'tools',loc:2736,
+  files:[['src/agent/tools/filesystem/mod.rs',2736,[[58,'make_params()'],[1379,'inner()']]],['src/agent/tools/filesystem/write.rs',0,[]]],
+  desc:'workspace-aware file read/write/edit; path validation.'},
+ {id:'web',n:'WEB',x:15,y:10,w:1,d:1,h:1.8,dis:'tools',loc:1806,
+  files:[['src/agent/tools/web.rs',1806,[[49,'normalize_whitespace()']]]],
+  desc:'fetch + read-page; content marked tainted before reaching exec tools.'},
+ {id:'spawn',n:'SPAWN',x:11,y:12,w:1,d:1,h:1.9,dis:'tools',loc:1948,
+  files:[['src/agent/tools/spawn.rs',1948,[[608,'test_host()']]]],
+  desc:'subagent spawn (cavecrew-style workers).'},
+ {id:'pykern',n:'PY KERN',x:13,y:12,w:1,d:1,h:0.8,dis:'tools',tag:'new',loc:416,
+  files:[['src/agent/tools/python_kernel.rs',416,[]]],
+  desc:'NEW on this branch: persistent python kernel tool.'},
+ {id:'recall',n:'RECALL',x:15,y:12,w:1,d:1,h:1.3,dis:'tools',loc:1273,
+  files:[['src/agent/tools/recall.rs',1273,[]],['src/agent/tools/stash_search.rs',0,[]]],
+  desc:'session-history semantic recall.'},
+ {id:'session',n:'SESSION VAULT',x:4,y:11,w:4,d:2,h:1.2,dis:'session',loc:7389,
+  desc:'SQLite sessions.db: append-only turn history, replay, filters.',
+  files:[['src/session/db.rs',6050,[[3649,'make_db()']]],['src/session/filters.rs',1339,[[117,'filter_history()']]]]},
+ {id:'lcm',n:'LCM',x:8,y:10.2,w:2,d:2,h:5.2,dis:'memory',loc:5224,
+  desc:'long-context memory: ingests turns, emits summaries fed back into context.',
+  files:[['src/agent/lcm.rs',5224,[[408,'len()'],[2156,'ingest()']]]]},
+ {id:'memory',n:'MEMORY',x:5,y:13.2,w:1,d:1,h:0.9,dis:'memory',
+  files:[['src/agent/memory.rs',0,[]]],
+  desc:'on-disk MEMORY.md, injected into every context.'},
+ {id:'skills',n:'SKILLS',x:7,y:13.2,w:1,d:1,h:1.5,dis:'memory',loc:1472,
+  files:[['src/agent/skills.rs',1472,[[743,'make_workspace_with_skill()']]]],
+  desc:'workspace skills (~/.nanobot/workspace).'},
+ {id:'know',n:'KNOWLDG',x:9,y:13.2,w:1,d:1,h:1.1,dis:'memory',loc:1076,
+  files:[['src/agent/knowledge_store.rs',1076,[]]],
+  desc:'knowledge store backing recall / graph.'},
+ {id:'cluster',n:'CLUSTER',x:12,y:14,w:1,d:1,h:1.3,dis:'ops',loc:1296,
+  files:[['src/cluster/discovery.rs',1296,[]],['src/cluster/router.rs',0,[]],['src/cluster/state.rs',0,[]]],
+  desc:'mDNS peer discovery + cluster routing.'},
+ {id:'cron',n:'CRON·HB',x:14,y:14,w:1,d:1,h:0.8,dis:'ops',
+  files:[['src/cron/',0,[]],['src/heartbeat/',0,[]]],
+  desc:'timers: cron jobs + heartbeat re-enter via the bus.'},
+ {id:'server',n:'SERVER',x:16,y:14,w:1,d:1,h:1.3,dis:'ops',loc:1348,
+  files:[['src/server.rs',1348,[]]],
+  desc:'RPC server for bridges / remote control.'},
+];
+const byId=Object.fromEntries(BLD.map(b=>[b.id,b]));
+const NAME={cloud:'CLOUD LLM pool',...Object.fromEntries(BLD.map(b=>[b.id,b.n]))};
+const cloud={x:17.4,y:-1.6,z:9};
+const EDGES=[
+ {id:'cli-app',   f:'cli',t:'app',k:'ctl',l:'argv'},
+ {id:'repl-app',  f:'repl',t:'app',k:'ctl',l:''},
+ {id:'tui-app',   f:'tui',t:'app',k:'ctl',l:''},
+ {id:'app-core',  f:'app',t:'core',k:'ctl',l:'run'},
+ {id:'repl-core', f:'repl',t:'core',k:'ctl',l:'local turn',via:[[8.6,3.2,1.5]]},
+ {id:'tg-bus',    f:'telegram',t:'bus',k:'dat',l:'◆msg'},
+ {id:'wa-bus',    f:'whatsapp',t:'bus',k:'dat',l:'◆msg'},
+ {id:'em-bus',    f:'email',t:'bus',k:'dat',l:'◆msg',via:[[4.6,7,1]]},
+ {id:'bus-core',  f:'bus',t:'core',k:'ctl',l:'dispatch'},
+ {id:'core-eng',  f:'core',t:'engine',k:'ctl',l:'◆call'},
+ {id:'eng-reg',   f:'engine',t:'registry',k:'ctl',l:''},
+ {id:'reg-shell', f:'registry',t:'shell',k:'dat',l:'◆exec',via:[[13.2,9.6,1.4]]},
+ {id:'reg-fs',    f:'registry',t:'fs',k:'dat',l:'◆exec'},
+ {id:'reg-web',   f:'registry',t:'web',k:'dat',l:'◆exec'},
+ {id:'reg-spawn', f:'registry',t:'spawn',k:'dat',l:'◆exec',via:[[12.6,10.8,1.8]]},
+ {id:'reg-py',    f:'registry',t:'pykern',k:'dat',l:'◆exec',via:[[13.6,10.8,1.2]]},
+ {id:'reg-recall',f:'registry',t:'recall',k:'dat',l:'◆exec',via:[[14.6,10.8,1.4]]},
+ {id:'core-fact', f:'core',t:'factory',k:'ctl',l:'chat',via:[[13.4,4.2,2.5]]},
+ {id:'fact-oai',  f:'factory',t:'openai',k:'ctl',l:''},
+ {id:'fact-ant',  f:'factory',t:'anthropic',k:'ctl',l:'',via:[[18.4,3.4,1.2]]},
+ {id:'oai-cloud', f:'openai',t:'cloud',k:'dat',l:'HTTPS·SSE',via:[[16.6,0.6,6.4]]},
+ {id:'ant-cloud', f:'anthropic',t:'cloud',k:'dat',l:'HTTPS',via:[[18.6,3.2,3.4]]},
+ {id:'core-higgs',f:'core',t:'higgs',k:'dat',l:'◆key',via:[[9.4,7.4,1.6]]},
+ {id:'core-fp',   f:'core',t:'fingerprint',k:'dat',l:'◆fp',via:[[9.6,8,2.2]]},
+ {id:'core-pfx',  f:'core',t:'prefix',k:'dat',l:'◆prefix',via:[[8.4,8,2.0]]},
+ {id:'core-sess', f:'core',t:'session',k:'dat',l:'◆sql ▾persist',via:[[7.6,8.6,1.4]]},
+ {id:'sess-core', f:'session',t:'core',k:'dat',l:'▴replay',via:[[6.6,8.2,2.0]]},
+ {id:'lcm-core',  f:'lcm',t:'core',k:'dat',l:'◆ctx ▴',via:[[9.2,8.6,3.2]]},
+ {id:'mem-lcm',   f:'memory',t:'lcm',k:'dat',l:'MEMORY.md',via:[[6.8,11.6,1.4]]},
+ {id:'skl-core',  f:'skills',t:'core',k:'dat',l:'◆ctx',via:[[7.4,11.4,3.6]]},
+ {id:'know-recall',f:'know',t:'recall',k:'dat',l:'',via:[[10.4,12.6,1.6]]},
+ {id:'clu-core',  f:'cluster',t:'core',k:'dat',l:'mdns',via:[[12.4,9.4,1.8]]},
+ {id:'cron-bus',  f:'cron',t:'bus',k:'ctl',l:'timer',via:[[10,10,2.6]]},
+ {id:'core-bus',  f:'core',t:'bus',k:'dat',l:'◆out'},
+ {id:'bus-tg',    f:'bus',t:'telegram',k:'dat',l:'◆out',via:[[4.6,5.6,1]]},
+ {id:'bus-wa',    f:'bus',t:'whatsapp',k:'dat',l:'◆out'},
+ {id:'bus-em',    f:'bus',t:'email',k:'dat',l:'◆out',via:[[4.2,7,1]]},
+ {id:'core-hb',   f:'core',t:'hostbridge',k:'ctl',l:'delegated'},
+ {id:'srv-bus',   f:'server',t:'bus',k:'dat',l:'rpc',via:[[10.6,10.4,2.8]]},
+ {id:'jit-fact',  f:'jitgate',t:'factory',k:'ctl',l:''},
+];
+const EDESC={
+ msg:'InboundMessage payload (bus/events.rs:17), coalesced per channel (events.rs:108).',
+ out:'OutboundMessage reply (bus/events.rs:68) → channel formatting.',
+ sse:'chat completions over HTTPS; SSE stream parsed in openai_compat.rs:1627.',
+ sql:'turn append to SQLite sessions.db (session/db.rs).',
+ replay:'append-only history replay, filtered by session/filters.rs:117.',
+ ctx:'context payload injected into make_context (agent/context.rs:1766).',
+ key:'session-cache key handoff to Higgs gate (db.rs:851, higgs.rs:297).',
+ exec:'tool invocation via registry → tool_engine; shell guarded at shell.rs:611.',
+ call:'tool-call dispatch from the agent loop.',
+};
+const WALKS=[
+ {t:'1 · inbound turn',b:'telegram/whatsapp/email → InboundMessage → coalesce_messages → MessageBus.publish_inbound → AgentLoop.',e:['tg-bus','wa-bus','em-bus','bus-core']},
+ {t:'2 · context assembly',b:'vault replay (filter_history) + LCM summaries + MEMORY.md/skills → make_context → core.',e:['sess-core','lcm-core','mem-lcm','skl-core']},
+ {t:'3 · LLM call',b:'core → factory → OpenAICompatProvider (SSE) or native Anthropic → cloud.',e:['core-fact','fact-oai','fact-ant','oai-cloud','ant-cloud']},
+ {t:'4 · tool exec',b:'core → tool_engine → registry fan-out to kiosks; shell deny-checks at guard(); errors classified (errors.rs:232).',e:['core-eng','eng-reg','reg-shell','reg-fs','reg-web','reg-spawn','reg-py','reg-recall']},
+ {t:'5 · persist / replay',b:'every turn appended to sessions.db; append-only replay verified (commit 60a2a8e).',e:['core-sess','sess-core']},
+ {t:'6 · cache lane ★',b:'PromptFingerprint per session + prefix_guard + Higgs session-cache gate — this branch: exact-prefix retention (3c9133d) + inspectable live gate (c4a0d9b).',e:['core-fp','core-pfx','core-higgs']},
+ {t:'7 · outbound',b:'finalize_response → OutboundMessage → channel formatting (telegram html / email send).',e:['core-bus','bus-tg','bus-wa','bus-em']},
+ {t:'8 · ops',b:'cron/heartbeat timers and cluster mDNS peering re-enter via the bus; server.rs exposes RPC for bridges.',e:['cron-bus','clu-core','srv-bus']},
+];
+
+// ═══════════════════ state ═══════════════════
+const S={theta:0,thetaT:0,vx:0,vy:0,vs:1,
+  hide:new Set(),kinds:{ctl:true,dat:true},labels:true,grid:true,
+  sel:null,esel:null,traced:null,query:''};
+const TW=64,TH=32,ZH=26,OX=690,OY=185,C={x:10,y:7};
+
+// ═══════════════════ projection (rotating) ═══════════════════
+function rot(x,y,th){const dx=x-C.x,dy=y-C.y,c=Math.cos(th),s=Math.sin(th);
+  return [C.x+dx*c-dy*s, C.y+dx*s+dy*c];}
+const iso=(x,y,z=0)=>{const [rx,ry]=rot(x,y,S.theta);
+  return [ (rx-ry)*TW/2+OX, (rx+ry)*TH/2 - z*ZH + OY ];};
+const uniso=(sx,sy)=>{const rx=(sx-OX)/TW+(sy-OY)/TH, ry=(sy-OY)/TH-(sx-OX)/TW;
+  return rot(rx,ry,-S.theta);};
+const shade=(hex,f)=>{const n=parseInt(hex.slice(1),16);
+  const r=Math.min(255,Math.round(((n>>16)&255)*f)),g=Math.min(255,Math.round(((n>>8)&255)*f)),b=Math.min(255,Math.round((n&255)*f));
+  return `rgb(${r},${g},${b})`;};
+const F=v=>(+v.toFixed(1));
+
+function anchor(id,toward){
+  if(id==='cloud')return iso(cloud.x,cloud.y,cloud.z-1.2);
+  const b=byId[id];if(!b)return iso(cloud.x,cloud.y,cloud.z-1.2);
+  const cx=b.x+(b.w||b.dome||1)/2, cy=b.y+(b.d||b.dome||1)/2;
+  let tx,ty;
+  if(toward==='cloud'){tx=cloud.x;ty=cloud.y}
+  else{const t=byId[toward]||{x:cloud.x,y:cloud.y};tx=t.x+((t.w||t.dome||1)/2);ty=t.y+((t.d||t.dome||1)/2)}
+  const dx=tx-cx,dy=ty-cy,L=Math.hypot(dx,dy)||1;
+  const r=Math.min(b.w||b.dome||1,b.d||b.dome||1)/2+0.35;
+  return iso(cx+dx/L*r,cy+dy/L*r,(b.z0||0)+0.5);
+}
+const visB=id=>id==='cloud'||!S.hide.has(byId[id].dis);
+const match=b=>!S.query||(b.n+' '+b.dis+' '+b.files.map(f=>f[0]).join(' ')).toLowerCase().includes(S.query);
+function edgeState(e){
+  if(!S.kinds[e.k])return null;
+  if(!visB(e.f)||!visB(e.t))return null;
+  if(S.query){
+    const mf=e.f==='cloud'?false:match(byId[e.f]), mt=e.t==='cloud'?false:match(byId[e.t]);
+    return (mf||mt)?'':'dim';
+  }
+  if(S.traced)return S.traced.e.includes(e.id)?'hl':'dim';
+  if(S.esel===e.id)return 'sel';
+  if(S.sel)return (e.f===S.sel||e.t===S.sel)?'hl':'dim';
+  return '';
+}
+function bldState(b){
+  if(S.query)return match(b)?'':'dim';
+  if(S.traced)return S.traced.e.some(eid=>{const e=EDGES.find(x=>x.id===eid);return e&&(e.f===b.id||e.t===b.id)})?'':'dim';
+  if(S.sel)return b.id===S.sel?'sel':(EDGES.some(e=>e.f===S.sel&&e.t===b.id||e.t===S.sel&&e.f===b.id)?'':'dim2');
+  return '';
+}
+
+// ═══════════════════ world build ═══════════════════
+const world=document.getElementById('world'), svgEl=document.getElementById('iso');
+function buildWorld(){
+  let s='';
+  if(S.grid){
+    for(let x=0;x<=20;x++){const a=iso(x,-1),b=iso(x,16);
+      s+=`<line x1="${F(a[0])}" y1="${F(a[1])}" x2="${F(b[0])}" y2="${F(b[1])}" stroke="#1a2130"/>`;}
+    for(let y=-1;y<=16;y++){const a=iso(0,y),b=iso(20,y);
+      s+=`<line x1="${F(a[0])}" y1="${F(a[1])}" x2="${F(b[0])}" y2="${F(b[1])}" stroke="#1a2130"/>`;}
+  }
+  // edges (under buildings)
+  for(const e of EDGES){
+    const st=edgeState(e);if(st===null)continue;
+    const A=anchor(e.f,e.t), B=anchor(e.t,e.f);
+    const pts=[A,...(e.via||[]).map(v=>iso(v[0],v[1],v[2])),B];
+    const d='M'+pts.map(p=>F(p[0])+','+F(p[1])).join(' L');
+    s+=`<path d="${d}" class="edge ${e.k}${st?' '+st:''}" data-id="${e.id}" marker-end="url(#arr-${e.k})"/>`;
+    if(e.k==='dat'&&st!=='dim'){
+      const len=pts.reduce((a,p,i)=>i?a+Math.hypot(p[0]-pts[i-1][0],p[1]-pts[i-1][1]):0,0);
+      s+=`<circle r="3.2" fill="#22d3ee" class="pdot" data-id="${e.id}"><animateMotion dur="${Math.max(1.6,len/110).toFixed(2)}s" repeatCount="indefinite" path="${d}"/></circle>`;
+    }
+    if(e.l&&st!=='dim'){
+      const m=pts.length===2?[(pts[0][0]+pts[1][0])/2,(pts[0][1]+pts[1][1])/2]:pts[Math.ceil(pts.length/2)];
+      s+=`<text x="${F(m[0])}" y="${F(m[1]-6)}" class="elabel${S.labels?'':' hidden'}" text-anchor="middle" data-id="${e.id}">${e.l}</text>`;
+    }
+  }
+  // cloud
+  {const [cx,cy]=iso(cloud.x,cloud.y,cloud.z);
+   const orbs=[[0,0,46,16],[-30,8,26,11],[30,7,26,11]].map(([dx,dy,rx,ry])=>
+     `<ellipse cx="${dx}" cy="${dy}" rx="${rx}" ry="${ry}" fill="#263043" stroke="#3b4a63" stroke-width="1.5"/>`).join('');
+   s+=`<g transform="translate(${F(cx)},${F(cy)})"><g class="bld${S.query?' dim':''}" data-id="cloud">${orbs}</g>
+       <text y="-26" class="bl-label lb${S.labels?'':' hidden'}">CLOUD LLM pool</text></g>`;}
+  // buildings, painter-sorted on rotated depth
+  const list=BLD.filter(b=>!S.hide.has(b.dis))
+    .map(b=>{const [rx,ry]=rot(b.x+(b.w||b.dome||1)/2,b.y+(b.d||b.dome||1)/2,S.theta);return {b,dep:rx+ry};})
+    .sort((a,c)=>a.dep-c.dep);
+  for(const {b}of list){
+    const c=D[b.dis].c,z0=b.z0||0,st=bldState(b);
+    if(b.dome){
+      const [cx,cy]=iso(b.x+0.5,b.y+0.5,0),r=b.dome*TW/2;
+      s+=`<g class="bld ${st}" data-id="${b.id}">
+        <ellipse cx="${F(cx)}" cy="${F(cy)}" rx="${F(r)}" ry="${F(r/2)}" fill="#000" opacity=".35"/>
+        <path d="M ${F(cx-r)} ${F(cy)} A ${F(r)} ${F(r*.9)} 0 0 1 ${F(cx+r)} ${F(cy)} Z" fill="${shade(c,1)}" stroke="${shade(c,.6)}" stroke-width="1.5" class="top"/>
+        <ellipse cx="${F(cx)}" cy="${F(cy)}" rx="${F(r)}" ry="${F(r/2)}" fill="none" stroke="${shade(c,.6)}" stroke-width="1.5"/></g>`;
+      const [lx,ly]=iso(b.x+0.5,b.y+0.5,0.95);
+      s+=blabel(b,lx,ly-6);
+    }else{
+      const x2=b.x+b.w,y2=b.y+b.d;
+      const [sx,sy]=iso(b.x+b.w/2,b.y+b.d/2,0);
+      const T=[iso(b.x,b.y,z0+b.h),iso(x2,b.y,z0+b.h),iso(x2,y2,z0+b.h),iso(b.x,y2,z0+b.h)];
+      const R=[iso(x2,b.y,z0+b.h),iso(x2,y2,z0+b.h),iso(x2,y2,z0),iso(x2,b.y,z0)];
+      const Lf=[iso(b.x,y2,z0+b.h),iso(b.x,y2,z0),iso(x2,y2,z0),iso(x2,y2,z0+b.h)];
+      const P=p=>p.map(q=>F(q[0])+','+F(q[1])).join(' ');
+      s+=`<g class="bld ${st}" data-id="${b.id}">
+        <ellipse cx="${F(sx)}" cy="${F(sy)}" rx="${F(b.w*TW/2*.92)}" ry="${F(b.d*TH/2*.95)}" fill="#000" opacity=".38"/>
+        <polygon points="${P(R)}" fill="${shade(c,.66)}" stroke="${shade(c,.42)}"/>
+        <polygon points="${P(Lf)}" fill="${shade(c,.45)}" stroke="${shade(c,.3)}"/>
+        <polygon points="${P(T)}" fill="${shade(c,1.08)}" stroke="${shade(c,.6)}" stroke-width="1.4" class="top"/></g>`;
+      const [lx,ly]=iso(b.x+b.w/2,b.y+b.d/2,z0+b.h);
+      s+=blabel(b,lx,ly-10);
+    }
+  }
+  world.innerHTML=s;
+  // needle
+  document.getElementById('needle').style.transform=`rotate(${S.theta}rad)`;
+}
+function blabel(b,lx,ly){
+  let s=`<text x="${F(lx)}" y="${F(ly)}" class="bl-label lb${S.labels?'':' hidden'}">${b.n}</text>`;
+  if(b.loc)s+=`<text x="${F(lx)}" y="${F(ly+11)}" class="bl-sub lb${S.labels?'':' hidden'}">${(b.loc/1000).toFixed(1)}k Ln</text>`;
+  if(b.tag)s+=`<text x="${F(lx)}" y="${F(ly-16)}" class="bl-label lb${S.labels?'':' hidden'}" fill="${b.tag==='hot'?'#facc15':'#4ade80'}">${b.tag==='hot'?'★':'◄NEW'}</text>`;
+  if(b.id===S.sel){const c=firstCites(b,1)[0];
+    if(c)s+=`<text x="${F(lx)}" y="${F(ly+24)}" class="bl-sub lb${S.labels?'':' hidden'}" fill="#9ecbff">${c.split(' ')[0]} · ${c.split(' ').slice(1).join(' ')}</text>`;}
+  return s;
+}
+
+// ═══════════════════ pan / zoom / rotate ═══════════════════
+const apply=()=>{world.setAttribute('transform',`translate(${S.vx} ${S.vy}) scale(${S.vs})`);updateMM();};
+const stage=document.getElementById('stage');
+const rectSvg=()=>svgEl.getBoundingClientRect();
+function zoomAt(f,mx,my){const ns=Math.min(4,Math.max(.25,S.vs*f));
+  S.vx=mx-(mx-S.vx)*ns/S.vs; S.vy=my-(my-S.vy)*ns/S.vs; S.vs=ns; apply();}
+function fit(){
+  let x1=1e9,y1=1e9,x2=-1e9,y2=-1e9;
+  for(const b of BLD){ if(S.hide.has(b.dis))continue;
+    const pts=b.dome?[iso(b.x+.5,b.y+.5,0),iso(b.x+.5,b.y+.5,1)]
+      :[iso(b.x,b.y,0),iso(b.x+b.w,b.y+b.d,0),iso(b.x,b.y,b.z0+b.h),iso(b.x+b.w,b.y,b.z0+b.h)];
+    for(const p of pts){x1=Math.min(x1,p[0]);y1=Math.min(y1,p[1]);x2=Math.max(x2,p[0]);y2=Math.max(y2,p[1]);}}
+  const r=rectSvg(),pad=60;
+  S.vs=Math.min((r.width-2*pad)/(x2-x1),(r.height-2*pad)/(y2-y1));
+  S.vx=r.width/2-(x1+x2)/2*S.vs; S.vy=r.height/2-(y1+y2)/2*S.vs; apply();
+}
+let rotAnim=null;
+function rotate(dir){
+  S.thetaT+=dir*Math.PI/2;
+  if(rotAnim)return;
+  const th0=S.theta,t0=performance.now(),DUR=560;
+  svgEl.classList.add('rot');
+  const step=t=>{const k=Math.min(1,(t-t0)/DUR),e=k<.5?4*k*k*k:1-Math.pow(-2*k+2,3)/2;
+    S.theta=th0+(S.thetaT-th0)*e;buildWorld();apply();
+    if(k<1)rotAnim=requestAnimationFrame(step);
+    else{rotAnim=null;svgEl.classList.remove('rot');S.theta=S.thetaT;buildWorld();apply();}};
+  rotAnim=requestAnimationFrame(step);
+}
+
+// pointer: pan (with momentum) + click + dblclick
+let ptr=null,moved=0,lastT=0,lastX=0,lastY=0,vpx=0,vpy=0,glideID=null;
+function stopGlide(){if(glideID){cancelAnimationFrame(glideID);glideID=null}}
+function glide(){if(glideID)return;
+  const step=()=>{S.vx+=vpx;S.vy+=vpy;vpx*=.9;vpy*=.9;apply();
+    if(Math.hypot(vpx,vpy)>0.18)glideID=requestAnimationFrame(step);else glideID=null;};
+  glideID=requestAnimationFrame(step);}
+stage.addEventListener('pointerdown',e=>{
+  if(e.target.closest('button,#mmwrap,#ctrls,#help,#drawer,#inspector,input,.hbtn'))return;
+  stopGlide();
+  ptr={x:e.clientX,y:e.clientY,vx:S.vx,vy:S.vy};moved=0;lastT=performance.now();lastX=lastY=0;vpx=vpy=0;
+  stage.setPointerCapture(e.pointerId);stage.classList.add('drag');
+});
+stage.addEventListener('pointermove',e=>{
+  if(ptr){const dx=e.clientX-ptr.x,dy=e.clientY-ptr.y;moved=Math.max(moved,Math.hypot(dx,dy));
+    const now=performance.now(),dt=now-lastT||1;
+    vpx=(dx-lastX)/dt;vpy=(dy-lastY)/dt;lastX=dx;lastY=dy;lastT=now;
+    S.vx=ptr.vx+dx;S.vy=ptr.vy+dy;apply();}
+  const t=e.target.closest('.bld,.edge'),tip=document.getElementById('tooltip');
+  if(t&&!ptr){const id=t.dataset.id;
+    if(t.classList.contains('bld')&&byId[id]){const b=byId[id];
+      const cs=firstCites(b,3);
+      tip.innerHTML=`<b>${b.n}</b> <span class="loc">${D[b.dis].n}${b.loc?' · '+b.loc.toLocaleString()+' Ln':''}</span>`
+        +(cs.length?`<div class="tc">${cs.map(c=>c.split(' ').slice(0,1)+' · '+c.split(' ').slice(1).join(' ')).join('<br>')}</div>`
+          :(b.files.length?`<div class="tc">${b.files[0][0]}</div>`:''));}
+    else{const ed=EDGES.find(x=>x.id===id);
+      if(ed){const key=Object.keys(EDESC).find(k=>(ed.l||'').includes(k))||ed.k;
+        tip.innerHTML=`<b>${ed.l||ed.k}</b> <span class="loc">${NAME[ed.f]} → ${NAME[ed.t]} · ${ed.k==='ctl'?'control':'data'}</span>`
+          +`<div class="tc">${EDESC[key]||''}</div>`;}}
+    const r=stage.getBoundingClientRect();
+    tip.style.display='block';
+    tip.style.left=Math.min(r.width-tip.offsetWidth-14,e.clientX-r.left+16)+'px';
+    tip.style.top=Math.min(r.height-tip.offsetHeight-14,e.clientY-r.top+14)+'px';
+  }else tip.style.display='none';
+});
+stage.addEventListener('pointerup',e=>{
+  stage.classList.remove('drag');
+  if(ptr){
+    const sp=Math.hypot(vpx,vpy);
+    if(moved>=5&&sp>0.3){vpx*=18;vpy*=18;glide();}
+    if(moved<5){
+      const b=e.target.closest('.bld'),ed=e.target.closest('.edge');
+      if(b&&byId[b.dataset.id]){S.sel=b.dataset.id;S.esel=null;S.traced=null;showBld(S.sel);}
+      else if(ed){S.esel=ed.dataset.id;S.sel=null;S.traced=null;showEdge(S.esel);}
+      else{S.sel=null;S.esel=null;S.traced=null;hideInspector();}
+      buildWorld();
+    }
+    ptr=null;
+  }
+});
+stage.addEventListener('dblclick',e=>{
+  const b=e.target.closest('.bld');
+  if(b&&byId[b.dataset.id]){solo(byId[b.dataset.id].dis);showBld(b.dataset.id);}
+});
+svgEl.addEventListener('wheel',e=>{e.preventDefault();stopGlide();
+  const r=rectSvg();
+  zoomAt(e.deltaY<0?1.13:0.885,e.clientX-r.left,e.clientY-r.top);
+},{passive:false});
+
+// keyboard
+window.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT')return;
+  const k=e.key.toLowerCase(),step=80/S.vs;
+  if(k==='q')rotate(-1);
+  else if(k==='e')rotate(1);
+  else if(k==='f'||k==='0')fit();
+  else if(k==='+'||k==='=')zoomAt(1.2,rectSvg().width/2,rectSvg().height/2);
+  else if(k==='-'||k==='_')zoomAt(.83,rectSvg().width/2,rectSvg().height/2);
+  else if(k==='arrowleft'||k==='a'){stopGlide();S.vx+=step;apply()}
+  else if(k==='arrowright'||k==='d'){stopGlide();S.vx-=step;apply()}
+  else if(k==='arrowup'||k==='w'){stopGlide();S.vy+=step;apply()}
+  else if(k==='arrowdown'||k==='s'){stopGlide();S.vy-=step;apply()}
+  else if(k==='/'){e.preventDefault();document.getElementById('q').focus()}
+  else if(k==='?'){document.getElementById('help').classList.toggle('show')}
+  else if(k==='escape'){
+    const h=document.getElementById('help');
+    if(h.classList.contains('show'))h.classList.remove('show');
+    else if(drawer.classList.contains('show'))closeDrawer();
+    else if(S.sel||S.esel||S.traced){S.sel=S.esel=S.traced=null;hideInspector();buildWorld();}
+    else if(S.query){S.query='';document.getElementById('q').value='';buildWorld();}
+    else if(S.hide.size){S.hide.clear();paintChips();buildWorld();}
+  }
+  if(['arrowleft','arrowright','arrowup','arrowdown'].includes(k))e.preventDefault();
+});
+
+// buttons
+document.getElementById('b-ccw').onclick=()=>rotate(-1);
+document.getElementById('b-cw').onclick=()=>rotate(1);
+document.getElementById('b-zi').onclick=()=>zoomAt(1.25,rectSvg().width/2,rectSvg().height/2);
+document.getElementById('b-zo').onclick=()=>zoomAt(.8,rectSvg().width/2,rectSvg().height/2);
+document.getElementById('b-fit').onclick=fit;
+document.getElementById('b-help').onclick=()=>document.getElementById('help').classList.add('show');
+document.getElementById('help').addEventListener('click',e=>{if(e.target.id==='help')e.target.classList.remove('show')});
+
+// ═══════════════════ district chips ═══════════════════
+const chips=document.getElementById('chips');
+function paintChips(){
+  chips.innerHTML=Object.entries(D).map(([id,d])=>
+    `<span class="dchip ${S.hide.has(id)?'off':'on'}" data-d="${id}"><span class="dot" style="background:${d.c}"></span>${d.n}</span>`).join('')
+   +`<span class="ksep">│</span>
+     <label class="ktog"><input type="checkbox" id="k-ctl" ${S.kinds.ctl?'checked':''}>control ═▶</label>
+     <label class="ktog"><input type="checkbox" id="k-dat" ${S.kinds.dat?'checked':''}>data ┄▶</label>
+     <label class="ktog"><input type="checkbox" id="k-lab" ${S.labels?'checked':''}>labels</label>
+     <label class="ktog"><input type="checkbox" id="k-grid" ${S.grid?'checked':''}>grid</label>
+     <span class="ksep">│</span><span class="dchip" data-d="*">solo: none (reset)</span>`;
+  chips.querySelectorAll('.dchip[data-d]:not([data-d="*"])').forEach(ch=>{
+    ch.onclick=()=>{const d=ch.dataset.d;S.hide.has(d)?S.hide.delete(d):S.hide.add(d);paintChips();buildWorld();};
+    ch.ondblclick=()=>solo(ch.dataset.d);
+  });
+  chips.querySelector('[data-d="*"]').onclick=()=>{S.hide.clear();paintChips();buildWorld();};
+  document.getElementById('k-ctl').onchange=e=>{S.kinds.ctl=e.target.checked;buildWorld()};
+  document.getElementById('k-dat').onchange=e=>{S.kinds.dat=e.target.checked;buildWorld()};
+  document.getElementById('k-lab').onchange=e=>{S.labels=e.target.checked;buildWorld()};
+  document.getElementById('k-grid').onchange=e=>{S.grid=e.target.checked;buildWorld()};
+}
+function solo(d){S.hide=new Set(Object.keys(D).filter(x=>x!==d));paintChips();buildWorld();}
+
+document.getElementById('q').addEventListener('input',e=>{
+  S.query=e.target.value.trim().toLowerCase();S.traced=null;buildWorld();
+});
+
+// ═══════════════════ minimap ═══════════════════
+const mm=document.getElementById('mm');
+const MW=190,MH=130,K=.115,MC={x:10,y:7};
+const mmo=[MW/2+(MC.y-MC.x)*TW*K/2, MH/2-(MC.x+MC.y)*TH*K/2];
+const mmiso=(x,y)=>[(x-y)*TW*K/2+mmo[0],(x+y)*TH*K/2+mmo[1]];
+(function buildMM(){
+  let s='';
+  for(let x=0;x<=20;x++){const a=mmiso(x,-1),b=mmiso(x,16);
+    s+=`<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="#1c2434"/>`;}
+  for(let y=-1;y<=16;y++){const a=mmiso(0,y),b=mmiso(20,y);
+    s+=`<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="#1c2434"/>`;}
+  for(const b of BLD){const c=D[b.dis].c;
+    const p1=mmiso(b.x,b.y),p2=mmiso(b.x+(b.w||b.dome||1),b.y+(b.d||b.dome||1));
+    s+=`<rect data-mm="${b.id}" x="${Math.min(p1[0],p2[0])}" y="${Math.min(p1[1],p2[1])}"
+        width="${Math.abs(p2[0]-p1[0])||5}" height="${Math.abs(p2[1]-p1[1])||4}"
+        fill="${c}" opacity="${S.hide.has(b.dis)?.15:.8}" rx="1"/>`;}
+  s+=`<polygon id="mmvp" fill="#7aa2f722" stroke="#7aa2f7" stroke-width="1.2"/>`;
+  mm.innerHTML=s;
+  mm.querySelectorAll('[data-mm]').forEach(r=>{
+    r.addEventListener('click',ev=>{ev.stopPropagation();
+      const id=r.dataset.mm;S.sel=id;S.esel=null;S.traced=null;showBld(id);buildWorld();});
+  });
+})();
+function updateMM(){
+  mm.querySelectorAll('[data-mm]').forEach(r=>{
+    r.setAttribute('opacity',S.hide.has(byId[r.dataset.mm].dis)?.15:.8);});
+  const vp=mm.querySelector('#mmvp');if(!vp)return;
+  const r=stage.getBoundingClientRect();
+  const corners=[[0,0],[r.width,0],[r.width,r.height],[0,r.height]].map(([px,py])=>{
+    const wx=(px-S.vx)/S.vs, wy=(py-S.vy)/S.vs;
+    const [tx,ty]=uniso(wx,wy);const p=mmiso(tx,ty);return F(p[0])+','+F(p[1]);});
+  vp.setAttribute('points',corners.join(' '));
+}
+function mmJump(e){
+  const mr=mm.getBoundingClientRect();
+  const mx=e.clientX-mr.left,my=e.clientY-mr.top;
+  const rx=(mx-mmo[0])/(TW*K/2), ry=(my-mmo[1])/(TH*K/2);
+  const X=(rx+ry)/2, Y=(ry-rx)/2; // absolute tile coords (north-up frame)
+  const p=iso(X,Y,0), r=stage.getBoundingClientRect();
+  S.vx=r.width/2-p[0]*S.vs; S.vy=r.height/2-p[1]*S.vs; apply();
+}
+mm.addEventListener('pointerdown',e=>{mmJump(e);
+  const mv=ev=>mmJump(ev),up=()=>{window.removeEventListener('pointermove',mv);window.removeEventListener('pointerup',up);};
+  window.addEventListener('pointermove',mv);window.addEventListener('pointerup',up);
+});
+
+// ═══════════════════ inspector + drawer ═══════════════════
+const drawer=document.getElementById('drawer'), inspector=document.getElementById('inspector');
+function cite(f){return f[2].filter(c=>c[1]!=='—').map(c=>
+  `<span class="cite">${f[0].split('/').pop()}:${c[0]} · ${c[1]}</span>`).join('')}
+function firstCites(b,n=3){const out=[];
+  for(const f of b.files)for(const c of f[2])if(c[1]!=='—'){out.push(`${f[0].split('/').pop()}:${c[0]} ${c[1]}`);if(out.length>=n)return out;}
+  return out;}
+function hideInspector(){inspector.style.display='none'}
+function openDrawer(html){drawer.innerHTML=`<button class="dclose" title="close (Esc)">×</button>`+html;
+  drawer.classList.add('show');
+  drawer.querySelector('.dclose').onclick=closeDrawer;}
+function closeDrawer(){drawer.classList.remove('show')}
+function tagHtml(b){return b.tag==='hot'?' <span class="tag hot">★ branch-hot</span>':b.tag==='new'?' <span class="tag new">◄ NEW</span>':''}
+function flowRows(ins,outs){
+  let s='';
+  if(ins.length)s+=`<div style="color:var(--faint);font-size:11px;margin-bottom:2px">inbound</div>`
+    +ins.map(e=>`<div class="flow">${e.k==='ctl'?'═▶':'┄▶'} <b data-bld="${e.f}">${NAME[e.f]}</b> <span>${e.l||e.k}</span></div>`).join('');
+  if(outs.length)s+=`<div style="color:var(--faint);font-size:11px;margin:6px 0 2px">outbound</div>`
+    +outs.map(e=>`<div class="flow">${e.k==='ctl'?'═▶':'┄▶'} <b data-bld="${e.t}">${NAME[e.t]}</b> <span>${e.l||e.k}</span></div>`).join('');
+  return s;}
+
+function showBld(id){ // pinned, compact inspector (does not cover the map)
+  const b=byId[id],d=D[b.dis];
+  const ins=EDGES.filter(e=>e.t===id),outs=EDGES.filter(e=>e.f===id);
+  inspector.style.display='block';
+  inspector.innerHTML=`
+   <div class="head"><h2>${b.n}${tagHtml(b)}</h2><button class="x" id="ix" title="close">×</button></div>
+   <span class="badge-district" style="color:${d.c};border:1px solid ${d.c}55;background:${d.c}14">${d.n}</span>
+   ${b.loc?`<span class="chip" style="margin-left:6px">${b.loc.toLocaleString()} Ln</span>`:''}
+   <p class="desc">${b.desc}</p>
+   <div class="ft">
+     <button class="iso-btn" id="full">⤢ full details</button>
+     <button class="iso-btn" id="iso">◎ isolate</button>
+   </div>
+   <h3>files (${b.files.length}) <span class="ct" id="cf">collapse ▾</span></h3>
+   <div class="fbody" id="fb">
+     ${b.files.map(f=>`<div class="file"><span class="path">${f[0]}</span>${f[1]?`<span class="loc">${f[1].toLocaleString()} Ln</span>`:''}<div>${cite(f)}</div></div>`).join('')}
+   </div>
+   ${ins.length||outs.length?`<h3>flows</h3><div class="flows">${flowRows(ins,outs)}</div>`:''}`;
+  inspector.querySelector('#ix').onclick=()=>{hideInspector();S.sel=null;buildWorld()};
+  inspector.querySelector('#full').onclick=()=>fullDetails(id);
+  inspector.querySelector('#iso').onclick=()=>solo(b.dis);
+  inspector.querySelector('#cf').onclick=()=>{const f=inspector.querySelector('#fb');
+    f.classList.toggle('collapsed');
+    inspector.querySelector('#cf').textContent=f.classList.contains('collapsed')?'expand ▸':'collapse ▾';};
+  inspector.querySelectorAll('[data-bld]').forEach(j=>j.onclick=()=>{S.sel=j.dataset.bld;showBld(S.sel);buildWorld()});
+}
+function fullDetails(id){ // slide-over drawer: everything
+  const b=byId[id],d=D[b.dis];
+  const ins=EDGES.filter(e=>e.t===id),outs=EDGES.filter(e=>e.f===id);
+  const walks=WALKS.filter(w=>w.e.some(eid=>{const e=EDGES.find(x=>x.id===eid);return e&&(e.f===id||e.t===id)}));
+  openDrawer(`
+   <h2>${b.n}${tagHtml(b)}</h2>
+   <span class="badge-district" style="color:${d.c};border:1px solid ${d.c}55;background:${d.c}14">${d.n}</span>
+   ${b.loc?`<span class="chip" style="margin-left:6px">${b.loc.toLocaleString()} Ln</span>`:''}
+   <p style="color:var(--dim);font-size:12.5px">${b.desc}</p>
+   <button class="iso-btn" id="iso">◎ isolate “${d.n}” district</button>
+   <h3>files · cited symbols</h3>
+   ${b.files.map(f=>`<div class="file"><span class="path">${f[0]}</span>${f[1]?`<span class="loc">${f[1].toLocaleString()} Ln</span>`:''}<div>${cite(f)}</div></div>`).join('')}
+   <h3>flows</h3><div class="flows">${flowRows(ins,outs)}</div>
+   ${walks.length?`<h3>walks through here</h3>${walks.map(w=>`<div class="walk"><div class="wt">${w.t}</div><div class="wb">${w.b}</div></div>`).join('')}`:''}`);
+  drawer.querySelector('#iso').onclick=()=>solo(b.dis);
+  drawer.querySelectorAll('[data-bld]').forEach(j=>j.onclick=()=>{S.sel=j.dataset.bld;showBld(S.sel);buildWorld()});
+}
+function showEdge(id){
+  const e=EDGES.find(x=>x.id===id);if(!e){hideInspector();return}
+  const key=Object.keys(EDESC).find(k=>(e.l||'').includes(k))||e.k;
+  inspector.style.display='block';
+  inspector.innerHTML=`
+   <div class="head"><h2>${e.l||e.k} path</h2><button class="x" id="ix" title="close">×</button></div>
+   <p style="font-size:13px;margin:8px 0 0"><b style="color:${e.f==='cloud'?'#94a3b8':D[byId[e.f]?.dis]?.c}">${NAME[e.f]}</b>
+   ${e.k==='ctl'?' ═▶ ':' ┄▶ '}
+   <b style="color:${e.t==='cloud'?'#94a3b8':D[byId[e.t]?.dis]?.c}">${NAME[e.t]}</b></p>
+   <p class="desc">${e.k==='ctl'?'control path — direct invocation':'data path — payload / bytes'}<br>${EDESC[key]||''}</p>
+   <div class="ft"><button class="iso-btn" id="tr1">▸ trace this path</button></div>`;
+  inspector.querySelector('#ix').onclick=()=>{hideInspector();S.esel=null;buildWorld()};
+  inspector.querySelector('#tr1').onclick=()=>{S.esel=null;S.traced={t:e.l||e.k,b:'',e:[e.id]};hideInspector();buildWorld();};
+}
+function bindWalks(root){
+  root.querySelectorAll('button[data-w]').forEach(btn=>btn.onclick=()=>{
+    const i=+btn.dataset.w;
+    if(S.traced===WALKS[i]){S.traced=null;btn.classList.remove('on');btn.textContent='▸ trace'}
+    else{S.traced=WALKS[i];S.sel=null;S.esel=null;
+      root.querySelectorAll('button[data-w]').forEach(b2=>{b2.classList.remove('on');b2.textContent='▸ trace'});
+      btn.classList.add('on');btn.textContent='■ stop';}
+    buildWorld();
+  });
+}
+function homeHTML(){return `
+   <h2>explainer · real control / data walks</h2>
+   <p style="color:var(--dim);font-size:12px;margin:4px 0 10px">click a building to pin a compact inspector · <b>Q/E</b> rotate · drag pans (with momentum) · <b>?</b> for all controls</p>
+   ${WALKS.map((w,i)=>`<div class="walk"><div class="wt">${w.t}</div><div class="wb">${w.b}</div>
+     <button data-w="${i}">▸ trace</button></div>`).join('')}
+   <h3>legend</h3>
+   ${Object.entries(D).map(([id,d])=>`<div class="lg-row"><span class="sw" style="background:${d.c}"></span>${d.n}${S.hide.has(id)?' (hidden)':''}</div>`).join('')}
+   <div class="lg-row"><span class="sw" style="background:var(--ctl)"></span>solid ═▶ control path (invocation)</div>
+   <div class="lg-row"><span class="sw" style="background:var(--dat)"></span>dashed ┄▶ + moving dot = data / payload</div>
+   <div class="lg-row"><span class="sw" style="height:5px;width:22px;border-radius:2px;background:linear-gradient(90deg,#334,#ccd)"></span>building height ∝ lines of code</div>
+   <div class="lg-row"><span style="color:var(--hot)">★</span> branch-hot: cache / prefix lane (3c9133d, c4a0d9b)</div>
+   <div class="lg-row"><span style="color:#4ade80">◄NEW</span> file added on this branch</div>
+   <div class="lg-row"><span class="sw" style="background:none;border:1px dashed #2a3348"></span>grid = shared workspace (~/.nanobot)</div>
+   <h3>top deltas vs main</h3>
+   <div class="file"><span class="path">agent_loop/tests.rs</span><span class="loc">+3.3k</span></div>
+   <div class="file"><span class="path">agent_loop/shared.rs</span><span class="loc">+2.7k</span></div>
+   <div class="file"><span class="path">agent_core.rs</span><span class="loc">+2.2k</span></div>
+   <div class="file"><span class="path">tools/spawn.rs</span><span class="loc">+1.1k</span></div>
+   <div class="file"><span class="path">openai_compat.rs</span><span class="loc">+1.0k</span></div>
+   <div class="file"><span class="path">host_bridge.rs · python_kernel.rs</span><span class="loc">NEW +958 / +416</span></div>`;}
+function openHome(){openDrawer(homeHTML());bindWalks(drawer);}
+
+// ═══════════════════ boot ═══════════════════
+document.getElementById('b-explain').onclick=openHome;
+paintChips();buildWorld();fit();
+window.addEventListener('resize',updateMM);
+</script>
+</body>
+</html>

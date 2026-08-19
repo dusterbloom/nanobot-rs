@@ -230,6 +230,34 @@ impl AgentLoopShared {
 
         ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
 
+        let turn_outcome = if ctx.is_cancelled() {
+            "cancelled"
+        } else if ctx.final_content.is_empty() {
+            "empty"
+        } else {
+            "finished"
+        };
+        // The reply is already generated and persisted by this point. A
+        // failed turn-finish journal write must not discard it: warn and
+        // deliver, letting the session's replay degrade to Incomplete.
+        if let Err(error) = ctx
+            .core
+            .sessions
+            .record_turn_finished(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                turn_outcome,
+            )
+            .await
+        {
+            warn!(
+                %error,
+                session = %ctx.session_key,
+                "turn_finished_replay_persist_failed; replay degrades to incomplete"
+            );
+        }
+
         let cache = counters.session_cache_metrics(&ctx.session_id);
         info!(
             logical_session = %ctx.session_id,

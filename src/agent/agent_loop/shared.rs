@@ -53,6 +53,7 @@ use crate::errors::{
     classify_retained_session_error, is_retryable_provider_error, RetainedSessionErrorKind,
 };
 use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
+use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
 
 use crate::agent::agent_core::{
     append_to_system_prompt, apply_compaction_result, ExpansionCheckpoint, PendingCompaction,
@@ -2856,6 +2857,28 @@ impl AgentLoopShared {
     // Step 3: Calling — invoke the LLM (streaming or blocking)
     // -----------------------------------------------------------------------
 
+    async fn persist_model_failure(ctx: &TurnContext, call_id: &str, detail: &str) {
+        if let Err(record_error) = ctx
+            .core
+            .sessions
+            .record_model_failure(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                call_id,
+                detail,
+            )
+            .await
+        {
+            error!(
+                session = %ctx.session_key,
+                call_id,
+                error = %record_error,
+                "model_failure_replay_persist_failed"
+            );
+        }
+    }
+
     /// Handle an LLM provider error: retry once if retryable, otherwise return error.
     async fn handle_llm_error(
         e: anyhow::Error,
@@ -3013,6 +3036,45 @@ impl AgentLoopShared {
             .map(|staged| staged.rendered_messages.clone())
             .unwrap_or_else(|| render_via_protocol(&*ctx.protocol, &ctx.messages));
         attach_higgs_session_control(&mut messages, reservation.control());
+        let recorded_request = RecordedProviderRequest {
+            messages: messages.clone(),
+            tools: tool_defs_opt.map(<[Value]>::to_vec),
+            model: ctx.core.model.clone(),
+            max_tokens: 0,
+            temperature: ctx.core.temperature,
+            thinking_budget: None,
+            top_p: None,
+            tool_choice: "auto".to_string(),
+            streaming: false,
+        };
+        let call_id = match ctx
+            .core
+            .sessions
+            .record_model_request(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                ModelCallPurpose::RetainedExpansionPreflight,
+                &recorded_request,
+            )
+            .await
+        {
+            Ok(call_id) => call_id,
+            Err(error) => {
+                warn!(
+                    session = %ctx.session_key,
+                    %error,
+                    "retained_expansion_preflight_replay_persist_failed"
+                );
+                drop(reservation);
+                Self::discard_selected_expansion_checkpoint(
+                    ctx,
+                    &plan.checkpoint,
+                    RetainedExpansionFailure::Unavailable,
+                );
+                return;
+            }
+        };
         let result = ctx
             .core
             .provider
@@ -3027,8 +3089,30 @@ impl AgentLoopShared {
             )
             .await;
         let failure = match result {
-            Ok(response) => response.outcome().err().map(anyhow::Error::new),
-            Err(error) => Some(error),
+            Ok(response) => {
+                if let Err(error) = ctx
+                    .core
+                    .sessions
+                    .record_model_response(
+                        &ctx.session_id,
+                        &ctx.request_id,
+                        ctx.turn_count,
+                        &call_id,
+                        &RecordedProviderResponse::from(&response),
+                    )
+                    .await
+                {
+                    Some(anyhow::anyhow!(
+                        "retained preflight response replay persistence failed: {error}"
+                    ))
+                } else {
+                    response.outcome().err().map(anyhow::Error::new)
+                }
+            }
+            Err(error) => {
+                Self::persist_model_failure(ctx, &call_id, &error.to_string()).await;
+                Some(error)
+            }
         };
         drop(reservation);
         if let Some(error) = failure {
@@ -3474,6 +3558,48 @@ impl AgentLoopShared {
             attach_higgs_session_control(&mut messages_for_llm, control);
         }
 
+        // The provider boundary is the exact model-visible contract: protocol
+        // rendering, tool presentation, retained-session controls, and sampling
+        // settings are final here. Make it durable before the call so neither a
+        // workspace change nor a crash can force replay to regenerate bytes.
+        let recorded_request = RecordedProviderRequest {
+            messages: messages_for_llm.clone(),
+            tools: tool_defs_opt.map(<[Value]>::to_vec),
+            model: ctx.core.model.clone(),
+            max_tokens,
+            temperature: ctx.core.temperature,
+            thinking_budget,
+            top_p: None,
+            tool_choice: "auto".to_string(),
+            streaming: ctx.text_delta_tx.is_some(),
+        };
+        let model_call_id = match ctx
+            .core
+            .sessions
+            .record_model_request(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                ModelCallPurpose::Main,
+                &recorded_request,
+            )
+            .await
+        {
+            Ok(call_id) => call_id,
+            Err(record_error) => {
+                counters.mark_inference_finished();
+                error!(
+                    session = %ctx.session_key,
+                    error = %record_error,
+                    "model_request_replay_persist_failed"
+                );
+                return StepResult::Done(IterationOutcome::Error(
+                    "I could not durably record the model request, so I stopped before sending it."
+                        .to_string(),
+                ));
+            }
+        };
+
         let no_progress_timeout = local_stream_no_progress_timeout(ctx);
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas to the REPL/voice renderer as
@@ -3499,6 +3625,7 @@ impl AgentLoopShared {
                 match tokio::time::timeout(timeout, stream_call).await {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
+                        Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
                         if Self::handle_retained_route_error(ctx, &e) {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
@@ -3515,6 +3642,7 @@ impl AgentLoopShared {
                     Err(_) => {
                         counters.mark_inference_finished();
                         let detail = local_no_stream_headers_error(timeout);
+                        Self::persist_model_failure(ctx, &model_call_id, &detail).await;
                         error!(
                             model = %ctx.core.model,
                             timeout_secs = timeout.as_secs(),
@@ -3528,6 +3656,7 @@ impl AgentLoopShared {
                 match stream_call.await {
                     Ok(s) => s,
                     Err(e) => {
+                        Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
                         if Self::handle_retained_route_error(ctx, &e) {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
@@ -3588,6 +3717,7 @@ impl AgentLoopShared {
                             None => std::time::Duration::ZERO,
                         };
                         let detail = local_no_stream_progress_error(timeout);
+                        Self::persist_model_failure(ctx, &model_call_id, &detail).await;
                         error!(
                             model = %ctx.core.model,
                             timeout_secs = timeout.as_secs(),
@@ -3688,6 +3818,12 @@ impl AgentLoopShared {
                     // Stream ended without Done — either cancelled or genuine error.
                     if ctx.is_cancelled() {
                         // Cancelled mid-stream — exit cleanly.
+                        Self::persist_model_failure(
+                            ctx,
+                            &model_call_id,
+                            "stream cancelled before terminal response",
+                        )
+                        .await;
                         emit_stream_abort_metrics(
                             ctx,
                             "The stream was cancelled before the backend returned a final response.",
@@ -3695,6 +3831,12 @@ impl AgentLoopShared {
                         return StepResult::Done(IterationOutcome::Finished(String::new()));
                     }
                     error!("LLM stream ended without Done");
+                    Self::persist_model_failure(
+                        ctx,
+                        &model_call_id,
+                        "stream ended without terminal response",
+                    )
+                    .await;
                     emit_stream_abort_metrics(
                         ctx,
                         "The LLM stream ended without a final response.",
@@ -3722,6 +3864,7 @@ impl AgentLoopShared {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
                     if Self::handle_retained_route_error(ctx, &e) {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Continue);
@@ -3731,6 +3874,31 @@ impl AgentLoopShared {
                 }
             }
         };
+
+        if let Err(record_error) = ctx
+            .core
+            .sessions
+            .record_model_response(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &model_call_id,
+                &RecordedProviderResponse::from(&response),
+            )
+            .await
+        {
+            counters.mark_inference_finished();
+            error!(
+                session = %ctx.session_key,
+                call_id = %model_call_id,
+                error = %record_error,
+                "model_response_replay_persist_failed"
+            );
+            return StepResult::Done(IterationOutcome::Error(
+                "I received a model response but could not record it durably, so I stopped before acting on it."
+                    .to_string(),
+            ));
+        }
 
         if !pending_higgs_drop.is_empty() {
             counters.clear_pending_higgs_session_drop_ids(&ctx.session_key, &pending_higgs_drop);
@@ -3855,7 +4023,40 @@ impl AgentLoopShared {
             model = %ctx.core.model,
             "forced_tool_recovery: botched tool intent — re-issuing with tool_choice=required"
         );
-        match ctx
+        let request = RecordedProviderRequest {
+            messages: messages_for_llm.to_vec(),
+            tools: tool_defs_opt.map(<[Value]>::to_vec),
+            model: ctx.core.model.clone(),
+            max_tokens,
+            temperature: ctx.core.temperature,
+            thinking_budget: None,
+            top_p: None,
+            tool_choice: "required".to_string(),
+            streaming: false,
+        };
+        let call_id = match ctx
+            .core
+            .sessions
+            .record_model_request(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                ModelCallPurpose::ForcedToolRecovery,
+                &request,
+            )
+            .await
+        {
+            Ok(call_id) => call_id,
+            Err(error) => {
+                return ForcedToolRecoveryOutcome::ProviderError {
+                    original: response,
+                    error: anyhow::anyhow!(
+                        "forced-tool recovery was not sent because replay persistence failed: {error}"
+                    ),
+                };
+            }
+        };
+        let recovered = ctx
             .core
             .provider
             .chat_with_tool_choice(
@@ -3868,22 +4069,44 @@ impl AgentLoopShared {
                 None,
                 ToolChoice::Required,
             )
-            .await
-        {
-            Ok(recovered) if recovered.has_tool_calls() => {
+            .await;
+        match recovered {
+            Ok(recovered) => {
+                if let Err(error) = ctx
+                    .core
+                    .sessions
+                    .record_model_response(
+                        &ctx.session_id,
+                        &ctx.request_id,
+                        ctx.turn_count,
+                        &call_id,
+                        &RecordedProviderResponse::from(&recovered),
+                    )
+                    .await
+                {
+                    return ForcedToolRecoveryOutcome::ProviderError {
+                        original: response,
+                        error: anyhow::anyhow!(
+                            "forced-tool recovery response could not be recorded: {error}"
+                        ),
+                    };
+                }
+                if !recovered.has_tool_calls() {
+                    return ForcedToolRecoveryOutcome::Response(response);
+                }
                 info!("forced_tool_recovery: recovered a constrained tool call");
                 if ctx.flow.content_was_streamed {
                     send_retract_reply_marker(&ctx.text_delta_tx);
                 }
                 ForcedToolRecoveryOutcome::Response(recovered)
             }
-            // No tool call (e.g. constraint disabled server-side): fall back
-            // to the original response and the hint-retry path.
-            Ok(_) => ForcedToolRecoveryOutcome::Response(response),
-            Err(error) => ForcedToolRecoveryOutcome::ProviderError {
-                original: response,
-                error,
-            },
+            Err(error) => {
+                Self::persist_model_failure(ctx, &call_id, &error.to_string()).await;
+                ForcedToolRecoveryOutcome::ProviderError {
+                    original: response,
+                    error,
+                }
+            }
         }
     }
 
@@ -4016,6 +4239,27 @@ impl AgentLoopShared {
                 allowed_calls.push(tc);
             } else {
                 let reason = result.reason.unwrap_or("lease_blocked");
+                if let Err(error) = ctx
+                    .core
+                    .sessions
+                    .record_tool_pre_execute(
+                        &ctx.session_id,
+                        &ctx.request_id,
+                        ctx.turn_count,
+                        &tc.id,
+                        &tc.name,
+                        &tc.arguments,
+                        crate::session::db::ToolPreExecuteDecision::Rejected {
+                            reason: format!("lease:{reason}"),
+                        },
+                    )
+                    .await
+                {
+                    return StepResult::Done(IterationOutcome::Error(format!(
+                        "tool {} was rejected but its pre-execution decision could not be recorded: {error}",
+                        tc.id
+                    )));
+                }
                 let name = tc.name.clone();
                 let id = tc.id.clone();
                 blocked_calls.push((name, id, reason));
