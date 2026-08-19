@@ -389,7 +389,7 @@ echo "unknown command: $1" >&2; exit 1
 
     #[tokio::test]
     async fn test_missing_tool_param_lists_tools() {
-        let dir = std::env::temp_dir().join(format!("cua-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cua-test-{}-missing_tool", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bin = make_shim(&dir);
         let tool = CuaTool::with_binary(bin.to_str().unwrap());
@@ -401,7 +401,7 @@ echo "unknown command: $1" >&2; exit 1
 
     #[tokio::test]
     async fn test_call_passes_tool_and_args() {
-        let dir = std::env::temp_dir().join(format!("cua-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cua-test-{}-call_passes", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bin = make_shim(&dir);
         fs::write(dir.join(".running"), "").unwrap(); // daemon "up"
@@ -423,7 +423,7 @@ echo "unknown command: $1" >&2; exit 1
 
     #[tokio::test]
     async fn test_daemon_down_no_autostart_errors_with_launch_hint() {
-        let dir = std::env::temp_dir().join(format!("cua-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cua-test-{}-daemon_down", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bin = make_shim(&dir); // no .running marker → status exit 1
         let tool = CuaTool::with_binary(bin.to_str().unwrap()); // daemon_auto_start=false
@@ -440,7 +440,7 @@ echo "unknown command: $1" >&2; exit 1
 
     #[tokio::test]
     async fn test_screenshot_out_file_returned_when_written() {
-        let dir = std::env::temp_dir().join(format!("cua-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cua-test-{}-screenshot", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bin = make_shim(&dir);
         fs::write(dir.join(".running"), "").unwrap();
@@ -487,7 +487,7 @@ echo "unknown command: $1" >&2; exit 1
 
     #[test]
     fn test_binary_present_absolute_and_missing() {
-        let dir = std::env::temp_dir().join(format!("cua-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cua-test-{}-binary_present", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bin = make_shim(&dir);
         let tool = CuaTool::with_binary(bin.to_str().unwrap());
