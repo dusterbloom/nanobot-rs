@@ -346,6 +346,59 @@ When `ttsVoice: null` and `ttsEngine: "supertonic"`, the curated picker resolves
 - `language: "en"` → `M2` (male) / `F1` (female via `ttsVoice: "F1"`)
 - Any other language → `M2` global default
 
+## Cua Driver — local desktop computer-use
+
+The `cua` tool lets the agent drive native GUI apps on this machine in the
+background (click, type, screenshot, menus, browser pages) via
+[cua-driver](https://github.com/trycua/cua) from trycua/cua.
+
+### One-time setup
+
+1. Install cua-driver:
+
+   ```bash
+   curl -fsSL https://cua.ai/driver/install.sh | bash
+   ```
+
+   (Windows: `irm https://cua.ai/driver/install.ps1 | iex`)
+
+2. Grant macOS Accessibility + Screen Recording to `CuaDriver.app` when
+   prompted, then start it once (`open -n -g -a CuaDriver --args serve`).
+   The tool auto-starts the daemon on first use; keep `daemonAutoStart`
+   enabled unless you manage the daemon yourself.
+
+3. Install the cua-driver agent skill pack so the model knows the
+   snapshot-before-action loop:
+
+   ```bash
+   mkdir -p ~/.nanobot/workspace/skills/cua-driver
+   curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/rust/Skills/cua-driver/SKILL.md -o ~/.nanobot/workspace/skills/cua-driver/SKILL.md
+   # optional platform docs:
+   curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/rust/Skills/cua-driver/MACOS.md -o ~/.nanobot/workspace/skills/cua-driver/MACOS.md
+   ```
+
+### Configuration
+
+```json
+{
+  "tools": {
+    "cua": {
+      "enabled": true,
+      "binaryPath": "cua-driver",
+      "permissionMode": "standard",
+      "daemonAutoStart": true,
+      "screenshotDir": null
+    }
+  }
+}
+```
+
+`screenshotDir` defaults to `<workspace>/cua`. `permissionMode` is
+`standard` (default), `bounded` (requires a capability manifest), or
+`unrestricted` (requires `--dangerously-bypass-approvals` at daemon launch).
+Screenshots are saved to a file and their path returned; feeding images back
+to vision models is a planned follow-up.
+
 ## Architecture
 
 ```
