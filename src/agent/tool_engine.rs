@@ -22,9 +22,7 @@ use tracing::{debug, info, instrument, warn, Instrument};
 use crate::agent::agent_core::RuntimeCounters;
 use crate::agent::audit::ToolEvent;
 use crate::agent::context::ContextBuilder;
-use crate::agent::markers::{
-    TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_OUTPUT_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
-};
+use crate::agent::markers::{TOOL_RUNNER_OUTPUT_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX};
 use crate::agent::role_policy;
 use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
 use crate::providers::base::{LLMProvider, LLMResponse, ToolCallRequest};
@@ -150,6 +148,20 @@ fn is_explicit_retrieval_tool(name: &str) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolResultExposure {
+    Handle,
+    ExplicitExcerpt,
+}
+
+fn tool_result_exposure(name: &str) -> ToolResultExposure {
+    if is_explicit_retrieval_tool(name) {
+        ToolResultExposure::ExplicitExcerpt
+    } else {
+        ToolResultExposure::Handle
+    }
+}
+
 /// Render the canonical, write-once-stable handle for a tool result. Pure and
 /// deterministic: identical inputs always produce byte-identical output, so a
 /// handle rendered live at ingestion is identical to the one persisted to
@@ -186,6 +198,42 @@ fn render_tool_result_handle(
         args_j = serde_json::to_string(&tool_arg_summary(args)).unwrap_or_else(|_| "{}".into()),
         excerpt_j = serde_json::to_string(&excerpt).unwrap_or_else(|_| "\"\"".into()),
     )
+}
+
+/// The provider-facing ingestion chokepoint for completed tool output.
+///
+/// Store the exact bytes before rendering anything for the model. Ordinary
+/// results become deterministic handles; explicit retrieval tools remain
+/// bounded excerpts so a slice/search continuation can show the bytes it
+/// deliberately requested. A storage failure never falls back to raw output.
+pub(crate) async fn store_then_render_tool_result(
+    sessions: &crate::session::SessionDb,
+    session_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    args: &std::collections::HashMap<String, Value>,
+    exact_body: &str,
+    ok: bool,
+    cap: usize,
+) -> Result<String, crate::session::db::StoredResult> {
+    use crate::session::db::StoredResult;
+
+    match sessions
+        .store_tool_result_immutable(session_id, tool_call_id, tool_name, exact_body)
+        .await
+    {
+        StoredResult::Stored { .. } | StoredResult::Identical { .. } => {}
+        outcome @ (StoredResult::Conflict { .. } | StoredResult::Failed) => return Err(outcome),
+    }
+
+    Ok(match tool_result_exposure(tool_name) {
+        ToolResultExposure::Handle => {
+            render_tool_result_handle(tool_call_id, tool_name, ok, exact_body.as_bytes(), args)
+        }
+        ToolResultExposure::ExplicitExcerpt => {
+            digest_tool_result(tool_name, args, exact_body, cap, tool_call_id)
+        }
+    })
 }
 
 /// Fixed-scalar allowlist for the handle's `args` field, in a fixed order.
@@ -714,7 +762,6 @@ pub(crate) async fn execute_tools_delegated(
     let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
     let routed_result_cap =
         inline_hot_prompt_result_cap_for_ctx_batch(ctx, routed_tool_calls.len());
-    let force_routed_stash = routed_tool_calls.len() > 1;
 
     for tc in routed_tool_calls {
         let routed_result = run_result
@@ -751,67 +798,20 @@ pub(crate) async fn execute_tools_delegated(
             return true;
         }
 
-        let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
-
-        let threshold = summary_threshold_tokens(&tc.name);
         let cap = routed_result_cap;
-        let injected_raw = if let Some(ref summary) = run_result.summary {
-            // Summary exists from scratch-pad analysis.
-            if full_tokens > threshold {
-                // Large data + good summary available: use the summary so compaction
-                // can never destroy the content by proportional truncation.
-                format!(
-                    "{}\n{}\n\n[Full output: {} chars, cached in context store]",
-                    TOOL_ANALYSIS_SUMMARY_PREFIX,
-                    summary,
-                    full_data.len()
-                )
-            } else {
-                // Small data — raw injection is safe; compaction won't truncate it.
-                ctx.content_gate.admit_simple(full_data).into_text()
-            }
-        } else if full_tokens > threshold {
-            if let Some(specialist) = ctx.core.specialist_provider.as_ref() {
-                let replay_provider = ReplayRecordingProvider::new(
-                    Arc::clone(specialist),
-                    TurnReplayRecorder::new(
-                        Arc::clone(&ctx.core.sessions),
-                        ctx.session_id.clone(),
-                        ctx.request_id.clone(),
-                        ctx.turn_count,
-                    ),
-                    ModelCallPurpose::ToolResultSummary,
-                );
-                ctx.content_gate
-                    .admit_with_specialist(
-                        full_data,
-                        &replay_provider,
-                        ctx.core.specialist_model.as_deref().unwrap_or(""),
-                    )
-                    .await
-                    .into_text()
-            } else {
-                ctx.content_gate.admit_simple(full_data).into_text()
-            }
-        } else {
-            ctx.content_gate.admit_simple(full_data).into_text()
-        };
-        // Stash the RAW delegated output (pre-runner-summary / pre-gate) for
-        // lossless recall — digesting `injected_raw` directly would store the
-        // summary instead of the original. Then preview injected_raw and add a
-        // recall pointer when the raw was stashed.
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
+        let mut injected = match store_then_render_tool_result(
             &ctx.core.sessions,
             &ctx.session_id,
             &tc.id,
             &tc.name,
+            &tc.arguments,
             full_data,
+            raw_ok,
             cap,
-            force_routed_stash,
         )
         .await
         {
-            Ok(b) => b,
+            Ok(rendered) => ctx.content_gate.admit_simple(&rendered).into_text(),
             Err(sr) => {
                 abort_turn_on_stash_failure(ctx, &tc.id, &tc.name, &sr);
                 // Skip this iteration's post-stash shaping (the abort helper
@@ -819,29 +819,6 @@ pub(crate) async fn execute_tools_delegated(
                 // infra_error check in step_execute_tools finalizes the turn.
                 continue;
             }
-        };
-        let mut injected = if stashed_raw
-            && !is_explicit_retrieval_tool(&tc.name)
-            && full_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES
-        {
-            // Genuinely oversized (over the replay byte cap) non-retrieval
-            // delegated output → handle only. Body lives in the stash; model
-            // recalls it. (A 95KB result replayed raw was the cache-break
-            // class.)
-            render_tool_result_handle(
-                &tc.id,
-                &tc.name,
-                tool_result_ok(full_data),
-                full_data.as_bytes(),
-                &tc.arguments,
-            )
-        } else {
-            // Medium (over the hot-prompt char cap but within the replay byte
-            // cap), retrieval tools (bounded excerpt by design), or small —
-            // excerpt by design), or small — show actual CONTENT via the
-            // deterministic head+tail preview. Handling medium results starved
-            // the model of normal read/exec bytes (2026-07-31 regression).
-            build_tool_result_preview(&tc.name, &tc.arguments, &injected_raw, cap, &tc.id)
         };
         // Prepend the per-lease progress signal so the model can see
         // remaining budget inline (B3 of the lease design — visible,
@@ -1364,12 +1341,7 @@ async fn execute_tool_calls_ordered(
 ///
 /// This function must run sequentially (one result at a time) because it
 /// mutates `ctx`.
-async fn inject_tool_result(
-    ctx: &mut TurnContext,
-    r: &SingleToolResult,
-    prompt_cap: usize,
-    force_stash_raw: bool,
-) {
+async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_cap: usize) {
     if let Some(record_error) = &r.replay_error {
         ctx.flow.infra_error = Some(format!(
             "tool execution result for {} could not be recorded: {record_error}",
@@ -1386,144 +1358,23 @@ async fn inject_tool_result(
         r.result.data().to_string()
     };
 
-    // Gate tool result through context budget.
-    let threshold = summary_threshold_tokens(&r.tool_name);
     let cap = prompt_cap.max(1);
-    let data = if r.tool_name == "recall_tool_result" {
-        // A recalled body is verbatim what the model asked for, but a large
-        // one cannot enter live context raw: a 172KB recall inflated a
-        // session to 77k tokens and triggered a cache-dropping compaction
-        // (session 20260730_094531_508b68, 2026-07-30). Route it through the
-        // same stash+digest as any other oversized result — the full body is
-        // stashed under this recall's id and the model queries it via
-        // slice_tool_result / search_tool_result.
-        let _stashed_raw = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &r.tool_id,
-            &r.tool_name,
-            &result_data,
-            cap,
-            force_stash_raw,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
-                return;
-            }
-        };
-        // Recall is an explicit-retrieval tool: its result carries a bounded
-        // excerpt (digest_tool_result handles small-as-passthrough + large as
-        // head+tail preview). The full body is stashed for slice/search.
-        let prompt_data =
-            digest_tool_result(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id);
-        ctx.content_gate.admit_simple(&prompt_data).into_text()
-    } else if ctx.core.specialist_provider.is_some()
-        && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > threshold
+    let data = match store_then_render_tool_result(
+        &ctx.core.sessions,
+        &ctx.session_id,
+        &r.tool_id,
+        &r.tool_name,
+        &r.arguments,
+        &result_data,
+        r.result.ok(),
+        cap,
+    )
+    .await
     {
-        // Specialist path: stash the RAW (pre-specialist) output for lossless
-        // recall — without this, recall would return the specialist's summary
-        // instead of the original. Then summarize and preview the summary.
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &r.tool_id,
-            &r.tool_name,
-            &result_data,
-            cap,
-            force_stash_raw,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
-                return;
-            }
-        };
-        let summarized = match ctx.core.specialist_provider.as_ref() {
-            Some(specialist) => {
-                let replay_provider = ReplayRecordingProvider::new(
-                    Arc::clone(specialist),
-                    TurnReplayRecorder::new(
-                        Arc::clone(&ctx.core.sessions),
-                        ctx.session_id.clone(),
-                        ctx.request_id.clone(),
-                        ctx.turn_count,
-                    ),
-                    ModelCallPurpose::ToolResultSummary,
-                );
-                ctx.content_gate
-                    .admit_with_specialist(
-                        &result_data,
-                        &replay_provider,
-                        ctx.core.specialist_model.as_deref().unwrap_or(""),
-                    )
-                    .await
-                    .into_text()
-            }
-            // Defensive: the caller previously panicked here if the provider
-            // was None; fall back to the simple admit instead.
-            None => ctx.content_gate.admit_simple(&result_data).into_text(),
-        };
-        let mut preview =
-            build_tool_result_preview(&r.tool_name, &r.arguments, &summarized, cap, &r.tool_id);
-        // If the summary fit under cap, build_tool_result_preview returned it
-        // unchanged with no recall pointer — but the raw IS stashed, so tell
-        // the model it can still recover the original.
-        if stashed_raw && !preview.contains("recall_tool_result") {
-            preview.push_str(&format!(
-                "\n[full original output retrievable via recall_tool_result({{\"tool_call_id\": \"{}\"}})]",
-                r.tool_id
-            ));
-        }
-        preview
-    } else {
-        let stashed_raw = match stash_tool_result_for_prompt_shaping(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &r.tool_id,
-            &r.tool_name,
-            &result_data,
-            cap,
-            force_stash_raw,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
-                return;
-            }
-        };
-        if stashed_raw && result_data.len() > TOOL_RESULT_REPLAY_MAX_BYTES {
-            // GENUINELY oversized (over the replay byte cap): handle only. A
-            // single 95KB result replayed raw was the cache-break class
-            // (token_mismatch under ExactBootstrap). The body lives in the
-            // stash, fetchable via recall_tool_result.
-            let handle = render_tool_result_handle(
-                &r.tool_id,
-                &r.tool_name,
-                r.result.ok(),
-                result_data.as_bytes(),
-                &r.arguments,
-            );
-            ctx.content_gate.admit_simple(&handle).into_text()
-        } else if stashed_raw {
-            // Medium (over the hot-prompt char cap but within the replay byte
-            // cap): show actual CONTENT via a deterministic head+tail preview.
-            // Handling these deprived the model of normal read/exec bytes and
-            // forced hallucination (2026-07-31 regression after the handles
-            // uproot). Stable per-result (body doesn't change) → no cache
-            // drift.
-            build_tool_result_preview(&r.tool_name, &r.arguments, &result_data, cap, &r.tool_id)
-        } else {
-            // Small result, not stashed — small enough to carry inline raw
-            // (under both the char cap and the replay byte cap). A handle
-            // would be larger than the body itself.
-            ctx.content_gate.admit_simple(&result_data).into_text()
+        Ok(rendered) => ctx.content_gate.admit_simple(&rendered).into_text(),
+        Err(sr) => {
+            abort_turn_on_stash_failure(ctx, &r.tool_id, &r.tool_name, &sr);
+            return;
         }
     };
 
@@ -1856,9 +1707,8 @@ pub(crate) async fn execute_tools_inline(
     )
     .await;
     let result_cap = inline_hot_prompt_result_cap_for_ctx_batch(ctx, ordered_results.len());
-    let force_stash_raw = ordered_results.len() > 1;
     for result in &ordered_results {
-        inject_tool_result(ctx, result, result_cap, force_stash_raw).await;
+        inject_tool_result(ctx, result, result_cap).await;
     }
 
     // Behavioral response-boundary arming. `parallel`/`sequential` hold only the
@@ -2982,6 +2832,41 @@ mod tests {
             Some(body_a.as_str()),
             "conflicting write must not replace the stored body"
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_result_size_classes_store_before_rendering_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("cli:handle-size-classes").await;
+        let args = HashMap::new();
+
+        for (index, size) in [0usize, 2, 7_400, 8_000, 172_000].into_iter().enumerate() {
+            let body = "x".repeat(size);
+            let id = format!("call_size_{index}");
+            let rendered = store_then_render_tool_result(
+                &sessions,
+                &session.id,
+                &id,
+                "web_fetch",
+                &args,
+                &body,
+                true,
+                4_096,
+            )
+            .await
+            .expect("ordinary result must be stored before rendering");
+
+            assert!(
+                rendered.starts_with(TOOL_RESULT_HANDLE_MARKER),
+                "size {size} must use the ordinary handle wire: {rendered}"
+            );
+            assert_eq!(
+                sessions.load_tool_result(&session.id, &id).await.as_deref(),
+                Some(body.as_str()),
+                "size {size} must remain losslessly recoverable"
+            );
+        }
     }
 
     /// STEP 2: the canonical handle must be a pure deterministic function of

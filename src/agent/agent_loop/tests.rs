@@ -6866,18 +6866,16 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
     );
 }
 
-/// A MEDIUM result (over the hot-prompt char cap but ≤8KB replay cap) must
-/// show actual CONTENT, NOT an opaque handle — the model needs bytes for
-/// normal read/exec work. Regression: the initial handles uproot handled these
-/// too, starving the model and forcing hallucination (2026-07-31). Only
-/// genuinely oversized (>8KB) results take the handle path.
+/// A MEDIUM ordinary result must be stored before prompt shaping and reach the
+/// model as a deterministic handle. This closes the raw-replay hole where a
+/// roughly 7KB web/file result was resent on every turn.
 #[tokio::test]
-async fn medium_tool_result_shows_content_not_handle() {
+async fn medium_tool_result_persists_handle_not_body() {
     use crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER;
 
     let files_dir = tempfile::tempdir().unwrap();
-    // ~5.6KB: over the small hot-prompt cap (stashed) but under the 8KB replay
-    // cap → must be content, not a handle.
+    // ~6.4KB: below the old replay-byte gate, but large enough to expose the
+    // raw replay behavior this regression is about.
     let body = "medium_line_one\nmedium_line_two\n".repeat(200);
     let path = files_dir.path().join("medium.txt");
     std::fs::write(&path, &body).unwrap();
@@ -6925,12 +6923,40 @@ async fn medium_tool_result_shows_content_not_handle() {
         .unwrap_or("");
 
     assert!(
-        !content.starts_with(TOOL_RESULT_HANDLE_MARKER),
-        "medium (<=8KB) result must show CONTENT, not a handle; got: {content}"
+        content.starts_with(TOOL_RESULT_HANDLE_MARKER),
+        "ordinary medium result must be a handle, not raw content; got: {content}"
     );
     assert!(
-        content.contains("medium_line_one"),
-        "medium result must carry real body content; got: {content}"
+        !content.contains("medium_line_one"),
+        "ordinary medium result body must stay out of the message; got: {content}"
+    );
+
+    let stashed = core
+        .sessions
+        .load_tool_result(&session.id, "tc_medium")
+        .await
+        .expect("medium body must be durably stashed");
+    assert!(
+        stashed.contains("medium_line_one") && stashed.contains("medium_line_two"),
+        "stash must retain the exact tool output bytes; got: {stashed}"
+    );
+
+    let calls = provider.calls();
+    let live_msg = calls
+        .iter()
+        .flat_map(|call| call.iter())
+        .find(|message| {
+            message.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && message.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_medium")
+        })
+        .expect("next provider request must contain the medium tool message");
+    let live_content = live_msg
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        live_content, content,
+        "live and persisted medium handles must be byte-identical"
     );
 
     let _ = std::fs::remove_dir_all(files_dir);

@@ -2283,6 +2283,71 @@ impl SessionDb {
     ) -> Vec<Value> {
         let mut raw = self.get_all_messages(session_id).await;
 
+        // Upgrade legacy ordinary tool messages at the replay boundary. Older
+        // binaries persisted medium bodies inline, so merely fixing new
+        // ingestion would leave a 7 KB web/file result replaying forever from
+        // an existing session. Reuse the same store-then-render chokepoint as
+        // live tool execution; handles remain deterministic across reloads.
+        for message in &mut raw {
+            if message.get("role").and_then(Value::as_str) != Some("tool") {
+                continue;
+            }
+            let Some(raw_content) = message.get("content").and_then(Value::as_str) else {
+                continue;
+            };
+            if raw_content.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER) {
+                continue;
+            }
+            // These are protocol/infrastructure receipts, not ordinary tool
+            // output. Rewriting them would make a live boundary rejection
+            // become a handle on the next reload and bust the prefix cache.
+            if raw_content.starts_with("response boundary:")
+                || raw_content.starts_with("Error: result for ")
+            {
+                continue;
+            }
+            let Some(tool_call_id) = message.get("tool_call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(tool_name) = message.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+
+            // A previous batch path may already have stored the exact body
+            // while persisting a bounded preview. Prefer that durable body;
+            // otherwise the legacy message itself is the only available exact
+            // input and is stored before it is hidden behind a handle.
+            let exact_body = self
+                .load_tool_result(session_id, tool_call_id)
+                .await
+                .unwrap_or_else(|| raw_content.to_string());
+            let ok = message
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(!exact_body.starts_with("Error:"));
+            match crate::agent::tool_engine::store_then_render_tool_result(
+                self,
+                session_id,
+                tool_call_id,
+                tool_name,
+                &HashMap::new(),
+                &exact_body,
+                ok,
+                crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES,
+            )
+            .await
+            {
+                Ok(rendered) => message["content"] = Value::String(rendered),
+                Err(error) => warn!(
+                    session_id,
+                    tool_call_id,
+                    tool_name,
+                    ?error,
+                    "Could not upgrade legacy tool result during history replay"
+                ),
+            }
+        }
+
         // The history filter still performs text-specific truncation and token
         // estimation. Give it a JSON text projection for structured content,
         // then restore the exact persisted value by stable row id before the
@@ -4656,6 +4721,56 @@ mod tests {
         assert_eq!(history[0]["content"], "hello");
         assert_eq!(history[1]["role"], "assistant");
         assert_eq!(history[1]["content"], "hi there");
+    }
+
+    #[tokio::test]
+    async fn get_history_upgrades_legacy_medium_tool_body_to_handle() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:legacy-tool-handle").await;
+        let body = "nytimes article line\n".repeat(400);
+
+        db.add_messages(
+            &meta.id,
+            &[
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "legacy_web_fetch",
+                        "type": "function",
+                        "function": {"name": "web_fetch", "arguments": "{}"}
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "legacy_web_fetch",
+                    "name": "web_fetch",
+                    "ok": true,
+                    "content": body
+                }),
+            ],
+        )
+        .await;
+
+        let first = db.get_history(&meta.id, 100, 0).await;
+        let first_tool = first
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .expect("legacy tool message must remain in the complete turn");
+        let first_content = first_tool["content"].as_str().unwrap();
+        assert!(first_content.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER));
+        assert!(!first_content.contains("nytimes article line\nnytimes article line"));
+        assert_eq!(
+            db.load_tool_result(&meta.id, "legacy_web_fetch").await,
+            Some(body.clone())
+        );
+
+        let second = db.get_history(&meta.id, 100, 0).await;
+        let second_tool = second
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .expect("upgraded tool message must remain replayable");
+        assert_eq!(second_tool["content"], first_tool["content"]);
     }
 
     #[tokio::test]
