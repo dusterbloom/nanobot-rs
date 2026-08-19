@@ -19,6 +19,7 @@ use tracing::warn;
 use crate::agent::agent_core::{PendingCompaction, SwappableCore};
 use crate::agent::lcm::{CompactionFailureMode, LcmCompactionState, LcmEngine};
 use crate::agent::token_budget::TokenBudget;
+use crate::session::db::{ModelCallPurpose, ReplayRecordingProvider, TurnReplayRecorder};
 
 #[derive(Clone, Copy)]
 enum CompactionPhase {
@@ -433,11 +434,24 @@ pub(super) async fn execute_lcm_compaction(
     if failure_mode == CompactionFailureMode::PreserveContext {
         mutation.engine_mut().request_async_compaction();
     }
+    let replay = TurnReplayRecorder::new(
+        Arc::clone(&core.sessions),
+        session_id.clone(),
+        format!("compaction:{session_turn}:{}", uuid::Uuid::new_v4()),
+        session_turn,
+    );
+    let recorded_provider: Arc<dyn crate::providers::base::LLMProvider> =
+        Arc::new(ReplayRecordingProvider::new(
+            Arc::clone(&core.provider),
+            replay.clone(),
+            ModelCallPurpose::Compaction,
+        ));
+    let compactor = core.compactor.with_provider(recorded_provider);
     let summary_turn = tokio::select! {
         biased;
         () = cancellation.cancelled() => return None,
         summary = mutation.engine_mut().compact(
-            Some(&core.compactor),
+            Some(&compactor),
             &core.token_budget,
             0,
             failure_mode,
@@ -515,6 +529,7 @@ pub(super) async fn execute_lcm_compaction(
     };
 
     if pending.is_some() && (cancellation.is_cancelled() || !publication.begin_publication()) {
+        let _ = replay.turn_finished("cancelled_before_publication").await;
         return None;
     }
 
@@ -557,6 +572,24 @@ pub(super) async fn execute_lcm_compaction(
     }
     drop(mutation);
     drop(engine);
+    // The checkpoint itself is durable (engine commit + SQLite row above),
+    // so a failed replay finalization must not discard it. Warn and hand the
+    // pending compaction to the foreground; the session's replay degrades to
+    // Incomplete, which is exactly what that availability level exists for.
+    if let Err(error) = replay
+        .turn_finished(if checkpoint_persisted {
+            "finished"
+        } else {
+            "checkpoint_failed"
+        })
+        .await
+    {
+        warn!(
+            %error,
+            %session_id,
+            "compaction replay finalization failed; replay degrades to incomplete"
+        );
+    }
     if checkpoint_persisted {
         pending
     } else {

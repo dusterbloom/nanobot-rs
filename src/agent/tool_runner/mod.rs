@@ -149,11 +149,22 @@ impl Budget {
     }
 }
 
+/// One delegated tool outcome. `duration_ms` is the implementation-exit
+/// timing (the tool implementation itself, excluding delegation LLM
+/// iterations), matching the journal schema for `tool_execute` events.
+#[derive(Debug, Clone)]
+pub struct ToolRunOutcome {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub data: String,
+    pub duration_ms: u64,
+}
+
 /// Result of a delegated tool execution loop.
 #[derive(Debug, Clone)]
 pub struct ToolRunResult {
-    /// Collected (tool_call_id, tool_name, result_data) from all iterations.
-    pub tool_results: Vec<(String, String, String)>,
+    /// Collected outcomes (tool_call_id, tool_name, result_data, duration) from all iterations.
+    pub tool_results: Vec<ToolRunOutcome>,
     /// Optional summary from the cheap model about what happened.
     pub summary: Option<String>,
     /// How many iterations were used.
@@ -217,7 +228,7 @@ async fn analyze_via_scratch_pad(
     allowed_tools: &std::collections::HashSet<&str>,
     tools: &ToolRegistry,
     task_context: &str,
-    all_results: &mut Vec<(String, String, String)>,
+    all_results: &mut Vec<ToolRunOutcome>,
     max_rounds: usize,
 ) -> Option<String> {
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -417,15 +428,23 @@ async fn analyze_via_scratch_pad(
                         _ => {} // scratch_store/scratch_recall/set_phase handle persistence internally
                     }
                 } else if worker_tools::is_worker_tool(&tc.name) {
+                    let started = std::time::Instant::now();
                     let result =
                         worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
+                    let duration_ms = started.elapsed().as_millis() as u64;
                     let (_, _metadata) = context_store.store(result.clone());
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
-                    all_results.push((original_id, tc.name.clone(), result));
+                    all_results.push(ToolRunOutcome {
+                        tool_call_id: original_id,
+                        tool_name: tc.name.clone(),
+                        data: result,
+                        duration_ms,
+                    });
                 } else {
                     // Real tool — execute with retry on transient errors.
                     debug!("Scratch pad executing real tool: {}", tc.name);
+                    let started = std::time::Instant::now();
                     let result = execute_with_retry(
                         tools,
                         &tc.name,
@@ -435,10 +454,16 @@ async fn analyze_via_scratch_pad(
                         TOOL_MAX_RETRIES,
                     )
                     .await;
+                    let duration_ms = started.elapsed().as_millis() as u64;
                     let (_, _metadata) = context_store.store(result.data().to_string());
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
-                    all_results.push((original_id, tc.name.clone(), result.data().to_string()));
+                    all_results.push(ToolRunOutcome {
+                        tool_call_id: original_id,
+                        tool_name: tc.name.clone(),
+                        data: result.data().to_string(),
+                        duration_ms,
+                    });
                 }
             }
             // Continue to next round — fresh call with updated state.
@@ -540,7 +565,7 @@ pub async fn run_tool_loop(
         tools = initial_tool_calls.len(),
         "tool_delegation_start"
     );
-    let mut all_results: Vec<(String, String, String)> = Vec::new();
+    let mut all_results: Vec<ToolRunOutcome> = Vec::new();
     let mut iterations_used: u32 = 0;
     let mut id_counter: usize = 0;
     // Track tool calls we've already executed to detect loops.
@@ -755,7 +780,13 @@ pub async fn run_tool_loop(
                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         let original_id =
                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                        all_results.push((original_id, tc.name.clone(), result));
+                        all_results.push(ToolRunOutcome {
+                            tool_call_id: original_id,
+                            tool_name: tc.name.clone(),
+                            data: result,
+                            // No implementation ran.
+                            duration_ms: 0,
+                        });
                         continue;
                     }
                 };
@@ -897,11 +928,20 @@ pub async fn run_tool_loop(
                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         let original_id =
                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                        all_results.push((original_id, tc.name.clone(), result));
+                        all_results.push(ToolRunOutcome {
+                            tool_call_id: original_id,
+                            tool_name: tc.name.clone(),
+                            data: result,
+                            // Provider failed before any child implementation ran.
+                            duration_ms: 0,
+                        });
                         continue;
                     }
                 };
 
+                // The delegate tool's implementation is the child loop (or
+                // the direct child response) plus its provider call.
+                let started = std::time::Instant::now();
                 let result = if child_response.has_tool_calls() {
                     // Child wants to use tools — run the tool loop.
                     let child_result = Box::pin(run_tool_loop(
@@ -916,8 +956,12 @@ pub async fn run_tool_loop(
                         child_result
                             .tool_results
                             .iter()
-                            .map(|(_, name, data)| {
-                                format!("[{}]: {}", name, &data[..data.len().min(500)])
+                            .map(|outcome| {
+                                format!(
+                                    "[{}]: {}",
+                                    outcome.tool_name,
+                                    &outcome.data[..outcome.data.len().min(500)]
+                                )
                             })
                             .collect::<Vec<_>>()
                             .join("\n")
@@ -928,6 +972,7 @@ pub async fn run_tool_loop(
                         .content
                         .unwrap_or_else(|| "No result from delegate.".to_string())
                 };
+                let delegate_duration_ms = started.elapsed().as_millis() as u64;
 
                 // Store delegate result like any other tool.
                 let (_, metadata) = context_store.store(result.clone());
@@ -938,11 +983,18 @@ pub async fn run_tool_loop(
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                all_results.push((original_id, tc.name.clone(), result));
+                all_results.push(ToolRunOutcome {
+                    tool_call_id: original_id,
+                    tool_name: tc.name.clone(),
+                    data: result,
+                    duration_ms: delegate_duration_ms,
+                });
             } else if worker_tools::is_worker_tool(&tc.name) {
                 // Async worker tool: runs a command/script and returns result.
                 debug!("Worker tool: {} (id: {})", tc.name, tc.id);
+                let started = std::time::Instant::now();
                 let result = worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
+                let duration_ms = started.elapsed().as_millis() as u64;
                 // Store result in ContextStore for subsequent micro-tool access.
                 let (_, metadata) = context_store.store(result.clone());
                 let delegation_data = if result.len() > config.max_tool_result_chars {
@@ -952,14 +1004,19 @@ pub async fn run_tool_loop(
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                all_results.push((original_id, tc.name.clone(), result));
+                all_results.push(ToolRunOutcome {
+                    tool_call_id: original_id,
+                    tool_name: tc.name.clone(),
+                    data: result,
+                    duration_ms,
+                });
 
                 // Track result hashes for loop detection.
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 tc.name.hash(&mut hasher);
                 if let Some(last) = all_results.last() {
-                    last.2.hash(&mut hasher);
+                    last.data.hash(&mut hasher);
                 }
                 let result_hash = hasher.finish();
                 if !seen_results.insert(result_hash) {
@@ -978,6 +1035,7 @@ pub async fn run_tool_loop(
             } else {
                 // Real tool: execute with retry on transient errors.
                 debug!("Tool runner executing: {} (id: {})", tc.name, tc.id);
+                let started = std::time::Instant::now();
                 let result = execute_with_retry(
                     tools,
                     &tc.name,
@@ -987,6 +1045,7 @@ pub async fn run_tool_loop(
                     TOOL_MAX_RETRIES,
                 )
                 .await;
+                let duration_ms = started.elapsed().as_millis() as u64;
                 // For web_fetch/web_search: unwrap the JSON envelope so the model
                 // sees clean article text rather than a JSON metadata summary.
                 let raw_data = if tc.name == "web_fetch" || tc.name == "web_search" {
@@ -1005,7 +1064,12 @@ pub async fn run_tool_loop(
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                all_results.push((original_id, tc.name.clone(), stripped));
+                all_results.push(ToolRunOutcome {
+                    tool_call_id: original_id,
+                    tool_name: tc.name.clone(),
+                    data: stripped,
+                    duration_ms,
+                });
 
                 // Track result hashes for loop detection.
                 use std::hash::{Hash, Hasher};
@@ -1043,12 +1107,15 @@ pub async fn run_tool_loop(
             let threshold = config.short_circuit_chars;
             let all_short = all_results
                 .iter()
-                .all(|(_, _, data)| data.len() < threshold);
+                .all(|outcome| outcome.data.len() < threshold);
             // exec/web_search/web_fetch results need interpretation even when short
             // (e.g. a 50-char error message should be analyzed, not passed raw).
-            let needs_interpretation = all_results
-                .iter()
-                .any(|(_, name, _)| matches!(name.as_str(), "exec" | "web_search" | "web_fetch"));
+            let needs_interpretation = all_results.iter().any(|outcome| {
+                matches!(
+                    outcome.tool_name.as_str(),
+                    "exec" | "web_search" | "web_fetch"
+                )
+            });
             if all_short && !needs_interpretation {
                 debug!(
                     "All {} tool results are short (< {} chars) — skipping delegation LLM, returning raw results",
@@ -1111,14 +1178,15 @@ pub fn format_results_for_context(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    for (_, tool_name, data) in &result.tool_results {
-        let compacted = compact_result_for_context(tool_name, data, max_result_chars);
+    for outcome in &result.tool_results {
+        let compacted =
+            compact_result_for_context(&outcome.tool_name, &outcome.data, max_result_chars);
         let visible = if let Some(g) = gate.as_deref_mut() {
             g.admit_simple(&compacted).into_text()
         } else {
             compacted
         };
-        parts.push(format!("[{}]: {}", tool_name, visible));
+        parts.push(format!("[{}]: {}", outcome.tool_name, visible));
     }
 
     if let Some(ref summary) = result.summary {
@@ -1139,7 +1207,7 @@ fn compact_result_for_context(tool_name: &str, data: &str, max_result_chars: usi
         "[tool result compacted for main context]\n\
          tool: {tool_name}\n\
          full_output: {total_chars} chars\n\
-         guidance: do not replay the same broad tool call; inspect a narrower range only if needed.\n\n\
+         guidance: do not replay the same broad tool .all(|outcome| outcome.data.len() < threshold); inspect a narrower range only if needed.\n\n\
          --- preview ---\n"
     );
     let footer = "\n\n[truncated; full output kept outside the hot prompt]";

@@ -217,11 +217,50 @@ async fn test_request_strict_router_decision_action_matrix() {
             1.0,
             "",
             256,
+            None,
         )
         .await
         .expect("valid strict router decision");
         assert_eq!(decision.action, expected_action);
     }
+}
+
+#[tokio::test]
+async fn router_journal_failure_degrades_instead_of_failing_routing() {
+    // Break caught: a transient replay-journal write failure aborted the
+    // strict router before the provider was even called, turning any
+    // SQLite stutter into a routing outage.
+    let dir = tempfile::tempdir().unwrap();
+    let sessions =
+        std::sync::Arc::new(crate::session::db::SessionDb::new(&dir.path().join("s.db")));
+    let meta = sessions.create_session("cli:router-journal-fault").await;
+    sessions.fail_model_request_writes_for_tests(1);
+    let replay = crate::session::db::TurnReplayRecorder::new(
+        std::sync::Arc::clone(&sessions),
+        meta.id.clone(),
+        "turn-1".to_string(),
+        1,
+    );
+    let llm = StaticResponseLLM::plain(
+        "router",
+        r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#,
+    );
+
+    let decision = request_strict_router_decision(
+        &llm,
+        "router",
+        "route this action with strict schema",
+        false,
+        0.6,
+        1.0,
+        "",
+        256,
+        Some(&replay),
+    )
+    .await
+    .expect("routing must survive a transient journal write failure");
+
+    assert_eq!(decision.action, "respond");
 }
 
 /// Real-provider trio probe.
@@ -288,6 +327,7 @@ async fn test_real_providers_trio_probe() {
             1.0,
             "",
             256,
+            None,
         )
         .await
         {
@@ -3487,6 +3527,103 @@ async fn published_soft_checkpoint_replays_and_installs_on_next_turn() {
 }
 
 #[tokio::test]
+async fn soft_checkpoint_survives_turn_finish_journal_failure() {
+    // Break caught: a durably-checkpointed LCM compaction was discarded when
+    // the final replay journal write failed, so the compacted context never
+    // installed on the next turn (prefix-divergence class).
+    let provider = Arc::new(ReplayStableSoftProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
+        force_recovery_on_second: false,
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "replay-stable-soft-compaction-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("replay-soft-fault-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    persist_prior_summary(&core, &session.id).await;
+
+    let mut probe = InboundMessage::new("test", "user", "offline", "probe prior summary");
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    assert!(prepared
+        .messages
+        .iter()
+        .any(|message| message.get("_lcm_summary").is_some()));
+    let compaction = prepared.compaction.clone();
+    drop(prepared);
+
+    // Fail both turn-finish journal writes of turn one: the foreground
+    // finalize and the compaction close. Reply and checkpoint must both
+    // survive; replay degrades to Incomplete.
+    core.sessions.fail_turn_finished_writes_for_tests(2);
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    await_compaction_sync(
+        "soft checkpoint publication despite journal failure",
+        async {
+            while !compaction.has_pending().await {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await;
+
+    let installs_before = agent_loop
+        .shared
+        .core_handle
+        .counters
+        .lcm_compaction_count
+        .load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        agent_loop
+            .process_direct("Continue on turn two.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+
+    assert!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .lcm_compaction_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > installs_before,
+        "the checkpoint must install despite the journal failure"
+    );
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("To read the exact originals call"))
+    }));
+}
+
+#[tokio::test]
 async fn exact_soft_compaction_leases_old_higgs_id_before_fresh_rotation() {
     let provider = Arc::new(ReplayStableSoftProvider {
         foreground_calls: std::sync::Mutex::new(Vec::new()),
@@ -4104,6 +4241,15 @@ async fn retained_expansion_preflight_persists_old_route_through_tools_then_dele
         Some(fresh_id)
     );
     assert_eq!(counters.expansion_checkpoint(&session_key), None);
+    let replay = core
+        .sessions
+        .load_session_replay(&session.id)
+        .await
+        .unwrap();
+    assert!(replay.model_calls.iter().any(|call| {
+        call.purpose == crate::session::db::ModelCallPurpose::RetainedExpansionPreflight
+            && call.response.is_some()
+    }));
 }
 
 #[tokio::test]
@@ -7074,6 +7220,22 @@ async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
     let turn1_calls = provider.calls().len();
     assert!(turn1_calls >= 2, "turn 1 must make multiple provider calls");
 
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("boundary session should exist");
+    let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
+    assert!(replay.events.iter().any(|event| matches!(
+        &event.payload,
+        crate::session::db::SessionEventPayload::ToolPreExecute {
+            tool_call_id,
+            decision: crate::session::db::ToolPreExecuteDecision::Rejected { reason },
+            ..
+        } if tool_call_id == "tc_exec_2" && reason == "response_boundary"
+    )));
+
     tokio::time::timeout(
         std::time::Duration::from_secs(15),
         agent_loop.process_direct("so what happened?", &session_key, "test", "offline"),
@@ -7088,6 +7250,49 @@ async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
         calls.len()
     );
     assert_wire_prefix(&calls[turn1_calls - 1], &calls[turn1_calls]);
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn turn_finish_journal_failure_still_returns_the_reply() {
+    // Break caught: when the final turn-finished journal write failed, an
+    // already-generated and already-persisted reply was discarded and the
+    // user got nothing. The reply must survive; only replay availability
+    // degrades to Incomplete.
+    let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![crate::providers::base::LLMResponse {
+            content: Some(attested_text("still delivered")),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: std::collections::HashMap::new(),
+        }],
+    ));
+    let (agent_loop, workspace) = build_local_inline_harness(main);
+    let session_key = format!("journal-fault-reply-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+
+    core.sessions.fail_turn_finished_writes_for_tests(1);
+
+    let response = agent_loop
+        .process_direct("say the thing", &session_key, "test", "offline")
+        .await;
+    assert_eq!(response, "still delivered");
+
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("session should exist");
+    let messages = core.sessions.get_all_messages(&meta.id).await;
+    assert!(
+        messages.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("assistant")
+                && m.get("content").and_then(Value::as_str) == Some("still delivered")
+        }),
+        "the reply must remain in persisted history despite the journal failure"
+    );
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -7176,6 +7381,194 @@ async fn test_tool_call_carrier_persists_before_tool_result() {
         "tool result must point at the immediately preceding assistant call"
     );
 
+    let replay = core
+        .sessions
+        .load_session_replay(&meta.id)
+        .await
+        .expect("load tool replay");
+    assert_eq!(
+        replay.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| event.payload.kind())
+            .collect::<Vec<_>>(),
+        vec![
+            "turn_started",
+            "model_request",
+            "model_response",
+            "tool_pre_execute",
+            "tool_execute",
+            "tool_post_execute",
+            "model_request",
+            "model_response",
+            "turn_finished",
+        ]
+    );
+    assert_eq!(replay.model_calls.len(), 2);
+    let second_request: Value = serde_json::from_slice(&replay.model_calls[1].request).unwrap();
+    assert!(second_request["messages"]
+        .as_array()
+        .is_some_and(|messages| messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some("tc_list")
+        })));
+    let lifecycle: Vec<&crate::session::db::SessionEventPayload> = replay
+        .events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            payload @ (crate::session::db::SessionEventPayload::ToolPreExecute { .. }
+            | crate::session::db::SessionEventPayload::ToolExecute { .. }
+            | crate::session::db::SessionEventPayload::ToolPostExecute { .. }) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lifecycle.len(), 3);
+    assert!(matches!(
+        lifecycle[0],
+        crate::session::db::SessionEventPayload::ToolPreExecute {
+            tool_call_id,
+            decision: crate::session::db::ToolPreExecuteDecision::Ready,
+            ..
+        } if tool_call_id == "tc_list"
+    ));
+    assert!(matches!(
+        lifecycle[1],
+        crate::session::db::SessionEventPayload::ToolExecute {
+            tool_call_id,
+            ok: true,
+            ..
+        } if tool_call_id == "tc_list"
+    ));
+    assert!(matches!(
+        lifecycle[2],
+        crate::session::db::SessionEventPayload::ToolPostExecute {
+            tool_call_id,
+            message_id,
+            ..
+        } if tool_call_id == "tc_list" && *message_id > 0
+    ));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn exact_turn_replay_survives_workspace_prompt_changes() {
+    // Break caught: replay reconstructs the old provider request from today's
+    // workspace/system prompt instead of reading the exact durable call bytes.
+    let main: Arc<dyn LLMProvider> =
+        Arc::new(StaticResponseLLM::new("local-main", "recorded answer"));
+    let (agent_loop, workspace) = build_local_inline_harness(main);
+    let session_key = format!("exact-turn-replay-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct("preserve this exact turn", &session_key, "test", "offline")
+        .await;
+    assert_eq!(response, "recorded answer");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("session should exist");
+    let before = core
+        .sessions
+        .load_session_replay(&meta.id)
+        .await
+        .expect("load exact replay");
+    assert_eq!(
+        before.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+    assert_eq!(before.model_calls.len(), 1);
+    assert!(matches!(
+        before.events.last().map(|event| &event.payload),
+        Some(crate::session::db::SessionEventPayload::TurnFinished { outcome })
+            if outcome == "finished"
+    ));
+    let request: Value = serde_json::from_slice(&before.model_calls[0].request).unwrap();
+    assert_eq!(request.get("streaming"), Some(&Value::Bool(false)));
+    assert_eq!(
+        request.get("model").and_then(Value::as_str),
+        Some(core.model.as_str())
+    );
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("recorded messages");
+    assert!(messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("user")
+            && message.get("content").and_then(Value::as_str) == Some("preserve this exact turn")
+    }));
+
+    std::fs::write(workspace.join("IDENTITY.md"), "a different future identity").unwrap();
+    let after = core
+        .sessions
+        .load_session_replay(&meta.id)
+        .await
+        .expect("reload exact replay");
+    assert_eq!(after.model_calls[0].request, before.model_calls[0].request);
+    assert_eq!(
+        after.model_calls[0].response,
+        before.model_calls[0].response
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn pre_execute_persistence_failure_prevents_tool_side_effect() {
+    // Break caught: a tool enters its implementation even though the durable
+    // pre-execute decision failed, leaving an unreplayable side effect.
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: "tc-blocked-write".to_string(),
+                name: "write_file".to_string(),
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("blocked.txt")),
+                    ("content".to_string(), json!("must not exist")),
+                ]),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: HashMap::new(),
+        }],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let core = agent_loop.shared.core_handle.swappable();
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_tool_pre_replay \
+             BEFORE INSERT ON session_events \
+             WHEN NEW.event_kind = 'tool_pre_execute' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic pre-execute persistence failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct(
+            "write the blocked file",
+            &format!("pre-execute-failure-{}", uuid::Uuid::new_v4()),
+            "test",
+            "offline",
+        )
+        .await;
+
+    assert!(
+        response.contains("pre-execution decision could not be recorded"),
+        "unexpected failure response: {response:?}"
+    );
+    assert!(!workspace.join("blocked.txt").exists());
+    assert_eq!(provider.call_count(), 1);
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
@@ -7509,6 +7902,27 @@ async fn test_failed_local_call_does_not_seed_prompt_cache_marker() {
             .is_some_and(|m| m.starts_with("\u{0}cache:first:")),
         "failed call may diagnose cold cache, but must not commit it: {first_markers:?}"
     );
+    let core = agent_loop.shared.core_handle.swappable();
+    let failed_session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("failed turn session");
+    let failed_replay = core
+        .sessions
+        .load_session_replay(&failed_session.id)
+        .await
+        .expect("failed turn replay");
+    assert_eq!(
+        failed_replay.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+    assert!(failed_replay.model_calls[0]
+        .failure
+        .as_deref()
+        .is_some_and(|bytes| bytes
+            .windows("synthetic provider failure".len())
+            .any(|window| { window == "synthetic provider failure".as_bytes() })));
 
     let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let second = agent_loop
@@ -7603,6 +8017,22 @@ async fn test_direct_streaming_forwards_thinking_delta_with_ansi_marker() {
         deltas.iter().any(|delta| delta == "visible answer"),
         "visible answer text should still stream after thinking: {deltas:?}"
     );
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("streaming replay session");
+    let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
+    assert_eq!(
+        replay.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+    let recorded_request: Value = serde_json::from_slice(&replay.model_calls[0].request).unwrap();
+    assert_eq!(recorded_request["streaming"], json!(true));
+    let recorded_response: Value =
+        serde_json::from_slice(replay.model_calls[0].response.as_deref().unwrap()).unwrap();
+    assert_eq!(recorded_response["content"], json!("visible answer"));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -9100,6 +9530,17 @@ mod runtime_mode_parity_tests {
             final_text.contains("narrated a tool action"),
             "turn must end with an explicit no-execution failure, got: {final_text:?}"
         );
+        let core = agent_loop.shared.core_handle.swappable();
+        let meta = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .expect("phantom session");
+        let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
+        assert!(replay.model_calls.iter().any(|call| {
+            call.purpose == crate::session::db::ModelCallPurpose::ForcedToolRecovery
+                && call.response.is_some()
+        }));
 
         let _ = std::fs::remove_dir_all(&workspace);
     }

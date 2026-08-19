@@ -59,6 +59,98 @@ struct CountingTool {
     call_count: AtomicU32,
 }
 
+/// Tool with a controllable runtime, for per-tool timing assertions.
+struct TimedTool {
+    name: String,
+    sleep_ms: u64,
+}
+
+#[async_trait]
+impl Tool for TimedTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "A timed test tool"
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]})
+    }
+    async fn execute(&self, _params: HashMap<String, Value>) -> String {
+        if self.sleep_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
+        }
+        format!("{} result", self.name)
+    }
+}
+
+#[tokio::test]
+async fn tool_results_report_per_tool_implementation_timing() {
+    // Break caught: delegated duration_ms was fabricated as
+    // total_delegation_time / count, so a 150ms tool and a 0ms tool both
+    // reported the same averaged value in the audit journal and TUI.
+    let provider = Arc::new(MockProvider::new(vec![
+        // After initial tool execution, model says "done".
+        crate::providers::base::LLMResponse {
+            content: Some("All done.".to_string()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: HashMap::new(),
+        },
+    ]));
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(TimedTool {
+        name: "fast_tool".to_string(),
+        sleep_ms: 0,
+    }));
+    tools.register(Box::new(TimedTool {
+        name: "slow_tool".to_string(),
+        sleep_ms: 150,
+    }));
+
+    let config = ToolRunnerConfig {
+        provider,
+        model: "mock".to_string(),
+        max_iterations: 10,
+        max_tokens: 4096,
+
+        max_tool_result_chars: 30000,
+        short_circuit_chars: 0,
+        depth: 0,
+        cancellation_token: None,
+        verbatim: false,
+        budget: None,
+    };
+
+    let result = run_tool_loop(
+        &config,
+        &make_tool_calls(&["fast_tool", "slow_tool"]),
+        &tools,
+        "timing context",
+    )
+    .await;
+
+    assert_eq!(result.tool_results.len(), 2);
+    let duration_of = |name: &str| {
+        result
+            .tool_results
+            .iter()
+            .find(|outcome| outcome.tool_name == name)
+            .unwrap_or_else(|| panic!("no outcome for {name}"))
+            .duration_ms
+    };
+    let fast = duration_of("fast_tool");
+    let slow = duration_of("slow_tool");
+    assert!(
+        slow >= 140,
+        "slow tool must report its own runtime, got {slow}ms"
+    );
+    assert!(
+        fast * 3 < slow,
+        "fast tool runtime must be measured, not a fabricated average: fast={fast}ms slow={slow}ms"
+    );
+}
 impl CountingTool {
     fn new() -> Self {
         Self {
@@ -137,6 +229,15 @@ fn make_tool_calls(names: &[&str]) -> Vec<ToolCallRequest> {
         .collect()
 }
 
+fn outcome(id: &str, name: &str, data: &str) -> ToolRunOutcome {
+    ToolRunOutcome {
+        tool_call_id: id.to_string(),
+        tool_name: name.to_string(),
+        data: data.to_string(),
+        duration_ms: 0,
+    }
+}
+
 #[tokio::test]
 async fn test_run_tool_loop_executes_tools() {
     let provider = Arc::new(MockProvider::new(vec![
@@ -175,8 +276,8 @@ async fn test_run_tool_loop_executes_tools() {
     .await;
 
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].1, "test_tool");
-    assert_eq!(result.tool_results[0].2, "tool result data");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
+    assert_eq!(result.tool_results[0].data, "tool result data");
     assert_eq!(result.summary.as_deref(), Some("All done."));
     assert_eq!(result.iterations_used, 1);
 }
@@ -329,12 +430,8 @@ async fn test_run_tool_loop_returns_on_no_more_tool_calls() {
 fn test_aggregate_results_formatting() {
     let result = ToolRunResult {
         tool_results: vec![
-            (
-                "id1".into(),
-                "read_file".into(),
-                "file contents here".into(),
-            ),
-            ("id2".into(), "exec".into(), "command output".into()),
+            outcome("id1", "read_file", "file contents here"),
+            outcome("id2", "exec", "command output"),
         ],
         summary: Some("Read a file and ran a command.".to_string()),
         iterations_used: 1,
@@ -351,7 +448,7 @@ fn test_aggregate_results_formatting() {
 fn test_aggregate_results_compacts_long_output() {
     let long_data = "x".repeat(3000);
     let result = ToolRunResult {
-        tool_results: vec![("id1".into(), "big_tool".into(), long_data.clone())],
+        tool_results: vec![outcome("id1", "big_tool", &long_data)],
         summary: None,
         iterations_used: 1,
         error: None,
@@ -368,7 +465,7 @@ fn test_aggregate_results_compacts_long_output() {
 fn test_results_preview_with_summary() {
     let data = "x".repeat(500);
     let result = ToolRunResult {
-        tool_results: vec![("id1".into(), "read_file".into(), data.clone())],
+        tool_results: vec![outcome("id1", "read_file", &data)],
         summary: Some("Found a large file.".to_string()),
         iterations_used: 1,
         error: None,
@@ -630,7 +727,7 @@ async fn test_tool_loop_provider_error_still_returns_results() {
 
     // Tool was executed before the LLM call failed
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].1, "test_tool");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
     // Scratch pad LLM call fails, falls back to None (no memory findings).
     assert!(
         result.summary.is_none(),
@@ -738,7 +835,7 @@ async fn test_tool_loop_normalizes_ids_in_messages() {
 
     // Result should use ORIGINAL ID (for main model correlation)
     assert_eq!(
-        result.tool_results[0].0, "toolu_01XYZabc123def456ghi789",
+        result.tool_results[0].tool_call_id, "toolu_01XYZabc123def456ghi789",
         "Results should preserve original tool call ID"
     );
 
@@ -799,8 +896,8 @@ async fn test_tool_loop_id_mapping_preserves_originals() {
     let result = run_tool_loop(&config, &calls, &tools, "test").await;
 
     assert_eq!(result.tool_results.len(), 2);
-    assert_eq!(result.tool_results[0].0, "toolu_01AAAA");
-    assert_eq!(result.tool_results[1].0, "toolu_01BBBB");
+    assert_eq!(result.tool_results[0].tool_call_id, "toolu_01AAAA");
+    assert_eq!(result.tool_results[1].tool_call_id, "toolu_01BBBB");
 }
 
 // -- Truncation tests --
@@ -864,7 +961,7 @@ async fn test_large_result_injects_metadata() {
 
     // all_results should have full 500-char data
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].2.len(), 500);
+    assert_eq!(result.tool_results[0].data.len(), 500);
 
     // Scratch pad receives variable metadata in the user message state.
     let captured = provider.captured_messages.lock().await;
@@ -921,7 +1018,7 @@ async fn test_small_result_injects_directly() {
     let result = run_tool_loop(&config, &calls, &tools, "test").await;
 
     // Full data in both places
-    assert_eq!(result.tool_results[0].2.len(), 50);
+    assert_eq!(result.tool_results[0].data.len(), 50);
 
     // Scratch pad receives variable metadata in user message state.
     let captured = provider.captured_messages.lock().await;
@@ -972,7 +1069,7 @@ async fn test_short_circuit_skips_llm_for_trivial_results() {
 
     // Tool was executed
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].2, "tool result data");
+    assert_eq!(result.tool_results[0].data, "tool result data");
     // No summary — LLM was skipped
     assert!(
         result.summary.is_none(),
@@ -1107,7 +1204,7 @@ async fn test_tool_filtering_blocks_uninvited_tools() {
         1,
         "Only initial tool should execute"
     );
-    assert_eq!(result.tool_results[0].1, "test_tool");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
     // dangerous_tool was blocked; early-break optimization means summary
     // may be None (no useful work to summarize), which is correct.
 }
@@ -1172,8 +1269,8 @@ async fn test_tool_filtering_allows_same_tool_different_args() {
         2,
         "Should have 2 results (initial + chain)"
     );
-    assert_eq!(result.tool_results[0].1, "test_tool");
-    assert_eq!(result.tool_results[1].1, "test_tool");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
+    assert_eq!(result.tool_results[1].tool_name, "test_tool");
 }
 
 #[tokio::test]
@@ -1283,7 +1380,7 @@ async fn test_micro_tool_results_not_in_all_results() {
         1,
         "Micro-tool results should not be in all_results"
     );
-    assert_eq!(result.tool_results[0].1, "test_tool");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
 }
 
 #[tokio::test]
@@ -1442,7 +1539,7 @@ async fn test_short_circuit_bypasses_context_store() {
 
     // Tool was executed and full result returned
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].2, "tool result data");
+    assert_eq!(result.tool_results[0].data, "tool result data");
     // No LLM call (short-circuited)
     assert!(result.summary.is_none());
     let captured = provider.captured_messages.lock().await;
@@ -1621,7 +1718,7 @@ async fn test_ctx_summarize_produces_summary() {
 
     // Real tool result preserved
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].1, "verbose_tool");
+    assert_eq!(result.tool_results[0].tool_name, "verbose_tool");
     // Provider was called at least 2 times (outer + sub-loop)
     let total_calls = call_count.load(Ordering::SeqCst);
     assert!(
@@ -1856,8 +1953,8 @@ async fn test_verbatim_skips_delegation_returns_raw() {
 
     // Tools are executed.
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].1, "test_tool");
-    assert_eq!(result.tool_results[0].2, "tool result data");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
+    assert_eq!(result.tool_results[0].data, "tool result data");
     // Delegation model NOT called — no summary.
     assert!(
         result.summary.is_none(),

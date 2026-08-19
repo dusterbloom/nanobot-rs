@@ -27,7 +27,10 @@ use crate::agent::markers::{
 };
 use crate::agent::role_policy;
 use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
-use crate::providers::base::{LLMResponse, ToolCallRequest};
+use crate::providers::base::{LLMProvider, LLMResponse, ToolCallRequest};
+use crate::session::db::{
+    ModelCallPurpose, ReplayRecordingProvider, ToolPreExecuteDecision, TurnReplayRecorder,
+};
 use std::sync::Arc;
 
 use super::agent_loop::{ResponseBoundary, TurnContext};
@@ -473,6 +476,17 @@ pub(crate) async fn execute_tools_delegated(
             return false;
         }
     };
+    let replay = TurnReplayRecorder::new(
+        Arc::clone(&ctx.core.sessions),
+        ctx.session_id.clone(),
+        ctx.request_id.clone(),
+        ctx.turn_count,
+    );
+    let tr_provider: Arc<dyn LLMProvider> = Arc::new(ReplayRecordingProvider::new(
+        tr_provider,
+        replay,
+        ModelCallPurpose::ToolRunner,
+    ));
 
     let tool_names_summary: String = routed_tool_calls
         .iter()
@@ -616,6 +630,29 @@ pub(crate) async fn execute_tools_delegated(
     );
     ctx.persist_pending_protocol_messages().await;
 
+    for tc in routed_tool_calls {
+        if let Err(error) = ctx
+            .core
+            .sessions
+            .record_tool_pre_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                &tc.name,
+                &tc.arguments,
+                ToolPreExecuteDecision::Ready,
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "delegated tool {} was not started because its pre-execution decision could not be recorded: {error}",
+                tc.id
+            ));
+            return true;
+        }
+    }
+
     let run_result =
         tool_runner::run_tool_loop(&runner_config, routed_tool_calls, &ctx.tools, &task_desc).await;
     let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
@@ -630,8 +667,12 @@ pub(crate) async fn execute_tools_delegated(
         let results_preview: String = run_result
             .tool_results
             .first()
-            .map(|(_, name, data)| {
-                format!("[{}]: {}", name, data.chars().take(200).collect::<String>())
+            .map(|outcome| {
+                format!(
+                    "[{}]: {}",
+                    outcome.tool_name,
+                    outcome.data.chars().take(200).collect::<String>()
+                )
             })
             .unwrap_or_default();
         warn!(
@@ -676,12 +717,39 @@ pub(crate) async fn execute_tools_delegated(
     let force_routed_stash = routed_tool_calls.len() > 1;
 
     for tc in routed_tool_calls {
-        let full_data = run_result
+        let routed_result = run_result
             .tool_results
             .iter()
-            .find(|(id, _, _)| id == &tc.id)
-            .map(|(_, _, data)| data.as_str())
+            .find(|outcome| outcome.tool_call_id == tc.id);
+        let full_data = routed_result
+            .map(|outcome| outcome.data.as_str())
             .unwrap_or("(no result)");
+        let raw_ok = routed_result.is_some() && tool_result_ok(full_data);
+        // Implementation-exit timing as measured by the runner; 0 when the
+        // runner produced no outcome for this call.
+        let routed_duration_ms = routed_result
+            .map(|outcome| outcome.duration_ms)
+            .unwrap_or(0);
+        if let Err(error) = ctx
+            .core
+            .sessions
+            .record_tool_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                full_data,
+                raw_ok,
+                routed_duration_ms,
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "delegated tool execution result for {} could not be recorded: {error}",
+                tc.id
+            ));
+            return true;
+        }
 
         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
@@ -704,10 +772,20 @@ pub(crate) async fn execute_tools_delegated(
             }
         } else if full_tokens > threshold {
             if let Some(specialist) = ctx.core.specialist_provider.as_ref() {
+                let replay_provider = ReplayRecordingProvider::new(
+                    Arc::clone(specialist),
+                    TurnReplayRecorder::new(
+                        Arc::clone(&ctx.core.sessions),
+                        ctx.session_id.clone(),
+                        ctx.request_id.clone(),
+                        ctx.turn_count,
+                    ),
+                    ModelCallPurpose::ToolResultSummary,
+                );
                 ctx.content_gate
                     .admit_with_specialist(
                         full_data,
-                        specialist.as_ref(),
+                        &replay_provider,
                         ctx.core.specialist_model.as_deref().unwrap_or(""),
                     )
                     .await
@@ -799,6 +877,41 @@ pub(crate) async fn execute_tools_delegated(
         );
         ctx.used_tools.insert(tc.name.clone());
         ctx.persist_pending_protocol_messages().await;
+        let persisted_message_id = ctx
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.get("tool_call_id").and_then(Value::as_str) == Some(tc.id.as_str())
+            })
+            .and_then(|message| message.get("_db_id"))
+            .and_then(Value::as_i64);
+        let Some(persisted_message_id) = persisted_message_id else {
+            ctx.flow.infra_error = Some(format!(
+                "model-visible delegated tool result for {} was not durably persisted",
+                tc.id
+            ));
+            return true;
+        };
+        if let Err(error) = ctx
+            .core
+            .sessions
+            .record_tool_post_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                &injected,
+                persisted_message_id,
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "delegated tool post-execution result for {} could not be recorded: {error}",
+                tc.id
+            ));
+            return true;
+        }
     }
 
     // Inject the runner's summary so the main LLM knows what
@@ -836,21 +949,20 @@ pub(crate) async fn execute_tools_delegated(
 
     // Record learning + audit for all tool results.
     let executor = format!("tool_runner:{}", tr_model);
-    let n_results = run_result.tool_results.len().max(1) as u64;
-    for (tool_call_id, tool_name, data) in &run_result.tool_results {
-        let ok = !data.starts_with("Error:");
-        let per_tool_ms = delegation_elapsed_ms / n_results;
+    for outcome in &run_result.tool_results {
+        let ok = !outcome.data.starts_with("Error:");
+        let per_tool_ms = outcome.duration_ms;
 
         // Only render CallEnd in the TUI for results that the caller asked
-        // for. Internal scratchpad calls the runner made on its own already
+        // for. Internal scratchpad calls the runner made on their own already
         // roll up into the runner-summary user message — emitting a CallEnd
         // for them produces a duplicate identical-duration block per tool.
         if let Some(ref tx) = ctx.tool_event_tx {
-            if is_routed_call(tool_call_id, routed_tool_calls) {
+            if is_routed_call(&outcome.tool_call_id, routed_tool_calls) {
                 let _ = tx.send(ToolEvent::CallEnd {
-                    tool_name: tool_name.clone(),
-                    tool_call_id: tool_call_id.clone(),
-                    result_data: data.clone(),
+                    tool_name: outcome.tool_name.clone(),
+                    tool_call_id: outcome.tool_call_id.clone(),
+                    result_data: outcome.data.clone(),
                     ok,
                     duration_ms: per_tool_ms,
                 });
@@ -859,29 +971,29 @@ pub(crate) async fn execute_tools_delegated(
 
         if let Some(ref audit) = ctx.audit {
             let _ = audit.record(
-                tool_name,
-                tool_call_id,
+                &outcome.tool_name,
+                &outcome.tool_call_id,
                 &json!({}),
-                data,
+                &outcome.data,
                 ok,
                 per_tool_ms,
                 &executor,
             );
         }
 
-        ctx.used_tools.insert(tool_name.clone());
+        ctx.used_tools.insert(outcome.tool_name.clone());
         ctx.turn_tool_entries
             .push(crate::agent::audit::TurnToolEntry {
-                name: tool_name.clone(),
-                id: tool_call_id.clone(),
+                name: outcome.tool_name.clone(),
+                id: outcome.tool_call_id.clone(),
                 ok,
                 duration_ms: per_tool_ms,
-                result_chars: data.len(),
+                result_chars: outcome.data.len(),
             });
 
         // Taint tracking: mark context tainted when a web tool ran via delegation.
         // We don't have the original arguments here, so pass None for detail.
-        ctx.taint_state.mark_tainted(tool_name, None);
+        ctx.taint_state.mark_tainted(&outcome.tool_name, None);
     }
 
     // Behavioral response-boundary arming (mirrors execute_tools_inline).
@@ -889,7 +1001,7 @@ pub(crate) async fn execute_tools_delegated(
     let executed: Vec<&str> = run_result
         .tool_results
         .iter()
-        .map(|(_, tool_name, _)| tool_name.as_str())
+        .map(|outcome| outcome.tool_name.as_str())
         .collect();
     if should_arm_boundary(response.content.as_deref(), &executed) {
         ctx.flow.boundary = ResponseBoundary::Pending;
@@ -968,6 +1080,39 @@ struct SingleToolResult {
     arguments: std::collections::HashMap<String, serde_json::Value>,
     result: crate::agent::tools::base::ToolExecutionResult,
     duration_ms: u64,
+    replay_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct ToolReplayRecorder {
+    sessions: Arc<crate::session::SessionDb>,
+    session_id: String,
+    turn_request_id: String,
+    turn_tag: u64,
+}
+
+async fn record_completed_tool(
+    mut result: SingleToolResult,
+    recorder: Option<&ToolReplayRecorder>,
+) -> SingleToolResult {
+    if let Some(recorder) = recorder {
+        if let Err(error) = recorder
+            .sessions
+            .record_tool_execute(
+                &recorder.session_id,
+                &recorder.turn_request_id,
+                recorder.turn_tag,
+                &result.tool_id,
+                result.result.data(),
+                result.result.ok(),
+                result.duration_ms,
+            )
+            .await
+        {
+            result.replay_error = Some(error.to_string());
+        }
+    }
+    result
 }
 
 fn completed_reportable_tool(result: &SingleToolResult) -> Option<&str> {
@@ -998,6 +1143,7 @@ async fn execute_single_tool(
     cancellation_token: &Option<tokio_util::sync::CancellationToken>,
     tool_heartbeat_secs: u64,
     taint_warning: Option<String>,
+    replay_recorder: Option<&ToolReplayRecorder>,
 ) -> SingleToolResult {
     let tool_span = tracing::info_span!(
         "execute_tool_inline",
@@ -1039,15 +1185,20 @@ async fn execute_single_tool(
             .as_ref()
             .is_some_and(|token| token.is_cancelled())
         {
-            return SingleToolResult {
-                tool_name: tc.name.clone(),
-                tool_id: tc.id.clone(),
-                arguments: tc.arguments.clone(),
-                result: crate::agent::tools::base::ToolExecutionResult::failure(
-                    "tool call cancelled".to_string(),
-                ),
-                duration_ms: 0,
-            };
+            return record_completed_tool(
+                SingleToolResult {
+                    tool_name: tc.name.clone(),
+                    tool_id: tc.id.clone(),
+                    arguments: tc.arguments.clone(),
+                    result: crate::agent::tools::base::ToolExecutionResult::failure(
+                        "tool call cancelled".to_string(),
+                    ),
+                    duration_ms: 0,
+                    replay_error: None,
+                },
+                replay_recorder,
+            )
+            .await;
         }
 
         // Spawn heartbeat that emits Progress ticks until the tool finishes.
@@ -1129,13 +1280,18 @@ async fn execute_single_tool(
             duration_ms
         );
 
-        SingleToolResult {
-            tool_name: tc.name.clone(),
-            tool_id: tc.id.clone(),
-            arguments: tc.arguments.clone(),
-            result,
-            duration_ms,
-        }
+        record_completed_tool(
+            SingleToolResult {
+                tool_name: tc.name.clone(),
+                tool_id: tc.id.clone(),
+                arguments: tc.arguments.clone(),
+                result,
+                duration_ms,
+                replay_error: None,
+            },
+            replay_recorder,
+        )
+        .await
     }
     .instrument(tool_span)
     .await
@@ -1151,6 +1307,7 @@ async fn execute_tool_calls_ordered(
     cancellation_token: &Option<tokio_util::sync::CancellationToken>,
     tool_heartbeat_secs: u64,
     taints: Vec<Option<String>>,
+    replay_recorder: Option<&ToolReplayRecorder>,
 ) -> Vec<SingleToolResult> {
     let mut results = Vec::with_capacity(calls.len());
     let mut start = 0;
@@ -1176,6 +1333,7 @@ async fn execute_tool_calls_ordered(
                             cancellation_token,
                             tool_heartbeat_secs,
                             taint,
+                            replay_recorder,
                         )
                     });
                 results.extend(futures_util::future::join_all(futures).await);
@@ -1190,6 +1348,7 @@ async fn execute_tool_calls_ordered(
                     cancellation_token,
                     tool_heartbeat_secs,
                     taints[start].clone(),
+                    replay_recorder,
                 )
                 .await,
             );
@@ -1211,6 +1370,14 @@ async fn inject_tool_result(
     prompt_cap: usize,
     force_stash_raw: bool,
 ) {
+    if let Some(record_error) = &r.replay_error {
+        ctx.flow.infra_error = Some(format!(
+            "tool execution result for {} could not be recorded: {record_error}",
+            r.tool_id
+        ));
+        return;
+    }
+
     // For web_fetch/web_search: unwrap the JSON envelope so the model
     // sees clean article text rather than a JSON metadata summary.
     let result_data = if r.tool_name == "web_fetch" || r.tool_name == "web_search" {
@@ -1277,15 +1444,26 @@ async fn inject_tool_result(
             }
         };
         let summarized = match ctx.core.specialist_provider.as_ref() {
-            Some(specialist) => ctx
-                .content_gate
-                .admit_with_specialist(
-                    &result_data,
-                    specialist.as_ref(),
-                    ctx.core.specialist_model.as_deref().unwrap_or(""),
-                )
-                .await
-                .into_text(),
+            Some(specialist) => {
+                let replay_provider = ReplayRecordingProvider::new(
+                    Arc::clone(specialist),
+                    TurnReplayRecorder::new(
+                        Arc::clone(&ctx.core.sessions),
+                        ctx.session_id.clone(),
+                        ctx.request_id.clone(),
+                        ctx.turn_count,
+                    ),
+                    ModelCallPurpose::ToolResultSummary,
+                );
+                ctx.content_gate
+                    .admit_with_specialist(
+                        &result_data,
+                        &replay_provider,
+                        ctx.core.specialist_model.as_deref().unwrap_or(""),
+                    )
+                    .await
+                    .into_text()
+            }
             // Defensive: the caller previously panicked here if the provider
             // was None; fall back to the simple admit instead.
             None => ctx.content_gate.admit_simple(&result_data).into_text(),
@@ -1367,6 +1545,41 @@ async fn inject_tool_result(
         );
     }
     ctx.persist_pending_protocol_messages().await;
+    let persisted_message_id = ctx
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some(r.tool_id.as_str())
+        })
+        .and_then(|message| message.get("_db_id"))
+        .and_then(Value::as_i64);
+    let Some(persisted_message_id) = persisted_message_id else {
+        ctx.flow.infra_error = Some(format!(
+            "model-visible tool result for {} was not durably persisted",
+            r.tool_id
+        ));
+        return;
+    };
+    if let Err(record_error) = ctx
+        .core
+        .sessions
+        .record_tool_post_execute(
+            &ctx.session_id,
+            &ctx.request_id,
+            ctx.turn_count,
+            &r.tool_id,
+            &data,
+            persisted_message_id,
+        )
+        .await
+    {
+        ctx.flow.infra_error = Some(format!(
+            "tool post-execution result for {} could not be recorded: {record_error}",
+            r.tool_id
+        ));
+        return;
+    }
     ctx.flow.tool_guard.record_result_with_status(
         &r.tool_name,
         &r.arguments,
@@ -1562,6 +1775,28 @@ pub(crate) async fn execute_tools_inline(
         .iter()
         .partition(|tc| blocks && requires_result_report(&tc.name));
     for tc in &blocked {
+        if let Err(record_error) = ctx
+            .core
+            .sessions
+            .record_tool_pre_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                &tc.name,
+                &tc.arguments,
+                ToolPreExecuteDecision::Rejected {
+                    reason: "response_boundary".to_string(),
+                },
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "tool {} rejection could not be recorded: {record_error}",
+                tc.id
+            ));
+            return;
+        }
         inject_boundary_rejection(ctx, tc);
     }
     ctx.persist_pending_protocol_messages().await;
@@ -1578,6 +1813,38 @@ pub(crate) async fn execute_tools_inline(
         })
         .collect();
 
+    // All policy checks are complete and the assistant carrier is already
+    // durable. Record each ready decision before any tool implementation can
+    // produce a side effect. A storage failure aborts the batch fail-closed.
+    for tc in &allowed {
+        if let Err(record_error) = ctx
+            .core
+            .sessions
+            .record_tool_pre_execute(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &tc.id,
+                &tc.name,
+                &tc.arguments,
+                ToolPreExecuteDecision::Ready,
+            )
+            .await
+        {
+            ctx.flow.infra_error = Some(format!(
+                "tool {} was not started because its pre-execution decision could not be recorded: {record_error}",
+                tc.id
+            ));
+            return;
+        }
+    }
+
+    let replay_recorder = ToolReplayRecorder {
+        sessions: Arc::clone(&ctx.core.sessions),
+        session_id: ctx.session_id.clone(),
+        turn_request_id: ctx.request_id.clone(),
+        turn_tag: ctx.turn_count,
+    };
     let ordered_results = execute_tool_calls_ordered(
         &allowed,
         &ctx.tools,
@@ -1585,6 +1852,7 @@ pub(crate) async fn execute_tools_inline(
         &ctx.cancellation_token,
         ctx.core.tool_heartbeat_secs,
         taints,
+        Some(&replay_recorder),
     )
     .await;
     let result_cap = inline_hot_prompt_result_cap_for_ctx_batch(ctx, ordered_results.len());
@@ -1726,6 +1994,7 @@ mod tests {
             &cancellation,
             60,
             vec![None; calls.len()],
+            None,
         )
         .await
     }
@@ -2224,6 +2493,7 @@ mod tests {
                 arguments,
                 result: crate::agent::tools::base::ToolExecutionResult::success("ok".to_string()),
                 duration_ms: 0,
+                replay_error: None,
             }
         };
 
@@ -2254,7 +2524,8 @@ mod tests {
             ]),
         };
         for _ in 0..2 {
-            let result = execute_single_tool(&staged, &registry, &None, &None, 60, None).await;
+            let result =
+                execute_single_tool(&staged, &registry, &None, &None, 60, None, None).await;
             assert!(result.result.ok(), "{:?}", result.result.error());
         }
 
@@ -2267,7 +2538,8 @@ mod tests {
                 ("state".to_string(), json!("complete")),
             ]),
         };
-        let result = execute_single_tool(&final_piece, &registry, &None, &None, 60, None).await;
+        let result =
+            execute_single_tool(&final_piece, &registry, &None, &None, 60, None, None).await;
         assert!(result.result.ok(), "{:?}", result.result.error());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "once-done");
     }
@@ -2330,6 +2602,103 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
+    }
+
+    #[tokio::test]
+    async fn tool_execute_events_follow_actual_parallel_completion_order() {
+        // Break caught: raw execution exits are journaled later during
+        // provider-order message injection, obscuring which parallel tool
+        // actually completed first.
+        let state = ProbeState::new();
+        let slow_gate = tokio_util::sync::CancellationToken::new();
+        let fast_gate = tokio_util::sync::CancellationToken::new();
+        let mut registry = ToolRegistry::new();
+        register_probe(
+            &mut registry,
+            "slow",
+            ToolConcurrency::ParallelSafe,
+            &state,
+            Some(slow_gate.clone()),
+            false,
+        );
+        register_probe(
+            &mut registry,
+            "fast",
+            ToolConcurrency::ParallelSafe,
+            &state,
+            Some(fast_gate.clone()),
+            false,
+        );
+        let calls = vec![make_tc("slow", "tc-slow"), make_tc("fast", "tc-fast")];
+
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(crate::session::SessionDb::new(
+            &dir.path().join("sessions.db"),
+        ));
+        let session = sessions.create_session("cli:completion-order").await;
+        for call in &calls {
+            sessions
+                .record_tool_pre_execute(
+                    &session.id,
+                    "turn-tools",
+                    1,
+                    &call.id,
+                    &call.name,
+                    &call.arguments,
+                    ToolPreExecuteDecision::Ready,
+                )
+                .await
+                .unwrap();
+        }
+        let recorder = ToolReplayRecorder {
+            sessions: Arc::clone(&sessions),
+            session_id: session.id.clone(),
+            turn_request_id: "turn-tools".to_string(),
+            turn_tag: 1,
+        };
+        let refs = calls.iter().collect::<Vec<_>>();
+        let execution = execute_tool_calls_ordered(
+            &refs,
+            &registry,
+            &None,
+            &None,
+            60,
+            vec![None; calls.len()],
+            Some(&recorder),
+        );
+        let release =
+            async {
+                tokio::time::timeout(Duration::from_secs(1), state.wait_for_started(2))
+                    .await
+                    .expect("parallel calls did not start");
+                fast_gate.cancel();
+                loop {
+                    let events = sessions.load_session_events(&session.id).await.unwrap();
+                    if events.iter().any(|event| matches!(
+                    &event.payload,
+                    crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. }
+                        if tool_call_id == "tc-fast"
+                )) {
+                    break;
+                }
+                    tokio::task::yield_now().await;
+                }
+                slow_gate.cancel();
+            };
+        let (_results, ()) = tokio::join!(execution, release);
+        let completion_order = sessions
+            .load_session_events(&session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. } => {
+                    Some(tool_call_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completion_order, vec!["tc-fast", "tc-slow"]);
     }
 
     #[tokio::test]

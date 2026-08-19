@@ -161,6 +161,15 @@ impl ContextCompactor {
         }
     }
 
+    pub(crate) fn with_provider(&self, provider: Arc<dyn LLMProvider>) -> Self {
+        Self {
+            provider,
+            model: self.model.clone(),
+            summary_max_tokens: self.summary_max_tokens,
+            compaction_context_size: self.compaction_context_size,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn model(&self) -> &str {
         &self.model

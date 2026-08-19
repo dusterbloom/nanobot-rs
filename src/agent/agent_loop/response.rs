@@ -26,9 +26,90 @@ use crate::agent::token_budget::TokenBudget;
 use crate::agent::validation;
 use crate::errors::ProviderError;
 use crate::providers::base::{FinishReason, LLMResponse, ToolCallRequest};
+use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
 use crate::turn_stream::ControlMarker;
 
 use super::{AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnContext};
+
+async fn recorded_auxiliary_chat(
+    ctx: &TurnContext,
+    purpose: ModelCallPurpose,
+    messages: &[Value],
+    max_tokens: u32,
+    temperature: f64,
+) -> anyhow::Result<LLMResponse> {
+    let request = RecordedProviderRequest {
+        messages: messages.to_vec(),
+        tools: None,
+        model: ctx.core.model.clone(),
+        max_tokens,
+        temperature,
+        thinking_budget: None,
+        top_p: None,
+        tool_choice: "auto".to_string(),
+        streaming: false,
+    };
+    let call_id = ctx
+        .core
+        .sessions
+        .record_model_request(
+            &ctx.session_id,
+            &ctx.request_id,
+            ctx.turn_count,
+            purpose,
+            &request,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("auxiliary model request was not recorded: {error}"))?;
+    let result = ctx
+        .core
+        .provider
+        .chat(
+            messages,
+            None,
+            Some(&ctx.core.model),
+            max_tokens,
+            temperature,
+            None,
+            None,
+        )
+        .await;
+    match result {
+        Ok(response) => {
+            ctx.core
+                .sessions
+                .record_model_response(
+                    &ctx.session_id,
+                    &ctx.request_id,
+                    ctx.turn_count,
+                    &call_id,
+                    &RecordedProviderResponse::from(&response),
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("auxiliary model response was not recorded: {error}")
+                })?;
+            Ok(response)
+        }
+        Err(error) => {
+            if let Err(record_error) = ctx
+                .core
+                .sessions
+                .record_model_failure(
+                    &ctx.session_id,
+                    &ctx.request_id,
+                    ctx.turn_count,
+                    &call_id,
+                    &error.to_string(),
+                )
+                .await
+            {
+                warn!(%record_error, "auxiliary_model_failure_replay_persist_failed");
+            }
+            Err(error)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ResponseKind — pure classification of an LLM response
@@ -871,19 +952,14 @@ impl AgentLoopShared {
             }
 
             counters.mark_inference_started();
-            let cont_result = ctx
-                .core
-                .provider
-                .chat(
-                    &cont_messages,
-                    None,
-                    Some(&ctx.core.model),
-                    ctx.core.max_tokens,
-                    ctx.core.temperature,
-                    None,
-                    None,
-                )
-                .await;
+            let cont_result = recorded_auxiliary_chat(
+                ctx,
+                ModelCallPurpose::Continuation,
+                &cont_messages,
+                ctx.core.max_tokens,
+                ctx.core.temperature,
+            )
+            .await;
             counters.mark_inference_finished();
 
             match cont_result {
@@ -934,19 +1010,14 @@ impl AgentLoopShared {
             let rescue_tokens = ctx.core.max_tokens.min(384).max(128);
             let rescue_messages = prepare_rescue_messages(&ctx.messages, &*ctx.protocol);
             counters.mark_inference_started();
-            let rescue_result = ctx
-                .core
-                .provider
-                .chat(
-                    &rescue_messages,
-                    None,
-                    Some(&ctx.core.model),
-                    rescue_tokens,
-                    0.2,
-                    None,
-                    None,
-                )
-                .await;
+            let rescue_result = recorded_auxiliary_chat(
+                ctx,
+                ModelCallPurpose::EmptyResponseRescue,
+                &rescue_messages,
+                rescue_tokens,
+                0.2,
+            )
+            .await;
             counters.mark_inference_finished();
 
             match rescue_result {
