@@ -396,6 +396,9 @@ background (click, type, screenshot, menus, browser pages) via
 `screenshotDir` defaults to `<workspace>/cua`. `permissionMode` is
 `standard` (default), `bounded` (requires a capability manifest), or
 `unrestricted` (requires `--dangerously-bypass-approvals` at daemon launch).
+`permissionMode` is applied on Linux/Windows daemon launches; on macOS the
+CuaDriver.app launch manages its own mode (the field is accepted but not
+forwarded).
 Screenshots are saved to a file and their path returned; feeding images back
 to vision models is a planned follow-up.
 

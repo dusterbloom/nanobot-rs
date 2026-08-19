@@ -411,7 +411,11 @@ impl ToolRegistry {
             self.register(Box::new(BrowserTool::new(config.max_tool_result_chars)));
         }
         if should_include("cua") && config.cua.enabled {
-            self.register(Box::new(CuaTool::new(&config.cua, &config.workspace)));
+            self.register(Box::new(CuaTool::new(
+                &config.cua,
+                &config.workspace,
+                config.exec_timeout,
+            )));
         }
         if should_include("recall") {
             // recall is the unified retrieval tool: it absorbs the dissolved

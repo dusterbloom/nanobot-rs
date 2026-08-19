@@ -28,7 +28,9 @@ pub struct CuaTool {
 }
 
 impl CuaTool {
-    pub fn new(config: &CuaToolConfig, workspace: &Path) -> Self {
+    /// `exec_timeout` seconds bounds every driver subprocess; 0 falls back to
+    /// the default (a zero timeout would make every call abort instantly).
+    pub fn new(config: &CuaToolConfig, workspace: &Path, exec_timeout: u64) -> Self {
         let screenshot_dir = config
             .screenshot_dir
             .clone()
@@ -41,7 +43,11 @@ impl CuaTool {
             permission_mode: config.permission_mode.clone(),
             daemon_auto_start: config.daemon_auto_start,
             screenshot_dir,
-            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            timeout: Duration::from_secs(if exec_timeout == 0 {
+                DEFAULT_TIMEOUT_SECS
+            } else {
+                exec_timeout
+            }),
         }
     }
 
@@ -57,14 +63,34 @@ impl CuaTool {
         }
     }
 
-    /// Whether the configured binary resolves (absolute path exists, or on PATH).
+    /// Test seam: like `with_binary`, but with daemon auto-start enabled so
+    /// the tool launches the daemon (shim `serve` arm) and polls until ready.
+    /// macOS is excluded: the launch argv there is `open -a CuaDriver`, which
+    /// would launch the real app from a test.
+    #[cfg(test)]
+    #[cfg(not(target_os = "macos"))]
+    fn with_binary_autostart(binary: &str) -> Self {
+        Self {
+            binary: binary.to_string(),
+            permission_mode: "standard".to_string(),
+            daemon_auto_start: true,
+            screenshot_dir: std::env::temp_dir().join("cua-test-shots"),
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        }
+    }
+
+    /// Whether the configured binary resolves (absolute path exists, or on
+    /// PATH; Windows also probes `cua-driver.exe`).
     fn binary_present(&self) -> bool {
         let p = Path::new(&self.binary);
         if p.is_absolute() {
             return p.is_file();
         }
         std::env::var_os("PATH").is_some_and(|paths| {
-            std::env::split_paths(&paths).any(|d| d.join(&self.binary).is_file())
+            std::env::split_paths(&paths).any(|d| {
+                d.join(&self.binary).is_file()
+                    || (cfg!(windows) && d.join(format!("{}.exe", self.binary)).is_file())
+            })
         })
     }
 
@@ -100,6 +126,53 @@ impl CuaTool {
         ok
     }
 
+    /// Run `cua-driver call`, racing the timeout against cooperative
+    /// cancellation. `kill_on_drop` aborts the child on the timeout/cancel
+    /// path (same pattern as `code_execution.rs`). `None` means cancelled.
+    async fn run_call(&self, args: &[&str], ctx: &ToolContext) -> Option<(String, String, bool)> {
+        let child = match Command::new(&self.binary)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Some((
+                    String::new(),
+                    format!("failed to run cua-driver: {e}"),
+                    false,
+                ))
+            }
+        };
+        tokio::select! {
+            output = tokio::time::timeout(self.timeout, child.wait_with_output()) => {
+                match output {
+                    Ok(Ok(out)) => Some((
+                        String::from_utf8_lossy(&out.stdout).to_string(),
+                        String::from_utf8_lossy(&out.stderr).to_string(),
+                        out.status.success(),
+                    )),
+                    Ok(Err(e)) => Some((
+                        String::new(),
+                        format!("failed to run cua-driver: {e}"),
+                        false,
+                    )),
+                    Err(_) => Some((
+                        String::new(),
+                        format!(
+                            "cua-driver call timed out after {}s",
+                            self.timeout.as_secs()
+                        ),
+                        false,
+                    )),
+                }
+            }
+            () = ctx.cancellation_token().cancelled() => None,
+        }
+    }
+
     /// Launch command argv, pure for testability. macOS uses `open -a
     /// CuaDriver` so Accessibility/Screen Recording grants keep the app
     /// identity (raw `serve` outside the app is unsupported on macOS).
@@ -108,8 +181,10 @@ impl CuaTool {
     }
 
     /// Ensure the daemon is up before calling. Auto-start is bounded: launch,
-    /// then poll `status` up to `DAEMON_READY_POLLS` times.
-    async fn ensure_daemon(&self) -> Result<(), String> {
+    /// then poll `status` up to `DAEMON_READY_POLLS` times. Cooperative
+    /// cancellation is honored before and after the poll loop (the `status`
+    /// probes themselves are short — no per-iteration check).
+    async fn ensure_daemon(&self, ctx: &ToolContext) -> Result<(), String> {
         if self.daemon_running().await {
             return Ok(());
         }
@@ -134,11 +209,21 @@ impl CuaTool {
                 self.binary
             ));
         }
+        // Cancellation check before the poll loop: a cancelled call should not
+        // keep waiting for the daemon to come up.
+        if ctx.cancellation_token().is_cancelled() {
+            return Err("Error: cua-driver call cancelled".to_string());
+        }
         for _ in 0..DAEMON_READY_POLLS {
             tokio::time::sleep(Duration::from_millis(DAEMON_READY_POLL_MS)).await;
             if self.daemon_running().await {
                 return Ok(());
             }
+        }
+        // Cancellation check after the poll loop: prefer the cancellation
+        // signal over the generic not-ready error.
+        if ctx.cancellation_token().is_cancelled() {
+            return Err("Error: cua-driver call cancelled".to_string());
         }
         Err("Error: cua-driver daemon did not become ready after launch. Run `cua-driver doctor`.".to_string())
     }
@@ -146,6 +231,66 @@ impl CuaTool {
     /// Run `cua-driver list-tools` and return the output (discovery fallback).
     async fn list_tools(&self) -> String {
         let (out, _err, _ok) = self.run_driver(&["list-tools"]).await;
+        out
+    }
+
+    /// Run one `cua-driver call` with screenshot capture, mapping failures to
+    /// user-facing errors: daemon-down gets the launch hint, other failures
+    /// append the available-tools list (discovery fallback), cancellation
+    /// short-circuits.
+    async fn call_tool(&self, tool: &str, args_json: &str, ctx: &ToolContext) -> String {
+        // Always pass --screenshot-out-file: the driver only writes the file
+        // when the response contains an image block, so it is harmless for
+        // non-image tools.
+        let call_id = ctx.call_id();
+        let shot_name = if call_id.is_empty() {
+            "screenshot.png".to_string()
+        } else {
+            let safe: String = call_id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            format!("cua-{safe}.png")
+        };
+        let shot_path = self.screenshot_dir.join(shot_name);
+        let shot_str = shot_path.to_string_lossy().to_string();
+        let shot_arg = "--screenshot-out-file";
+        // Ensure the screenshot dir exists before the driver writes into it.
+        if let Err(e) = std::fs::create_dir_all(&self.screenshot_dir) {
+            return format!("Error: cannot create screenshot dir {}: {e}", self.screenshot_dir.display());
+        }
+        let Some((raw_out, raw_err, ok)) = self
+            .run_call(&["call", tool, args_json, shot_arg, &shot_str], ctx)
+            .await
+        else {
+            return "Error: cua-driver call cancelled".to_string();
+        };
+        let mut out = raw_out;
+        if !ok {
+            if raw_err.contains("daemon is not running") {
+                return format!(
+                    "Error: cua-driver daemon is not running. Start it with: {}",
+                    self.daemon_launch_args().join(" ")
+                );
+            }
+            let detail = if raw_err.is_empty() { out.clone() } else { raw_err };
+            // Unknown/missing tool names surface the tool list so the model
+            // learns the surface (discovery fallback).
+            let list = self.list_tools().await;
+            return format!(
+                "Error: cua-driver call '{tool}' failed: {detail}\n\nAvailable cua-driver tools:\n{list}"
+            );
+        }
+        if shot_path.is_file() {
+            out.push_str("\n\nScreenshot saved: ");
+            out.push_str(&shot_str);
+        }
         out
     }
 }
@@ -228,8 +373,12 @@ impl Tool for CuaTool {
     async fn execute_with_context(
         &self,
         params: HashMap<String, Value>,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> String {
+        // Honor cooperative cancellation before doing any driver work.
+        if ctx.cancellation_token().is_cancelled() {
+            return "Error: cua-driver call cancelled".to_string();
+        }
         if !self.binary_present() {
             return "Error: cua-driver binary not found. Install it with: \
                     curl -fsSL https://cua.ai/driver/install.sh | bash"
@@ -249,55 +398,11 @@ impl Tool for CuaTool {
             |v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()),
         );
 
-        if let Err(e) = self.ensure_daemon().await {
+        if let Err(e) = self.ensure_daemon(ctx).await {
             return e;
         }
 
-        // Always pass --screenshot-out-file: the driver only writes the file
-        // when the response contains an image block, so it is harmless for
-        // non-image tools.
-        let call_id = _ctx.call_id();
-        let shot_name = if call_id.is_empty() {
-            "screenshot.png".to_string()
-        } else {
-            let safe: String = call_id
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            format!("cua-{safe}.png")
-        };
-        let shot_path = self.screenshot_dir.join(shot_name);
-        let shot_str = shot_path.to_string_lossy().to_string();
-        let shot_arg = "--screenshot-out-file";
-        // Ensure the screenshot dir exists before the driver writes into it.
-        if let Err(e) = std::fs::create_dir_all(&self.screenshot_dir) {
-            return format!("Error: cannot create screenshot dir {}: {e}", self.screenshot_dir.display());
-        }
-        let (raw_out, raw_err, ok) = self
-            .run_driver(&["call", tool, &args_json, shot_arg, &shot_str])
-            .await;
-        let mut out = raw_out;
-        if !ok {
-            if raw_err.contains("daemon is not running") {
-                return format!(
-                    "Error: cua-driver daemon is not running. Start it with: {}",
-                    self.daemon_launch_args().join(" ")
-                );
-            }
-            let detail = if raw_err.is_empty() { out.clone() } else { raw_err };
-            return format!("Error: cua-driver call '{tool}' failed: {detail}");
-        }
-        if shot_path.is_file() {
-            out.push_str("\n\nScreenshot saved: ");
-            out.push_str(&shot_str);
-        }
-        out
+        self.call_tool(tool, &args_json, ctx).await
     }
 }
 
@@ -323,6 +428,7 @@ if [ "$1" = "status" ]; then
 fi
 if [ "$1" = "call" ]; then
   echo "$@" > "{d}/.last_call"
+  if [ "$2" = "nonexistent_tool" ]; then echo "unknown tool: $2" >&2; exit 1; fi
   prev=""
   for a in "$@"; do
     if [ "$prev" = "--screenshot-out-file" ]; then touch "$a"; fi
@@ -414,6 +520,30 @@ echo "unknown command: $1" >&2; exit 1
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
+    async fn test_autostart_launches_daemon_and_call_succeeds() {
+        // macOS excluded: the launch argv there is `open -a CuaDriver`, which
+        // would launch the real app. On Linux/Windows the tool runs
+        // `[binary, serve, --permission-mode, standard]` against the shim.
+        let dir = std::env::temp_dir().join(format!("cua-test-{}-autostart", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = make_shim(&dir); // no .running marker initially → status exit 1
+        let tool = CuaTool::with_binary_autostart(bin.to_str().unwrap());
+        let mut params = HashMap::new();
+        params.insert("tool".to_string(), Value::String("click".to_string()));
+        let result = tool.execute(params).await;
+        assert!(
+            result.contains("OK"),
+            "call should succeed after the tool auto-starts the daemon, got: {result}"
+        );
+        assert!(
+            dir.join(".running").is_file(),
+            "tool should have launched the daemon (shim serve arm creates .running)"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn test_screenshot_out_file_returned_when_written() {
         let dir = std::env::temp_dir().join(format!("cua-test-{}-screenshot", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -428,6 +558,31 @@ echo "unknown command: $1" >&2; exit 1
             result.contains("Screenshot saved"),
             "expected screenshot path in result, got: {result}"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_unknown_tool_appends_available_tools() {
+        let dir = std::env::temp_dir().join(format!("cua-test-{}-unknown_tool", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = make_shim(&dir); // call with nonexistent_tool exits 1
+        fs::write(dir.join(".running"), "").unwrap(); // daemon up
+        let tool = CuaTool::with_binary(bin.to_str().unwrap());
+        let mut params = HashMap::new();
+        params.insert(
+            "tool".to_string(),
+            Value::String("nonexistent_tool".to_string()),
+        );
+        let result = tool.execute(params).await;
+        assert!(
+            result.contains("cua-driver call 'nonexistent_tool' failed"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("Available cua-driver tools"),
+            "expected discovery fallback, got: {result}"
+        );
+        assert!(result.contains("list_apps"), "got: {result}");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -460,8 +615,8 @@ echo "unknown command: $1" >&2; exit 1
         );
     }
 
-    #[test]
-    fn test_binary_present_absolute_and_missing() {
+    #[tokio::test]
+    async fn test_binary_present_absolute_and_missing() {
         let dir = std::env::temp_dir().join(format!("cua-test-{}-binary_present", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bin = make_shim(&dir);
@@ -469,6 +624,17 @@ echo "unknown command: $1" >&2; exit 1
         assert!(tool.binary_present());
         let missing = CuaTool::with_binary("/nonexistent/cua-driver");
         assert!(!missing.binary_present());
+        // A missing binary short-circuits before tool-param discovery, so the
+        // empty-params call must return the spec'd install hint.
+        let result = missing.execute(HashMap::new()).await;
+        assert!(
+            result.contains("cua-driver binary not found"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("curl -fsSL https://cua.ai/driver/install.sh"),
+            "install hint missing, got: {result}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
