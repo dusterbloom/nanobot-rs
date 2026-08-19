@@ -800,6 +800,51 @@ impl Default for ExecToolConfig {
     }
 }
 
+/// Cua driver (local desktop computer-use) tool configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CuaToolConfig {
+    /// When false, the `cua` tool is not registered.
+    #[serde(default = "default_cua_enabled")]
+    pub enabled: bool,
+    /// Path to the cua-driver binary. `None` resolves `cua-driver` on PATH.
+    #[serde(default)]
+    pub binary_path: Option<String>,
+    /// Daemon permission mode applied at launch: standard | bounded | unrestricted.
+    #[serde(default = "default_cua_permission_mode")]
+    pub permission_mode: String,
+    /// Auto-start the cua-driver daemon when a call finds it not running.
+    #[serde(default = "default_cua_daemon_auto_start")]
+    pub daemon_auto_start: bool,
+    /// Directory for screenshots. `None` defaults to `<workspace>/cua`.
+    #[serde(default)]
+    pub screenshot_dir: Option<PathBuf>,
+}
+
+fn default_cua_enabled() -> bool {
+    true
+}
+
+fn default_cua_permission_mode() -> String {
+    "standard".to_string()
+}
+
+fn default_cua_daemon_auto_start() -> bool {
+    true
+}
+
+impl Default for CuaToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cua_enabled(),
+            binary_path: None,
+            permission_mode: default_cua_permission_mode(),
+            daemon_auto_start: default_cua_daemon_auto_start(),
+            screenshot_dir: None,
+        }
+    }
+}
+
 /// Named toolset groupings that can be referenced by channel configs.
 ///
 /// Each key is a set name; each value is a list of tool names or `@other_set`
@@ -896,6 +941,9 @@ pub struct ToolsConfig {
     /// Code execution (Python RPC) tool settings.
     #[serde(default)]
     pub code_execution: CodeExecutionConfig,
+    /// Cua driver (local desktop computer-use) tool settings.
+    #[serde(default)]
+    pub cua: CuaToolConfig,
     /// Stateful Python kernel tool (PyO3). Feature: `python-kernel`.
     #[serde(default)]
     pub python_kernel: PythonKernelConfig,
@@ -3288,5 +3336,44 @@ mod tests {
             debug_output.contains("[REDACTED"),
             "missing redaction markers"
         );
+    }
+
+    #[test]
+    fn test_cua_config_roundtrip() {
+        // Defaults.
+        let default = CuaToolConfig::default();
+        assert!(default.enabled);
+        assert_eq!(default.permission_mode, "standard");
+        assert!(default.daemon_auto_start);
+        assert_eq!(default.binary_path, None);
+        assert_eq!(default.screenshot_dir, None);
+
+        // Explicit JSON (camelCase) parses.
+        let json = r#"{
+            "tools": {
+                "cua": {
+                    "enabled": false,
+                    "binaryPath": "/opt/bin/cua-driver",
+                    "permissionMode": "bounded",
+                    "daemonAutoStart": false,
+                    "screenshotDir": "/tmp/shots"
+                }
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let cua = &cfg.tools.cua;
+        assert!(!cua.enabled);
+        assert_eq!(cua.binary_path.as_deref(), Some("/opt/bin/cua-driver"));
+        assert_eq!(cua.permission_mode, "bounded");
+        assert!(!cua.daemon_auto_start);
+        assert_eq!(
+            cua.screenshot_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/shots"))
+        );
+
+        // Missing block falls back to defaults.
+        let cfg2: Config = serde_json::from_str(r#"{"tools": {}}"#).unwrap();
+        assert!(cfg2.tools.cua.enabled);
+        assert!(cfg2.tools.cua.daemon_auto_start);
     }
 }
