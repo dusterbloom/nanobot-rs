@@ -76,7 +76,9 @@ cua tool → "Screenshot saved: <workspace>/cua/cua-<id>.png" (text tool result)
                     │
                     ▼
 inject_tool_result (tool_engine.rs:1344) — after the tool result is added
-    │ maybe_inject_cua_screenshot(ctx, r):
+    │ cua_screenshot_candidate(tool_name, ok, vision, data, workspace)
+    │   → Option<PathBuf> (pure gate + marker parse + path confinement)
+    │ append_cua_screenshot_turn(&mut ctx.messages, path) (IO shell)
     │   1. r.tool_name == "cua"?
     │   2. ctx.core.model_capabilities.vision == true?
     │   3. parse "Screenshot saved: <path>" marker from r.result.data()
@@ -93,13 +95,17 @@ OpenAI-compat and Anthropic translate_user_content already handle arrays)
 
 ## Components
 
-### 1. `maybe_inject_cua_screenshot` — `src/agent/tool_engine.rs`
+### 1. `cua_screenshot_candidate` + `append_cua_screenshot_turn` — `src/agent/tool_engine.rs`
 
-A private async helper called from `inject_tool_result` immediately after
-the tool result is added to `ctx.messages` (after
-`record_tool_post_execute` succeeds, before the function returns).
+Two private helpers, called from `inject_tool_result` at the very end of
+the function (after the tool result is durably persisted, before the
+function returns). Split so the gate logic is pure and unit-testable
+without constructing a `TurnContext` (~50 fields, no test builder).
 
-Signature: `async fn maybe_inject_cua_screenshot(ctx: &mut TurnContext, r: &SingleToolResult)`
+Signatures:
+- `fn cua_screenshot_candidate(tool_name: &str, ok: bool, vision: bool, data: &str, workspace: &Path) -> Option<PathBuf>`
+- `async fn append_cua_screenshot_turn(messages: &mut Vec<Value>, path: PathBuf)`
+- Call site: `if let Some(path) = cua_screenshot_candidate(&r.tool_name, r.result.ok(), ctx.core.model_capabilities.vision, r.result.data(), &ctx.core.workspace) { append_cua_screenshot_turn(&mut ctx.messages, path).await; }`
 
 Logic (all conditions must hold):
 
