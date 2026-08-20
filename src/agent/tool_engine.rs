@@ -1365,10 +1365,12 @@ fn cua_screenshot_candidate(
 
 /// Read + embed one screenshot: read the file (≤ 10 MiB), base64-encode it,
 /// and append a synthetic user turn carrying it as an `image_url` content
-/// part so the model sees the screen. The image is in-memory only — the
-/// caller appends this AFTER the tool result is durably persisted and never
-/// re-persists. Every skip path is silent: the tool's text result already
-/// told the model the path.
+/// part so the model sees the screen. The image is in-memory only: the
+/// `_synthetic` marker (with no `_cache_replay`) makes
+/// `TurnContext::persist_pending_protocol_messages` skip it, so the base64
+/// never lands in the session DB and never reloads into later turns. Every
+/// skip path is silent: the tool's text result already told the model the
+/// path.
 async fn append_cua_screenshot_turn(messages: &mut Vec<serde_json::Value>, path: std::path::PathBuf) {
     let path_str = path.to_string_lossy().to_string();
     let Ok(bytes) = tokio::fs::read(&path).await else {
@@ -1382,6 +1384,12 @@ async fn append_cua_screenshot_turn(messages: &mut Vec<serde_json::Value>, path:
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     messages.push(serde_json::json!({
         "role": "user",
+        // `_synthetic`-only, deliberately NOT `_cache_replay` (unlike
+        // `scaffold_user`): the image is a per-turn view, not a prompt-prefix
+        // anchor. `is_synthetic && !is_cache_replay` is exactly the
+        // "in-memory only" branch of the persist skip — adding `_cache_replay`
+        // would force the base64 into the session DB.
+        "_synthetic": true,
         "content": [
             {"type": "text", "text": format!("[cua screenshot: {path_str}]")},
             {"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{b64}")}}
@@ -3108,6 +3116,11 @@ mod tests {
         let b64 = url.trim_start_matches("data:image/png;base64,");
         let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
         assert_eq!(decoded, png);
+        // The turn must be `_synthetic` (and NOT `_cache_replay`) so the
+        // persist machinery keeps the base64 image in-memory only — never in
+        // the session DB, never reloaded into later turns.
+        assert_eq!(last["_synthetic"], true);
+        assert_eq!(last["_cache_replay"], serde_json::Value::Null);
     }
 
     /// IO shell: file missing → nothing appended.
