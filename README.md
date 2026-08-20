@@ -399,8 +399,11 @@ background (click, type, screenshot, menus, browser pages) via
 `permissionMode` is applied on Linux/Windows daemon launches; on macOS the
 CuaDriver.app launch manages its own mode (the field is accepted but not
 forwarded).
-Screenshots are saved to a file and their path returned; feeding images back
-to vision models is a planned follow-up.
+Screenshots are saved to a file and their path returned; when the active
+model is vision-capable (`modelCapabilities.<name>.vision`), the image is
+also fed back to the model as an `image_url` content part so it can see
+the screen. Images are in-memory only — the path is what persists to
+session history.
 
 ## Architecture
 
