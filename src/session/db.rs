@@ -2295,7 +2295,7 @@ impl SessionDb {
             let Some(raw_content) = message.get("content").and_then(Value::as_str) else {
                 continue;
             };
-            if raw_content.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER) {
+            if crate::agent::tool_engine::is_stable_tool_result_representation(raw_content) {
                 continue;
             }
             // These are protocol/infrastructure receipts, not ordinary tool
@@ -2321,6 +2321,14 @@ impl SessionDb {
                 .load_tool_result(session_id, tool_call_id)
                 .await
                 .unwrap_or_else(|| raw_content.to_string());
+            if crate::agent::tool_engine::is_persisted_retrieval_excerpt(
+                tool_name,
+                tool_call_id,
+                raw_content,
+                &exact_body,
+            ) {
+                continue;
+            }
             let ok = message
                 .get("ok")
                 .and_then(Value::as_bool)
@@ -4771,6 +4779,79 @@ mod tests {
             .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
             .expect("upgraded tool message must remain replayable");
         assert_eq!(second_tool["content"], first_tool["content"]);
+    }
+
+    #[tokio::test]
+    async fn get_history_preserves_live_retrieval_excerpt_bytes() {
+        // A retrieval preview is already prompt-shaped at live ingestion using
+        // the configured cap. Reloading it must preserve those exact bytes:
+        // re-rendering the stashed source under the replay cap changes an old
+        // message and breaks Higgs's cached prefix.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:stable-retrieval-excerpt").await;
+        let tool_call_id = "recall-large-web-body";
+        let exact_body = "nytimes article payload ".repeat(1_500);
+        let live = crate::agent::tool_engine::store_then_render_tool_result(
+            &db,
+            &meta.id,
+            tool_call_id,
+            "recall_tool_result",
+            &HashMap::new(),
+            &exact_body,
+            true,
+            10_000,
+        )
+        .await
+        .expect("live retrieval output must be stashed and rendered");
+        assert!(
+            live.chars().count() <= 10_000,
+            "live excerpt must obey the configured cap"
+        );
+        assert!(
+            live.starts_with(crate::agent::tool_engine::TOOL_RESULT_EXCERPT_MARKER),
+            "new retrieval excerpts must carry the stable replay marker"
+        );
+        // Simulate the exact representation written by the preceding release:
+        // it has no marker, but is still the byte-identical live preview that
+        // an active session must continue replaying after an upgrade.
+        let persisted_legacy_excerpt = live
+            .strip_prefix(crate::agent::tool_engine::TOOL_RESULT_EXCERPT_MARKER)
+            .and_then(|content| content.strip_prefix('\n'))
+            .expect("new marker must be a standalone prefix")
+            .to_string();
+
+        db.add_messages(
+            &meta.id,
+            &[
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {"name": "recall_tool_result", "arguments": "{}"}
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": "recall_tool_result",
+                    "ok": true,
+                    "content": persisted_legacy_excerpt
+                }),
+            ],
+        )
+        .await;
+
+        let reloaded = db.get_history(&meta.id, 100, 0).await;
+        let replayed = reloaded
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .expect("retrieval tool message must remain in the complete turn");
+        assert_eq!(
+            replayed["content"], persisted_legacy_excerpt,
+            "reload must not re-render an already-live retrieval excerpt"
+        );
     }
 
     #[tokio::test]

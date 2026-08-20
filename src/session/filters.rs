@@ -201,10 +201,11 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
             // A recalled body is now just a tool result, capped like the rest.
             let raw = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let content = if role == "tool"
-                && raw.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
+                && crate::agent::tool_engine::is_stable_tool_result_representation(raw)
             {
-                // Handles are write-once-stable: pass through byte-identical
-                // on reload so the prefix cache never sees a drift.
+                // Handles and explicit retrieval excerpts are rendered once at
+                // ingestion: pass through byte-identical on reload so the
+                // prefix cache never sees a drift.
                 raw.to_string()
             } else if role == "tool" {
                 cap_tool_body(raw)

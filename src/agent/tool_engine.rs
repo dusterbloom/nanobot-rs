@@ -139,6 +139,17 @@ async fn stash_tool_result_for_prompt_shaping(
 /// `recall_tool_result({"tool_call_id": id})`.
 pub(crate) const TOOL_RESULT_HANDLE_MARKER: &str = "TOOL_RESULT_HANDLE v1 |";
 
+/// The canonical stable marker for a bounded result from an explicit retrieval
+/// tool. Unlike a handle, the excerpt remains directly readable in the
+/// prompt; the marker tells history replay it was rendered at ingestion and
+/// must never be shaped again with a different cap.
+pub(crate) const TOOL_RESULT_EXCERPT_MARKER: &str = "TOOL_RESULT_EXCERPT v1 |";
+
+pub(crate) fn is_stable_tool_result_representation(content: &str) -> bool {
+    content.starts_with(TOOL_RESULT_HANDLE_MARKER)
+        || content.starts_with(TOOL_RESULT_EXCERPT_MARKER)
+}
+
 /// The explicit-retrieval tools whose results are ALREADY bounded (≤4KB) by
 /// their own cap. Per plan §2 they carry their bounded excerpt directly —
 /// wrapping them in a handle would be pointless double-indirection.
@@ -161,6 +172,41 @@ fn tool_result_exposure(name: &str) -> ToolResultExposure {
     } else {
         ToolResultExposure::Handle
     }
+}
+
+/// True when `rendered` is a retrieval excerpt created by the pre-marker
+/// renderer. This recognizes in-flight sessions written before
+/// [`TOOL_RESULT_EXCERPT_MARKER`] existed: the exact stash is immutable, and
+/// regenerating its already-shaped preview with the replay cap would change a
+/// prior provider message and invalidate the cached prefix.
+pub(crate) fn is_persisted_retrieval_excerpt(
+    tool_name: &str,
+    tool_call_id: &str,
+    rendered: &str,
+    exact_body: &str,
+) -> bool {
+    if !is_explicit_retrieval_tool(tool_name) {
+        return false;
+    }
+    if rendered.starts_with(TOOL_RESULT_EXCERPT_MARKER) {
+        return true;
+    }
+    if rendered == exact_body {
+        return false;
+    }
+
+    // The legacy renderer used its cap as the resulting preview length, so
+    // infer it from the persisted text and require a byte-for-byte match.
+    // This cannot misclassify a raw body unless it is exactly the deterministic
+    // digest of a different stashed body.
+    rendered
+        == digest_tool_result(
+            tool_name,
+            &std::collections::HashMap::new(),
+            exact_body,
+            rendered.chars().count(),
+            tool_call_id,
+        )
 }
 
 /// Render the canonical, write-once-stable handle for a tool result. Pure and
@@ -204,9 +250,10 @@ fn render_tool_result_handle(
 /// The provider-facing ingestion chokepoint for completed tool output.
 ///
 /// Store the exact bytes before rendering anything for the model. Ordinary
-/// results become deterministic handles; explicit retrieval tools remain
-/// bounded excerpts so a slice/search continuation can show the bytes it
-/// deliberately requested. A storage failure never falls back to raw output.
+/// results become deterministic handles; explicit retrieval tools retain a
+/// directly readable, versioned bounded excerpt so a slice/search continuation
+/// can show the bytes it deliberately requested. A storage failure never falls
+/// back to raw output.
 pub(crate) async fn store_then_render_tool_result(
     sessions: &crate::session::SessionDb,
     session_id: &str,
@@ -232,9 +279,26 @@ pub(crate) async fn store_then_render_tool_result(
             render_tool_result_handle(tool_call_id, tool_name, ok, exact_body.as_bytes(), args)
         }
         ToolResultExposure::ExplicitExcerpt => {
-            digest_tool_result(tool_name, args, exact_body, cap, tool_call_id)
+            render_stable_retrieval_excerpt(tool_name, args, exact_body, cap, tool_call_id)
         }
     })
+}
+
+/// Render a retrieval excerpt once at ingestion. Reserve the version marker
+/// inside the cap so the stored live message is also safe to replay verbatim.
+fn render_stable_retrieval_excerpt(
+    tool_name: &str,
+    args: &std::collections::HashMap<String, Value>,
+    exact_body: &str,
+    cap: usize,
+    tool_call_id: &str,
+) -> String {
+    let marker_chars = TOOL_RESULT_EXCERPT_MARKER.chars().count() + 1; // newline
+    let excerpt_cap = cap
+        .min(TOOL_RESULT_REPLAY_MAX_BYTES)
+        .saturating_sub(marker_chars);
+    let excerpt = digest_tool_result(tool_name, args, exact_body, excerpt_cap, tool_call_id);
+    format!("{TOOL_RESULT_EXCERPT_MARKER}\n{excerpt}")
 }
 
 /// Fixed-scalar allowlist for the handle's `args` field, in a fixed order.
