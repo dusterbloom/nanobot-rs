@@ -1582,7 +1582,7 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
             if !path.is_file() {
                 continue;
             }
-            let mime = _guess_mime(path_str);
+            let mime = guess_mime(path_str);
             if !mime.starts_with("image/") {
                 continue;
             }
@@ -1739,8 +1739,8 @@ fn _voice_mode_instructions(detected_language: Option<&str>) -> String {
     text
 }
 
-/// Guess MIME type from a file extension.
-fn _guess_mime(path: &str) -> String {
+/// Guess a MIME type from a file extension (used for image content parts).
+pub(crate) fn guess_mime(path: &str) -> String {
     let lower = path.to_lowercase();
     if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
         "image/jpeg".to_string()
@@ -1915,47 +1915,59 @@ mod tests {
         );
     }
 
-    // ----- _guess_mime -----
+    // ----- guess_mime -----
 
     #[test]
     fn test_guess_mime_jpg() {
-        assert_eq!(_guess_mime("photo.jpg"), "image/jpeg");
+        assert_eq!(guess_mime("photo.jpg"), "image/jpeg");
     }
 
     #[test]
     fn test_guess_mime_jpeg() {
-        assert_eq!(_guess_mime("photo.jpeg"), "image/jpeg");
+        assert_eq!(guess_mime("photo.jpeg"), "image/jpeg");
     }
 
     #[test]
     fn test_guess_mime_png() {
-        assert_eq!(_guess_mime("image.png"), "image/png");
+        assert_eq!(guess_mime("image.png"), "image/png");
     }
 
     #[test]
     fn test_guess_mime_gif() {
-        assert_eq!(_guess_mime("anim.gif"), "image/gif");
+        assert_eq!(guess_mime("anim.gif"), "image/gif");
     }
 
     #[test]
     fn test_guess_mime_webp() {
-        assert_eq!(_guess_mime("pic.webp"), "image/webp");
+        assert_eq!(guess_mime("pic.webp"), "image/webp");
     }
 
     #[test]
     fn test_guess_mime_svg() {
-        assert_eq!(_guess_mime("icon.svg"), "image/svg+xml");
+        assert_eq!(guess_mime("icon.svg"), "image/svg+xml");
     }
 
     #[test]
     fn test_guess_mime_unknown() {
-        assert_eq!(_guess_mime("archive.tar.gz"), "application/octet-stream");
+        assert_eq!(guess_mime("archive.tar.gz"), "application/octet-stream");
     }
 
     #[test]
     fn test_guess_mime_case_insensitive() {
-        assert_eq!(_guess_mime("PHOTO.JPG"), "image/jpeg");
-        assert_eq!(_guess_mime("image.PNG"), "image/png");
+        assert_eq!(guess_mime("PHOTO.JPG"), "image/jpeg");
+        assert_eq!(guess_mime("image.PNG"), "image/png");
+    }
+
+    #[test]
+    fn test_guess_mime_shared_fn() {
+        // Same behavior as the former private helper, now a shared free fn.
+        assert_eq!(guess_mime("photo.jpg"), "image/jpeg");
+        assert_eq!(guess_mime("photo.jpeg"), "image/jpeg");
+        assert_eq!(guess_mime("image.png"), "image/png");
+        assert_eq!(guess_mime("anim.gif"), "image/gif");
+        assert_eq!(guess_mime("pic.webp"), "image/webp");
+        assert_eq!(guess_mime("img.svg"), "image/svg+xml");
+        assert_eq!(guess_mime("file.bin"), "application/octet-stream");
     }
 
     // ----- build_system_prompt -----
