@@ -1355,9 +1355,19 @@ fn cua_screenshot_candidate(
         line.strip_prefix("Screenshot saved: ").map(str::to_string)
     })?;
     let path = std::path::PathBuf::from(&path_str);
-    // Defense in depth: only accept paths under <workspace>/cua/.
+    // Defense in depth: only accept paths under <workspace>/cua/. Also reject
+    // any `..` component: `Path::starts_with` compares components without
+    // normalizing, so `<workspace>/cua/../x.png` would pass the prefix check
+    // yet resolve outside the directory. The marker is tool-generated (not
+    // model-injectable), so this is defense-in-depth, not a live exploit.
     let cua_dir = workspace.join("cua");
     if !path.starts_with(&cua_dir) {
+        return None;
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return None;
     }
     Some(path)
@@ -1372,11 +1382,21 @@ fn cua_screenshot_candidate(
 /// skip path is silent: the tool's text result already told the model the
 /// path.
 async fn append_cua_screenshot_turn(messages: &mut Vec<serde_json::Value>, path: std::path::PathBuf) {
+    const MAX_EMBED_BYTES: usize = 10 * 1024 * 1024;
     let path_str = path.to_string_lossy().to_string();
+    // Size gate before read: never fully buffer an oversized file. `try_from`
+    // avoids an `as` conversion; a file that does not fit usize is certainly
+    // oversized, so treat that as MAX. The post-read check below stays as
+    // belt-and-suspenders.
+    let Ok(meta) = tokio::fs::metadata(&path).await else {
+        return;
+    };
+    if usize::try_from(meta.len()).unwrap_or(usize::MAX) > MAX_EMBED_BYTES {
+        return;
+    }
     let Ok(bytes) = tokio::fs::read(&path).await else {
         return;
     };
-    const MAX_EMBED_BYTES: usize = 10 * 1024 * 1024;
     if bytes.len() > MAX_EMBED_BYTES {
         return;
     }
@@ -3026,17 +3046,6 @@ mod tests {
 
     const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-    fn cua_result(data: &str) -> SingleToolResult {
-        SingleToolResult {
-            tool_name: "cua".to_string(),
-            tool_id: "tc_1".to_string(),
-            arguments: HashMap::new(),
-            result: crate::agent::tools::base::ToolExecutionResult::success(data.to_string()),
-            duration_ms: 5,
-            replay_error: None,
-        }
-    }
-
     #[test]
     fn test_cua_screenshot_candidate_detects_marker() {
         let ws = std::path::Path::new("/tmp/ws");
@@ -3089,6 +3098,14 @@ mod tests {
     fn test_cua_screenshot_candidate_skips_relative_path() {
         let ws = std::path::Path::new("/tmp/ws");
         let data = "Screenshot saved: cua/relative.png";
+        let got = cua_screenshot_candidate("cua", true, true, data, ws);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_cua_screenshot_candidate_skips_parent_dir_component() {
+        let ws = std::path::Path::new("/tmp/ws");
+        let data = "Screenshot saved: /tmp/ws/cua/../evil.png";
         let got = cua_screenshot_candidate("cua", true, true, data, ws);
         assert_eq!(got, None);
     }

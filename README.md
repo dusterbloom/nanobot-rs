@@ -403,7 +403,9 @@ Screenshots are saved to a file and their path returned; when the active
 model is vision-capable (`modelCapabilities.<name>.vision`), the image is
 also fed back to the model as an `image_url` content part so it can see
 the screen. Images are in-memory only — the path is what persists to
-session history.
+session history. Note: vision injection is pinned to the default
+screenshot directory (`<workspace>/cua`); a custom `screenshotDir` saves
+screenshots but does not feed them back to the model.
 
 ## Architecture
 
