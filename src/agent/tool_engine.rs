@@ -16,6 +16,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use base64::Engine;
 use serde_json::{json, Value};
 use tracing::{debug, info, instrument, warn, Instrument};
 
@@ -1336,6 +1337,58 @@ async fn execute_tool_calls_ordered(
     results
 }
 
+/// Parse the cua screenshot marker and apply every gate: tool name, success,
+/// vision capability, marker presence, and path confinement under
+/// `<workspace>/cua/`. Pure — no IO — so the gate logic is unit-testable
+/// without a TurnContext.
+fn cua_screenshot_candidate(
+    tool_name: &str,
+    ok: bool,
+    vision: bool,
+    data: &str,
+    workspace: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if tool_name != "cua" || !ok || !vision {
+        return None;
+    }
+    let path_str = data.lines().rev().find_map(|line| {
+        line.strip_prefix("Screenshot saved: ").map(str::to_string)
+    })?;
+    let path = std::path::PathBuf::from(&path_str);
+    // Defense in depth: only accept paths under <workspace>/cua/.
+    let cua_dir = workspace.join("cua");
+    if !path.starts_with(&cua_dir) {
+        return None;
+    }
+    Some(path)
+}
+
+/// Read + embed one screenshot: read the file (≤ 10 MiB), base64-encode it,
+/// and append a synthetic user turn carrying it as an `image_url` content
+/// part so the model sees the screen. The image is in-memory only — the
+/// caller appends this AFTER the tool result is durably persisted and never
+/// re-persists. Every skip path is silent: the tool's text result already
+/// told the model the path.
+async fn append_cua_screenshot_turn(messages: &mut Vec<serde_json::Value>, path: std::path::PathBuf) {
+    let path_str = path.to_string_lossy().to_string();
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return;
+    };
+    const MAX_EMBED_BYTES: usize = 10 * 1024 * 1024;
+    if bytes.len() > MAX_EMBED_BYTES {
+        return;
+    }
+    let mime = crate::agent::context::guess_mime(&path_str);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": format!("[cua screenshot: {path_str}]")},
+            {"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{b64}")}}
+        ]
+    }));
+}
+
 /// Post-process one completed tool result: gate content, inject into messages,
 /// emit CallEnd, audit, update taint/learning/force_response.
 ///
@@ -1484,6 +1537,19 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_
             duration_ms: r.duration_ms,
             result_chars: r.result.data().len(),
         });
+
+    // Cua screenshot vision: append the image as a user turn (in-memory only).
+    // The image is NOT persisted — this runs after the tool result's own
+    // persistence and nothing re-persists it.
+    if let Some(path) = cua_screenshot_candidate(
+        &r.tool_name,
+        r.result.ok(),
+        ctx.core.model_capabilities.vision,
+        r.result.data(),
+        &ctx.core.workspace,
+    ) {
+        append_cua_screenshot_turn(&mut ctx.messages, path).await;
+    }
 
     // NOTE: response-boundary arming is NOT done here. This function sees only
     // one tool result and cannot tell whether the model reported its work in the
@@ -2948,5 +3014,119 @@ mod tests {
             "handle with a 500-char first line must stay small; got len={}",
             h2.len()
         );
+    }
+
+    const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn cua_result(data: &str) -> SingleToolResult {
+        SingleToolResult {
+            tool_name: "cua".to_string(),
+            tool_id: "tc_1".to_string(),
+            arguments: HashMap::new(),
+            result: crate::agent::tools::base::ToolExecutionResult::success(data.to_string()),
+            duration_ms: 5,
+            replay_error: None,
+        }
+    }
+
+    #[test]
+    fn test_cua_screenshot_candidate_detects_marker() {
+        let ws = std::path::Path::new("/tmp/ws");
+        let shot = "/tmp/ws/cua/cua-tc_1.png";
+        let data = format!("click OK\n\nScreenshot saved: {shot}");
+        let got = cua_screenshot_candidate("cua", true, true, &data, ws);
+        assert_eq!(got.as_deref(), Some(std::path::Path::new(shot)));
+    }
+
+    #[test]
+    fn test_cua_screenshot_candidate_skips_without_marker() {
+        let ws = std::path::Path::new("/tmp/ws");
+        let got = cua_screenshot_candidate("cua", true, true, "click OK", ws);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_cua_screenshot_candidate_skips_non_cua_tool() {
+        let ws = std::path::Path::new("/tmp/ws");
+        let data = "Screenshot saved: /tmp/ws/cua/x.png";
+        let got = cua_screenshot_candidate("read_file", true, true, data, ws);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_cua_screenshot_candidate_skips_on_failure() {
+        let ws = std::path::Path::new("/tmp/ws");
+        let data = "Screenshot saved: /tmp/ws/cua/x.png";
+        let got = cua_screenshot_candidate("cua", false, true, data, ws);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_cua_screenshot_candidate_skips_without_vision() {
+        let ws = std::path::Path::new("/tmp/ws");
+        let data = "Screenshot saved: /tmp/ws/cua/x.png";
+        let got = cua_screenshot_candidate("cua", true, false, data, ws);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_cua_screenshot_candidate_skips_path_outside_cua_dir() {
+        let ws = std::path::Path::new("/tmp/ws");
+        let data = "Screenshot saved: /tmp/evil.png";
+        let got = cua_screenshot_candidate("cua", true, true, data, ws);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_cua_screenshot_candidate_skips_relative_path() {
+        let ws = std::path::Path::new("/tmp/ws");
+        let data = "Screenshot saved: cua/relative.png";
+        let got = cua_screenshot_candidate("cua", true, true, data, ws);
+        assert_eq!(got, None);
+    }
+
+    /// IO shell: real file ≤ 10 MiB → image turn appended with a base64
+    /// roundtrip. Uses a plain Vec<Value> — no TurnContext required.
+    #[tokio::test]
+    async fn test_append_cua_screenshot_turn_embeds_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let shot = dir.path().join("cua-tc_1.png");
+        let png = base64::engine::general_purpose::STANDARD.decode(PNG_B64).unwrap();
+        std::fs::write(&shot, &png).unwrap();
+
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+        append_cua_screenshot_turn(&mut messages, shot.clone()).await;
+
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        let content = last["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"].as_str().unwrap().contains("cua screenshot"));
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "got: {url}");
+        let b64 = url.trim_start_matches("data:image/png;base64,");
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        assert_eq!(decoded, png);
+    }
+
+    /// IO shell: file missing → nothing appended.
+    #[tokio::test]
+    async fn test_append_cua_screenshot_turn_missing_file() {
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+        append_cua_screenshot_turn(&mut messages, std::path::PathBuf::from("/nonexistent/x.png")).await;
+        assert!(messages.is_empty());
+    }
+
+    /// IO shell: oversized file (> 10 MiB) → nothing appended.
+    #[tokio::test]
+    async fn test_append_cua_screenshot_turn_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let shot = dir.path().join("big.png");
+        std::fs::write(&shot, vec![0u8; 10 * 1024 * 1024 + 1]).unwrap();
+
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+        append_cua_screenshot_turn(&mut messages, shot).await;
+        assert!(messages.is_empty());
     }
 }
