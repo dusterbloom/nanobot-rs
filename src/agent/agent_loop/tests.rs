@@ -6785,7 +6785,7 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
 /// STEP 2 integration test: a turn that produces a stashed (large/forced) tool
 /// A GENUINELY oversized (>8KB / TOOL_RESULT_REPLAY_MAX_BYTES) tool result
 /// must persist a HANDLE as the tool-result message content — not the raw
-/// body. The body lives only in the stash, fetchable via recall_tool_result.
+/// body. The body lives only in the stash, inspectable through inspect_tool_result.
 /// The handle is byte-identical live and after a SQLite round-trip (reload).
 /// Uses `exec seq` (~13KB) because read_file self-caps under the replay limit.
 #[tokio::test]
@@ -6843,7 +6843,7 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
         "the handle must not contain the raw body; got: {content}"
     );
 
-    // The full body IS in the stash, fetchable by recall_tool_result.
+    // The full body IS in the stash, inspectable through inspect_tool_result.
     let stashed = core
         .sessions
         .load_tool_result(&session.id, "tc_handle")
@@ -9408,19 +9408,15 @@ mod runtime_mode_parity_tests {
     // what the model emits, the loop must terminate in a BOUNDED number of
     // provider calls and return something — it must never spin. These tests
     // feed adversarial providers that never cooperate and assert bounded
-    // termination. They are the one e2e layer that would have caught the
-    // strip/restore churn, the phantom regression, and the family-cap spin.
+    // termination. They guard schema churn, phantom tool narration, and
+    // repeated tool-call loops.
 
-    /// A provider that emits a list_dir tool call on every turn, never
-    /// exhausts, and counts calls. Each call uses a DISTINCT path argument
-    /// (defeats the cached-duplicate breaker, which keys on name+args) so the
-    /// loop is forced through the lease coarse-family cap → sticky-strip path.
-    /// It records whether any call observed `tools == None` — the direct signal
-    /// that the sticky strip fired.
+    /// A provider that emits a distinct side-effect tool call on every turn.
+    /// The session replay records the main-call catalogs for the lease
+    /// convergence assertion.
     struct LoopingProvider {
         name: String,
         call_count: std::sync::atomic::AtomicU32,
-        saw_tools_absent: std::sync::atomic::AtomicBool,
     }
 
     impl LoopingProvider {
@@ -9428,17 +9424,10 @@ mod runtime_mode_parity_tests {
             Self {
                 name: name.to_string(),
                 call_count: std::sync::atomic::AtomicU32::new(0),
-                saw_tools_absent: std::sync::atomic::AtomicBool::new(false),
             }
         }
-
         fn call_count(&self) -> u32 {
             self.call_count.load(std::sync::atomic::Ordering::Relaxed)
-        }
-
-        fn saw_tools_absent(&self) -> bool {
-            self.saw_tools_absent
-                .load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -9447,7 +9436,7 @@ mod runtime_mode_parity_tests {
         async fn chat(
             &self,
             _messages: &[Value],
-            tools: Option<&[Value]>,
+            _tools: Option<&[Value]>,
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
@@ -9457,13 +9446,9 @@ mod runtime_mode_parity_tests {
             let n = self
                 .call_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if tools.is_none() {
-                self.saw_tools_absent
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
             // Distinct command per call: the cached-duplicate breaker cannot
-            // arm, so the lease exhaustion → sticky strip is the only path that
-            // can stop the run. Uses `exec` (side-effect) not `list_dir`
+            // arm, so the lease exhaustion path exercises paired rejections.
+            // Uses `exec` (side-effect) not `list_dir`
             // (read-only) because read-only tools now auto-renew the lease.
             let mut args = std::collections::HashMap::new();
             args.insert("command".to_string(), json!(format!("echo {n}")));
@@ -9593,25 +9578,18 @@ mod runtime_mode_parity_tests {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
-    /// Adversarial convergence: the model emits a fresh list_dir every turn
-    /// (distinct args, so no cached-duplicate shortcut) and NEVER writes a
-    /// final answer. The loop must still converge — via the lease coarse-family
-    /// cap (6) → sticky tool strip (Fix A1) → a tools-absent call → forced text.
-    ///
-    /// This is the test that was missing for the 2026-07 incidents. It is only
-    /// meaningful because it ASSERTS the sticky strip fired (`saw_tools_absent`);
-    /// if Fix A1 were reverted, the router would restore tools on every call and
-    /// this assertion would fail.
+    /// Adversarial convergence: the model emits a fresh side-effect call every
+    /// turn and never writes a final answer. The loop must terminate after the
+    /// lease rejections, without changing the frozen catalog or orphaning any
+    /// rejected tool result.
     #[tokio::test]
-    async fn convergence_loop_terminates_via_sticky_strip_when_model_loops() {
+    async fn convergence_loop_terminates_without_mutating_tool_catalog() {
         let provider = Arc::new(LoopingProvider::new("local-main"));
-        // max_iterations must exceed the per-lease budget (DEFAULT_TOOLS_PER_LEASE
-        // = 12) so the lease can exhaust and arm the sticky strip before the
-        // bare iteration limit stops the loop. (The coarse-family cap that
-        // used to fire at 6 was retired 2026-07-30.)
+        // max_iterations must exceed the 12-call lease so the provider reaches
+        // paired lease rejections before the ordinary iteration limit.
         let (agent_loop, workspace) =
             build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
-        let session_key = format!("conv-sticky-strip-{}", uuid::Uuid::new_v4());
+        let session_key = format!("conv-stable-catalog-{}", uuid::Uuid::new_v4());
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -9624,15 +9602,73 @@ mod runtime_mode_parity_tests {
             !response.trim().is_empty(),
             "a converged turn must return text, got empty"
         );
-        assert!(
-            provider.saw_tools_absent(),
-            "loop never observed a tools-absent call — the sticky strip (Fix A1) did not fire. \
-             Either the lease never exhausted or the router restored tools (regression)."
-        );
         let calls = provider.call_count();
         assert!(
             calls < 25,
             "loop made {calls} provider calls — did not converge (termination guard regressed)"
+        );
+
+        let core = agent_loop.shared.core_handle.swappable();
+        let meta = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .expect("loop session must exist");
+        let replay = core
+            .sessions
+            .load_session_replay(&meta.id)
+            .await
+            .expect("loop replay must be readable");
+        let main_catalogs: Vec<Option<Vec<Value>>> = replay
+            .model_calls
+            .iter()
+            .filter(|call| call.purpose == crate::session::db::ModelCallPurpose::Main)
+            .map(|call| {
+                serde_json::from_slice::<crate::session::db::RecordedProviderRequest>(&call.request)
+                    .expect("main request must decode")
+                    .tools
+            })
+            .collect();
+        assert!(
+            !main_catalogs.is_empty(),
+            "the foreground loop must record main provider calls"
+        );
+        assert!(
+            main_catalogs.windows(2).all(|pair| pair[0] == pair[1]),
+            "lease rejection changed the main-call tool catalog and would bust Higgs's cached prefix"
+        );
+        let raw = core.sessions.get_all_messages(&meta.id).await;
+        let carrier_ids: std::collections::HashSet<String> = raw
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            .flat_map(|message| {
+                message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+            .collect();
+        let blocked_ids: Vec<&str> = raw
+            .iter()
+            .filter(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.starts_with("lease exhausted:"))
+            })
+            .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
+            .collect();
+        assert!(
+            !blocked_ids.is_empty(),
+            "adversarial provider must reach lease-blocked receipts"
+        );
+        assert!(
+            blocked_ids.iter().all(|id| carrier_ids.contains(*id)),
+            "every lease rejection must have an assistant tool-call carrier: {blocked_ids:?}"
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
@@ -9641,15 +9677,14 @@ mod runtime_mode_parity_tests {
     /// Positive counterpart to the convergence test: legitimate bounded
     /// exploration — 8 distinct same-family (read) calls, the exact pattern the
     /// retired coarse-family cap used to block at 6 — must complete normally
-    /// with the model's own answer, WITHOUT arming the sticky strip or any loop
-    /// guard. Under the OLD cap the 7th call would be blocked and the sticky
-    /// strip would fire a tools-absent request, so this asserts tools were
-    /// present on EVERY call (no strip) and the turn reaches the model's answer.
+    /// with the model's own answer, without a lease rejection or loop guard.
+    /// Under the old cap the 7th call would be blocked, so this asserts tools
+    /// stay available and the turn reaches the model's answer.
     #[tokio::test]
     async fn convergence_legitimate_exploration_completes_without_guard() {
-        // A sequence provider that ALSO records whether any call observed
-        // `tools == None` (the sticky-strip signal). Without this, a blind
-        // sequence dequeue would pass even if the 7th call were capped.
+        // A sequence provider also records an absent tool catalog. Without
+        // this, a blind sequence dequeue would pass if a loop guard changed
+        // the schema before the model reached its answer.
         struct ExploringProvider {
             responses:
                 parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
@@ -9734,24 +9769,25 @@ mod runtime_mode_parity_tests {
         );
         assert!(
             !provider.saw_tools_absent.load(std::sync::atomic::Ordering::Relaxed),
-            "tools were stripped during exploration — a loop guard fired (regression of the family-cap retirement)"
+            "tools disappeared during exploration — a loop guard fired (regression of the family-cap retirement)"
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
     /// dropped the warm cache). The model runs a command whose output is huge
-    /// (stashed under its tool_call_id), then recalls it. The recalled result
-    /// persisted in the conversation must be bounded AND point at slice/search —
-    /// not the full body. This exercises the real tool-execution + shaping path
+    /// (stashed under its tool_call_id), then inspects it. The inspection result
+    /// persisted in the conversation must be bounded — not the full body. This
+    /// exercises the real tool-execution + shaping path
     /// end-to-end (the unit test only covers `digest_tool_result`).
     #[tokio::test]
-    async fn convergence_recall_of_oversized_body_stays_bounded() {
+    async fn convergence_inspection_of_oversized_body_stays_bounded() {
         let mut exec_args = std::collections::HashMap::new();
         // ~230KB of output — far over any in-context cap, guaranteed to stash.
         exec_args.insert("command".to_string(), json!("seq 1 40000"));
-        let mut recall_args = std::collections::HashMap::new();
-        recall_args.insert("tool_call_id".to_string(), json!("tc_big"));
+        let mut inspect_args = std::collections::HashMap::new();
+        inspect_args.insert("tool_call_id".to_string(), json!("tc_big"));
+        inspect_args.insert("query".to_string(), json!("39999"));
 
         let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
             "local-main",
@@ -9769,9 +9805,9 @@ mod runtime_mode_parity_tests {
                 crate::providers::base::LLMResponse {
                     content: Some(String::new()),
                     tool_calls: vec![crate::providers::base::ToolCallRequest {
-                        id: "tc_recall".to_string(),
-                        name: "recall_tool_result".to_string(),
-                        arguments: recall_args,
+                        id: "tc_inspect".to_string(),
+                        name: "inspect_tool_result".to_string(),
+                        arguments: inspect_args,
                     }],
                     finish_reason: FinishReason::ToolCalls,
                     usage: std::collections::HashMap::new(),
@@ -9785,19 +9821,19 @@ mod runtime_mode_parity_tests {
             ],
         ));
         let (agent_loop, workspace) = build_local_inline_harness(main);
-        let session_key = format!("conv-recall-bound-{}", uuid::Uuid::new_v4());
+        let session_key = format!("conv-inspect-bound-{}", uuid::Uuid::new_v4());
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            agent_loop.process_direct("run then recall", &session_key, "test", "offline"),
+            agent_loop.process_direct("run then inspect", &session_key, "test", "offline"),
         )
         .await
-        .expect("recall e2e must terminate");
+        .expect("inspection e2e must terminate");
 
         assert_eq!(response, "done");
 
-        // The recalled body persisted in the conversation must be bounded, not
-        // the raw ~230KB, and must direct the model at slice/search.
+        // The inspected body persisted in the conversation must be bounded,
+        // not the raw ~230KB.
         let core = agent_loop.shared.core_handle.swappable();
         let meta = core
             .sessions
@@ -9805,22 +9841,22 @@ mod runtime_mode_parity_tests {
             .await
             .expect("session should exist");
         let msgs = core.sessions.get_all_messages(&meta.id).await;
-        let recall_result = msgs
+        let inspect_result = msgs
             .iter()
-            .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_recall"))
-            .expect("recall tool result must be persisted");
-        let content = recall_result
+            .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_inspect"))
+            .expect("inspect tool result must be persisted");
+        let content = inspect_result
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert!(
             content.chars().count() < 5000,
-            "recalled body must be bounded in context, got {} chars (regression of the 172KB blowup)",
+            "inspected body must be bounded in context, got {} chars (regression of the 172KB blowup)",
             content.chars().count()
         );
         assert!(
-            content.contains("slice_tool_result") || content.contains("search_tool_result"),
-            "recalled preview must point at slice/search, got: {content}"
+            content.starts_with(crate::agent::tool_engine::TOOL_RESULT_EXCERPT_MARKER),
+            "inspection output must be the bounded projection, got: {content}"
         );
 
         let _ = std::fs::remove_dir_all(&workspace);

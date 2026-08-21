@@ -1767,8 +1767,8 @@ pub(crate) async fn route_tool_calls(
             let receipt = format!(
                 "duplicate {} call blocked; cached result from the earlier identical call \
                  was {} chars and is already represented in the conversation. Do not replay \
-                 this broad call; answer from the prior result, or use search_tool_result / \
-                 slice_tool_result when the previous output was stashed and needs filtering.",
+                 this broad call; answer from the prior result, or use inspect_tool_result \
+                 with a query or line range when the previous output was stashed.",
                 tc.name, cached_chars
             );
             ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &receipt);

@@ -46,7 +46,7 @@ static RE_NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
 });
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_TOOL_RESULT_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(read_file|list_dir|find_files|search_files|exec|recall|remember|recall_tool_result|search_tool_result|slice_tool_result)\b[^.\n]{0,140}\b(succeeded|returned|showed|shows|listed|found|exists|contains|worked|completed|done|ready|updated|failed|error|not found|permission denied|timed? ?out)\b").expect("static regex")
+    Regex::new(r"(?i)\b(read_file|list_dir|find_files|search_files|exec|recall|remember|inspect_tool_result)\b[^.\n]{0,140}\b(succeeded|returned|showed|shows|listed|found|exists|contains|worked|completed|done|ready|updated|failed|error|not found|permission denied|timed? ?out)\b").expect("static regex")
 });
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {

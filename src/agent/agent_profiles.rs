@@ -375,10 +375,10 @@ Do stuff."#;
         let tools = profile
             .tools
             .expect("capabilities should produce a tools list");
-        // Read also carries the recovery tool required by digested results.
+        // Read also carries the bounded recovery tool required by result handles.
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"list_dir".to_string()));
-        assert!(tools.contains(&"recall_tool_result".to_string()));
+        assert!(tools.contains(&"inspect_tool_result".to_string()));
         assert!(tools.contains(&"web_search".to_string()));
         assert!(tools.contains(&"web_fetch".to_string()));
         assert!(tools.contains(&"browser".to_string()));

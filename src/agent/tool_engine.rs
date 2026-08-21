@@ -36,19 +36,25 @@ use super::agent_loop::{ResponseBoundary, TurnContext};
 use crate::agent::context_hygiene::{tool_result_ok, TOOL_RESULT_REPLAY_MAX_BYTES};
 use crate::agent::tools::base::ToolConcurrency;
 
+#[cfg(test)]
 const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
 /// Bound native multi-tool fan-out. Four concurrent reads/fetches keep local
 /// resource use predictable while still collapsing the dominant serial waits.
 const MAX_PARALLEL_TOOL_CALLS: usize = 4;
-/// Minimum room for a compact receipt with a recall handle. Below this, the
+/// Minimum room for a compact receipt with an inspection handle. Below this, the
 /// prompt may save a few bytes while losing the exact retrieval path.
 const MIN_BATCH_TOOL_RESULT_CAP_CHARS: usize = 320;
+/// The sole readable tool-result projection. This is deliberately independent
+/// of user-configured tool output limits so one inspection cannot reintroduce
+/// an oversized prompt suffix.
+const TOOL_RESULT_INSPECTION_MAX_CHARS: usize = 1_024;
 
 /// Per-tool token threshold above which a raw tool result is replaced by a
 /// summary. Enumerative tools (`exec`, `list_dir`, `web_search`, `read_file`)
 /// return specific strings — filenames, URLs, error lines — that the model
 /// needs to quote verbatim. Summaries destroy them, which the model then
 /// papers over by fabricating. Keep raw output for these up to ~4000 tokens.
+#[cfg(test)]
 fn summary_threshold_tokens(tool_name: &str) -> usize {
     match tool_name {
         "exec" | "list_dir" | "find_files" | "search_files" | "search_context" | "file_info"
@@ -101,6 +107,7 @@ fn inline_hot_prompt_result_cap_for_ctx_batch(ctx: &TurnContext, result_count: u
 ///   error). The caller MUST NOT show a raw body or re-run a side-effect tool;
 ///   it surfaces this via `abort_turn_on_stash_failure` so the turn fails
 ///   cleanly. See `docs/superpowers/plans/2026-07-30-tool-result-handles-not-bodies.md`.
+#[cfg(test)]
 async fn stash_tool_result_for_prompt_shaping(
     sessions: &crate::session::SessionDb,
     session_id: &str,
@@ -111,10 +118,9 @@ async fn stash_tool_result_for_prompt_shaping(
     force: bool,
 ) -> Result<bool, crate::session::db::StoredResult> {
     use crate::session::db::StoredResult;
-    // No recall exemption: a recalled body can be hundreds of KB and must be
-    // stashable under the recall's own id so slice_tool_result /
-    // search_tool_result can query it. Exempting it left the raw body in live
-    // context, which inflated a session to 77k tokens (2026-07-30).
+    // No retrieval exemption: a result can be hundreds of KB and must stay
+    // stashable under its own id. Exempting it left raw output in live context,
+    // which inflated a session to 77k tokens (2026-07-30).
     if !force && data.chars().count() <= cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES {
         return Ok(false);
     }
@@ -136,7 +142,7 @@ async fn stash_tool_result_for_prompt_shaping(
 /// The canonical stable handle marker. A tool-result message whose content
 /// starts with this is a handle — it carries metadata + a tiny excerpt, never
 /// the full body. The body lives in the stash, fetchable via
-/// `recall_tool_result({"tool_call_id": id})`.
+/// `inspect_tool_result({"tool_call_id": id})`.
 pub(crate) const TOOL_RESULT_HANDLE_MARKER: &str = "TOOL_RESULT_HANDLE v1 |";
 
 /// The canonical stable marker for a bounded result from an explicit retrieval
@@ -147,17 +153,13 @@ pub(crate) const TOOL_RESULT_EXCERPT_MARKER: &str = "TOOL_RESULT_EXCERPT v1 |";
 
 pub(crate) fn is_stable_tool_result_representation(content: &str) -> bool {
     content.starts_with(TOOL_RESULT_HANDLE_MARKER)
-        || content.starts_with(TOOL_RESULT_EXCERPT_MARKER)
 }
 
-/// The explicit-retrieval tools whose results are ALREADY bounded (≤4KB) by
-/// their own cap. Per plan §2 they carry their bounded excerpt directly —
-/// wrapping them in a handle would be pointless double-indirection.
+/// Inspection is the only operation allowed to show selected result content
+/// directly to the model. Full recall and separate search/slice names remain
+/// legacy implementation details, never prompt-visible escape hatches.
 fn is_explicit_retrieval_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "recall_tool_result" | "slice_tool_result" | "search_tool_result"
-    )
+    name == "inspect_tool_result"
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +240,7 @@ fn render_tool_result_handle(
         .unwrap_or(stored_bytes.len());
     let excerpt = handle_excerpt(stored_bytes);
     format!(
-        r#"{MARKER} id:{id_j} | tool:{tool_j} | ok:{ok} | chars:{chars} | sha256:{digest} | args:{args_j} | excerpt:{excerpt_j} | fetch:"recall_tool_result""#,
+        r#"{MARKER} id:{id_j} | tool:{tool_j} | ok:{ok} | chars:{chars} | sha256:{digest} | args:{args_j} | excerpt:{excerpt_j} | fetch:"inspect_tool_result""#,
         MARKER = TOOL_RESULT_HANDLE_MARKER,
         id_j = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".into()),
         tool_j = serde_json::to_string(tool).unwrap_or_else(|_| "\"\"".into()),
@@ -249,10 +251,9 @@ fn render_tool_result_handle(
 
 /// The provider-facing ingestion chokepoint for completed tool output.
 ///
-/// Store the exact bytes before rendering anything for the model. Ordinary
-/// results become deterministic handles; explicit retrieval tools retain a
-/// directly readable, versioned bounded excerpt so a slice/search continuation
-/// can show the bytes it deliberately requested. A storage failure never falls
+/// Store exact bytes before rendering anything for the model. Ordinary results
+/// become deterministic handles; only explicit inspection retains a readable,
+/// versioned excerpt with a fixed hard ceiling. A storage failure never falls
 /// back to raw output.
 pub(crate) async fn store_then_render_tool_result(
     sessions: &crate::session::SessionDb,
@@ -284,8 +285,8 @@ pub(crate) async fn store_then_render_tool_result(
     })
 }
 
-/// Render a retrieval excerpt once at ingestion. Reserve the version marker
-/// inside the cap so the stored live message is also safe to replay verbatim.
+/// Render an inspection excerpt once at ingestion. The fixed ceiling—not the
+/// caller or config—is the context safety boundary.
 fn render_stable_retrieval_excerpt(
     tool_name: &str,
     args: &std::collections::HashMap<String, Value>,
@@ -295,6 +296,7 @@ fn render_stable_retrieval_excerpt(
 ) -> String {
     let marker_chars = TOOL_RESULT_EXCERPT_MARKER.chars().count() + 1; // newline
     let excerpt_cap = cap
+        .min(TOOL_RESULT_INSPECTION_MAX_CHARS)
         .min(TOOL_RESULT_REPLAY_MAX_BYTES)
         .saturating_sub(marker_chars);
     let excerpt = digest_tool_result(tool_name, args, exact_body, excerpt_cap, tool_call_id);
@@ -363,9 +365,10 @@ fn abort_turn_on_stash_failure(
     ContextBuilder::add_tool_result_with_status(&mut ctx.messages, tool_id, tool_name, &msg, false);
 }
 
-/// Build a head+tail preview of `data` (≤ `cap` chars) with a `recall_tool_result`
-/// pointer to `tool_call_id`. Assumes the full body is ALREADY stashed (by the
-/// caller) when `data` was truncated — this only shapes the in-context preview.
+/// Build a head+tail preview of `data` (≤ `cap` chars) with an
+/// `inspect_tool_result` pointer to `tool_call_id`. Assumes the full body is
+/// ALREADY stashed (by the caller) when `data` was truncated — this only
+/// shapes the in-context preview.
 fn build_tool_result_preview(
     tool_name: &str,
     _args: &std::collections::HashMap<String, Value>,
@@ -378,21 +381,11 @@ fn build_tool_result_preview(
         return data.to_string();
     }
     let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
-    // A recalled body that is still too large for live context must NOT point
-    // back at recall_tool_result (circular: the model just recalled it and
-    // would loop). The full body is stashed under this id; direct the model at
-    // slice_tool_result / search_tool_result to query it without reloading.
-    let header = if tool_name == "recall_tool_result" {
-        format!(
-            "[recalled output still too large (~{estimated_tokens} tokens); \
-             use slice_tool_result/search_tool_result with tool_call_id=\"{tool_call_id}\"]\n"
-        )
-    } else {
-        format!(
-            "[truncated: {tool_name}, ~{estimated_tokens} tokens; \
-             recall_tool_result({{\"tool_call_id\": \"{tool_call_id}\"}}) for full]\n"
-        )
-    };
+    let header = format!(
+        "[truncated: {tool_name}, ~{estimated_tokens} tokens; \
+         inspect_tool_result({{\"tool_call_id\": \"{tool_call_id}\", \"query\": \"...\"}}) \
+         or use start_line/end_line]\n"
+    );
     let footer = "\n[...]\n";
     let fixed_chars = header.chars().count() + footer.chars().count();
     if fixed_chars >= cap {
@@ -416,7 +409,7 @@ fn build_tool_result_preview(
 /// Small results (≤ `cap`) pass through verbatim. Large results are reduced to
 /// a head+tail preview; the caller has already stored the FULL body in SQLite
 /// under `(session_id, tool_call_id)`. The preview tells the model how to call
-/// `recall_tool_result` to recover the middle. This bounds each result's
+/// `inspect_tool_result` to recover a bounded part. This bounds each result's
 /// in-context cost to ~`cap` chars (so N tool calls cost ~N×cap, not N×full)
 /// while keeping any result one tool call away — no re-run needed.
 fn digest_tool_result(
@@ -426,9 +419,8 @@ fn digest_tool_result(
     cap: usize,
     tool_call_id: &str,
 ) -> String {
-    // No recall exemption: recalled bodies are shaped by the same cap as any
-    // other result. build_tool_result_preview points recalled output at
-    // slice/search (not back at recall) so the model cannot loop.
+    // No retrieval exemption: every output is shaped by the same cap and the
+    // preview points at bounded inspection instead of full replay.
     let prompt_cap = cap.min(TOOL_RESULT_REPLAY_MAX_BYTES);
     let total_chars = data.chars().count();
     if total_chars <= prompt_cap && data.len() <= TOOL_RESULT_REPLAY_MAX_BYTES {
@@ -560,6 +552,26 @@ fn should_arm_boundary(assistant_content: Option<&str>, executed_tools: &[&str])
 fn boundary_blocks_side_effects(armed: bool, assistant_content: Option<&str>) -> bool {
     let reported = assistant_content.is_some_and(|c| !c.trim().is_empty());
     armed && !reported
+}
+
+/// Persist the one assistant carrier that owns a routed batch before policy or
+/// execution can settle any member. Callers pass the complete batch, including
+/// calls that a lease will reject, so a tool result can never become orphaned.
+pub(crate) async fn journal_tool_call_carrier(
+    ctx: &mut TurnContext,
+    routed_tool_calls: &[ToolCallRequest],
+    response: &LLMResponse,
+) {
+    let tc_json: Vec<Value> = routed_tool_calls
+        .iter()
+        .map(ToolCallRequest::to_openai_json)
+        .collect();
+    ContextBuilder::add_assistant_message(
+        &mut ctx.messages,
+        response.content.as_deref(),
+        Some(&tc_json),
+    );
+    ctx.persist_pending_protocol_messages().await;
 }
 
 /// Execute tool calls via the delegation (tool-runner) path.
@@ -729,19 +741,6 @@ pub(crate) async fn execute_tools_delegated(
     }
 
     let delegation_start = std::time::Instant::now();
-
-    // Journal the provider's tool-call carrier before the runner can perform
-    // any side effect. This is the durable intent record for delegated tools.
-    let tc_json: Vec<Value> = routed_tool_calls
-        .iter()
-        .map(|tc| tc.to_openai_json())
-        .collect();
-    ContextBuilder::add_assistant_message(
-        &mut ctx.messages,
-        response.content.as_deref(),
-        Some(&tc_json),
-    );
-    ctx.persist_pending_protocol_messages().await;
 
     for tc in routed_tool_calls {
         if let Err(error) = ctx
@@ -1758,19 +1757,6 @@ pub(crate) async fn execute_tools_inline(
     routed_tool_calls: &[ToolCallRequest],
     response: &LLMResponse,
 ) {
-    let tc_json: Vec<Value> = routed_tool_calls
-        .iter()
-        .map(|tc| tc.to_openai_json())
-        .collect();
-
-    ContextBuilder::add_assistant_message(
-        &mut ctx.messages,
-        response.content.as_deref(),
-        Some(&tc_json),
-    );
-    // Durable intent precedes execution, including side-effect tools.
-    ctx.persist_pending_protocol_messages().await;
-
     // Response boundary enforcement: when this call was nudged to respond,
     // side-effect tools are rejected with an error result instead of having
     // been stripped from the schema (schema churn changes the prompt head
@@ -2156,7 +2142,7 @@ mod tests {
         let injected = digest_tool_result("read_file", &HashMap::new(), &data, cap, "call_stored");
 
         assert!(stashed);
-        assert!(injected.contains("recall_tool_result"));
+        assert!(injected.contains("inspect_tool_result"));
         assert!(!injected.contains("MIDDLE_SECRET"));
         assert_eq!(
             sessions
@@ -2278,18 +2264,16 @@ mod tests {
         // Preview is bounded and omits the middle.
         assert!(out.chars().count() <= 1200);
         assert!(!out.contains("MIDDLE_SECRET"));
-        // Points the model at the recall tool with the right id.
-        assert!(out.contains("recall_tool_result"));
+        // Points the model at the bounded inspection tool with the right id.
+        assert!(out.contains("inspect_tool_result"));
         assert!(out.contains("call_42"));
     }
 
-    /// A recalled body that exceeds the replay cap must NOT enter live context
-    /// raw — that is the 2026-07-30 regression (a 172KB recall inflated a
-    /// session to 77k tokens and dropped the cache). The digest must (a) bound
-    /// it, (b) point the model at slice/search against the recall's own id,
-    /// and (c) NOT point back at recall_tool_result (which would loop).
+    /// An inspected result that exceeds the replay cap must NOT enter live
+    /// context raw. The digest must bound it and point to the one bounded
+    /// inspection operation against its own id.
     #[test]
-    fn digest_tool_result_caps_recalled_body_and_points_to_slice_search() {
+    fn digest_tool_result_caps_inspected_body_and_points_to_inspect() {
         let args = HashMap::new();
         // ~200KB body, far over the replay cap.
         let data = format!(
@@ -2299,26 +2283,20 @@ mod tests {
         );
         let cap = TOOL_RESULT_REPLAY_MAX_BYTES;
 
-        let out = digest_tool_result("recall_tool_result", &args, &data, cap, "recall_call_7");
+        let out = digest_tool_result("inspect_tool_result", &args, &data, cap, "inspect_call_7");
 
         // (a) bounded — never the raw 200KB.
         assert!(
             out.chars().count() <= cap + 40,
-            "recalled body must be capped to ~replay budget, got {} chars",
+            "inspected body must be capped to ~replay budget, got {} chars",
             out.chars().count()
         );
         assert!(
             !out.contains("NEVER_INLINE_THIS_SECRET"),
             "the oversized middle must not enter the preview"
         );
-        // (b) the model can recover parts via slice/search against this id.
-        assert!(out.contains("slice_tool_result") || out.contains("search_tool_result"));
-        assert!(out.contains("recall_call_7"));
-        // (c) NOT a circular recall pointer — the model just recalled it.
-        assert!(
-            !out.contains("call recall_tool_result"),
-            "recalled-body preview must not point back at recall_tool_result (loop)"
-        );
+        assert!(out.contains("inspect_tool_result"));
+        assert!(out.contains("inspect_call_7"));
     }
 
     #[test]
@@ -2351,7 +2329,7 @@ mod tests {
             "batch prompt payload must stay under one replay budget, got {total_chars}"
         );
         for (idx, out) in outputs.iter().enumerate() {
-            assert!(out.contains("recall_tool_result"));
+            assert!(out.contains("inspect_tool_result"));
             assert!(out.contains(&format!("call_{idx}")));
             assert!(!out.contains("MIDDLE_SECRET"));
         }
@@ -3027,6 +3005,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn full_retrieval_never_replays_its_raw_body_into_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("cli:no-raw-retrieval-replay").await;
+        let body = format!(
+            "header\n{}\nfooter",
+            "NYT_HTML_MUST_STAY_STASHED\n".repeat(300)
+        );
+
+        let rendered = store_then_render_tool_result(
+            &sessions,
+            &session.id,
+            "call_recall",
+            "recall_tool_result",
+            &HashMap::new(),
+            &body,
+            true,
+            10_000,
+        )
+        .await
+        .expect("exact retrieval body must be stashed");
+
+        assert!(
+            rendered.starts_with(TOOL_RESULT_HANDLE_MARKER),
+            "model history must receive a receipt, never a full retrieval excerpt: {rendered}"
+        );
+        assert!(
+            !rendered.contains("NYT_HTML_MUST_STAY_STASHED"),
+            "the exact body belongs only in SQLite"
+        );
+        assert_eq!(
+            sessions
+                .load_tool_result(&session.id, "call_recall")
+                .await
+                .as_deref(),
+            Some(body.as_str()),
+            "the exact body remains recoverable from the immutable stash"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_is_the_only_bounded_readable_result_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("cli:bounded-inspection").await;
+        let body = format!("MATCHED_LINE\n{}", "unrelated line\n".repeat(2_000));
+
+        let rendered = store_then_render_tool_result(
+            &sessions,
+            &session.id,
+            "call_inspect",
+            "inspect_tool_result",
+            &HashMap::new(),
+            &body,
+            true,
+            10_000,
+        )
+        .await
+        .expect("inspection result must be stored before projection");
+
+        assert!(
+            rendered.starts_with(TOOL_RESULT_EXCERPT_MARKER),
+            "inspection is the single bounded readable projection: {rendered}"
+        );
+        assert!(rendered.contains("MATCHED_LINE"));
+        assert!(
+            rendered.chars().count() <= 1_024,
+            "the configured result limit must not bypass the inspection ceiling"
+        );
+    }
+
     /// STEP 2: the canonical handle must be a pure deterministic function of
     /// (id, tool, ok, stored_bytes, args). Same inputs → byte-identical output
     /// across calls (write-once-stable → no prefix-cache drift). The full body
@@ -3060,10 +3110,10 @@ mod tests {
             !h1.contains("line three"),
             "the full body must not be a substring of the handle; got: {h1}"
         );
-        // The handle points the model at recall_tool_result for the full body.
+        // The handle points the model at inspect_tool_result for a bounded part.
         assert!(
-            h1.contains("recall_tool_result") && h1.contains("call_42"),
-            "handle must reference recall_tool_result and the id; got: {h1}"
+            h1.contains("inspect_tool_result") && h1.contains("call_42"),
+            "handle must reference inspect_tool_result and the id; got: {h1}"
         );
         // The deterministic args summary includes the allowlisted scalar (path)
         // but NOT non-allowlisted fields.

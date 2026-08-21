@@ -781,15 +781,11 @@ impl ToolRegistry {
         "web_search",
         "web_fetch",
         "message",
-        "recall_tool_result",
-        // Bounded retrieval over stashed results (search/slice without loading
-        // the full body). See stash_search.rs.
-        "search_tool_result",
-        "slice_tool_result",
+        "inspect_tool_result",
         "todo",
         // The system prompt instructs the model to expand LCM summaries; the
         // schema must be advertised or local models fall back to guessing
-        // (observed: recall_tool_result with invented ids).
+        // (observed: legacy result retrieval with invented ids).
         "lcm_expand",
         // Memory tools: medium local models (e.g. Qwen3.6-35B-A3M) fail to route
         // through the `tool` proxy meta-tool reliably, so they get dedicated
@@ -798,7 +794,7 @@ impl ToolRegistry {
         "remember",
     ];
 
-    /// Hot tools advertised as native schemas at turn 1. Kept to the 5 the
+    /// Hot tools advertised as native schemas at turn 1. Kept to the 6 the
     /// model uses every turn — the rest go through the `tool` proxy to keep
     /// the tool-schema prefix small (~670 tok vs ~2000 tok for 14 native).
     /// `get_skills` is native (not proxied) so the model reads skill content
@@ -806,8 +802,14 @@ impl ToolRegistry {
     /// See commit f03c6e8 for the prior pure-proxy attempt; this is the
     /// middle ground that avoids the proxy/native arg confusion that killed
     /// pure-proxy while still cutting cold-start prefill by ~60%.
-    const CORE_NATIVE_TOOLS: &'static [&'static str] =
-        &["read_file", "edit_file", "write_file", "exec", "get_skills"];
+    const CORE_NATIVE_TOOLS: &'static [&'static str] = &[
+        "read_file",
+        "edit_file",
+        "write_file",
+        "exec",
+        "get_skills",
+        "inspect_tool_result",
+    ];
 
     /// Tools kept registered and reachable via the `get_tools` proxy (call with
     /// no `tool_name` to list) but omitted from the per-turn prompt catalog to
@@ -815,10 +817,9 @@ impl ToolRegistry {
     /// sessions and peripheral to the hot path. `remember` and `lcm_expand` are
     /// intentionally NOT here (core to memory formation / LCM expansion).
     ///
-    /// `recall_tool_result` is advertised because `TOOL_RESULT_HANDLE v1`
-    /// receipts point the model at it (`fetch:"recall_tool_result"`); an
-    /// unadvertised target made local models substitute `recall` and burn turns
-    /// failing to resolve handles (session 20260804_204406_c16eb0).
+    /// Result inspection is native because `TOOL_RESULT_HANDLE v1` receipts
+    /// point directly at it; a local model should never need a proxy round-trip
+    /// to recover a narrow slice of prior evidence.
     const RARELY_ADVERTISED_TOOLS: &'static [&'static str] = &[
         "file_preview",
         "file_info",
@@ -826,8 +827,6 @@ impl ToolRegistry {
         "system_info",
         "tool_status",
         "browser",
-        "search_tool_result",
-        "slice_tool_result",
     ];
 
     /// Internal Lean-catalog builder: condense every available schema before
@@ -937,7 +936,7 @@ impl ToolRegistry {
             "get_skills",
             "recall",
             "remember",
-            "recall_tool_result",
+            "inspect_tool_result",
         ];
         for def in &mut defs {
             Self::remove_local_hot_model_hazards(def);
@@ -1414,21 +1413,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
-    fn register_test_result_recall(registry: &mut ToolRegistry, db_path: std::path::PathBuf) {
-        registry.register(Box::new(
-            crate::agent::tools::recall_tool_result::RecallToolResultTool::with_db(
-                db_path.clone(),
-                "test-session".to_string(),
-            ),
-        ));
+    fn register_test_result_inspector(registry: &mut ToolRegistry, db_path: std::path::PathBuf) {
         registry.register(Box::new(
             crate::agent::tools::stash_search::SearchToolResultTool::with_db(
-                db_path.clone(),
-                "test-session".to_string(),
-            ),
-        ));
-        registry.register(Box::new(
-            crate::agent::tools::stash_search::SliceToolResultTool::with_db(
                 db_path,
                 "test-session".to_string(),
             ),
@@ -1446,7 +1433,7 @@ mod tests {
         let mut config = ToolConfig::new(ws.path());
         config.db_path = Some(ws.path().join("sessions.db"));
         let mut reg = ToolRegistry::with_standard_tools(&config);
-        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
         let count = reg.get_local_definitions().len();
         let full = TokenBudget::estimate_tool_def_tokens(&reg.get_definitions());
         let local = TokenBudget::estimate_tool_def_tokens(&reg.get_local_definitions());
@@ -1492,21 +1479,28 @@ mod tests {
         let mut config = ToolConfig::new(ws.path());
         config.db_path = Some(ws.path().join("sessions.db"));
         let mut reg = ToolRegistry::with_standard_tools(&config);
-        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
         reg.register(Box::new(crate::agent::tools::TodoTool::new(ws.path())));
         let defs = reg.get_core_plus_proxy_definitions();
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        // 5 hot native tools + 1 proxy = 6 total.
+        // 6 hot native tools + 1 proxy = 7 total.
         assert_eq!(
             names.len(),
-            6,
-            "core+proxy must be 5 native + 1 proxy, got {names:?}"
+            7,
+            "core+proxy must expose the bounded inspection tool directly, got {names:?}"
         );
         assert!(names.contains(&"get_tools"), "missing proxy: {names:?}");
-        for expected in ["read_file", "edit_file", "write_file", "exec", "get_skills"] {
+        for expected in [
+            "read_file",
+            "edit_file",
+            "write_file",
+            "exec",
+            "get_skills",
+            "inspect_tool_result",
+        ] {
             assert!(
                 names.contains(&expected),
                 "core missing {expected}: {names:?}"
@@ -1540,7 +1534,7 @@ mod tests {
     fn test_artifact_core_plus_proxy_surface_matches_core_for_prefix_stability() {
         let ws = tempfile::tempdir().unwrap();
         let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
-        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
         let core_defs = reg.get_core_plus_proxy_definitions();
         let defs = reg.get_artifact_core_plus_proxy_definitions();
         // Both surfaces are pure-proxy; they must be byte-identical so the chat
@@ -1573,7 +1567,7 @@ mod tests {
     fn test_lean_definitions_surface() {
         let ws = tempfile::tempdir().unwrap();
         let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
-        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
         let lean = reg.get_lean_definitions();
 
         // Lazy-load contract: exactly ONE tool advertised at turn 1.

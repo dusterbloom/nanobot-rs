@@ -4782,43 +4782,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_history_preserves_live_retrieval_excerpt_bytes() {
-        // A retrieval preview is already prompt-shaped at live ingestion using
-        // the configured cap. Reloading it must preserve those exact bytes:
-        // re-rendering the stashed source under the replay cap changes an old
-        // message and breaks Higgs's cached prefix.
+    async fn get_history_reprojects_legacy_full_recall_to_a_handle() {
+        // An older binary wrote a large full-recall preview into the live
+        // transcript. On upgrade, recover the immutable exact body and project
+        // it to the current stable handle so raw output cannot keep polluting
+        // every later prompt.
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:stable-retrieval-excerpt").await;
         let tool_call_id = "recall-large-web-body";
-        let exact_body = "nytimes article payload ".repeat(1_500);
-        let live = crate::agent::tool_engine::store_then_render_tool_result(
-            &db,
-            &meta.id,
-            tool_call_id,
-            "recall_tool_result",
-            &HashMap::new(),
-            &exact_body,
-            true,
-            10_000,
-        )
-        .await
-        .expect("live retrieval output must be stashed and rendered");
-        assert!(
-            live.chars().count() <= 10_000,
-            "live excerpt must obey the configured cap"
+        let exact_body = format!(
+            "{}RAW_HTML_MUST_STAY_IN_TOOL_RESULTS\n{}",
+            "safe header\n".repeat(30),
+            "nytimes article payload ".repeat(1_500)
         );
-        assert!(
-            live.starts_with(crate::agent::tool_engine::TOOL_RESULT_EXCERPT_MARKER),
-            "new retrieval excerpts must carry the stable replay marker"
-        );
-        // Simulate the exact representation written by the preceding release:
-        // it has no marker, but is still the byte-identical live preview that
-        // an active session must continue replaying after an upgrade.
-        let persisted_legacy_excerpt = live
-            .strip_prefix(crate::agent::tool_engine::TOOL_RESULT_EXCERPT_MARKER)
-            .and_then(|content| content.strip_prefix('\n'))
-            .expect("new marker must be a standalone prefix")
-            .to_string();
+        assert!(matches!(
+            db.store_tool_result_immutable(
+                &meta.id,
+                tool_call_id,
+                "recall_tool_result",
+                &exact_body
+            )
+            .await,
+            StoredResult::Stored { .. }
+        ));
 
         db.add_messages(
             &meta.id,
@@ -4837,7 +4823,7 @@ mod tests {
                     "tool_call_id": tool_call_id,
                     "name": "recall_tool_result",
                     "ok": true,
-                    "content": persisted_legacy_excerpt
+                    "content": exact_body
                 }),
             ],
         )
@@ -4848,9 +4834,16 @@ mod tests {
             .iter()
             .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
             .expect("retrieval tool message must remain in the complete turn");
-        assert_eq!(
-            replayed["content"], persisted_legacy_excerpt,
-            "reload must not re-render an already-live retrieval excerpt"
+        let content = replayed["content"]
+            .as_str()
+            .expect("tool content must be text");
+        assert!(
+            content.starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER),
+            "legacy full recall must be replaced with a safe handle: {content}"
+        );
+        assert!(
+            !content.contains("RAW_HTML_MUST_STAY_IN_TOOL_RESULTS"),
+            "the original HTML-like payload must stay in tool_results"
         );
     }
 

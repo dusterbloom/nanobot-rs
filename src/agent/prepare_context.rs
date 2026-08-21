@@ -347,28 +347,11 @@ impl AgentLoopShared {
 
         let lcm_setup_ms = lap_ms();
 
-        // Large results enter the prompt as bounded previews. Keep the direct
-        // recovery tool in every mode and bind it to this concrete session so
-        // a restarted process can load the exact original bytes from SQLite.
-        tools.register(Box::new(
-            crate::agent::tools::recall_tool_result::RecallToolResultTool::with_db(
-                core.sessions.path().to_path_buf(),
-                session_id.clone(),
-            ),
-        ));
-
-        // Bounded retrieval over stashed results: search (grep) and slice
-        // (line-range) without ever loading the full body into context.
-        // These complement recall_tool_result for the common case where only
-        // a few matching lines are needed.
+        // One bounded result-inspection tool replaces full recall plus separate
+        // search/slice verbs. Exact bodies remain in SQLite and no model call
+        // can request an unbounded replay into the transcript.
         tools.register(Box::new(
             crate::agent::tools::stash_search::SearchToolResultTool::with_db(
-                core.sessions.path().to_path_buf(),
-                session_id.clone(),
-            ),
-        ));
-        tools.register(Box::new(
-            crate::agent::tools::stash_search::SliceToolResultTool::with_db(
                 core.sessions.path().to_path_buf(),
                 session_id.clone(),
             ),
@@ -659,7 +642,6 @@ impl AgentLoopShared {
                     crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,
                     crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN,
                 ),
-                consecutive_lease_blocks: 0,
                 llm_call_start: None,
                 ttft_ms: None,
                 provider_prompt_estimate: None,

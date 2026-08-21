@@ -152,7 +152,6 @@ pub(crate) enum ToolPresentationMode {
     Native,
     Textual,
     Trio,
-    ForcedText,
 }
 
 #[derive(Clone, Debug)]
@@ -3096,11 +3095,7 @@ mod tests {
         assert_ne!(native, availability_flip);
 
         let mut previous_mode = ToolPresentationMode::Native;
-        for mode in [
-            ToolPresentationMode::Textual,
-            ToolPresentationMode::Trio,
-            ToolPresentationMode::ForcedText,
-        ] {
+        for mode in [ToolPresentationMode::Textual, ToolPresentationMode::Trio] {
             assert!(counters.tool_presentation_mode_changed(session, mode));
             assert_eq!(
                 counters.tool_presentation_mode(session),

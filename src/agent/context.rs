@@ -1268,11 +1268,11 @@ impl ContextBuilder {
                 format!(
                     "You are nanobot.\n\
                      Date: {today}. Model: {model_line}. Cwd: {cwd}. Workspace: {workspace_path}.\n\n\
-                     Native tools: read_file, edit_file, write_file, exec, get_skills — call with schema args; never wrap. \
+                     Native tools: read_file, edit_file, write_file, exec, get_skills, inspect_tool_result — call with schema args; never wrap. \
                      Other tools via `get_tools` proxy: omit tool_name to list; \
                      {{\"tool_name\":\"X\"}} inspect; {{\"tool_name\":\"X\",\"tool_args\":{{...}}}} invoke. \
                       get_skills: omit name to list, name to read; recall (memory + files + past sessions). \
-                     TOOL_RESULT_HANDLE v1 receipt → fetch the body with recall_tool_result({{\"tool_call_id\":\"<id>\"}}). \
+                     TOOL_RESULT_HANDLE v1 receipt → inspect a bounded part with inspect_tool_result({{\"tool_call_id\":\"<id>\",\"query\":\"...\"}}), or use start_line/end_line. \
                      Quote exact tool errors; never invent causes or tool results. \
                      edit_file uses path, old_text, new_text—not content. \
                      Never pass read_file line prefixes as args. \
@@ -1316,7 +1316,7 @@ impl ContextBuilder {
                 "\n- Reply directly for conversation; use 'message' tool only for chat channels.\n\
                  - Use absolute paths or paths relative to the project directory.\n\
                  - Tool results may arrive as TOOL_RESULT_HANDLE v1 receipts (body stashed to save context); \
-                 fetch the full body with recall_tool_result({\"tool_call_id\":\"<id>\"})."
+                 inspect only the needed part with inspect_tool_result({\"tool_call_id\":\"<id>\",\"query\":\"...\"}}) or start_line/end_line."
                     .to_string(),
                 format!(
                     "## Memory\n\
@@ -2381,15 +2381,6 @@ mod tests {
         let mut messages: Vec<Value> = Vec::new();
         let body = "exact bytes that the caller already bounded";
         ContextBuilder::add_tool_result(&mut messages, "c1", "read_file", body);
-        assert_eq!(messages[0]["content"].as_str().unwrap(), body);
-    }
-
-    #[test]
-    fn test_add_tool_result_keeps_recall_tool_result_raw_for_live_turn() {
-        let mut messages: Vec<Value> = Vec::new();
-        let body = "x".repeat(crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES + 1024);
-        ContextBuilder::add_tool_result(&mut messages, "c1", "recall_tool_result", &body);
-
         assert_eq!(messages[0]["content"].as_str().unwrap(), body);
     }
 

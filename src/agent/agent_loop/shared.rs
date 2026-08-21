@@ -894,50 +894,11 @@ fn advance_response_boundary(
 // Loop convergence bounds
 // ---------------------------------------------------------------------------
 //
-// These three constants govern the loop's termination guards. They INTERACT,
-// and the ordering invariant below MUST hold — editing one in isolation can
-// re-introduce a spin (2026-07-30 incident class). Co-located so the
-// relationship is auditable in one place; these are tuning constants, not
-// user config (no flag, no struct — see AGENTS.md "no configurability that
-// wasn't requested").
-//
-// Ordering invariant:
-//   NO_PROGRESS_HARD_STOP > LEASE_BLOCKS_BEFORE_STRIP
-//
-// The lease strip must arm BEFORE the hard stop forces a finish, so a model
-// that ignored "lease exhausted" receipts gets `NO_PROGRESS_HARD_STOP -
-// LEASE_BLOCKS_BEFORE_STRIP` tools-absent rounds to comply with the strip and
-// produce a final answer. If they were equal (or reversed) the hard stop would
-// fire before/during the strip, prematurely ending turns that could have
-// converged. `MAX_LEASE_RENEWAL_REJECTIONS` is independent (it bounds the
-// renewal-rejection path in response.rs, not the no-progress streak) but is
-// kept here for visibility.
-pub(crate) const LEASE_BLOCKS_BEFORE_STRIP: u32 = 2;
+// Lease exhaustion is a paired tool-result receipt. The universal no-progress
+// stop converges repeated blocked calls without mutating the frozen tool schema
+// that participates in the server-side prompt prefix.
 pub(crate) const NO_PROGRESS_HARD_STOP: u32 = 4;
 pub(crate) const MAX_LEASE_RENEWAL_REJECTIONS: u32 = 2;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LeasePresentationPolicy {
-    forced_text: bool,
-    stripped_definitions: bool,
-}
-
-fn apply_lease_presentation_policy(
-    consecutive_lease_blocks: u32,
-    tool_defs: &mut Vec<Value>,
-    mode: &mut ToolPresentationMode,
-) -> LeasePresentationPolicy {
-    let forced_text = consecutive_lease_blocks >= LEASE_BLOCKS_BEFORE_STRIP;
-    let stripped_definitions = forced_text && !tool_defs.is_empty();
-    if forced_text {
-        tool_defs.clear();
-        *mode = ToolPresentationMode::ForcedText;
-    }
-    LeasePresentationPolicy {
-        forced_text,
-        stripped_definitions,
-    }
-}
 
 /// Per-turn flow control flags.
 ///
@@ -975,12 +936,9 @@ pub(crate) struct FlowControl {
     /// duplicate receipts force a text response immediately.
     pub(crate) round_executed_no_tools: bool,
     /// Per-turn tool lease. Caps the total tool calls per turn at
-    /// `lease_size * (1 + max_renewals)`; on exhaustion `step_pre_call`
-    /// strips tool definitions from the request so the model cannot
-    /// emit more tool calls and must produce a final text answer. This
-    /// is the structural prevention for the 2026-07-27 13-call loop
-    /// (session 20260727_161730_6e61a0). See
-    /// `docs/superpowers/specs/2026-07-27-tool-leases-design.md`.
+    /// `lease_size * (1 + max_renewals)`; after exhaustion, paired rejection
+    /// receipts preserve provider protocol and the no-progress breaker bounds
+    /// a model that ignores them without changing the prompt prefix.
     pub(crate) lease: Lease,
     /// When the LLM call started — set in step_call_llm, read in step_process_response.
     pub(crate) llm_call_start: Option<std::time::Instant>,
@@ -1015,13 +973,6 @@ pub(crate) struct FlowControl {
     pub(crate) consecutive_repeat_rounds: u32,
     /// True once we've already nudged about a repeating tool call; the next
     /// repeat forces a stop instead of nudging again.
-    /// Consecutive rounds where ALL tool calls were blocked by the lease.
-    /// After 2, tool_defs are stripped for the next iteration — one cache
-    /// miss, but the model then physically cannot emit tool calls and must
-    /// produce a text answer. Without this, a small model that ignores
-    /// the lease receipt keeps trying indefinitely, burning iterations
-    /// and churning the cache with unique-UUID receipts.
-    pub(crate) consecutive_lease_blocks: u32,
     pub(crate) repeat_nudged: bool,
     /// Infrastructure error surfaced by the tool engine when the
     /// "handles-not-bodies" invariant cannot be honored — i.e. the immutable
@@ -1906,16 +1857,9 @@ impl AgentLoopShared {
                 )));
         }
 
-        // Select and filter tool definitions for this turn.
-        //
-        // Tool-lease enforcement happens at execution time (cache-safe).
-        // But after 2 consecutive rounds where ALL calls were blocked by
-        // the lease, we strip tool_defs entirely — a small model that
-        // ignores the "lease exhausted" receipt keeps trying tools
-        // indefinitely, burning iterations and churning the cache with
-        // unique-UUID receipts. One cache miss here stops the churn and
-        // forces a text answer. The counter resets as soon as any tool
-        // succeeds (renewal, new lease, etc.).
+        // Select and filter tool definitions for this turn. Tool-lease
+        // enforcement happens at execution time: rejections remain paired
+        // protocol messages and never change the schema Higgs caches.
         let (mut tool_defs, saved_tool_defs, mut tool_presentation_mode) =
             self.select_tool_definitions(ctx);
         // Reuse only a catalog previously installed from a final provider
@@ -1926,27 +1870,6 @@ impl AgentLoopShared {
             .frozen_tool_definitions(&ctx.session_key, tool_presentation_mode)
         {
             tool_defs = frozen;
-        }
-        // `lease_forced_text_only` is computed from the same counter the
-        // strip below uses, and is honored by the router-passthrough
-        // restore further down. Without this hand-off the strip is undone
-        // in the SAME step_pre_call: the restore sees empty tool_defs and
-        // repopulates them, so the model keeps emitting tool calls the
-        // lease then blocks — the 6× strip/restore churn documented in
-        // session 20260729_155613_2b65f0. Router passthrough may reverse
-        // trio stripping; it must never reverse lease enforcement.
-        let lease_policy = apply_lease_presentation_policy(
-            ctx.flow.consecutive_lease_blocks,
-            &mut tool_defs,
-            &mut tool_presentation_mode,
-        );
-        let lease_forced_text_only = lease_policy.forced_text;
-        if lease_policy.stripped_definitions {
-            tracing::info!(
-                session = %ctx.session_key,
-                consecutive_blocks = ctx.flow.consecutive_lease_blocks,
-                "tool_lease_stripping_after_blocks — model ignored receipts, forcing text-only iteration"
-            );
         }
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
@@ -2106,12 +2029,8 @@ impl AgentLoopShared {
         // Router-first preflight for strict trio mode. The router can only
         // strip tools when trio is active, so the passthrough-restore below
         // is only meaningful then. When trio is off (the common local
-        // single-model setup) the preflight is a pure passthrough and the
-        // restore must NOT run — `tool_defs` is empty here only because the
-        // lease forced a text-only call, and restoring would undo lease
-        // enforcement (the 20260729_155613_2b65f0 failure). Gating the
-        // whole block makes trio-off absent from the hot path instead of
-        // present-but-inert.
+        // single-model setup), the preflight is a pure passthrough, so gating
+        // the whole block makes trio-off absent from the hot path.
         let trio_active =
             ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main();
         if trio_active {
@@ -2124,12 +2043,7 @@ impl AgentLoopShared {
                     return StepResult::Done(IterationOutcome::Finished(msg));
                 }
                 crate::agent::router::PreflightResult::Passthrough => {
-                    // Restore undoes trio stripping — but never when the lease
-                    // simultaneously forced a text-only call.
-                    if !lease_forced_text_only
-                        && tool_defs.is_empty()
-                        && !saved_tool_defs.is_empty()
-                    {
+                    if tool_defs.is_empty() && !saved_tool_defs.is_empty() {
                         debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
                         tool_defs = saved_tool_defs;
                         tool_presentation_mode = ToolPresentationMode::Native;
@@ -4196,14 +4110,20 @@ impl AgentLoopShared {
             })
             .collect();
 
+        // One carrier owns every lease disposition below. Persist it before
+        // either execution path can add a result, so rejected proxy calls are
+        // protocol-valid and cache-replayable just like executed calls.
+        crate::agent::tool_engine::journal_tool_call_carrier(ctx, &routed_tool_calls, &response)
+            .await;
+
         // Tool-lease enforcement. Each call is recorded against the per-turn
         // lease; calls that exceed the lease budget are NOT executed — they
         // get a rejection receipt in their tool_call_id slot (preserves the
         // wire contract) and the model sees a clear renewal prompt.
         //
-        // Cache-safe by design: tool_defs are NOT modified at execution time
-        // (only the later sticky-strip path clears them), so the tool-block
-        // hash stays byte-stable across tool rounds and the prefix cache hits.
+        // Cache-safe by design: tool_defs are never modified at execution
+        // time, so the tool-block hash stays byte-stable across rounds and
+        // the prefix cache hits.
         //
         // There is no longer a consecutive-same-family cap (retired 2026-07-30
         // — it over-fired on legitimate exploration and busted the cache).
@@ -4289,6 +4209,9 @@ impl AgentLoopShared {
                 false,
             );
         }
+        if !blocked_calls.is_empty() {
+            ctx.persist_pending_protocol_messages().await;
+        }
         let routed_tool_calls = allowed_calls;
         if routed_tool_calls.is_empty() && !blocked_calls.is_empty() {
             // Every call this round was blocked by the lease — flag it
@@ -4296,12 +4219,6 @@ impl AgentLoopShared {
             // iteration (matches the response_boundary pattern).
             ctx.flow.round_executed_no_tools = true;
             ctx.flow.tool_guard.had_blocked_calls = true;
-            // Track consecutive lease-only-blocked rounds. After 2,
-            // step_pre_call strips tool_defs to force a text answer.
-            ctx.flow.consecutive_lease_blocks = ctx.flow.consecutive_lease_blocks.saturating_add(1);
-        } else if !routed_tool_calls.is_empty() {
-            // At least one tool ran — reset the consecutive-block counter.
-            ctx.flow.consecutive_lease_blocks = 0;
         }
         // Snapshot the dispatched tool-call keys for the repeated-call breaker.
         let dispatched_keys: Vec<String> = routed_tool_calls
@@ -4507,11 +4424,11 @@ impl AgentLoopShared {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_response_boundary, apply_auto_expansion_candidates,
-        apply_lease_presentation_policy, commit_staged_auto_expansion, divergent_message_digest,
+        advance_response_boundary, apply_auto_expansion_candidates, commit_staged_auto_expansion,
+        divergent_message_digest,
         materialize_auto_expansion, proactive_grounding_preserves_prefix_cache,
         AppliedAutoExpansion, AutoExpansionMaterializationKind, HiggsSessionRoute,
-        PromptCacheSnapshot, ResponseBoundary, RetainedExpansionFailure, LEASE_BLOCKS_BEFORE_STRIP,
+        PromptCacheSnapshot, ResponseBoundary, RetainedExpansionFailure,
     };
     use crate::agent::agent_core::{
         stable_higgs_session_id, ExpansionCheckpoint, RuntimeCounters, SessionRetirement,
@@ -5425,23 +5342,6 @@ mod tests {
             Some(1)
         );
         assert!(!engine.lock().await.commit_auto_expansion(7));
-    }
-
-    #[test]
-    fn forced_text_mode_is_stable_when_available_definitions_are_empty() {
-        let mut definitions = Vec::new();
-        let mut mode = ToolPresentationMode::Native;
-
-        let policy =
-            apply_lease_presentation_policy(LEASE_BLOCKS_BEFORE_STRIP, &mut definitions, &mut mode);
-
-        assert!(policy.forced_text);
-        assert!(
-            !policy.stripped_definitions,
-            "there were no physical definitions to remove"
-        );
-        assert_eq!(mode, ToolPresentationMode::ForcedText);
-        assert!(definitions.is_empty());
     }
 
     /// The divergence diagnostic must name the divergent message's STRUCTURAL
