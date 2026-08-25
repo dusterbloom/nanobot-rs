@@ -12,9 +12,35 @@ Sequencing decision (Q1=b): agency first, error-protocol codemod later.
       (`nanobot skills list/validate` OK). No new permissions needed
       (git/cargo already allowed); merge stays a human act via git;
       `/evolution` REPL command skipped — git is the UI for git things.
-- [ ] P2/P3 Error protocol: migrate 18 tool files to execute_typed, flip
-      the trait, delete the legacy ladder + from_legacy/classify_tool_error
-      (research: docs/research/2026-08-06-error-conventions-and-host-bridge.md §2.6).
+- [~] P2/P3 Error protocol (batches `a9f664d`, `6d06d21`; 18/40 impls typed):
+      Migrated: system_info, tool_status, file_preview, todo, check_inbox,
+      send_email, get_skills, cron, inspect_tool_result, apply_patch,
+      create_skill, checkpoint, backtrack, plan, python_kernel, execute_code.
+      Remaining P2: browser, cua, filesystem/mod (7 tools), filesystem/write,
+      web_search + web_fetch (ctx overrides), shell (ctx), and merging the 4
+      partial tools (message, spawn, remember, recall — logic into their
+      existing execute_typed, delete String bodies).
+      Then P3 flip: trait `execute(params, ctx) -> ToolResult` becomes the one
+      method (delete String execute default, execute_with_context,
+      execute_with_result(_and_context), funnel_legacy, require_str!);
+      registry execute_inner calls tool.execute directly; classify_tool_error
+      + ToolError::from_legacy move private into host_bridge (its serde wire
+      round-trip needs them; errors.rs goes clean); tests switch
+      `tool.execute(p)` -> bridge fn or typed asserts; update AGENTS.md
+      "tools return String" line + docs/error-protocol-backlog.md.
+      MIGRATION RULES (proven byte-stable, follow exactly):
+      1. Param/validation sites -> InvalidArgs{message: <legacy text minus
+         "Error: " prefix>} (keeps "is required" worked-example appends).
+      2. Not-found -> NotFound, policy denials -> PermissionDenied, everything
+         else -> Execution — ALL carry the exact stripped legacy message.
+      3. Timeout/Network/RateLimited ONLY if the legacy string is already the
+         canonical render ("Command timed out after Ns"); else Execution.
+      4. No-"Error:"-prefix strings (e.g. "Error reading X: ...") were
+         SUCCESS-channel — keep Ok(...) and mark the quirk.
+      5. Inner closures/threads returning flat strings: one tool-local
+         strip_prefix("Error:") boundary split (python_kernel pattern).
+      6. Tests calling tool.execute(p) keep passing via the trait default
+         bridge; no test churn until the P3 flip.
 - [ ] E4 Anthropic demotion (−~1.6k): delete anthropic.rs + factory arm +
       schema; openai-compat + higgs remain. Revert hatch = the commit.
 - [ ] E5 Cluster idle compute (~150-200 LOC): per-idle-turn router consult,
