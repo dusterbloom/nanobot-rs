@@ -18,34 +18,12 @@ Sequencing decision (Q1=b): agency first, error-protocol codemod later.
       the three ctx-path suites (write/web/shell call execute_typed
       directly; remember's empty-add assertion moved to the MissingArg
       contract).
-- [ ] P3 flip (one mechanical change, do with fresh context):
-      1. base.rs: rename trait method execute_typed -> `execute(&self,
-         params, ctx) -> ToolResult` (REQUIRED, no default); delete the
-         String execute default, execute_with_context,
-         execute_with_result, execute_with_result_and_context,
-         funnel_legacy, and require_str! (rg users first).
-      2. All ~40 impls + their test call sites: rename execute_typed ->
-         execute (sd). Tests asserting on strings use per-file
-         render(ToolResult) -> String helpers (shell.rs has the pattern);
-         plain `tool.execute(p)` sites become render(tool.execute(p, &ctx))
-         or unwrap().text.
-      3. Registry execute_inner: call tool.execute(params, &ctx) directly,
-         wrap ToolExecutionResult::from; delete the catch_unwind shape only
-         if trivially adaptable (keep catch_unwind — panics still map to
-         failure).
-      4. errors.rs: move classify_tool_error + from_legacy + ToolErrorKind
-         ROUND-TRIP... NO: keep ToolErrorKind + legacy_kind_from_tool_error
-         (typed->kind, feeds ToolExecutionResult.error_kind + registry
-         worked-example arm at registry.rs:751). Move ONLY classify_tool_error
-         + from_legacy to host_bridge as private fns (serde wire round-trip
-         at host_bridge.rs:260,394 + into_model_text).
-      5. Update AGENTS.md ("tools return String" line) +
-         docs/error-protocol-backlog.md status.
-      6. Full gate: build + test + clippy (no new warnings) + higgs E2E
-         smoke (one exec + one recall turn).
-      Landmine: trait defaults currently form a 3-cycle (execute -> typed ->
-      with_context -> execute) if an impl overrides NOTHING — the flip
-      deletes the cycle by construction.
+- [x] P3 flip COMPLETE (`cc58b02`): `Tool::execute(params, ctx) -> ToolResult`
+      is the one required method; String ladder + funnel_legacy + require_str!
+      deleted (require_str! lives private in the worker lane); from_legacy is
+      private in host_bridge; classify_tool_error + ToolErrorKind remain for
+      the registry audit shape. Gate: 2804/0, 0 warnings, higgs E2E
+      (exec + remember) green.
 - [ ] E4 Anthropic demotion (−~1.6k): delete anthropic.rs + factory arm +
       schema; openai-compat + higgs remain. Revert hatch = the commit.
 - [ ] E5 Cluster idle compute (~150-200 LOC): per-idle-turn router consult,
