@@ -426,18 +426,13 @@ impl Tool for SpawnTool {
         })
     }
 
-    /// Legacy string entry point — thin render-wrapped call into the
-    /// typed path (error protocol Phase 2 migration).
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        self.execute_with_result(params).await.data().to_string()
-    }
-
     /// Typed entry point: parses the params into a typed [`SpawnAction`]
     /// (every validation error string byte-identical to the legacy surface)
     /// and drives the request through the host bridge — one call, no locks,
     /// no `Option<callback>` slots (research §3.4). Origin channel/chat are
     /// baked into the host; the tool sends empty placeholders that never
-    /// travel on the wire (`#[serde(skip)]`).
+    /// travel on the wire (`#[serde(skip)]`). The trait's default String
+    /// `execute` renders this byte-for-byte.
     async fn execute_typed(
         &self,
         params: HashMap<String, serde_json::Value>,

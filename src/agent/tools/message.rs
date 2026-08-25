@@ -66,18 +66,13 @@ impl Tool for MessageTool {
         })
     }
 
-    /// Legacy string entry point — thin render-wrapped call into the typed
-    /// path (error protocol Phase 2 migration).
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        self.execute_with_result(params).await.data().to_string()
-    }
-
     /// Typed entry point: resolves the target channel/chat (per-call params
     /// override the baked defaults; same `"No target channel/chat
     /// specified"` guard as legacy), then drives the send through the
     /// [`MessageHost`] trait — no callback slot, no `anyhow` at the tool
     /// boundary. The host's reply text is the model-visible output; host
-    /// errors propagate typed and render byte-identically.
+    /// errors propagate typed and render byte-identically. The trait's
+    /// default String `execute` renders this byte-for-byte.
     async fn execute_typed(
         &self,
         params: HashMap<String, serde_json::Value>,

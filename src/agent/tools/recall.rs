@@ -687,7 +687,51 @@ impl Tool for RecallTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        let has_query = params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_session = params
+            .get("session")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_message_ids = params
+            .get("message_ids")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+        let is_fetch = matches!(mode, "latest" | "session" | "in_session" | "extract")
+            || has_session
+            || has_message_ids;
+
+        // Empty-arg is self-correcting: a structural MissingArg (model-
+        // fixable) whose render carries a worked call shape instead of
+        // looping on the same bare call.
+        if !is_fetch && !has_query {
+            return Err(crate::errors::ToolError::MissingArg {
+                param: "query".to_string(),
+                example: r#"recall({"query":"..."})"#.to_string(),
+            });
+        }
+        // One boundary over the String dispatch (python_kernel pattern).
+        let out = self.run(params).await;
+        match out.strip_prefix("Error:").map(str::trim) {
+            Some(err) => Err(crate::errors::ToolError::Execution {
+                message: err.to_string(),
+            }),
+            None => Ok(out.into()),
+        }
+    }
+}
+
+impl RecallTool {
+    /// Legacy String dispatch, called only by [`RecallTool::execute_typed`].
+    async fn run(&self, params: HashMap<String, Value>) -> String {
         let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("");
         let session = params
             .get("session")
@@ -722,41 +766,6 @@ impl Tool for RecallTool {
         "Error: recall needs one of: 'query' (to search), 'session' or 'message_ids' (to fetch), or mode=\"latest\".".to_string()
     }
 
-    /// Empty-arg is self-correcting: produce a structural
-    /// [`crate::errors::ToolError::MissingArg`] (model-fixable) whose render
-    /// carries a worked call shape instead of looping on the same bare call.
-    /// Everything else funnels through the legacy string path unchanged.
-    async fn execute_typed(&self, params: HashMap<String, Value>, ctx: &ToolContext) -> ToolResult {
-        let has_query = params
-            .get("query")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_session = params
-            .get("session")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_message_ids = params
-            .get("message_ids")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty());
-        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-        let is_fetch = matches!(mode, "latest" | "session" | "in_session" | "extract")
-            || has_session
-            || has_message_ids;
-
-        if !is_fetch && !has_query {
-            return Err(crate::errors::ToolError::MissingArg {
-                param: "query".to_string(),
-                example: r#"recall({"query":"..."})"#.to_string(),
-            });
-        }
-        // Funnel through the legacy string path (error protocol §2.2).
-        // NB: call the shared helper, NOT `Tool::execute_typed(self, ...)` —
-        // under #[async_trait] that qualified call re-dispatches to this
-        // override and recurses until stack overflow (see funnel_legacy docs).
-        let out = self.execute_with_context(params, ctx).await;
-        crate::agent::tools::base::funnel_legacy(out)
-    }
 }
 
 #[cfg(test)]

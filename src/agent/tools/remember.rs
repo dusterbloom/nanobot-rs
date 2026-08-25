@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tokio::fs;
 
 use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 
 const MAX_FACT_CHARS: usize = 180;
 
@@ -181,7 +182,43 @@ impl Tool for RememberTool {
         })
     }
 
-    async fn execute(&self, args: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        args: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        // Structured empty-arg path: an `add` with no facts returns
+        // MissingArg (model-fixable) whose render carries a corrective
+        // worked example. Without this, a zero-temp model emitting
+        // `remember({})` got a silent success and looped.
+        let pre_action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "add".to_string());
+        if pre_action == "add" {
+            let has_input = args.contains_key("facts") || args.contains_key("fact");
+            if !has_input {
+                return Err(crate::errors::ToolError::MissingArg {
+                    param: "facts".to_string(),
+                    example: r#"remember({"facts":["a concise fact"]})"#.to_string(),
+                });
+            }
+        }
+        // One boundary over the String body (python_kernel pattern).
+        let out = self.run(args).await;
+        match out.strip_prefix("Error:").map(str::trim) {
+            Some(err) => Err(ToolError::Execution {
+                message: err.to_string(),
+            }),
+            None => Ok(out.into()),
+        }
+    }
+}
+
+impl RememberTool {
+    /// Legacy String body, called only by [`RememberTool::execute_typed`].
+    async fn run(&self, args: HashMap<String, Value>) -> String {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -334,32 +371,6 @@ impl Tool for RememberTool {
         message
     }
 
-    /// Structured empty-arg path: an `add` with no facts returns
-    /// [`crate::errors::ToolError::MissingArg`] (model-fixable) whose render
-    /// carries a corrective worked example. Without this, a zero-temp model
-    /// emitting `remember({})` got a silent success (the old list default)
-    /// and looped. Other actions funnel through the legacy string path.
-    async fn execute_typed(&self, args: HashMap<String, Value>, ctx: &ToolContext) -> ToolResult {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| "add".to_string());
-        if action == "add" {
-            let has_input = args.contains_key("facts") || args.contains_key("fact");
-            if !has_input {
-                return Err(crate::errors::ToolError::MissingArg {
-                    param: "facts".to_string(),
-                    example: r#"remember({"facts":["a concise fact"]})"#.to_string(),
-                });
-            }
-        }
-        // Funnel through the legacy string path via the shared helper —
-        // NOT `Tool::execute_typed(self, ...)` (async_trait qualified-call
-        // recursion trap, see funnel_legacy docs).
-        let out = self.execute_with_context(args, ctx).await;
-        crate::agent::tools::base::funnel_legacy(out)
-    }
 }
 
 fn required_string<'a>(args: &'a HashMap<String, Value>, key: &str) -> Result<&'a str, String> {
@@ -550,7 +561,7 @@ mod tests {
         let tool = RememberTool::new(dir.path().to_path_buf());
         let result = tool.execute(HashMap::new()).await;
         assert!(
-            result.starts_with("Error:") && result.contains("nothing to remember"),
+            result.starts_with("Error:") && result.contains("facts"),
             "direct execute({{}}) must error, not succeed as list: {result}"
         );
     }
