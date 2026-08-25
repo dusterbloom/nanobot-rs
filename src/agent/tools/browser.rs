@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::Command;
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 
 /// Default command timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -127,15 +128,23 @@ impl Tool for BrowserTool {
         *BINARY_AVAILABLE.get_or_init(check_binary)
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         // Fail fast if binary is missing — don't waste tokens on param validation.
         if !*BINARY_AVAILABLE.get_or_init(check_binary) {
-            return format!("Error: {}", INSTALL_HINT);
+            return Err(ToolError::ServiceUnavailable(INSTALL_HINT.to_string()));
         }
 
         let action = match params.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
-            None => return "Error: 'action' parameter is required".to_string(),
+            None => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'action' parameter is required".to_string(),
+                })
+            }
         };
 
         let result = match action {
@@ -156,12 +165,19 @@ impl Tool for BrowserTool {
             "eval" => self.do_eval(&params).await,
             "wait" => self.do_wait(&params).await,
             "close" => self.do_simple("close").await,
-            other => return format!("Error: unknown action '{}'", other),
+            other => {
+                return Err(ToolError::InvalidArgs {
+                    message: format!("unknown action '{}'", other),
+                })
+            }
         };
 
+        // One boundary: internal helpers carry `Result<String, String>` with
+        // already-stripped messages (e.g. "agent-browser timed out after Ns"
+        // is non-canonical — Execution preserves those bytes).
         match result {
-            Ok(output) => truncate_output(&output, self.max_output_chars),
-            Err(e) => format!("Error: {}", e),
+            Ok(output) => Ok(truncate_output(&output, self.max_output_chars).into()),
+            Err(e) => Err(ToolError::Execution { message: e }),
         }
     }
 }

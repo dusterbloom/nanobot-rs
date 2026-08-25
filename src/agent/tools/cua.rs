@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::Command;
 
-use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext};
+use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult};
 use crate::config::schema::CuaToolConfig;
+use crate::errors::ToolError;
 
 const DEFAULT_BINARY: &str = "cua-driver";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -355,26 +356,31 @@ impl Tool for CuaTool {
                     "description": "JSON arguments for that tool, per its input schema"
                 }
             },
-            "required": ["tool"]
+             "required": ["tool"]
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolContext::new(
-            None,
-            event_tx,
-            tokio_util::sync::CancellationToken::new(),
-            String::new(),
-        );
-        self.execute_with_context(params, &ctx).await
-    }
-
-    async fn execute_with_context(
+    async fn execute_typed(
         &self,
         params: HashMap<String, Value>,
         ctx: &ToolContext,
-    ) -> String {
+    ) -> ToolResult {
+        let out = self.run(params, ctx).await;
+        // One boundary: driver-protocol strings split the legacy error
+        // channel here (python_kernel pattern). Nothing downstream consumes
+        // per-kind telemetry for these, so Execution preserves bytes.
+        match out.strip_prefix("Error:").map(str::trim) {
+            Some(err) => Err(ToolError::Execution {
+                message: err.to_string(),
+            }),
+            None => Ok(out.into()),
+        }
+    }
+}
+
+impl CuaTool {
+    /// Legacy String body, called only by [`CuaTool::execute_typed`].
+    async fn run(&self, params: HashMap<String, Value>, ctx: &ToolContext) -> String {
         // Honor cooperative cancellation before doing any driver work.
         if ctx.cancellation_token().is_cancelled() {
             return "Error: cua-driver call cancelled".to_string();
