@@ -76,11 +76,15 @@ impl Tool for TimedTool {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]})
     }
-    async fn execute(&self, _params: HashMap<String, Value>) -> String {
+    async fn execute(
+        &self,
+        _params: HashMap<String, Value>,
+        _ctx: &crate::agent::tools::base::ToolContext,
+    ) -> crate::agent::tools::base::ToolResult {
         if self.sleep_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
         }
-        format!("{} result", self.name)
+        Ok(format!("{} result", self.name).into())
     }
 }
 
@@ -170,9 +174,13 @@ impl Tool for CountingTool {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]})
     }
-    async fn execute(&self, _params: HashMap<String, Value>) -> String {
+    async fn execute(
+        &self,
+        _params: HashMap<String, Value>,
+        _ctx: &crate::agent::tools::base::ToolContext,
+    ) -> crate::agent::tools::base::ToolResult {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        "tool result data".to_string()
+        Ok("tool result data".into())
     }
 }
 
@@ -918,8 +926,12 @@ impl Tool for VerboseTool {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]})
     }
-    async fn execute(&self, _params: HashMap<String, Value>) -> String {
-        "x".repeat(self.output_len)
+    async fn execute(
+        &self,
+        _params: HashMap<String, Value>,
+        _ctx: &crate::agent::tools::base::ToolContext,
+    ) -> crate::agent::tools::base::ToolResult {
+        Ok("x".repeat(self.output_len).into())
     }
 }
 
@@ -1144,8 +1156,12 @@ impl Tool for DangerousTool {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]})
     }
-    async fn execute(&self, _params: HashMap<String, Value>) -> String {
-        "DANGER: this should not execute".to_string()
+    async fn execute(
+        &self,
+        _params: HashMap<String, Value>,
+        _ctx: &crate::agent::tools::base::ToolContext,
+    ) -> crate::agent::tools::base::ToolResult {
+        Ok("DANGER: this should not execute".into())
     }
 }
 

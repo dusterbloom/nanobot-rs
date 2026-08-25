@@ -345,8 +345,8 @@ pub enum ToolError {
     ServiceUnavailable(String),
 
     /// Everything else. The registry converts panics here; unmigrated tools
-    /// funnel legacy `"Error: ..."` strings through [`Self::from_legacy`] —
-    /// the *only* string-to-error path left in the codebase.
+    /// funnel legacy `"Error: ..."` strings through the host bridge's
+    /// legacy classifier — the *only* string-to-error path left.
     #[error("Execution failed: {message}")]
     Execution { message: String },
 }
@@ -373,8 +373,8 @@ impl ToolError {
     /// tests keep passing unmodified.
     ///
     /// The message-carrying variants render the payload verbatim because
-    /// [`Self::from_legacy`] passes the *full* original message through —
-    /// `render()` reproduces the pre-migration byte string exactly.
+    /// the host bridge's legacy classifier passes the *full* original
+    /// message through — `render()` reproduces the pre-migration bytes.
     pub fn render(&self) -> String {
         match self {
             Self::MissingArg { param, example } => {
@@ -392,29 +392,6 @@ impl ToolError {
             | Self::ServiceUnavailable(message) => format!("Error: {message}"),
             Self::Timeout(secs) => format!("Error: Command timed out after {secs}s"),
             Self::RateLimited => format!("Error: Rate limited"),
-        }
-    }
-
-    /// The single legacy bridge. Called only by the migration adapter
-    /// (default `Tool::execute_typed`). Maps the exact strings
-    /// `classify_tool_error` matched today, so retry behavior is preserved.
-    #[allow(clippy::disallowed_methods)] // legacy bridge — retained, called by HostBridge::call error round-trip
-    pub fn from_legacy(msg: &str) -> Self {
-        if let Some(kind) = classify_tool_error(msg) {
-            return match kind {
-                ToolErrorKind::Timeout(s) => Self::Timeout(s),
-                ToolErrorKind::PermissionDenied(m) => Self::PermissionDenied(m),
-                ToolErrorKind::NotFound(m) => Self::NotFound(m),
-                ToolErrorKind::InvalidArgs(m) => Self::InvalidArgs { message: m },
-                ToolErrorKind::ToolNotFound(m) => Self::ToolNotFound { name: m },
-                ToolErrorKind::NetworkError(m) => Self::Network(m),
-                ToolErrorKind::RateLimited => Self::RateLimited,
-                ToolErrorKind::ServiceUnavailable(m) => Self::ServiceUnavailable(m),
-                ToolErrorKind::MissingArg { param, example } => Self::MissingArg { param, example },
-            };
-        }
-        Self::Execution {
-            message: msg.to_string(),
         }
     }
 }
@@ -787,62 +764,6 @@ mod tests {
     }
 
     // -- ToolError (typed protocol) --
-
-    #[test]
-    fn test_tool_error_render_preserves_legacy_bytes() {
-        // Unclassified legacy strings funnel through Execution and must come
-        // out byte-identical ("'task' parameter is required", "Spawn callback
-        // not configured" etc. — the 297-site contract).
-        let e = ToolError::from_legacy("'task' parameter is required");
-        assert_eq!(e.render(), "Error: 'task' parameter is required");
-
-        let e = ToolError::from_legacy("Spawn callback not configured");
-        assert_eq!(e.render(), "Error: Spawn callback not configured");
-
-        // Classified payload-carrying variants reproduce the full original
-        // message (the payload IS the stripped message).
-        let e = ToolError::from_legacy("File not found: /tmp/missing");
-        assert_eq!(e.render(), "Error: File not found: /tmp/missing");
-        assert!(matches!(e, ToolError::NotFound(_)));
-
-        let e = ToolError::from_legacy("Permission denied: /etc/shadow");
-        assert_eq!(e.render(), "Error: Permission denied: /etc/shadow");
-
-        let e = ToolError::from_legacy("Invalid path argument: cannot be empty");
-        assert_eq!(e.render(), "Error: Invalid path argument: cannot be empty");
-    }
-
-    #[test]
-    fn test_tool_error_from_legacy_classification() {
-        assert!(matches!(
-            ToolError::from_legacy("Command timed out after 30 seconds"),
-            ToolError::Timeout(30)
-        ));
-        assert!(matches!(
-            ToolError::from_legacy("connection refused by remote host"),
-            ToolError::Network(_)
-        ));
-        assert!(matches!(
-            ToolError::from_legacy("429 rate limit exceeded"),
-            ToolError::RateLimited
-        ));
-        assert!(matches!(
-            ToolError::from_legacy("service unavailable, try again later"),
-            ToolError::ServiceUnavailable(_)
-        ));
-        assert!(matches!(
-            ToolError::from_legacy("Unknown tool: magic_wand"),
-            ToolError::ToolNotFound { .. }
-        ));
-        assert!(matches!(
-            ToolError::from_legacy("No such file or directory: /x"),
-            ToolError::NotFound(_)
-        ));
-        assert!(matches!(
-            ToolError::from_legacy("unusual failure"),
-            ToolError::Execution { .. }
-        ));
-    }
 
     #[test]
     fn test_tool_error_structural_classification() {

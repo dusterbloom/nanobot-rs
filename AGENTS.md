@@ -73,9 +73,11 @@ the correctness and speed regression tracks.
 ## Code Style
 
 Rust 2021. `snake_case` fns, `PascalCase` types, `SCREAMING_SNAKE` consts.
-`serde` `camelCase` for JSON config. `anyhow::Result` at app layer; tools return
-`String` (prefix errors with `"Error: "`). Async via `async_trait` + `tokio`.
-Shared state via `Arc<Mutex<_>>`.
+`serde` `camelCase` for JSON config. `anyhow::Result` at app layer; tools
+implement `Tool::execute(params, &ToolContext) -> ToolResult` with typed
+`ToolError` variants at failure sites (`Err(e).render()` is the
+`"Error: ..."` wire string — byte-stable with the legacy convention). Async
+via `async_trait` + `tokio`. Shared state via `Arc<Mutex<_>>`.
 
 ```rust
 use std::collections::HashMap;

@@ -13,10 +13,10 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use super::base::{require_param, PermissionLevel, Tool, ToolContext, ToolResult};
-use crate::errors::ToolError;
 use crate::cron::executor::initial_next_run;
 use crate::cron::service::CronService;
 use crate::cron::types::CronSchedule;
+use crate::errors::ToolError;
 
 /// Tool to schedule reminders and recurring tasks.
 pub struct CronScheduleTool {
@@ -205,7 +205,7 @@ impl Tool for CronScheduleTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -255,13 +255,17 @@ mod tests {
         let (tool, service, _tmp) = temp_tool();
         tool.set_context("telegram", "12345").await;
 
-        let result = tool
-            .execute(params(&[
-                ("action", json!("add")),
-                ("message", json!("water break")),
-                ("every_seconds", json!(3600)),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[
+                    ("action", json!("add")),
+                    ("message", json!("water break")),
+                    ("every_seconds", json!(3600)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         let jobs = service.list_jobs(true);
         assert_eq!(jobs.len(), 1, "tool add must persist a real job");
@@ -294,13 +298,17 @@ mod tests {
         let (tool, service, _tmp) = temp_tool();
         tool.set_context("whatsapp", "+491234").await;
 
-        let result = tool
-            .execute(params(&[
-                ("action", json!("add")),
-                ("message", json!("morning digest")),
-                ("cron_expr", json!("0 9 * * *")),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[
+                    ("action", json!("add")),
+                    ("message", json!("morning digest")),
+                    ("cron_expr", json!("0 9 * * *")),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         let jobs = service.list_jobs(true);
         assert_eq!(jobs.len(), 1);
@@ -315,13 +323,17 @@ mod tests {
         let (tool, service, _tmp) = temp_tool();
         tool.set_context("telegram", "1").await;
 
-        let result = tool
-            .execute(params(&[
-                ("action", json!("add")),
-                ("message", json!("bad")),
-                ("cron_expr", json!("not a cron")),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[
+                    ("action", json!("add")),
+                    ("message", json!("bad")),
+                    ("cron_expr", json!("not a cron")),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(result.starts_with("Error"), "got: {result}");
         assert!(
@@ -347,23 +359,25 @@ mod tests {
             false,
         );
 
-        let result = tool
-            .execute(params(&[
-                ("action", json!("remove")),
-                ("job_id", json!(job.id)),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("remove")), ("job_id", json!(job.id))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(result.contains("Removed"), "got: {result}");
         assert!(service.list_jobs(true).is_empty());
 
         // Unknown id: clear feedback, no panic.
-        let missing = tool
-            .execute(params(&[
-                ("action", json!("remove")),
-                ("job_id", json!("nope1234")),
-            ]))
-            .await;
+        let missing = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("remove")), ("job_id", json!("nope1234"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(missing.contains("not found"), "got: {missing}");
     }
 }

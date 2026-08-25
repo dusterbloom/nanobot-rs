@@ -54,11 +54,7 @@ impl Tool for ReadSkillTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         // No name (or empty, or the legacy "__list__" sentinel) → list all
         // skills. Same discoverability contract as the `tool` proxy: call with
         // no args to discover, call with a name to load.
@@ -125,7 +121,10 @@ mod tests {
         let (_tmp, tool) = make_workspace_with_skill("coding", "# Coding Skill\nWrite good code.");
         let mut params = HashMap::new();
         params.insert("name".to_string(), json!("coding"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("Coding Skill"));
         assert!(result.contains("Write good code."));
     }
@@ -135,7 +134,10 @@ mod tests {
         let (_tmp, tool) = make_workspace_with_skill("coding", "body");
         let mut params = HashMap::new();
         params.insert("name".to_string(), json!("nonexistent"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error:"));
         assert!(result.contains("coding")); // lists available skills
     }
@@ -148,7 +150,10 @@ mod tests {
         // "__list__" sentinel.
         let (_tmp, tool) = make_workspace_with_skill("test", "body");
         let params = HashMap::new();
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("<skills>"),
             "missing name should list skills, got: {result}"
@@ -175,7 +180,10 @@ mod tests {
         );
         let mut params = HashMap::new();
         params.insert("name".to_string(), json!("__list__"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         // Should return the XML summary format.
         assert!(
             result.starts_with("<skills>"),
@@ -198,7 +206,10 @@ mod tests {
         let tool = ReadSkillTool::new(tmp.path());
         let mut params = HashMap::new();
         params.insert("name".to_string(), json!("__list__"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "No skills are installed.");
     }
 }

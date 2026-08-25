@@ -115,11 +115,7 @@ impl Tool for TodoTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
         let mut items = self.load().await;
 
@@ -200,7 +196,13 @@ mod tests {
     async fn test_list_on_empty_is_friendly() {
         let tmp = TempDir::new().unwrap();
         let tool = tool_in(&tmp);
-        let out = tool.execute(params(&[("action", json!("list"))])).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("list"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert_eq!(out, "(no todos)");
     }
 
@@ -208,14 +210,21 @@ mod tests {
     async fn test_add_then_list_shows_pending() {
         let tmp = TempDir::new().unwrap();
         let tool = tool_in(&tmp);
-        let added = tool
-            .execute(params(&[
-                ("action", json!("add")),
-                ("text", json!("fix bug")),
-            ]))
-            .await;
+        let added = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("add")), ("text", json!("fix bug"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(added.starts_with("Added todo #1"));
-        let listed = tool.execute(params(&[("action", json!("list"))])).await;
+        let listed = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("list"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(listed.contains("[ ] 1: fix bug"), "got: {listed}");
     }
 
@@ -223,13 +232,28 @@ mod tests {
     async fn test_complete_marks_done() {
         let tmp = TempDir::new().unwrap();
         let tool = tool_in(&tmp);
-        tool.execute(params(&[("action", json!("add")), ("text", json!("t1"))]))
-            .await;
-        let done = tool
-            .execute(params(&[("action", json!("complete")), ("id", json!(1))]))
-            .await;
+        crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("add")), ("text", json!("t1"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        let done = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("complete")), ("id", json!(1))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(done.starts_with("Completed todo #1"));
-        let listed = tool.execute(params(&[("action", json!("list"))])).await;
+        let listed = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("list"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(listed.contains("[x] 1: t1"), "got: {listed}");
     }
 
@@ -238,12 +262,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = tool_in(&tmp);
         for n in 1..=3 {
-            let out = tool
-                .execute(params(&[
-                    ("action", json!("add")),
-                    ("text", json!(format!("task {n}"))),
-                ]))
-                .await;
+            let out = crate::agent::tools::base::render_result(
+                tool.execute(
+                    params(&[
+                        ("action", json!("add")),
+                        ("text", json!(format!("task {n}"))),
+                    ]),
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+            );
             assert!(out.contains(&format!("#{n}")), "got: {out}");
         }
     }
@@ -252,15 +280,22 @@ mod tests {
     async fn test_state_isolated_between_workspaces() {
         let a = TempDir::new().unwrap();
         let b = TempDir::new().unwrap();
-        tool_in(&a)
-            .execute(params(&[
-                ("action", json!("add")),
-                ("text", json!("only-a")),
-            ]))
-            .await;
-        let listed_b = tool_in(&b)
-            .execute(params(&[("action", json!("list"))]))
-            .await;
+        crate::agent::tools::base::render_result(
+            tool_in(&a)
+                .execute(
+                    params(&[("action", json!("add")), ("text", json!("only-a"))]),
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+        );
+        let listed_b = crate::agent::tools::base::render_result(
+            tool_in(&b)
+                .execute(
+                    params(&[("action", json!("list"))]),
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+        );
         assert_eq!(listed_b, "(no todos)");
     }
 
@@ -268,15 +303,22 @@ mod tests {
     async fn test_persists_across_tool_instances() {
         // New tool instance against the same workspace must see the earlier state.
         let tmp = TempDir::new().unwrap();
-        tool_in(&tmp)
-            .execute(params(&[
-                ("action", json!("add")),
-                ("text", json!("persisted")),
-            ]))
-            .await;
-        let listed = tool_in(&tmp)
-            .execute(params(&[("action", json!("list"))]))
-            .await;
+        crate::agent::tools::base::render_result(
+            tool_in(&tmp)
+                .execute(
+                    params(&[("action", json!("add")), ("text", json!("persisted"))]),
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+        );
+        let listed = crate::agent::tools::base::render_result(
+            tool_in(&tmp)
+                .execute(
+                    params(&[("action", json!("list"))]),
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+        );
         assert!(listed.contains("persisted"), "got: {listed}");
     }
 
@@ -284,9 +326,13 @@ mod tests {
     async fn test_complete_with_bad_id_errors() {
         let tmp = TempDir::new().unwrap();
         let tool = tool_in(&tmp);
-        let out = tool
-            .execute(params(&[("action", json!("complete")), ("id", json!(42))]))
-            .await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("complete")), ("id", json!(42))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(out.starts_with("Error:"), "got: {out}");
     }
 
@@ -294,10 +340,27 @@ mod tests {
     async fn test_clear_wipes_all() {
         let tmp = TempDir::new().unwrap();
         let tool = tool_in(&tmp);
-        tool.execute(params(&[("action", json!("add")), ("text", json!("gone"))]))
-            .await;
-        tool.execute(params(&[("action", json!("clear"))])).await;
-        let listed = tool.execute(params(&[("action", json!("list"))])).await;
+        crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("add")), ("text", json!("gone"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("clear"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        let listed = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(&[("action", json!("list"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert_eq!(listed, "(no todos)");
     }
 

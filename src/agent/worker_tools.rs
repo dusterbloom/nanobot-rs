@@ -17,7 +17,21 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::agent::tools::base::require_str;
+/// Worker-lane param extraction (String protocol — the tool-runner lane,
+/// not the Tool trait; the last require_str! consumer after the trait flip).
+macro_rules! require_str {
+    ($params:expr, $key:literal) => {
+        require_str!($params, $key, "")
+    };
+    ($params:expr, $key:literal, $suffix:literal) => {
+        match $params.get($key).and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => {
+                return concat!("Error: '", $key, "' parameter is required", $suffix).to_string()
+            }
+        }
+    };
+}
 
 /// Names of async worker tools.
 pub const WORKER_TOOLS: &[&str] = &["verify", "python_eval", "diff_apply", "fmt_convert"];

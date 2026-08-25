@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult};
-use crate::errors::ToolError;
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
+use crate::errors::ToolError;
 
 /// Leave room below the replay ceiling for wrappers while retaining a useful
 /// direct-file page. Crossing the ceiling stashes an otherwise contiguous
@@ -49,11 +49,12 @@ fn require_param<'a>(
     params: &'a HashMap<String, serde_json::Value>,
     key: &str,
 ) -> Result<&'a str, crate::errors::ToolError> {
-    params.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
-        crate::errors::ToolError::InvalidArgs {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| crate::errors::ToolError::InvalidArgs {
             message: format!("'{}' parameter is required", key),
-        }
-    })
+        })
 }
 
 /// Build a `HashMap<String, Value>` from `&str` pairs. Shared test helper used
@@ -146,7 +147,7 @@ impl Tool for ReadFileTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -182,7 +183,7 @@ impl Tool for ReadFileTool {
                 } else {
                     // Legacy quirk preserved: no "Error:" prefix → success channel.
                     Ok(format!("Error reading file: {}", e).into())
-                }
+                };
             }
         };
 
@@ -196,9 +197,7 @@ impl Tool for ReadFileTool {
         let content_sha256 = sha256_hex(&bytes);
         let total = content.lines().count();
         if total == 0 {
-            return Ok(
-                format!("# {} (0 lines) sha256={}\n", display_path, content_sha256).into(),
-            );
+            return Ok(format!("# {} (0 lines) sha256={}\n", display_path, content_sha256).into());
         }
 
         // Explicit range → render it. Bare read → first DEFAULT_READ_LINES,
@@ -377,7 +376,7 @@ impl Tool for EditFileTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -484,12 +483,11 @@ impl Tool for EditFileTool {
         }
 
         if !content.contains(old_text) {
-            return Err(ToolError::NotFound(diagnose_missing_old_text(
-                &content,
-                old_text,
-            )
-            .trim_start_matches("Error: ")
-            .to_string()));
+            return Err(ToolError::NotFound(
+                diagnose_missing_old_text(&content, old_text)
+                    .trim_start_matches("Error: ")
+                    .to_string(),
+            ));
         }
 
         // Count occurrences.
@@ -556,7 +554,7 @@ impl Tool for ListDirTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -715,7 +713,7 @@ impl Tool for FindFilesTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -933,7 +931,7 @@ impl Tool for SearchFilesTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -1229,7 +1227,7 @@ impl Tool for FileInfoTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -1346,7 +1344,7 @@ impl Tool for WorkspaceDiffTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -1879,17 +1877,27 @@ mod tests {
         let e = idle_entries();
         assert!(idle_write_allowed(&e, &ws.join("skills/foo/SKILL.md"), ws));
         assert!(idle_write_allowed(&e, &ws.join("MEMORY.md"), ws));
-        assert!(idle_write_allowed(&e, &Path::new("/etc/nanobot/allow/x.toml"), ws));
+        assert!(idle_write_allowed(
+            &e,
+            &Path::new("/etc/nanobot/allow/x.toml"),
+            ws
+        ));
         // Denials: outside subtree, exact-file mismatch, foreign absolute.
         // ("skills" the directory itself DOES match "skills/**" —
         // starts_with includes the base — but a directory is not a
         // writable file target, so this is harmless by construction.)
-        assert!(idle_write_allowed(&e, &ws.join("skills"), ws), "base dir matches its own /**");
+        assert!(
+            idle_write_allowed(&e, &ws.join("skills"), ws),
+            "base dir matches its own /**"
+        );
         assert!(!idle_write_allowed(&e, &ws.join("MEMORY.md.bak"), ws));
         assert!(!idle_write_allowed(&e, &ws.join("workspace/other.md"), ws));
         assert!(!idle_write_allowed(&e, &Path::new("/etc/passwd"), ws));
         assert!(!idle_write_allowed(&e, &ws.join("secrets/MEMORY.md"), ws));
-        assert!(!idle_write_allowed(&[], &ws.join("MEMORY.md"), ws), "empty allowlist denies");
+        assert!(
+            !idle_write_allowed(&[], &ws.join("MEMORY.md"), ws),
+            "empty allowlist denies"
+        );
     }
 
     #[tokio::test]
@@ -1898,13 +1906,19 @@ mod tests {
         let ws = crate::utils::helpers::get_workspace_path(None);
         let mut params = HashMap::new();
         // Absolute path outside the allowlist (whatever the workspace is).
-        let outside = ws.parent().unwrap_or(&ws).join("definitely-not-allowed.txt");
+        let outside = ws
+            .parent()
+            .unwrap_or(&ws)
+            .join("definitely-not-allowed.txt");
         params.insert(
             "path".to_string(),
             serde_json::json!(outside.to_string_lossy()),
         );
         params.insert("content".to_string(), serde_json::json!("x"));
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             out.starts_with("Error: idle turns may only write"),
             "denied write returned: {out}"
@@ -2035,7 +2049,10 @@ mod tests {
 
         let tool = ReadFileTool::default();
         let params = make_params(&[("path", file_path.to_str().unwrap())]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         // Bounded-default format: numbered line + header reporting the total.
         // A small file fits in one read → no continuation hint.
         assert!(result.contains("(lines 1-1 of 1)"), "{result}");
@@ -2059,9 +2076,13 @@ mod tests {
         std::fs::write(&file_path, &content).unwrap();
 
         let tool = ReadFileTool::default();
-        let result = tool
-            .execute(make_params(&[("path", file_path.to_str().unwrap())]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[("path", file_path.to_str().unwrap())]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(result.contains("of 1200)"), "header: {}", &result[..80]);
         assert!(
@@ -2100,9 +2121,13 @@ mod tests {
         // cliff: direct source-file pagination is cheaper and clearer than
         // stashing an otherwise complete window.
         let tool = ReadFileTool::new(10_000);
-        let result = tool
-            .execute(make_params(&[("path", file_path.to_str().unwrap())]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[("path", file_path.to_str().unwrap())]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(
             result.len() < crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES,
@@ -2126,9 +2151,13 @@ mod tests {
         std::fs::write(&file_path, &content).unwrap();
 
         let tool = ReadFileTool::new(10_000);
-        let result = tool
-            .execute(make_params(&[("path", file_path.to_str().unwrap())]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[("path", file_path.to_str().unwrap())]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(
             result.len() < crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES,
@@ -2159,7 +2188,10 @@ mod tests {
         let tool = ReadFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("max_lines".to_string(), serde_json::json!(40));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(result.contains("(lines 1-40 of 1500)"), "{result}");
         assert!(result.contains("  40: line 40"), "{result}");
@@ -2185,7 +2217,10 @@ mod tests {
         let tool = ReadFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("lines".to_string(), serde_json::json!("1:"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(result.contains("(lines 1-200 of 200)"));
         assert!(result.contains(" 200: L200"));
@@ -2210,8 +2245,20 @@ mod tests {
         let tool = ReadFileTool::default();
         let p = file_path.to_str().unwrap();
 
-        let bare1 = tool.execute(make_params(&[("path", p)])).await;
-        let bare2 = tool.execute(make_params(&[("path", p)])).await;
+        let bare1 = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[("path", p)]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        let bare2 = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[("path", p)]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert_eq!(
             bare1, bare2,
             "bare read must be byte-identical across calls"
@@ -2222,8 +2269,20 @@ mod tests {
             m.insert("lines".to_string(), serde_json::json!(s));
             m
         };
-        let r1 = tool.execute(ranged("100:200")).await;
-        let r2 = tool.execute(ranged("100:200")).await;
+        let r1 = crate::agent::tools::base::render_result(
+            tool.execute(
+                ranged("100:200"),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        let r2 = crate::agent::tools::base::render_result(
+            tool.execute(
+                ranged("100:200"),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert_eq!(r1, r2, "ranged read must be byte-identical across calls");
     }
 
@@ -2231,7 +2290,10 @@ mod tests {
     async fn test_read_file_missing() {
         let tool = ReadFileTool::default();
         let params = make_params(&[("path", "/tmp/nonexistent_nanobot_test_file_xyz.txt")]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error: File not found"));
     }
 
@@ -2239,7 +2301,10 @@ mod tests {
     async fn test_read_file_missing_param() {
         let tool = ReadFileTool::default();
         let params = HashMap::new();
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("'path' parameter is required"));
     }
 
@@ -2248,7 +2313,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = ReadFileTool::default();
         let params = make_params(&[("path", dir.path().to_str().unwrap())]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error: Not a file"));
     }
 
@@ -2280,7 +2348,10 @@ mod tests {
         let tool = ReadFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("lines".to_string(), serde_json::json!("5:10"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(result.contains("lines 5-10 of 20"));
         assert!(result.contains("line 5"));
@@ -2302,7 +2373,10 @@ mod tests {
         let tool = ReadFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("lines".to_string(), serde_json::json!("3:"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(result.contains("lines 3-5 of 5"));
         assert!(result.contains("line 3"));
@@ -2420,7 +2494,10 @@ mod tests {
             ("old_text", "World"),
             ("new_text", "Rust"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Successfully edited"));
 
         let content = std::fs::read_to_string(&file_path).unwrap();
@@ -2433,13 +2510,18 @@ mod tests {
         let file_path = dir.path().join("no_op.txt");
         std::fs::write(&file_path, "unchanged").unwrap();
 
-        let result = EditFileTool::default()
-            .execute(make_params(&[
-                ("path", file_path.to_str().unwrap()),
-                ("old_text", "unchanged"),
-                ("new_text", "unchanged"),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            EditFileTool::default()
+                .execute(
+                    make_params(&[
+                        ("path", file_path.to_str().unwrap()),
+                        ("old_text", "unchanged"),
+                        ("new_text", "unchanged"),
+                    ]),
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+        );
 
         assert!(result.starts_with("Error:"), "{result}");
         assert!(result.contains("identical"), "{result}");
@@ -2465,7 +2547,10 @@ mod tests {
         let tool = EditFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("patch".to_string(), serde_json::json!(patch));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Successfully patched"), "{result}");
 
         let content = std::fs::read_to_string(&file_path).unwrap();
@@ -2488,7 +2573,10 @@ mod tests {
             "expected_sha256".to_string(),
             serde_json::json!("0".repeat(64)),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Error: File changed before edit"),
             "{result}"
@@ -2514,7 +2602,10 @@ mod tests {
             "expected_sha256".to_string(),
             serde_json::json!("not-a-real-hash"),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Error: invalid expected_sha256"),
             "{result}"
@@ -2536,7 +2627,10 @@ mod tests {
             ("old_text", "nonexistent text"),
             ("new_text", "replacement"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("old_text not found"));
     }
 
@@ -2552,7 +2646,10 @@ mod tests {
             ("old_text", "aaa"),
             ("new_text", "ccc"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         // Must be surfaced as an Error, not a Warning — small models
         // routinely misread "Warning:" as a non-fatal success.
         assert!(
@@ -2578,7 +2675,10 @@ mod tests {
             ("old_text", "foo\nbar"),
             ("new_text", "baz"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Error:"),
             "expected Error prefix, got: {result}"
@@ -2604,7 +2704,10 @@ mod tests {
             ("old_text", "hello\nworld"), // no trailing space
             ("new_text", "bye"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Error:"),
             "expected Error prefix, got: {result}"
@@ -2624,7 +2727,10 @@ mod tests {
             ("old_text", "a"),
             ("new_text", "b"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error: File not found"));
     }
 
@@ -2647,7 +2753,10 @@ mod tests {
 
         let tool = ListDirTool;
         let params = make_params(&[("path", dir.path().to_str().unwrap())]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(result.contains("[file] file_a.txt"));
         assert!(result.contains("[file] file_b.txt"));
@@ -2660,7 +2769,10 @@ mod tests {
 
         let tool = ListDirTool;
         let params = make_params(&[("path", dir.path().to_str().unwrap())]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("is empty"));
     }
 
@@ -2668,7 +2780,10 @@ mod tests {
     async fn test_list_dir_not_found() {
         let tool = ListDirTool;
         let params = make_params(&[("path", "/tmp/nonexistent_nanobot_dir_xyz")]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error: Directory not found"));
     }
 
@@ -2680,7 +2795,10 @@ mod tests {
 
         let tool = ListDirTool;
         let params = make_params(&[("path", file_path.to_str().unwrap())]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error: Not a directory"));
     }
 
@@ -2694,7 +2812,10 @@ mod tests {
     async fn test_list_dir_missing_param() {
         let tool = ListDirTool;
         let params = HashMap::new();
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("'path' parameter is required"));
     }
 
@@ -2714,7 +2835,10 @@ mod tests {
         let mut params =
             make_params(&[("path", dir.path().to_str().unwrap()), ("pattern", "*.rs")]);
         params.insert("max_depth".to_string(), serde_json::json!(3));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(result.contains("src/main.rs"), "{result}");
         assert!(result.contains("src/nested/lib.rs"), "{result}");
@@ -2728,12 +2852,16 @@ mod tests {
         std::fs::write(dir.path().join(".git").join("config"), "").unwrap();
 
         let tool = FindFilesTool;
-        let result = tool
-            .execute(make_params(&[
-                ("path", dir.path().to_str().unwrap()),
-                ("pattern", "config"),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[
+                    ("path", dir.path().to_str().unwrap()),
+                    ("pattern", "config"),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.starts_with("No matches"), "{result}");
     }
 
@@ -2759,7 +2887,10 @@ mod tests {
             ("pattern", "*.rs"),
         ]);
         params.insert("context".to_string(), serde_json::json!(1));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(result.contains("Found 1 matching line"), "{result}");
         assert!(result.contains("src/lib.rs:1- alpha"), "{result}");
@@ -2780,7 +2911,10 @@ mod tests {
         ]);
         params.insert("regex".to_string(), serde_json::json!(true));
         params.insert("limit".to_string(), serde_json::json!(2));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(result.contains("a.txt:1: item 1"), "{result}");
         assert!(result.contains("a.txt:2: item 2"), "{result}");
@@ -2799,9 +2933,13 @@ mod tests {
         std::fs::write(&file_path, "hash me").unwrap();
 
         let tool = FileInfoTool;
-        let result = tool
-            .execute(make_params(&[("path", file_path.to_str().unwrap())]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[("path", file_path.to_str().unwrap())]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(result.contains("Type: file"), "{result}");
         assert!(result.contains("Size: 7 bytes"), "{result}");
@@ -2836,7 +2974,10 @@ mod tests {
             "path".to_string(),
             serde_json::Value::String(bin_path.to_string_lossy().to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("[Binary file:"),
             "Expected binary detection, got: {}",
@@ -2853,7 +2994,10 @@ mod tests {
     async fn test_read_file_not_found_has_hint() {
         let tool = ReadFileTool::default();
         let params = make_params(&[("path", "/tmp/nanobot_hint_test_nonexistent_xyz.txt")]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Hint:"),
             "Expected hint in error: {}",
@@ -2871,7 +3015,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = ReadFileTool::default();
         let params = make_params(&[("path", dir.path().to_str().unwrap())]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Hint:"),
             "Expected hint in error: {}",
@@ -2892,7 +3039,10 @@ mod tests {
             ("old_text", "a"),
             ("new_text", "b"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Hint:"),
             "Expected hint in error: {}",
@@ -2917,7 +3067,10 @@ mod tests {
             ("old_text", "text that does not exist in file"),
             ("new_text", "replacement"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Hint:"),
             "Expected hint in error: {}",
@@ -2934,7 +3087,10 @@ mod tests {
     async fn test_list_dir_not_found_has_hint() {
         let tool = ListDirTool;
         let params = make_params(&[("path", "/tmp/nanobot_hint_test_nonexistent_dir_xyz")]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Hint:"),
             "Expected hint in error: {}",
@@ -2955,7 +3111,10 @@ mod tests {
 
         let tool = ListDirTool;
         let params = make_params(&[("path", file_path.to_str().unwrap())]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Hint:"),
             "Expected hint in error: {}",

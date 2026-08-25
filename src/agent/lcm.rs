@@ -1812,7 +1812,11 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &crate::agent::tools::base::ToolContext,
+    ) -> crate::agent::tools::base::ToolResult {
         // Lenient by design: small models emit arrays, bare strings, ranges, or
         // stray prose. Accept all of them rather than silently returning nothing.
         let msg_ids = match params.get("message_ids") {
@@ -1821,16 +1825,18 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
         };
 
         if msg_ids.is_empty() {
-            return "Error: no valid message IDs provided. lcm_expand only expands LCM \
+            return Err(crate::errors::ToolError::InvalidArgs {
+                message: "no valid message IDs provided. lcm_expand only expands LCM \
                     summary blocks from the CURRENT session, and needs IDs from a \
                     [Summary … (IDs: …)] block as an array, e.g. [5, 6, 7, 8]. To read a \
                     PAST session's full transcript, use session_search(mode=\"session\", \
                     session=KEY) with that session's key (search first to get the key)."
-                .to_string();
+                    .to_string(),
+            });
         }
 
         let engine = self.engine.lock().await;
-        engine.format_expanded(&msg_ids)
+        Ok(engine.format_expanded(&msg_ids).into())
     }
 }
 
@@ -3306,7 +3312,10 @@ mod tests {
         // Valid IDs.
         let mut params = HashMap::new();
         params.insert("message_ids".to_string(), json!("1,2,3"));
-        let output = tool.execute(params).await;
+        let output = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(output.contains("[msg 1] user: What is Rust?"));
         assert!(output.contains("[msg 2] assistant: Rust is a systems programming language."));
         assert!(output.contains("[msg 3] user: Tell me about ownership."));
@@ -3314,26 +3323,38 @@ mod tests {
         // Integer array (the shape small models actually emit) works too.
         let mut params = HashMap::new();
         params.insert("message_ids".to_string(), json!([1, 2, 3]));
-        let output = tool.execute(params).await;
+        let output = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(output.contains("[msg 1] user: What is Rust?"));
         assert!(output.contains("[msg 3] user: Tell me about ownership."));
 
         // A range string expands inclusively.
         let mut params = HashMap::new();
         params.insert("message_ids".to_string(), json!("1-3"));
-        let output = tool.execute(params).await;
+        let output = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(output.contains("[msg 2]"));
 
         // Invalid IDs.
         let mut params = HashMap::new();
         params.insert("message_ids".to_string(), json!("99,100"));
-        let output = tool.execute(params).await;
+        let output = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(output.contains("No messages found"));
 
         // Empty input.
         let mut params = HashMap::new();
         params.insert("message_ids".to_string(), json!(""));
-        let output = tool.execute(params).await;
+        let output = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(output.contains("Error: no valid message IDs"));
     }
 

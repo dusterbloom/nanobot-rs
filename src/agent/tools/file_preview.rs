@@ -53,11 +53,7 @@ impl Tool for FilePreviewTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) if !p.trim().is_empty() => p,
             _ => {
@@ -262,7 +258,11 @@ mod tests {
         .unwrap();
         let mut params = HashMap::new();
         params.insert("path".to_string(), json!(path.display().to_string()));
-        let out = FilePreviewTool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            FilePreviewTool
+                .execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(out.contains("Language: rust"), "{out}");
         assert!(out.contains("Lines: 5"), "{out}");
         assert!(out.contains("pub struct Thing"), "{out}");

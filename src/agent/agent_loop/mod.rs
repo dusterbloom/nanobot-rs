@@ -217,7 +217,10 @@ impl AgentLoop {
     /// Wire idle-window agency (gateway only, before `run()`). The returned
     /// tracker Arc is the same one the idle timer task polls; `run()` notes
     /// real inbound activity into it.
-    pub fn set_idle_runtime(&mut self, runtime: crate::agent::idle::IdleRuntime) -> Arc<crate::agent::idle::IdleTracker> {
+    pub fn set_idle_runtime(
+        &mut self,
+        runtime: crate::agent::idle::IdleRuntime,
+    ) -> Arc<crate::agent::idle::IdleTracker> {
         // SAFETY: we hold &mut self so no concurrent access exists yet.
         let shared = Arc::get_mut(&mut self.shared)
             .expect("set_idle_runtime called after shared Arc was cloned");
@@ -284,8 +287,7 @@ impl AgentLoop {
             let msg = if let Some(msg) = pending_msg.take() {
                 msg
             } else {
-                match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv())
-                    .await
+                match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv()).await
                 {
                     Ok(Some(msg)) => msg,
                     Ok(None) => {
@@ -435,18 +437,17 @@ impl AgentLoop {
                 // lives in channels/telegram.rs::spawn_stream_editor so the hot path
                 // stays channel-agnostic. Idle turns skip it: no typing indicators
                 // or placeholder edits for self-directed turns (quiet by default).
-                let stream_tx = if msg.channel == "telegram"
-                    && !crate::agent::idle::is_idle_message(&msg)
-                {
-                    let bot_token = msg
-                        .metadata
-                        .get("bot_token")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    crate::channels::telegram::spawn_stream_editor(bot_token, &msg.chat_id)
-                } else {
-                    None
-                };
+                let stream_tx =
+                    if msg.channel == "telegram" && !crate::agent::idle::is_idle_message(&msg) {
+                        let bot_token = msg
+                            .metadata
+                            .get("bot_token")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        crate::channels::telegram::spawn_stream_editor(bot_token, &msg.chat_id)
+                    } else {
+                        None
+                    };
                 let stream_is_telegram = stream_tx.is_some();
 
                 let response = shared

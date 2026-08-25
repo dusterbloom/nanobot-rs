@@ -1417,9 +1417,10 @@ fn cua_screenshot_candidate(
     if tool_name != "cua" || !ok || !vision {
         return None;
     }
-    let path_str = data.lines().rev().find_map(|line| {
-        line.strip_prefix("Screenshot saved: ").map(str::to_string)
-    })?;
+    let path_str = data
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("Screenshot saved: ").map(str::to_string))?;
     let path = std::path::PathBuf::from(&path_str);
     // Defense in depth: only accept paths under <workspace>/cua/. Also reject
     // any `..` component: `Path::starts_with` compares components without
@@ -1447,7 +1448,10 @@ fn cua_screenshot_candidate(
 /// never lands in the session DB and never reloads into later turns. Every
 /// skip path is silent: the tool's text result already told the model the
 /// path.
-async fn append_cua_screenshot_turn(messages: &mut Vec<serde_json::Value>, path: std::path::PathBuf) {
+async fn append_cua_screenshot_turn(
+    messages: &mut Vec<serde_json::Value>,
+    path: std::path::PathBuf,
+) {
     const MAX_EMBED_BYTES: usize = 10 * 1024 * 1024;
     let path_str = path.to_string_lossy().to_string();
     // Size gate before read: never fully buffer an oversized file. `try_from`
@@ -1943,7 +1947,11 @@ mod tests {
             self.concurrency
         }
 
-        async fn execute(&self, _params: HashMap<String, Value>) -> String {
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+            _ctx: &crate::agent::tools::base::ToolContext,
+        ) -> crate::agent::tools::base::ToolResult {
             self.state.started.fetch_add(1, Ordering::SeqCst);
             let active = self.state.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.state.peak.fetch_max(active, Ordering::SeqCst);
@@ -1954,9 +1962,11 @@ mod tests {
             }
             self.state.active.fetch_sub(1, Ordering::SeqCst);
             if self.fail {
-                "Error: probe failure".to_string()
+                Err(crate::errors::ToolError::Execution {
+                    message: "probe failure".to_string(),
+                })
             } else {
-                format!("{} complete", self.name)
+                Ok(format!("{} complete", self.name).into())
             }
         }
     }
@@ -3251,7 +3261,9 @@ mod tests {
     async fn test_append_cua_screenshot_turn_embeds_image() {
         let dir = tempfile::tempdir().unwrap();
         let shot = dir.path().join("cua-tc_1.png");
-        let png = base64::engine::general_purpose::STANDARD.decode(PNG_B64).unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(PNG_B64)
+            .unwrap();
         std::fs::write(&shot, &png).unwrap();
 
         let mut messages: Vec<serde_json::Value> = Vec::new();
@@ -3261,12 +3273,17 @@ mod tests {
         assert_eq!(last["role"], "user");
         let content = last["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
-        assert!(content[0]["text"].as_str().unwrap().contains("cua screenshot"));
+        assert!(content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cua screenshot"));
         assert_eq!(content[1]["type"], "image_url");
         let url = content[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"), "got: {url}");
         let b64 = url.trim_start_matches("data:image/png;base64,");
-        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
         assert_eq!(decoded, png);
         // The turn must be `_synthetic` (and NOT `_cache_replay`) so the
         // persist machinery keeps the base64 image in-memory only — never in
@@ -3279,7 +3296,11 @@ mod tests {
     #[tokio::test]
     async fn test_append_cua_screenshot_turn_missing_file() {
         let mut messages: Vec<serde_json::Value> = Vec::new();
-        append_cua_screenshot_turn(&mut messages, std::path::PathBuf::from("/nonexistent/x.png")).await;
+        append_cua_screenshot_turn(
+            &mut messages,
+            std::path::PathBuf::from("/nonexistent/x.png"),
+        )
+        .await;
         assert!(messages.is_empty());
     }
 

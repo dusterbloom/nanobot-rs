@@ -2612,7 +2612,10 @@ mod tests {
         assert!(parsed.idle.enabled);
         assert_eq!(parsed.idle.after_secs, 60);
         assert_eq!(parsed.idle.session_key.as_deref(), Some("telegram:42"));
-        assert_eq!(parsed.idle.max_turns_per_hour, 4, "unspecified keep defaults");
+        assert_eq!(
+            parsed.idle.max_turns_per_hour, 4,
+            "unspecified keep defaults"
+        );
         assert_eq!(parsed.idle.write_paths.len(), 2);
 
         // Partial old config with no idle block still parses to defaults.

@@ -101,7 +101,10 @@ fn write_proposals(workspace: &Path, output: &DreamOutput) -> usize {
         return 0;
     }
     let path = workspace.join("DREAM_PROPOSALS.md");
-    let mut entry = format!("\n## Dream {} (Local)\n\n", Local::now().format("%Y-%m-%d %H:%M"));
+    let mut entry = format!(
+        "\n## Dream {} (Local)\n\n",
+        Local::now().format("%Y-%m-%d %H:%M")
+    );
     for candidate in &output.skill_candidates {
         entry.push_str(&format!("- Skill proposal: {candidate}\n"));
     }
@@ -224,9 +227,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = MemoryStore::new(tmp.path());
         store.write_long_term("- User prefers dark mode\n");
-        assert_eq!(store.append_long_term_facts(&["USER PREFERS DARK MODE".into()]), 0);
+        assert_eq!(
+            store.append_long_term_facts(&["USER PREFERS DARK MODE".into()]),
+            0
+        );
         assert_eq!(store.append_long_term_facts(&["Likes Rust".into()]), 1);
-        assert_eq!(store.append_long_term_facts(&["Likes Rust".into()]), 0, "idempotent");
+        assert_eq!(
+            store.append_long_term_facts(&["Likes Rust".into()]),
+            0,
+            "idempotent"
+        );
         let content = store.read_long_term();
         assert!(content.contains("- User prefers dark mode"));
         assert!(content.contains("- Likes Rust"));
@@ -241,9 +251,14 @@ mod tests {
         let provider: Arc<dyn LLMProvider> = Arc::new(DreamMockLLM {
             body: "{\"facts\":[\"already known\",\"fresh fact\"],\"skill_candidates\":[\"morning-brief\"],\"flags\":[\"searxng flaky\"]}".to_string(),
         });
-        let report = run_dream(&provider, "dream-mock", tmp.path(), &["**Session: x**\nstuff".to_string()])
-            .await
-            .unwrap();
+        let report = run_dream(
+            &provider,
+            "dream-mock",
+            tmp.path(),
+            &["**Session: x**\nstuff".to_string()],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.appended_facts, 1, "duplicate fact skipped");
         assert_eq!(report.proposals_written, 2);

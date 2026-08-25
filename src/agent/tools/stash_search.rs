@@ -389,11 +389,7 @@ impl Tool for SearchToolResultTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let id = match params.get("tool_call_id").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => {
@@ -502,7 +498,10 @@ mod tests {
             ("tool_call_id".to_string(), json!("call_a")),
             ("query".to_string(), json!("error")),
         ]);
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(tool.name(), "inspect_tool_result");
         assert!(out.contains("2:error here"));
         assert!(out.contains("4:error again"));
@@ -520,7 +519,10 @@ mod tests {
             ("query".to_string(), json!("x")),
             ("max_results".to_string(), json!(3)),
         ]);
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         // 3 shown + the "[3 matches shown, 20 total]" footer.
         assert!(out.contains("[3 matches shown, 20 total"));
     }
@@ -535,7 +537,10 @@ mod tests {
             ("tool_call_id".to_string(), json!("call_c")),
             ("query".to_string(), json!("zzz")),
         ]);
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(out.contains("No matching lines"));
     }
 
@@ -547,7 +552,10 @@ mod tests {
             ("tool_call_id".to_string(), json!("ghost")),
             ("query".to_string(), json!("x")),
         ]);
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(out.contains("No stored output"));
     }
 
@@ -564,7 +572,10 @@ mod tests {
             ("start_line".to_string(), json!(10)),
             ("end_line".to_string(), json!(12)),
         ]);
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(out.contains("10:data"));
         assert!(out.contains("12:data"));
         assert!(!out.contains("13:data"));
@@ -577,23 +588,31 @@ mod tests {
         seed(&db_path, &sid, "call_page", &body.join("\n")).await;
 
         let tool = SearchToolResultTool::with_db(db_path, sid);
-        let first_page = tool
-            .execute(HashMap::from([
-                ("tool_call_id".to_string(), json!("call_page")),
-                ("start_line".to_string(), json!(10)),
-            ]))
-            .await;
+        let first_page = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("call_page")),
+                    ("start_line".to_string(), json!(10)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             first_page.starts_with("[source=call_page lines 10-60/100 next=61]"),
             "inspection must tell the model how to request the next page: {first_page}"
         );
 
-        let last_page = tool
-            .execute(HashMap::from([
-                ("tool_call_id".to_string(), json!("call_page")),
-                ("start_line".to_string(), json!(90)),
-            ]))
-            .await;
+        let last_page = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("call_page")),
+                    ("start_line".to_string(), json!(90)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             last_page.starts_with("[source=call_page lines 90-100/100 end]"),
             "inspection must tell the model that paging is complete: {last_page}"
@@ -606,12 +625,16 @@ mod tests {
         seed(&db_path, &sid, "artifact_read_7", "alpha\nbeta\ngamma").await;
 
         let tool = SearchToolResultTool::with_db(db_path, sid);
-        let out = tool
-            .execute(HashMap::from([
-                ("tool_call_id".to_string(), json!("artifact_read_7")),
-                ("start_line".to_string(), json!(2)),
-            ]))
-            .await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("artifact_read_7")),
+                    ("start_line".to_string(), json!(2)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(
             out.starts_with("[source=artifact_read_7 "),
@@ -629,13 +652,17 @@ mod tests {
         seed(&db_path, &sid, "wide_artifact", &body).await;
 
         let tool = SearchToolResultTool::with_db(db_path, sid);
-        let out = tool
-            .execute(HashMap::from([
-                ("tool_call_id".to_string(), json!("wide_artifact")),
-                ("start_line".to_string(), json!(1)),
-                ("end_line".to_string(), json!(100)),
-            ]))
-            .await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("wide_artifact")),
+                    ("start_line".to_string(), json!(1)),
+                    ("end_line".to_string(), json!(100)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(out.chars().count() <= MAX_OUTPUT_CHARS);
         let next_start = out
@@ -664,12 +691,13 @@ mod tests {
         seed(&db_path, &sid, "wide_single_line", &body).await;
 
         let tool = SearchToolResultTool::with_db(db_path, sid);
-        let first = tool
-            .execute(HashMap::from([(
-                "tool_call_id".to_string(),
-                json!("wide_single_line"),
-            )]))
-            .await;
+        let first = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([("tool_call_id".to_string(), json!("wide_single_line"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(
             first.starts_with("[source=wide_single_line chars 0.."),
@@ -683,12 +711,16 @@ mod tests {
             .and_then(|n| n.parse::<usize>().ok())
             .expect("first character page must expose a continuation offset");
 
-        let second = tool
-            .execute(HashMap::from([
-                ("tool_call_id".to_string(), json!("wide_single_line")),
-                ("start_char".to_string(), json!(next_char)),
-            ]))
-            .await;
+        let second = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("wide_single_line")),
+                    ("start_char".to_string(), json!(next_char)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(second.contains("TAIL"), "tail must be reachable: {second}");
         assert!(
@@ -705,12 +737,16 @@ mod tests {
         seed(&db_path, &sid, "wide_query", &body).await;
 
         let tool = SearchToolResultTool::with_db(db_path, sid);
-        let out = tool
-            .execute(HashMap::from([
-                ("tool_call_id".to_string(), json!("wide_query")),
-                ("query".to_string(), json!("needle")),
-            ]))
-            .await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("wide_query")),
+                    ("query".to_string(), json!("needle")),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(
             out.starts_with("[source=wide_query chars 4200.."),
@@ -733,12 +769,16 @@ mod tests {
         seed(&db_path, &sid, "mixed_query", &body).await;
 
         let tool = SearchToolResultTool::with_db(db_path, sid);
-        let out = tool
-            .execute(HashMap::from([
-                ("tool_call_id".to_string(), json!("mixed_query")),
-                ("query".to_string(), json!("tail_only_match")),
-            ]))
-            .await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("mixed_query")),
+                    ("query".to_string(), json!("tail_only_match")),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(
             out.starts_with("[source=mixed_query chars "),
@@ -760,7 +800,10 @@ mod tests {
             ("query".to_string(), json!("target")),
             ("context_lines".to_string(), json!(1)),
         ]);
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(out.contains("> 3:TARGET"));
         assert!(out.contains("  2:b"));
         assert!(out.contains("  4:c"));
@@ -776,7 +819,10 @@ mod tests {
             ("tool_call_id".to_string(), json!("call_f")),
             ("query".to_string(), json!("fatal error")),
         ]);
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(out.contains("1:Fatal ERROR here"));
     }
 }

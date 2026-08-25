@@ -3027,50 +3027,41 @@ async fn gateway_clear_waits_for_active_same_session_turn() {
     let clear = InboundMessage::new("test", "user", "offline", "/clear");
     inbound_tx.send(clear).unwrap();
     assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(150),
-            outbound_rx.recv(),
-        )
-        .await
-        .is_err(),
+        tokio::time::timeout(std::time::Duration::from_millis(150), outbound_rx.recv(),)
+            .await
+            .is_err(),
         "/clear completed while an older same-session turn still held the session lock"
     );
 
     let third = InboundMessage::new("test", "user", "other", "independent");
     let independent_started = provider.second_started.notified();
     inbound_tx.send(third).unwrap();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        independent_started,
-    )
-    .await
-    .expect("a queued same-session clear must not consume another session's permit");
-    let independent_outbound = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        outbound_rx.recv(),
-    )
-    .await
-    .expect("independent response must arrive while the first turn remains blocked")
-    .expect("outbound channel must stay open");
+    tokio::time::timeout(std::time::Duration::from_secs(5), independent_started)
+        .await
+        .expect("a queued same-session clear must not consume another session's permit");
+    let independent_outbound =
+        tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("independent response must arrive while the first turn remains blocked")
+            .expect("outbound channel must stay open");
     assert_eq!(independent_outbound.content, "response 2");
 
     provider.allow_first.notify_one();
-    let first_outbound = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        outbound_rx.recv(),
-    )
-    .await
-    .expect("first response must arrive")
-    .expect("outbound channel must stay open");
+    let first_outbound =
+        tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("first response must arrive")
+            .expect("outbound channel must stay open");
     assert_eq!(first_outbound.content, "response 1");
-    let clear_outbound = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        outbound_rx.recv(),
-    )
-    .await
-    .expect("clear response must arrive after the active turn")
-    .expect("outbound channel must stay open");
-    assert_eq!(clear_outbound.content, "Working memory and history cleared.");
+    let clear_outbound =
+        tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("clear response must arrive after the active turn")
+            .expect("outbound channel must stay open");
+    assert_eq!(
+        clear_outbound.content,
+        "Working memory and history cleared."
+    );
 
     let session = sessions
         .get_latest_session(&session_key)
@@ -3112,17 +3103,16 @@ async fn cross_session_command_seen_during_coalescing_uses_gateway_dispatch() {
     let mut responses = Vec::new();
     for _ in 0..2 {
         responses.push(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                outbound_rx.recv(),
-            )
-            .await
-            .expect("both the normal turn and command must complete")
-            .expect("outbound channel must stay open")
-            .content,
+            tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+                .await
+                .expect("both the normal turn and command must complete")
+                .expect("outbound channel must stay open")
+                .content,
         );
     }
-    assert!(responses.iter().any(|response| response == "coalesced response"));
+    assert!(responses
+        .iter()
+        .any(|response| response == "coalesced response"));
     assert!(
         responses
             .iter()
@@ -10182,9 +10172,8 @@ async fn idle_turn_e2e_injects_journaled_quiet_turn() {
         session_key: None,
         write_paths: vec!["skills/**".to_string(), "MEMORY.md".to_string()],
     };
-    let tracker = agent_loop.set_idle_runtime(crate::agent::idle::IdleRuntime::new(
-        idle_cfg.clone(),
-    ));
+    let tracker =
+        agent_loop.set_idle_runtime(crate::agent::idle::IdleRuntime::new(idle_cfg.clone()));
     let mut loop_for_run = agent_loop;
     let run_handle = tokio::spawn(async move {
         loop_for_run.run().await;

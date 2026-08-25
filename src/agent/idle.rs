@@ -126,7 +126,9 @@ pub fn is_idle_message(msg: &InboundMessage) -> bool {
 pub fn effective_wait_secs(after_secs: u64, consecutive_fires: u32, max_backoff_secs: u64) -> u64 {
     // Saturating shift: beyond 63 doublings the cap governs anyway.
     let factor = 1u64.saturating_mul(1 << consecutive_fires.min(62));
-    (after_secs.saturating_mul(factor)).min(max_backoff_secs).max(after_secs)
+    (after_secs.saturating_mul(factor))
+        .min(max_backoff_secs)
+        .max(after_secs)
 }
 
 /// Sliding one-hour window cap. Prunes entries older than an hour and
@@ -273,12 +275,13 @@ pub(crate) async fn run_idle_timer_with_tick(
         }
         fire_times.push_back(now);
         consecutive_fires += 1;
-        next_due_ms = now + effective_wait_secs(
-            config.after_secs,
-            consecutive_fires,
-            config.max_backoff_secs,
-        )
-        .saturating_mul(1000) as i64;
+        next_due_ms = now
+            + effective_wait_secs(
+                config.after_secs,
+                consecutive_fires,
+                config.max_backoff_secs,
+            )
+            .saturating_mul(1000) as i64;
         info!(session = %target.session_key(), "idle turn injected");
     }
 }
@@ -317,7 +320,11 @@ mod tests {
         // exactly one entry is pruned, freeing one slot.
         let later = now - 3000 + 3_600_001;
         assert!(hour_allows(&mut fires, later, 3));
-        assert_eq!(fires.len(), 2, "oldest pruned; recording is the caller's job");
+        assert_eq!(
+            fires.len(),
+            2,
+            "oldest pruned; recording is the caller's job"
+        );
         let mut few = VecDeque::new();
         assert!(hour_allows(&mut few, now, 1));
     }

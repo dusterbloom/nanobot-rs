@@ -52,11 +52,7 @@ impl Tool for SystemInfoTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let action = params
             .get("action")
             .and_then(|v| v.as_str())
@@ -248,7 +244,10 @@ mod tests {
         let tool = SystemInfoTool;
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("overview"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("OS:"), "got: {}", result);
         assert!(result.contains("CWD:"), "got: {}", result);
     }
@@ -259,7 +258,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("processes"));
         params.insert("limit".to_string(), json!(3));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("PID") || result.contains("pid"),
             "got: {}",

@@ -11,31 +11,13 @@ use crate::agent::audit::ToolEvent;
 
 /// Extract a required string parameter or early-return the canonical error.
 ///
-/// `require_str!(params, "key")`          → `Error: 'key' parameter is required`
-/// `require_str!(params, "key", " for X")`→ `Error: 'key' parameter is required for X`
-/// `require_str!(params, "key", ".")`     → `Error: 'key' parameter is required.`
+/// `require_param!(params, "key")`          → `InvalidArgs{..}' parameter is required'}`
+/// `require_param!(params, "key", " for X")`→ `InvalidArgs{..}' parameter is required for X'}`
+/// `require_param!(params, "key", ".")`     → `InvalidArgs{..}' parameter is required.'}`
 ///
 /// The suffix is appended verbatim so every pre-existing error string
-/// (tests assert exact substrings) is preserved byte-for-byte.
-macro_rules! require_str {
-    ($params:expr, $key:literal) => {
-        require_str!($params, $key, "")
-    };
-    ($params:expr, $key:literal, $suffix:literal) => {
-        match $params.get($key).and_then(|v| v.as_str()) {
-            Some(v) => v,
-            None => {
-                return concat!("Error: '", $key, "' parameter is required", $suffix).to_string()
-            }
-        }
-    };
-}
-pub(crate) use require_str;
-
-/// Typed twin of `require_str!` for tools whose `execute_typed` returns
-/// [`ToolResult`] (error protocol §2.6 Phase 2). Same message bytes —
-/// `InvalidArgs` renders `Error: 'key' parameter is required{suffix}` — so
-/// the registry's "is required" worked-example path behaves identically.
+/// (tests assert exact substrings) is preserved byte-for-byte through
+/// `ToolError::InvalidArgs::render`.
 macro_rules! require_param {
     ($params:expr, $key:literal) => {
         require_param!($params, $key, "")
@@ -207,21 +189,13 @@ impl From<&str> for ToolOutput {
 /// The one result type of the tool layer.
 pub type ToolResult = Result<ToolOutput, crate::errors::ToolError>;
 
-/// The shared legacy->typed funnel (error protocol §2.2): a tool's legacy
-/// `String` output becomes the typed [`ToolResult`], classifying `Error: ...`
-/// strings structurally via [`crate::errors::ToolError::from_legacy`].
-///
-/// NOTE: this must be a free function, NOT a call to the trait default.
-/// Calling `Tool::execute_typed(self, ...)` from inside an override of the
-/// same method dispatches back to the override under `#[async_trait]`
-/// (async-trait resolves the qualified call to the concrete impl), which
-/// recurses until the stack overflows. Overrides must call
-/// `self.execute_with_context(...)` and then this helper instead.
-pub fn funnel_legacy(out: String) -> ToolResult {
-    if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
-        Err(crate::errors::ToolError::from_legacy(&err))
-    } else {
-        Ok(ToolOutput { text: out })
+/// Render a typed [`ToolResult`] as the model-visible String (Ok text, or
+/// `Err(e.render())`). The bridge for String-shaped call sites — tests and
+/// the worker lane — after the trait flip deleted the legacy channel.
+pub fn render_result(r: ToolResult) -> String {
+    match r {
+        Ok(out) => out.text,
+        Err(e) => e.render(),
     }
 }
 
@@ -263,6 +237,18 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    /// Sandbox context for tests and legacy String-bridge call sites: no
+    /// host, a throwaway event channel, a fresh cancellation token.
+    pub fn sandbox() -> Self {
+        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Self::new(
+            None,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            String::new(),
+        )
+    }
+
     /// The single constructor — the registry is the only builder in
     /// production; tests and streaming tools pass their own parts with
     /// `host: None` (the registry injects its host).
@@ -344,90 +330,13 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for tool parameters.
     fn parameters(&self) -> serde_json::Value;
 
-    /// Execute the tool with given parameters.
-    ///
-    /// Legacy String channel (error protocol §2.6 Phase 2): the default
-    /// renders the typed [`execute_typed`] result — `Ok(text)` on success,
-    /// `Err(e.render())` on failure, byte-identical to the old funnel — so
-    /// migrated tools delete their String override and old callers/tests
-    /// keep working unchanged. Unmigrated tools still override this with a
-    /// String body; the trait flip (Phase 3) deletes the method.
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolContext::new(
-            None,
-            event_tx,
-            tokio_util::sync::CancellationToken::new(),
-            String::new(),
-        );
-        match self.execute_typed(params, &ctx).await {
-            Ok(out) => out.text,
-            Err(e) => e.render(),
-        }
-    }
-
-    /// Execute the tool with an execution context for progress reporting
-    /// and cancellation.
-    ///
-    /// The default implementation ignores the context and delegates to
-    /// [`execute`]. Tools that support streaming (like ExecTool) override
-    /// this to emit [`ToolEvent::Progress`] events and check the
-    /// cancellation token.
-    async fn execute_with_context(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-        _ctx: &ToolContext,
-    ) -> String {
-        self.execute(params).await
-    }
-
-    /// Execute and return the typed outcome (error protocol, Phase 1 —
-    /// additive). This is the migration seam: tools land on `ToolResult` by
-    /// overriding this method and building [`crate::errors::ToolError`]
-    /// variants at their failure sites.
-    ///
-    /// The default implementation funnels the legacy `String` channel through
-    /// [`crate::errors::ToolError::from_legacy`] so every unmigrated tool
-    /// keeps working — and keeps producing byte-identical `Error: ...` wire
-    /// strings — with no changes.
-    async fn execute_typed(
+    /// Execute the tool with given parameters (error protocol §2.6 Phase 3:
+    /// the one execution method — typed result, context always carried).
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolContext,
-    ) -> ToolResult {
-        let out = self.execute_with_context(params, ctx).await;
-        funnel_legacy(out)
-    }
-
-    /// Execute and return a structured outcome.
-    ///
-    /// Default renders the typed [`execute_typed`] result into the legacy
-    /// structured shape (`From<ToolResult> for ToolExecutionResult`).
-    async fn execute_with_result(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-    ) -> ToolExecutionResult {
-        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolContext::new(
-            None,
-            event_tx,
-            tokio_util::sync::CancellationToken::new(),
-            String::new(),
-        );
-        ToolExecutionResult::from(self.execute_typed(params, &ctx).await)
-    }
-
-    /// Like [`execute_with_result`] but with an execution context.
-    ///
-    /// Default renders the typed [`execute_typed`] result into the legacy
-    /// structured shape.
-    async fn execute_with_result_and_context(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-        ctx: &ToolContext,
-    ) -> ToolExecutionResult {
-        ToolExecutionResult::from(self.execute_typed(params, ctx).await)
-    }
+    ) -> ToolResult;
 
     /// The permission level required to execute this tool.
     ///
@@ -496,12 +405,16 @@ mod tests {
             })
         }
 
-        async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+        async fn execute(
+            &self,
+            params: HashMap<String, serde_json::Value>,
+            _ctx: &ToolContext,
+        ) -> ToolResult {
             let input = params
                 .get("input")
                 .and_then(|v| v.as_str())
                 .unwrap_or("none");
-            format!("executed with: {}", input)
+            Ok(format!("executed with: {}", input).into())
         }
     }
 
@@ -560,7 +473,10 @@ mod tests {
             "input".to_string(),
             serde_json::Value::String("hello".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "executed with: hello");
     }
 
@@ -568,19 +484,22 @@ mod tests {
     async fn test_mock_tool_execute_missing_param() {
         let tool = MockTool;
         let params = HashMap::new();
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "executed with: none");
     }
 
     #[tokio::test]
-    async fn test_mock_tool_execute_with_result_success() {
+    async fn test_mock_tool_typed_success_renders_into_structured_shape() {
         let tool = MockTool;
         let mut params = HashMap::new();
         params.insert(
             "input".to_string(),
             serde_json::Value::String("hello".to_string()),
         );
-        let result = tool.execute_with_result(params).await;
+        let result = ToolExecutionResult::from(tool.execute(params, &ToolContext::sandbox()).await);
         assert!(result.ok());
         assert_eq!(result.data(), "executed with: hello");
         assert!(result.error().is_none());
@@ -601,13 +520,20 @@ mod tests {
             fn parameters(&self) -> serde_json::Value {
                 serde_json::json!({"type": "object", "properties": {}})
             }
-            async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
-                "Error: bad input".to_string()
+            async fn execute(
+                &self,
+                _params: HashMap<String, serde_json::Value>,
+                _ctx: &ToolContext,
+            ) -> ToolResult {
+                Err(crate::errors::ToolError::Execution {
+                    message: "bad input".to_string(),
+                })
             }
         }
 
         let tool = ErrorTool;
-        let result = tool.execute_with_result(HashMap::new()).await;
+        let result =
+            ToolExecutionResult::from(tool.execute(HashMap::new(), &ToolContext::sandbox()).await);
         assert!(!result.ok());
         // Wire string stays byte-identical through the typed funnel.
         assert_eq!(result.data(), "Error: bad input");
@@ -617,7 +543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_with_context_default_delegates_to_execute() {
+    async fn test_execute_with_custom_context_matches_sandbox_render() {
         use crate::agent::audit::ToolEvent;
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
@@ -631,15 +557,16 @@ mod tests {
             serde_json::Value::String("hello".to_string()),
         );
 
-        // execute_with_context should return same result as execute
-        let result = tool.execute_with_context(params.clone(), &ctx).await;
-        let direct = tool.execute(params).await;
+        // A caller-supplied context produces the same output as the sandbox
+        // bridge — the context only carries events/cancellation, not results.
+        let result = render_result(tool.execute(params.clone(), &ctx).await);
+        let direct = render_result(tool.execute(params, &ToolContext::sandbox()).await);
         assert_eq!(result, direct);
         assert_eq!(result, "executed with: hello");
     }
 
     #[tokio::test]
-    async fn test_execute_with_result_and_context_default() {
+    async fn test_structured_render_from_context_call() {
         use crate::agent::audit::ToolEvent;
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
@@ -653,7 +580,7 @@ mod tests {
             serde_json::Value::String("test".to_string()),
         );
 
-        let result = tool.execute_with_result_and_context(params, &ctx).await;
+        let result = ToolExecutionResult::from(tool.execute(params, &ctx).await);
         assert!(result.ok());
         assert_eq!(result.data(), "executed with: test");
     }

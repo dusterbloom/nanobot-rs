@@ -68,7 +68,7 @@ impl Tool for ToolStatusTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: std::collections::HashMap<String, Value>,
         _ctx: &ToolContext,
@@ -430,7 +430,13 @@ mod tests {
         .unwrap();
 
         let tool = ToolStatusTool::new(tmp.path().to_path_buf());
-        let out = tool.execute(std::collections::HashMap::new()).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                std::collections::HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(out.contains("## Learning"), "{out}");
         assert!(out.contains("read_file: 1/1 ok"), "{out}");
         assert!(out.contains("exec: 0/1 ok"), "{out}");
@@ -448,7 +454,10 @@ mod tests {
         let tool = ToolStatusTool::new(tmp.path().to_path_buf());
         let mut params = std::collections::HashMap::new();
         params.insert("action".to_string(), json!("skills"));
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(out.contains("newsreader"), "{out}");
         assert!(out.contains("Missing description"), "{out}");
     }

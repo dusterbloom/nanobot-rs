@@ -31,8 +31,8 @@ static RE_WIN_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).expect("static regex"));
 
 use super::base::{require_param, PermissionLevel, Tool, ToolContext, ToolResult};
-use crate::errors::ToolError;
 use crate::agent::audit::ToolEvent;
+use crate::errors::ToolError;
 
 /// Default deny patterns for dangerous shell commands.
 fn default_deny_patterns() -> Vec<String> {
@@ -420,7 +420,7 @@ impl Tool for ExecTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolContext,
@@ -668,7 +668,9 @@ mod tests {
             serde_json::Value::String("printf nope >&2; exit 7".to_string()),
         );
 
-        let result = tool.execute_with_result(params).await;
+        let result = crate::agent::tools::base::ToolExecutionResult::from(
+            tool.execute(params, &ToolContext::sandbox()).await,
+        );
         assert!(
             !result.ok(),
             "non-zero shell exit must be a failed tool result"
@@ -859,7 +861,10 @@ mod tests {
             serde_json::Value::String("echo test_output".to_string()),
         );
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("test_output"));
     }
 
@@ -867,7 +872,10 @@ mod tests {
     async fn test_execute_missing_command_param() {
         let tool = make_exec_tool(false);
         let params = HashMap::new();
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("'command' parameter is required"));
     }
 
@@ -880,7 +888,10 @@ mod tests {
             serde_json::Value::String("rm -rf /".to_string()),
         );
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("blocked"));
     }
 
@@ -1063,7 +1074,10 @@ mod tests {
             serde_json::Value::String("false".to_string()),
         );
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("Exit code:"));
     }
 
@@ -1090,7 +1104,7 @@ mod tests {
             ),
         );
 
-        let result = render_result(tool.execute_typed(params, &ctx).await);;
+        let result = render_result(tool.execute(params, &ctx).await);
         assert!(result.contains("end"));
 
         // Collect all Progress events (includes start event with elapsed_ms=0)
@@ -1134,7 +1148,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let result = render_result(tool.execute_typed(params, &ctx).await);;
+        let result = render_result(tool.execute(params, &ctx).await);
         let elapsed = start.elapsed();
 
         assert!(
@@ -1165,7 +1179,7 @@ mod tests {
             serde_json::Value::String("true".to_string()),
         );
 
-        let result = render_result(tool.execute_typed(params, &ctx).await);;
+        let result = render_result(tool.execute(params, &ctx).await);
         assert_eq!(result, "(no output)");
 
         // Fast command emits exactly one "start" progress event with the command preview.
@@ -1210,7 +1224,7 @@ mod tests {
             serde_json::Value::String("echo error_msg >&2".to_string()),
         );
 
-        let result = render_result(tool.execute_typed(params, &ctx).await);;
+        let result = render_result(tool.execute(params, &ctx).await);
         assert!(
             result.contains("STDERR:"),
             "Expected STDERR prefix, got: {}",
@@ -1235,7 +1249,7 @@ mod tests {
             serde_json::Value::String("rm -rf /".to_string()),
         );
 
-        let result = render_result(tool.execute_typed(params, &ctx).await);;
+        let result = render_result(tool.execute(params, &ctx).await);
         assert!(
             result.contains("blocked"),
             "Blocked command should still be blocked with context, got: {}",
@@ -1259,7 +1273,8 @@ mod tests {
             serde_json::Value::String("echo hello".to_string()),
         );
 
-        let result = render_result(tool.execute_typed(params, &ctx).await);
+        // Result text is irrelevant here; only the emitted events matter.
+        let _ = render_result(tool.execute(params, &ctx).await);
 
         // The very first event must be a Progress with "Running: echo hello".
         let first = rx.try_recv().expect("Expected at least one progress event");
@@ -1295,8 +1310,11 @@ mod tests {
             serde_json::Value::String("echo hello world".to_string()),
         );
 
-        let ctx_result = render_result(tool.execute_typed(params.clone(), &ctx).await);
-        let plain_result = tool.execute(params).await;
+        let ctx_result = render_result(tool.execute(params.clone(), &ctx).await);
+        let plain_result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         // Streaming uses BufReader::lines() which strips trailing newlines;
         // .output() preserves them. Both are equivalent for tool results.
         assert_eq!(
@@ -1323,7 +1341,7 @@ mod tests {
             serde_json::Value::String("echo preview_line && sleep 2".to_string()),
         );
 
-        let _result = render_result(tool.execute_typed(params, &ctx).await);
+        let _result = render_result(tool.execute(params, &ctx).await);
 
         // Find a progress event with output_preview containing our line
         let mut found_preview = false;
@@ -1360,7 +1378,7 @@ mod tests {
             serde_json::Value::String("exit 42".to_string()),
         );
 
-        let result = render_result(tool.execute_typed(params, &ctx).await);;
+        let result = render_result(tool.execute(params, &ctx).await);
         assert!(
             result.contains("Exit code:"),
             "Expected exit code in output, got: {}",
@@ -1381,7 +1399,10 @@ mod tests {
             "command".to_string(),
             serde_json::Value::String("sleep 10".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("timed out"),
             "Expected timeout message: {}",

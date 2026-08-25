@@ -69,11 +69,7 @@ impl Tool for ApplyPatchTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let patch = match params.get("patch").and_then(|v| v.as_str()) {
             Some(p) if !p.trim().is_empty() => p,
             _ => {
@@ -157,11 +153,7 @@ impl Tool for ApplyPatchTool {
                 Ok(result) => result,
                 Err(e) => {
                     return Err(ToolError::Execution {
-                        message: format!(
-                            "{}: {}",
-                            fp.path,
-                            e.trim_start_matches("Error: ")
-                        ),
+                        message: format!("{}: {}", fp.path, e.trim_start_matches("Error: ")),
                     })
                 }
             };
@@ -544,7 +536,11 @@ mod tests {
             "expected_sha256_by_path".to_string(),
             Value::Object(expected),
         );
-        let out = ApplyPatchTool::default().execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            ApplyPatchTool::default()
+                .execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(out.contains("File changed before patch"), "{out}");
     }
 }

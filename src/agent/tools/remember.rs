@@ -182,11 +182,7 @@ impl Tool for RememberTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        args: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, args: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         // Structured empty-arg path: an `add` with no facts returns
         // MissingArg (model-fixable) whose render carries a corrective
         // worked example. Without this, a zero-temp model emitting
@@ -370,7 +366,6 @@ impl RememberTool {
 
         message
     }
-
 }
 
 fn required_string<'a>(args: &'a HashMap<String, Value>, key: &str) -> Result<&'a str, String> {
@@ -532,7 +527,10 @@ mod tests {
         let tool = RememberTool::new(dir.path().to_path_buf());
         let mut args = HashMap::new();
         args.insert("fact".to_string(), json!("  "));
-        let result = tool.execute(args).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(args, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error:"), "got: {}", result);
     }
 
@@ -540,7 +538,13 @@ mod tests {
     async fn test_empty_add_returns_structural_missing_arg() {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
-        let res = tool.execute_with_result(HashMap::new()).await;
+        let res = crate::agent::tools::base::ToolExecutionResult::from(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             !res.ok(),
             "empty add must not be a silent success (old list-default loop)"
@@ -559,7 +563,13 @@ mod tests {
     async fn test_empty_add_direct_execute_errors_not_succeeds() {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
-        let result = tool.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.starts_with("Error:") && result.contains("facts"),
             "direct execute({{}}) must error, not succeed as list: {result}"
@@ -571,9 +581,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
         let verbose = "Peppi said something memorable during this session, which means the user was expressing a complex emotional reaction to the agent and the surrounding project context, with additional speculative narrative details that were never explicitly established.";
-        let result = tool
-            .execute(HashMap::from([("fact".to_string(), json!(verbose))]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([("fact".to_string(), json!(verbose))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.contains("too verbose"), "got: {result}");
         assert!(!dir.path().join("memory").join("MEMORY.md").exists());
     }
@@ -582,12 +596,16 @@ mod tests {
     async fn test_add_rejects_multiline_fact() {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
-        let result = tool
-            .execute(HashMap::from([(
-                "fact".to_string(),
-                json!("First claim\n- inferred second claim"),
-            )]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([(
+                    "fact".to_string(),
+                    json!("First claim\n- inferred second claim"),
+                )]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.contains("one plain-text fact"), "got: {result}");
     }
 
@@ -598,7 +616,10 @@ mod tests {
 
         let mut args = HashMap::new();
         args.insert("fact".to_string(), json!("Testing round trip"));
-        let result = tool.execute(args).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(args, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Remembered:"),
             "expected success, got: {}",
@@ -616,11 +637,17 @@ mod tests {
 
         let mut args1 = HashMap::new();
         args1.insert("fact".to_string(), json!("First fact"));
-        tool.execute(args1).await;
+        crate::agent::tools::base::render_result(
+            tool.execute(args1, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         let mut args2 = HashMap::new();
         args2.insert("fact".to_string(), json!("Second fact"));
-        tool.execute(args2).await;
+        crate::agent::tools::base::render_result(
+            tool.execute(args2, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         let content = std::fs::read_to_string(dir.path().join("memory").join("MEMORY.md")).unwrap();
         assert!(content.contains("- First fact"), "first fact missing");
@@ -634,8 +661,18 @@ mod tests {
 
         let mut args = HashMap::new();
         args.insert("fact".to_string(), json!("Use concise answers"));
-        assert!(tool.execute(args.clone()).await.starts_with("Remembered:"));
-        let result = tool.execute(args).await;
+        assert!(crate::agent::tools::base::render_result(
+            tool.execute(
+                args.clone(),
+                &crate::agent::tools::base::ToolContext::sandbox()
+            )
+            .await
+        )
+        .starts_with("Remembered:"));
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(args, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Already remembered:"), "got: {result}");
 
         let content = std::fs::read_to_string(dir.path().join("memory").join("MEMORY.md")).unwrap();
@@ -649,19 +686,28 @@ mod tests {
 
         let mut add = HashMap::new();
         add.insert("fact".to_string(), json!("Old preference"));
-        tool.execute(add).await;
+        crate::agent::tools::base::render_result(
+            tool.execute(add, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         let mut replace = HashMap::new();
         replace.insert("action".to_string(), json!("replace"));
         replace.insert("old_fact".to_string(), json!("Old preference"));
         replace.insert("new_fact".to_string(), json!("New preference"));
-        let result = tool.execute(replace).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(replace, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Replaced 1"), "got: {result}");
 
         let mut delete = HashMap::new();
         delete.insert("action".to_string(), json!("delete"));
         delete.insert("fact".to_string(), json!("New preference"));
-        let result = tool.execute(delete).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(delete, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Deleted 1"), "got: {result}");
     }
 
@@ -688,7 +734,10 @@ mod tests {
 
         let mut args = HashMap::new();
         args.insert("fact".to_string(), json!("Auto-create dir test"));
-        let result = tool.execute(args).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(args, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             !result.starts_with("Error:"),
             "should succeed even with missing dir, got: {}",
@@ -707,7 +756,12 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("fact".to_string(), json!("Serialized memory write"));
 
-        let mut task = tokio::spawn(async move { tool.execute(args).await });
+        let mut task = tokio::spawn(async move {
+            crate::agent::tools::base::render_result(
+                tool.execute(args, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            )
+        });
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut task)
                 .await
@@ -732,7 +786,10 @@ mod tests {
             "facts".to_string(),
             json!(["alpha fact", "bravo fact", "charlie fact"]),
         );
-        let result = tool.execute(args).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(args, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Remembered 3 fact(s)"),
             "batch add must report 3 facts: {result}"
@@ -747,9 +804,13 @@ mod tests {
     async fn test_list_action_is_rejected_with_recall_redirect() {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
-        let result = tool
-            .execute(HashMap::from([("action".to_string(), json!("list"))]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([("action".to_string(), json!("list"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.contains("recall") && result.contains("scope"),
             "list must redirect to recall(scope=memory): {result}"
@@ -762,9 +823,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = RememberTool::new(dir.path().to_path_buf());
         let many: Vec<String> = (0..25).map(|i| format!("fact {i}")).collect();
-        let result = tool
-            .execute(HashMap::from([("facts".to_string(), json!(many))]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([("facts".to_string(), json!(many))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.contains("too many facts") && result.contains("max 20"),
             "over-20 batch must be rejected: {result}"

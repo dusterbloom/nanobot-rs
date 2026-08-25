@@ -46,11 +46,7 @@ impl Tool for CheckInboxTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        _params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, _params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
 
         let use_api = self.email_config.imap_host.contains("agentmail.to");
@@ -148,11 +144,7 @@ impl Tool for SendEmailTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let to = require_param!(params, "to");
         let subject = require_param!(params, "subject");
         let body = require_param!(params, "body");
@@ -220,7 +212,10 @@ mod tests {
         let config = EmailConfig::default();
         let tool = SendEmailTool::new(config);
         let params = HashMap::new();
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Error"),
             "Should error without 'to': {}",
@@ -234,7 +229,10 @@ mod tests {
         let tool = SendEmailTool::new(config);
         let mut params = HashMap::new();
         params.insert("to".to_string(), json!("test@example.com"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Error"),
             "Should error without 'subject': {}",
@@ -249,7 +247,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("to".to_string(), json!("test@example.com"));
         params.insert("subject".to_string(), json!("Test"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Error"),
             "Should error without 'body': {}",
@@ -267,7 +268,13 @@ mod tests {
             ..Default::default()
         };
         let tool = CheckInboxTool::new(config);
-        let result = tool.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.starts_with("Error"),
             "Should return error: {}",
@@ -288,7 +295,10 @@ mod tests {
         params.insert("to".to_string(), json!("test@example.com"));
         params.insert("subject".to_string(), json!("Test"));
         params.insert("body".to_string(), json!("Hello"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Error"),
             "Should return error: {}",

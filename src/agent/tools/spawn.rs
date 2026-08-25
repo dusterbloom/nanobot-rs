@@ -84,8 +84,12 @@ impl Tool for SpawnToolLite {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        self.0.execute(params).await
+    async fn execute(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolContext,
+    ) -> ToolResult {
+        self.0.execute(params, ctx).await
     }
 }
 
@@ -433,7 +437,7 @@ impl Tool for SpawnTool {
     /// baked into the host; the tool sends empty placeholders that never
     /// travel on the wire (`#[serde(skip)]`). The trait's default String
     /// `execute` renders this byte-for-byte.
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -662,14 +666,20 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("task".to_string(), json!("investigate"));
         params.insert("profile".to_string(), json!("researcher"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("profile=researcher"));
         // 'agent' is a synonym; 'profile' wins when both are given.
         let mut params = HashMap::new();
         params.insert("task".to_string(), json!("investigate"));
         params.insert("profile".to_string(), json!("researcher"));
         params.insert("agent".to_string(), json!("explore"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("profile=researcher"));
     }
 
@@ -677,7 +687,10 @@ mod tests {
     async fn test_execute_missing_task() {
         let tool = SpawnTool::new(test_host(EchoHost));
         let params = HashMap::new();
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Error: 'task' parameter is required");
     }
 
@@ -686,7 +699,10 @@ mod tests {
         let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("cancel"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Error: 'task_id' parameter is required for cancel");
     }
 
@@ -695,7 +711,10 @@ mod tests {
         let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("wait"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Error: 'task_id' parameter is required for wait");
     }
 
@@ -704,7 +723,10 @@ mod tests {
         let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("pipeline"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Error: 'steps' parameter is required for pipeline");
     }
 
@@ -713,7 +735,10 @@ mod tests {
         let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("loop"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Error: 'task' parameter is required for loop");
     }
 
@@ -722,12 +747,18 @@ mod tests {
         let tool = SpawnTool::new(test_host(FailingHost));
         let mut params = HashMap::new();
         params.insert("task".to_string(), json!("t"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Error: spawn exploded");
 
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("list"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Error: list exploded");
     }
 
@@ -736,7 +767,10 @@ mod tests {
         let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("list"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "No subagents currently running.");
     }
 
@@ -746,7 +780,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("cancel"));
         params.insert("task_id".to_string(), json!("abc123"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Cancelled abc123");
     }
 
@@ -756,7 +793,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("check"));
         params.insert("task_id".to_string(), json!("abc123"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "checking abc123");
     }
 
@@ -769,7 +809,10 @@ mod tests {
         params.insert("profile".to_string(), json!("explore"));
         params.insert("model".to_string(), json!("haiku"));
         params.insert("working_dir".to_string(), json!("/tmp/project"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("task=analyze data"));
         assert!(result.contains("label=data-analysis"));
         assert!(result.contains("profile=explore"));
@@ -785,7 +828,10 @@ mod tests {
         let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
         params.insert("task".to_string(), json!("simple task"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("task=simple task"));
         assert!(result.contains("label=none"));
         assert!(result.contains("profile=none"));
@@ -799,7 +845,10 @@ mod tests {
         params.insert("action".to_string(), json!("pipeline"));
         params.insert("steps".to_string(), json!([{"prompt": "one"}]));
         params.insert("ahead_by_k".to_string(), json!(2));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, r#"pipeline [{"prompt":"one"}] ahead 2"#);
     }
 
@@ -810,7 +859,10 @@ mod tests {
         params.insert("action".to_string(), json!("loop"));
         params.insert("task".to_string(), json!("refine"));
         params.insert("max_rounds".to_string(), json!(3));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "loop refine r3");
     }
 
@@ -820,7 +872,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("wait"));
         params.insert("task_id".to_string(), json!("abc123"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         // No timeout param → legacy default of 120s.
         assert_eq!(result, "waited abc123 120s");
 
@@ -828,7 +883,10 @@ mod tests {
         params.insert("action".to_string(), json!("wait"));
         params.insert("task_id".to_string(), json!("abc123"));
         params.insert("timeout".to_string(), json!(10));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "waited abc123 10s");
     }
 
@@ -841,7 +899,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("action".to_string(), json!("pipeline"));
         params.insert("steps".to_string(), json!("not-an-array"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(
             result,
             "Error parsing pipeline steps: invalid type: string \"not-an-array\", expected a sequence at line 1 column 14"

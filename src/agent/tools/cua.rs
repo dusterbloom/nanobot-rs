@@ -97,11 +97,9 @@ impl CuaTool {
 
     /// Run a driver subcommand; returns (stdout, stderr, success).
     async fn run_driver(&self, args: &[&str]) -> (String, String, bool) {
-        let result = tokio::time::timeout(
-            self.timeout,
-            Command::new(&self.binary).args(args).output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(self.timeout, Command::new(&self.binary).args(args).output())
+                .await;
         match result {
             Ok(Ok(output)) => (
                 String::from_utf8_lossy(&output.stdout).to_string(),
@@ -115,7 +113,10 @@ impl CuaTool {
             ),
             Err(_) => (
                 String::new(),
-                format!("cua-driver call timed out after {}s", self.timeout.as_secs()),
+                format!(
+                    "cua-driver call timed out after {}s",
+                    self.timeout.as_secs()
+                ),
                 false,
             ),
         }
@@ -178,7 +179,11 @@ impl CuaTool {
     /// CuaDriver` so Accessibility/Screen Recording grants keep the app
     /// identity (raw `serve` outside the app is unsupported on macOS).
     fn daemon_launch_args(&self) -> Vec<String> {
-        daemon_launch_args(&self.binary, &self.permission_mode, cfg!(target_os = "macos"))
+        daemon_launch_args(
+            &self.binary,
+            &self.permission_mode,
+            cfg!(target_os = "macos"),
+        )
     }
 
     /// Ensure the daemon is up before calling. Auto-start is bounded: launch,
@@ -226,7 +231,10 @@ impl CuaTool {
         if ctx.cancellation_token().is_cancelled() {
             return Err("Error: cua-driver call cancelled".to_string());
         }
-        Err("Error: cua-driver daemon did not become ready after launch. Run `cua-driver doctor`.".to_string())
+        Err(
+            "Error: cua-driver daemon did not become ready after launch. Run `cua-driver doctor`."
+                .to_string(),
+        )
     }
 
     /// Run `cua-driver list-tools` and return the output (discovery fallback).
@@ -264,7 +272,10 @@ impl CuaTool {
         let shot_arg = "--screenshot-out-file";
         // Ensure the screenshot dir exists before the driver writes into it.
         if let Err(e) = std::fs::create_dir_all(&self.screenshot_dir) {
-            return format!("Error: cannot create screenshot dir {}: {e}", self.screenshot_dir.display());
+            return format!(
+                "Error: cannot create screenshot dir {}: {e}",
+                self.screenshot_dir.display()
+            );
         }
         let Some((raw_out, raw_err, ok)) = self
             .run_call(&["call", tool, args_json, shot_arg, &shot_str], ctx)
@@ -280,7 +291,11 @@ impl CuaTool {
                     self.daemon_launch_args().join(" ")
                 );
             }
-            let detail = if raw_err.is_empty() { out.clone() } else { raw_err };
+            let detail = if raw_err.is_empty() {
+                out.clone()
+            } else {
+                raw_err
+            };
             // Unknown/missing tool names surface the tool list so the model
             // learns the surface (discovery fallback).
             let list = self.list_tools().await;
@@ -360,11 +375,7 @@ impl Tool for CuaTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, ctx: &ToolContext) -> ToolResult {
         let out = self.run(params, ctx).await;
         // One boundary: driver-protocol strings split the legacy error
         // channel here (python_kernel pattern). Nothing downstream consumes
@@ -466,21 +477,25 @@ echo "unknown command: $1" >&2; exit 1
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert_eq!(params["properties"]["tool"]["type"], "string");
-        assert_eq!(
-            params["required"],
-            serde_json::json!(["tool"])
-        );
+        assert_eq!(params["required"], serde_json::json!(["tool"]));
         assert_eq!(tool.permission(), PermissionLevel::System);
         assert_eq!(tool.concurrency(), ToolConcurrency::Sequential);
     }
 
     #[tokio::test]
     async fn test_missing_tool_param_lists_tools() {
-        let dir = std::env::temp_dir().join(format!("cua-test-{}-missing_tool", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cua-test-{}-missing_tool", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bin = make_shim(&dir);
         let tool = CuaTool::with_binary(bin.to_str().unwrap());
-        let result = tool.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.contains("list_apps"), "got: {result}");
         assert!(result.contains("click"), "got: {result}");
         fs::remove_dir_all(&dir).ok();
@@ -499,7 +514,10 @@ echo "unknown command: $1" >&2; exit 1
             "args".to_string(),
             serde_json::json!({"element_token": "@e3"}),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("OK"), "got: {result}");
         let last = fs::read_to_string(dir.join(".last_call")).unwrap();
         assert!(last.contains("call"), "got: {last}");
@@ -516,7 +534,10 @@ echo "unknown command: $1" >&2; exit 1
         let tool = CuaTool::with_binary(bin.to_str().unwrap()); // daemon_auto_start=false
         let mut params = HashMap::new();
         params.insert("tool".to_string(), Value::String("click".to_string()));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error:"), "got: {result}");
         assert!(
             result.contains("cua-driver") || result.contains("CuaDriver"),
@@ -537,7 +558,10 @@ echo "unknown command: $1" >&2; exit 1
         let tool = CuaTool::with_binary_autostart(bin.to_str().unwrap());
         let mut params = HashMap::new();
         params.insert("tool".to_string(), Value::String("click".to_string()));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("OK"),
             "call should succeed after the tool auto-starts the daemon, got: {result}"
@@ -558,7 +582,10 @@ echo "unknown command: $1" >&2; exit 1
         let tool = CuaTool::with_binary(bin.to_str().unwrap());
         let mut params = HashMap::new();
         params.insert("tool".to_string(), Value::String("screenshot".to_string()));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("OK"), "got: {result}");
         assert!(
             result.contains("Screenshot saved"),
@@ -569,7 +596,8 @@ echo "unknown command: $1" >&2; exit 1
 
     #[tokio::test]
     async fn test_unknown_tool_appends_available_tools() {
-        let dir = std::env::temp_dir().join(format!("cua-test-{}-unknown_tool", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cua-test-{}-unknown_tool", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bin = make_shim(&dir); // call with nonexistent_tool exits 1
         fs::write(dir.join(".running"), "").unwrap(); // daemon up
@@ -579,7 +607,10 @@ echo "unknown command: $1" >&2; exit 1
             "tool".to_string(),
             Value::String("nonexistent_tool".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("cua-driver call 'nonexistent_tool' failed"),
             "got: {result}"
@@ -623,7 +654,8 @@ echo "unknown command: $1" >&2; exit 1
 
     #[tokio::test]
     async fn test_binary_present_absolute_and_missing() {
-        let dir = std::env::temp_dir().join(format!("cua-test-{}-binary_present", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cua-test-{}-binary_present", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bin = make_shim(&dir);
         let tool = CuaTool::with_binary(bin.to_str().unwrap());
@@ -632,7 +664,14 @@ echo "unknown command: $1" >&2; exit 1
         assert!(!missing.binary_present());
         // A missing binary short-circuits before tool-param discovery, so the
         // empty-params call must return the spec'd install hint.
-        let result = missing.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            missing
+                .execute(
+                    HashMap::new(),
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+        );
         assert!(
             result.contains("cua-driver binary not found"),
             "got: {result}"

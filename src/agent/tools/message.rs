@@ -73,7 +73,7 @@ impl Tool for MessageTool {
     /// boundary. The host's reply text is the model-visible output; host
     /// errors propagate typed and render byte-identically. The trait's
     /// default String `execute` renders this byte-for-byte.
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -175,7 +175,10 @@ mod tests {
     async fn test_execute_missing_content() {
         let tool = MessageTool::new(Arc::new(MockHost), "chan", "chat");
         let params = HashMap::new();
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(
             result,
             "Error: 'content' parameter is required; call as message({\"content\":\"hello\"})"
@@ -190,7 +193,10 @@ mod tests {
             "content".to_string(),
             serde_json::Value::String("hello".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Error: No target channel/chat specified");
     }
 
@@ -202,7 +208,10 @@ mod tests {
             "content".to_string(),
             serde_json::Value::String("hello!".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Message sent to telegram:12345");
     }
 
@@ -214,7 +223,10 @@ mod tests {
             "content".to_string(),
             serde_json::Value::String("hello".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("Error sending message"));
         assert!(result.contains("network error"));
     }
@@ -235,7 +247,10 @@ mod tests {
             "chat_id".to_string(),
             serde_json::Value::String("override_chat".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Message sent to override_chan:override_chat");
     }
 
@@ -257,7 +272,10 @@ mod tests {
             "chat_id".to_string(),
             serde_json::Value::String("".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert_eq!(result, "Message sent to telegram:42");
     }
 }

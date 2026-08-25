@@ -20,11 +20,9 @@ use reqwest::Client;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::base::{
-    require_param, PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult,
-};
-use crate::errors::ToolError;
+use super::base::{require_param, PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult};
 use crate::agent::audit::ToolEvent;
+use crate::errors::ToolError;
 
 /// Shared user-agent string.
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36";
@@ -279,7 +277,7 @@ impl Tool for WebSearchTool {
         (self.provider == "searxng" && !self.searxng_url.is_empty()) || !self.api_key.is_empty()
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolContext,
@@ -687,7 +685,7 @@ impl Tool for WebFetchTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolContext,
@@ -1080,7 +1078,10 @@ mod tests {
             "url".to_string(),
             serde_json::Value::String("https://example.com".to_string()),
         );
-        let out = tool.execute(params).await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["extractor"], "crw", "fetch must route through crw: {out}");
         assert!(v["text"].as_str().unwrap().contains("Example Domain"));
@@ -1381,7 +1382,10 @@ mod tests {
 
         let mut params = HashMap::new();
         params.insert("query".to_string(), serde_json::json!("test"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(
             result.contains("SearXNG backend is degraded"),
@@ -1413,7 +1417,10 @@ mod tests {
 
         let mut params = HashMap::new();
         params.insert("query".to_string(), serde_json::json!("test"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         // Reaches the network layer -> connection error, NOT the degraded msg.
         assert!(
@@ -1485,7 +1492,10 @@ mod tests {
             "query".to_string(),
             serde_json::Value::String("test".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("BRAVE_API_KEY not configured"));
     }
 
@@ -1502,7 +1512,10 @@ mod tests {
             "query".to_string(),
             serde_json::Value::String("test".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("config.json"),
             "Expected config.json hint: {}",
@@ -1529,7 +1542,10 @@ mod tests {
             "query".to_string(),
             serde_json::Value::String("test".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Error: SearXNG unavailable") && result.contains("automatic restart"),
             "Expected unavailable error with self-heal notice, got: {}",
@@ -1558,7 +1574,10 @@ mod tests {
             "url".to_string(),
             serde_json::Value::String("ftp://invalid.example".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("error") || result.contains("URL validation failed"));
     }
 
@@ -1566,7 +1585,10 @@ mod tests {
     async fn test_web_fetch_missing_url() {
         let tool = WebFetchTool::new(50000);
         let params = HashMap::new();
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("url parameter is required"));
     }
 
@@ -1702,7 +1724,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             serde_json::Value::String("rust programming".to_string()),
         );
 
-        tool.execute_typed(params, &ctx).await;
+        let _ = tool.execute(params, &ctx).await;
 
         let first = rx.try_recv().expect("Expected at least one progress event");
         match first {
@@ -1741,7 +1763,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             serde_json::Value::String("ftp://invalid-url-that-fails-fast".to_string()),
         );
 
-        tool.execute_typed(params, &ctx).await;
+        let _ = tool.execute(params, &ctx).await;
 
         let mut events = vec![];
         while let Ok(ev) = rx.try_recv() {
@@ -1781,7 +1803,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             serde_json::Value::String("ftp://example.com".to_string()),
         );
 
-        tool.execute_typed(params, &ctx).await;
+        let _ = tool.execute(params, &ctx).await;
 
         let mut events = vec![];
         while let Ok(ev) = rx.try_recv() {

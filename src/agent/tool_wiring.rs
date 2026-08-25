@@ -55,8 +55,12 @@ impl<T: crate::agent::tools::Tool> crate::agent::tools::Tool for ArcToolProxy<T>
     fn concurrency(&self) -> crate::agent::tools::base::ToolConcurrency {
         self.0.concurrency()
     }
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
-        self.0.execute(params).await
+    async fn execute(
+        &self,
+        params: HashMap<String, Value>,
+        ctx: &crate::agent::tools::base::ToolContext,
+    ) -> crate::agent::tools::base::ToolResult {
+        self.0.execute(params, ctx).await
     }
 }
 

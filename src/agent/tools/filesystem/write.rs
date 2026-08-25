@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use super::super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
-use super::{expand_path, require_param, idle_write_allowed, idle_write_denied_err};
+use super::{expand_path, idle_write_allowed, idle_write_denied_err, require_param};
 use crate::errors::ToolError;
 
 pub(crate) const MAX_WRITE_FILE_PIECE_CHARS: usize = 4096;
@@ -317,7 +317,10 @@ impl WriteFileTool {
                             },
                         );
                     }
-                    Ok(published_receipt("appended", content.len() as u64, total_bytes, path).into())
+                    Ok(
+                        published_receipt("appended", content.len() as u64, total_bytes, path)
+                            .into(),
+                    )
                 }
                 Err(e) => write_error(path, e),
             };
@@ -336,13 +339,10 @@ impl WriteFileTool {
                         },
                     );
                 }
-                Ok(published_receipt(
-                    "wrote",
-                    content.len() as u64,
-                    content.len() as u64,
-                    path,
+                Ok(
+                    published_receipt("wrote", content.len() as u64, content.len() as u64, path)
+                        .into(),
                 )
-                .into())
             }
             Err(e) => write_error(path, e),
         }
@@ -389,7 +389,7 @@ impl Tool for WriteFileTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolContext,
@@ -520,7 +520,10 @@ mod tests {
             ("path", file_path.to_str().unwrap()),
             ("content", "test content"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Successfully wrote"));
 
         let content = std::fs::read_to_string(&file_path).unwrap();
@@ -537,7 +540,10 @@ mod tests {
             ("path", file_path.to_str().unwrap()),
             ("content", "nested content"),
         ]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Successfully wrote"));
         assert!(file_path.exists());
     }
@@ -574,7 +580,10 @@ mod tests {
     async fn test_write_file_missing_path() {
         let tool = WriteFileTool::default();
         let params = make_params(&[("content", "test")]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("'path' parameter is required"));
     }
 
@@ -582,7 +591,10 @@ mod tests {
     async fn test_write_file_missing_content() {
         let tool = WriteFileTool::default();
         let params = make_params(&[("path", "/tmp/test.txt")]);
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("'content' parameter is required"));
     }
 
@@ -631,35 +643,47 @@ mod tests {
         std::fs::write(&file_path, "old").unwrap();
         let tool = WriteFileTool::default();
 
-        let first = tool
-            .execute(make_params(&[
-                ("path", file_path.to_str().unwrap()),
-                ("content", "<html>"),
-                ("state", "more"),
-            ]))
-            .await;
+        let first = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[
+                    ("path", file_path.to_str().unwrap()),
+                    ("content", "<html>"),
+                    ("state", "more"),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(first.contains("Staged 6 bytes"));
         assert!(first.contains("state=\"more\""));
         assert!(first.contains("state=\"complete\""));
         assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "old");
 
-        let second = tool
-            .execute(make_params(&[
-                ("path", file_path.to_str().unwrap()),
-                ("content", "<body>ok</body>"),
-                ("state", "more"),
-            ]))
-            .await;
+        let second = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[
+                    ("path", file_path.to_str().unwrap()),
+                    ("content", "<body>ok</body>"),
+                    ("state", "more"),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(second.contains("total=21"));
         assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "old");
 
-        let final_result = tool
-            .execute(make_params(&[
-                ("path", file_path.to_str().unwrap()),
-                ("content", "</html>"),
-                ("state", "complete"),
-            ]))
-            .await;
+        let final_result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[
+                    ("path", file_path.to_str().unwrap()),
+                    ("content", "</html>"),
+                    ("state", "complete"),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(final_result.starts_with("Successfully wrote 28 bytes"));
         assert!(final_result.contains("Validate the published artifact"));
         assert_eq!(
@@ -679,7 +703,10 @@ mod tests {
         params.insert("content".to_string(), serde_json::json!("x".repeat(4097)));
         params.insert("state".to_string(), serde_json::json!("more"));
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
 
         assert!(result.contains("4097 characters"));
         assert!(result.contains("4096 characters or less"));
@@ -702,7 +729,7 @@ mod tests {
 
         let content = "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1);
         let result = tool
-            .execute_typed(
+            .execute(
                 make_params(&[
                     ("path", file_path.to_str().unwrap()),
                     ("content", &content),
@@ -734,22 +761,30 @@ mod tests {
         let prefix = "<html>";
         let final_piece = "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1);
 
-        let staged = tool
-            .execute(make_params(&[
-                ("path", file_path.to_str().unwrap()),
-                ("content", prefix),
-                ("state", "more"),
-            ]))
-            .await;
+        let staged = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[
+                    ("path", file_path.to_str().unwrap()),
+                    ("content", prefix),
+                    ("state", "more"),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(staged.starts_with("Staged"), "{staged}");
 
-        let result = tool
-            .execute(make_params(&[
-                ("path", file_path.to_str().unwrap()),
-                ("content", &final_piece),
-                ("state", "complete"),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[
+                    ("path", file_path.to_str().unwrap()),
+                    ("content", &final_piece),
+                    ("state", "complete"),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(result.starts_with("Successfully wrote"), "{result}");
         assert!(
@@ -769,13 +804,17 @@ mod tests {
         let tool = WriteFileTool::default();
         let content = "é".repeat(MAX_WRITE_FILE_PIECE_CHARS);
 
-        let result = tool
-            .execute(make_params(&[
-                ("path", path.to_str().unwrap()),
-                ("content", &content),
-                ("state", "more"),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[
+                    ("path", path.to_str().unwrap()),
+                    ("content", &content),
+                    ("state", "more"),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(!result.starts_with("Error:"), "{result}");
         assert!(!path.exists(), "staged writes must not publish early");
@@ -787,13 +826,17 @@ mod tests {
         let path = dir.path().join("unfinished.txt");
         {
             let tool = WriteFileTool::default();
-            let result = tool
-                .execute(make_params(&[
-                    ("path", path.to_str().unwrap()),
-                    ("content", "partial"),
-                    ("state", "more"),
-                ]))
-                .await;
+            let result = crate::agent::tools::base::render_result(
+                tool.execute(
+                    make_params(&[
+                        ("path", path.to_str().unwrap()),
+                        ("content", "partial"),
+                        ("state", "more"),
+                    ]),
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+            );
             assert!(!result.starts_with("Error:"), "{result}");
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         }
@@ -812,13 +855,17 @@ mod tests {
         let file_path = dir.path().join("artifact.html");
         let tool = WriteFileTool::default();
 
-        let result = tool
-            .execute(make_params(&[
-                ("path", file_path.to_str().unwrap()),
-                ("content", "content"),
-                ("state", "merge"),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[
+                    ("path", file_path.to_str().unwrap()),
+                    ("content", "content"),
+                    ("state", "merge"),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
 
         assert!(result.contains("'state' must be one of: more, complete, append"));
         assert!(!file_path.exists());
@@ -843,18 +890,22 @@ mod tests {
             ("content", "<html>"),
             ("state", "more"),
         ]);
-        let first = tool.execute_typed(params.clone(), &ctx).await.unwrap().text;
-        let duplicate = tool.execute_typed(params, &ctx).await.unwrap().text;
+        let first = tool.execute(params.clone(), &ctx).await.unwrap().text;
+        let duplicate = tool.execute(params, &ctx).await.unwrap().text;
         assert!(first.contains("total=6"));
         assert!(duplicate.contains("already staged"));
 
-        let final_result = tool
-            .execute(make_params(&[
-                ("path", file_path.to_str().unwrap()),
-                ("content", "</html>"),
-                ("state", "complete"),
-            ]))
-            .await;
+        let final_result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[
+                    ("path", file_path.to_str().unwrap()),
+                    ("content", "</html>"),
+                    ("state", "complete"),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(final_result.starts_with("Successfully wrote 13 bytes"));
         assert_eq!(
             std::fs::read_to_string(&file_path).unwrap(),
@@ -881,8 +932,8 @@ mod tests {
             ("state", "append"),
         ]);
 
-        let first = tool.execute_typed(params.clone(), &ctx).await.unwrap().text;
-        let duplicate = tool.execute_typed(params, &ctx).await.unwrap().text;
+        let first = tool.execute(params.clone(), &ctx).await.unwrap().text;
+        let duplicate = tool.execute(params, &ctx).await.unwrap().text;
 
         assert!(first.starts_with("Successfully appended"), "{first}");
         assert!(duplicate.contains("already completed"), "{duplicate}");
@@ -911,26 +962,27 @@ mod tests {
             "call-2".to_string(),
         );
 
-        tool.execute_typed(
-            make_params(&[
-                ("path", file_path.to_str().unwrap()),
-                ("content", "<html>"),
-                ("state", "more"),
-            ]),
-            &first_ctx,
-        )
-        .await;
+        let _ = tool
+            .execute(
+                make_params(&[
+                    ("path", file_path.to_str().unwrap()),
+                    ("content", "<html>"),
+                    ("state", "more"),
+                ]),
+                &first_ctx,
+            )
+            .await;
         let final_params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("content", "</html>"),
             ("state", "complete"),
         ]);
         let first_publish = tool
-            .execute_typed(final_params.clone(), &final_ctx)
+            .execute(final_params.clone(), &final_ctx)
             .await
             .unwrap()
             .text;
-        let duplicate_publish = tool.execute_typed(final_params, &final_ctx).await.unwrap().text;
+        let duplicate_publish = tool.execute(final_params, &final_ctx).await.unwrap().text;
 
         assert!(first_publish.starts_with("Successfully wrote 13 bytes"));
         assert!(duplicate_publish.contains("already completed"));

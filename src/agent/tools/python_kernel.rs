@@ -91,11 +91,7 @@ impl Tool for PythonKernel {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let code = match params.get("code").and_then(|v| v.as_str()) {
             Some(c) if !c.trim().is_empty() => c.to_string(),
             None => {
@@ -312,7 +308,10 @@ mod tests {
         let k = kernel();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("print('hello')"));
-        let result = k.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            k.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("hello"), "got: {}", result);
     }
 
@@ -321,7 +320,10 @@ mod tests {
         let k = kernel();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("x = 42"));
-        let result = k.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            k.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("(no output)"), "got: {}", result);
     }
 
@@ -330,9 +332,18 @@ mod tests {
         let k = kernel();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("x = 42"));
-        k.execute(params.clone()).await;
+        crate::agent::tools::base::render_result(
+            k.execute(
+                params.clone(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         params.insert("code".to_string(), json!("print(x * 2)"));
-        let result = k.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            k.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("84"), "got: {}", result);
     }
 
@@ -341,9 +352,18 @@ mod tests {
         let k = kernel();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("import json"));
-        k.execute(params.clone()).await;
+        crate::agent::tools::base::render_result(
+            k.execute(
+                params.clone(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         params.insert("code".to_string(), json!("print(json.dumps({'a': 1}))"));
-        let result = k.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            k.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("{\"a\": 1}"), "got: {}", result);
     }
 
@@ -355,9 +375,18 @@ mod tests {
             "code".to_string(),
             json!("def double(n):\n    return n * 2"),
         );
-        k.execute(params.clone()).await;
+        crate::agent::tools::base::render_result(
+            k.execute(
+                params.clone(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         params.insert("code".to_string(), json!("print(double(21))"));
-        let result = k.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            k.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("42"), "got: {}", result);
     }
 
@@ -366,7 +395,10 @@ mod tests {
         let k = kernel();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("def (broken"));
-        let result = k.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            k.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(!result.contains("panicked"), "got: {}", result);
         assert!(
             result.contains("SyntaxError") || result.contains("Error"),
@@ -380,7 +412,10 @@ mod tests {
         let k = kernel();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("1 / 0"));
-        let result = k.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            k.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("ZeroDivisionError") || result.contains("division by zero"),
             "got: {}",
@@ -391,7 +426,13 @@ mod tests {
     #[tokio::test]
     async fn empty_code_rejected() {
         let k = kernel();
-        let result = k.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            k.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.starts_with("Error:"), "got: {}", result);
     }
 
@@ -404,7 +445,13 @@ mod tests {
         let k = PythonKernel::new(1);
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("while True:\n    pass"));
-        let result = k.execute(params.clone()).await;
+        let result = crate::agent::tools::base::render_result(
+            k.execute(
+                params.clone(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.contains("TimeoutError"),
             "expected an in-interpreter TimeoutError, got: {}",
@@ -412,7 +459,10 @@ mod tests {
         );
 
         params.insert("code".to_string(), json!("print('alive')"));
-        let after = k.execute(params).await;
+        let after = crate::agent::tools::base::render_result(
+            k.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             after.contains("alive"),
             "kernel wedged after timeout: {after}"
@@ -426,11 +476,20 @@ mod tests {
         let k = kernel();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("print('before'); 1 / 0"));
-        let failed = k.execute(params.clone()).await;
+        let failed = crate::agent::tools::base::render_result(
+            k.execute(
+                params.clone(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(failed.contains("ZeroDivisionError"), "got: {failed}");
 
         params.insert("code".to_string(), json!("print('after')"));
-        let ok = k.execute(params).await;
+        let ok = crate::agent::tools::base::render_result(
+            k.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(ok.contains("after"), "got: {ok}");
         assert!(!ok.contains("before"), "stale buffer leaked: {ok}");
     }

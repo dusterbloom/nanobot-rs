@@ -31,8 +31,8 @@ use serde_json::{json, Value};
 use tokio::task;
 
 use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
-use crate::errors::ToolError;
 use super::registry::{ToolConfig, ToolRegistry};
+use crate::errors::ToolError;
 
 // ---------------------------------------------------------------------------
 // Python stub generation
@@ -273,11 +273,7 @@ impl Tool for CodeExecutionTool {
         self.enabled
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         if !self.enabled {
             return Err(ToolError::PermissionDenied(
                 "execute_code tool is not enabled. \
@@ -457,7 +453,10 @@ mod tests {
         let tool = disabled_tool();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("print('hello')"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("not enabled") || result.contains("disabled"),
             "expected disabled message, got: {}",
@@ -468,7 +467,13 @@ mod tests {
     #[tokio::test]
     async fn test_code_execution_missing_code_returns_error() {
         let tool = enabled_tool();
-        let result = tool.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.starts_with("Error:"),
             "expected Error, got: {}",
@@ -481,7 +486,10 @@ mod tests {
         let tool = enabled_tool();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("   "));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Error:"),
             "expected Error, got: {}",
@@ -600,7 +608,10 @@ mod tests {
         let tool = enabled_tool();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("print('hello from rpc')"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("hello from rpc"),
             "expected script stdout, got: {}",
@@ -616,7 +627,10 @@ mod tests {
         let tool = enabled_tool();
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("def (broken syntax"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         // Should return an error, not panic.
         assert!(
             !result.is_empty(),
@@ -638,7 +652,10 @@ mod tests {
         };
         let mut params = HashMap::new();
         params.insert("code".to_string(), json!("import time; time.sleep(60)"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("timed out"),
             "expected timeout message, got: {}",
@@ -657,7 +674,10 @@ mod tests {
             "code".to_string(),
             json!("for i in range(3):\n    print(f'line {i}')"),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("line 0"), "got: {}", result);
         assert!(result.contains("line 1"), "got: {}", result);
         assert!(result.contains("line 2"), "got: {}", result);

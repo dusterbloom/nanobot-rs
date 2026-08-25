@@ -353,13 +353,17 @@ impl ToolRegistry {
             self.register(Box::new(FilePreviewTool));
         }
         if should_include("write_file") {
-            self.register(Box::new(WriteFileTool::new(config.idle_write_paths.clone())));
+            self.register(Box::new(WriteFileTool::new(
+                config.idle_write_paths.clone(),
+            )));
         }
         if should_include("edit_file") {
             self.register(Box::new(EditFileTool::new(config.idle_write_paths.clone())));
         }
         if should_include("apply_patch") {
-            self.register(Box::new(ApplyPatchTool::new(config.idle_write_paths.clone())));
+            self.register(Box::new(ApplyPatchTool::new(
+                config.idle_write_paths.clone(),
+            )));
         }
         if should_include("list_dir") {
             self.register(Box::new(ListDirTool));
@@ -725,12 +729,10 @@ impl ToolRegistry {
             return blocked;
         }
 
-        let unwound = std::panic::AssertUnwindSafe(
-            tool.execute_with_result_and_context(params.clone(), &ctx),
-        );
+        let unwound = std::panic::AssertUnwindSafe(tool.execute(params.clone(), &ctx));
         let unwound = futures_util::FutureExt::catch_unwind(unwound).await;
         let mut result = match unwound {
-            Ok(result) => result,
+            Ok(typed) => ToolExecutionResult::from(typed),
             Err(_) => {
                 ToolExecutionResult::failure(format!("Tool '{}' panicked during execution", name))
             }
@@ -1420,6 +1422,7 @@ impl Default for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tools::base::ToolResult;
     use async_trait::async_trait;
 
     fn register_test_result_inspector(registry: &mut ToolRegistry, db_path: std::path::PathBuf) {
@@ -1699,8 +1702,14 @@ mod tests {
             })
         }
 
-        async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-            serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string())
+        async fn execute(
+            &self,
+            params: HashMap<String, serde_json::Value>,
+            _ctx: &ToolContext,
+        ) -> ToolResult {
+            Ok(serde_json::to_string(&params)
+                .unwrap_or_else(|_| "{}".to_string())
+                .into())
         }
     }
 
@@ -1724,12 +1733,16 @@ mod tests {
             })
         }
 
-        async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+        async fn execute(
+            &self,
+            params: HashMap<String, serde_json::Value>,
+            _ctx: &ToolContext,
+        ) -> ToolResult {
             let value = params
                 .get("value")
                 .and_then(|v| v.as_str())
                 .unwrap_or("default");
-            format!("{}:{}", self.tool_name, value)
+            Ok(format!("{}:{}", self.tool_name, value).into())
         }
     }
 
@@ -2394,8 +2407,12 @@ mod tests {
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({"type": "object", "properties": {}})
         }
-        async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
-            "executed".to_string()
+        async fn execute(
+            &self,
+            _params: HashMap<String, serde_json::Value>,
+            _ctx: &ToolContext,
+        ) -> ToolResult {
+            Ok("executed".into())
         }
         fn is_available(&self) -> bool {
             false
@@ -2753,8 +2770,12 @@ mod tests {
             fn parameters(&self) -> serde_json::Value {
                 serde_json::json!({ "type": "object", "properties": {} })
             }
-            async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
-                String::new()
+            async fn execute(
+                &self,
+                _params: HashMap<String, serde_json::Value>,
+                _ctx: &ToolContext,
+            ) -> ToolResult {
+                Ok(String::new().into())
             }
         }
 
@@ -3401,8 +3422,14 @@ mod tests {
                     "required": ["query"]
                 })
             }
-            async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
-                "Error: 'query' parameter is required and must be non-empty.".to_string()
+            async fn execute(
+                &self,
+                _params: HashMap<String, serde_json::Value>,
+                _ctx: &ToolContext,
+            ) -> ToolResult {
+                Err(crate::errors::ToolError::InvalidArgs {
+                    message: "'query' parameter is required and must be non-empty.".to_string(),
+                })
             }
         }
 
@@ -3436,8 +3463,6 @@ mod tests {
     /// `lcm_expand` unaugmented under the old substring gate.
     #[tokio::test]
     async fn missing_arg_error_kind_appends_structured_example() {
-        use crate::agent::tools::base::ToolExecutionResult;
-
         struct StructuredMissingArg;
         #[async_trait]
         impl Tool for StructuredMissingArg {
@@ -3450,21 +3475,17 @@ mod tests {
             fn parameters(&self) -> serde_json::Value {
                 serde_json::json!({"type":"object","properties":{"facts":{"type":"array"}}})
             }
-            async fn execute(&self, _: HashMap<String, serde_json::Value>) -> String {
-                "Error: provide facts".to_string() // NOTE: no "is required" substring
-            }
-            async fn execute_with_result_and_context(
+            async fn execute(
                 &self,
                 _: HashMap<String, serde_json::Value>,
                 _ctx: &ToolContext,
-            ) -> ToolExecutionResult {
-                ToolExecutionResult::failure_with_kind(
-                    "Error: provide facts".to_string(),
-                    crate::errors::ToolErrorKind::MissingArg {
-                        param: "facts".to_string(),
-                        example: r#"structured_missing_arg({"facts":["..."]})"#.to_string(),
-                    },
-                )
+            ) -> ToolResult {
+                // Structural MissingArg with an example (the registry's
+                // typed worked-example path).
+                Err(crate::errors::ToolError::MissingArg {
+                    param: "facts".to_string(),
+                    example: r#"structured_missing_arg({"facts":["..."]})"#.to_string(),
+                })
             }
         }
 
@@ -3478,8 +3499,8 @@ mod tests {
         assert!(
             result
                 .data()
-                .contains(r#"Call as structured_missing_arg({"facts":["..."]})"#),
-            "structural MissingArg must append the example from error_kind: {}",
+                .contains(r#"call as structured_missing_arg({"facts":["..."]})"#),
+            "typed MissingArg renders the worked example itself: {}",
             result.data()
         );
     }
@@ -3549,8 +3570,12 @@ mod tests {
                 "required": ["path", "content"]
             })
         }
-        async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
-            "ok".into()
+        async fn execute(
+            &self,
+            _params: HashMap<String, serde_json::Value>,
+            _ctx: &ToolContext,
+        ) -> ToolResult {
+            Ok("ok".into())
         }
     }
 
@@ -3612,8 +3637,12 @@ mod tests {
         fn permission(&self) -> PermissionLevel {
             PermissionLevel::Execute
         }
-        async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
-            "executed".to_string()
+        async fn execute(
+            &self,
+            _params: HashMap<String, serde_json::Value>,
+            _ctx: &ToolContext,
+        ) -> ToolResult {
+            Ok("executed".into())
         }
     }
 

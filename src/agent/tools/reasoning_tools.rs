@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use daggy::Dag;
 
 use super::base::{Tool, ToolContext, ToolResult};
-use crate::errors::ToolError;
 use crate::agent::reasoning::{EdgeType, PlanStep, ReasoningEngine, StepStatus};
+use crate::errors::ToolError;
 
 /// Shared handle to the reasoning engine, passed into each tool.
 pub type SharedEngine = Arc<Mutex<ReasoningEngine>>;
@@ -66,7 +66,7 @@ impl Tool for CheckpointTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -89,9 +89,7 @@ impl Tool for CheckpointTool {
         let msgs = engine.current_messages().to_vec();
         engine.save_checkpoint(&label, &msgs, 0);
         let n = engine.checkpoint_count();
-        Ok(
-            format!("Checkpoint '{}' saved. {} checkpoints on stack.", label, n).into(),
-        )
+        Ok(format!("Checkpoint '{}' saved. {} checkpoints on stack.", label, n).into())
     }
 }
 
@@ -140,7 +138,7 @@ impl Tool for BacktrackTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -253,7 +251,7 @@ impl Tool for PlanTool {
         })
     }
 
-    async fn execute_typed(
+    async fn execute(
         &self,
         params: HashMap<String, serde_json::Value>,
         _ctx: &ToolContext,
@@ -391,7 +389,10 @@ mod tests {
             serde_json::Value::String("before_tool_call".to_string()),
         );
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("before_tool_call"),
             "result should mention label, got: {result}"
@@ -414,7 +415,13 @@ mod tests {
         let tool = CheckpointTool::new(Arc::clone(&engine));
 
         // Execute without a label parameter.
-        let result = tool.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.contains("cp-"),
             "auto-label should start with 'cp-', got: {result}"
@@ -436,7 +443,10 @@ mod tests {
                 "label".to_string(),
                 serde_json::Value::String(format!("cp{}", i)),
             );
-            tool.execute(params).await;
+            crate::agent::tools::base::render_result(
+                tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            );
         }
 
         let count = engine.lock().checkpoint_count();
@@ -463,7 +473,10 @@ mod tests {
             serde_json::Value::String("tool failed".to_string()),
         );
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         // Should be a simple status message (not JSON).
         assert!(
             result.contains("Backtracking"),
@@ -507,7 +520,10 @@ mod tests {
             serde_json::Value::String("first".to_string()),
         );
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("first"),
             "should mention 'first' checkpoint, got: {result}"
@@ -529,7 +545,10 @@ mod tests {
             serde_json::Value::String("failed".to_string()),
         );
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Error:"),
             "should return error when no checkpoints, got: {result}"
@@ -555,7 +574,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("steps".to_string(), steps);
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Plan created with 3 steps"),
             "should report 3 steps, got: {result}"
@@ -589,7 +611,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("steps".to_string(), steps);
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.contains("Plan created with 3 steps"),
             "should create 3 steps, got: {result}"
@@ -611,7 +636,13 @@ mod tests {
         let engine = make_engine();
         let tool = PlanTool::new(Arc::clone(&engine));
 
-        let result = tool.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.starts_with("Error:"),
             "should error on missing steps, got: {result}"
@@ -626,7 +657,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("steps".to_string(), json!([]));
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Error:"),
             "should error on empty steps, got: {result}"
@@ -645,7 +679,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("steps".to_string(), steps);
 
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(
             result.starts_with("Error:"),
             "should error on out-of-range dep, got: {result}"

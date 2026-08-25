@@ -236,7 +236,7 @@ pub trait HostBridge: SpawnHost + PipelineHost + LoopHost + MessageHost {
     /// method (shared by every host implementation), builds the reply
     /// envelope, and round-trips the error channel byte-losslessly: an
     /// `Error` envelope's rendered string converts back through
-    /// [`ToolError::from_legacy`] and re-renders identically, so a tool
+    /// [`tool_error_from_legacy`] and re-renders identically, so a tool
     /// that `?`-propagates never double-prefixes or rewrites it.
     async fn call(&self, req: HostRequest) -> Result<serde_json::Value, ToolError> {
         let reply: HostReply = match req {
@@ -257,7 +257,7 @@ pub trait HostBridge: SpawnHost + PipelineHost + LoopHost + MessageHost {
                     .map(str::trim)
                     .unwrap_or(&error)
                     .to_string();
-                Err(ToolError::from_legacy(&message))
+                Err(tool_error_from_legacy(&message))
             }
         }
     }
@@ -379,19 +379,47 @@ where
     }
 }
 
+/// The single legacy string→typed bridge (error protocol §2.6 Phase 3).
+///
+/// Private to the host bridge: its serde wire envelope round-trips rendered
+/// error strings, and that round-trip is the only remaining consumer of the
+/// legacy classifier. Maps the exact strings `classify_tool_error` matched,
+/// so retry behavior is preserved byte-for-byte.
+#[allow(clippy::disallowed_methods)] // legacy bridge — the serde wire round-trip is its one caller
+fn tool_error_from_legacy(msg: &str) -> ToolError {
+    if let Some(kind) = crate::errors::classify_tool_error(msg) {
+        return match kind {
+            crate::errors::ToolErrorKind::Timeout(s) => ToolError::Timeout(s),
+            crate::errors::ToolErrorKind::PermissionDenied(m) => ToolError::PermissionDenied(m),
+            crate::errors::ToolErrorKind::NotFound(m) => ToolError::NotFound(m),
+            crate::errors::ToolErrorKind::InvalidArgs(m) => ToolError::InvalidArgs { message: m },
+            crate::errors::ToolErrorKind::ToolNotFound(m) => ToolError::ToolNotFound { name: m },
+            crate::errors::ToolErrorKind::NetworkError(m) => ToolError::Network(m),
+            crate::errors::ToolErrorKind::RateLimited => ToolError::RateLimited,
+            crate::errors::ToolErrorKind::ServiceUnavailable(m) => ToolError::ServiceUnavailable(m),
+            crate::errors::ToolErrorKind::MissingArg { param, example } => {
+                ToolError::MissingArg { param, example }
+            }
+        };
+    }
+    ToolError::Execution {
+        message: msg.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
 /// Funnel a legacy callback's `String` output into the typed channel: an
 /// `Error:`-prefixed string becomes a typed [`ToolError`] via
-/// [`ToolError::from_legacy`] (byte-identical classification); anything else
+/// [`tool_error_from_legacy`] (byte-identical classification); anything else
 /// is the model-visible text of a success reply. Mirrors `spawn.rs`'s
 /// `into_result`.
 pub(crate) fn into_model_text(out: String) -> Result<String, ToolError> {
     out.strip_prefix("Error:")
         .map(|s| s.trim().to_string())
-        .map_or(Ok(out), |err| Err(ToolError::from_legacy(&err)))
+        .map_or(Ok(out), |err| Err(tool_error_from_legacy(&err)))
 }
 
 /// Best-effort structured task id from the spawn confirmation line
@@ -407,6 +435,62 @@ pub fn spawn_task_id(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn legacy_bridge_preserves_render_bytes() {
+        // Unclassified legacy strings funnel through Execution and must come
+        // out byte-identical ("'task' parameter is required", "Spawn callback
+        // not configured" etc. — the 297-site contract).
+        let e = tool_error_from_legacy("'task' parameter is required");
+        assert_eq!(e.render(), "Error: 'task' parameter is required");
+
+        let e = tool_error_from_legacy("Spawn callback not configured");
+        assert_eq!(e.render(), "Error: Spawn callback not configured");
+
+        // Classified payload-carrying variants reproduce the full original
+        // message (the payload IS the stripped message).
+        let e = tool_error_from_legacy("File not found: /tmp/missing");
+        assert_eq!(e.render(), "Error: File not found: /tmp/missing");
+        assert!(matches!(e, ToolError::NotFound(_)));
+
+        let e = tool_error_from_legacy("Permission denied: /etc/shadow");
+        assert_eq!(e.render(), "Error: Permission denied: /etc/shadow");
+
+        let e = tool_error_from_legacy("Invalid path argument: cannot be empty");
+        assert_eq!(e.render(), "Error: Invalid path argument: cannot be empty");
+    }
+
+    #[test]
+    fn legacy_bridge_classification() {
+        assert!(matches!(
+            tool_error_from_legacy("Command timed out after 30 seconds"),
+            ToolError::Timeout(30)
+        ));
+        assert!(matches!(
+            tool_error_from_legacy("connection refused by remote host"),
+            ToolError::Network(_)
+        ));
+        assert!(matches!(
+            tool_error_from_legacy("429 rate limit exceeded"),
+            ToolError::RateLimited
+        ));
+        assert!(matches!(
+            tool_error_from_legacy("service unavailable, try again later"),
+            ToolError::ServiceUnavailable(_)
+        ));
+        assert!(matches!(
+            tool_error_from_legacy("Unknown tool: magic_wand"),
+            ToolError::ToolNotFound { .. }
+        ));
+        assert!(matches!(
+            tool_error_from_legacy("No such file or directory: /x"),
+            ToolError::NotFound(_)
+        ));
+        assert!(matches!(
+            tool_error_from_legacy("unusual failure"),
+            ToolError::Execution { .. }
+        ));
+    }
     use super::*;
     use std::collections::HashMap;
 
@@ -822,30 +906,56 @@ mod tests {
         p.insert("label".to_string(), json!("explore"));
         p.insert("model".to_string(), json!("haiku"));
         assert_eq!(
-            tool.execute(p).await,
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox()).await,
+            ),
             "Subagent 'explore' spawned (id: abc12345, model: haiku). It will announce results when done."
         );
 
         // list / cancel / wait / check
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("list"));
-        assert_eq!(tool.execute(p).await, "No subagents currently running.");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "No subagents currently running."
+        );
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("cancel"));
         p.insert("task_id".to_string(), json!("abc12345"));
-        assert_eq!(tool.execute(p).await, "Subagent 'abc12345' cancelled.");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "Subagent 'abc12345' cancelled."
+        );
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("wait"));
         p.insert("task_id".to_string(), json!("abc12345"));
         p.insert("timeout".to_string(), json!(10));
-        assert_eq!(tool.execute(p).await, "waited abc12345 for 10s");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "waited abc12345 for 10s"
+        );
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("check"));
         p.insert("task_id".to_string(), json!("abc12345"));
-        assert_eq!(tool.execute(p).await, "checked abc12345");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "checked abc12345"
+        );
 
         // pipeline / loop
         let mut p = HashMap::new();
@@ -856,7 +966,10 @@ mod tests {
         );
         p.insert("ahead_by_k".to_string(), json!(2));
         assert_eq!(
-            tool.execute(p).await,
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
             "pipeline over [{\"prompt\":\"one\"},{\"prompt\":\"two\"}] ahead 2"
         );
 
@@ -864,7 +977,13 @@ mod tests {
         p.insert("action".to_string(), json!("loop"));
         p.insert("task".to_string(), json!("refine"));
         p.insert("max_rounds".to_string(), json!(3));
-        assert_eq!(tool.execute(p).await, "loop refine r3");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "loop refine r3"
+        );
     }
 
     #[tokio::test]
@@ -881,12 +1000,24 @@ mod tests {
         let tool = SpawnTool::new(Arc::new(d));
         let mut p = HashMap::new();
         p.insert("task".to_string(), json!("t"));
-        assert_eq!(tool.execute(p).await, "Error: Command timed out after 30s");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "Error: Command timed out after 30s"
+        );
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("check"));
         p.insert("task_id".to_string(), json!("x"));
-        assert_eq!(tool.execute(p).await, "Error: Network error: dns");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "Error: Network error: dns"
+        );
     }
 
     #[tokio::test]
@@ -895,26 +1026,41 @@ mod tests {
         // Tool-level validation errors are the exact legacy strings (no host
         // round-trip involved).
         let p = HashMap::new();
-        assert_eq!(tool.execute(p).await, "Error: 'task' parameter is required");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "Error: 'task' parameter is required"
+        );
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("wait"));
         assert_eq!(
-            tool.execute(p).await,
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
             "Error: 'task_id' parameter is required for wait"
         );
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("pipeline"));
         assert_eq!(
-            tool.execute(p).await,
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
             "Error: 'steps' parameter is required for pipeline"
         );
 
         let mut p = HashMap::new();
         p.insert("action".to_string(), json!("loop"));
         assert_eq!(
-            tool.execute(p).await,
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
             "Error: 'task' parameter is required for loop"
         );
     }
@@ -926,19 +1072,34 @@ mod tests {
 
         let mut p = HashMap::new();
         p.insert("content".to_string(), json!("hi"));
-        assert_eq!(tool.execute(p).await, "Message sent to telegram:42");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "Message sent to telegram:42"
+        );
 
         // Per-call channel/chat overrides win over the baked defaults.
         let mut p = HashMap::new();
         p.insert("content".to_string(), json!("hi"));
         p.insert("channel".to_string(), json!("discord"));
         p.insert("chat_id".to_string(), json!("999"));
-        assert_eq!(tool.execute(p).await, "Message sent to discord:999");
+        assert_eq!(
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
+            "Message sent to discord:999"
+        );
 
         // Missing content → the exact legacy MissingArg wire string.
         let p = HashMap::new();
         assert_eq!(
-            tool.execute(p).await,
+            crate::agent::tools::base::render_result(
+                tool.execute(p, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            ),
             "Error: 'content' parameter is required; call as message({\"content\":\"hello\"})"
         );
     }

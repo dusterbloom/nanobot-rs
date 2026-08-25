@@ -89,11 +89,7 @@ impl Tool for CreateSkillTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
@@ -125,9 +121,7 @@ impl Tool for CreateSkillTool {
         }
         if description.is_empty() || description.chars().count() > MAX_DESCRIPTION_CHARS {
             return Err(ToolError::InvalidArgs {
-                message: format!(
-                    "description must be 1..={MAX_DESCRIPTION_CHARS} characters."
-                ),
+                message: format!("description must be 1..={MAX_DESCRIPTION_CHARS} characters."),
             });
         }
         let body_lines = body.lines().count();
@@ -193,9 +187,17 @@ mod tests {
     async fn creates_valid_skill_visible_to_loader() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = CreateSkillTool::new(tmp.path());
-        let out = tool
-            .execute(params("brew-coffee", "How to brew coffee", "1. Grind beans\n2. Brew"))
-            .await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                params(
+                    "brew-coffee",
+                    "How to brew coffee",
+                    "1. Grind beans\n2. Brew",
+                ),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(out.contains("brew-coffee"), "created: {out}");
 
         // Hot-reload is free: a fresh loader scan sees it.
@@ -209,16 +211,40 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tool = CreateSkillTool::new(tmp.path());
 
-        let first = tool.execute(params("dup", "d", "b")).await;
+        let first = crate::agent::tools::base::render_result(
+            tool.execute(
+                params("dup", "d", "b"),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(first.contains("created"));
-        let dup = tool.execute(params("dup", "d", "b")).await;
+        let dup = crate::agent::tools::base::render_result(
+            tool.execute(
+                params("dup", "d", "b"),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(dup.starts_with("Error:"), "duplicate rejected: {dup}");
 
-        let bad = tool.execute(params("Bad_Name", "d", "b")).await;
+        let bad = crate::agent::tools::base::render_result(
+            tool.execute(
+                params("Bad_Name", "d", "b"),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(bad.starts_with("Error:"), "non-kebab rejected");
 
         let long_body = "line\n".repeat(201);
-        let oversized = tool.execute(params("big", "d", &long_body)).await;
+        let oversized = crate::agent::tools::base::render_result(
+            tool.execute(
+                params("big", "d", &long_body),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(oversized.starts_with("Error:"), ">200 lines rejected");
     }
 
@@ -229,9 +255,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let token = tokio_util::sync::CancellationToken::new();
         let ctx = ToolContext::new(None, tx, token, "test-call");
-        let res = tool
-            .execute_typed(params("BAD!", "d", "b"), &ctx)
-            .await;
+        let res = tool.execute(params("BAD!", "d", "b"), &ctx).await;
         assert!(res.is_err(), "funnel turns Error: string into ToolError");
     }
 }

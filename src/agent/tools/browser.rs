@@ -128,11 +128,7 @@ impl Tool for BrowserTool {
         *BINARY_AVAILABLE.get_or_init(check_binary)
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         // Fail fast if binary is missing — don't waste tokens on param validation.
         if !*BINARY_AVAILABLE.get_or_init(check_binary) {
             return Err(ToolError::ServiceUnavailable(INSTALL_HINT.to_string()));
@@ -375,7 +371,13 @@ mod tests {
     #[tokio::test]
     async fn test_missing_action() {
         let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
-        let result = tool.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.starts_with("Error:"));
         // If binary available, error mentions "action"; otherwise install hint.
         if tool.is_available() {
@@ -388,7 +390,10 @@ mod tests {
         let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("fly".to_string()));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error:"));
         if tool.is_available() {
             assert!(result.contains("fly"));
@@ -400,7 +405,10 @@ mod tests {
         let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("open".to_string()));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error:"));
         if tool.is_available() {
             assert!(result.contains("url"));
@@ -412,7 +420,10 @@ mod tests {
         let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("click".to_string()));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error:"));
         if tool.is_available() {
             assert!(result.contains("ref"));
@@ -426,7 +437,10 @@ mod tests {
         params.insert("action".to_string(), Value::String("type".to_string()));
         params.insert("ref".to_string(), Value::String("@e1".to_string()));
         // Missing 'text'
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error:"));
         if tool.is_available() {
             assert!(result.contains("text"));
@@ -438,7 +452,10 @@ mod tests {
         let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("search".to_string()));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error:"));
         if tool.is_available() {
             assert!(result.contains("query"));
@@ -454,7 +471,10 @@ mod tests {
             "direction".to_string(),
             Value::String("diagonal".to_string()),
         );
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.starts_with("Error:"));
         if tool.is_available() {
             assert!(result.contains("up") || result.contains("down"));

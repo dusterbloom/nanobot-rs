@@ -4449,10 +4449,10 @@ impl AgentLoopShared {
 mod tests {
     use super::{
         advance_response_boundary, apply_auto_expansion_candidates, commit_staged_auto_expansion,
-        divergent_message_digest,
-        materialize_auto_expansion, proactive_grounding_preserves_prefix_cache,
-        AppliedAutoExpansion, AutoExpansionMaterializationKind, HiggsSessionRoute,
-        PromptCacheSnapshot, ResponseBoundary, RetainedExpansionFailure,
+        divergent_message_digest, materialize_auto_expansion,
+        proactive_grounding_preserves_prefix_cache, AppliedAutoExpansion,
+        AutoExpansionMaterializationKind, HiggsSessionRoute, PromptCacheSnapshot, ResponseBoundary,
+        RetainedExpansionFailure,
     };
     use crate::agent::agent_core::{
         stable_higgs_session_id, ExpansionCheckpoint, RuntimeCounters, SessionRetirement,

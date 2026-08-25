@@ -14,6 +14,14 @@ regime (research doc: `docs/research/2026-08-06-error-conventions-and-host-bridg
   `HostBridgeAdapter`, and the 8 `build_tools` closures are deleted (research
   doc §3.7 Steps 2-3); the `host_bridge.rs` dead-code allow is gone and
   `set_*_callback` is gated by `clippy.toml` + the quality sentinel.
+- [x] **Phase 2 milestone**: every tool implements the typed
+  `execute(params, ctx) -> ToolResult` (the §2.6 Phase 3 flip): the String
+  `execute`/`execute_with_context`/`execute_with_result(_and_context)`
+  ladder and `funnel_legacy` are deleted; `require_param!` is the param
+  macro; `ToolError::from_legacy` moved private into `host_bridge`
+  (`tool_error_from_legacy`) — its serde wire round-trip is the only
+  consumer. `classify_tool_error` + `ToolErrorKind` remain in `errors.rs`
+  feeding `ToolExecutionResult` (the registry's audit shape).
 - [ ] **Phase 3 milestone**: zero modules carry the `Error-protocol layer-3 backlog` allow
 - [ ] **Phase 3 milestone**: `from_output` / `classify_tool_error` fully removed (see `scripts/quality-sentinel.sh`)
 

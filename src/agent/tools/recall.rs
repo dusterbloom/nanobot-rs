@@ -218,7 +218,14 @@ impl RecallTool {
             json!(self.workspace.display().to_string()),
         );
         file_params.insert("limit".to_string(), json!(n));
-        let out = super::SearchFilesTool.execute(file_params).await;
+        let out = crate::agent::tools::base::render_result(
+            super::SearchFilesTool
+                .execute(
+                    file_params,
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+        );
         let trimmed = out.trim();
         if trimmed.is_empty() || trimmed.starts_with("No matches") || trimmed.starts_with("Error") {
             return None;
@@ -687,11 +694,7 @@ impl Tool for RecallTool {
         })
     }
 
-    async fn execute_typed(
-        &self,
-        params: HashMap<String, Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
+    async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
         let has_query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -765,7 +768,6 @@ impl RecallTool {
 
         "Error: recall needs one of: 'query' (to search), 'session' or 'message_ids' (to fetch), or mode=\"latest\".".to_string()
     }
-
 }
 
 #[cfg(test)]
@@ -870,7 +872,10 @@ mod tests {
         let (_tmp, tool) = make_tool();
         let mut params = HashMap::new();
         params.insert("query".to_string(), json!(""));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("Error"));
     }
 
@@ -878,7 +883,13 @@ mod tests {
     #[tokio::test]
     async fn test_recall_empty_arg_returns_structural_missing_arg() {
         let (_tmp, tool) = make_tool();
-        let res = tool.execute_with_result(HashMap::new()).await;
+        let res = crate::agent::tools::base::ToolExecutionResult::from(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(!res.ok());
         assert!(matches!(
             res.error_kind(),
@@ -906,7 +917,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("query".to_string(), json!("Rust"));
         params.insert("mode".to_string(), json!("keyword"));
-        let result = tool.execute(params).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
         assert!(result.contains("Rust"), "Should find Rust in MEMORY.md");
     }
 
@@ -966,12 +980,13 @@ mod tests {
     #[tokio::test]
     async fn test_recall_rejects_topicless_memory_query() {
         let (_tmp, tool) = make_tool();
-        let result = tool
-            .execute(HashMap::from([(
-                "query".to_string(),
-                json!("what do you remember about me"),
-            )]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([("query".to_string(), json!("what do you remember about me"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.contains("No specific memory topic"), "got: {result}");
     }
 
@@ -993,7 +1008,13 @@ mod tests {
     #[tokio::test]
     async fn test_recall_missing_query_param_returns_error() {
         let (_tmp, tool) = make_tool();
-        let result = tool.execute(HashMap::new()).await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.contains("Error"),
             "missing curated-memory query must be rejected, got: {result}"
@@ -1059,12 +1080,16 @@ mod tests {
         )
         .await;
 
-        let result = tool
-            .execute(HashMap::from([
-                ("query".to_string(), json!("quasarledger")),
-                ("scope".to_string(), json!("memory")),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("query".to_string(), json!("quasarledger")),
+                    ("scope".to_string(), json!("memory")),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.contains("## Curated memory") && result.contains("quasarledger note"),
             "memory scope must surface curated fact: {result}"
@@ -1097,9 +1122,13 @@ mod tests {
         )
         .await;
 
-        let result = tool
-            .execute(HashMap::from([("query".to_string(), json!("rust"))]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([("query".to_string(), json!("rust"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         let mem_pos = result.find("## Curated memory");
         let sess_pos = result.find("## Past conversations");
         assert!(
@@ -1147,12 +1176,16 @@ mod tests {
             .await;
         let tool = tool.with_current_session_id(Some(current.id));
 
-        let result = tool
-            .execute(HashMap::from([
-                ("mode".to_string(), json!("latest")),
-                ("count".to_string(), json!(3)),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("mode".to_string(), json!("latest")),
+                    ("count".to_string(), json!(3)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.contains("cli:previous"), "got: {result}");
         assert!(!result.contains("cli:current"), "got: {result}");
     }
@@ -1169,12 +1202,13 @@ mod tests {
             ],
         )
         .await;
-        let result = tool
-            .execute(HashMap::from([(
-                "session".to_string(),
-                json!("20260717_224429_33c9c0"),
-            )]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([("session".to_string(), json!("20260717_224429_33c9c0"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.contains("Full session"), "got: {result}");
         assert!(result.contains("Diary of Two Threads"), "got: {result}");
         assert!(result.contains("two voices converge"), "got: {result}");
@@ -1194,12 +1228,16 @@ mod tests {
             ],
         )
         .await;
-        let result = tool
-            .execute(HashMap::from([
-                ("session".to_string(), json!("20260717_224429_33c9c0")),
-                ("message_ids".to_string(), json!("2-3")),
-            ]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("session".to_string(), json!("20260717_224429_33c9c0")),
+                    ("message_ids".to_string(), json!("2-3")),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(result.contains("Extracted 2 message(s)"), "got: {result}");
         assert!(
             result.contains("beta two") && result.contains("gamma three"),
@@ -1224,13 +1262,17 @@ mod tests {
             ],
         )
         .await;
-        let out = tool
-            .execute(HashMap::from([
-                ("mode".to_string(), json!("in_session")),
-                ("session".to_string(), json!("20260717_224429_33c9c0")),
-                ("query".to_string(), json!("Diary of Two Threads story")),
-            ]))
-            .await;
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("mode".to_string(), json!("in_session")),
+                    ("session".to_string(), json!("20260717_224429_33c9c0")),
+                    ("query".to_string(), json!("Diary of Two Threads story")),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(out.contains("returned in full"), "got: {out}");
         assert!(
             out.contains("Diary of Two Threads Entry 1 nano32"),
@@ -1245,9 +1287,13 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_without_db_returns_clear_error() {
         let (_tmp, tool) = make_tool();
-        let result = tool
-            .execute(HashMap::from([("mode".to_string(), json!("latest"))]))
-            .await;
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([("mode".to_string(), json!("latest"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
         assert!(
             result.contains("not available") || result.contains("Error"),
             "fetch without db_path must error clearly: {result}"
@@ -1267,7 +1313,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let token = tokio_util::sync::CancellationToken::new();
         let ctx = ToolContext::new(None, tx, token, "test-call");
-        let res = tool.execute_with_result_and_context(params, &ctx).await;
+        let res =
+            crate::agent::tools::base::ToolExecutionResult::from(tool.execute(params, &ctx).await);
         assert!(
             res.ok(),
             "should succeed via typed chain: {:?}",
