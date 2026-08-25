@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{Tool, ToolConcurrency, ToolContext};
-use crate::agent::tools::base::ToolResult;
+use super::base::{Tool, ToolConcurrency, ToolContext, ToolResult};
+use crate::errors::ToolError;
 
 const MAX_NAME_CHARS: usize = 48;
 const MAX_DESCRIPTION_CHARS: usize = 200;
@@ -89,7 +89,11 @@ impl Tool for CreateSkillTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
@@ -107,21 +111,30 @@ impl Tool for CreateSkillTool {
             .trim();
 
         if name.is_empty() {
-            return "Error: 'name' parameter is required (kebab-case, e.g. release-checklist)".to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "'name' parameter is required (kebab-case, e.g. release-checklist)"
+                    .to_string(),
+            });
         }
         if !is_kebab_case(name) {
-            return format!(
-                "Error: skill name must be kebab-case (lowercase letters, digits, single hyphens; <= {MAX_NAME_CHARS} chars), got '{name}'."
-            );
+            return Err(ToolError::InvalidArgs {
+                message: format!(
+                    "skill name must be kebab-case (lowercase letters, digits, single hyphens; <= {MAX_NAME_CHARS} chars), got '{name}'."
+                ),
+            });
         }
         if description.is_empty() || description.chars().count() > MAX_DESCRIPTION_CHARS {
-            return format!(
-                "Error: description must be 1..={MAX_DESCRIPTION_CHARS} characters."
-            );
+            return Err(ToolError::InvalidArgs {
+                message: format!(
+                    "description must be 1..={MAX_DESCRIPTION_CHARS} characters."
+                ),
+            });
         }
         let body_lines = body.lines().count();
         if body.is_empty() || body_lines > MAX_BODY_LINES {
-            return format!("Error: body must be 1..={MAX_BODY_LINES} lines, got {body_lines}.");
+            return Err(ToolError::InvalidArgs {
+                message: format!("body must be 1..={MAX_BODY_LINES} lines, got {body_lines}."),
+            });
         }
 
         let skill_dir = self.workspace.join("skills").join(name);
@@ -133,35 +146,34 @@ impl Tool for CreateSkillTool {
                 .into_iter()
                 .map(|s| s.name)
                 .collect();
-            return format!(
-                "Error: skill '{name}' already exists. Existing skills: {}",
-                available.join(", ")
-            );
+            return Err(ToolError::Execution {
+                message: format!(
+                    "skill '{name}' already exists. Existing skills: {}",
+                    available.join(", ")
+                ),
+            });
         }
 
         if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
-            return format!("Error creating skill directory: {e}");
+            // Legacy quirk preserved: no "Error:" prefix → success channel.
+            return Ok(format!("Error creating skill directory: {e}").into());
         }
         // Atomic publish: stage then rename, mirroring memory.rs writes.
         let tmp = skill_path.with_extension("md.tmp");
         if let Err(e) = tokio::fs::write(&tmp, render_skill_md(description, body)).await {
-            return format!("Error writing skill: {e}");
+            // Legacy quirk preserved: no "Error:" prefix → success channel.
+            return Ok(format!("Error writing skill: {e}").into());
         }
         if let Err(e) = tokio::fs::rename(&tmp, &skill_path).await {
-            return format!("Error publishing skill: {e}");
+            // Legacy quirk preserved: no "Error:" prefix → success channel.
+            return Ok(format!("Error publishing skill: {e}").into());
         }
 
-        format!(
+        Ok(format!(
             "Skill '{name}' created at {} and available on the next turn.",
             skill_path.display()
         )
-    }
-
-    /// Typed funnel (remember.rs pattern): validation failures classify as
-    /// model-fixable via `from_legacy`; success passes the created-path text.
-    async fn execute_typed(&self, params: HashMap<String, Value>, ctx: &ToolContext) -> ToolResult {
-        let out = self.execute_with_context(params, ctx).await;
-        crate::agent::tools::base::funnel_legacy(out)
+        .into())
     }
 }
 

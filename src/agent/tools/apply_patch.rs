@@ -12,8 +12,9 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{PermissionLevel, Tool};
-use super::filesystem::{expand_path, sha256_hex};
+use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
+use super::filesystem::{expand_path, idle_write_denied_err, sha256_hex};
+use crate::errors::ToolError;
 
 /// Tool to validate or apply unified diffs across one or more files.
 pub struct ApplyPatchTool {
@@ -68,10 +69,18 @@ impl Tool for ApplyPatchTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let patch = match params.get("patch").and_then(|v| v.as_str()) {
             Some(p) if !p.trim().is_empty() => p,
-            _ => return "Error: 'patch' parameter is required and must be non-empty".to_string(),
+            _ => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'patch' parameter is required and must be non-empty".to_string(),
+                })
+            }
         };
         let dry_run = params
             .get("dry_run")
@@ -85,7 +94,13 @@ impl Tool for ApplyPatchTool {
 
         let file_patches = match parse_file_patches(patch) {
             Ok(patches) => patches,
-            Err(e) => return e,
+            // Parser errors carry the legacy "Error: " prefix; strip it so
+            // render() re-prefixes exactly once.
+            Err(e) => {
+                return Err(ToolError::Execution {
+                    message: e.trim_start_matches("Error: ").to_string(),
+                })
+            }
         };
 
         let mut updates: Vec<(PathBuf, String, usize, usize)> = Vec::new();
@@ -102,29 +117,36 @@ impl Tool for ApplyPatchTool {
             if let Some(paths) = &self.idle_paths {
                 let workspace = crate::utils::helpers::get_workspace_path(None);
                 if !super::filesystem::idle_write_allowed(paths, &path, &workspace) {
-                    return super::filesystem::idle_write_denied(&path);
+                    return Err(idle_write_denied_err(&path));
                 }
             }
             let content = if path.exists() {
                 match tokio::fs::read(&path).await {
                     Ok(bytes) => {
                         if crate::utils::helpers::is_binary(&bytes) {
-                            return format!("Error: {} is binary; refusing to patch", fp.path);
+                            return Err(ToolError::InvalidArgs {
+                                message: format!("{} is binary; refusing to patch", fp.path),
+                            });
                         }
                         let current_hash = sha256_hex(&bytes);
                         if let Some(expected_hash) =
                             expected_hash_for_path(&expected, &fp.path, &path)
                         {
                             if !expected_hash.eq_ignore_ascii_case(&current_hash) {
-                                return format!(
-                                    "Error: File changed before patch. path={}, expected_sha256={}, actual_sha256={}",
-                                    fp.path, expected_hash, current_hash
-                                );
+                                // "expected_sha256" matched the legacy
+                                // InvalidArgs classifier; keep the kind.
+                                return Err(ToolError::InvalidArgs {
+                                    message: format!(
+                                        "File changed before patch. path={}, expected_sha256={}, actual_sha256={}",
+                                        fp.path, expected_hash, current_hash
+                                    ),
+                                });
                             }
                         }
                         String::from_utf8_lossy(&bytes).to_string()
                     }
-                    Err(e) => return format!("Error reading {}: {}", fp.path, e),
+                    // Legacy quirk preserved: no "Error:" prefix → success.
+                    Err(e) => return Ok(format!("Error reading {}: {}", fp.path, e).into()),
                 }
             } else {
                 String::new()
@@ -134,7 +156,13 @@ impl Tool for ApplyPatchTool {
             let (updated, hunks) = match apply_unified_patch_to_content(&content, &fp.patch) {
                 Ok(result) => result,
                 Err(e) => {
-                    return format!("Error: {}: {}", fp.path, e.trim_start_matches("Error: "))
+                    return Err(ToolError::Execution {
+                        message: format!(
+                            "{}: {}",
+                            fp.path,
+                            e.trim_start_matches("Error: ")
+                        ),
+                    })
                 }
             };
             let after_lines = updated.lines().count();
@@ -146,22 +174,24 @@ impl Tool for ApplyPatchTool {
         }
 
         if dry_run {
-            return lines.join("\n");
+            return Ok(lines.join("\n").into());
         }
 
         for (path, updated, _, _) in updates {
             if let Some(parent) = path.parent() {
                 if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    return format!("Error creating {}: {}", parent.display(), e);
+                    // Legacy quirk preserved: no "Error:" prefix → success.
+                    return Ok(format!("Error creating {}: {}", parent.display(), e).into());
                 }
             }
             if let Err(e) = tokio::fs::write(&path, updated).await {
-                return format!("Error writing {}: {}", path.display(), e);
+                // Legacy quirk preserved: no "Error:" prefix → success.
+                return Ok(format!("Error writing {}: {}", path.display(), e).into());
             }
         }
 
         lines.push("Patch applied successfully".to_string());
-        lines.join("\n")
+        Ok(lines.join("\n").into())
     }
 }
 

@@ -285,6 +285,15 @@ pub(crate) fn idle_write_denied(target: &Path) -> String {
     )
 }
 
+/// Typed form of [`idle_write_denied`] for tools returning [`ToolResult`].
+pub(crate) fn idle_write_denied_err(target: &Path) -> crate::errors::ToolError {
+    crate::errors::ToolError::PermissionDenied(
+        idle_write_denied(target)
+            .trim_start_matches("Error: ")
+            .to_string(),
+    )
+}
+
 /// Tool to edit a file by replacing text.
 pub struct EditFileTool {
     /// Idle-turn write allowlist; `None` on normal turns.

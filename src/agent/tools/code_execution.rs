@@ -30,7 +30,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::task;
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 use super::registry::{ToolConfig, ToolRegistry};
 
 // ---------------------------------------------------------------------------
@@ -272,16 +273,26 @@ impl Tool for CodeExecutionTool {
         self.enabled
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         if !self.enabled {
-            return "Error: execute_code tool is not enabled. \
+            return Err(ToolError::PermissionDenied(
+                "execute_code tool is not enabled. \
                 Set tools.codeExecution.enabled = true in config."
-                .to_string();
+                    .to_string(),
+            ));
         }
 
         let code = match params.get("code").and_then(|v| v.as_str()) {
             Some(c) if !c.trim().is_empty() => c.to_string(),
-            _ => return "Error: 'code' parameter is required and must not be empty".to_string(),
+            _ => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'code' parameter is required and must not be empty".to_string(),
+                })
+            }
         };
 
         // Build the complete script: stub + user code.
@@ -291,20 +302,30 @@ impl Tool for CodeExecutionTool {
         // Create a temp directory for this execution.
         let tmp_dir = match tempfile::tempdir() {
             Ok(d) => d,
-            Err(e) => return format!("Error: failed to create temp dir: {}", e),
+            Err(e) => {
+                return Err(ToolError::Execution {
+                    message: format!("failed to create temp dir: {}", e),
+                })
+            }
         };
 
         let script_path = tmp_dir.path().join("script.py");
         let socket_path = tmp_dir.path().join("rpc.sock");
 
         if let Err(e) = std::fs::write(&script_path, &full_script) {
-            return format!("Error: failed to write script: {}", e);
+            return Err(ToolError::Execution {
+                message: format!("failed to write script: {}", e),
+            });
         }
 
         // Open UDS listener before spawning the child so the socket exists.
         let listener = match UnixListener::bind(&socket_path) {
             Ok(l) => l,
-            Err(e) => return format!("Error: failed to bind RPC socket: {}", e),
+            Err(e) => {
+                return Err(ToolError::Execution {
+                    message: format!("failed to bind RPC socket: {}", e),
+                })
+            }
         };
 
         // Build a fresh registry for this execution.
@@ -343,7 +364,11 @@ impl Tool for CodeExecutionTool {
 
         let child = match child_result {
             Ok(c) => c,
-            Err(e) => return format!("Error: failed to spawn python3: {}", e),
+            Err(e) => {
+                return Err(ToolError::Execution {
+                    message: format!("failed to spawn python3: {}", e),
+                })
+            }
         };
 
         // Wait for child with timeout.
@@ -361,28 +386,33 @@ impl Tool for CodeExecutionTool {
 
                 if !out.status.success() && stdout.trim().is_empty() {
                     if stderr.trim().is_empty() {
-                        format!(
+                        Ok(format!(
                             "Script exited with code {}",
                             out.status.code().unwrap_or(-1)
                         )
+                        .into())
                     } else {
-                        format!(
+                        Ok(format!(
                             "Script error (exit {}): {}",
                             out.status.code().unwrap_or(-1),
                             stderr.trim()
                         )
+                        .into())
                     }
                 } else {
-                    stdout
+                    Ok(stdout.into())
                 }
             }
-            Ok(Err(e)) => format!("Error: waiting for child process failed: {}", e),
+            Ok(Err(e)) => Err(ToolError::Execution {
+                message: format!("waiting for child process failed: {}", e),
+            }),
             Err(_) => {
                 // kill_on_drop(true) ensures the child is killed when dropped.
-                format!(
-                    "Error: script timed out after {} seconds",
-                    self.timeout_secs
-                )
+                // Non-canonical timeout wording → Execution keeps legacy bytes
+                // (Timeout's render would rewrite them).
+                Err(ToolError::Execution {
+                    message: format!("script timed out after {} seconds", self.timeout_secs),
+                })
             }
         }
         // tmp_dir drops here, cleaning up script and socket.

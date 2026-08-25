@@ -16,7 +16,8 @@ use pyo3::types::PyDict;
 use serde_json::{json, Value};
 use tokio::task;
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 
 // ---------------------------------------------------------------------------
 // Capture stdout/stderr using only builtins (no import statements needed)
@@ -90,15 +91,28 @@ impl Tool for PythonKernel {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let code = match params.get("code").and_then(|v| v.as_str()) {
             Some(c) if !c.trim().is_empty() => c.to_string(),
-            _ => return "Error: 'code' parameter is required and must not be empty".to_string(),
+            None => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'code' parameter is required and must not be empty".to_string(),
+                })
+            }
+            Some(c) => c.to_string(),
         };
 
         let c_code = match CString::new(code) {
             Ok(c) => c,
-            Err(_) => return "Error: 'code' must not contain null bytes".to_string(),
+            Err(_) => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'code' must not contain null bytes".to_string(),
+                })
+            }
         };
 
         let globals = Arc::clone(&self.globals);
@@ -176,7 +190,14 @@ impl Tool for PythonKernel {
             ),
         };
         watchdog.join().ok();
-        output
+        // Thread output is a flat string; split the legacy error channel at
+        // this one boundary exactly as the funnel did (byte-identical).
+        match output.strip_prefix("Error:").map(str::trim) {
+            Some(err) => Err(ToolError::Execution {
+                message: err.to_string(),
+            }),
+            None => Ok(output.into()),
+        }
     }
 }
 

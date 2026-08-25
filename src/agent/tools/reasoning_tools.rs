@@ -17,7 +17,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use daggy::Dag;
 
-use super::base::Tool;
+use super::base::{Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 use crate::agent::reasoning::{EdgeType, PlanStep, ReasoningEngine, StepStatus};
 
 /// Shared handle to the reasoning engine, passed into each tool.
@@ -65,7 +66,11 @@ impl Tool for CheckpointTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let label = params
             .get("label")
             .and_then(|v| v.as_str())
@@ -84,7 +89,9 @@ impl Tool for CheckpointTool {
         let msgs = engine.current_messages().to_vec();
         engine.save_checkpoint(&label, &msgs, 0);
         let n = engine.checkpoint_count();
-        format!("Checkpoint '{}' saved. {} checkpoints on stack.", label, n)
+        Ok(
+            format!("Checkpoint '{}' saved. {} checkpoints on stack.", label, n).into(),
+        )
     }
 }
 
@@ -133,7 +140,11 @@ impl Tool for BacktrackTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let reason = params
             .get("reason")
             .and_then(|v| v.as_str())
@@ -166,17 +177,18 @@ impl Tool for BacktrackTool {
         };
 
         match checkpoint {
-            None => format!(
-                "Error: No checkpoint available to backtrack to (reason: {})",
+            None => Err(ToolError::NotFound(format!(
+                "No checkpoint available to backtrack to (reason: {})",
                 reason
-            ),
+            ))),
             Some(cp) => {
                 let cp_label = cp.label.clone();
                 engine.set_pending_restore(cp.messages.clone());
-                format!(
+                Ok(format!(
                     "Backtracking to checkpoint '{}'. Reason: {}. Conversation state will be restored.",
                     cp_label, reason
                 )
+                .into())
             }
         }
     }
@@ -241,19 +253,33 @@ impl Tool for PlanTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let steps_val = match params.get("steps") {
             Some(v) => v,
-            None => return "Error: 'steps' parameter is required".to_string(),
+            None => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'steps' parameter is required".to_string(),
+                })
+            }
         };
 
         let steps_arr = match steps_val.as_array() {
             Some(a) => a,
-            None => return "Error: 'steps' must be an array".to_string(),
+            None => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'steps' must be an array".to_string(),
+                })
+            }
         };
 
         if steps_arr.is_empty() {
-            return "Error: 'steps' array must not be empty".to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "'steps' array must not be empty".to_string(),
+            });
         }
 
         let step_budget = params
@@ -291,18 +317,22 @@ impl Tool for PlanTool {
                         None => continue,
                     };
                     if dep_idx_raw >= node_indices.len() {
-                        return format!(
-                            "Error: step {} depends_on index {} is out of range",
-                            i, dep_idx_raw
-                        );
+                        return Err(ToolError::InvalidArgs {
+                            message: format!(
+                                "step {} depends_on index {} is out of range",
+                                i, dep_idx_raw
+                            ),
+                        });
                     }
                     let from = node_indices[dep_idx_raw];
                     let to = node_indices[i];
                     if dag.add_edge(from, to, EdgeType::Dependency).is_err() {
-                        return format!(
-                            "Error: dependency from step {} to step {} would create a cycle",
-                            dep_idx_raw, i
-                        );
+                        return Err(ToolError::InvalidArgs {
+                            message: format!(
+                                "dependency from step {} to step {} would create a cycle",
+                                dep_idx_raw, i
+                            ),
+                        });
                     }
                 }
             }
@@ -321,10 +351,11 @@ impl Tool for PlanTool {
         let mut engine = self.engine.lock();
         *engine = new_engine;
 
-        format!(
+        Ok(format!(
             "Plan created with {} steps. Starting step 1: {}",
             n, first_goal
         )
+        .into())
     }
 }
 
