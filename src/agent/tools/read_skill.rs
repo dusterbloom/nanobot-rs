@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{Tool, ToolConcurrency};
+use super::base::{Tool, ToolConcurrency, ToolContext, ToolResult};
 use crate::agent::skills::SkillsLoader;
+use crate::errors::ToolError;
 
 /// Tool that reads a skill's full content by name.
 pub struct ReadSkillTool {
@@ -53,7 +54,11 @@ impl Tool for ReadSkillTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         // No name (or empty, or the legacy "__list__" sentinel) → list all
         // skills. Same discoverability contract as the `tool` proxy: call with
         // no args to discover, call with a name to load.
@@ -66,16 +71,16 @@ impl Tool for ReadSkillTool {
 
         if want_list {
             let summary = SkillsLoader::new(&self.workspace, None).build_skills_summary();
-            return if summary.is_empty() {
-                "No skills are installed.".to_string()
+            return Ok(if summary.is_empty() {
+                "No skills are installed.".into()
             } else {
-                summary
-            };
+                summary.into()
+            });
         }
 
         let loader = SkillsLoader::new(&self.workspace, None);
         match loader.load_skill(name) {
-            Some(content) => content,
+            Some(content) => Ok(content.into()),
             None => {
                 // List available skills to help the agent.
                 let available: Vec<String> = loader
@@ -84,16 +89,16 @@ impl Tool for ReadSkillTool {
                     .map(|s| s.name)
                     .collect();
                 if available.is_empty() {
-                    format!(
-                        "Error: Skill '{}' not found. No skills are installed.",
+                    Err(ToolError::NotFound(format!(
+                        "Skill '{}' not found. No skills are installed.",
                         name
-                    )
+                    )))
                 } else {
-                    format!(
-                        "Error: Skill '{}' not found. Available skills: {}",
+                    Err(ToolError::NotFound(format!(
+                        "Skill '{}' not found. Available skills: {}",
                         name,
                         available.join(", ")
-                    )
+                    )))
                 }
             }
         }

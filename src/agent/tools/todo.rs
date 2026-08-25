@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs;
 
-use super::base::{PermissionLevel, Tool};
+use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Todo {
@@ -114,15 +115,21 @@ impl Tool for TodoTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
         let mut items = self.load().await;
 
         match action {
-            "list" => Self::render(&items),
+            "list" => Ok(Self::render(&items).into()),
             "add" => {
                 let Some(text) = params.get("text").and_then(|v| v.as_str()) else {
-                    return "Error: 'text' is required for action=add".to_string();
+                    return Err(ToolError::InvalidArgs {
+                        message: "'text' is required for action=add".to_string(),
+                    });
                 };
                 let next_id = items.iter().map(|t| t.id).max().unwrap_or(0) + 1;
                 items.push(Todo {
@@ -131,32 +138,44 @@ impl Tool for TodoTool {
                     done: false,
                 });
                 if let Err(e) = self.save(&items).await {
-                    return format!("Error: {e}");
+                    return Err(ToolError::Execution {
+                        message: e.to_string(),
+                    });
                 }
-                format!("Added todo #{next_id}: {text}")
+                Ok(format!("Added todo #{next_id}: {text}").into())
             }
             "complete" => {
                 let Some(id) = params.get("id").and_then(|v| v.as_u64()) else {
-                    return "Error: 'id' is required for action=complete".to_string();
+                    return Err(ToolError::InvalidArgs {
+                        message: "'id' is required for action=complete".to_string(),
+                    });
                 };
                 let id = id as u32;
                 let Some(t) = items.iter_mut().find(|t| t.id == id) else {
-                    return format!("Error: no todo with id={id}");
+                    return Err(ToolError::NotFound(format!("no todo with id={id}")));
                 };
                 t.done = true;
                 let text = t.text.clone();
                 if let Err(e) = self.save(&items).await {
-                    return format!("Error: {e}");
+                    return Err(ToolError::Execution {
+                        message: e.to_string(),
+                    });
                 }
-                format!("Completed todo #{id}: {text}")
+                Ok(format!("Completed todo #{id}: {text}").into())
             }
             "clear" => {
                 if let Err(e) = self.save(&[]).await {
-                    return format!("Error: {e}");
+                    return Err(ToolError::Execution {
+                        message: e.to_string(),
+                    });
                 }
-                "Cleared all todos".to_string()
+                Ok("Cleared all todos".into())
             }
-            other => format!("Error: unknown action '{other}' (use add|list|complete|clear)"),
+            other => {
+                return Err(ToolError::InvalidArgs {
+                    message: format!("unknown action '{other}' (use add|list|complete|clear)"),
+                })
+            }
         }
     }
 }

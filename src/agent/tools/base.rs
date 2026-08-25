@@ -32,6 +32,27 @@ macro_rules! require_str {
 }
 pub(crate) use require_str;
 
+/// Typed twin of `require_str!` for tools whose `execute_typed` returns
+/// [`ToolResult`] (error protocol §2.6 Phase 2). Same message bytes —
+/// `InvalidArgs` renders `Error: 'key' parameter is required{suffix}` — so
+/// the registry's "is required" worked-example path behaves identically.
+macro_rules! require_param {
+    ($params:expr, $key:literal) => {
+        require_param!($params, $key, "")
+    };
+    ($params:expr, $key:literal, $suffix:literal) => {
+        match $params.get($key).and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => {
+                return Err(crate::errors::ToolError::InvalidArgs {
+                    message: concat!("'", $key, "' parameter is required", $suffix).to_string(),
+                })
+            }
+        }
+    };
+}
+pub(crate) use require_param;
+
 /// Permission level required to execute a tool.
 ///
 /// Ordered from least to most privileged. A registry's `max_permission`
@@ -167,6 +188,20 @@ pub struct ToolOutput {
     /// The model-facing text. May carry `TOOL_RESULT_HANDLE v1` receipts,
     /// `[truncated: …]` markers, or raw output.
     pub text: String,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self { text }
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+        }
+    }
 }
 
 /// The one result type of the tool layer.
@@ -311,8 +346,25 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with given parameters.
     ///
-    /// Returns the result as a string.
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String;
+    /// Legacy String channel (error protocol §2.6 Phase 2): the default
+    /// renders the typed [`execute_typed`] result — `Ok(text)` on success,
+    /// `Err(e.render())` on failure, byte-identical to the old funnel — so
+    /// migrated tools delete their String override and old callers/tests
+    /// keep working unchanged. Unmigrated tools still override this with a
+    /// String body; the trait flip (Phase 3) deletes the method.
+    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolContext::new(
+            None,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            String::new(),
+        );
+        match self.execute_typed(params, &ctx).await {
+            Ok(out) => out.text,
+            Err(e) => e.render(),
+        }
+    }
 
     /// Execute the tool with an execution context for progress reporting
     /// and cancellation.

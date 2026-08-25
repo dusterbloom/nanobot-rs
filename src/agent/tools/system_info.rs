@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-use super::base::Tool;
+use super::base::{Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 
 /// Tool to inspect process/disk/runtime state without hand-written shell calls.
 pub struct SystemInfoTool;
@@ -51,13 +52,19 @@ impl Tool for SystemInfoTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let action = params
             .get("action")
             .and_then(|v| v.as_str())
             .unwrap_or("overview");
         if !matches!(action, "overview" | "processes" | "disk" | "all") {
-            return "Error: 'action' must be one of: overview, processes, disk, all".to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "'action' must be one of: overview, processes, disk, all".to_string(),
+            });
         }
 
         let limit = params
@@ -68,20 +75,28 @@ impl Tool for SystemInfoTool {
         let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         match action {
-            "overview" => overview(),
-            "processes" => process_snapshot(limit).await,
+            "overview" => Ok(overview().into()),
+            "processes" => Ok(process_snapshot(limit).await.into()),
             "disk" => disk_snapshot(path).await,
             "all" => {
                 let mut out = overview();
                 out.push_str("\n\n## Processes\n");
                 out.push_str(&process_snapshot(limit).await);
                 out.push_str("\n\n## Disk\n");
-                out.push_str(&disk_snapshot(path).await);
-                out
+                // Legacy embedded a rendered disk error inline in the
+                // success report (the funnel only saw the final string);
+                // preserve those bytes.
+                out.push_str(&match disk_snapshot(path).await {
+                    Ok(o) => o.text,
+                    Err(e) => e.render(),
+                });
+                Ok(out.into())
             }
             // Defensive: action was validated above; unknown values are a
             // programming error, report rather than panic.
-            _ => "Error: 'action' must be one of: overview, processes, disk, all".to_string(),
+            _ => Err(ToolError::InvalidArgs {
+                message: "'action' must be one of: overview, processes, disk, all".to_string(),
+            }),
         }
     }
 }
@@ -142,25 +157,33 @@ async fn process_snapshot(limit: usize) -> String {
     }
 }
 
-async fn disk_snapshot(path: &str) -> String {
+async fn disk_snapshot(path: &str) -> ToolResult {
     let target = expand_path(path);
     if !target.exists() {
-        return format!("Error: Path not found for disk check: {}", path);
+        return Err(ToolError::NotFound(format!(
+            "Path not found for disk check: {}",
+            path
+        )));
     }
 
     #[cfg(unix)]
     {
         let path_arg = target.to_string_lossy().to_string();
         let output = run_command("df", &["-k", &path_arg], Duration::from_secs(5)).await;
-        return output.unwrap_or_else(|e| format!("Error reading disk usage: {}", e));
+        // Legacy returned the informational fallback as the success channel
+        // (only a leading "Error:" prefix is an error) — keep those bytes.
+        return Ok(output
+            .unwrap_or_else(|e| format!("Error reading disk usage: {}", e))
+            .into());
     }
 
     #[cfg(not(unix))]
     {
-        format!(
+        Ok(format!(
             "Disk usage is not available on this platform. Path exists: {}",
             target.display()
         )
+        .into())
     }
 }
 

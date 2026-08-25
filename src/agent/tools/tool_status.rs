@@ -19,9 +19,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::base::Tool;
+use super::base::{Tool, ToolContext, ToolResult};
 use crate::agent::audit::AuditEntry;
 use crate::agent::skills::SkillsLoader;
+use crate::errors::ToolError;
 
 const DEFAULT_RECENT_LIMIT: usize = 80;
 const MAX_RECENT_LIMIT: usize = 500;
@@ -67,14 +68,20 @@ impl Tool for ToolStatusTool {
         })
     }
 
-    async fn execute(&self, params: std::collections::HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: std::collections::HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let action = params
             .get("action")
             .and_then(|v| v.as_str())
             .unwrap_or("summary");
         if ToolStatusAction::parse(action).is_none() {
-            return "Error: 'action' must be one of: summary, learning, audit, skills, all"
-                .to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "'action' must be one of: summary, learning, audit, skills, all"
+                    .to_string(),
+            });
         }
         let recent_limit = params
             .get("recent_limit")
@@ -82,7 +89,7 @@ impl Tool for ToolStatusTool {
             .map(|v| (v as usize).clamp(1, MAX_RECENT_LIMIT))
             .unwrap_or(DEFAULT_RECENT_LIMIT);
 
-        build_tool_status_report(&self.workspace, action, recent_limit)
+        Ok(build_tool_status_report(&self.workspace, action, recent_limit).into())
     }
 }
 

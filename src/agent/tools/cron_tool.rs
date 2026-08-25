@@ -12,7 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::base::{require_str, PermissionLevel, Tool};
+use super::base::{require_param, PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 use crate::cron::executor::initial_next_run;
 use crate::cron::service::CronService;
 use crate::cron::types::CronSchedule;
@@ -46,27 +47,35 @@ impl CronScheduleTool {
         message: &str,
         every_seconds: Option<i64>,
         cron_expr: Option<&str>,
-    ) -> String {
+    ) -> ToolResult {
         if message.is_empty() {
-            return "Error: message is required for add".to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "message is required for add".to_string(),
+            });
         }
 
         let channel = self.channel.lock().await.clone();
         let chat_id = self.chat_id.lock().await.clone();
 
         if channel.is_empty() || chat_id.is_empty() {
-            return "Error: no session context (channel/chat_id)".to_string();
+            return Err(ToolError::Execution {
+                message: "no session context (channel/chat_id)".to_string(),
+            });
         }
 
         let Some(schedule) = build_schedule(every_seconds, cron_expr) else {
-            return "Error: either every_seconds or cron_expr is required".to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "either every_seconds or cron_expr is required".to_string(),
+            });
         };
 
         // Validate before persisting: an unschedulable job (bad cron expr,
         // non-positive interval) would sit in the store and never fire.
         let now_ms = chrono::Local::now().timestamp_millis();
         let Some(next_run_ms) = initial_next_run(&schedule, now_ms) else {
-            return "Error: invalid schedule (check cron expression / interval)".to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "invalid schedule (check cron expression / interval)".to_string(),
+            });
         };
 
         // Truncate name to 30 chars.
@@ -83,37 +92,43 @@ impl CronScheduleTool {
             false,
         );
 
-        format!(
+        Ok(format!(
             "Scheduled '{}' (id: {}, next run: {})",
             job.name,
             job.id,
             format_local(next_run_ms)
         )
+        .into())
     }
 
     /// Handle the "list" action.
-    async fn list_jobs(&self) -> String {
+    async fn list_jobs(&self) -> ToolResult {
         let jobs = self.cron_service.list_jobs(false);
         if jobs.is_empty() {
-            return "No scheduled jobs.".to_string();
+            return Ok("No scheduled jobs.".into());
         }
         let lines: Vec<String> = jobs
             .iter()
             .map(|j| format!("- {} (id: {}, {})", j.name, j.id, j.schedule.kind))
             .collect();
-        format!("Scheduled jobs:\n{}", lines.join("\n"))
+        Ok(format!("Scheduled jobs:\n{}", lines.join("\n")).into())
     }
 
     /// Handle the "remove" action.
-    async fn remove_job(&self, job_id: Option<&str>) -> String {
+    async fn remove_job(&self, job_id: Option<&str>) -> ToolResult {
         let job_id = match job_id {
             Some(id) if !id.is_empty() => id,
-            _ => return "Error: job_id is required for remove".to_string(),
+            _ => {
+                return Err(ToolError::InvalidArgs {
+                    message: "job_id is required for remove".to_string(),
+                })
+            }
         };
         if self.cron_service.remove_job(job_id) {
-            format!("Removed job {}", job_id)
+            Ok(format!("Removed job {}", job_id).into())
         } else {
-            format!("Job {} not found", job_id)
+            // Legacy quirk preserved: no "Error:" prefix → success channel.
+            Ok(format!("Job {} not found", job_id).into())
         }
     }
 }
@@ -190,8 +205,12 @@ impl Tool for CronScheduleTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let action = require_str!(params, "action");
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        let action = require_param!(params, "action");
 
         match action {
             "add" => {
@@ -205,7 +224,8 @@ impl Tool for CronScheduleTool {
                 let job_id = params.get("job_id").and_then(|v| v.as_str());
                 self.remove_job(job_id).await
             }
-            other => format!("Unknown action: {}", other),
+            // Legacy quirk preserved: no "Error:" prefix → success channel.
+            other => Ok(format!("Unknown action: {}", other).into()),
         }
     }
 }

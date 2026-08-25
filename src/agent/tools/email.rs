@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{require_str, PermissionLevel, Tool};
+use super::base::{require_param, PermissionLevel, Tool, ToolContext, ToolResult};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::email::{poll_inbox, poll_inbox_api, send_email};
 use crate::config::schema::EmailConfig;
@@ -46,7 +46,11 @@ impl Tool for CheckInboxTool {
         })
     }
 
-    async fn execute(&self, _params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        _params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
 
         let use_api = self.email_config.imap_host.contains("agentmail.to");
@@ -58,8 +62,9 @@ impl Tool for CheckInboxTool {
 
         drop(tx); // close sender so receiver drains
 
+        // Legacy quirk preserved: no "Error:" prefix → success channel.
         if let Err(e) = result {
-            return format!("Error checking inbox: {}", e);
+            return Ok(format!("Error checking inbox: {}", e).into());
         }
 
         let mut messages = Vec::new();
@@ -77,13 +82,14 @@ impl Tool for CheckInboxTool {
         }
 
         if messages.is_empty() {
-            "No new messages.".to_string()
+            Ok("No new messages.".into())
         } else {
-            format!(
+            Ok(format!(
                 "{} unread message(s):\n\n{}",
                 messages.len(),
                 messages.join("\n---\n")
             )
+            .into())
         }
     }
 }
@@ -142,10 +148,14 @@ impl Tool for SendEmailTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let to = require_str!(params, "to");
-        let subject = require_str!(params, "subject");
-        let body = require_str!(params, "body");
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        let to = require_param!(params, "to");
+        let subject = require_param!(params, "subject");
+        let body = require_param!(params, "body");
         let reply_to = params.get("reply_to_message_id").and_then(|v| v.as_str());
 
         let mut msg = OutboundMessage::new("email", format!("email:{}", to), body);
@@ -155,8 +165,9 @@ impl Tool for SendEmailTool {
         }
 
         match send_email(&self.email_config, &msg).await {
-            Ok(()) => format!("Email sent to {}", to),
-            Err(e) => format!("Error sending email: {}", e),
+            Ok(()) => Ok(format!("Email sent to {}", to).into()),
+            // Legacy quirk preserved: no "Error:" prefix → success channel.
+            Err(e) => Ok(format!("Error sending email: {}", e).into()),
         }
     }
 }

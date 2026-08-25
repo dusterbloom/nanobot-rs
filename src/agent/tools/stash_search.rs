@@ -24,7 +24,8 @@ use async_trait::async_trait;
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
 
-use crate::agent::tools::base::Tool;
+use crate::agent::tools::base::{Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 use crate::session::db::SessionDb;
 
 // ---------------------------------------------------------------------------
@@ -388,13 +389,19 @@ impl Tool for SearchToolResultTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let id = match params.get("tool_call_id").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => {
-                return "Error: tool_call_id is required. Pass the id from the \
+                return Err(ToolError::InvalidArgs {
+                    message: "tool_call_id is required. Pass the id from the \
                         [truncated: ...] preview block."
-                    .to_string();
+                        .to_string(),
+                })
             }
         };
         let body = SessionDb::new(&self.db_path)
@@ -408,7 +415,11 @@ impl Tool for SearchToolResultTool {
                     .build()
                 {
                     Ok(matcher) => matcher,
-                    Err(_) => return "Error: query could not be compiled.".to_string(),
+                    Err(_) => {
+                        return Err(ToolError::InvalidArgs {
+                            message: "query could not be compiled.".to_string(),
+                        })
+                    }
                 };
                 let max_results = clamp_results(params.get("max_results").and_then(|v| v.as_u64()));
                 let context_lines =
@@ -437,9 +448,11 @@ impl Tool for SearchToolResultTool {
                 render_slice_page(&body, &lines, id, start, end)
             }
         } else {
+            // Success channel by design: teaches the model why nothing was
+            // stashed instead of a bare error.
             Self::not_found(id)
         };
-        result
+        Ok(result.into())
     }
 }
 

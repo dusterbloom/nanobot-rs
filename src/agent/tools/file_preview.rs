@@ -12,8 +12,9 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{Tool, ToolConcurrency};
+use super::base::{Tool, ToolConcurrency, ToolContext, ToolResult};
 use super::filesystem::{resolve_read_path, sha256_hex};
+use crate::errors::ToolError;
 
 const SNIPPET_LINES: usize = 12;
 const OUTLINE_LIMIT: usize = 40;
@@ -52,10 +53,18 @@ impl Tool for FilePreviewTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) if !p.trim().is_empty() => p,
-            _ => return "Error: 'path' parameter is required".to_string(),
+            _ => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'path' parameter is required".to_string(),
+                })
+            }
         };
         let outline_limit = params
             .get("outline_limit")
@@ -67,17 +76,21 @@ impl Tool for FilePreviewTool {
         let metadata = match tokio::fs::metadata(&file_path).await {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return format!("Error: File not found: {}", path)
+                return Err(ToolError::NotFound(format!("File not found: {}", path)))
             }
-            Err(e) => return format!("Error reading metadata: {}", e),
+            // Legacy quirk preserved: without the "Error:" prefix this was a
+            // success-channel string, not an error result.
+            Err(e) => return Ok(format!("Error reading metadata: {}", e).into()),
         };
         if !metadata.is_file() {
-            return format!("Error: Not a file: {}", path);
+            return Err(ToolError::InvalidArgs {
+                message: format!("Not a file: {}", path),
+            });
         }
 
         let bytes = match tokio::fs::read(&file_path).await {
             Ok(b) => b,
-            Err(e) => return format!("Error reading file: {}", e),
+            Err(e) => return Ok(format!("Error reading file: {}", e).into()),
         };
         let lang = detect_language(path);
         let mut out = format!(
@@ -91,11 +104,11 @@ impl Tool for FilePreviewTool {
 
         if bytes.is_empty() {
             out.push_str("\nEmpty: true\nLines: 0");
-            return out;
+            return Ok(out.into());
         }
         if crate::utils::helpers::is_binary(&bytes) {
             out.push_str("\nBinary: true");
-            return out;
+            return Ok(out.into());
         }
 
         let content = String::from_utf8_lossy(&bytes);
@@ -127,7 +140,7 @@ impl Tool for FilePreviewTool {
             out.push_str("\n\n## Tail");
             append_numbered_snippet(&mut out, &lines, tail_start, total);
         }
-        out
+        Ok(out.into())
     }
 }
 
