@@ -16,7 +16,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::config::schema::{ProviderConfig, RetryConfig};
-use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::base::{LLMProvider, LLMResponse};
 use crate::providers::jit_gate::JitGate;
 use crate::providers::openai_compat::OpenAICompatProvider;
@@ -173,11 +172,6 @@ pub fn create_openai_compat(spec: ProviderSpec) -> Arc<dyn LLMProvider> {
     Arc::new(prov)
 }
 
-/// Create an Anthropic native provider (for OAuth / direct API).
-pub fn create_anthropic(token: &str, model: Option<&str>) -> Arc<dyn LLMProvider> {
-    Arc::new(AnthropicProvider::new(token, model))
-}
-
 struct MisconfiguredProvider {
     model: String,
     message: String,
@@ -240,7 +234,9 @@ pub fn from_provider_config_for_model(
 ///
 /// Routing rules (applied in order):
 /// 1. `api_base` contains `localhost` / `127.0.0.1` → OpenAICompat (local server).
-/// 2. `api_key` starts with `sk-ant-` AND model is Claude (or unspecified) → AnthropicProvider.
+/// 2. `api_key` starts with `sk-ant-` AND model is Claude (or unspecified) →
+///    OpenAICompat against the Anthropic OpenAI-compat endpoint (the native
+///    Messages client was demoted in v0.5 E4; revert the commit to restore).
 /// 3. Otherwise → OpenAICompat, using only explicit config or `default_base`.
 ///
 /// When the target `model` is known at the call site, pass it here so the
@@ -257,16 +253,21 @@ pub fn from_provider_config_for_model_with_default_base(
         }
     }
 
-    // Rule 2: Anthropic API key + Claude model (or no model specified) → AnthropicProvider.
+    // Rule 2: Anthropic API key + Claude model (or no model specified) →
+    // OpenAICompat against the Anthropic compat endpoint.
     if cfg.api_key.starts_with("sk-ant-") {
         let use_anthropic = match model {
             Some(m) => is_claude_model(m),
             None => true, // No model hint → assume Claude (backward compat).
         };
-        if use_anthropic {
-            return create_anthropic(&cfg.api_key, model);
+        if use_anthropic && cfg.api_base.is_none() && default_base.is_none() {
+            return openai_compat_from_config(
+                cfg,
+                model,
+                Some(crate::providers::constants::ANTHROPIC_API_BASE),
+            );
         }
-        if cfg.api_base.is_none() && default_base.is_none() {
+        if !use_anthropic && cfg.api_base.is_none() && default_base.is_none() {
             let model = model.unwrap_or("non-Claude model").to_string();
             return Arc::new(MisconfiguredProvider {
                 model: model.clone(),
@@ -352,12 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_anthropic() {
-        let provider = create_anthropic("test-token", Some("claude-sonnet-4-20250514"));
-        assert_eq!(provider.get_default_model(), "claude-sonnet-4-20250514");
-    }
-
-    #[test]
     fn test_from_provider_config_unknown_key_uses_openai_compat() {
         let cfg = ProviderConfig {
             api_key: "sk-test".to_string(),
@@ -419,14 +414,14 @@ mod tests {
     }
 
     #[test]
-    fn test_from_provider_config_anthropic_key_uses_anthropic_provider() {
+    fn test_from_provider_config_anthropic_key_routes_to_compat_endpoint() {
         let cfg = ProviderConfig {
             api_key: "sk-ant-api03-abc123".to_string(),
             api_base: None,
         };
         let provider = from_provider_config_for_model(&cfg, None);
-        // AnthropicProvider reports None for get_api_base() or the Anthropic base.
-        // The key check: it should NOT be pointing to localhost.
+        // The native client is demoted (v0.5 E4): an Anthropic key with no
+        // model hint routes OpenAICompat against the Anthropic compat base.
         let base = provider.get_api_base();
         if let Some(b) = base {
             assert!(
@@ -473,13 +468,12 @@ mod tests {
     // --- Model-aware routing tests (from_provider_config_for_model) ---
 
     #[test]
-    fn test_anthropic_key_with_claude_model_uses_anthropic() {
+    fn test_anthropic_key_with_claude_model_routes_compat() {
         let cfg = ProviderConfig {
             api_key: "sk-ant-api03-abc123".to_string(),
             api_base: None,
         };
         let provider = from_provider_config_for_model(&cfg, Some("claude-3-haiku-20240307"));
-        // AnthropicProvider has no api_base or returns the Anthropic URL.
         let base = provider.get_api_base();
         if let Some(b) = base {
             assert!(
@@ -488,7 +482,6 @@ mod tests {
                 b
             );
         }
-        // Also: the default model should be set.
         assert_eq!(provider.get_default_model(), "claude-3-haiku-20240307");
     }
 

@@ -95,7 +95,9 @@ Config chooses provider in this order (first non-empty API key wins):
 OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM.
 
 All providers use OpenAI-compatible chat completions API via
-`OpenAICompatProvider`, except Anthropic (native Messages API).
+`OpenAICompatProvider` — including Anthropic keys, which route against the
+Anthropic OpenAI-compat endpoint (the native Messages client was demoted in
+v0.5 E4; revert that commit to restore).
 
 ## Configuration
 

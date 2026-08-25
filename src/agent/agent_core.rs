@@ -1528,7 +1528,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         // "anthropic/claude-opus-4-5" that the local server doesn't understand.
         let tr_model = if !tool_delegation.model.is_empty() {
             tool_delegation.model.clone()
-        } else if is_auto_local || model.starts_with("claude-max") || model.contains('/') {
+        } else if is_auto_local || model.contains('/') {
             // Auto-spawned local delegation, or cloud model name — use provider default.
             tr_provider.get_default_model().to_string()
         } else {
