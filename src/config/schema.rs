@@ -1978,6 +1978,71 @@ impl Default for ProprioceptionConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Idle agency config
+// ---------------------------------------------------------------------------
+
+fn default_idle_after_secs() -> u64 {
+    900
+}
+
+fn default_idle_max_backoff_secs() -> u64 {
+    3600
+}
+
+fn default_idle_max_turns_per_hour() -> u32 {
+    4
+}
+
+fn default_idle_write_paths() -> Vec<String> {
+    vec!["skills/**".to_string(), "MEMORY.md".to_string()]
+}
+
+/// Idle-window agency (v0.5 E1). When the designated session has been quiet
+/// past `afterSecs` and the local inference server is already warm, the
+/// gateway injects one self-directed turn into the same session loop.
+/// Keep `afterSecs` well under `memory.sessionCompleteAfterSecs` (default
+/// 3600) or the idle observation lands in a freshly rolled-over session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdleConfig {
+    /// Enable idle turns (default: false). Gateway mode only.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Quiet time before the first idle turn (default: 900s).
+    #[serde(default = "default_idle_after_secs")]
+    pub after_secs: u64,
+    /// Backoff ceiling between consecutive idle turns (default: 3600s).
+    /// Actual wait doubles per consecutive fire and resets on any inbound.
+    #[serde(default = "default_idle_max_backoff_secs")]
+    pub max_backoff_secs: u64,
+    /// Hard cap on fired idle turns per sliding hour (default: 4).
+    #[serde(default = "default_idle_max_turns_per_hour")]
+    pub max_turns_per_hour: u32,
+    /// Designated idle session key ("channel:chat_id"). None = the most
+    /// recently active session (default: None).
+    #[serde(default)]
+    pub session_key: Option<String>,
+    /// Write allowlist enforced only during idle turns: workspace-relative
+    /// subtree ("skills/**"), workspace-relative exact file ("MEMORY.md"),
+    /// or absolute path. File tools deny everything else while idle.
+    #[serde(default = "default_idle_write_paths")]
+    pub write_paths: Vec<String>,
+}
+
+impl Default for IdleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            after_secs: default_idle_after_secs(),
+            max_backoff_secs: default_idle_max_backoff_secs(),
+            max_turns_per_hour: default_idle_max_turns_per_hour(),
+            session_key: None,
+            write_paths: default_idle_write_paths(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Voice config
 // ---------------------------------------------------------------------------
 
@@ -2363,6 +2428,8 @@ pub struct Config {
     #[serde(default)]
     pub proprioception: ProprioceptionConfig,
     #[serde(default)]
+    pub idle: IdleConfig,
+    #[serde(default)]
     pub trio: TrioConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
@@ -2494,6 +2561,35 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_config_defaults_and_parse() {
+        let cfg = Config::default();
+        assert!(!cfg.idle.enabled);
+        assert_eq!(cfg.idle.after_secs, 900);
+        assert_eq!(cfg.idle.max_backoff_secs, 3600);
+        assert_eq!(cfg.idle.max_turns_per_hour, 4);
+        assert_eq!(cfg.idle.session_key, None);
+        assert_eq!(
+            cfg.idle.write_paths,
+            vec!["skills/**".to_string(), "MEMORY.md".to_string()]
+        );
+
+        let parsed: Config = serde_json::from_str(
+            r#"{"idle": {"enabled": true, "afterSecs": 60, "sessionKey": "telegram:42",
+                        "writePaths": ["skills/**", "/abs/path/**"]}}"#,
+        )
+        .unwrap();
+        assert!(parsed.idle.enabled);
+        assert_eq!(parsed.idle.after_secs, 60);
+        assert_eq!(parsed.idle.session_key.as_deref(), Some("telegram:42"));
+        assert_eq!(parsed.idle.max_turns_per_hour, 4, "unspecified keep defaults");
+        assert_eq!(parsed.idle.write_paths.len(), 2);
+
+        // Partial old config with no idle block still parses to defaults.
+        let bare: Config = serde_json::from_str("{}").unwrap();
+        assert!(!bare.idle.enabled);
+    }
 
     #[test]
     fn test_default_config_serialization_roundtrip() {

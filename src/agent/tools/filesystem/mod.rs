@@ -243,8 +243,65 @@ fn is_sha256_hex(value: &str) -> bool {
     trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Idle-turn write gate (v0.5 E1). Entry forms: workspace-relative subtree
+/// ("skills/**"), workspace-relative exact file ("MEMORY.md"), or absolute
+/// path, optionally with a "/**" subtree suffix. Only idle turns pass an
+/// allowlist at all — a human watches normal turns.
+///
+/// Note: relative paths resolve against cwd first (see [`expand_path`]), so
+/// an idle "MEMORY.md" with cwd outside the workspace resolves outside the
+/// allowlist and is denied. Deny-over-surprise is the correct direction for
+/// an unattended turn; memory maintenance goes through remember/recall.
+pub(crate) fn idle_write_allowed(entries: &[String], target: &Path, workspace: &Path) -> bool {
+    let mut allowed = false;
+    for entry in entries {
+        let (raw, subtree) = match entry.strip_suffix("/**") {
+            Some(dir) => (dir, true),
+            None => (entry.as_str(), false),
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let base = Path::new(raw);
+        let matched = if base.is_absolute() {
+            subtree && target.starts_with(base) || (!subtree && target == base)
+        } else {
+            let ws = workspace.join(base);
+            subtree && target.starts_with(&ws) || (!subtree && target == ws)
+        };
+        if matched {
+            allowed = true;
+            break;
+        }
+    }
+    allowed
+}
+
+/// Consistent denial message for idle-turn writes outside the allowlist.
+pub(crate) fn idle_write_denied(target: &Path) -> String {
+    format!(
+        "Error: idle turns may only write to configured paths (idle.writePaths); denied: {}. Use the message tool to ask the user for wider access.",
+        target.display()
+    )
+}
+
 /// Tool to edit a file by replacing text.
-pub struct EditFileTool;
+pub struct EditFileTool {
+    /// Idle-turn write allowlist; `None` on normal turns.
+    pub idle_paths: Option<Vec<String>>,
+}
+
+impl Default for EditFileTool {
+    fn default() -> Self {
+        Self { idle_paths: None }
+    }
+}
+
+impl EditFileTool {
+    pub fn new(idle_paths: Option<Vec<String>>) -> Self {
+        Self { idle_paths }
+    }
+}
 
 #[async_trait]
 impl Tool for EditFileTool {
@@ -296,6 +353,12 @@ impl Tool for EditFileTool {
         };
 
         let file_path = expand_path(path);
+        if let Some(paths) = &self.idle_paths {
+            let workspace = crate::utils::helpers::get_workspace_path(None);
+            if !idle_write_allowed(paths, &file_path, &workspace) {
+                return idle_write_denied(&file_path);
+            }
+        }
 
         if !file_path.exists() {
             return format!("Error: File not found: {}. Hint: verify the path exists. Use list_dir to browse the directory.", path);
@@ -1679,6 +1742,57 @@ mod tests {
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------------
+    // idle write-allowlist tests
+    // -----------------------------------------------------------------------
+
+    fn idle_entries() -> Vec<String> {
+        vec![
+            "skills/**".to_string(),
+            "MEMORY.md".to_string(),
+            "/etc/nanobot/allow/**".to_string(),
+        ]
+    }
+
+    #[test]
+    fn idle_allowlist_subtree_exact_and_absolute() {
+        let ws = Path::new("/ws");
+        let e = idle_entries();
+        assert!(idle_write_allowed(&e, &ws.join("skills/foo/SKILL.md"), ws));
+        assert!(idle_write_allowed(&e, &ws.join("MEMORY.md"), ws));
+        assert!(idle_write_allowed(&e, &Path::new("/etc/nanobot/allow/x.toml"), ws));
+        // Denials: outside subtree, exact-file mismatch, foreign absolute.
+        // ("skills" the directory itself DOES match "skills/**" —
+        // starts_with includes the base — but a directory is not a
+        // writable file target, so this is harmless by construction.)
+        assert!(idle_write_allowed(&e, &ws.join("skills"), ws), "base dir matches its own /**");
+        assert!(!idle_write_allowed(&e, &ws.join("MEMORY.md.bak"), ws));
+        assert!(!idle_write_allowed(&e, &ws.join("workspace/other.md"), ws));
+        assert!(!idle_write_allowed(&e, &Path::new("/etc/passwd"), ws));
+        assert!(!idle_write_allowed(&e, &ws.join("secrets/MEMORY.md"), ws));
+        assert!(!idle_write_allowed(&[], &ws.join("MEMORY.md"), ws), "empty allowlist denies");
+    }
+
+    #[tokio::test]
+    async fn write_tool_enforces_idle_paths() {
+        let tool = crate::agent::tools::filesystem::write::WriteFileTool::new(Some(idle_entries()));
+        let ws = crate::utils::helpers::get_workspace_path(None);
+        let mut params = HashMap::new();
+        // Absolute path outside the allowlist (whatever the workspace is).
+        let outside = ws.parent().unwrap_or(&ws).join("definitely-not-allowed.txt");
+        params.insert(
+            "path".to_string(),
+            serde_json::json!(outside.to_string_lossy()),
+        );
+        params.insert("content".to_string(), serde_json::json!("x"));
+        let out = tool.execute(params).await;
+        assert!(
+            out.starts_with("Error: idle turns may only write"),
+            "denied write returned: {out}"
+        );
+        assert!(!outside.exists(), "denied write must not touch disk");
+    }
+
+    // -----------------------------------------------------------------------
     // expand_path tests
     // -----------------------------------------------------------------------
 
@@ -2180,7 +2294,7 @@ mod tests {
         let file_path = dir.path().join("edit_me.txt");
         std::fs::write(&file_path, "Hello World! This is a test.").unwrap();
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("old_text", "World"),
@@ -2199,7 +2313,7 @@ mod tests {
         let file_path = dir.path().join("no_op.txt");
         std::fs::write(&file_path, "unchanged").unwrap();
 
-        let result = EditFileTool
+        let result = EditFileTool::default()
             .execute(make_params(&[
                 ("path", file_path.to_str().unwrap()),
                 ("old_text", "unchanged"),
@@ -2228,7 +2342,7 @@ mod tests {
 -beta
 +BETTA";
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
         params.insert("patch".to_string(), serde_json::json!(patch));
         let result = tool.execute(params).await;
@@ -2244,7 +2358,7 @@ mod tests {
         let file_path = dir.path().join("guarded.txt");
         std::fs::write(&file_path, "current\n").unwrap();
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let mut params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("old_text", "current"),
@@ -2270,7 +2384,7 @@ mod tests {
         let file_path = dir.path().join("guarded.txt");
         std::fs::write(&file_path, "current\n").unwrap();
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let mut params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("old_text", "current"),
@@ -2296,7 +2410,7 @@ mod tests {
         let file_path = dir.path().join("edit_me.txt");
         std::fs::write(&file_path, "Hello World!").unwrap();
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("old_text", "nonexistent text"),
@@ -2312,7 +2426,7 @@ mod tests {
         let file_path = dir.path().join("dup.txt");
         std::fs::write(&file_path, "aaa bbb aaa").unwrap();
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("old_text", "aaa"),
@@ -2338,7 +2452,7 @@ mod tests {
         let file_path = dir.path().join("crlf.txt");
         std::fs::write(&file_path, "foo\r\nbar\r\n").unwrap();
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("old_text", "foo\nbar"),
@@ -2364,7 +2478,7 @@ mod tests {
         // On-disk content has a trailing space after `hello`.
         std::fs::write(&file_path, "hello \nworld\n").unwrap();
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("old_text", "hello\nworld"), // no trailing space
@@ -2384,7 +2498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_file_missing_file() {
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let params = make_params(&[
             ("path", "/tmp/nonexistent_nanobot_edit_test_xyz.txt"),
             ("old_text", "a"),
@@ -2396,7 +2510,7 @@ mod tests {
 
     #[test]
     fn test_edit_file_name() {
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         assert_eq!(tool.name(), "edit_file");
     }
 
@@ -2652,7 +2766,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_file_not_found_has_hint() {
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let params = make_params(&[
             ("path", "/tmp/nanobot_hint_test_nonexistent_edit_xyz.txt"),
             ("old_text", "a"),
@@ -2677,7 +2791,7 @@ mod tests {
         let file_path = dir.path().join("edit_hint.txt");
         std::fs::write(&file_path, "some existing content").unwrap();
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::default();
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("old_text", "text that does not exist in file"),

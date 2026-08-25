@@ -122,6 +122,9 @@ pub(crate) struct AgentLoopShared {
     pub(crate) system_state: Arc<arc_swap::ArcSwap<SystemState>>,
     /// Proprioception config (feature toggles).
     pub(crate) proprioception_config: ProprioceptionConfig,
+    /// Idle-window agency config + inbound tracker (gateway-only feature;
+    /// default-disabled). See `agent::idle`.
+    pub(crate) idle: crate::agent::idle::IdleRuntime,
     /// Receiver for priority signals from subagents (aha channel).
     pub(crate) aha_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<AhaSignal>>>,
     /// Sender for priority signals (given to subagent manager).

@@ -10083,3 +10083,168 @@ mod runtime_mode_parity_tests {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Idle-window agency (v0.5 E1) — full-path E2E through the real run() loop
+// ---------------------------------------------------------------------------
+
+/// End-to-end: a real inbound seeds the tracker; the idle timer (with a
+/// warm fake inference server) injects a self-directed turn onto the same
+/// bus; run() processes it through the normal lock/permit path; the turn
+/// is journaled in the session DB but its reply is suppressed
+/// (quiet-by-default), and the idle turn does not reset its own backoff.
+#[tokio::test]
+async fn idle_turn_e2e_injects_journaled_quiet_turn() {
+    use crate::bus::events::{InboundMessage, OutboundMessage};
+
+    // Fake warm inference server: any HTTP GET -> 200 with a JSON body.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let warm_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                    .await;
+            });
+        }
+    });
+
+    // Real loop, static-reply provider, isolated session DB.
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let db_path = workspace.join("sessions.db");
+    let provider = Arc::new(StaticResponseLLM::plain("idle-e2e", "noted."));
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider,
+        workspace: workspace.clone(),
+        model: "idle-e2e-model".to_string(),
+        max_iterations: 3,
+        max_continuations: 1,
+        max_tokens: 512,
+        temperature: 0.0,
+        max_context_tokens: 8192,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        crw_url: String::new(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: false,
+        memory_config: MemoryConfig::default(),
+        is_local: false,
+        lane: Lane::default(),
+        tool_delegation: ToolDelegationConfig::default(),
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        delegation_provider: None,
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(db_path.clone()),
+    });
+    let counters = test_runtime_counters(8192);
+    let core_handle = AgentHandle::new(core, counters);
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+    let mut agent_loop = AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx.clone(),
+        None,
+        2,
+        None,
+        None,
+        None,
+        ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    );
+
+    let idle_cfg = crate::config::schema::IdleConfig {
+        enabled: true,
+        after_secs: 1,
+        max_backoff_secs: 60,
+        max_turns_per_hour: 10,
+        session_key: None,
+        write_paths: vec!["skills/**".to_string(), "MEMORY.md".to_string()],
+    };
+    let tracker = agent_loop.set_idle_runtime(crate::agent::idle::IdleRuntime::new(
+        idle_cfg.clone(),
+    ));
+    let mut loop_for_run = agent_loop;
+    let run_handle = tokio::spawn(async move {
+        loop_for_run.run().await;
+    });
+
+    // Real inbound seeds the tracker and gets a normal (non-suppressed) reply.
+    inbound_tx
+        .send(InboundMessage::new("test", "human", "e2e", "hello"))
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(20), outbound_rx.recv())
+        .await
+        .expect("user turn reply within 20s")
+        .expect("outbound channel alive");
+    assert_eq!(first.chat_id, "e2e", "user turn replies to its chat");
+
+    // Idle timer with a 1s tick against the fake warm server.
+    tokio::spawn(crate::agent::idle::run_idle_timer_with_tick(
+        idle_cfg,
+        tracker,
+        inbound_tx.clone(),
+        format!("http://127.0.0.1:{warm_port}/v1"),
+        1,
+    ));
+
+    // Wait for the [idle] observation to be journaled in the session DB.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut idle_row_seen = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
+            let found: Result<i64, _> = conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE content LIKE '[idle]%'",
+                [],
+                |row| row.get(0),
+            );
+            if let Ok(n) = found {
+                if n > 0 {
+                    idle_row_seen = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    assert!(
+        idle_row_seen,
+        "idle observation journaled in the session DB within 30s"
+    );
+
+    // Quiet-by-default: after the journaled turn, allow a grace window for
+    // the (suppressed) reply path, then assert the outbound bus is empty.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        outbound_rx.try_recv().is_err(),
+        "idle turn reply must not reach the outbound bus"
+    );
+
+    run_handle.abort();
+    let _ = std::fs::remove_dir_all(&workspace);
+}

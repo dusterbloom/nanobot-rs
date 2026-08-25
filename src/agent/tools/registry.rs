@@ -64,6 +64,11 @@ pub struct ToolConfig {
     /// the "searxng" probe before calling SearXNG and returns a clear
     /// "degraded, restart the container" message instead of silent zero results.
     pub health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
+    /// Idle-turn write allowlist. `Some(..)` only on self-directed idle
+    /// turns: write_file / edit_file / apply_patch deny any path outside
+    /// these entries (workspace-relative "skills/**" subtree, exact file,
+    /// or absolute path). `None` on normal turns — a human is watching.
+    pub idle_write_paths: Option<Vec<String>>,
 }
 
 impl ToolConfig {
@@ -88,6 +93,7 @@ impl ToolConfig {
             python_kernel: PythonKernelConfig::default(),
             cua: crate::config::schema::CuaToolConfig::default(),
             health_registry: None,
+            idle_write_paths: None,
         }
     }
 }
@@ -347,13 +353,13 @@ impl ToolRegistry {
             self.register(Box::new(FilePreviewTool));
         }
         if should_include("write_file") {
-            self.register(Box::new(WriteFileTool::default()));
+            self.register(Box::new(WriteFileTool::new(config.idle_write_paths.clone())));
         }
         if should_include("edit_file") {
-            self.register(Box::new(EditFileTool));
+            self.register(Box::new(EditFileTool::new(config.idle_write_paths.clone())));
         }
         if should_include("apply_patch") {
-            self.register(Box::new(ApplyPatchTool));
+            self.register(Box::new(ApplyPatchTool::new(config.idle_write_paths.clone())));
         }
         if should_include("list_dir") {
             self.register(Box::new(ListDirTool));

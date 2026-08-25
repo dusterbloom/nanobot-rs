@@ -314,6 +314,7 @@ impl AgentLoopShared {
         core: &SwappableCore,
         channel: &str,
         chat_id: &str,
+        idle_write_paths: Option<Vec<String>>,
     ) -> (
         ToolRegistry,
         crate::agent::tools::reasoning_tools::SharedEngine,
@@ -342,6 +343,10 @@ impl AgentLoopShared {
             #[cfg(feature = "python-kernel")]
             python_kernel: core.python_kernel.clone(),
             cua: core.cua.clone(),
+            // Idle-turn write allowlist (None on normal turns): mutator file
+            // tools deny paths outside this list while the turn is idle
+            // (see `agent::idle`).
+            idle_write_paths,
             ..ToolConfig::new(&core.workspace)
         };
         let mut tools = ToolRegistry::with_standard_tools(&tool_config);

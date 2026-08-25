@@ -16,7 +16,22 @@ use super::base::{PermissionLevel, Tool};
 use super::filesystem::{expand_path, sha256_hex};
 
 /// Tool to validate or apply unified diffs across one or more files.
-pub struct ApplyPatchTool;
+pub struct ApplyPatchTool {
+    /// Idle-turn write allowlist; `None` on normal turns.
+    pub idle_paths: Option<Vec<String>>,
+}
+
+impl Default for ApplyPatchTool {
+    fn default() -> Self {
+        Self { idle_paths: None }
+    }
+}
+
+impl ApplyPatchTool {
+    pub fn new(idle_paths: Option<Vec<String>>) -> Self {
+        Self { idle_paths }
+    }
+}
 
 #[async_trait]
 impl Tool for ApplyPatchTool {
@@ -82,6 +97,14 @@ impl Tool for ApplyPatchTool {
 
         for fp in file_patches {
             let path = expand_path(&fp.path);
+            // Idle turns gate every patched path: hunks name targets the
+            // registry-level param check can never see.
+            if let Some(paths) = &self.idle_paths {
+                let workspace = crate::utils::helpers::get_workspace_path(None);
+                if !super::filesystem::idle_write_allowed(paths, &path, &workspace) {
+                    return super::filesystem::idle_write_denied(&path);
+                }
+            }
             let content = if path.exists() {
                 match tokio::fs::read(&path).await {
                     Ok(bytes) => {
@@ -491,7 +514,7 @@ mod tests {
             "expected_sha256_by_path".to_string(),
             Value::Object(expected),
         );
-        let out = ApplyPatchTool.execute(params).await;
+        let out = ApplyPatchTool::default().execute(params).await;
         assert!(out.contains("File changed before patch"), "{out}");
     }
 }

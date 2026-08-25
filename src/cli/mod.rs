@@ -761,6 +761,23 @@ pub(crate) async fn run_gateway_async(
         f(&mut agent_loop);
     }
 
+    // Idle-window agency (v0.5 E1): self-directed turns on the designated
+    // session when quiet, local-only, warm-only, lease-bounded. The timer
+    // injects on the same inbound bus run() drains (cron-executor
+    // precedent), so lock/permit machinery applies unchanged.
+    if config.idle.enabled {
+        let runtime = crate::agent::idle::IdleRuntime::new(config.idle.clone());
+        let idle_tracker = agent_loop.set_idle_runtime(runtime);
+        let idle_tx = inbound_tx.clone();
+        let idle_base = config.agents.defaults.local_api_base.clone();
+        tokio::spawn(crate::agent::idle::run_idle_timer(
+            config.idle.clone(),
+            idle_tracker,
+            idle_tx,
+            idle_base,
+        ));
+    }
+
     // Start cluster discovery in the background (when cluster feature is enabled).
     #[cfg(feature = "cluster")]
     if config.cluster.enabled {

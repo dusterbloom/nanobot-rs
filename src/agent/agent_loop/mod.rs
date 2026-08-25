@@ -174,6 +174,7 @@ impl AgentLoop {
             repl_display_tx,
             system_state,
             proprioception_config,
+            idle: crate::agent::idle::IdleRuntime::default(),
             aha_rx: Arc::new(Mutex::new(aha_rx)),
             aha_tx,
             session_policies: Arc::new(Mutex::new(HashMap::new())),
@@ -211,6 +212,17 @@ impl AgentLoop {
         let subagents = Arc::get_mut(&mut shared.subagents)
             .expect("set_cluster_router: subagents Arc already shared");
         subagents.cluster_router = Some(router);
+    }
+
+    /// Wire idle-window agency (gateway only, before `run()`). The returned
+    /// tracker Arc is the same one the idle timer task polls; `run()` notes
+    /// real inbound activity into it.
+    pub fn set_idle_runtime(&mut self, runtime: crate::agent::idle::IdleRuntime) -> Arc<crate::agent::idle::IdleTracker> {
+        // SAFETY: we hold &mut self so no concurrent access exists yet.
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("set_idle_runtime called after shared Arc was cloned");
+        shared.idle = runtime;
+        shared.idle.tracker.clone()
     }
 
     /// Check whether the in-process MLX provider is set.
@@ -286,8 +298,11 @@ impl AgentLoop {
 
             // Coalesce rapid messages from the same session (Telegram, WhatsApp).
             // Waits up to 400ms for follow-up messages before processing.
+            // Idle turns never coalesce: their observation must not be glued
+            // onto a real user message arriving in the window.
             let msg = if crate::bus::events::should_coalesce(&msg.channel)
                 && !msg.content.trim_start().starts_with('/')
+                && !crate::agent::idle::is_idle_message(&msg)
             {
                 let session = msg.session_key();
                 let mut batch = vec![msg];
@@ -336,6 +351,18 @@ impl AgentLoop {
                     error!("Failed to publish outbound message: {}", e);
                 }
                 continue;
+            }
+
+            // Idle-turn activity bookkeeping: record real inbound for the
+            // idle timer's designated-session resolution and backoff reset.
+            // Placed after the is_system branch (internal events are not
+            // user activity) and skipped for idle turns themselves — an
+            // agent's own thoughts must not reset its idle backoff.
+            if !crate::agent::idle::is_idle_message(&msg) {
+                self.shared
+                    .idle
+                    .tracker
+                    .note_inbound(&msg.channel, &msg.chat_id);
             }
 
             // Get or create the per-session lock.
@@ -406,8 +433,11 @@ impl AgentLoop {
                 // For Telegram: set up streaming with typing indicator + progressive edits.
                 // The actual streaming logic (typing action, placeholder, throttled edits)
                 // lives in channels/telegram.rs::spawn_stream_editor so the hot path
-                // stays channel-agnostic.
-                let stream_tx = if msg.channel == "telegram" {
+                // stays channel-agnostic. Idle turns skip it: no typing indicators
+                // or placeholder edits for self-directed turns (quiet by default).
+                let stream_tx = if msg.channel == "telegram"
+                    && !crate::agent::idle::is_idle_message(&msg)
+                {
                     let bot_token = msg
                         .metadata
                         .get("bot_token")
@@ -422,6 +452,21 @@ impl AgentLoop {
                 let response = shared
                     .process_message(&msg, stream_tx, None, None, None)
                     .await;
+
+                // Quiet by default for idle turns: the final reply is logged
+                // instead of sent — the agent reaches the human only through
+                // an explicit `message` tool call (Q2 decision, v0.5 E1).
+                if crate::agent::idle::is_idle_message(&msg) {
+                    match response {
+                        Some(outbound) => info!(
+                            channel = %outbound.channel,
+                            "idle turn completed (reply suppressed)"
+                        ),
+                        None => warn!("idle turn errored during processing"),
+                    }
+                    drop(permit);
+                    return;
+                }
 
                 let outbound = match response {
                     Some(mut outbound) => {

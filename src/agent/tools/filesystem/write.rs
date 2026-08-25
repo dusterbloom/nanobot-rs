@@ -96,12 +96,24 @@ struct WriteState {
 /// Tool to write content to a file.
 pub struct WriteFileTool {
     state: Mutex<WriteState>,
+    /// Idle-turn write allowlist; `None` on normal turns.
+    idle_paths: Option<Vec<String>>,
 }
 
 impl Default for WriteFileTool {
     fn default() -> Self {
         Self {
             state: Mutex::new(WriteState::default()),
+            idle_paths: None,
+        }
+    }
+}
+
+impl WriteFileTool {
+    pub fn new(idle_paths: Option<Vec<String>>) -> Self {
+        Self {
+            state: Mutex::new(WriteState::default()),
+            idle_paths,
         }
     }
 }
@@ -142,6 +154,12 @@ impl WriteFileTool {
         let piece_chars = content.chars().count();
 
         let target_path = expand_write_path(path);
+        if let Some(paths) = &self.idle_paths {
+            let workspace = crate::utils::helpers::get_workspace_path(None);
+            if !super::idle_write_allowed(paths, &target_path, &workspace) {
+                return super::idle_write_denied(&target_path);
+            }
+        }
         if let Some(parent) = target_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return format!(

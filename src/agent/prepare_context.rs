@@ -265,8 +265,16 @@ impl AgentLoopShared {
         // Build per-message tools with context baked in.
         // The reasoning engine is returned alongside the registry so it can be
         // stored in TurnContext for plan-guided execution and backtracking.
-        let (mut tools, reasoning_engine) =
-            self.build_tools(&core, &msg.channel, &msg.chat_id).await;
+        // Idle turns get a write allowlist (skills/MEMORY) — no human is
+        // watching a self-directed turn (see `agent::idle`).
+        let idle_write_paths = if crate::agent::idle::is_idle_message(msg) {
+            Some(self.idle.config.write_paths.clone())
+        } else {
+            None
+        };
+        let (mut tools, reasoning_engine) = self
+            .build_tools(&core, &msg.channel, &msg.chat_id, idle_write_paths)
+            .await;
         let tools_ms = lap_ms();
 
         // Resolve the concrete SQLite session before constructing any state
