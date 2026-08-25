@@ -20,7 +20,10 @@ use reqwest::Client;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::base::{require_str, PermissionLevel, Tool, ToolConcurrency, ToolContext};
+use super::base::{
+    require_param, PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult,
+};
+use crate::errors::ToolError;
 use crate::agent::audit::ToolEvent;
 
 /// Shared user-agent string.
@@ -276,31 +279,12 @@ impl Tool for WebSearchTool {
         (self.provider == "searxng" && !self.searxng_url.is_empty()) || !self.api_key.is_empty()
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let query = require_str!(params, "query");
-
-        let count = params
-            .get("count")
-            .and_then(|v| v.as_u64())
-            .map(|n| n.min(10).max(1) as u32)
-            .unwrap_or(self.max_results);
-
-        match self.provider.as_str() {
-            "searxng" => self.execute_searxng(query, count).await,
-            "brave" => self.execute_brave(query, count).await,
-            other => format!(
-                "Error: unknown search provider '{}'. Use 'searxng' or 'brave'.",
-                other
-            ),
-        }
-    }
-
-    async fn execute_with_context(
+    async fn execute_typed(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolContext,
-    ) -> String {
-        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    ) -> ToolResult {
+        let query = require_param!(params, "query");
 
         let _ = ctx.emit(ToolEvent::Progress {
             tool_name: "web_search".to_string(),
@@ -309,7 +293,32 @@ impl Tool for WebSearchTool {
             output_preview: Some(format!("Searching: {}", query)),
         });
 
-        self.execute(params).await
+        let count = params
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.min(10).max(1) as u32)
+            .unwrap_or(self.max_results);
+
+        let out = match self.provider.as_str() {
+            "searxng" => self.execute_searxng(query, count).await,
+            "brave" => self.execute_brave(query, count).await,
+            other => {
+                return Err(ToolError::InvalidArgs {
+                    message: format!(
+                        "unknown search provider '{}'. Use 'searxng' or 'brave'.",
+                        other
+                    ),
+                })
+            }
+        };
+        // One boundary: backend executors are String-shaped; strip the
+        // legacy prefix so render() re-prefixes exactly once.
+        match out.strip_prefix("Error:").map(str::trim) {
+            Some(err) => Err(ToolError::Execution {
+                message: err.to_string(),
+            }),
+            None => Ok(out.into()),
+        }
     }
 }
 
@@ -678,7 +687,38 @@ impl Tool for WebFetchTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolContext,
+    ) -> ToolResult {
+        let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("");
+
+        let _ = ctx.emit(ToolEvent::Progress {
+            tool_name: "web_fetch".to_string(),
+            tool_call_id: ctx.call_id().to_string(),
+            elapsed_ms: 0,
+            output_preview: Some(format!("Fetching: {}", url)),
+        });
+
+        let result = self.run(params).await;
+
+        let _ = ctx.emit(ToolEvent::Progress {
+            tool_name: "web_fetch".to_string(),
+            tool_call_id: ctx.call_id().to_string(),
+            elapsed_ms: 0,
+            output_preview: Some("Extracting content...".to_string()),
+        });
+
+        // JSON envelopes carry their own {"error": ...} channel — legacy
+        // never emitted these as tool errors, so every envelope is Ok.
+        Ok(result.into())
+    }
+}
+
+impl WebFetchTool {
+    /// Legacy String body, called only by [`WebFetchTool::execute_typed`].
+    async fn run(&self, params: HashMap<String, serde_json::Value>) -> String {
         let url = match params.get("url").and_then(|v| v.as_str()) {
             Some(u) => u,
             None => return serde_json::json!({"error": "url parameter is required"}).to_string(),
@@ -793,32 +833,6 @@ impl Tool for WebFetchTool {
             })
             .to_string(),
         }
-    }
-
-    async fn execute_with_context(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-        ctx: &ToolContext,
-    ) -> String {
-        let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("");
-
-        let _ = ctx.emit(ToolEvent::Progress {
-            tool_name: "web_fetch".to_string(),
-            tool_call_id: ctx.call_id().to_string(),
-            elapsed_ms: 0,
-            output_preview: Some(format!("Fetching: {}", url)),
-        });
-
-        let result = self.execute(params).await;
-
-        let _ = ctx.emit(ToolEvent::Progress {
-            tool_name: "web_fetch".to_string(),
-            tool_call_id: ctx.call_id().to_string(),
-            elapsed_ms: 0,
-            output_preview: Some("Extracting content...".to_string()),
-        });
-
-        result
     }
 }
 
@@ -1688,7 +1702,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             serde_json::Value::String("rust programming".to_string()),
         );
 
-        tool.execute_with_context(params, &ctx).await;
+        tool.execute_typed(params, &ctx).await;
 
         let first = rx.try_recv().expect("Expected at least one progress event");
         match first {
@@ -1727,7 +1741,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             serde_json::Value::String("ftp://invalid-url-that-fails-fast".to_string()),
         );
 
-        tool.execute_with_context(params, &ctx).await;
+        tool.execute_typed(params, &ctx).await;
 
         let mut events = vec![];
         while let Ok(ev) = rx.try_recv() {
@@ -1767,7 +1781,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             serde_json::Value::String("ftp://example.com".to_string()),
         );
 
-        tool.execute_with_context(params, &ctx).await;
+        tool.execute_typed(params, &ctx).await;
 
         let mut events = vec![];
         while let Ok(ev) = rx.try_recv() {

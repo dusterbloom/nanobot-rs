@@ -30,7 +30,8 @@ static RE_POSIX_PATH: LazyLock<Regex> =
 static RE_WIN_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).expect("static regex"));
 
-use super::base::{require_str, PermissionLevel, Tool, ToolContext};
+use super::base::{require_param, PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::errors::ToolError;
 use crate::agent::audit::ToolEvent;
 
 /// Default deny patterns for dangerous shell commands.
@@ -419,67 +420,23 @@ impl Tool for ExecTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let command = require_str!(params, "command");
-
-        let cwd = self.resolve_cwd(&params);
-
-        // Safety guard.
-        if let Some(error) = self.guard_command(command, &cwd) {
-            return error;
-        }
-
-        let timeout = self.effective_timeout(&params);
-        let result = tokio::time::timeout(Duration::from_secs(timeout), async {
-            let output = Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&cwd)
-                .output()
-                .await;
-
-            match output {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    Self::format_output(&stdout, &stderr, &output.status)
-                }
-                Err(e) => self.spawn_error_hint(&e, &cwd),
-            }
-        })
-        .await;
-
-        let output = match result {
-            Ok(s) => s,
-            Err(_) => {
-                format!("Error: Command timed out after {} seconds. Hint: try a simpler command or break it into smaller steps, or set a longer timeout.", timeout)
-            }
-        };
-
-        // NOTE: no truncation here. The tool-result ingestion layer
-        // (`inject_tool_result` / `build_tool_result_preview` in
-        // `tool_engine.rs`) stashes the FULL body to SQLite and replaces it in
-        // context with a bounded head+tail preview, plus a recall/search
-        // pointer. Truncating here would destroy data before it can be stashed,
-        // making search_tool_result/slice_tool_result/recall_tool_result
-        // operate on already-lossy data.
-        output
-    }
-
-    async fn execute_with_context(
+    async fn execute_typed(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolContext,
-    ) -> String {
+    ) -> ToolResult {
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let command = require_str!(params, "command");
+        let command = require_param!(params, "command");
 
         let cwd = self.resolve_cwd(&params);
 
+        // Safety guard: policy denials keep their full hint text.
         if let Some(error) = self.guard_command(command, &cwd) {
-            return error;
+            return Err(ToolError::PermissionDenied(
+                error.trim_start_matches("Error: ").to_string(),
+            ));
         }
 
         // Emit a "start" progress event so the REPL shows the command immediately.
@@ -591,15 +548,30 @@ impl Tool for ExecTool {
             Err(_) => format!("Error: Command timed out after {} seconds. Hint: try a simpler command or break it into smaller steps, or set a longer timeout.", timeout),
         };
 
-        // No truncation: the tool-result ingestion layer (see comment in
-        // `execute`) stashes the full body and bounds the in-context preview.
-        output
+        // One boundary (python_kernel pattern). The timeout wording here is
+        // NOT the canonical Timeout render (it carries a hint suffix), so it
+        // stays Execution — Timeout would rewrite the bytes.
+        match output.strip_prefix("Error:").map(str::trim) {
+            Some(err) => Err(ToolError::Execution {
+                message: err.to_string(),
+            }),
+            None => Ok(output.into()),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bridge for String-shaped assertions: render the typed result exactly
+    /// as the model would see it.
+    fn render_result(r: ToolResult) -> String {
+        match r {
+            Ok(out) => out.text,
+            Err(e) => e.render(),
+        }
+    }
 
     /// Create an ExecTool with default deny patterns, no allow patterns,
     /// and workspace restriction enabled.
@@ -1118,7 +1090,7 @@ mod tests {
             ),
         );
 
-        let result = tool.execute_with_context(params, &ctx).await;
+        let result = render_result(tool.execute_typed(params, &ctx).await);;
         assert!(result.contains("end"));
 
         // Collect all Progress events (includes start event with elapsed_ms=0)
@@ -1162,7 +1134,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let result = tool.execute_with_context(params, &ctx).await;
+        let result = render_result(tool.execute_typed(params, &ctx).await);;
         let elapsed = start.elapsed();
 
         assert!(
@@ -1193,7 +1165,7 @@ mod tests {
             serde_json::Value::String("true".to_string()),
         );
 
-        let result = tool.execute_with_context(params, &ctx).await;
+        let result = render_result(tool.execute_typed(params, &ctx).await);;
         assert_eq!(result, "(no output)");
 
         // Fast command emits exactly one "start" progress event with the command preview.
@@ -1238,7 +1210,7 @@ mod tests {
             serde_json::Value::String("echo error_msg >&2".to_string()),
         );
 
-        let result = tool.execute_with_context(params, &ctx).await;
+        let result = render_result(tool.execute_typed(params, &ctx).await);;
         assert!(
             result.contains("STDERR:"),
             "Expected STDERR prefix, got: {}",
@@ -1263,7 +1235,7 @@ mod tests {
             serde_json::Value::String("rm -rf /".to_string()),
         );
 
-        let result = tool.execute_with_context(params, &ctx).await;
+        let result = render_result(tool.execute_typed(params, &ctx).await);;
         assert!(
             result.contains("blocked"),
             "Blocked command should still be blocked with context, got: {}",
@@ -1287,7 +1259,7 @@ mod tests {
             serde_json::Value::String("echo hello".to_string()),
         );
 
-        tool.execute_with_context(params, &ctx).await;
+        let result = render_result(tool.execute_typed(params, &ctx).await);
 
         // The very first event must be a Progress with "Running: echo hello".
         let first = rx.try_recv().expect("Expected at least one progress event");
@@ -1323,7 +1295,7 @@ mod tests {
             serde_json::Value::String("echo hello world".to_string()),
         );
 
-        let ctx_result = tool.execute_with_context(params.clone(), &ctx).await;
+        let ctx_result = render_result(tool.execute_typed(params.clone(), &ctx).await);
         let plain_result = tool.execute(params).await;
         // Streaming uses BufReader::lines() which strips trailing newlines;
         // .output() preserves them. Both are equivalent for tool results.
@@ -1351,7 +1323,7 @@ mod tests {
             serde_json::Value::String("echo preview_line && sleep 2".to_string()),
         );
 
-        let _result = tool.execute_with_context(params, &ctx).await;
+        let _result = render_result(tool.execute_typed(params, &ctx).await);
 
         // Find a progress event with output_preview containing our line
         let mut found_preview = false;
@@ -1388,7 +1360,7 @@ mod tests {
             serde_json::Value::String("exit 42".to_string()),
         );
 
-        let result = tool.execute_with_context(params, &ctx).await;
+        let result = render_result(tool.execute_typed(params, &ctx).await);;
         assert!(
             result.contains("Exit code:"),
             "Expected exit code in output, got: {}",
