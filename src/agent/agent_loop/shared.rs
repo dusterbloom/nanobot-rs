@@ -144,9 +144,6 @@ pub(crate) struct AgentLoopShared {
     pub(crate) lcm_config: LcmSchemaConfig,
     /// Health probes for foreground/router/specialist providers.
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
-    /// Cluster router for distributed inference (feature-gated).
-    #[cfg(feature = "cluster")]
-    pub(crate) cluster_router: Option<Arc<crate::cluster::router::ClusterRouter>>,
     /// Knowledge store for proactive grounding retrieval.
     pub(crate) knowledge_store:
         Option<Arc<parking_lot::Mutex<crate::agent::knowledge_store::KnowledgeStore>>>,

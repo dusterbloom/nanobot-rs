@@ -183,8 +183,6 @@ impl AgentLoop {
             compaction_handles: Arc::new(Mutex::new(HashMap::new())),
             lcm_config,
             health_registry,
-            #[cfg(feature = "cluster")]
-            cluster_router: None,
             knowledge_store: crate::agent::knowledge_store::KnowledgeStore::open_default()
                 .ok()
                 .map(|ks| Arc::new(parking_lot::Mutex::new(ks))),
@@ -204,11 +202,12 @@ impl AgentLoop {
     /// Must be called before `run()` or `process_direct()` to take effect.
     #[cfg(feature = "cluster")]
     pub fn set_cluster_router(&mut self, router: Arc<crate::cluster::router::ClusterRouter>) {
+        // Only the subagent manager consumes the router (per-model peer
+        // resolution); the former Shared.cluster_router field was a dead
+        // store — written, never read (removed v0.5 E5).
         // SAFETY: we hold &mut self so no concurrent access exists yet.
         let shared = Arc::get_mut(&mut self.shared)
             .expect("set_cluster_router called after shared Arc was cloned");
-        shared.cluster_router = Some(router.clone());
-        // Also pass the router down to the subagent manager.
         let subagents = Arc::get_mut(&mut shared.subagents)
             .expect("set_cluster_router: subagents Arc already shared");
         subagents.cluster_router = Some(router);

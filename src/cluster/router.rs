@@ -110,6 +110,35 @@ impl ClusterRouter {
         decision
     }
 
+    /// Pick a peer for an idle self-directed turn (v0.5 E5).
+    ///
+    /// Only models on the `cluster.idleModels` allowlist are eligible
+    /// (heterogeneous LAN peers would otherwise break local governance);
+    /// an empty allowlist disables cluster idle routing entirely. Returns
+    /// `Cluster { endpoint, model }` for the first healthy peer serving an
+    /// allowlisted model, else `None` (idle stays on the local warm path).
+    pub async fn route_idle(&self) -> Option<RoutingDecision> {
+        if !self.config.enabled || self.config.idle_models.is_empty() {
+            return None;
+        }
+        let peers = self.state.get_healthy_peers().await;
+        for wanted in &self.config.idle_models {
+            let lower = wanted.to_ascii_lowercase();
+            for peer in &peers {
+                for model in &peer.models {
+                    let id = model.id.to_ascii_lowercase();
+                    if id == lower || id.contains(&lower) {
+                        return Some(RoutingDecision::Cluster {
+                            endpoint: peer.endpoint.clone(),
+                            model: model.id.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Create an OpenAI-compatible provider for a `Cluster` routing decision.
     ///
     /// Returns `Some((provider, model_id))` when the decision is `Cluster`,
@@ -192,6 +221,65 @@ impl ClusterRouter {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn route_idle_requires_enabled_allowlist_and_healthy_peer() {
+        use crate::cluster::state::ClusterState;
+        use crate::config::schema::ClusterConfig;
+
+        let state = ClusterState::new();
+        state
+            .update_peer(make_peer("http://10.0.0.5:1234", vec!["qwen3-4b"], true))
+            .await;
+
+        // Disabled cluster or empty allowlist -> None (idle stays local).
+        for cfg in [
+            ClusterConfig::default(),
+            ClusterConfig {
+                enabled: true,
+                idle_models: vec![],
+                ..Default::default()
+            },
+        ] {
+            let router = ClusterRouter::new(state.clone(), cfg);
+            assert!(router.route_idle().await.is_none());
+        }
+
+        // Allowlisted model on a healthy peer -> Cluster decision.
+        let cfg = ClusterConfig {
+            enabled: true,
+            idle_models: vec!["qwen3-4b".to_string()],
+            ..Default::default()
+        };
+        let router = ClusterRouter::new(state.clone(), cfg);
+        let decision = router.route_idle().await.expect("peer serves allowlisted model");
+        match decision {
+            RoutingDecision::Cluster { endpoint, model } => {
+                assert_eq!(endpoint, "http://10.0.0.5:1234");
+                assert_eq!(model, "qwen3-4b");
+            }
+            other => panic!("expected Cluster, got {other:?}"),
+        }
+
+        // A model NOT on the allowlist is never eligible (Q6 decision).
+        let cfg = ClusterConfig {
+            enabled: true,
+            idle_models: vec!["some-other-model".to_string()],
+            ..Default::default()
+        };
+        let router = ClusterRouter::new(state.clone(), cfg);
+        assert!(router.route_idle().await.is_none());
+
+        // Unhealthy peer -> None.
+        state.mark_unhealthy("http://10.0.0.5:1234").await;
+        let cfg = ClusterConfig {
+            enabled: true,
+            idle_models: vec!["qwen3-4b".to_string()],
+            ..Default::default()
+        };
+        let router = ClusterRouter::new(state.clone(), cfg);
+        assert!(router.route_idle().await.is_none());
+    }
+
     use std::time::Instant;
 
     use super::*;

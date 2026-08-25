@@ -126,6 +126,19 @@ impl ClusterState {
 
     /// Find the first healthy peer that has a model matching the given ID.
     /// Model matching is case-insensitive and supports substring match.
+    /// Mark the peer at `endpoint` unhealthy (e.g. its chat call failed).
+    ///
+    /// Discovery's periodic re-probe restores `healthy = true` if the peer
+    /// actually recovers — this is failure feedback closing the "dead peer
+    /// stays healthy for 60-180s" gap (v0.5 E5).
+    pub async fn mark_unhealthy(&self, endpoint: &str) {
+        let mut peers = self.peers.write().await;
+        if let Some(peer) = peers.iter_mut().find(|p| p.endpoint == endpoint) {
+            peer.healthy = false;
+            tracing::warn!(endpoint, "cluster_peer_marked_unhealthy");
+        }
+    }
+
     pub async fn find_model(&self, model_id: &str) -> Option<ModelMatch> {
         let peers = self.peers.read().await;
         let lower = model_id.to_ascii_lowercase();
@@ -237,6 +250,20 @@ mod tests {
         let healthy = state.get_healthy_peers().await;
         assert_eq!(healthy.len(), 1);
         assert_eq!(healthy[0].endpoint, "http://a:1234/v1");
+    }
+
+    #[tokio::test]
+    async fn mark_unhealthy_flips_flag_and_ignores_unknown_endpoints() {
+        let state = ClusterState::new();
+        state
+            .update_peer(make_peer("http://10.0.0.2:1234", PeerType::LMStudio, vec!["m"], true))
+            .await;
+        state.mark_unhealthy("http://nonexistent:9").await; // no panic, no change
+        assert_eq!(state.get_healthy_peers().await.len(), 1);
+        state.mark_unhealthy("http://10.0.0.2:1234").await;
+        assert_eq!(state.get_healthy_peers().await.len(), 0);
+        // The peer is still known (unhealthy), just not eligible.
+        assert_eq!(state.get_all_peers().await.len(), 1);
     }
 
     #[tokio::test]

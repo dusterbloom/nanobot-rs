@@ -2196,6 +2196,13 @@ pub struct ClusterConfig {
     pub scan_interval_secs: u64,
     /// Prefer cluster over cloud when model is available on both (default: true).
     pub prefer_cluster: bool,
+    /// Model-name allowlist for idle-turn compute on cluster peers (v0.5 E5).
+    /// Idle turns only ever run on a peer serving one of these models —
+    /// heterogeneous LAN peers would otherwise break the local-governance
+    /// moat (tool-call-capable, protocol-repaired models only). Empty
+    /// (default) = cluster idle routing off, even when cluster.enabled.
+    #[serde(default)]
+    pub idle_models: Vec<String>,
 }
 
 impl Default for ClusterConfig {
@@ -2207,6 +2214,7 @@ impl Default for ClusterConfig {
             scan_ports: default_cluster_scan_ports(),
             scan_interval_secs: default_cluster_scan_interval(),
             prefer_cluster: true,
+            idle_models: Vec::new(),
         }
     }
 }
@@ -2590,6 +2598,19 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_idle_models_parse_with_default_off() {
+        let bare: Config = serde_json::from_str("{}").unwrap();
+        assert!(bare.cluster.idle_models.is_empty(), "default off");
+
+        let parsed: Config = serde_json::from_str(
+            r#"{"cluster": {"enabled": true, "idleModels": ["qwen3-4b"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.cluster.idle_models, vec!["qwen3-4b".to_string()]);
+        assert!(parsed.cluster.enabled);
+    }
 
     #[test]
     fn idle_config_defaults_and_parse() {

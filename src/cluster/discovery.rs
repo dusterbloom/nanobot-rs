@@ -1213,6 +1213,7 @@ eth0\t00000000\tC01AA8C0\t0003\n";
         // localhost on scan_ports (which fail) and leaves state empty.
         // Use unlikely ports to avoid hitting real local servers.
         let config = crate::config::schema::ClusterConfig {
+            idle_models: Vec::new(),
             enabled: true,
             auto_discover: false,
             endpoints: vec![],
@@ -1231,6 +1232,7 @@ eth0\t00000000\tC01AA8C0\t0003\n";
         // When a manual endpoint has no port, it should be expanded
         // across all scan_ports during discovery.
         let config = crate::config::schema::ClusterConfig {
+            idle_models: Vec::new(),
             enabled: true,
             auto_discover: false,
             endpoints: vec!["http://192.168.1.22".to_string()],
@@ -1268,6 +1270,7 @@ eth0\t00000000\tC01AA8C0\t0003\n";
     #[test]
     fn test_manual_endpoint_with_port_not_expanded() {
         let config = crate::config::schema::ClusterConfig {
+            idle_models: Vec::new(),
             enabled: true,
             auto_discover: false,
             endpoints: vec!["http://192.168.1.22:5000".to_string()],
