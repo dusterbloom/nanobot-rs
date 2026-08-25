@@ -13,6 +13,7 @@ pub mod message;
 #[cfg(feature = "python-kernel")]
 pub mod python_kernel;
 pub mod read_skill;
+pub mod create_skill;
 pub mod reasoning_tools;
 pub mod recall;
 pub mod registry;
@@ -41,6 +42,7 @@ pub use message::MessageTool;
 #[cfg(feature = "python-kernel")]
 pub use python_kernel::PythonKernel;
 pub use read_skill::ReadSkillTool;
+pub use create_skill::CreateSkillTool;
 pub use recall::RecallTool;
 pub use registry::ToolRegistry;
 pub use remember::RememberTool;

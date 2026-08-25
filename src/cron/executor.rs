@@ -176,6 +176,8 @@ pub struct ExecutorHooks {
     pub inbound_tx: Option<UnboundedSender<InboundMessage>>,
     /// Memory reflection runner (`reflect`).
     pub reflect: Option<ReflectFn>,
+    /// Dream consolidation runner (`dream`; see `agent::dream`).
+    pub dream: Option<ReflectFn>,
 }
 
 /// Spawn the background executor. Stop it by aborting the returned handle —
@@ -213,6 +215,7 @@ pub(crate) fn fire_job(job: &CronJob, hooks: &ExecutorHooks) {
     match kind {
         PayloadKind::AgentTurn => fire_agent_turn(job, hooks.inbound_tx.as_ref()),
         PayloadKind::Reflect => fire_reflect(job, hooks.reflect.as_ref()),
+        PayloadKind::Dream => fire_reflect(job, hooks.dream.as_ref()),
     }
 }
 
@@ -509,6 +512,7 @@ mod tests {
         let hooks = ExecutorHooks {
             inbound_tx: None,
             reflect: None,
+            dream: None,
         };
         fire_job(&bogus, &hooks); // must not panic
                                   // Known kinds with missing hooks are also skips, not panics.
@@ -544,6 +548,7 @@ mod tests {
             ExecutorHooks {
                 inbound_tx: Some(tx),
                 reflect: None,
+                dream: None,
             },
         );
 

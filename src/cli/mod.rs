@@ -728,16 +728,43 @@ pub(crate) async fn run_gateway_async(
 
     // Cron executor: fires due jobs in the background. `agent_turn` payloads
     // are injected on the same inbound bus `agent_loop.run()` consumes below;
-    // `reflect` payloads distill working memory via the reflector. Gateway
-    // mode only — see `cron::executor` module docs for why REPL/TUI direct
-    // mode cannot consume injected turns.
+    // `reflect` payloads distill working memory via the reflector; `dream`
+    // payloads consolidate memory + file proposals. Gateway mode only — see
+    // `cron::executor` module docs for why REPL/TUI direct mode cannot
+    // consume injected turns.
     let cron_executor = crate::cron::executor::spawn_executor(
         cron_arc.clone(),
         crate::cron::executor::ExecutorHooks {
             inbound_tx: Some(inbound_tx.clone()),
             reflect: Some(build_cron_reflect_hook(core_handle.clone())),
+            dream: Some(build_cron_dream_hook(core_handle.clone())),
         },
     );
+
+    // Nightly dream job (v0.5 E2), registered once; the persisted store
+    // survives restarts so this only inserts when missing.
+    if config.dream.enabled {
+        let already = cron_arc
+            .list_jobs(true)
+            .iter()
+            .any(|job| job.name == DREAM_JOB_NAME);
+        if !already {
+            let payload = crate::cron::types::CronPayload {
+                kind: crate::cron::types::PayloadKind::Dream.as_str().to_string(),
+                ..Default::default()
+            };
+            let schedule = crate::cron::types::CronSchedule {
+                kind: "cron".to_string(),
+                expr: Some(config.dream.schedule.clone()),
+                ..Default::default()
+            };
+            cron_arc.add_job_with_payload(DREAM_JOB_NAME, schedule, payload, false);
+            tracing::info!(
+                schedule = %config.dream.schedule,
+                "dream job registered"
+            );
+        }
+    }
 
     let health_registry = Arc::new(crate::heartbeat::health::build_registry(&config));
 
@@ -939,6 +966,59 @@ fn build_cron_reflect_hook(core_handle: SharedCoreHandle) -> crate::cron::execut
         })
     })
 }
+
+/// Build the cron executor's `dream` hook from the live core handle (v0.5
+/// E2). Mirrors the reflect hook: memory disabled → skip; runs the dream
+/// consolidation (append facts + file proposals) off the executor tick.
+fn build_cron_dream_hook(core_handle: SharedCoreHandle) -> crate::cron::executor::ReflectFn {
+    Arc::new(move || {
+        let core = core_handle.swappable();
+        Box::pin(async move {
+            if !core.memory_enabled {
+                tracing::debug!("Cron dream: memory disabled — skipped");
+                return;
+            }
+            use crate::agent::memory::memory_transaction_lock;
+            use crate::agent::working_memory::WorkingMemoryStore;
+            // Serialize with the reflector: both write MEMORY.md.
+            let _guard = memory_transaction_lock().lock().await;
+            let wm = WorkingMemoryStore::new(core.sessions.clone());
+            let Ok(completed) = wm.list_completed().await else {
+                tracing::debug!("Cron dream: no completed sessions — skipped");
+                return;
+            };
+            let summaries: Vec<String> = completed
+                .iter()
+                .map(|s| {
+                    format!(
+                        "**Session: {}** ({})\n{}",
+                        s.session_key,
+                        s.updated.format("%Y-%m-%d %H:%M"),
+                        s.content
+                    )
+                })
+                .collect();
+            match crate::agent::dream::run_dream(
+                &core.memory_provider,
+                &core.memory_model,
+                &core.workspace,
+                &summaries,
+            )
+            .await
+            {
+                Ok(report) => tracing::info!(
+                    appended = report.appended_facts,
+                    proposals = report.proposals_written,
+                    "Cron dream: consolidation complete"
+                ),
+                Err(e) => tracing::warn!("Cron dream failed: {}", e),
+            }
+        })
+    })
+}
+
+/// Name of the gateway-registered nightly dream consolidation job.
+const DREAM_JOB_NAME: &str = "dream-consolidation";
 
 // ============================================================================
 // Quick-start channel commands
@@ -1461,11 +1541,11 @@ pub(crate) fn cmd_cron_add(
     let message = match (kind, message) {
         (PayloadKind::AgentTurn, Some(m)) => m,
         (PayloadKind::AgentTurn, None) => {
-            eprintln!("Error: --message is required (unless --reflect)");
+            eprintln!("Error: --message is required (unless --reflect or --dream)");
             std::process::exit(1);
         }
-        // Reflection needs no prompt; keep any note the user attached.
-        (PayloadKind::Reflect, m) => m.unwrap_or_default(),
+        // Reflection/dreaming need no prompt; keep any note the user attached.
+        (PayloadKind::Reflect | PayloadKind::Dream, m) => m.unwrap_or_default(),
     };
 
     let payload = CronPayload {

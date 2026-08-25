@@ -2042,6 +2042,33 @@ impl Default for IdleConfig {
     }
 }
 
+fn default_dream_schedule() -> String {
+    "0 3 * * *".to_string()
+}
+
+/// Dream consolidation (v0.5 E2): a scheduled pass that distills completed
+/// sessions into MEMORY.md facts (append + dedup) and files skill proposals
+/// in workspace/DREAM_PROPOSALS.md for human review. Gateway mode only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DreamConfig {
+    /// Register the nightly dream job (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Five-field cron expression, gateway-local time (default: "0 3 * * *").
+    #[serde(default = "default_dream_schedule")]
+    pub schedule: String,
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: default_dream_schedule(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Voice config
 // ---------------------------------------------------------------------------
@@ -2429,6 +2456,8 @@ pub struct Config {
     pub proprioception: ProprioceptionConfig,
     #[serde(default)]
     pub idle: IdleConfig,
+    #[serde(default)]
+    pub dream: DreamConfig,
     #[serde(default)]
     pub trio: TrioConfig,
     #[serde(default)]

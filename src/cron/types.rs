@@ -71,6 +71,9 @@ pub enum PayloadKind {
     AgentTurn,
     /// Run the memory reflector (threshold 0: distill whatever accumulated).
     Reflect,
+    /// Run dream consolidation (append facts + file proposals; see
+    /// `agent::dream`).
+    Dream,
 }
 
 impl PayloadKind {
@@ -79,6 +82,7 @@ impl PayloadKind {
         match kind {
             "agent_turn" => Some(Self::AgentTurn),
             "reflect" => Some(Self::Reflect),
+            "dream" => Some(Self::Dream),
             _ => None,
         }
     }
@@ -88,6 +92,7 @@ impl PayloadKind {
         match self {
             Self::AgentTurn => "agent_turn",
             Self::Reflect => "reflect",
+            Self::Dream => "dream",
         }
     }
 }

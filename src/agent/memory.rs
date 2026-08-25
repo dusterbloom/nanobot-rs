@@ -51,6 +51,41 @@ impl MemoryStore {
         }
         let _ = fs::rename(&tmp_path, &self.memory_file);
     }
+
+    /// Append new facts under the existing content, skipping facts already
+    /// present (normalized comparison). Returns how many were appended.
+    ///
+    /// Dream consolidation (agent::dream) uses this — unlike the reflector's
+    /// full rewrite, appending cannot lose concurrent curation, and dedup
+    /// makes repeated dreams idempotent.
+    pub fn append_long_term_facts(&self, facts: &[String]) -> usize {
+        let existing = self.read_long_term();
+        let existing_norm: std::collections::HashSet<String> = existing
+            .lines()
+            .map(|l| l.trim().trim_start_matches("- ").trim().to_lowercase())
+            .collect();
+        let fresh: Vec<&String> = facts
+            .iter()
+            .filter(|f| {
+                let t = f.trim();
+                !t.is_empty() && !existing_norm.contains(&t.to_lowercase())
+            })
+            .collect();
+        if fresh.is_empty() {
+            return 0;
+        }
+        let mut next = existing;
+        if !next.is_empty() && !next.ends_with('\n') {
+            next.push('\n');
+        }
+        for fact in &fresh {
+            next.push_str("- ");
+            next.push_str(fact.trim());
+            next.push('\n');
+        }
+        self.write_long_term(&next);
+        fresh.len()
+    }
 }
 
 #[cfg(test)]

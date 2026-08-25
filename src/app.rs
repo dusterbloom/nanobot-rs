@@ -309,6 +309,9 @@ enum CronAction {
         /// Schedule a memory reflection instead of an agent message.
         #[arg(long)]
         reflect: bool,
+        /// Schedule dream consolidation instead of an agent message.
+        #[arg(long, conflicts_with = "reflect")]
+        dream: bool,
     },
     /// Remove a scheduled job.
     Remove {
@@ -607,10 +610,13 @@ pub fn run() {
                 to,
                 channel,
                 reflect,
+                dream,
             } => {
                 // CLI flag → enum at the boundary (G1): payload kind, not a bool.
                 let kind = if reflect {
                     crate::cron::types::PayloadKind::Reflect
+                } else if dream {
+                    crate::cron::types::PayloadKind::Dream
                 } else {
                     crate::cron::types::PayloadKind::AgentTurn
                 };

@@ -34,6 +34,7 @@ pub mod lcm;
 pub(crate) mod lease;
 pub(crate) mod markers;
 pub(crate) mod idle;
+pub(crate) mod dream;
 pub(crate) mod memory;
 pub(crate) mod memory_ladder;
 pub(crate) mod metrics;

@@ -17,10 +17,10 @@ use tracing::warn;
 use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolExecutionResult};
 use super::filesystem::MAX_WRITE_FILE_PIECE_CHARS;
 use super::{
-    ApplyPatchTool, BrowserTool, CodeExecutionTool, CuaTool, EditFileTool, ExecTool, FileInfoTool,
-    FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool,
-    RememberTool, SearchFilesTool, SystemInfoTool, ToolStatusTool, WebFetchTool, WebSearchTool,
-    WorkspaceDiffTool, WriteFileTool,
+    ApplyPatchTool, BrowserTool, CodeExecutionTool, CreateSkillTool, CuaTool, EditFileTool,
+    ExecTool, FileInfoTool, FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool,
+    ReadSkillTool, RecallTool, RememberTool, SearchFilesTool, SystemInfoTool, ToolStatusTool,
+    WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileTool,
 };
 use crate::config::schema::CodeExecutionConfig;
 #[cfg(feature = "python-kernel")]
@@ -438,6 +438,9 @@ impl ToolRegistry {
         }
         if should_include("get_skills") {
             self.register(Box::new(ReadSkillTool::new(&config.workspace)));
+        }
+        if should_include("create_skill") {
+            self.register(Box::new(CreateSkillTool::new(&config.workspace)));
         }
         if config.code_execution.enabled && should_include("execute_code") {
             // Collect tool names for the Python stub (excluding execute_code itself).
