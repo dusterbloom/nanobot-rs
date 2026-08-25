@@ -32,9 +32,6 @@ pub struct WhatsAppConfig {
     pub bridge_port: u16,
     #[serde(default)]
     pub allow_from: Vec<String>,
-    /// Optional toolset name from `tools.toolsets` to restrict available tools.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toolset: Option<String>,
 }
 
 fn default_whatsapp_bridge_port() -> u16 {
@@ -57,7 +54,6 @@ impl Default for WhatsAppConfig {
             bridge_url: None,
             bridge_port: default_whatsapp_bridge_port(),
             allow_from: Vec::new(),
-            toolset: None,
         }
     }
 }
@@ -74,9 +70,6 @@ pub struct TelegramConfig {
     pub allow_from: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
-    /// Optional toolset name from `tools.toolsets` to restrict available tools.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toolset: Option<String>,
 }
 
 impl fmt::Debug for TelegramConfig {
@@ -86,7 +79,6 @@ impl fmt::Debug for TelegramConfig {
             .field("token", &crate::config::redact(&self.token))
             .field("allow_from", &self.allow_from)
             .field("proxy", &self.proxy)
-            .field("toolset", &self.toolset)
             .finish()
     }
 }
@@ -98,7 +90,6 @@ impl Default for TelegramConfig {
             token: String::new(),
             allow_from: Vec::new(),
             proxy: None,
-            toolset: None,
         }
     }
 }
@@ -125,9 +116,6 @@ pub struct EmailConfig {
     pub poll_interval_secs: u64,
     #[serde(default)]
     pub allow_from: Vec<String>,
-    /// Optional toolset name from `tools.toolsets` to restrict available tools.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toolset: Option<String>,
 }
 
 fn default_imap_port() -> u16 {
@@ -154,7 +142,6 @@ impl fmt::Debug for EmailConfig {
             .field("password", &crate::config::redact(&self.password))
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("allow_from", &self.allow_from)
-            .field("toolset", &self.toolset)
             .finish()
     }
 }
@@ -171,7 +158,6 @@ impl Default for EmailConfig {
             password: String::new(),
             poll_interval_secs: default_poll_interval(),
             allow_from: Vec::new(),
-            toolset: None,
         }
     }
 }
@@ -845,19 +831,6 @@ impl Default for CuaToolConfig {
     }
 }
 
-/// Named toolset groupings that can be referenced by channel configs.
-///
-/// Each key is a set name; each value is a list of tool names or `@other_set`
-/// references that expand to the contents of another set (built-in or custom).
-///
-/// Built-in set names: `core`, `web`, `memory`, `read_only`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolsetsConfig {
-    #[serde(default)]
-    pub sets: HashMap<String, Vec<String>>,
-}
-
 /// Code execution tool configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -935,9 +908,6 @@ pub struct ToolsConfig {
     pub web: WebToolsConfig,
     #[serde(default, rename = "exec")]
     pub exec_: ExecToolConfig,
-    /// Named toolset groupings available to channel configs.
-    #[serde(default)]
-    pub toolsets: Option<ToolsetsConfig>,
     /// Code execution (Python RPC) tool settings.
     #[serde(default)]
     pub code_execution: CodeExecutionConfig,

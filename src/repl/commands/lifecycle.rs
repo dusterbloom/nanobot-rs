@@ -230,7 +230,6 @@ impl ReplContext {
                     lms_port,
                     &main_model,
                     main_ctx,
-                    self.config.timeouts.lms_load_secs,
                 )
                 .await
                 {
@@ -248,7 +247,6 @@ impl ReplContext {
                             lms_port,
                             &self.config.trio.router_model,
                             Some(self.config.trio.router_ctx_tokens),
-                            self.config.timeouts.lms_load_secs,
                         )
                         .await
                         {
@@ -264,7 +262,6 @@ impl ReplContext {
                             lms_port,
                             &self.config.trio.specialist_model,
                             Some(self.config.trio.specialist_ctx_tokens),
-                            self.config.timeouts.lms_load_secs,
                         )
                         .await
                         {
@@ -358,8 +355,6 @@ impl ReplContext {
                     lms_port,
                     &model_name,
                     new_ctx,
-                    self.config.timeouts.lms_load_secs,
-                    self.config.timeouts.lms_unload_secs,
                 )
                 .await
                 {
@@ -398,8 +393,6 @@ impl ReplContext {
                             port,
                             &model_name,
                             new_ctx,
-                            self.config.timeouts.lms_load_secs,
-                            self.config.timeouts.lms_unload_secs,
                         )
                         .await
                         {
@@ -467,7 +460,6 @@ impl ReplContext {
                     port,
                     &selected_id,
                     ctx,
-                    self.config.timeouts.lms_load_secs,
                 )
                 .await
                 .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
@@ -533,7 +525,6 @@ impl ReplContext {
                         port,
                         &selected_id,
                         ctx,
-                        self.config.timeouts.lms_load_secs,
                     )
                     .await
                     .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
@@ -958,7 +949,6 @@ impl ReplContext {
                         lms_port,
                         &self.config.trio.router_model,
                         Some(self.config.trio.router_ctx_tokens),
-                        self.config.timeouts.lms_load_secs,
                     )
                     .await
                     {
@@ -974,7 +964,6 @@ impl ReplContext {
                         lms_port,
                         &self.config.trio.specialist_model,
                         Some(self.config.trio.specialist_ctx_tokens),
-                        self.config.timeouts.lms_load_secs,
                     )
                     .await
                     {
@@ -1180,7 +1169,6 @@ impl ReplContext {
                 lms_port,
                 model,
                 ctx,
-                self.config.timeouts.lms_load_secs,
             )
             .await
             {
@@ -1446,7 +1434,6 @@ impl ReplContext {
                                     lms_port,
                                     &main_model,
                                     main_ctx,
-                                    self.config.timeouts.lms_load_secs,
                                 )
                                 .await
                                 {
@@ -1464,7 +1451,6 @@ impl ReplContext {
                                             lms_port,
                                             &self.config.trio.router_model,
                                             Some(self.config.trio.router_ctx_tokens),
-                                            self.config.timeouts.lms_load_secs,
                                         )
                                         .await
                                         {
@@ -1487,7 +1473,6 @@ impl ReplContext {
                                             lms_port,
                                             &self.config.trio.specialist_model,
                                             Some(self.config.trio.specialist_ctx_tokens),
-                                            self.config.timeouts.lms_load_secs,
                                         )
                                         .await
                                         {

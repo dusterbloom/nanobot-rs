@@ -571,7 +571,6 @@ mod tests {
             password: data["pass"].as_str()?.to_string(),
             poll_interval_secs: 5,
             allow_from: Vec::new(),
-            toolset: None,
         })
     }
 
@@ -703,7 +702,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 5,
             allow_from: Vec::new(),
-            toolset: None,
         };
         let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
         let result = poll_inbox(&config, &tx).await;
@@ -731,7 +729,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
         let msg = OutboundMessage::new("email", "email:test@example.com", "body");
         let result = send_email(&config, &msg).await;
@@ -752,7 +749,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
         // chat_id with invalid email after "email:" prefix
         let msg = OutboundMessage::new("email", "email:not-valid", "body");
@@ -775,7 +771,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
         // chat_id with prefix: recipient should be "recv@example.com"
         let msg = OutboundMessage::new("email", "email:recv@example.com", "body");
@@ -802,7 +797,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
         // chat_id WITHOUT "email:" prefix — should still work
         let msg = OutboundMessage::new("email", "recv@example.com", "body");
@@ -831,7 +825,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
 
         // With subject
@@ -1350,7 +1343,6 @@ mod tests {
             password: std::env::var("TEST_EMAIL_PASS").expect("TEST_EMAIL_PASS required"),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
 
         println!(
@@ -1452,7 +1444,6 @@ mod tests {
             password: std::env::var("TEST_AGENTMAIL_PASS").expect("TEST_AGENTMAIL_PASS required"),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
 
         println!("Polling agentmail.to API as {}", config.username);

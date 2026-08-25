@@ -26,7 +26,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
@@ -172,23 +171,6 @@ impl ChannelManager {
                 info!("Stopped {} channel", name);
             }
         }
-    }
-
-    /// Get status information for all channels.
-    pub fn get_status(&self) -> HashMap<String, Value> {
-        let mut status = HashMap::new();
-
-        for name in self.channels.keys() {
-            status.insert(
-                name.clone(),
-                json!({
-                    "enabled": true,
-                    "type": name,
-                }),
-            );
-        }
-
-        status
     }
 
     /// Get the list of enabled channel names.

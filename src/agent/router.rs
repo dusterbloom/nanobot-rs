@@ -435,25 +435,18 @@ pub async fn request_strict_router_decision(
     replay: Option<&TurnReplayRecorder>,
 ) -> Result<role_policy::RouterDecision, String> {
     info!(role = "router", model = %model, "router_decision_start");
+    // action=/target= are bare tokens ended by whitespace or a comma.
+    fn take_token(pack: &str, key: &str) -> Option<String> {
+        let start = pack.find(key)? + key.len();
+        let tail = &pack[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == ',')
+            .unwrap_or(tail.len());
+        Some(tail[..end].trim().to_string())
+    }
     fn parse_router_directive_pack(pack: &str) -> Option<role_policy::RouterDecision> {
-        let action = {
-            let pat = "action=";
-            let start = pack.find(pat)? + pat.len();
-            let tail = &pack[start..];
-            let end = tail
-                .find(|c: char| c.is_whitespace() || c == ',')
-                .unwrap_or(tail.len());
-            tail[..end].trim().to_string()
-        };
-        let target = {
-            let pat = "target=";
-            let start = pack.find(pat)? + pat.len();
-            let tail = &pack[start..];
-            let end = tail
-                .find(|c: char| c.is_whitespace() || c == ',')
-                .unwrap_or(tail.len());
-            tail[..end].trim().to_string()
-        };
+        let action = take_token(pack, "action=")?;
+        let target = take_token(pack, "target=")?;
         let args = if let Some(args_pos) = pack.find("args=") {
             let tail = &pack[args_pos + "args=".len()..];
             extract_json_object(tail)
@@ -911,11 +904,7 @@ pub(crate) fn subagent_preflight_result(subagent_result: &str) -> PreflightResul
 /// If `specialist_synthesis` is `Some`, use the specialist's synthesized
 /// response. If `None` (specialist unavailable), fall back to the raw tool
 /// result. Pure function — extracted for testability.
-pub(crate) fn tool_preflight_result(
-    _tool_name: &str,
-    _tool_result: &str,
-    specialist_synthesis: Option<String>,
-) -> PreflightResult {
+pub(crate) fn tool_preflight_result(specialist_synthesis: Option<String>) -> PreflightResult {
     match specialist_synthesis {
         Some(synthesized) => PreflightResult::Break(synthesized),
         None => PreflightResult::Continue,
@@ -1277,7 +1266,7 @@ pub(crate) async fn router_preflight(
                 )));
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some(decision.target.clone());
             ctx.used_tools.insert(decision.target.clone());
-            tool_preflight_result(&decision.target, &truncated, None)
+            tool_preflight_result(None)
         }
         "respond" => {
             tracing::Span::current().record("routing_decision", "respond");
@@ -2605,7 +2594,7 @@ mod tests {
     fn test_tool_arm_returns_continue_when_no_synthesis() {
         // Tool arm: when specialist is unavailable (None), should return Continue so the
         // main LLM loop can summarize the injected tool result rather than returning raw JSON.
-        let result = tool_preflight_result("web_fetch", "<html>Hacker News...</html>", None);
+        let result = tool_preflight_result(None);
         assert!(
             matches!(result, PreflightResult::Continue),
             "tool arm with no synthesis must return Continue, not Break"
@@ -2615,8 +2604,7 @@ mod tests {
     #[test]
     fn test_tool_arm_with_specialist_returns_synthesized() {
         let specialist_response = Some("Here are the top 5 HN stories...".to_string());
-        let result =
-            tool_preflight_result("web_fetch", "<html>raw content</html>", specialist_response);
+        let result = tool_preflight_result(specialist_response);
         match result {
             PreflightResult::Break(msg) => {
                 assert_eq!(msg, "Here are the top 5 HN stories...");
@@ -2732,13 +2720,13 @@ mod tests {
 
     #[test]
     fn test_tool_preflight_result_no_synthesis_returns_continue() {
-        let result = tool_preflight_result("web_fetch", "some data", None);
+        let result = tool_preflight_result(None);
         assert!(matches!(result, PreflightResult::Continue));
     }
 
     #[test]
     fn test_tool_preflight_result_with_synthesis_returns_break() {
-        let result = tool_preflight_result("web_fetch", "data", Some("Summary here".into()));
+        let result = tool_preflight_result(Some("Summary here".into()));
         match result {
             PreflightResult::Break(text) => assert_eq!(text, "Summary here"),
             _ => panic!("Expected Break with synthesis text"),

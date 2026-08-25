@@ -196,9 +196,6 @@ pub enum ToolErrorKind {
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
 
-    #[error("Execution failed: {0}")]
-    ExecutionFailed(String),
-
     #[error("Network error: {0}")]
     NetworkError(String),
 
@@ -410,7 +407,6 @@ impl ToolError {
                 ToolErrorKind::NotFound(m) => Self::NotFound(m),
                 ToolErrorKind::InvalidArgs(m) => Self::InvalidArgs { message: m },
                 ToolErrorKind::ToolNotFound(m) => Self::ToolNotFound { name: m },
-                ToolErrorKind::ExecutionFailed(m) => Self::Execution { message: m },
                 ToolErrorKind::NetworkError(m) => Self::Network(m),
                 ToolErrorKind::RateLimited => Self::RateLimited,
                 ToolErrorKind::ServiceUnavailable(m) => Self::ServiceUnavailable(m),
@@ -788,7 +784,6 @@ mod tests {
         assert!(!ToolErrorKind::PermissionDenied("denied".into()).is_retryable());
         assert!(!ToolErrorKind::InvalidArgs("bad arg".into()).is_retryable());
         assert!(!ToolErrorKind::ToolNotFound("no_tool".into()).is_retryable());
-        assert!(!ToolErrorKind::ExecutionFailed("fail".into()).is_retryable());
     }
 
     // -- ToolError (typed protocol) --

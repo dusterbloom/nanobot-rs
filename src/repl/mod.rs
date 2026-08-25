@@ -1723,7 +1723,7 @@ pub(crate) fn cmd_agent(
                             crate::lms::resolve_model_name(&available, hint)
                         };
                         let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
-                        if let Err(e) = crate::lms::load_model("", lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
+                        if let Err(e) = crate::lms::load_model("", lms_port, &main_model, main_ctx).await {
                             eprintln!("Warning: lms load failed: {}", e);
                         } else {
                             local_model_name = main_model;
@@ -1768,7 +1768,6 @@ pub(crate) fn cmd_agent(
                                     lms_port,
                                     &config.trio.router_model,
                                     Some(config.trio.router_ctx_tokens),
-                                    config.timeouts.lms_load_secs,
                                 )
                                 .await;
                             }
@@ -1779,7 +1778,6 @@ pub(crate) fn cmd_agent(
                                     lms_port,
                                     &config.trio.specialist_model,
                                     Some(config.trio.specialist_ctx_tokens),
-                                    config.timeouts.lms_load_secs,
                                 )
                                 .await;
                             }
@@ -1841,7 +1839,7 @@ pub(crate) fn cmd_agent(
                         let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
                         print!("  Loading {}... ", main_model);
                         io::stdout().flush().ok();
-                        match crate::lms::load_model("", lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
+                        match crate::lms::load_model("", lms_port, &main_model, main_ctx).await {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
@@ -1866,7 +1864,7 @@ pub(crate) fn cmd_agent(
                             if !config.trio.router_model.is_empty() {
                                 print!("  Loading {}... ", config.trio.router_model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model("", lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens), config.timeouts.lms_load_secs).await {
+                                match crate::lms::load_model("", lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens)).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }
@@ -1874,7 +1872,7 @@ pub(crate) fn cmd_agent(
                             if !config.trio.specialist_model.is_empty() {
                                 print!("  Loading {}... ", config.trio.specialist_model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model("", lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens), config.timeouts.lms_load_secs).await {
+                                match crate::lms::load_model("", lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens)).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }

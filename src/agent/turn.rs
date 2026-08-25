@@ -112,28 +112,9 @@ impl Turn {
         matches!(self, Turn::Assistant { .. })
     }
 
-    /// Returns true if this is a user turn (not system, not tool result).
-    pub fn is_user(&self) -> bool {
-        matches!(self, Turn::User { .. })
-    }
-
     /// Returns true if this is a summary turn (LCM compaction output).
     pub fn is_summary(&self) -> bool {
         matches!(self, Turn::Summary { .. })
-    }
-
-    /// Returns true if this is a clear marker (from `/clear` command).
-    pub fn is_clear(&self) -> bool {
-        matches!(self, Turn::Clear)
-    }
-
-    /// Returns the assistant text content, if any.
-    pub fn assistant_text(&self) -> Option<&str> {
-        if let Turn::Assistant { text, .. } = self {
-            text.as_deref()
-        } else {
-            None
-        }
     }
 
     /// Returns tool calls from an assistant turn.

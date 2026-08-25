@@ -77,24 +77,6 @@ pub fn get_workspace_path(workspace: Option<&str>) -> PathBuf {
     ensure_dir(path)
 }
 
-/// Get the memory directory within the workspace.
-pub fn get_memory_path(workspace: Option<&Path>) -> PathBuf {
-    let ws = match workspace {
-        Some(p) => p.to_path_buf(),
-        None => get_workspace_path(None),
-    };
-    ensure_dir(ws.join("memory"))
-}
-
-/// Get the skills directory within the workspace.
-pub fn get_skills_path(workspace: Option<&Path>) -> PathBuf {
-    let ws = match workspace {
-        Some(p) => p.to_path_buf(),
-        None => get_workspace_path(None),
-    };
-    ensure_dir(ws.join("skills"))
-}
-
 /// Get today's date in YYYY-MM-DD format.
 pub fn today_date() -> String {
     Local::now().format("%Y-%m-%d").to_string()
