@@ -1,3 +1,13 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::shadow_reuse
+)]
 //! Unified retrieval tool: trust-ranked search across curated memory, indexed
 //! knowledge docs, workspace files, and past conversations, plus fetch modes
 //! that dump or extract a specific session's messages.
@@ -14,7 +24,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{Tool, ToolExecutionResult};
+use super::base::{Tool, ToolContext, ToolResult};
 use crate::agent::knowledge_store::{KnowledgeStore, SearchHit};
 
 /// Cap (chars) on the merged search output so a broad query can't blow context.
@@ -552,7 +562,10 @@ impl RecallTool {
                 .to_string();
         }
 
-        let scope = params.get("scope").and_then(|v| v.as_str()).unwrap_or("all");
+        let scope = params
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("all");
         // `n` is the documented per-source cap; accept the legacy `limit` alias
         // so old `session_search`/`search_context` calls (now aliased to recall)
         // keep working without a param rewrite.
@@ -675,10 +688,7 @@ impl Tool for RecallTool {
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let mode = params
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("");
         let session = params
             .get("session")
             .and_then(|v| v.as_str())
@@ -712,12 +722,11 @@ impl Tool for RecallTool {
         "Error: recall needs one of: 'query' (to search), 'session' or 'message_ids' (to fetch), or mode=\"latest\".".to_string()
     }
 
-    /// Empty-arg is self-correcting: enumerate the three entry params with a
-    /// worked call shape instead of looping on the same bare call.
-    async fn execute_with_result(
-        &self,
-        params: HashMap<String, Value>,
-    ) -> ToolExecutionResult {
+    /// Empty-arg is self-correcting: produce a structural
+    /// [`crate::errors::ToolError::MissingArg`] (model-fixable) whose render
+    /// carries a worked call shape instead of looping on the same bare call.
+    /// Everything else funnels through the legacy string path unchanged.
+    async fn execute_typed(&self, params: HashMap<String, Value>, ctx: &ToolContext) -> ToolResult {
         let has_query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -730,26 +739,23 @@ impl Tool for RecallTool {
             .get("message_ids")
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.trim().is_empty());
-        let mode = params
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("");
         let is_fetch = matches!(mode, "latest" | "session" | "in_session" | "extract")
             || has_session
             || has_message_ids;
 
         if !is_fetch && !has_query {
-            return ToolExecutionResult {
-                ok: false,
-                data: "Error: recall needs one of: 'query' (to search), 'session' or 'message_ids' (to fetch), or mode=\"latest\".".to_string(),
-                error: None,
-                error_kind: Some(crate::errors::ToolErrorKind::MissingArg {
-                    param: "query".to_string(),
-                    example: r#"recall({"query":"..."})"#.to_string(),
-                }),
-            };
+            return Err(crate::errors::ToolError::MissingArg {
+                param: "query".to_string(),
+                example: r#"recall({"query":"..."})"#.to_string(),
+            });
         }
-        ToolExecutionResult::from_output(self.execute(params).await)
+        // Funnel through the legacy string path (error protocol §2.2).
+        // NB: call the shared helper, NOT `Tool::execute_typed(self, ...)` —
+        // under #[async_trait] that qualified call re-dispatches to this
+        // override and recurses until stack overflow (see funnel_legacy docs).
+        let out = self.execute_with_context(params, ctx).await;
+        crate::agent::tools::base::funnel_legacy(out)
     }
 }
 
@@ -864,15 +870,19 @@ mod tests {
     async fn test_recall_empty_arg_returns_structural_missing_arg() {
         let (_tmp, tool) = make_tool();
         let res = tool.execute_with_result(HashMap::new()).await;
-        assert!(!res.ok);
+        assert!(!res.ok());
         assert!(matches!(
-            res.error_kind,
+            res.error_kind(),
             Some(crate::errors::ToolErrorKind::MissingArg { ref param, .. }) if param == "query"
         ));
-        // The data string enumerates the three entry params.
-        assert!(res.data.contains("query"), "{}", res.data);
-        assert!(res.data.contains("session"), "{}", res.data);
-        assert!(res.data.contains("message_ids"), "{}", res.data);
+        // Canonical MissingArg render names the required param and carries
+        // the worked call shape (error protocol Phase 2 canonicalization).
+        assert!(
+            res.data().contains("'query' parameter is required"),
+            "{}",
+            res.data()
+        );
+        assert!(res.data().contains("call as recall("), "{}", res.data());
     }
 
     #[tokio::test]
@@ -1083,7 +1093,10 @@ mod tests {
             .await;
         let mem_pos = result.find("## Curated memory");
         let sess_pos = result.find("## Past conversations");
-        assert!(mem_pos.is_some(), "curated section must be present: {result}");
+        assert!(
+            mem_pos.is_some(),
+            "curated section must be present: {result}"
+        );
         assert!(
             sess_pos.is_some(),
             "sessions section must be present (both matched): {result}"
@@ -1210,8 +1223,14 @@ mod tests {
             ]))
             .await;
         assert!(out.contains("returned in full"), "got: {out}");
-        assert!(out.contains("Diary of Two Threads Entry 1 nano32"), "got: {out}");
-        assert!(!out.contains("... (truncated"), "in_session must not truncate: {out}");
+        assert!(
+            out.contains("Diary of Two Threads Entry 1 nano32"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("... (truncated"),
+            "in_session must not truncate: {out}"
+        );
     }
 
     #[tokio::test]
@@ -1223,6 +1242,32 @@ mod tests {
         assert!(
             result.contains("not available") || result.contains("Error"),
             "fetch without db_path must error clearly: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_full_typed_chain_with_query_does_not_recurse() {
+        let (tmp, tool) = make_tool();
+        std::fs::write(
+            tmp.path().join("memory").join("MEMORY.md"),
+            "- User prefers dark mode\n- Favorite language is Rust\n",
+        )
+        .unwrap();
+        let mut params = HashMap::new();
+        params.insert("query".to_string(), json!("Rust"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolContext::new(None, tx, token, "test-call");
+        let res = tool.execute_with_result_and_context(params, &ctx).await;
+        assert!(
+            res.ok(),
+            "should succeed via typed chain: {:?}",
+            res.error()
+        );
+        assert!(
+            res.data().contains("Rust"),
+            "should find Rust: {}",
+            res.data()
         );
     }
 }

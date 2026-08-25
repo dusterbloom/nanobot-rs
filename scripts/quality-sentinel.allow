@@ -1,0 +1,11 @@
+# error-protocol quality-sentinel allowlist (scripts/quality-sentinel.sh)
+# Format: `<path>` or `<path>:<lineno> — reason`. Delete entries as the legacy
+# code they pin is removed in Phase 3 (tracked in docs/error-protocol-backlog.md).
+#
+# The whole legacy bridge module: classify_tool_error definition + from_legacy
+# caller + the mapping-pinning tests (marked `deleted in Phase 3`).
+src/errors.rs
+#
+# Legacy ToolExecutionResult::failure constructor — funnels a legacy String
+# through classify_tool_error; deleted with the legacy channel in Phase 3.
+src/agent/tools/base.rs:143

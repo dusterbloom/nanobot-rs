@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions, clippy::indexing_slicing)]
 //! Model capability detection: replaces scattered model-name string matching
 //! with a centralized registry. Built-in patterns cover known models; config
 //! overrides let users customize for new/custom models.
@@ -121,8 +127,12 @@ pub fn lookup_default(model: &str) -> ModelCapabilities {
 
 /// Models whose local servers can split template reasoning into
 /// `reasoning_content` even when nanobot does not send an explicit budget.
+/// LFM2.5 always thinks (its chat template injects a think block
+/// unconditionally), so it must keep `enable_thinking: true` on the wire to
+/// stay in sync with the server's reasoning tracker.
 pub fn prefers_hidden_reasoning(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("vibethinker")
+    let lower = model.to_ascii_lowercase();
+    lower.contains("vibethinker") || lower.contains("lfm2.5") || lower.contains("lfm2_5")
 }
 
 /// Returns true if `name` contains `marker` as a standalone size token.
@@ -356,6 +366,40 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             vision: false,
         };
     }
+    // Liquid AI LFM2.5: hybrid conv/attention agent model (~2.6B) that always
+    // thinks (its template injects a think block unconditionally). Tool calls
+    // arrive as native OpenAI tool_calls via higgs' parser; a Pythonic content
+    // fallback lives in openai_compat.
+    if lower.contains("lfm2.5") || lower.contains("lfm2_5") {
+        return ModelCapabilities {
+            size_class: ModelSizeClass::Small,
+            tool_calling: true,
+            thinking: true,
+            needs_native_lms_api: false,
+            strict_alternation: true,
+            max_reliable_output: 4096,
+            scratch_pad_rounds: 6,
+            reader_tier: ReaderTier::Minimal,
+            parser: None,
+            vision: false,
+        };
+    }
+    // Macaw: LFM2-architecture fine-tune; unlike LFM2.5 it does not think
+    // unconditionally.
+    if lower.contains("macaw") {
+        return ModelCapabilities {
+            size_class: ModelSizeClass::Small,
+            tool_calling: true,
+            thinking: false,
+            needs_native_lms_api: false,
+            strict_alternation: true,
+            max_reliable_output: 2048,
+            scratch_pad_rounds: 4,
+            reader_tier: ReaderTier::Minimal,
+            parser: None,
+            vision: false,
+        };
+    }
     // Generic small model patterns (catch-all for size indicators)
     // Use has_size_marker to avoid false positives like "35b" matching "3b"
     // or "a3b" (MoE active-param suffix) matching "3b".
@@ -494,6 +538,29 @@ mod tests {
         assert_eq!(caps.size_class, ModelSizeClass::Small);
         assert!(!caps.tool_calling, "no tool-calling training");
         assert!(caps.thinking, "reasoning-first model");
+    }
+
+    #[test]
+    fn test_lfm25_is_small_always_thinking_agent_model() {
+        let caps = lookup("lfm2.5-2.6b-8bit", &empty_overrides());
+        assert_eq!(caps.size_class, ModelSizeClass::Small);
+        assert!(caps.tool_calling);
+        assert!(caps.thinking, "LFM2.5 always thinks");
+        assert!(caps.strict_alternation);
+        assert_eq!(caps.reader_tier, ReaderTier::Minimal);
+        assert!(prefers_hidden_reasoning("local:lfm2.5-2.6b-8bit"));
+        assert!(prefers_hidden_reasoning("mlx-community/lfm2_5-3b-4bit"));
+    }
+
+    #[test]
+    fn test_lfm2_base_and_macaw_do_not_always_think() {
+        // Plain LFM2 (base) and Macaw lack the unconditional <think> inject.
+        assert!(!prefers_hidden_reasoning("lfm2-2.6b"));
+        assert!(!prefers_hidden_reasoning("macaw-4bit"));
+        let macaw = lookup("macaw-4bit", &empty_overrides());
+        assert_eq!(macaw.size_class, ModelSizeClass::Small);
+        assert!(macaw.tool_calling);
+        assert!(!macaw.thinking);
     }
 
     #[test]

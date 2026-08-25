@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::format_push_string)]
 #![allow(dead_code)]
 //! Skills loader for agent capabilities.
 //!
@@ -11,10 +17,12 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_FRONTMATTER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)^---\n(.*?)\n---").unwrap());
+    LazyLock::new(|| Regex::new(r"(?s)^---\n(.*?)\n---").expect("static regex"));
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_FRONTMATTER_STRIP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)^---\n.*?\n---\n").unwrap());
+    LazyLock::new(|| Regex::new(r"(?s)^---\n.*?\n---\n").expect("static regex"));
 use tracing::debug;
 
 /// Information about a discovered skill.

@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::indexing_slicing)]
 #![allow(dead_code)]
 //! Context hygiene pipeline for cleaning up conversation history.
 //!
@@ -37,7 +43,7 @@ const TRUNCATED_ASSISTANT_PLACEHOLDER: &str = "[assistant message truncated]";
 #[derive(Clone, Copy, Debug)]
 pub enum ToolBodyPolicy {
     /// Cap the body to at most this many bytes (backed off to a UTF-8 char
-///   boundary), appending the `...[tool output truncated]` marker.
+    ///   boundary), appending the `...[tool output truncated]` marker.
     ByteCap(usize),
     /// Replace bodies longer than `preview_len` bytes with a digest marker
     /// (sha256 prefix + original length + single-line preview).
@@ -49,7 +55,14 @@ pub enum ToolBodyPolicy {
 /// The same cap must apply before a tool result enters live `ctx.messages` and
 /// when session history is loaded from SQLite. Otherwise a same-turn prompt can
 /// warm the server cache with bytes that the next turn will never replay.
-pub(crate) const TOOL_RESULT_REPLAY_MAX_BYTES: usize = 8000;
+///
+/// Sized above `config::schema::DEFAULT_MAX_TOOL_RESULT_CHARS` (10_000) so a
+/// result that fits the user-visible char cap (near-ASCII) also fits the byte
+/// cap and stays inline instead of degrading to a stashed handle. A static cap
+/// can't track per-agent char caps exactly (UTF-8 multibyte), but 12_000 keeps
+/// the 8-10KB dead band — where a sub-cap result became an unresolvable handle
+/// (session 20260804_204406_c16eb0) — inside the inline contract.
+pub(crate) const TOOL_RESULT_REPLAY_MAX_BYTES: usize = 12_000;
 
 pub(crate) fn cap_tool_result_for_replay(content: &str) -> String {
     shrink_tool_body(
@@ -76,27 +89,6 @@ pub(crate) fn tool_result_ok(content: &str) -> bool {
         || normalized.starts_with("response boundary:")
         || normalized.starts_with("No stored output for tool_call_id=")
         || normalized == "(no result)")
-}
-
-/// Replace a persisted `recall_tool_result` body with a stable replay receipt.
-///
-/// The live turn that requested recall sees the raw bytes. On later SQLite
-/// reloads, replaying those bytes would turn a one-time explicit recall into a
-/// permanent prompt balloon. Keep only identity and the exact re-recall handle.
-pub(crate) fn recall_tool_result_replay_reference(
-    _content: &str,
-    source_tool_call_id: Option<&str>,
-) -> String {
-    let recall_hint = source_tool_call_id.map(|id| {
-        let encoded_id = serde_json::to_string(id).unwrap_or_else(|_| "\"<tool_call_id>\"".into());
-        format!(
-            r#", re-call recall_tool_result({{"tool_call_id": {encoded_id}}}) for bytes"#
-        )
-    });
-    format!(
-        "[recalled earlier; raw output omitted from replay{}]",
-        recall_hint.unwrap_or_default()
-    )
 }
 
 /// Shrink a tool-result body according to `policy`.

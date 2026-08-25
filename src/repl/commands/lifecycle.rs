@@ -1,9 +1,36 @@
 //! Server lifecycle REPL commands: /provenance, /restart, /ctx, /model, /trio, /local.
 
+// Interactive/app boundary (error-protocol layer 3 backlog): printing IS the
+// product here (REPL/TUI/CLI), and the thin glue code keeps pragmatic
+// unwraps on always-set state (rl, runtime, static regexes). The deny regime
+// in Cargo.toml stays live for the core; this module lands on the regime
+// when its backlog is migrated.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::format_push_string,
+    clippy::string_add
+)]
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 
 use super::*;
+
+fn reset_prompt_state_after_runtime_switch(
+    counters: &crate::agent::agent_core::RuntimeCounters,
+    session_id: &str,
+) {
+    counters.reset_session_prompt_state(session_id);
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ModelSwitchReport {
@@ -203,7 +230,6 @@ impl ReplContext {
                     lms_port,
                     &main_model,
                     main_ctx,
-                    self.config.timeouts.lms_load_secs,
                 )
                 .await
                 {
@@ -221,7 +247,6 @@ impl ReplContext {
                             lms_port,
                             &self.config.trio.router_model,
                             Some(self.config.trio.router_ctx_tokens),
-                            self.config.timeouts.lms_load_secs,
                         )
                         .await
                         {
@@ -237,7 +262,6 @@ impl ReplContext {
                             lms_port,
                             &self.config.trio.specialist_model,
                             Some(self.config.trio.specialist_ctx_tokens),
-                            self.config.timeouts.lms_load_secs,
                         )
                         .await
                         {
@@ -331,8 +355,6 @@ impl ReplContext {
                     lms_port,
                     &model_name,
                     new_ctx,
-                    self.config.timeouts.lms_load_secs,
-                    self.config.timeouts.lms_unload_secs,
                 )
                 .await
                 {
@@ -371,8 +393,6 @@ impl ReplContext {
                             port,
                             &model_name,
                             new_ctx,
-                            self.config.timeouts.lms_load_secs,
-                            self.config.timeouts.lms_unload_secs,
                         )
                         .await
                         {
@@ -440,7 +460,6 @@ impl ReplContext {
                     port,
                     &selected_id,
                     ctx,
-                    self.config.timeouts.lms_load_secs,
                 )
                 .await
                 .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
@@ -506,7 +525,6 @@ impl ReplContext {
                         port,
                         &selected_id,
                         ctx,
-                        self.config.timeouts.lms_load_secs,
                     )
                     .await
                     .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
@@ -931,7 +949,6 @@ impl ReplContext {
                         lms_port,
                         &self.config.trio.router_model,
                         Some(self.config.trio.router_ctx_tokens),
-                        self.config.timeouts.lms_load_secs,
                     )
                     .await
                     {
@@ -947,7 +964,6 @@ impl ReplContext {
                         lms_port,
                         &self.config.trio.specialist_model,
                         Some(self.config.trio.specialist_ctx_tokens),
-                        self.config.timeouts.lms_load_secs,
                     )
                     .await
                     {
@@ -1153,7 +1169,6 @@ impl ReplContext {
                 lms_port,
                 model,
                 ctx,
-                self.config.timeouts.lms_load_secs,
             )
             .await
             {
@@ -1419,7 +1434,6 @@ impl ReplContext {
                                     lms_port,
                                     &main_model,
                                     main_ctx,
-                                    self.config.timeouts.lms_load_secs,
                                 )
                                 .await
                                 {
@@ -1437,7 +1451,6 @@ impl ReplContext {
                                             lms_port,
                                             &self.config.trio.router_model,
                                             Some(self.config.trio.router_ctx_tokens),
-                                            self.config.timeouts.lms_load_secs,
                                         )
                                         .await
                                         {
@@ -1460,7 +1473,6 @@ impl ReplContext {
                                             lms_port,
                                             &self.config.trio.specialist_model,
                                             Some(self.config.trio.specialist_ctx_tokens),
-                                            self.config.timeouts.lms_load_secs,
                                         )
                                         .await
                                         {
@@ -1531,6 +1543,7 @@ impl ReplContext {
             // Flip to local mode and rebuild.
             self.persist_local_config();
             self.apply_and_rebuild_with(true);
+            reset_prompt_state_after_runtime_switch(&self.core_handle.counters, &self.session_id);
             tui::print_mode_banner(&self.srv.local_port, true);
         } else {
             // Toggle OFF — switch to cloud mode.
@@ -1555,6 +1568,7 @@ impl ReplContext {
             self.stop_watchdog();
             self.persist_local_config();
             self.apply_and_rebuild_with(false);
+            reset_prompt_state_after_runtime_switch(&self.core_handle.counters, &self.session_id);
             tui::print_mode_banner(&self.srv.local_port, false);
         }
     }
@@ -1583,5 +1597,28 @@ impl ReplContext {
         self.config.agents.default_lane = Some(new_lane.to_string());
         self.apply_and_rebuild();
         println!("\n  Lane switched to: {}\n", new_lane);
+    }
+}
+
+#[cfg(test)]
+mod task1_catalog_tests {
+    use super::*;
+    use crate::agent::agent_core::{RuntimeCounters, ToolPresentationMode};
+    use crate::config::schema::CircuitBreakerConfig;
+
+    #[test]
+    fn runtime_switch_clears_same_mode_native_catalog_in_both_directions() {
+        let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
+        let defs = vec![serde_json::json!({"function": {"name": "read_file"}})];
+
+        for session in ["cloud-to-local", "local-to-cloud"] {
+            counters.install_tool_catalog(session, ToolPresentationMode::Native, defs.clone());
+            reset_prompt_state_after_runtime_switch(&counters, session);
+            assert_eq!(
+                counters.frozen_tool_definitions(session, ToolPresentationMode::Native),
+                None,
+                "{session} must not reuse the previous model's Native catalog"
+            );
+        }
     }
 }

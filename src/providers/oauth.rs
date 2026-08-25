@@ -4,6 +4,7 @@
 //! the Claude CLI during authentication) and provides valid access tokens
 //! with automatic refresh when expired.
 
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::fmt;
 
 use anyhow::{Context, Result};

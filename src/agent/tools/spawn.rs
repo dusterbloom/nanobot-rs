@@ -4,65 +4,16 @@
 //! delegation. Also supports listing running subagents and cancelling them.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
-use super::base::{require_str, PermissionLevel, Tool};
-
-/// Type alias for the spawn callback.
-///
-/// Arguments: (task, label, agent_name, model_override, origin_channel, origin_chat_id, working_dir) -> result string.
-pub type SpawnCallback = Arc<
-    dyn Fn(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            Option<String>,
-        ) -> Pin<Box<dyn Future<Output = String> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Type alias for the list callback. Returns formatted list of running subagents.
-pub type ListCallback = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the cancel callback. Takes task_id prefix, returns success message.
-pub type CancelCallback =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the wait callback. Takes task_id prefix + timeout secs, returns result.
-pub type WaitCallback =
-    Arc<dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the check callback. Takes task_id prefix, returns result without blocking.
-pub type CheckCallback =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the pipeline callback. Takes (steps_json, ahead_by_k) -> result string.
-pub type PipelineCallback =
-    Arc<dyn Fn(String, usize) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
-
-/// Type alias for the loop callback.
-/// Takes (task, max_rounds, tools, stop_condition, model, working_dir) -> result string.
-pub type LoopCallback = Arc<
-    dyn Fn(
-            String,
-            u32,
-            Option<Vec<String>>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) -> Pin<Box<dyn Future<Output = String> + Send>>
-        + Send
-        + Sync,
->;
+use super::base::{PermissionLevel, Tool, ToolContext, ToolOutput, ToolResult};
+use crate::agent::host_bridge::{
+    CancelRequest, CheckRequest, HostBridge, HostRequest, ListSubagentsRequest, LoopRequest,
+    PipelineRequest, SpawnRequest, WaitRequest,
+};
+use crate::errors::ToolError;
 
 /// Tool to spawn a subagent for background task execution.
 ///
@@ -72,79 +23,19 @@ pub type LoopCallback = Arc<
 ///
 /// Also supports `action: "list"` to check running subagents and
 /// `action: "cancel"` to abort a stuck subagent.
+///
+/// Depends only on [`HostBridge`] (research §3.3 DIP): the production host
+/// (`AgentHost` in `tool_wiring`) and test mocks are interchangeable. Origin
+/// channel/chat are baked into the host at the registry boundary — the tool
+/// never carries them (doc §3.2/§3.3).
 pub struct SpawnTool {
-    spawn_callback: Arc<Mutex<Option<SpawnCallback>>>,
-    list_callback: Arc<Mutex<Option<ListCallback>>>,
-    cancel_callback: Arc<Mutex<Option<CancelCallback>>>,
-    wait_callback: Arc<Mutex<Option<WaitCallback>>>,
-    check_callback: Arc<Mutex<Option<CheckCallback>>>,
-    pipeline_callback: Arc<Mutex<Option<PipelineCallback>>>,
-    loop_callback: Arc<Mutex<Option<LoopCallback>>>,
-    origin_channel: Arc<Mutex<String>>,
-    origin_chat_id: Arc<Mutex<String>>,
+    host: Arc<dyn HostBridge>,
 }
 
 impl SpawnTool {
-    /// Create a new spawn tool.
-    pub fn new() -> Self {
-        Self {
-            spawn_callback: Arc::new(Mutex::new(None)),
-            list_callback: Arc::new(Mutex::new(None)),
-            cancel_callback: Arc::new(Mutex::new(None)),
-            wait_callback: Arc::new(Mutex::new(None)),
-            check_callback: Arc::new(Mutex::new(None)),
-            pipeline_callback: Arc::new(Mutex::new(None)),
-            loop_callback: Arc::new(Mutex::new(None)),
-            origin_channel: Arc::new(Mutex::new("cli".to_string())),
-            origin_chat_id: Arc::new(Mutex::new("direct".to_string())),
-        }
-    }
-
-    /// Set the origin context for subagent announcements.
-    pub async fn set_context(&self, channel: &str, chat_id: &str) {
-        *self.origin_channel.lock().await = channel.to_string();
-        *self.origin_chat_id.lock().await = chat_id.to_string();
-    }
-
-    /// Set the spawn callback.
-    pub async fn set_callback(&self, callback: SpawnCallback) {
-        *self.spawn_callback.lock().await = Some(callback);
-    }
-
-    /// Set the list callback for checking running subagents.
-    pub async fn set_list_callback(&self, callback: ListCallback) {
-        *self.list_callback.lock().await = Some(callback);
-    }
-
-    /// Set the cancel callback for aborting subagents.
-    pub async fn set_cancel_callback(&self, callback: CancelCallback) {
-        *self.cancel_callback.lock().await = Some(callback);
-    }
-
-    /// Set the wait callback for blocking until a subagent completes.
-    pub async fn set_wait_callback(&self, callback: WaitCallback) {
-        *self.wait_callback.lock().await = Some(callback);
-    }
-
-    /// Set the check callback for non-blocking result lookup.
-    pub async fn set_check_callback(&self, callback: CheckCallback) {
-        *self.check_callback.lock().await = Some(callback);
-    }
-
-    /// Set the pipeline callback for running multi-step pipelines.
-    pub async fn set_pipeline_callback(&self, callback: PipelineCallback) {
-        *self.pipeline_callback.lock().await = Some(callback);
-    }
-
-    /// Set the loop callback for autonomous refinement loops.
-    pub async fn set_loop_callback(&self, callback: LoopCallback) {
-        *self.loop_callback.lock().await = Some(callback);
-    }
-}
-
-impl Default for SpawnTool {
-    fn default() -> Self {
-        Self::new()
+    /// Create a new spawn tool wired to a typed host bridge.
+    pub fn new(host: Arc<dyn HostBridge>) -> Self {
+        Self { host }
     }
 }
 
@@ -195,6 +86,244 @@ impl Tool for SpawnToolLite {
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
         self.0.execute(params).await
+    }
+}
+
+/// Typed spawn action — the parse output of the tool (research §3.3 SRP:
+/// arg extraction + action routing lives here; invocation lives in the host).
+///
+/// The wire mapping into [`HostRequest`] is one-to-one (see
+/// [`From<SpawnAction> for HostRequest`]); origin channel/chat are filled
+/// with empty placeholders and baked in by the host.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpawnAction {
+    /// `spawn` (the default action).
+    Spawn {
+        task: String,
+        label: Option<String>,
+        /// `profile` wins over `agent` when both are given (legacy
+        /// resolution); unknown-name errors are the host's, not the tool's.
+        profile: Option<String>,
+        model: Option<String>,
+        working_dir: Option<String>,
+    },
+    /// `action: "list"` — no payload.
+    List,
+    /// `action: "check"` — non-blocking result lookup by task-id prefix.
+    Check { task_id: String },
+    /// `action: "cancel"` — abort a running subagent by task-id prefix.
+    Cancel { task_id: String },
+    /// `action: "wait"` — block until completion (default timeout 120s).
+    Wait { task_id: String, timeout_secs: u64 },
+    /// `action: "pipeline"` — multi-step pipeline (MAKER voting).
+    Pipeline {
+        steps: Vec<serde_json::Value>,
+        ahead_by_k: usize,
+    },
+    /// `action: "loop"` — autonomous refinement loop (default 5 rounds).
+    Loop {
+        task: String,
+        max_rounds: u32,
+        tools: Option<Vec<String>>,
+        stop_condition: Option<String>,
+        model: Option<String>,
+        working_dir: Option<String>,
+    },
+}
+
+/// Parse outcome: a typed action, a typed error, or — one legacy quirk — a
+/// success text. The pipeline `steps` parse reproduces the legacy callback's
+/// two-step (serialize → re-parse), which reported a malformed (non-array)
+/// `steps` value as a *success* carrying `"Error parsing pipeline steps:
+/// {serde}"` — no `"Error: "` prefix. That string is model-visible, so it
+/// survives unchanged.
+pub(crate) enum ParseError {
+    Tool(ToolError),
+    LegacyText(String),
+}
+
+impl From<ToolError> for ParseError {
+    fn from(e: ToolError) -> Self {
+        ParseError::Tool(e)
+    }
+}
+
+impl SpawnAction {
+    /// Parse tool params into a typed action. Every error string is the
+    /// exact legacy one, so the model sees byte-identical output.
+    pub(crate) fn parse(params: &HashMap<String, serde_json::Value>) -> Result<Self, ParseError> {
+        let action = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("spawn");
+        match action {
+            "list" => Ok(SpawnAction::List),
+            "check" => Ok(SpawnAction::Check {
+                task_id: required_str(params, "task_id", "check")?,
+            }),
+            "cancel" => Ok(SpawnAction::Cancel {
+                task_id: required_str(params, "task_id", "cancel")?,
+            }),
+            "wait" => Ok(SpawnAction::Wait {
+                task_id: required_str(params, "task_id", "wait")?,
+                timeout_secs: params
+                    .get("timeout")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(120),
+            }),
+            "pipeline" => {
+                let steps_value = params.get("steps").ok_or_else(|| ToolError::Execution {
+                    message: "'steps' parameter is required for pipeline".to_string(),
+                })?;
+                // Legacy two-step: serialize the raw value, then re-parse it
+                // as a sequence. A non-array value (string/map) failed the
+                // re-parse in the old callback and came back as the success
+                // text "Error parsing pipeline steps: {serde error}" — no
+                // "Error:" prefix. Reproduced verbatim.
+                let steps_json =
+                    serde_json::to_string(steps_value).unwrap_or_else(|_| "[]".to_string());
+                let steps: Vec<serde_json::Value> = match serde_json::from_str(&steps_json) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Err(ParseError::LegacyText(format!(
+                            "Error parsing pipeline steps: {e}"
+                        )))
+                    }
+                };
+                let ahead_by_k = params
+                    .get("ahead_by_k")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
+                    .unwrap_or(0);
+                Ok(SpawnAction::Pipeline { steps, ahead_by_k })
+            }
+            "loop" => Ok(SpawnAction::Loop {
+                task: required_str(params, "task", "loop")?,
+                max_rounds: params
+                    .get("max_rounds")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+                    .unwrap_or(5),
+                tools: params.get("tools").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                }),
+                stop_condition: params
+                    .get("stop_condition")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                model: params
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                working_dir: params
+                    .get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            }),
+            "spawn" | _ => Ok(SpawnAction::Spawn {
+                task: required_str(params, "task", "spawn")?,
+                label: params
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                // 'profile' and 'agent' are synonyms; 'profile' wins when both
+                // are given (legacy resolution, unchanged).
+                profile: params
+                    .get("profile")
+                    .or_else(|| params.get("agent"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                model: params
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                working_dir: params
+                    .get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            }),
+        }
+    }
+}
+
+/// Legacy-identical required-param error. The default `spawn` action reads
+/// `'task' parameter is required` (no suffix); the routed actions read
+/// `'task_id' parameter is required for check` etc. — byte-stable.
+fn required_str(
+    params: &HashMap<String, serde_json::Value>,
+    key: &str,
+    action: &str,
+) -> Result<String, ToolError> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            let message = if action == "spawn" {
+                format!("'{key}' parameter is required")
+            } else {
+                format!("'{key}' parameter is required for {action}")
+            };
+            ToolError::Execution { message }
+        })
+}
+
+impl From<SpawnAction> for HostRequest {
+    fn from(action: SpawnAction) -> Self {
+        match action {
+            SpawnAction::Spawn {
+                task,
+                label,
+                profile,
+                model,
+                working_dir,
+            } => {
+                HostRequest::Spawn(SpawnRequest {
+                    task,
+                    label,
+                    profile,
+                    model,
+                    working_dir,
+                    // Origin channel/chat are baked into the host at the
+                    // registry boundary (doc §3.2/§3.3); the tool never
+                    // carries them, and they never travel on the wire.
+                    channel: String::new(),
+                    chat_id: String::new(),
+                })
+            }
+            SpawnAction::List => HostRequest::ListSubagents(ListSubagentsRequest {}),
+            SpawnAction::Check { task_id } => HostRequest::CheckSubagent(CheckRequest { task_id }),
+            SpawnAction::Cancel { task_id } => {
+                HostRequest::CancelSubagent(CancelRequest { task_id })
+            }
+            SpawnAction::Wait {
+                task_id,
+                timeout_secs,
+            } => HostRequest::WaitSubagent(WaitRequest {
+                task_id,
+                timeout_secs,
+            }),
+            SpawnAction::Pipeline { steps, ahead_by_k } => {
+                HostRequest::RunPipeline(PipelineRequest { steps, ahead_by_k })
+            }
+            SpawnAction::Loop {
+                task,
+                max_rounds,
+                tools,
+                stop_condition,
+                model,
+                working_dir,
+            } => HostRequest::RunLoop(LoopRequest {
+                task,
+                max_rounds,
+                tools,
+                stop_condition,
+                model,
+                working_dir,
+            }),
+        }
     }
 }
 
@@ -297,190 +426,204 @@ impl Tool for SpawnTool {
         })
     }
 
+    /// Legacy string entry point — thin render-wrapped call into the
+    /// typed path (error protocol Phase 2 migration).
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let action = params
-            .get("action")
+        self.execute_with_result(params).await.data().to_string()
+    }
+
+    /// Typed entry point: parses the params into a typed [`SpawnAction`]
+    /// (every validation error string byte-identical to the legacy surface)
+    /// and drives the request through the host bridge — one call, no locks,
+    /// no `Option<callback>` slots (research §3.4). Origin channel/chat are
+    /// baked into the host; the tool sends empty placeholders that never
+    /// travel on the wire (`#[serde(skip)]`).
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        let action = match SpawnAction::parse(&params) {
+            Ok(action) => action,
+            Err(ParseError::Tool(e)) => return Err(e),
+            // Legacy quirk preserved exactly: a malformed (non-array)
+            // pipeline `steps` value made the old callback return
+            // "Error parsing pipeline steps: …" as a *success* — no "Error:"
+            // prefix. Emit verbatim.
+            Err(ParseError::LegacyText(text)) => return Ok(ToolOutput { text }),
+        };
+        let reply = self.host.call(action.into()).await?;
+        let text = reply
+            .get("text")
             .and_then(|v| v.as_str())
-            .unwrap_or("spawn");
-
-        match action {
-            "list" => {
-                let cb_guard = self.list_callback.lock().await;
-                match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
-                        drop(cb_guard);
-                        cb().await
-                    }
-                    None => "Error: List callback not configured".to_string(),
-                }
-            }
-            "check" => {
-                let task_id = require_str!(params, "task_id", " for check").to_string();
-                let cb_guard = self.check_callback.lock().await;
-                match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
-                        drop(cb_guard);
-                        cb(task_id).await
-                    }
-                    None => "Error: Check callback not configured".to_string(),
-                }
-            }
-            "cancel" => {
-                let task_id = require_str!(params, "task_id", " for cancel").to_string();
-                let cb_guard = self.cancel_callback.lock().await;
-                match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
-                        drop(cb_guard);
-                        cb(task_id).await
-                    }
-                    None => "Error: Cancel callback not configured".to_string(),
-                }
-            }
-            "wait" => {
-                let task_id = require_str!(params, "task_id", " for wait").to_string();
-                let timeout = params
-                    .get("timeout")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(120);
-                let cb_guard = self.wait_callback.lock().await;
-                match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
-                        drop(cb_guard);
-                        cb(task_id, timeout).await
-                    }
-                    None => "Error: Wait callback not configured".to_string(),
-                }
-            }
-            "pipeline" => {
-                let steps_json = match params.get("steps") {
-                    Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
-                    None => return "Error: 'steps' parameter is required for pipeline".to_string(),
-                };
-                let ahead_by_k = params
-                    .get("ahead_by_k")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-
-                let cb_guard = self.pipeline_callback.lock().await;
-                match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
-                        drop(cb_guard);
-                        cb(steps_json, ahead_by_k).await
-                    }
-                    None => "Error: Pipeline callback not configured".to_string(),
-                }
-            }
-            "loop" => {
-                let task = require_str!(params, "task", " for loop").to_string();
-                let max_rounds = params
-                    .get("max_rounds")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as u32;
-                let tools_filter: Option<Vec<String>> =
-                    params.get("tools").and_then(|v| v.as_array()).map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    });
-                let stop_condition = params
-                    .get("stop_condition")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let model = params
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let working_dir = params
-                    .get("working_dir")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let cb_guard = self.loop_callback.lock().await;
-                match cb_guard.as_ref() {
-                    Some(cb) => {
-                        let cb = cb.clone();
-                        drop(cb_guard);
-                        cb(
-                            task,
-                            max_rounds,
-                            tools_filter,
-                            stop_condition,
-                            model,
-                            working_dir,
-                        )
-                        .await
-                    }
-                    None => "Error: Loop callback not configured".to_string(),
-                }
-            }
-            "spawn" | _ => {
-                let task = require_str!(params, "task").to_string();
-
-                let label = params
-                    .get("label")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                // 'profile' and 'agent' are synonyms; 'profile' wins when both
-                // are given. Resolution (and unknown-name errors) happens in
-                // SubagentManager::spawn via the existing agent_name plumbing.
-                let agent = params
-                    .get("profile")
-                    .or_else(|| params.get("agent"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let model = params
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let working_dir = params
-                    .get("working_dir")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let channel = self.origin_channel.lock().await.clone();
-                let chat_id = self.origin_chat_id.lock().await.clone();
-
-                let callback_guard = self.spawn_callback.lock().await;
-                let callback = match callback_guard.as_ref() {
-                    Some(cb) => cb.clone(),
-                    None => return "Error: Spawn callback not configured".to_string(),
-                };
-                // Drop the lock before awaiting.
-                drop(callback_guard);
-
-                callback(task, label, agent, model, channel, chat_id, working_dir).await
-            }
-        }
+            .map(str::to_string)
+            .ok_or_else(|| ToolError::Execution {
+                message: "host reply missing 'text'".to_string(),
+            })?;
+        Ok(ToolOutput { text })
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::host_bridge::{
+        CancelReply, CheckReply, HostDispatcher, ListReply, LoopHost, LoopReply, MessageHost,
+        PipelineHost, PipelineReply, SendMessageReply, SendMessageRequest, SpawnHost, SpawnReply,
+        WaitReply,
+    };
+    use serde_json::json;
 
-    #[test]
-    fn test_spawn_tool_name() {
-        let tool = SpawnTool::new();
-        assert_eq!(tool.name(), "spawn");
+    /// Test host that echoes every request back into the model-visible text,
+    /// so tests can assert exactly what the tool forwarded to the bridge.
+    struct EchoHost;
+
+    #[async_trait]
+    impl SpawnHost for EchoHost {
+        async fn spawn(&self, req: SpawnRequest) -> Result<SpawnReply, ToolError> {
+            Ok(SpawnReply {
+                task_id: "abc12345".to_string(),
+                text: format!(
+                    "spawned: task={}, label={}, profile={}, model={}, channel={}, chat_id={}, working_dir={}",
+                    req.task,
+                    req.label.unwrap_or_else(|| "none".to_string()),
+                    req.profile.unwrap_or_else(|| "none".to_string()),
+                    req.model.unwrap_or_else(|| "none".to_string()),
+                    req.channel,
+                    req.chat_id,
+                    req.working_dir.unwrap_or_else(|| "none".to_string()),
+                ),
+            })
+        }
+        async fn list_subagents(&self) -> Result<ListReply, ToolError> {
+            Ok(ListReply {
+                text: "No subagents currently running.".to_string(),
+            })
+        }
+        async fn cancel(&self, req: CancelRequest) -> Result<CancelReply, ToolError> {
+            Ok(CancelReply {
+                text: format!("Cancelled {}", req.task_id),
+            })
+        }
+        async fn wait(&self, req: WaitRequest) -> Result<WaitReply, ToolError> {
+            Ok(WaitReply {
+                text: format!("waited {} {}s", req.task_id, req.timeout_secs),
+            })
+        }
+        async fn check(&self, req: CheckRequest) -> Result<CheckReply, ToolError> {
+            Ok(CheckReply {
+                text: format!("checking {}", req.task_id),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl PipelineHost for EchoHost {
+        async fn run_pipeline(&self, req: PipelineRequest) -> Result<PipelineReply, ToolError> {
+            let steps = serde_json::to_string(&req.steps).unwrap_or_default();
+            Ok(PipelineReply {
+                text: format!("pipeline {steps} ahead {}", req.ahead_by_k),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LoopHost for EchoHost {
+        async fn run_loop(&self, req: LoopRequest) -> Result<LoopReply, ToolError> {
+            Ok(LoopReply {
+                text: format!("loop {} r{}", req.task, req.max_rounds),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl MessageHost for EchoHost {
+        async fn send(&self, req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
+            Ok(SendMessageReply {
+                text: format!("sent {}:{}", req.channel, req.chat_id),
+            })
+        }
+    }
+
+    /// Test host whose capability methods all fail with a typed error, used
+    /// to prove host errors propagate through the bridge unchanged.
+    struct FailingHost;
+
+    #[async_trait]
+    impl SpawnHost for FailingHost {
+        async fn spawn(&self, _req: SpawnRequest) -> Result<SpawnReply, ToolError> {
+            Err(ToolError::Execution {
+                message: "spawn exploded".to_string(),
+            })
+        }
+        async fn list_subagents(&self) -> Result<ListReply, ToolError> {
+            Err(ToolError::Execution {
+                message: "list exploded".to_string(),
+            })
+        }
+        async fn cancel(&self, _req: CancelRequest) -> Result<CancelReply, ToolError> {
+            Err(ToolError::Execution {
+                message: "cancel exploded".to_string(),
+            })
+        }
+        async fn wait(&self, _req: WaitRequest) -> Result<WaitReply, ToolError> {
+            Err(ToolError::Execution {
+                message: "wait exploded".to_string(),
+            })
+        }
+        async fn check(&self, _req: CheckRequest) -> Result<CheckReply, ToolError> {
+            Err(ToolError::Execution {
+                message: "check exploded".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl PipelineHost for FailingHost {
+        async fn run_pipeline(&self, _req: PipelineRequest) -> Result<PipelineReply, ToolError> {
+            Err(ToolError::Execution {
+                message: "pipeline exploded".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LoopHost for FailingHost {
+        async fn run_loop(&self, _req: LoopRequest) -> Result<LoopReply, ToolError> {
+            Err(ToolError::Execution {
+                message: "loop exploded".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl MessageHost for FailingHost {
+        async fn send(&self, _req: SendMessageRequest) -> Result<SendMessageReply, ToolError> {
+            Err(ToolError::Execution {
+                message: "send exploded".to_string(),
+            })
+        }
+    }
+
+    /// The production composition: a dispatcher over a single mock host.
+    fn test_host(host: impl HostBridge + 'static) -> Arc<dyn HostBridge> {
+        let host = Arc::new(host);
+        Arc::new(HostDispatcher::new(
+            host.clone(),
+            host.clone(),
+            host.clone(),
+            host.clone(),
+        ))
     }
 
     #[test]
-    fn test_spawn_tool_default() {
-        let tool = SpawnTool::default();
+    fn test_spawn_tool_name() {
+        let tool = SpawnTool::new(test_host(EchoHost));
         assert_eq!(tool.name(), "spawn");
     }
 
     #[test]
     fn test_spawn_tool_description() {
-        let tool = SpawnTool::new();
+        let tool = SpawnTool::new(test_host(EchoHost));
         let desc = tool.description();
         assert!(!desc.is_empty());
         assert!(desc.contains("subagent") || desc.contains("background"));
@@ -490,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_spawn_tool_parameters() {
-        let tool = SpawnTool::new();
+        let tool = SpawnTool::new(test_host(EchoHost));
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["task"].is_object());
@@ -507,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_spawn_tool_parameters_contains_profile() {
-        let tool = SpawnTool::new();
+        let tool = SpawnTool::new(test_host(EchoHost));
         let params = tool.parameters();
         assert!(params["properties"]["profile"].is_object());
         let desc = params["properties"]["profile"]["description"]
@@ -519,260 +662,213 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_profile_param_routes_to_agent_slot() {
-        let tool = SpawnTool::new();
-        let callback: SpawnCallback = Arc::new(
-            |_task, _label, agent: Option<String>, _model, _channel, _chat_id, _wd| {
-                Box::pin(
-                    async move { format!("agent={}", agent.unwrap_or_else(|| "none".to_string())) },
-                )
-            },
-        );
-        tool.set_callback(callback).await;
-
+    async fn test_profile_param_routes_to_profile_slot() {
+        let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
-        params.insert("task".to_string(), serde_json::json!("investigate"));
-        params.insert("profile".to_string(), serde_json::json!("researcher"));
+        params.insert("task".to_string(), json!("investigate"));
+        params.insert("profile".to_string(), json!("researcher"));
         let result = tool.execute(params).await;
-        assert!(result.contains("agent=researcher"));
-    }
-
-    #[tokio::test]
-    async fn test_execute_without_callback() {
-        let tool = SpawnTool::new();
+        assert!(result.contains("profile=researcher"));
+        // 'agent' is a synonym; 'profile' wins when both are given.
         let mut params = HashMap::new();
-        params.insert(
-            "task".to_string(),
-            serde_json::Value::String("do something".to_string()),
-        );
+        params.insert("task".to_string(), json!("investigate"));
+        params.insert("profile".to_string(), json!("researcher"));
+        params.insert("agent".to_string(), json!("explore"));
         let result = tool.execute(params).await;
-        assert!(result.contains("Spawn callback not configured"));
+        assert!(result.contains("profile=researcher"));
     }
 
     #[tokio::test]
     async fn test_execute_missing_task() {
-        let tool = SpawnTool::new();
+        let tool = SpawnTool::new(test_host(EchoHost));
         let params = HashMap::new();
         let result = tool.execute(params).await;
-        assert!(result.contains("'task' parameter is required"));
-    }
-
-    #[tokio::test]
-    async fn test_list_without_callback() {
-        let tool = SpawnTool::new();
-        let mut params = HashMap::new();
-        params.insert(
-            "action".to_string(),
-            serde_json::Value::String("list".to_string()),
-        );
-        let result = tool.execute(params).await;
-        assert!(result.contains("List callback not configured"));
+        assert_eq!(result, "Error: 'task' parameter is required");
     }
 
     #[tokio::test]
     async fn test_cancel_without_task_id() {
-        let tool = SpawnTool::new();
+        let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
-        params.insert(
-            "action".to_string(),
-            serde_json::Value::String("cancel".to_string()),
-        );
+        params.insert("action".to_string(), json!("cancel"));
         let result = tool.execute(params).await;
-        assert!(result.contains("'task_id' parameter is required"));
+        assert_eq!(result, "Error: 'task_id' parameter is required for cancel");
     }
 
     #[tokio::test]
-    async fn test_cancel_without_callback() {
-        let tool = SpawnTool::new();
+    async fn test_wait_without_task_id() {
+        let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
-        params.insert(
-            "action".to_string(),
-            serde_json::Value::String("cancel".to_string()),
-        );
-        params.insert(
-            "task_id".to_string(),
-            serde_json::Value::String("abc123".to_string()),
-        );
+        params.insert("action".to_string(), json!("wait"));
         let result = tool.execute(params).await;
-        assert!(result.contains("Cancel callback not configured"));
+        assert_eq!(result, "Error: 'task_id' parameter is required for wait");
     }
 
     #[tokio::test]
-    async fn test_list_with_mock_callback() {
-        let tool = SpawnTool::new();
-        let list_cb: ListCallback =
-            Arc::new(|| Box::pin(async { "No subagents currently running.".to_string() }));
-        tool.set_list_callback(list_cb).await;
-
+    async fn test_pipeline_without_steps() {
+        let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
-        params.insert(
-            "action".to_string(),
-            serde_json::Value::String("list".to_string()),
-        );
+        params.insert("action".to_string(), json!("pipeline"));
         let result = tool.execute(params).await;
-        assert!(result.contains("No subagents"));
+        assert_eq!(result, "Error: 'steps' parameter is required for pipeline");
     }
 
     #[tokio::test]
-    async fn test_cancel_with_mock_callback() {
-        let tool = SpawnTool::new();
-        let cancel_cb: CancelCallback =
-            Arc::new(|id: String| Box::pin(async move { format!("Cancelled {}", id) }));
-        tool.set_cancel_callback(cancel_cb).await;
-
+    async fn test_loop_without_task() {
+        let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
-        params.insert(
-            "action".to_string(),
-            serde_json::Value::String("cancel".to_string()),
-        );
-        params.insert(
-            "task_id".to_string(),
-            serde_json::Value::String("abc123".to_string()),
-        );
+        params.insert("action".to_string(), json!("loop"));
         let result = tool.execute(params).await;
-        assert!(result.contains("Cancelled abc123"));
+        assert_eq!(result, "Error: 'task' parameter is required for loop");
     }
 
     #[tokio::test]
-    async fn test_set_context() {
-        let tool = SpawnTool::new();
-        tool.set_context("discord", "guild_123").await;
+    async fn test_host_errors_propagate_through_the_bridge() {
+        let tool = SpawnTool::new(test_host(FailingHost));
+        let mut params = HashMap::new();
+        params.insert("task".to_string(), json!("t"));
+        let result = tool.execute(params).await;
+        assert_eq!(result, "Error: spawn exploded");
 
         let mut params = HashMap::new();
-        params.insert(
-            "task".to_string(),
-            serde_json::Value::String("test task".to_string()),
-        );
+        params.insert("action".to_string(), json!("list"));
         let result = tool.execute(params).await;
-        assert!(result.contains("Spawn callback not configured"));
+        assert_eq!(result, "Error: list exploded");
     }
 
     #[tokio::test]
-    async fn test_execute_with_mock_callback() {
-        let tool = SpawnTool::new();
-
-        let callback: SpawnCallback = Arc::new(
-            |task: String,
-             label: Option<String>,
-             agent: Option<String>,
-             model: Option<String>,
-             channel: String,
-             chat_id: String,
-             working_dir: Option<String>| {
-                Box::pin(async move {
-                    format!(
-                        "spawned: task={}, label={}, agent={}, model={}, channel={}, chat_id={}, working_dir={}",
-                        task,
-                        label.unwrap_or_else(|| "none".to_string()),
-                        agent.unwrap_or_else(|| "none".to_string()),
-                        model.unwrap_or_else(|| "none".to_string()),
-                        channel,
-                        chat_id,
-                        working_dir.unwrap_or_else(|| "none".to_string()),
-                    )
-                })
-            },
-        );
-        tool.set_callback(callback).await;
-        tool.set_context("telegram", "42").await;
-
+    async fn test_list_forwards_to_host() {
+        let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
-        params.insert(
-            "task".to_string(),
-            serde_json::Value::String("analyze data".to_string()),
-        );
-        params.insert(
-            "label".to_string(),
-            serde_json::Value::String("data-analysis".to_string()),
-        );
-        params.insert(
-            "agent".to_string(),
-            serde_json::Value::String("explore".to_string()),
-        );
-        params.insert(
-            "model".to_string(),
-            serde_json::Value::String("haiku".to_string()),
-        );
+        params.insert("action".to_string(), json!("list"));
         let result = tool.execute(params).await;
-        assert!(result.contains("spawned:"));
+        assert_eq!(result, "No subagents currently running.");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_forwards_to_host() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("cancel"));
+        params.insert("task_id".to_string(), json!("abc123"));
+        let result = tool.execute(params).await;
+        assert_eq!(result, "Cancelled abc123");
+    }
+
+    #[tokio::test]
+    async fn test_check_forwards_to_host() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("check"));
+        params.insert("task_id".to_string(), json!("abc123"));
+        let result = tool.execute(params).await;
+        assert_eq!(result, "checking abc123");
+    }
+
+    #[tokio::test]
+    async fn test_execute_forwards_full_params() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("task".to_string(), json!("analyze data"));
+        params.insert("label".to_string(), json!("data-analysis"));
+        params.insert("profile".to_string(), json!("explore"));
+        params.insert("model".to_string(), json!("haiku"));
+        params.insert("working_dir".to_string(), json!("/tmp/project"));
+        let result = tool.execute(params).await;
         assert!(result.contains("task=analyze data"));
         assert!(result.contains("label=data-analysis"));
-        assert!(result.contains("agent=explore"));
+        assert!(result.contains("profile=explore"));
         assert!(result.contains("model=haiku"));
-        assert!(result.contains("channel=telegram"));
-        assert!(result.contains("chat_id=42"));
+        assert!(result.contains("working_dir=/tmp/project"));
+        // Origin channel/chat are baked into the host — the tool never
+        // carries them (empty placeholders on the request).
+        assert!(result.contains("channel=, chat_id="));
     }
 
     #[tokio::test]
-    async fn test_execute_with_callback_no_optional_params() {
-        let tool = SpawnTool::new();
-
-        let callback: SpawnCallback = Arc::new(
-            |task: String,
-             label: Option<String>,
-             agent: Option<String>,
-             model: Option<String>,
-             _channel: String,
-             _chat_id: String,
-             _working_dir: Option<String>| {
-                Box::pin(async move {
-                    format!(
-                        "task={}, has_label={}, has_agent={}, has_model={}",
-                        task,
-                        label.is_some(),
-                        agent.is_some(),
-                        model.is_some(),
-                    )
-                })
-            },
-        );
-        tool.set_callback(callback).await;
-
+    async fn test_execute_without_optional_params() {
+        let tool = SpawnTool::new(test_host(EchoHost));
         let mut params = HashMap::new();
-        params.insert(
-            "task".to_string(),
-            serde_json::Value::String("simple task".to_string()),
-        );
+        params.insert("task".to_string(), json!("simple task"));
         let result = tool.execute(params).await;
         assert!(result.contains("task=simple task"));
-        assert!(result.contains("has_label=false"));
-        assert!(result.contains("has_agent=false"));
-        assert!(result.contains("has_model=false"));
+        assert!(result.contains("label=none"));
+        assert!(result.contains("profile=none"));
+        assert!(result.contains("model=none"));
     }
 
     #[tokio::test]
-    async fn test_execute_with_working_dir() {
-        let tool = SpawnTool::new();
+    async fn test_pipeline_forwards_steps_and_ahead_by_k() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), json!(2));
+        let result = tool.execute(params).await;
+        assert_eq!(result, r#"pipeline [{"prompt":"one"}] ahead 2"#);
+    }
 
-        let callback: SpawnCallback = Arc::new(
-            |_task: String,
-             _label: Option<String>,
-             _agent: Option<String>,
-             _model: Option<String>,
-             _channel: String,
-             _chat_id: String,
-             working_dir: Option<String>| {
-                Box::pin(async move {
-                    format!(
-                        "working_dir={}",
-                        working_dir.unwrap_or_else(|| "none".to_string()),
-                    )
-                })
-            },
+    #[tokio::test]
+    async fn test_loop_forwards_task_and_rounds() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("loop"));
+        params.insert("task".to_string(), json!("refine"));
+        params.insert("max_rounds".to_string(), json!(3));
+        let result = tool.execute(params).await;
+        assert_eq!(result, "loop refine r3");
+    }
+
+    #[tokio::test]
+    async fn test_wait_forwards_timeout() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("wait"));
+        params.insert("task_id".to_string(), json!("abc123"));
+        let result = tool.execute(params).await;
+        // No timeout param → legacy default of 120s.
+        assert_eq!(result, "waited abc123 120s");
+
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("wait"));
+        params.insert("task_id".to_string(), json!("abc123"));
+        params.insert("timeout".to_string(), json!(10));
+        let result = tool.execute(params).await;
+        assert_eq!(result, "waited abc123 10s");
+    }
+
+    #[tokio::test]
+    async fn test_malformed_pipeline_steps_reports_legacy_text() {
+        // Legacy quirk: a non-array `steps` value came back from the old
+        // callback as a *success* carrying "Error parsing pipeline steps: …"
+        // (no "Error:" prefix). The bridge must reproduce it exactly.
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!("not-an-array"));
+        let result = tool.execute(params).await;
+        assert_eq!(
+            result,
+            "Error parsing pipeline steps: invalid type: string \"not-an-array\", expected a sequence at line 1 column 14"
         );
-        tool.set_callback(callback).await;
+    }
 
-        // With working_dir
-        let mut params = HashMap::new();
-        params.insert("task".to_string(), serde_json::json!("build project"));
-        params.insert("working_dir".to_string(), serde_json::json!("/tmp/project"));
-        let result = tool.execute(params).await;
-        assert!(result.contains("working_dir=/tmp/project"));
-
-        // Without working_dir
-        let mut params = HashMap::new();
-        params.insert("task".to_string(), serde_json::json!("build project"));
-        let result = tool.execute(params).await;
-        assert!(result.contains("working_dir=none"));
+    #[test]
+    fn spawn_action_wire_round_trip() {
+        // The typed action maps onto the exact wire request.
+        let action = SpawnAction::Spawn {
+            task: "t".to_string(),
+            label: None,
+            profile: Some("explore".to_string()),
+            model: None,
+            working_dir: None,
+        };
+        let wire = serde_json::to_string(&HostRequest::from(action)).unwrap();
+        assert!(wire.contains(r#""type":"spawn""#));
+        assert!(wire.contains(r#""task":"t""#));
+        assert!(wire.contains(r#""profile":"explore""#));
+        // Origin never travels on the wire.
+        assert!(!wire.contains("channel"));
+        assert!(!wire.contains("chat_id"));
     }
 }

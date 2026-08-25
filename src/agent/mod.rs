@@ -25,6 +25,7 @@ pub(crate) mod embedder;
 pub(crate) mod finalize_response;
 pub(crate) mod gateway_commands;
 pub(crate) mod hooks;
+pub(crate) mod host_bridge;
 pub(crate) mod instructions;
 pub(crate) mod knowledge_graph;
 pub mod knowledge_store;

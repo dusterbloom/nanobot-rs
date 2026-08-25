@@ -9,11 +9,55 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+/// Cumulative prompt-cache accounting for one logical Nanobot session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionCacheMetrics {
+    pub calls: u64,
+    pub prompt_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cold_calls: u64,
+}
+
+impl SessionCacheMetrics {
+    pub fn record(
+        &mut self,
+        prompt_tokens: u64,
+        cache_read_tokens: Option<u64>,
+        cache_creation_tokens: Option<u64>,
+    ) {
+        let cache_read_tokens = cache_read_tokens.unwrap_or(0);
+        self.calls = self.calls.saturating_add(1);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(cache_read_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(cache_creation_tokens.unwrap_or(0));
+        if prompt_tokens > 0 && cache_read_tokens == 0 {
+            self.cold_calls = self.cold_calls.saturating_add(1);
+        }
+    }
+
+    pub fn efficiency_pct(self) -> f64 {
+        if self.prompt_tokens == 0 {
+            0.0
+        } else {
+            self.cache_read_tokens as f64 * 100.0 / self.prompt_tokens as f64
+        }
+    }
+}
+
 /// One metric record per LLM call.
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestMetrics {
     pub timestamp: String,
     pub request_id: String,
+    /// Stable Nanobot session key spanning every provider call in one logical
+    /// conversation, independent of retained Higgs session-id rotations.
+    pub logical_session: String,
+    /// Prompt-cache branch used for this request. Wire values are `active`,
+    /// `retained_expansion`, and `fallback`.
+    pub cache_route: String,
     pub role: String,
     pub model: String,
     pub provider_base: String,
@@ -108,10 +152,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_cache_metrics_aggregate_provider_calls() {
+        let mut stats = SessionCacheMetrics::default();
+        stats.record(100, Some(60), Some(40));
+        stats.record(200, Some(0), Some(200));
+
+        assert_eq!(stats.calls, 2);
+        assert_eq!(stats.prompt_tokens, 300);
+        assert_eq!(stats.cache_read_tokens, 60);
+        assert_eq!(stats.cache_creation_tokens, 240);
+        assert_eq!(stats.cold_calls, 1);
+        assert_eq!(stats.efficiency_pct(), 20.0);
+    }
+
+    #[test]
     fn test_request_metrics_serialization() {
         let m = RequestMetrics {
             timestamp: "2026-02-20T12:00:00Z".into(),
             request_id: "abc12345".into(),
+            logical_session: "cli:session-42".into(),
+            cache_route: "active".into(),
             role: "main".into(),
             model: "qwen3-8b".into(),
             provider_base: "http://localhost:1234/v1".into(),
@@ -135,6 +195,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed["request_id"], "abc12345");
+        assert_eq!(parsed["logical_session"], "cli:session-42");
+        assert_eq!(parsed["cache_route"], "active");
         assert_eq!(parsed["elapsed_ms"], 1500);
         assert_eq!(parsed["status"], "ok");
         assert!(parsed.get("error_detail").is_none()); // skip_serializing_if
@@ -151,6 +213,8 @@ mod tests {
         let m = RequestMetrics {
             timestamp: "2026-02-20T12:00:00Z".into(),
             request_id: "def67890".into(),
+            logical_session: "cli:router-7".into(),
+            cache_route: "fallback".into(),
             role: "router".into(),
             model: "nvidia_Orchestrator-8B".into(),
             provider_base: "http://192.168.1.22:1234/v1".into(),
@@ -221,6 +285,8 @@ mod tests {
         let m = RequestMetrics {
             timestamp: "2026-02-20T12:00:00Z".into(),
             request_id: "test1234".into(),
+            logical_session: "cli:test".into(),
+            cache_route: "active".into(),
             role: "main".into(),
             model: "test-model".into(),
             provider_base: "http://localhost/v1".into(),

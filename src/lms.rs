@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions, clippy::indexing_slicing)]
 //! LM Studio integration via CLI (server management) and HTTP API (model operations).
 //!
 //! The `lms` CLI is used only for server start/stop/status because those commands
@@ -171,7 +177,6 @@ pub(crate) async fn load_model(
     port: u16,
     model: &str,
     context_length: Option<usize>,
-    _timeout_secs: u64,
 ) -> Result<(), String> {
     load_model_at(&rest_base(host, port), model, context_length).await
 }
@@ -207,16 +212,8 @@ pub(crate) async fn reload_model_with_context(
     port: u16,
     model: &str,
     context_length: usize,
-    _load_timeout_secs: u64,
-    _unload_timeout_secs: u64,
 ) -> Result<(), String> {
-    reload_model_with_context_at(
-        &rest_base(host, port),
-        model,
-        context_length,
-        _unload_timeout_secs,
-    )
-    .await
+    reload_model_with_context_at(&rest_base(host, port), model, context_length).await
 }
 
 /// Like `reload_model_with_context` but accepts a full base URL.
@@ -224,7 +221,6 @@ pub(crate) async fn reload_model_with_context_at(
     base_url: &str,
     model: &str,
     context_length: usize,
-    _unload_timeout_secs: u64,
 ) -> Result<(), String> {
     let models = list_models_full_at(base_url).await;
     let loaded_keys: Vec<String> = models
@@ -905,7 +901,7 @@ mod tests {
         let target_b = 6144.min(max_ctx).max(2048);
         let original = fetch_loaded_context_length(port, &model).await;
 
-        reload_model_with_context("", port, &model, target_a, 120, 30)
+        reload_model_with_context("", port, &model, target_a)
             .await
             .expect("failed to reload model at target_a context");
         let observed_a = fetch_loaded_context_length(port, &model)
@@ -917,7 +913,7 @@ mod tests {
         );
 
         if target_b != target_a {
-            reload_model_with_context("", port, &model, target_b, 120, 30)
+            reload_model_with_context("", port, &model, target_b)
                 .await
                 .expect("failed to reload model at target_b context");
             let observed_b = fetch_loaded_context_length(port, &model)
@@ -930,7 +926,7 @@ mod tests {
         }
 
         if let Some(orig_ctx) = original {
-            let _ = reload_model_with_context("", port, &model, orig_ctx, 120, 30).await;
+            let _ = reload_model_with_context("", port, &model, orig_ctx).await;
         }
     }
 

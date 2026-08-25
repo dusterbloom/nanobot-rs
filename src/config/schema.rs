@@ -32,9 +32,6 @@ pub struct WhatsAppConfig {
     pub bridge_port: u16,
     #[serde(default)]
     pub allow_from: Vec<String>,
-    /// Optional toolset name from `tools.toolsets` to restrict available tools.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toolset: Option<String>,
 }
 
 fn default_whatsapp_bridge_port() -> u16 {
@@ -57,7 +54,6 @@ impl Default for WhatsAppConfig {
             bridge_url: None,
             bridge_port: default_whatsapp_bridge_port(),
             allow_from: Vec::new(),
-            toolset: None,
         }
     }
 }
@@ -74,9 +70,6 @@ pub struct TelegramConfig {
     pub allow_from: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
-    /// Optional toolset name from `tools.toolsets` to restrict available tools.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toolset: Option<String>,
 }
 
 impl fmt::Debug for TelegramConfig {
@@ -86,7 +79,6 @@ impl fmt::Debug for TelegramConfig {
             .field("token", &crate::config::redact(&self.token))
             .field("allow_from", &self.allow_from)
             .field("proxy", &self.proxy)
-            .field("toolset", &self.toolset)
             .finish()
     }
 }
@@ -98,7 +90,6 @@ impl Default for TelegramConfig {
             token: String::new(),
             allow_from: Vec::new(),
             proxy: None,
-            toolset: None,
         }
     }
 }
@@ -125,9 +116,6 @@ pub struct EmailConfig {
     pub poll_interval_secs: u64,
     #[serde(default)]
     pub allow_from: Vec<String>,
-    /// Optional toolset name from `tools.toolsets` to restrict available tools.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toolset: Option<String>,
 }
 
 fn default_imap_port() -> u16 {
@@ -154,7 +142,6 @@ impl fmt::Debug for EmailConfig {
             .field("password", &crate::config::redact(&self.password))
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("allow_from", &self.allow_from)
-            .field("toolset", &self.toolset)
             .finish()
     }
 }
@@ -171,7 +158,6 @@ impl Default for EmailConfig {
             password: String::new(),
             poll_interval_secs: default_poll_interval(),
             allow_from: Vec::new(),
-            toolset: None,
         }
     }
 }
@@ -313,10 +299,6 @@ pub struct AgentDefaults {
     /// Number of draft tokens per speculative decoding step (default: 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_draft_tokens: Option<u32>,
-    /// Path to model used for ANE training (e.g. 0.8B for 32GB machines).
-    /// MLX model config preset: "qwen3-1.7b" or "qwen3.5-2b". Default: "qwen3.5-2b".
-    #[serde(default = "default_mlx_preset")]
-    pub mlx_preset: String,
     /// Path to a YAML instruction profiles file for model-specific prompt
     /// engineering. When set, profiles are loaded at startup and applied to
     /// every LLM call based on the active model name and task kind.
@@ -332,12 +314,6 @@ pub struct AgentDefaults {
     /// keeps appending rather than finishing.
     #[serde(default = "default_max_continuations")]
     pub max_continuations: u32,
-    /// Tokens reserved from completion budget for thinking overhead on local models (default: 512).
-    #[serde(default = "default_local_thinking_reserve_tokens")]
-    pub local_thinking_reserve_tokens: u32,
-    /// Minimum completion tokens guaranteed after thinking reserve is subtracted on local models (default: 256).
-    #[serde(default = "default_local_thinking_min_completion_tokens")]
-    pub local_thinking_min_completion_tokens: u32,
     /// Hard cap on thinking budget tokens for small local models (default: 256).
     #[serde(default = "default_local_thinking_small_model_cap")]
     pub local_thinking_small_model_cap: u32,
@@ -451,18 +427,6 @@ pub enum LocalAutostart {
     Off,
 }
 
-fn default_mlx_preset() -> String {
-    "qwen3.5-2b".to_string()
-}
-
-fn default_local_thinking_reserve_tokens() -> u32 {
-    512
-}
-
-fn default_local_thinking_min_completion_tokens() -> u32 {
-    256
-}
-
 fn default_local_thinking_small_model_cap() -> u32 {
     256
 }
@@ -516,11 +480,8 @@ impl Default for AgentDefaults {
             mlx_model_dir: None,
             higgs_draft_model: None,
             num_draft_tokens: None,
-            mlx_preset: default_mlx_preset(),
             instructions_path: None,
             skip_jit_gate: false,
-            local_thinking_reserve_tokens: default_local_thinking_reserve_tokens(),
-            local_thinking_min_completion_tokens: default_local_thinking_min_completion_tokens(),
             local_thinking_small_model_cap: default_local_thinking_small_model_cap(),
             adaptive_long_mode_min_tokens: default_adaptive_long_mode_min_tokens(),
             adaptive_long_form_min_tokens: default_adaptive_long_form_min_tokens(),
@@ -548,10 +509,6 @@ pub struct AgentsConfig {
 /// as a single field without requiring callers to populate 8 separate fields.
 #[derive(Debug, Clone)]
 pub struct AdaptiveTokenConfig {
-    #[allow(dead_code)] // kept for config.json backwards compat
-    pub local_thinking_reserve_tokens: u32,
-    #[allow(dead_code)] // kept for config.json backwards compat
-    pub local_thinking_min_completion_tokens: u32,
     pub local_thinking_small_model_cap: u32,
     pub adaptive_long_mode_min_tokens: u32,
     pub adaptive_long_form_min_tokens: u32,
@@ -563,8 +520,6 @@ pub struct AdaptiveTokenConfig {
 impl Default for AdaptiveTokenConfig {
     fn default() -> Self {
         Self {
-            local_thinking_reserve_tokens: 512,
-            local_thinking_min_completion_tokens: 256,
             local_thinking_small_model_cap: 256,
             adaptive_long_mode_min_tokens: 12288,
             adaptive_long_form_min_tokens: 6144,
@@ -579,8 +534,6 @@ impl AdaptiveTokenConfig {
     /// Build from `AgentDefaults`, keeping all values in sync.
     pub fn from_defaults(d: &AgentDefaults) -> Self {
         Self {
-            local_thinking_reserve_tokens: d.local_thinking_reserve_tokens,
-            local_thinking_min_completion_tokens: d.local_thinking_min_completion_tokens,
             local_thinking_small_model_cap: d.local_thinking_small_model_cap,
             adaptive_long_mode_min_tokens: d.adaptive_long_mode_min_tokens,
             adaptive_long_form_min_tokens: d.adaptive_long_form_min_tokens,
@@ -833,17 +786,49 @@ impl Default for ExecToolConfig {
     }
 }
 
-/// Named toolset groupings that can be referenced by channel configs.
-///
-/// Each key is a set name; each value is a list of tool names or `@other_set`
-/// references that expand to the contents of another set (built-in or custom).
-///
-/// Built-in set names: `core`, `web`, `memory`, `read_only`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Cua driver (local desktop computer-use) tool configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ToolsetsConfig {
+pub struct CuaToolConfig {
+    /// When false, the `cua` tool is not registered.
+    #[serde(default = "default_cua_enabled")]
+    pub enabled: bool,
+    /// Path to the cua-driver binary. `None` resolves `cua-driver` on PATH.
     #[serde(default)]
-    pub sets: HashMap<String, Vec<String>>,
+    pub binary_path: Option<String>,
+    /// Daemon permission mode applied at launch: standard | bounded | unrestricted.
+    #[serde(default = "default_cua_permission_mode")]
+    pub permission_mode: String,
+    /// Auto-start the cua-driver daemon when a call finds it not running.
+    #[serde(default = "default_cua_daemon_auto_start")]
+    pub daemon_auto_start: bool,
+    /// Directory for screenshots. `None` defaults to `<workspace>/cua`.
+    #[serde(default)]
+    pub screenshot_dir: Option<PathBuf>,
+}
+
+fn default_cua_enabled() -> bool {
+    true
+}
+
+fn default_cua_permission_mode() -> String {
+    "standard".to_string()
+}
+
+fn default_cua_daemon_auto_start() -> bool {
+    true
+}
+
+impl Default for CuaToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cua_enabled(),
+            binary_path: None,
+            permission_mode: default_cua_permission_mode(),
+            daemon_auto_start: default_cua_daemon_auto_start(),
+            screenshot_dir: None,
+        }
+    }
 }
 
 /// Code execution tool configuration.
@@ -879,6 +864,39 @@ impl Default for CodeExecutionConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Python kernel config
+// ---------------------------------------------------------------------------
+
+/// Stateful Python kernel tool settings.
+///
+/// Unlike `execute_code` which spawns a fresh python3 per call,
+/// the kernel holds a persistent CPython interpreter in-process
+/// via PyO3. Variables, imports, and function definitions survive
+/// across calls. Feature: `python-kernel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PythonKernelConfig {
+    /// When false (default), the `python` tool is not registered.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Per-call timeout in seconds (default: 30).
+    #[serde(default = "default_kernel_timeout")]
+    pub timeout: u64,
+}
+
+fn default_kernel_timeout() -> u64 {
+    30
+}
+
+impl Default for PythonKernelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout: default_kernel_timeout(),
+        }
+    }
+}
+
 /// Tools configuration.
 ///
 /// Note: the `exec` field from Python is renamed to `exec_` in Rust to avoid
@@ -890,12 +908,15 @@ pub struct ToolsConfig {
     pub web: WebToolsConfig,
     #[serde(default, rename = "exec")]
     pub exec_: ExecToolConfig,
-    /// Named toolset groupings available to channel configs.
-    #[serde(default)]
-    pub toolsets: Option<ToolsetsConfig>,
     /// Code execution (Python RPC) tool settings.
     #[serde(default)]
     pub code_execution: CodeExecutionConfig,
+    /// Cua driver (local desktop computer-use) tool settings.
+    #[serde(default)]
+    pub cua: CuaToolConfig,
+    /// Stateful Python kernel tool (PyO3). Feature: `python-kernel`.
+    #[serde(default)]
+    pub python_kernel: PythonKernelConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -3285,5 +3306,44 @@ mod tests {
             debug_output.contains("[REDACTED"),
             "missing redaction markers"
         );
+    }
+
+    #[test]
+    fn test_cua_config_roundtrip() {
+        // Defaults.
+        let default = CuaToolConfig::default();
+        assert!(default.enabled);
+        assert_eq!(default.permission_mode, "standard");
+        assert!(default.daemon_auto_start);
+        assert_eq!(default.binary_path, None);
+        assert_eq!(default.screenshot_dir, None);
+
+        // Explicit JSON (camelCase) parses.
+        let json = r#"{
+            "tools": {
+                "cua": {
+                    "enabled": false,
+                    "binaryPath": "/opt/bin/cua-driver",
+                    "permissionMode": "bounded",
+                    "daemonAutoStart": false,
+                    "screenshotDir": "/tmp/shots"
+                }
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let cua = &cfg.tools.cua;
+        assert!(!cua.enabled);
+        assert_eq!(cua.binary_path.as_deref(), Some("/opt/bin/cua-driver"));
+        assert_eq!(cua.permission_mode, "bounded");
+        assert!(!cua.daemon_auto_start);
+        assert_eq!(
+            cua.screenshot_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/shots"))
+        );
+
+        // Missing block falls back to defaults.
+        let cfg2: Config = serde_json::from_str(r#"{"tools": {}}"#).unwrap();
+        assert!(cfg2.tools.cua.enabled);
+        assert!(cfg2.tools.cua.daemon_auto_start);
     }
 }

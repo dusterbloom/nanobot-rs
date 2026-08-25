@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions, clippy::shadow_reuse)]
 //! Response classification and handler methods for `step_process_response`.
 //!
 //! Extracted from `agent_shared.rs` as a `#[path]` submodule.
@@ -18,10 +24,92 @@ use crate::agent::protocol::{
 };
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::validation;
-use crate::providers::base::{LLMResponse, ToolCallRequest};
+use crate::errors::ProviderError;
+use crate::providers::base::{FinishReason, LLMResponse, ToolCallRequest};
+use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
 use crate::turn_stream::ControlMarker;
 
 use super::{AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnContext};
+
+async fn recorded_auxiliary_chat(
+    ctx: &TurnContext,
+    purpose: ModelCallPurpose,
+    messages: &[Value],
+    max_tokens: u32,
+    temperature: f64,
+) -> anyhow::Result<LLMResponse> {
+    let request = RecordedProviderRequest {
+        messages: messages.to_vec(),
+        tools: None,
+        model: ctx.core.model.clone(),
+        max_tokens,
+        temperature,
+        thinking_budget: None,
+        top_p: None,
+        tool_choice: "auto".to_string(),
+        streaming: false,
+    };
+    let call_id = ctx
+        .core
+        .sessions
+        .record_model_request(
+            &ctx.session_id,
+            &ctx.request_id,
+            ctx.turn_count,
+            purpose,
+            &request,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("auxiliary model request was not recorded: {error}"))?;
+    let result = ctx
+        .core
+        .provider
+        .chat(
+            messages,
+            None,
+            Some(&ctx.core.model),
+            max_tokens,
+            temperature,
+            None,
+            None,
+        )
+        .await;
+    match result {
+        Ok(response) => {
+            ctx.core
+                .sessions
+                .record_model_response(
+                    &ctx.session_id,
+                    &ctx.request_id,
+                    ctx.turn_count,
+                    &call_id,
+                    &RecordedProviderResponse::from(&response),
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("auxiliary model response was not recorded: {error}")
+                })?;
+            Ok(response)
+        }
+        Err(error) => {
+            if let Err(record_error) = ctx
+                .core
+                .sessions
+                .record_model_failure(
+                    &ctx.session_id,
+                    &ctx.request_id,
+                    ctx.turn_count,
+                    &call_id,
+                    &error.to_string(),
+                )
+                .await
+            {
+                warn!(%record_error, "auxiliary_model_failure_replay_persist_failed");
+            }
+            Err(error)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ResponseKind — pure classification of an LLM response
@@ -75,11 +163,6 @@ pub(crate) struct RetryState {
     pub(crate) rescue_attempted: bool,
     /// One-shot: agent-level retry for transient LLM errors (per iteration).
     pub(crate) api_retried: bool,
-    /// One-shot: already retried a phantom-tool-claim text response by
-    /// looping back to PreCall with tools attached. Bounded to one extra
-    /// provider call; a second phantom finishes via the annotation path
-    /// in `finalize_response`.
-    pub(crate) phantom_claim_retried: bool,
     /// Consecutive lease-renewal rejections (the model emitted a PARTIAL
     /// checkpoint — some labels, missing a field — and was nudged what to
     /// add). Without a cap a small model that keeps emitting partial
@@ -98,7 +181,6 @@ impl RetryState {
             empty_think_retried: false,
             rescue_attempted: false,
             api_retried: false,
-            phantom_claim_retried: false,
             lease_renewal_rejections: 0,
         }
     }
@@ -120,9 +202,9 @@ pub(crate) fn classify_response(
     retries: &RetryState,
     thinking_was_on: bool,
 ) -> ResponseKind {
-    // Provider error takes absolute priority.
-    if let Some(err_msg) = response.error_detail() {
-        return ResponseKind::ProviderError(err_msg.to_string());
+    // Provider error takes absolute priority (error-protocol doc §2.3).
+    if let Err(ProviderError::EmptyStream(detail)) = response.outcome() {
+        return ResponseKind::ProviderError(detail);
     }
 
     let content = response.content.as_deref().unwrap_or("");
@@ -194,7 +276,7 @@ pub(crate) fn classify_response(
     // Empty response handling.
     if !has_visible_text {
         // Local model + truncated + thinking consumed output → rescue or retry.
-        if is_local && response.finish_reason == "length" && !retries.rescue_attempted {
+        if is_local && response.finish_reason == FinishReason::Length && !retries.rescue_attempted {
             return ResponseKind::EmptyAfterThink;
         }
         if thinking_was_on && !retries.empty_think_retried {
@@ -205,7 +287,7 @@ pub(crate) fn classify_response(
 
     // A provider length stop is transport truncation even if a marker-like
     // suffix survived. Continue/retry it before considering finality.
-    let is_truncated = response.finish_reason == "length";
+    let is_truncated = response.finish_reason == FinishReason::Length;
     if is_truncated && retries.continuations < 10 {
         // Only classify as Truncated if there's room to continue.
         // (Actual cap is checked in the handler via core.max_continuations.)
@@ -461,8 +543,7 @@ impl AgentLoopShared {
             }
 
             ResponseKind::Text(content) => {
-                // Tool-lease renewal: when the lease was exhausted (tools
-                // stripped on the previous step_pre_call) and the model
+                // Tool-lease renewal: when the lease was exhausted and the model
                 // emitted a structured checkpoint (findings + next + will),
                 // renew the lease and continue with tools restored. The
                 // checkpoint text is left in the conversation so the user
@@ -492,8 +573,7 @@ impl AgentLoopShared {
                                 ctx.flow.lease.lease_size()
                             )));
                         return StepResult::Next(IterationPhase::PreCall);
-                    } else if renewal.was_attempted()
-                        && renewal.missing_field() != "out_of_leases"
+                    } else if renewal.was_attempted() && renewal.missing_field() != "out_of_leases"
                     {
                         // Renewal attempted but missing a field. Tell the
                         // model exactly what's missing so the next attempt
@@ -543,60 +623,40 @@ impl AgentLoopShared {
                         );
                     }
                 }
-                // One-shot phantom-claim retry. Local models sometimes
-                // narrate a tool action as prose ("here's what I found",
-                // "let me read ...") instead of emitting a tool_call, then
-                // end the turn having done zero useful work. Give the model
-                // exactly one chance to correct while tools are still
-                // attached. Bounded — not a loop.
+                // Provenance is observe-only here — it never retracts a
+                // completed response and never re-prompts.
                 //
-                // The structural gates (no tools ran + tools advertised +
-                // lease live + local/provenance) define WHEN a phantom is
-                // possible; the phrase-list detector (`detect_phantom_claims`)
-                // is the content discriminator that says the text actually
-                // claimed a tool action. Both are required — the structural
-                // signal alone fires on every normal text answer, which is
-                // why `plain_text_response_is_final_answer` exists.
+                // This used to retract the streamed text and loop back to
+                // PreCall when the phrase list matched with zero tool calls
+                // this turn. That gate is wrong for retrospective questions
+                // ("what went wrong last turn?"), which are answered by
+                // narrating EARLIER tool calls in past tense and legitimately
+                // need no new tools. In session 20260810_081050_8306f8 it
+                // discarded a 2637-token answer that took 9m35s to generate,
+                // on the substring "I executed", and never persisted it.
                 //
-                // The lease guard (`!lease.is_exhausted()`) is what keeps
-                // this retry from fighting the lease: a lease-forced
-                // text-only call MUST finish, never be retried with tools
-                // it cannot have.
-                let tools_this_turn: Vec<String> = ctx.used_tools.iter().cloned().collect();
-                if !ctx.flow.retries.phantom_claim_retried
-                    && tools_this_turn.is_empty()
-                    && ctx
-                        .advertised_tool_names
-                        .as_ref()
-                        .map_or(false, |s| !s.is_empty())
-                    && !ctx.flow.lease.is_exhausted()
-                    && ctx.core.provenance_config.enabled
-                    && ctx.core.mode().is_local()
+                // A phantom now costs a warning header, not the answer:
+                // `finalize_response` annotates via `annotate_phantom_response`
+                // and the response is delivered. Detection stays; the blast
+                // radius is gone.
+                if ctx.core.provenance_config.enabled
+                    && ctx.used_tools.is_empty()
+                    && crate::agent::provenance::detect_phantom_claims(&content, &[]).is_some()
                 {
-                    if let Some(detection) =
-                        crate::agent::provenance::detect_phantom_claims(&content, &tools_this_turn)
-                    {
-                        ctx.flow.retries.phantom_claim_retried = true;
-                        if ctx.flow.content_was_streamed {
-                            send_retract_reply(&ctx.text_delta_tx);
-                            ctx.flow.content_was_streamed = false;
-                        }
-                        tracing::info!(
-                            session = %ctx.session_key,
-                            model = %ctx.core.model,
-                            patterns = detection.matched_patterns.len(),
-                            "phantom_tool_claims_retry"
-                        );
-                        ctx.messages
-                            .push(crate::agent::markers::scaffold_user(detection.system_warning));
-                        return StepResult::Next(IterationPhase::PreCall);
-                    }
+                    counters
+                        .phantom_claims_observed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        model = %ctx.core.model,
+                        "phantom_tool_claims_observed — response delivered with annotation"
+                    );
                 }
                 if !ctx.flow.content_was_streamed {
                     send_delta(&ctx.text_delta_tx, &content);
                     ctx.flow.content_was_streamed = true;
                 }
-                send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
+                send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
                 StepResult::Done(IterationOutcome::Finished(content))
             }
 
@@ -617,7 +677,7 @@ impl AgentLoopShared {
                     send_retract_reply(&ctx.text_delta_tx);
                     ctx.flow.content_was_streamed = false;
                 }
-                send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
+                send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
                 StepResult::Done(IterationOutcome::Error(
                     "The local model produced malformed or repetitive protocol text, so I discarded that response. Try the request again; if it repeats, restart the local backend.".to_string(),
                 ))
@@ -646,7 +706,7 @@ impl AgentLoopShared {
                 );
                 let content =
                     "I couldn't produce a response in this turn. Please try again.".to_string();
-                send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
+                send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
                 StepResult::Done(IterationOutcome::Finished(content))
             }
         }
@@ -747,28 +807,40 @@ impl AgentLoopShared {
             "response_validation_failed"
         );
 
-        if matches!(error, validation::ValidationError::ClaimedButNotExecuted)
-            && ctx.flow.retries.validation > 0
-        {
+        // The phantom text is already on the user's screen — a narrated
+        // `[exec(command='date')]` reads exactly like an executed call. Retract
+        // it so the retry (or the give-up message below) replaces it instead of
+        // trailing it. Without this the post-loop emit is suppressed by
+        // `content_was_streamed` and the phantom stands as the final answer
+        // (higgs + lfm2-2.6b, which never emits tool_calls at all).
+        if ctx.flow.content_was_streamed {
+            send_retract_reply(&ctx.text_delta_tx);
+            ctx.flow.content_was_streamed = false;
+        }
+
+        // Both phantom shapes give up after one failed retry: a local model
+        // that narrates a call twice narrates it forever, and each further
+        // round burns a real iteration for nothing.
+        if ctx.flow.retries.validation > 0 {
             warn!(
                 model = %ctx.core.model,
                 retry = retry_num,
                 "response_validation_claimed_tool_intent_repeated"
             );
             return StepResult::Done(IterationOutcome::Error(
-                "I could not complete the tool step because the model described a tool action without emitting a valid structured tool call."
+                "I could not complete the tool step: the model narrated a tool action instead of emitting a structured tool call, twice in a row. Nothing was executed. If this repeats, the model or endpoint likely does not support native function calling."
                     .to_string(),
             ));
         }
 
         let hint = validation::generate_retry_prompt(error, retry_num as u8);
 
-        if !matches!(error, validation::ValidationError::ClaimedButNotExecuted) {
-            ctx.messages.push(json!({
-                "role": "assistant",
-                "content": raw_content
-            }));
-        }
+        // Keep the fabricated-call text in history so the retry hint below has
+        // an antecedent (and the wire keeps alternating roles).
+        ctx.messages.push(json!({
+            "role": "assistant",
+            "content": raw_content
+        }));
 
         // Cache-replay tagged: a validation hint sent live must survive
         // session reload byte-identical, otherwise the warm prompt prefix
@@ -840,14 +912,14 @@ impl AgentLoopShared {
 
         while ctx.flow.retries.continuations < max_cont {
             // Check if still truncated.
-            let is_truncated = finish_reason == "length"
-                || (finish_reason == "stop" && super::appears_incomplete(&accumulated));
+            let is_truncated = finish_reason == FinishReason::Length
+                || (finish_reason == FinishReason::Stop && super::appears_incomplete(&accumulated));
             if !is_truncated {
                 break;
             }
 
             ctx.flow.retries.continuations += 1;
-            if finish_reason == "stop" {
+            if finish_reason == FinishReason::Stop {
                 info!("auto_continue: heuristic detected incomplete response despite finish_reason='stop'");
             }
             info!(
@@ -873,19 +945,14 @@ impl AgentLoopShared {
             }
 
             counters.mark_inference_started();
-            let cont_result = ctx
-                .core
-                .provider
-                .chat(
-                    &cont_messages,
-                    None,
-                    Some(&ctx.core.model),
-                    ctx.core.max_tokens,
-                    ctx.core.temperature,
-                    None,
-                    None,
-                )
-                .await;
+            let cont_result = recorded_auxiliary_chat(
+                ctx,
+                ModelCallPurpose::Continuation,
+                &cont_messages,
+                ctx.core.max_tokens,
+                ctx.core.temperature,
+            )
+            .await;
             counters.mark_inference_finished();
 
             match cont_result {
@@ -929,33 +996,28 @@ impl AgentLoopShared {
         // Try rescue pass first (forced finalize for local models).
         // migrated from swappable().is_local — phase 09-03
         if ctx.core.mode().is_local()
-            && response.finish_reason == "length"
+            && response.finish_reason == FinishReason::Length
             && !ctx.flow.retries.rescue_attempted
         {
             ctx.flow.retries.rescue_attempted = true;
             let rescue_tokens = ctx.core.max_tokens.min(384).max(128);
             let rescue_messages = prepare_rescue_messages(&ctx.messages, &*ctx.protocol);
             counters.mark_inference_started();
-            let rescue_result = ctx
-                .core
-                .provider
-                .chat(
-                    &rescue_messages,
-                    None,
-                    Some(&ctx.core.model),
-                    rescue_tokens,
-                    0.2,
-                    None,
-                    None,
-                )
-                .await;
+            let rescue_result = recorded_auxiliary_chat(
+                ctx,
+                ModelCallPurpose::EmptyResponseRescue,
+                &rescue_messages,
+                rescue_tokens,
+                0.2,
+            )
+            .await;
             counters.mark_inference_finished();
 
             match rescue_result {
                 Ok(r) => {
                     let content = r.content.unwrap_or_default();
                     if !content.trim().is_empty() {
-                        send_finish_reason(&ctx.text_delta_tx, &r.finish_reason);
+                        send_finish_reason(&ctx.text_delta_tx, r.finish_reason.wire_str());
                         return StepResult::Done(IterationOutcome::Finished(content));
                     }
                     // Rescue also empty — fall through to thinking-off retry.
@@ -986,7 +1048,7 @@ impl AgentLoopShared {
             "empty_llm_response: all recovery attempts exhausted, injecting fallback"
         );
         let content = "I couldn't produce a response in this turn. Please try again.".to_string();
-        send_finish_reason(&ctx.text_delta_tx, &response.finish_reason);
+        send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
         StepResult::Done(IterationOutcome::Finished(content))
     }
 
@@ -1003,7 +1065,11 @@ impl AgentLoopShared {
             .content
             .as_deref()
             .map_or(true, |c| c.trim().is_empty());
-        if response.is_error() || matches!(response.finish_reason.as_str(), "aborted" | "cancelled")
+        if response.outcome().is_err()
+            || matches!(
+                response.finish_reason,
+                FinishReason::Aborted | FinishReason::Cancelled
+            )
         {
             "error"
         } else if no_content && response.tool_calls.is_empty() {
@@ -1097,6 +1163,8 @@ impl AgentLoopShared {
         let metrics = crate::agent::metrics::RequestMetrics {
             timestamp: chrono::Local::now().to_rfc3339(),
             request_id: ctx.request_id.clone(),
+            logical_session: ctx.session_id.clone(),
+            cache_route: ctx.higgs_session_route.cache_route().into(),
             role: "main".into(),
             model: ctx.core.model.clone(),
             provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),
@@ -1110,7 +1178,10 @@ impl AgentLoopShared {
             cache_read_tokens,
             cache_creation_tokens,
             status: Self::response_status(response).into(),
-            error_detail: response.error_detail().map(str::to_owned),
+            error_detail: match response.outcome() {
+                Err(ProviderError::EmptyStream(detail)) => Some(detail),
+                _ => None,
+            },
             raw_response: Self::raw_pathological_response(response).map(str::to_owned),
             anti_drift_score: None,
             anti_drift_signals: None,
@@ -1118,6 +1189,12 @@ impl AgentLoopShared {
             tool_calls_executed: 0,
             validation_result: None,
         };
+        counters.record_cache_metrics(
+            &metrics.logical_session,
+            metrics.prompt_tokens,
+            metrics.cache_read_tokens,
+            metrics.cache_creation_tokens,
+        );
         if defer_until_tool_execution {
             debug_assert!(ctx.flow.pending_request_metrics.is_none());
             ctx.flow.pending_request_metrics = Some(metrics);
@@ -1162,7 +1239,7 @@ mod tests {
             LLMResponse {
                 content: content.map(str::to_string),
                 tool_calls,
-                finish_reason: finish_reason.to_string(),
+                finish_reason: FinishReason::parse_finish_reason(finish_reason),
                 usage: std::collections::HashMap::new(),
             }
         };
@@ -1260,7 +1337,8 @@ mod tests {
     /// substring check fired before textual detection and discarded it ×4.
     #[test]
     fn classify_recovers_truncated_tool_call_not_pathological() {
-        let raw = "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
+        let raw =
+            "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
         let resp = make_response(Some(raw), "stop");
 
         let kind = classify_response(&resp, true, false, false, &default_retries(), false);
@@ -1306,7 +1384,7 @@ mod tests {
         LLMResponse {
             content: content.map(|s| s.to_string()),
             tool_calls: vec![],
-            finish_reason: finish_reason.to_string(),
+            finish_reason: FinishReason::parse_finish_reason(finish_reason),
             usage: HashMap::new(),
         }
     }
@@ -1328,7 +1406,7 @@ mod tests {
         LLMResponse {
             content: content.map(|s| s.to_string()),
             tool_calls,
-            finish_reason: finish_reason.to_string(),
+            finish_reason: FinishReason::parse_finish_reason(finish_reason),
             usage: HashMap::new(),
         }
     }
@@ -1407,17 +1485,16 @@ mod tests {
         ));
     }
 
+    /// Tool-intent prose is a final answer, not a validation error — the loop
+    /// must deliver it rather than retract and re-issue the turn.
     #[test]
-    fn test_classify_validation_error_claimed() {
+    fn test_classify_tool_intent_prose_as_final_text() {
         let resp = make_response(Some("Let me check that file for you."), "stop");
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
-        assert!(matches!(
-            kind,
-            ResponseKind::ValidationError {
-                error: validation::ValidationError::ClaimedButNotExecuted,
-                ..
-            }
-        ));
+        assert!(
+            matches!(kind, ResponseKind::Text(_)),
+            "tool-intent prose must classify as final text, got {kind:?}"
+        );
     }
 
     #[test]
@@ -1430,23 +1507,48 @@ mod tests {
 
     #[test]
     fn test_classify_provider_error() {
-        let mut resp = make_response(Some(""), "stop");
-        resp.usage.insert("error".to_string(), -1);
-        // Provider errors are detected by error_detail() on LLMResponse.
-        // We test the path by checking that our kind logic handles it.
-        // Since error_detail() checks specific fields, let's test via the
-        // known error pattern.
+        // A dead stream (`finish_reason = "error"`) must classify as
+        // ProviderError via `outcome()` with the provider's payload intact.
+        let resp = make_response(
+            Some("LLM stream ended before the backend produced any response content or tool-call payload."),
+            "error",
+        );
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
-        // Without an actual error field this falls through to EmptyFinal.
-        assert!(matches!(kind, ResponseKind::EmptyFinal));
+        assert!(matches!(
+            kind,
+            ResponseKind::ProviderError(ref msg)
+                if msg == "LLM stream ended before the backend produced any response content or tool-call payload."
+        ));
+
+        // No payload -> the legacy "Unknown LLM error" fallback, byte-identical.
+        let kind = classify_response(
+            &make_response(None, "error"),
+            false,
+            false,
+            false,
+            &default_retries(),
+            false,
+        );
+        assert!(matches!(
+            kind,
+            ResponseKind::ProviderError(ref msg) if msg == "Unknown LLM error"
+        ));
+
+        // A healthy stop response is NOT a provider error.
+        let kind = classify_response(
+            &make_response(Some("hi"), "stop"),
+            false,
+            false,
+            false,
+            &default_retries(),
+            false,
+        );
+        assert!(!matches!(kind, ResponseKind::ProviderError(_)));
     }
 
     #[test]
     fn test_classify_text_with_stop_and_complete() {
-        let resp = make_response(
-            Some("All done. Here is your answer."),
-            "stop",
-        );
+        let resp = make_response(Some("All done. Here is your answer."), "stop");
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
         assert!(matches!(kind, ResponseKind::Text(ref s) if s == "All done. Here is your answer."));
     }

@@ -1,5 +1,25 @@
 //! Core handle construction, agent loop creation, and local provider wiring.
 
+// Interactive/app boundary (error-protocol layer 3 backlog): printing IS the
+// product here (REPL/TUI/CLI), and the thin glue code keeps pragmatic
+// unwraps on always-set state (rl, runtime, static regexes). The deny regime
+// in Cargo.toml stays live for the core; this module lands on the regime
+// when its backlog is migrated.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::format_push_string,
+    clippy::string_add
+)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -433,6 +453,9 @@ fn core_config_from(
         health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
         adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
         sessions_db_path: None,
+        code_execution: config.tools.code_execution.clone(),
+        python_kernel: config.tools.python_kernel.clone(),
+        cua: config.tools.cua.clone(),
     }
 }
 

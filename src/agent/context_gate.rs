@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions, clippy::indexing_slicing)]
 //! Context Gate: intelligent content management for LLM agents.
 //!
 //! Instead of uniform char-limit truncation, the gate makes context-aware
@@ -90,52 +96,6 @@ impl ContentGate {
                 build_simple_briefing(c, target_tokens)
             }
         })
-    }
-
-    /// Gate content using the specialist provider for semantically aware summarization.
-    /// Falls back to `admit_simple()` on failure.
-    pub async fn admit_with_specialist(
-        &mut self,
-        content: &str,
-        provider: &dyn crate::providers::base::LLMProvider,
-        model: &str,
-    ) -> GateResult {
-        let tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(content);
-        let available = self.budget.available();
-
-        // If it fits in budget, pass through raw.
-        if tokens <= available {
-            self.budget.consume(tokens);
-            return GateResult::Raw(content.to_string());
-        }
-
-        let target_tokens = available / 2;
-
-        // JSON tool output is handled deterministically to avoid model drift.
-        // This path preserves exact values and avoids hallucinated fields.
-        if let Some(summary) = build_json_briefing(content, target_tokens) {
-            let summary_tokens =
-                crate::agent::token_budget::TokenBudget::estimate_str_tokens(&summary);
-            self.budget.consume(summary_tokens);
-            return GateResult::Briefing { summary };
-        }
-
-        // Try specialist summarization, fall back to mechanical briefing.
-        let summary = match specialist_summarize(provider, model, content, target_tokens).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(
-                    "Specialist summarization failed, using simple briefing: {}",
-                    e
-                );
-                build_simple_briefing(content, target_tokens)
-            }
-        };
-
-        let summary_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(&summary);
-        self.budget.consume(summary_tokens);
-
-        GateResult::Briefing { summary }
     }
 }
 
@@ -485,114 +445,6 @@ fn build_json_briefing(content: &str, target_tokens: usize) -> Option<String> {
     Some(out)
 }
 
-fn normalize_specialist_summary(text: &str, target_tokens: usize) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    let first_header = ["key facts", "failures", "next checks"]
-        .iter()
-        .filter_map(|h| lower.find(h))
-        .min();
-
-    let mut out = if let Some(idx) = first_header {
-        trimmed[idx..].to_string()
-    } else {
-        trimmed.to_string()
-    };
-
-    let meta_markers = [
-        "we are given",
-        "let's",
-        "steps:",
-        "analysis:",
-        "the task is to",
-        "we must output",
-    ];
-    let has_meta = meta_markers
-        .iter()
-        .any(|m| out.to_ascii_lowercase().contains(m));
-    if has_meta && first_header.is_none() {
-        return None;
-    }
-
-    if !out.to_ascii_lowercase().contains("key facts") {
-        return None;
-    }
-
-    let max_chars = target_tokens.saturating_mul(7).max(280);
-    out = out.chars().take(max_chars).collect();
-    Some(out)
-}
-
-/// Ask the specialist provider to summarize a tool result.
-async fn specialist_summarize(
-    provider: &dyn crate::providers::base::LLMProvider,
-    model: &str,
-    content: &str,
-    target_tokens: usize,
-) -> Result<String, String> {
-    use serde_json::json;
-    let caps = crate::agent::model_capabilities::lookup_default(model);
-    let thinking_budget = if caps.thinking {
-        // Enable hidden reasoning only for thinking-capable models.
-        // Budget scales with requested summary size but stays bounded.
-        Some((target_tokens as u32).saturating_mul(2).clamp(160, 768))
-    } else {
-        None
-    };
-
-    let messages = vec![
-        json!({
-            "role": "system",
-            "content": format!(
-                "You are a strict incident summarizer for tool output.\n\
-                 Return ONLY final answer (no preamble) in <= {} tokens.\n\
-                 Rules:\n\
-                 1) Copy exact literals: numbers, IDs, paths, error strings.\n\
-                 2) If exact copy is not possible, omit that fact.\n\
-                 3) No meta text (no 'we are given', no 'let's', no planning).\n\
-                 4) No JSON output unless input is JSON.\n\
-                 5) Output exactly these sections:\n\
-                    - Key Facts\n\
-                    - Failures\n\
-                    - Next Checks",
-                target_tokens
-            )
-        }),
-        json!({
-            "role": "user",
-            "content": content
-        }),
-    ];
-    // Keep output budget tight to avoid runaway local generation latency.
-    // Previously this allowed 2x target tokens, then clamped locally, wasting
-    // generation time and hurting p95 latency on small local models.
-    let max_response_tokens = (target_tokens as u32).saturating_add(48).clamp(96, 320);
-    let resp = provider
-        .chat(
-            &messages,
-            None,
-            Some(model),
-            max_response_tokens,
-            0.2,
-            thinking_budget,
-            None,
-        )
-        .await
-        .map_err(|e| format!("specialist chat failed: {}", e))?;
-    let raw = resp
-        .content
-        .ok_or_else(|| "specialist returned no content".to_string())?;
-    let cleaned = crate::agent::compaction::strip_thinking_tags(&raw);
-    let max_chars = target_tokens.saturating_mul(6).max(240);
-    let clamped: String = cleaned.chars().take(max_chars).collect();
-    normalize_specialist_summary(&clamped, target_tokens)
-        .ok_or_else(|| "specialist returned non-final/meta output".to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -600,31 +452,6 @@ async fn specialist_summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-
-    use crate::providers::base::{LLMProvider, LLMResponse};
-
-    struct PanicProvider;
-
-    #[async_trait]
-    impl LLMProvider for PanicProvider {
-        async fn chat(
-            &self,
-            _messages: &[serde_json::Value],
-            _tools: Option<&[serde_json::Value]>,
-            _model: Option<&str>,
-            _max_tokens: u32,
-            _temperature: f64,
-            _thinking_budget: Option<u32>,
-            _top_p: Option<f64>,
-        ) -> anyhow::Result<LLMResponse> {
-            panic!("provider should not be called for JSON deterministic briefing")
-        }
-
-        fn get_default_model(&self) -> &str {
-            "panic"
-        }
-    }
 
     // -- TokenBudget (with_output_reserve) tests --
 
@@ -777,30 +604,5 @@ mod tests {
         let after = gate.budget.available();
 
         assert!(after < initial, "budget should decrease after admit");
-    }
-
-    #[tokio::test]
-    async fn test_admit_with_specialist_uses_deterministic_json_path() {
-        let mut gate = ContentGate::new(40, 0.20);
-        let content = r#"{
-  "requestId": "req-abc",
-  "entries": [
-    {"status": "ok", "latencyMs": 10, "error": ""},
-    {"status": "error", "latencyMs": 5000, "error": "bad checksum", "path": "/v1/jobs/reconcile"}
-  ]
-}"#;
-
-        let result = gate
-            .admit_with_specialist(content, &PanicProvider, "any-model")
-            .await;
-
-        match result {
-            GateResult::Raw(_) => panic!("expected briefing for oversized content"),
-            GateResult::Briefing { summary } => {
-                assert!(summary.contains("JSON Summary"));
-                assert!(summary.contains("bad checksum"));
-                assert!(summary.contains("/v1/jobs/reconcile"));
-            }
-        }
     }
 }

@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::string_add
+)]
 //! Pure helper functions for the agent loop (no IO — fully unit-testable).
 //!
 //! Extracted from `agent_loop.rs` as a `#[path]` submodule.
@@ -447,7 +458,7 @@ pub(crate) fn appears_incomplete(content: &str) -> bool {
     } else {
         stripped
     };
-    let last_char = text_for_check.chars().last().unwrap();
+    let last_char = text_for_check.chars().last().unwrap_or('\0');
     let ends_mid_sentence = !matches!(
         last_char,
         '.' | '!' | '?' | ':' | '"' | '\'' | ')' | ']' | '}' | '`'

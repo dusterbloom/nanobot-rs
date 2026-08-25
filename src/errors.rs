@@ -3,6 +3,7 @@
 //! Typed errors at module boundaries replace string-encoded errors and
 //! enable structured error handling via pattern matching.
 
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -18,6 +19,13 @@ use thiserror::Error;
 pub enum ProviderError {
     #[error("HTTP request failed: {0}")]
     HttpError(String),
+
+    #[error("HTTP request failed: HTTP {status}: {message}")]
+    HttpStatus {
+        status: u16,
+        code: Option<String>,
+        message: String,
+    },
 
     #[error("Failed to read response body: {0}")]
     ResponseReadError(String),
@@ -36,6 +44,13 @@ pub enum ProviderError {
 
     #[error("Request cancelled")]
     Cancelled,
+
+    /// The LLM stream ended before producing any content or tool-call payload
+    /// (`finish_reason = "error"` at the wire boundary). The payload is the
+    /// provider's final message when it reported one; `Display` reproduces
+    /// the legacy `error_detail()` string byte-for-byte (error-protocol doc §2.3).
+    #[error("{0}")]
+    EmptyStream(String),
 }
 
 impl ProviderError {
@@ -45,18 +60,96 @@ impl ProviderError {
             Self::RateLimited { .. } => true,
             Self::ServerError { .. } => true,
             Self::HttpError(msg) => is_transient_http_error(msg),
+            Self::HttpStatus { .. } => false,
             Self::ResponseReadError(_)
             | Self::JsonParseError(_)
             | Self::AuthError { .. }
-            | Self::Cancelled => false,
+            | Self::Cancelled
+            | Self::EmptyStream(_) => false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedSessionErrorKind {
+    Unavailable,
+    ContextOverflow,
+}
+
+/// Classify only structured provider status/code data. Retained routing must
+/// not be selected by arbitrary text from an untyped transport error.
+pub(crate) fn classify_retained_session_error(
+    error: &anyhow::Error,
+) -> Option<RetainedSessionErrorKind> {
+    let ProviderError::HttpStatus {
+        status,
+        code,
+        message,
+    } = error.downcast_ref::<ProviderError>()?
+    else {
+        return None;
+    };
+    let code = code.as_deref().unwrap_or_default().to_ascii_lowercase();
+    let response_message = serde_json::from_str::<serde_json::Value>(message)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| message.clone())
+        .to_ascii_lowercase();
+    let coded_context_overflow = code.contains("context")
+        && (code.contains("length")
+            || code.contains("size")
+            || code.contains("overflow")
+            || code.contains("exceed"));
+    let names_context_limit = response_message.contains("maximum context length")
+        || response_message.contains("context length")
+        || response_message.contains("available context size")
+        || response_message.contains("exceed_context_size_error");
+    let reports_request_overrun = response_message.contains("exceed")
+        || response_message.contains("too many tokens")
+        || response_message.contains("requested tokens")
+        || response_message.contains("requested") && response_message.contains("tokens")
+        || response_message.contains("request has") && response_message.contains("tokens")
+        || response_message.contains("input is too long");
+    let reports_messages_token_count =
+        response_message.contains("messages resulted in") && response_message.contains("tokens");
+    let context_overflow = coded_context_overflow
+        || *status == 400
+            && (names_context_limit && reports_request_overrun || reports_messages_token_count);
+    if context_overflow {
+        return Some(RetainedSessionErrorKind::ContextOverflow);
+    }
+    if *status == 409
+        || code.contains("retained_session")
+        || code.contains("session_expired")
+        || code.contains("prompt_mismatch")
+        || code.contains("token_mismatch")
+    {
+        return Some(RetainedSessionErrorKind::Unavailable);
+    }
+    None
 }
 
 /// Downcast an `anyhow::Error` and check retryability.
 pub fn is_retryable_provider_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ProviderError>()
         .map_or(false, |pe| pe.is_retryable())
+}
+
+/// Detect provider-side context overflow errors across OpenAI-compatible
+/// servers. Providers do not expose one stable structured code for this yet,
+/// so the hot path recognizes the small set of wire strings we receive.
+pub(crate) fn is_context_overflow_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_lowercase();
+    message.contains("exceed_context_size_error")
+        || message.contains("exceeds the available context size")
+        || message.contains("context size")
+        || message.contains("context length")
 }
 
 /// Check if an HTTP error message indicates a transient/retryable condition.
@@ -102,9 +195,6 @@ pub enum ToolErrorKind {
 
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
-
-    #[error("Execution failed: {0}")]
-    ExecutionFailed(String),
 
     #[error("Network error: {0}")]
     NetworkError(String),
@@ -212,7 +302,148 @@ fn extract_timeout_secs(msg: &str) -> Option<u64> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Typed tool error protocol (docs/research/2026-08-06-error-conventions-and-host-bridge.md §2)
+// ---------------------------------------------------------------------------
+
+/// The single typed failure for the tool layer.
+///
+/// Every failure that crosses a tool boundary is this enum: never a bare
+/// string, never `anyhow::Error`, never a struct with an `ok: bool` hole.
+/// Severity/action axes are collapsed into one enum so a single `match`
+/// gives retryability, model-fixability, and infra attribution.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ToolError {
+    // ---- model-recoverable (the model can repair its own call) ----
+    #[error("Missing required argument '{param}'; call as {example}")]
+    MissingArg { param: String, example: String },
+
+    #[error("Invalid arguments: {message}")]
+    InvalidArgs { message: String },
+
+    // ---- infra / policy (the model cannot fix these) ----
+    #[error("Tool '{name}' not found")]
+    ToolNotFound { name: String },
+
+    #[error("Not found: {0}")]
+    NotFound(String),
+
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
+    // ---- transient (safe to retry) ----
+    #[error("Command timed out after {0}s")]
+    Timeout(u64),
+
+    #[error("Network error: {0}")]
+    Network(String),
+
+    #[error("Rate limited")]
+    RateLimited,
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
+    /// Everything else. The registry converts panics here; unmigrated tools
+    /// funnel legacy `"Error: ..."` strings through [`Self::from_legacy`] —
+    /// the *only* string-to-error path left in the codebase.
+    #[error("Execution failed: {message}")]
+    Execution { message: String },
+}
+
+impl ToolError {
+    /// Transient ⇒ the tool runner may retry with backoff.
+    /// Mirrors today's `ToolErrorKind::is_retryable`.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout(_) | Self::Network(_) | Self::RateLimited | Self::ServiceUnavailable(_)
+        )
+    }
+
+    /// Model-recoverable ⇒ the loop re-injects the call with a corrected
+    /// shape instead of failing the turn. Replaces the `MissingArg` special
+    /// case in the registry and the `"is required"` string fallback.
+    pub fn is_model_fixable(&self) -> bool {
+        matches!(self, Self::MissingArg { .. } | Self::InvalidArgs { .. })
+    }
+
+    /// The exact wire string the model sees. Byte-stable with today's
+    /// `"Error: ..."` convention so `tool_result_ok` and the exact-substring
+    /// tests keep passing unmodified.
+    ///
+    /// The message-carrying variants render the payload verbatim because
+    /// [`Self::from_legacy`] passes the *full* original message through —
+    /// `render()` reproduces the pre-migration byte string exactly.
+    pub fn render(&self) -> String {
+        match self {
+            Self::MissingArg { param, example } => {
+                format!(
+                    "Error: '{}' parameter is required; call as {}",
+                    param, example
+                )
+            }
+            Self::Execution { message }
+            | Self::InvalidArgs { message }
+            | Self::NotFound(message)
+            | Self::PermissionDenied(message)
+            | Self::ToolNotFound { name: message }
+            | Self::Network(message)
+            | Self::ServiceUnavailable(message) => format!("Error: {message}"),
+            Self::Timeout(secs) => format!("Error: Command timed out after {secs}s"),
+            Self::RateLimited => format!("Error: Rate limited"),
+        }
+    }
+
+    /// The single legacy bridge. Called only by the migration adapter
+    /// (default `Tool::execute_typed`). Maps the exact strings
+    /// `classify_tool_error` matched today, so retry behavior is preserved.
+    #[allow(clippy::disallowed_methods)] // legacy bridge — retained, called by HostBridge::call error round-trip
+    pub fn from_legacy(msg: &str) -> Self {
+        if let Some(kind) = classify_tool_error(msg) {
+            return match kind {
+                ToolErrorKind::Timeout(s) => Self::Timeout(s),
+                ToolErrorKind::PermissionDenied(m) => Self::PermissionDenied(m),
+                ToolErrorKind::NotFound(m) => Self::NotFound(m),
+                ToolErrorKind::InvalidArgs(m) => Self::InvalidArgs { message: m },
+                ToolErrorKind::ToolNotFound(m) => Self::ToolNotFound { name: m },
+                ToolErrorKind::NetworkError(m) => Self::Network(m),
+                ToolErrorKind::RateLimited => Self::RateLimited,
+                ToolErrorKind::ServiceUnavailable(m) => Self::ServiceUnavailable(m),
+                ToolErrorKind::MissingArg { param, example } => Self::MissingArg { param, example },
+            };
+        }
+        Self::Execution {
+            message: msg.to_string(),
+        }
+    }
+}
+
+/// Reverse bridge: map a typed [`ToolError`] back to the legacy
+/// [`ToolErrorKind`] so existing consumers (retry, audit, the registry's
+/// worked-example append) keep working until Phase 3 deletes the legacy
+/// taxonomy. `Execution` has no legacy kind — it is the "everything else"
+/// bucket.
+pub fn legacy_kind_from_tool_error(e: &ToolError) -> Option<ToolErrorKind> {
+    match e {
+        ToolError::MissingArg { param, example } => Some(ToolErrorKind::MissingArg {
+            param: param.clone(),
+            example: example.clone(),
+        }),
+        ToolError::InvalidArgs { message } => Some(ToolErrorKind::InvalidArgs(message.clone())),
+        ToolError::ToolNotFound { name } => Some(ToolErrorKind::ToolNotFound(name.clone())),
+        ToolError::NotFound(m) => Some(ToolErrorKind::NotFound(m.clone())),
+        ToolError::PermissionDenied(m) => Some(ToolErrorKind::PermissionDenied(m.clone())),
+        ToolError::Timeout(s) => Some(ToolErrorKind::Timeout(*s)),
+        ToolError::Network(m) => Some(ToolErrorKind::NetworkError(m.clone())),
+        ToolError::RateLimited => Some(ToolErrorKind::RateLimited),
+        ToolError::ServiceUnavailable(m) => Some(ToolErrorKind::ServiceUnavailable(m.clone())),
+        ToolError::Execution { .. } => None,
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // pins classify_tool_error's mapping for legacy string->typed conversion (kept while ToolExecutionResult lives)
 mod tests {
     use super::*;
 
@@ -247,6 +478,106 @@ mod tests {
             downcasted.unwrap(),
             ProviderError::AuthError { status: 401, .. }
         ));
+    }
+
+    #[test]
+    fn retained_session_failures_use_typed_http_status_and_error_code() {
+        for (error, expected) in [
+            (
+                ProviderError::HttpStatus {
+                    status: 409,
+                    code: None,
+                    message: "conflict".into(),
+                },
+                RetainedSessionErrorKind::Unavailable,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: Some("context_length_exceeded".into()),
+                    message: "too large".into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: Some("token_mismatch".into()),
+                    message: "continuation mismatch".into(),
+                },
+                RetainedSessionErrorKind::Unavailable,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: None,
+                    message: r#"{"error":{"message":"maximum context length exceeded"}}"#.into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: None,
+                    message: "prompt exceeds the available context size".into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: None,
+                    message:
+                        "maximum context length is 8192 tokens; however, you requested 9000 tokens"
+                            .into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 400,
+                    code: None,
+                    message: "messages resulted in 9000 tokens".into(),
+                },
+                RetainedSessionErrorKind::ContextOverflow,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 409,
+                    code: None,
+                    message: r#"{"error":{"message":"retained session expired"}}"#.into(),
+                },
+                RetainedSessionErrorKind::Unavailable,
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 409,
+                    code: None,
+                    message: "prompt mismatch: retained session unavailable".into(),
+                },
+                RetainedSessionErrorKind::Unavailable,
+            ),
+        ] {
+            let error = anyhow::Error::new(error);
+            assert_eq!(classify_retained_session_error(&error), Some(expected));
+        }
+        assert_eq!(
+            classify_retained_session_error(&anyhow::anyhow!(
+                "HTTP 409: retained_session_unavailable"
+            )),
+            None,
+            "flattened strings must not select retained-session recovery"
+        );
+        assert_eq!(
+            classify_retained_session_error(&anyhow::Error::new(ProviderError::HttpStatus {
+                status: 400,
+                code: None,
+                message: "max_prompt_tokens must be below maximum context length for this model"
+                    .into(),
+            })),
+            None,
+            "typed configuration validation is not evidence that this request overflowed"
+        );
     }
 
     // -- classify_tool_error tests --
@@ -453,6 +784,111 @@ mod tests {
         assert!(!ToolErrorKind::PermissionDenied("denied".into()).is_retryable());
         assert!(!ToolErrorKind::InvalidArgs("bad arg".into()).is_retryable());
         assert!(!ToolErrorKind::ToolNotFound("no_tool".into()).is_retryable());
-        assert!(!ToolErrorKind::ExecutionFailed("fail".into()).is_retryable());
+    }
+
+    // -- ToolError (typed protocol) --
+
+    #[test]
+    fn test_tool_error_render_preserves_legacy_bytes() {
+        // Unclassified legacy strings funnel through Execution and must come
+        // out byte-identical ("'task' parameter is required", "Spawn callback
+        // not configured" etc. — the 297-site contract).
+        let e = ToolError::from_legacy("'task' parameter is required");
+        assert_eq!(e.render(), "Error: 'task' parameter is required");
+
+        let e = ToolError::from_legacy("Spawn callback not configured");
+        assert_eq!(e.render(), "Error: Spawn callback not configured");
+
+        // Classified payload-carrying variants reproduce the full original
+        // message (the payload IS the stripped message).
+        let e = ToolError::from_legacy("File not found: /tmp/missing");
+        assert_eq!(e.render(), "Error: File not found: /tmp/missing");
+        assert!(matches!(e, ToolError::NotFound(_)));
+
+        let e = ToolError::from_legacy("Permission denied: /etc/shadow");
+        assert_eq!(e.render(), "Error: Permission denied: /etc/shadow");
+
+        let e = ToolError::from_legacy("Invalid path argument: cannot be empty");
+        assert_eq!(e.render(), "Error: Invalid path argument: cannot be empty");
+    }
+
+    #[test]
+    fn test_tool_error_from_legacy_classification() {
+        assert!(matches!(
+            ToolError::from_legacy("Command timed out after 30 seconds"),
+            ToolError::Timeout(30)
+        ));
+        assert!(matches!(
+            ToolError::from_legacy("connection refused by remote host"),
+            ToolError::Network(_)
+        ));
+        assert!(matches!(
+            ToolError::from_legacy("429 rate limit exceeded"),
+            ToolError::RateLimited
+        ));
+        assert!(matches!(
+            ToolError::from_legacy("service unavailable, try again later"),
+            ToolError::ServiceUnavailable(_)
+        ));
+        assert!(matches!(
+            ToolError::from_legacy("Unknown tool: magic_wand"),
+            ToolError::ToolNotFound { .. }
+        ));
+        assert!(matches!(
+            ToolError::from_legacy("No such file or directory: /x"),
+            ToolError::NotFound(_)
+        ));
+        assert!(matches!(
+            ToolError::from_legacy("unusual failure"),
+            ToolError::Execution { .. }
+        ));
+    }
+
+    #[test]
+    fn test_tool_error_structural_classification() {
+        // Retryable.
+        assert!(ToolError::Timeout(30).is_retryable());
+        assert!(ToolError::Network("conn reset".into()).is_retryable());
+        assert!(ToolError::RateLimited.is_retryable());
+        assert!(ToolError::ServiceUnavailable("503".into()).is_retryable());
+        // Model-fixable.
+        assert!(ToolError::MissingArg {
+            param: "query".into(),
+            example: "recall({\"query\":\"...\"})".into(),
+        }
+        .is_model_fixable());
+        assert!(ToolError::InvalidArgs {
+            message: "bad".into()
+        }
+        .is_model_fixable());
+        // Neither.
+        assert!(!ToolError::NotFound("x".into()).is_retryable());
+        assert!(!ToolError::NotFound("x".into()).is_model_fixable());
+        assert!(!ToolError::Execution {
+            message: "boom".into()
+        }
+        .is_retryable());
+    }
+
+    #[test]
+    fn test_legacy_kind_from_tool_error_round_trip() {
+        let e = ToolError::MissingArg {
+            param: "facts".into(),
+            example: "remember({\"facts\":[\"a concise fact\"]})".into(),
+        };
+        assert!(matches!(
+            legacy_kind_from_tool_error(&e),
+            Some(ToolErrorKind::MissingArg { ref param, .. }) if param == "facts"
+        ));
+        assert!(matches!(
+            legacy_kind_from_tool_error(&ToolError::Timeout(42)),
+            Some(ToolErrorKind::Timeout(42))
+        ));
+        assert_eq!(
+            legacy_kind_from_tool_error(&ToolError::Execution {
+                message: "x".into()
+            }),
+            None
+        );
     }
 }

@@ -1,3 +1,25 @@
+// Test crate — sanctioned escape hatch (research doc §3.6): integration tests
+// keep pragmatic unwraps without blocking the production deny regime.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::string_add,
+    clippy::format_push_string,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::pedantic,
+    clippy::nursery
+)]
 //! E2E tests for Lossless Context Management (LCM)
 //!
 //! Tests the core LCM behaviors:
@@ -10,7 +32,7 @@ use nanobot::agent::compaction::ContextCompactor;
 use nanobot::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
 use nanobot::agent::token_budget::TokenBudget;
 use nanobot::agent::turn::Turn;
-use nanobot::providers::base::{LLMProvider, LLMResponse};
+use nanobot::providers::base::{FinishReason, LLMProvider, LLMResponse};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -119,7 +141,7 @@ impl LLMProvider for MockSummarizer {
         Ok(LLMResponse {
             content: Some(extractive_summary(request)),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }

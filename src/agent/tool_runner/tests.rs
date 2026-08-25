@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::agent::tools::base::Tool;
+use crate::providers::base::FinishReason;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,7 +41,7 @@ impl LLMProvider for MockProvider {
             Ok(crate::providers::base::LLMResponse {
                 content: Some("Done.".to_string()),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: HashMap::new(),
             })
         } else {
@@ -58,6 +59,98 @@ struct CountingTool {
     call_count: AtomicU32,
 }
 
+/// Tool with a controllable runtime, for per-tool timing assertions.
+struct TimedTool {
+    name: String,
+    sleep_ms: u64,
+}
+
+#[async_trait]
+impl Tool for TimedTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "A timed test tool"
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]})
+    }
+    async fn execute(&self, _params: HashMap<String, Value>) -> String {
+        if self.sleep_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
+        }
+        format!("{} result", self.name)
+    }
+}
+
+#[tokio::test]
+async fn tool_results_report_per_tool_implementation_timing() {
+    // Break caught: delegated duration_ms was fabricated as
+    // total_delegation_time / count, so a 150ms tool and a 0ms tool both
+    // reported the same averaged value in the audit journal and TUI.
+    let provider = Arc::new(MockProvider::new(vec![
+        // After initial tool execution, model says "done".
+        crate::providers::base::LLMResponse {
+            content: Some("All done.".to_string()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: HashMap::new(),
+        },
+    ]));
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(TimedTool {
+        name: "fast_tool".to_string(),
+        sleep_ms: 0,
+    }));
+    tools.register(Box::new(TimedTool {
+        name: "slow_tool".to_string(),
+        sleep_ms: 150,
+    }));
+
+    let config = ToolRunnerConfig {
+        provider,
+        model: "mock".to_string(),
+        max_iterations: 10,
+        max_tokens: 4096,
+
+        max_tool_result_chars: 30000,
+        short_circuit_chars: 0,
+        depth: 0,
+        cancellation_token: None,
+        verbatim: false,
+        budget: None,
+    };
+
+    let result = run_tool_loop(
+        &config,
+        &make_tool_calls(&["fast_tool", "slow_tool"]),
+        &tools,
+        "timing context",
+    )
+    .await;
+
+    assert_eq!(result.tool_results.len(), 2);
+    let duration_of = |name: &str| {
+        result
+            .tool_results
+            .iter()
+            .find(|outcome| outcome.tool_name == name)
+            .unwrap_or_else(|| panic!("no outcome for {name}"))
+            .duration_ms
+    };
+    let fast = duration_of("fast_tool");
+    let slow = duration_of("slow_tool");
+    assert!(
+        slow >= 140,
+        "slow tool must report its own runtime, got {slow}ms"
+    );
+    assert!(
+        fast * 3 < slow,
+        "fast tool runtime must be measured, not a fabricated average: fast={fast}ms slow={slow}ms"
+    );
+}
 impl CountingTool {
     fn new() -> Self {
         Self {
@@ -112,7 +205,7 @@ async fn retry_path_preserves_identity_across_transactional_write_pieces() {
             0,
         )
         .await;
-        assert!(result.ok, "{:?}", result.error);
+        assert!(result.ok(), "{:?}", result.error());
     }
 
     assert_eq!(std::fs::read_to_string(path).unwrap(), "first-second-done");
@@ -136,318 +229,12 @@ fn make_tool_calls(names: &[&str]) -> Vec<ToolCallRequest> {
         .collect()
 }
 
-#[test]
-fn recursive_delegate_is_an_external_leased_call() {
-    assert!(is_external_runner_tool(DELEGATE_TOOL));
-    assert!(!is_external_runner_tool("ctx_slice"));
-    assert!(!is_external_runner_tool("ctx_summarize"));
-}
-
-#[tokio::test]
-async fn persisted_runner_rejects_scratch_batch_on_shared_local_lease() {
-    let provider = Arc::new(MockProvider::new(vec![
-        crate::providers::base::LLMResponse {
-            content: None,
-            tool_calls: make_tool_calls(&["test_tool", "test_tool"]),
-            finish_reason: "tool_calls".to_string(),
-            usage: HashMap::new(),
-        },
-    ]));
-    let mut tools = ToolRegistry::new();
-    tools.register(Box::new(CountingTool::new()));
-    let config = ToolRunnerConfig {
-        provider,
-        model: "mock".into(),
-        max_iterations: 3,
-        max_tokens: 4096,
-        max_tool_result_chars: 30_000,
-        short_circuit_chars: 0,
-        depth: 0,
-        cancellation_token: None,
-        verbatim: false,
-        budget: None,
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = Arc::new(crate::session::SessionDb::new(
-        &dir.path().join("sessions.db"),
-    ));
-    let session = sessions.create_session("runner:lease").await;
-    let persistence =
-        ToolResultPersistence::new(sessions.clone(), session.id.clone(), ["root".to_string()]);
-    let mut lease = crate::agent::lease::Lease::new(12, 0);
-    assert_eq!(
-        lease.admit_batch(11),
-        crate::agent::lease::BatchAdmission::Admitted
-    );
-    let result = run_tool_loop_persisted(
-        &config,
-        &[ToolCallRequest {
-            id: "root".into(),
-            name: "test_tool".into(),
-            arguments: HashMap::from([("query".into(), json!("root"))]),
-        }],
-        &tools,
-        "test",
-        &persistence,
-        &mut lease,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(result.tool_results.len(), 3);
-    assert_eq!(result.tool_results[0].0, "root");
-    let extras = &result.tool_results[1..];
-    assert_ne!(extras[0].0, extras[1].0);
-    assert!(extras.iter().all(|(id, _, body)| {
-        id.starts_with("sp_")
-            && body.contains("Finalize now")
-            && !body.to_lowercase().contains("renewal checkpoint")
-    }));
-    for (id, _, _) in extras {
-        assert_eq!(
-            sessions
-                .load_tool_result_with_status(&session.id, id)
-                .await
-                .unwrap()
-                .1,
-            Some(false)
-        );
-    }
-}
-
-#[tokio::test]
-async fn scratch_lease_counts_unique_external_calls_before_admission() {
-    let duplicate = ToolCallRequest {
-        id: "duplicate_a".to_string(),
-        name: "test_tool".to_string(),
-        arguments: HashMap::from([("query".to_string(), json!("same"))]),
-    };
-    let mut duplicate_b = duplicate.clone();
-    duplicate_b.id = "duplicate_b".to_string();
-    let provider = Arc::new(MockProvider::new(vec![
-        crate::providers::base::LLMResponse {
-            content: None,
-            tool_calls: vec![duplicate, duplicate_b],
-            finish_reason: "tool_calls".to_string(),
-            usage: HashMap::new(),
-        },
-    ]));
-    let mut tools = ToolRegistry::new();
-    tools.register(Box::new(CountingTool::new()));
-    let config = ToolRunnerConfig {
-        provider,
-        model: "mock".into(),
-        max_iterations: 3,
-        max_tokens: 4096,
-        max_tool_result_chars: 30_000,
-        short_circuit_chars: 0,
-        depth: 0,
-        cancellation_token: None,
-        verbatim: false,
-        budget: None,
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = Arc::new(crate::session::SessionDb::new(
-        &dir.path().join("sessions.db"),
-    ));
-    let session = sessions.create_session("runner:unique-lease-count").await;
-    let persistence = ToolResultPersistence::new(sessions, session.id, ["root".to_string()]);
-    let mut lease = crate::agent::lease::Lease::new(12, 0);
-    assert_eq!(
-        lease.admit_batch(11),
-        crate::agent::lease::BatchAdmission::Admitted
-    );
-
-    let result = run_tool_loop_persisted(
-        &config,
-        &[ToolCallRequest {
-            id: "root".into(),
-            name: "test_tool".into(),
-            arguments: HashMap::from([("query".into(), json!("root"))]),
-        }],
-        &tools,
-        "test",
-        &persistence,
-        &mut lease,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(result.tool_results.len(), 2);
-    assert_eq!(result.tool_results[0].0, "root");
-    assert_eq!(result.tool_results[1].1, "test_tool");
-    assert_eq!(result.tool_results[1].2, "tool result data");
-}
-
-#[tokio::test]
-async fn exhausted_shared_lease_rejects_recursive_delegate_before_provider_call() {
-    let child_delegate = crate::providers::base::LLMResponse {
-        content: None,
-        tool_calls: vec![ToolCallRequest {
-            id: "reused_recursive_delegate".to_string(),
-            name: DELEGATE_TOOL.to_string(),
-            arguments: HashMap::from([("task".to_string(), json!("recurse"))]),
-        }],
-        finish_reason: "tool_calls".to_string(),
-        usage: HashMap::new(),
-    };
-    let provider = Arc::new(MockProvider::new(vec![
-        child_delegate,
-        crate::providers::base::LLMResponse {
-            content: Some("grandchild escaped the lease".to_string()),
-            tool_calls: vec![],
-            finish_reason: "stop".to_string(),
-            usage: HashMap::new(),
-        },
-    ]));
-    let config = ToolRunnerConfig {
-        provider: provider.clone(),
-        model: "mock".into(),
-        max_iterations: 3,
-        max_tokens: 4096,
-        max_tool_result_chars: 30_000,
-        short_circuit_chars: 0,
-        depth: 0,
-        cancellation_token: None,
-        verbatim: false,
-        budget: Some(Budget::root(3, 2)),
-    };
-    let tools = ToolRegistry::new();
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = Arc::new(crate::session::SessionDb::new(
-        &dir.path().join("sessions.db"),
-    ));
-    let session = sessions
-        .create_session("runner:recursive-delegate-lease")
-        .await;
-    let persistence =
-        ToolResultPersistence::new(sessions, session.id, ["root_delegate".to_string()]);
-    let mut lease = crate::agent::lease::Lease::new(12, 0);
-    assert_eq!(
-        lease.admit_batch(12),
-        crate::agent::lease::BatchAdmission::Admitted
-    );
-
-    let result = run_tool_loop_persisted(
-        &config,
-        &[ToolCallRequest {
-            id: "root_delegate".into(),
-            name: DELEGATE_TOOL.into(),
-            arguments: HashMap::from([("task".into(), json!("start"))]),
-        }],
-        &tools,
-        "test",
-        &persistence,
-        &mut lease,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].0, "root_delegate");
-    assert!(result.tool_results[0].2.contains("Finalize now"));
-    assert!(!result.tool_results[0]
-        .2
-        .contains("grandchild escaped the lease"));
-}
-
-#[tokio::test]
-async fn persisted_nested_sibling_runners_namespace_reused_provider_ids() {
-    let child_call = |query: &str| crate::providers::base::LLMResponse {
-        content: None,
-        tool_calls: vec![ToolCallRequest {
-            id: "provider_reused_child_id".to_string(),
-            name: "test_tool".to_string(),
-            arguments: HashMap::from([("query".to_string(), json!(query))]),
-        }],
-        finish_reason: "tool_calls".to_string(),
-        usage: HashMap::new(),
-    };
-    let text = |content: &str| crate::providers::base::LLMResponse {
-        content: Some(content.to_string()),
-        tool_calls: vec![],
-        finish_reason: "stop".to_string(),
-        usage: HashMap::new(),
-    };
-    let provider = Arc::new(MockProvider::new(vec![
-        child_call("first child"),
-        text("first child summary"),
-        text("first parent summary"),
-        child_call("second child"),
-        text("second child summary"),
-        text("second parent summary"),
-    ]));
-    let mut tools = ToolRegistry::new();
-    tools.register(Box::new(CountingTool::new()));
-    let config = ToolRunnerConfig {
-        provider,
-        model: "mock".to_string(),
-        max_iterations: 10,
-        max_tokens: 4096,
-        max_tool_result_chars: 30_000,
-        short_circuit_chars: 0,
-        depth: 0,
-        cancellation_token: None,
-        verbatim: false,
-        budget: Some(Budget::root(10, 2)),
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = Arc::new(crate::session::SessionDb::new(
-        &dir.path().join("sessions.db"),
-    ));
-    let session = sessions.create_session("runner:nested-siblings").await;
-    let persistence = ToolResultPersistence::new(
-        sessions.clone(),
-        session.id.clone(),
-        ["root_delegate_1".to_string(), "root_delegate_2".to_string()],
-    );
-    let mut lease = crate::agent::lease::Lease::new(12, 0);
-    let delegate_call = |id: &str| ToolCallRequest {
-        id: id.to_string(),
-        name: DELEGATE_TOOL.to_string(),
-        arguments: HashMap::from([
-            ("task".to_string(), json!("inspect")),
-            ("tools".to_string(), json!(["test_tool"])),
-        ]),
-    };
-
-    for root_id in ["root_delegate_1", "root_delegate_2"] {
-        assert_eq!(
-            lease.admit_batch(1),
-            crate::agent::lease::BatchAdmission::Admitted
-        );
-        let result = run_tool_loop_persisted(
-            &config,
-            &[delegate_call(root_id)],
-            &tools,
-            "test",
-            &persistence,
-            &mut lease,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            result.tool_results[0].0, root_id,
-            "root id must be preserved"
-        );
-    }
-
-    let child_ids: Vec<String> = persistence
-        .outcomes
-        .lock()
-        .keys()
-        .filter(|id| id.starts_with("child_"))
-        .cloned()
-        .collect();
-    assert_eq!(child_ids.len(), 2);
-    assert_ne!(child_ids[0], child_ids[1]);
-    for id in child_ids {
-        assert_eq!(
-            sessions
-                .load_tool_result_with_status(&session.id, &id)
-                .await,
-            Some(("tool result data".to_string(), Some(true)))
-        );
+fn outcome(id: &str, name: &str, data: &str) -> ToolRunOutcome {
+    ToolRunOutcome {
+        tool_call_id: id.to_string(),
+        tool_name: name.to_string(),
+        data: data.to_string(),
+        duration_ms: 0,
     }
 }
 
@@ -458,7 +245,7 @@ async fn test_run_tool_loop_executes_tools() {
         crate::providers::base::LLMResponse {
             content: Some("All done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -489,8 +276,8 @@ async fn test_run_tool_loop_executes_tools() {
     .await;
 
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].1, "test_tool");
-    assert_eq!(result.tool_results[0].2, "tool result data");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
+    assert_eq!(result.tool_results[0].data, "tool result data");
     assert_eq!(result.summary.as_deref(), Some("All done."));
     assert_eq!(result.iterations_used, 1);
 }
@@ -512,7 +299,7 @@ async fn test_run_tool_loop_respects_max_iterations() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         });
     }
@@ -562,7 +349,7 @@ async fn test_run_tool_loop_detects_duplicate_calls() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         });
     }
@@ -605,7 +392,7 @@ async fn test_run_tool_loop_returns_on_no_more_tool_calls() {
         crate::providers::base::LLMResponse {
             content: Some("Summary: found 3 files.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -643,12 +430,8 @@ async fn test_run_tool_loop_returns_on_no_more_tool_calls() {
 fn test_aggregate_results_formatting() {
     let result = ToolRunResult {
         tool_results: vec![
-            (
-                "id1".into(),
-                "read_file".into(),
-                "file contents here".into(),
-            ),
-            ("id2".into(), "exec".into(), "command output".into()),
+            outcome("id1", "read_file", "file contents here"),
+            outcome("id2", "exec", "command output"),
         ],
         summary: Some("Read a file and ran a command.".to_string()),
         iterations_used: 1,
@@ -665,7 +448,7 @@ fn test_aggregate_results_formatting() {
 fn test_aggregate_results_compacts_long_output() {
     let long_data = "x".repeat(3000);
     let result = ToolRunResult {
-        tool_results: vec![("id1".into(), "big_tool".into(), long_data.clone())],
+        tool_results: vec![outcome("id1", "big_tool", &long_data)],
         summary: None,
         iterations_used: 1,
         error: None,
@@ -682,7 +465,7 @@ fn test_aggregate_results_compacts_long_output() {
 fn test_results_preview_with_summary() {
     let data = "x".repeat(500);
     let result = ToolRunResult {
-        tool_results: vec![("id1".into(), "read_file".into(), data.clone())],
+        tool_results: vec![outcome("id1", "read_file", &data)],
         summary: Some("Found a large file.".to_string()),
         iterations_used: 1,
         error: None,
@@ -725,7 +508,7 @@ impl LLMProvider for CapturingProvider {
         Ok(crate::providers::base::LLMResponse {
             content: Some("Done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         })
     }
@@ -804,14 +587,14 @@ async fn test_tool_loop_continuation_present_in_chained_calls() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         },
         // Second response: done
         crate::providers::base::LLMResponse {
             content: Some("Chained done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -944,7 +727,7 @@ async fn test_tool_loop_provider_error_still_returns_results() {
 
     // Tool was executed before the LLM call failed
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].1, "test_tool");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
     // Scratch pad LLM call fails, falls back to None (no memory findings).
     assert!(
         result.summary.is_none(),
@@ -1052,7 +835,7 @@ async fn test_tool_loop_normalizes_ids_in_messages() {
 
     // Result should use ORIGINAL ID (for main model correlation)
     assert_eq!(
-        result.tool_results[0].0, "toolu_01XYZabc123def456ghi789",
+        result.tool_results[0].tool_call_id, "toolu_01XYZabc123def456ghi789",
         "Results should preserve original tool call ID"
     );
 
@@ -1067,7 +850,7 @@ async fn test_tool_loop_id_mapping_preserves_originals() {
         crate::providers::base::LLMResponse {
             content: Some("Done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -1113,8 +896,8 @@ async fn test_tool_loop_id_mapping_preserves_originals() {
     let result = run_tool_loop(&config, &calls, &tools, "test").await;
 
     assert_eq!(result.tool_results.len(), 2);
-    assert_eq!(result.tool_results[0].0, "toolu_01AAAA");
-    assert_eq!(result.tool_results[1].0, "toolu_01BBBB");
+    assert_eq!(result.tool_results[0].tool_call_id, "toolu_01AAAA");
+    assert_eq!(result.tool_results[1].tool_call_id, "toolu_01BBBB");
 }
 
 // -- Truncation tests --
@@ -1178,7 +961,7 @@ async fn test_large_result_injects_metadata() {
 
     // all_results should have full 500-char data
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].2.len(), 500);
+    assert_eq!(result.tool_results[0].data.len(), 500);
 
     // Scratch pad receives variable metadata in the user message state.
     let captured = provider.captured_messages.lock().await;
@@ -1235,7 +1018,7 @@ async fn test_small_result_injects_directly() {
     let result = run_tool_loop(&config, &calls, &tools, "test").await;
 
     // Full data in both places
-    assert_eq!(result.tool_results[0].2.len(), 50);
+    assert_eq!(result.tool_results[0].data.len(), 50);
 
     // Scratch pad receives variable metadata in user message state.
     let captured = provider.captured_messages.lock().await;
@@ -1286,7 +1069,7 @@ async fn test_short_circuit_skips_llm_for_trivial_results() {
 
     // Tool was executed
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].2, "tool result data");
+    assert_eq!(result.tool_results[0].data, "tool result data");
     // No summary — LLM was skipped
     assert!(
         result.summary.is_none(),
@@ -1307,7 +1090,7 @@ async fn test_short_circuit_disabled_when_zero() {
         crate::providers::base::LLMResponse {
             content: Some("Summarized.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -1383,7 +1166,7 @@ async fn test_tool_filtering_blocks_uninvited_tools() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         },
     ]));
@@ -1421,7 +1204,7 @@ async fn test_tool_filtering_blocks_uninvited_tools() {
         1,
         "Only initial tool should execute"
     );
-    assert_eq!(result.tool_results[0].1, "test_tool");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
     // dangerous_tool was blocked; early-break optimization means summary
     // may be None (no useful work to summarize), which is correct.
 }
@@ -1442,14 +1225,14 @@ async fn test_tool_filtering_allows_same_tool_different_args() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         },
         // Done
         crate::providers::base::LLMResponse {
             content: Some("All done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -1486,8 +1269,8 @@ async fn test_tool_filtering_allows_same_tool_different_args() {
         2,
         "Should have 2 results (initial + chain)"
     );
-    assert_eq!(result.tool_results[0].1, "test_tool");
-    assert_eq!(result.tool_results[1].1, "test_tool");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
+    assert_eq!(result.tool_results[1].tool_name, "test_tool");
 }
 
 #[tokio::test]
@@ -1554,14 +1337,14 @@ async fn test_micro_tool_results_not_in_all_results() {
                     m
                 },
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: HashMap::new(),
         },
         // Then it summarizes
         crate::providers::base::LLMResponse {
             content: Some("Length is 16.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -1597,7 +1380,7 @@ async fn test_micro_tool_results_not_in_all_results() {
         1,
         "Micro-tool results should not be in all_results"
     );
-    assert_eq!(result.tool_results[0].1, "test_tool");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
 }
 
 #[tokio::test]
@@ -1647,7 +1430,7 @@ async fn test_delegation_receives_micro_tool_defs() {
                             m
                         },
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: HashMap::new(),
                 })
             } else {
@@ -1655,7 +1438,7 @@ async fn test_delegation_receives_micro_tool_defs() {
                 Ok(crate::providers::base::LLMResponse {
                     content: Some("Done.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 })
             }
@@ -1756,7 +1539,7 @@ async fn test_short_circuit_bypasses_context_store() {
 
     // Tool was executed and full result returned
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].2, "tool result data");
+    assert_eq!(result.tool_results[0].data, "tool result data");
     // No LLM call (short-circuited)
     assert!(result.summary.is_none());
     let captured = provider.captured_messages.lock().await;
@@ -1870,7 +1653,7 @@ async fn test_ctx_summarize_produces_summary() {
                                 m
                             },
                         }],
-                        finish_reason: "tool_calls".to_string(),
+                        finish_reason: FinishReason::ToolCalls,
                         usage: HashMap::new(),
                     })
                 }
@@ -1879,7 +1662,7 @@ async fn test_ctx_summarize_produces_summary() {
                     Ok(crate::providers::base::LLMResponse {
                         content: Some("The content discusses Rust programming.".to_string()),
                         tool_calls: vec![],
-                        finish_reason: "stop".to_string(),
+                        finish_reason: FinishReason::Stop,
                         usage: HashMap::new(),
                     })
                 }
@@ -1888,7 +1671,7 @@ async fn test_ctx_summarize_produces_summary() {
                     Ok(crate::providers::base::LLMResponse {
                         content: Some("Based on the summary: Rust programming.".to_string()),
                         tool_calls: vec![],
-                        finish_reason: "stop".to_string(),
+                        finish_reason: FinishReason::Stop,
                         usage: HashMap::new(),
                     })
                 }
@@ -1935,7 +1718,7 @@ async fn test_ctx_summarize_produces_summary() {
 
     // Real tool result preserved
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].1, "verbose_tool");
+    assert_eq!(result.tool_results[0].tool_name, "verbose_tool");
     // Provider was called at least 2 times (outer + sub-loop)
     let total_calls = call_count.load(Ordering::SeqCst);
     assert!(
@@ -2032,14 +1815,14 @@ async fn test_cancellation_mid_iteration() {
                             m
                         },
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: HashMap::new(),
                 })
             } else {
                 Ok(crate::providers::base::LLMResponse {
                     content: Some("Should not reach here.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 })
             }
@@ -2101,7 +1884,7 @@ async fn test_cancellation_none_token_works() {
         crate::providers::base::LLMResponse {
             content: Some("All done.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -2170,8 +1953,8 @@ async fn test_verbatim_skips_delegation_returns_raw() {
 
     // Tools are executed.
     assert_eq!(result.tool_results.len(), 1);
-    assert_eq!(result.tool_results[0].1, "test_tool");
-    assert_eq!(result.tool_results[0].2, "tool result data");
+    assert_eq!(result.tool_results[0].tool_name, "test_tool");
+    assert_eq!(result.tool_results[0].data, "tool result data");
     // Delegation model NOT called — no summary.
     assert!(
         result.summary.is_none(),
@@ -2189,7 +1972,7 @@ async fn test_verbatim_false_calls_delegation() {
         crate::providers::base::LLMResponse {
             content: Some("Summarized.".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: HashMap::new(),
         },
     ]));
@@ -2502,7 +2285,7 @@ async fn test_scratch_pad_memory_accumulates_across_rounds() {
                                 m
                             },
                         }],
-                        finish_reason: "tool_calls".to_string(),
+                        finish_reason: FinishReason::ToolCalls,
                         usage: HashMap::new(),
                     })
                 }
@@ -2511,14 +2294,14 @@ async fn test_scratch_pad_memory_accumulates_across_rounds() {
                     Ok(crate::providers::base::LLMResponse {
                         content: Some("Found 5 endpoints in the API.".to_string()),
                         tool_calls: vec![],
-                        finish_reason: "stop".to_string(),
+                        finish_reason: FinishReason::Stop,
                         usage: HashMap::new(),
                     })
                 }
                 _ => Ok(crate::providers::base::LLMResponse {
                     content: Some("Unexpected call.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 }),
             }

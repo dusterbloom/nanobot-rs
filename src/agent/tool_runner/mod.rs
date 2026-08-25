@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions)]
 #![allow(dead_code)]
 //! Delegated tool execution loop.
 //!
@@ -5,14 +11,13 @@
 //! shared [`ToolRegistry`], and lets a cheap model decide if more tools are
 //! needed. Returns aggregated results for injection into the main context.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::agent::context::ContextBuilder;
-use crate::agent::context_hygiene::tool_result_ok;
 use crate::agent::context_store::{self, ContextStore};
 use crate::agent::sanitize::strip_tool_output;
 use crate::agent::tools::ToolRegistry;
@@ -144,134 +149,28 @@ impl Budget {
     }
 }
 
+/// One delegated tool outcome. `duration_ms` is the implementation-exit
+/// timing (the tool implementation itself, excluding delegation LLM
+/// iterations), matching the journal schema for `tool_execute` events.
+#[derive(Debug, Clone)]
+pub struct ToolRunOutcome {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub data: String,
+    pub duration_ms: u64,
+}
+
 /// Result of a delegated tool execution loop.
 #[derive(Debug, Clone)]
 pub struct ToolRunResult {
-    /// Collected (tool_call_id, tool_name, result_data) from all iterations.
-    pub tool_results: Vec<(String, String, String)>,
+    /// Collected outcomes (tool_call_id, tool_name, result_data, duration) from all iterations.
+    pub tool_results: Vec<ToolRunOutcome>,
     /// Optional summary from the cheap model about what happened.
     pub summary: Option<String>,
     /// How many iterations were used.
     pub iterations_used: u32,
     /// Error message if the delegation LLM call failed.
     pub error: Option<String>,
-}
-
-/// Optional production sink for durably recording completed delegated results
-/// before the runner exposes them to its own analysis loop.
-pub(crate) struct ToolResultPersistence {
-    sessions: Arc<crate::session::SessionDb>,
-    session_id: String,
-    routed_ids: HashSet<String>,
-    outcomes: parking_lot::Mutex<HashMap<String, PersistedToolOutcome>>,
-}
-
-struct PersistedToolOutcome {
-    ok: bool,
-    raw_body: Arc<str>,
-}
-
-impl ToolResultPersistence {
-    pub(crate) fn new(
-        sessions: Arc<crate::session::SessionDb>,
-        session_id: String,
-        routed_ids: impl IntoIterator<Item = String>,
-    ) -> Self {
-        Self {
-            sessions,
-            session_id,
-            routed_ids: routed_ids.into_iter().collect(),
-            outcomes: parking_lot::Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub(crate) fn ok_for(&self, tool_call_id: &str) -> Option<bool> {
-        self.outcomes
-            .lock()
-            .get(tool_call_id)
-            .map(|outcome| outcome.ok)
-    }
-
-    pub(crate) fn raw_body_for(&self, tool_call_id: &str) -> Option<Arc<str>> {
-        self.outcomes
-            .lock()
-            .get(tool_call_id)
-            .map(|outcome| outcome.raw_body.clone())
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ToolResultPersistenceError {
-    pub(crate) tool_call_id: String,
-    pub(crate) tool_name: String,
-    pub(crate) outcome: crate::session::db::StoredResult,
-}
-
-async fn persist_completed_result(
-    persistence: Option<&ToolResultPersistence>,
-    tool_call_id: &str,
-    tool_name: &str,
-    data: &str,
-    ok: bool,
-) -> Result<(), ToolResultPersistenceError> {
-    let Some(persistence) = persistence else {
-        return Ok(());
-    };
-    use crate::session::db::StoredResult;
-    match persistence
-        .sessions
-        .store_tool_result_immutable_with_status(
-            &persistence.session_id,
-            tool_call_id,
-            tool_name,
-            data,
-            ok,
-        )
-        .await
-    {
-        StoredResult::Stored { .. } | StoredResult::Identical { .. } => {
-            persistence.outcomes.lock().insert(
-                tool_call_id.to_string(),
-                PersistedToolOutcome {
-                    ok,
-                    raw_body: Arc::<str>::from(data),
-                },
-            );
-            Ok(())
-        }
-        outcome @ (StoredResult::Conflict { .. } | StoredResult::Failed) => {
-            Err(ToolResultPersistenceError {
-                tool_call_id: tool_call_id.to_string(),
-                tool_name: tool_name.to_string(),
-                outcome,
-            })
-        }
-    }
-}
-
-struct ToolCallIdAllocator {
-    namespace: String,
-    next: u64,
-}
-
-impl ToolCallIdAllocator {
-    fn new() -> Self {
-        Self {
-            namespace: uuid::Uuid::new_v4().simple().to_string(),
-            next: 0,
-        }
-    }
-
-    fn allocate(&mut self, lane: &str) -> String {
-        let id = format!("{lane}_{}_{}", &self.namespace[..12], self.next);
-        self.next = self.next.saturating_add(1);
-        id
-    }
-}
-
-fn is_external_runner_tool(name: &str) -> bool {
-    worker_tools::is_worker_tool(name)
-        || (!context_store::is_micro_tool(name) && name != "ctx_summarize")
 }
 
 /// Normalize a tool call key for dedup: sort JSON keys and use compact serialization.
@@ -329,13 +228,11 @@ async fn analyze_via_scratch_pad(
     allowed_tools: &std::collections::HashSet<&str>,
     tools: &ToolRegistry,
     task_context: &str,
-    all_results: &mut Vec<(String, String, String)>,
+    all_results: &mut Vec<ToolRunOutcome>,
     max_rounds: usize,
-    persistence: Option<&ToolResultPersistence>,
-    lease: &mut Option<&mut crate::agent::lease::Lease>,
-    ids: &mut ToolCallIdAllocator,
-) -> Result<Option<String>, ToolResultPersistenceError> {
+) -> Option<String> {
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut id_counter: usize = 1000; // offset to avoid collision with iteration-0 IDs
 
     // Cost tracking: accumulate across rounds, stop if budget exceeded.
     let mut cost_spent: f64 = 0.0;
@@ -351,7 +248,7 @@ async fn analyze_via_scratch_pad(
             .as_ref()
             .map_or(false, |t| t.is_cancelled())
         {
-            return Ok(Some("Analysis cancelled.".to_string()));
+            return Some("Analysis cancelled.".to_string());
         }
 
         // Check cost budget.
@@ -438,44 +335,6 @@ async fn analyze_via_scratch_pad(
                     round
                 );
                 break;
-            }
-
-            // The lease accounts for the batch that can actually execute.
-            // Provider call IDs are not semantic identity: local models often
-            // repeat one call under multiple IDs in the same response. Build
-            // one stable unique set before both admission and rejection so a
-            // duplicate cannot consume an extra slot or receive a fake receipt.
-            let mut external_seen = std::collections::HashSet::new();
-            let external_calls: Vec<_> = response
-                .tool_calls
-                .iter()
-                .filter(|tc| {
-                    allowed_tools.contains(tc.name.as_str())
-                        && !seen_calls.contains(&normalize_call_key(&tc.name, &tc.arguments))
-                        && is_external_runner_tool(&tc.name)
-                        && external_seen.insert(normalize_call_key(&tc.name, &tc.arguments))
-                })
-                .collect();
-            let external_count = external_calls.len() as u32;
-            if external_count > 0 {
-                if let Some(active_lease) = lease.as_deref_mut() {
-                    if let crate::agent::lease::BatchAdmission::Rejected { remaining } =
-                        active_lease.admit_batch(external_count)
-                    {
-                        let instruction = active_lease.rejection_instruction();
-                        for tc in external_calls {
-                            let id = ids.allocate("sp");
-                            let result = format!(
-                                "lease exhausted: {} was not executed — this batch requested {} external calls with {} remaining. {}",
-                                tc.name, external_count, remaining, instruction
-                            );
-                            persist_completed_result(persistence, &id, &tc.name, &result, false)
-                                .await?;
-                            all_results.push((id, tc.name.clone(), result));
-                        }
-                        return Ok(Some(instruction.to_string()));
-                    }
-                }
             }
 
             // Execute tool calls against ContextStore.
@@ -569,22 +428,23 @@ async fn analyze_via_scratch_pad(
                         _ => {} // scratch_store/scratch_recall/set_phase handle persistence internally
                     }
                 } else if worker_tools::is_worker_tool(&tc.name) {
+                    let started = std::time::Instant::now();
                     let result =
                         worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
-                    let original_id = ids.allocate("sp");
-                    persist_completed_result(
-                        persistence,
-                        &original_id,
-                        &tc.name,
-                        &result,
-                        tool_result_ok(&result),
-                    )
-                    .await?;
+                    let duration_ms = started.elapsed().as_millis() as u64;
                     let (_, _metadata) = context_store.store(result.clone());
-                    all_results.push((original_id, tc.name.clone(), result));
+                    let original_id = format!("sp{:07}", id_counter);
+                    id_counter += 1;
+                    all_results.push(ToolRunOutcome {
+                        tool_call_id: original_id,
+                        tool_name: tc.name.clone(),
+                        data: result,
+                        duration_ms,
+                    });
                 } else {
                     // Real tool — execute with retry on transient errors.
                     debug!("Scratch pad executing real tool: {}", tc.name);
+                    let started = std::time::Instant::now();
                     let result = execute_with_retry(
                         tools,
                         &tc.name,
@@ -594,17 +454,16 @@ async fn analyze_via_scratch_pad(
                         TOOL_MAX_RETRIES,
                     )
                     .await;
-                    let original_id = ids.allocate("sp");
-                    persist_completed_result(
-                        persistence,
-                        &original_id,
-                        &tc.name,
-                        &result.data,
-                        result.ok,
-                    )
-                    .await?;
-                    let (_, _metadata) = context_store.store(result.data.clone());
-                    all_results.push((original_id, tc.name.clone(), result.data));
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    let (_, _metadata) = context_store.store(result.data().to_string());
+                    let original_id = format!("sp{:07}", id_counter);
+                    id_counter += 1;
+                    all_results.push(ToolRunOutcome {
+                        tool_call_id: original_id,
+                        tool_name: tc.name.clone(),
+                        data: result.data().to_string(),
+                        duration_ms,
+                    });
                 }
             }
             // Continue to next round — fresh call with updated state.
@@ -613,7 +472,7 @@ async fn analyze_via_scratch_pad(
             if let Some(text) = response.content {
                 if !text.is_empty() {
                     debug!("Scratch pad analysis complete after {} rounds", round + 1);
-                    return Ok(Some(text));
+                    return Some(text);
                 }
             }
         }
@@ -638,10 +497,10 @@ async fn analyze_via_scratch_pad(
                 "Scratch pad fallback: synthesizing from {} memory findings",
                 findings.len()
             );
-            return Ok(Some(findings.join("\n")));
+            return Some(findings.join("\n"));
         }
     }
-    Ok(None)
+    None
 }
 
 /// Pick a bounded scratch-pad analysis round budget from config + model family.
@@ -683,7 +542,7 @@ pub async fn process_tool_response(
 
     for tc in &response.tool_calls {
         let result = tools.execute(&tc.name, tc.arguments.clone()).await;
-        ContextBuilder::add_tool_result(messages, &tc.id, &tc.name, &result.data);
+        ContextBuilder::add_tool_result(messages, &tc.id, &tc.name, result.data());
     }
 
     true
@@ -700,62 +559,13 @@ pub async fn run_tool_loop(
     tools: &ToolRegistry,
     system_context: &str,
 ) -> ToolRunResult {
-    let mut lease = None;
-    let mut ids = ToolCallIdAllocator::new();
-    run_tool_loop_inner(
-        config,
-        initial_tool_calls,
-        tools,
-        system_context,
-        None,
-        &mut lease,
-        &mut ids,
-        true,
-    )
-    .await
-    .expect("the sink-free runner cannot fail persistence")
-}
-
-pub(crate) async fn run_tool_loop_persisted(
-    config: &ToolRunnerConfig,
-    initial_tool_calls: &[ToolCallRequest],
-    tools: &ToolRegistry,
-    system_context: &str,
-    persistence: &ToolResultPersistence,
-    lease: &mut crate::agent::lease::Lease,
-) -> Result<ToolRunResult, ToolResultPersistenceError> {
-    let mut lease = Some(lease);
-    let mut ids = ToolCallIdAllocator::new();
-    run_tool_loop_inner(
-        config,
-        initial_tool_calls,
-        tools,
-        system_context,
-        Some(persistence),
-        &mut lease,
-        &mut ids,
-        true,
-    )
-    .await
-}
-
-async fn run_tool_loop_inner(
-    config: &ToolRunnerConfig,
-    initial_tool_calls: &[ToolCallRequest],
-    tools: &ToolRegistry,
-    system_context: &str,
-    persistence: Option<&ToolResultPersistence>,
-    lease: &mut Option<&mut crate::agent::lease::Lease>,
-    ids: &mut ToolCallIdAllocator,
-    preserve_initial_ids: bool,
-) -> Result<ToolRunResult, ToolResultPersistenceError> {
     info!(
         role = "delegation",
         model = %config.model,
         tools = initial_tool_calls.len(),
         "tool_delegation_start"
     );
-    let mut all_results: Vec<(String, String, String)> = Vec::new();
+    let mut all_results: Vec<ToolRunOutcome> = Vec::new();
     let mut iterations_used: u32 = 0;
     let mut id_counter: usize = 0;
     // Track tool calls we've already executed to detect loops.
@@ -879,55 +689,21 @@ async fn run_tool_loop_inner(
             .as_ref()
             .map_or(false, |t| t.is_cancelled())
         {
-            return Ok(ToolRunResult {
+            return ToolRunResult {
                 tool_results: all_results,
                 summary: Some("Tool execution cancelled.".to_string()),
                 iterations_used,
                 error: None,
-            });
+            };
         }
 
         if pending_calls.is_empty() {
-            return Ok(ToolRunResult {
+            return ToolRunResult {
                 tool_results: all_results,
                 summary: None,
                 iterations_used,
                 error: None,
-            });
-        }
-        if !preserve_initial_ids {
-            let external_count = pending_calls
-                .iter()
-                .filter(|tc| is_external_runner_tool(&tc.name))
-                .count() as u32;
-            if external_count > 0 {
-                if let Some(active_lease) = lease.as_deref_mut() {
-                    if let crate::agent::lease::BatchAdmission::Rejected { remaining } =
-                        active_lease.admit_batch(external_count)
-                    {
-                        let instruction = active_lease.rejection_instruction();
-                        for tc in pending_calls
-                            .iter()
-                            .filter(|tc| is_external_runner_tool(&tc.name))
-                        {
-                            let id = ids.allocate("child");
-                            let result = format!(
-                                "lease exhausted: {} was not executed — this batch requested {} external calls with {} remaining. {}",
-                                tc.name, external_count, remaining, instruction
-                            );
-                            persist_completed_result(persistence, &id, &tc.name, &result, false)
-                                .await?;
-                            all_results.push((id, tc.name.clone(), result));
-                        }
-                        return Ok(ToolRunResult {
-                            tool_results: all_results,
-                            summary: Some(instruction.to_string()),
-                            iterations_used,
-                            error: None,
-                        });
-                    }
-                }
-            }
+            };
         }
 
         // Mistral/Ministral models require tool call IDs to be exactly
@@ -937,12 +713,7 @@ async fn run_tool_loop_inner(
         for tc in &mut pending_calls {
             let normalized = normalize_tool_call_id(id_counter);
             id_counter += 1;
-            let durable_id = if preserve_initial_ids {
-                tc.id.clone()
-            } else {
-                ids.allocate("child")
-            };
-            id_map.insert(normalized.clone(), durable_id);
+            id_map.insert(normalized.clone(), tc.id.clone());
             tc.id = normalized;
         }
 
@@ -1006,18 +777,16 @@ async fn run_tool_loop_inner(
                     Some(b) => b,
                     None => {
                         let result = "Error: delegation depth limit reached.".to_string();
+                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         let original_id =
                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                        persist_completed_result(
-                            persistence,
-                            &original_id,
-                            &tc.name,
-                            &result,
-                            false,
-                        )
-                        .await?;
-                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
-                        all_results.push((original_id, tc.name.clone(), result));
+                        all_results.push(ToolRunOutcome {
+                            tool_call_id: original_id,
+                            tool_name: tc.name.clone(),
+                            data: result,
+                            // No implementation ran.
+                            duration_ms: 0,
+                        });
                         continue;
                     }
                 };
@@ -1156,42 +925,43 @@ async fn run_tool_loop_inner(
                     Ok(r) => r,
                     Err(e) => {
                         let result = format!("Delegate error: {}", e);
+                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                         let original_id =
                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                        persist_completed_result(
-                            persistence,
-                            &original_id,
-                            &tc.name,
-                            &result,
-                            false,
-                        )
-                        .await?;
-                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
-                        all_results.push((original_id, tc.name.clone(), result));
+                        all_results.push(ToolRunOutcome {
+                            tool_call_id: original_id,
+                            tool_name: tc.name.clone(),
+                            data: result,
+                            // Provider failed before any child implementation ran.
+                            duration_ms: 0,
+                        });
                         continue;
                     }
                 };
 
+                // The delegate tool's implementation is the child loop (or
+                // the direct child response) plus its provider call.
+                let started = std::time::Instant::now();
                 let result = if child_response.has_tool_calls() {
                     // Child wants to use tools — run the tool loop.
-                    let child_result = Box::pin(run_tool_loop_inner(
+                    let child_result = Box::pin(run_tool_loop(
                         &child_config,
                         &child_response.tool_calls,
                         tools,
                         &child_system,
-                        persistence,
-                        lease,
-                        ids,
-                        false,
                     ))
-                    .await?;
+                    .await;
                     // Return the child's summary, or concatenated results if no summary.
                     child_result.summary.unwrap_or_else(|| {
                         child_result
                             .tool_results
                             .iter()
-                            .map(|(_, name, data)| {
-                                format!("[{}]: {}", name, &data[..data.len().min(500)])
+                            .map(|outcome| {
+                                format!(
+                                    "[{}]: {}",
+                                    outcome.tool_name,
+                                    &outcome.data[..outcome.data.len().min(500)]
+                                )
                             })
                             .collect::<Vec<_>>()
                             .join("\n")
@@ -1202,17 +972,9 @@ async fn run_tool_loop_inner(
                         .content
                         .unwrap_or_else(|| "No result from delegate.".to_string())
                 };
+                let delegate_duration_ms = started.elapsed().as_millis() as u64;
 
                 // Store delegate result like any other tool.
-                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                persist_completed_result(
-                    persistence,
-                    &original_id,
-                    &tc.name,
-                    &result,
-                    tool_result_ok(&result),
-                )
-                .await?;
                 let (_, metadata) = context_store.store(result.clone());
                 let delegation_data = if result.len() > config.max_tool_result_chars {
                     metadata
@@ -1220,20 +982,19 @@ async fn run_tool_loop_inner(
                     result.clone()
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
-                all_results.push((original_id, tc.name.clone(), result));
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                all_results.push(ToolRunOutcome {
+                    tool_call_id: original_id,
+                    tool_name: tc.name.clone(),
+                    data: result,
+                    duration_ms: delegate_duration_ms,
+                });
             } else if worker_tools::is_worker_tool(&tc.name) {
                 // Async worker tool: runs a command/script and returns result.
                 debug!("Worker tool: {} (id: {})", tc.name, tc.id);
+                let started = std::time::Instant::now();
                 let result = worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
-                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                persist_completed_result(
-                    persistence,
-                    &original_id,
-                    &tc.name,
-                    &result,
-                    tool_result_ok(&result),
-                )
-                .await?;
+                let duration_ms = started.elapsed().as_millis() as u64;
                 // Store result in ContextStore for subsequent micro-tool access.
                 let (_, metadata) = context_store.store(result.clone());
                 let delegation_data = if result.len() > config.max_tool_result_chars {
@@ -1242,13 +1003,21 @@ async fn run_tool_loop_inner(
                     result.clone()
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
-                all_results.push((original_id, tc.name.clone(), result));
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                all_results.push(ToolRunOutcome {
+                    tool_call_id: original_id,
+                    tool_name: tc.name.clone(),
+                    data: result,
+                    duration_ms,
+                });
 
                 // Track result hashes for loop detection.
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 tc.name.hash(&mut hasher);
-                all_results.last().unwrap().2.hash(&mut hasher);
+                if let Some(last) = all_results.last() {
+                    last.data.hash(&mut hasher);
+                }
                 let result_hash = hasher.finish();
                 if !seen_results.insert(result_hash) {
                     warn!(
@@ -1266,6 +1035,7 @@ async fn run_tool_loop_inner(
             } else {
                 // Real tool: execute with retry on transient errors.
                 debug!("Tool runner executing: {} (id: {})", tc.name, tc.id);
+                let started = std::time::Instant::now();
                 let result = execute_with_retry(
                     tools,
                     &tc.name,
@@ -1275,21 +1045,13 @@ async fn run_tool_loop_inner(
                     TOOL_MAX_RETRIES,
                 )
                 .await;
-                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                persist_completed_result(
-                    persistence,
-                    &original_id,
-                    &tc.name,
-                    &result.data,
-                    result.ok,
-                )
-                .await?;
+                let duration_ms = started.elapsed().as_millis() as u64;
                 // For web_fetch/web_search: unwrap the JSON envelope so the model
                 // sees clean article text rather than a JSON metadata summary.
                 let raw_data = if tc.name == "web_fetch" || tc.name == "web_search" {
-                    crate::agent::tools::web::extract_web_content(&result.data)
+                    crate::agent::tools::web::extract_web_content(result.data())
                 } else {
-                    result.data.clone()
+                    result.data().to_string()
                 };
                 let stripped = strip_tool_output(&raw_data);
                 let (_, metadata) = context_store.store(stripped.clone());
@@ -1301,13 +1063,19 @@ async fn run_tool_loop_inner(
                     stripped.clone()
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
-                all_results.push((original_id, tc.name.clone(), stripped));
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                all_results.push(ToolRunOutcome {
+                    tool_call_id: original_id,
+                    tool_name: tc.name.clone(),
+                    data: stripped,
+                    duration_ms,
+                });
 
                 // Track result hashes for loop detection.
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 tc.name.hash(&mut hasher);
-                result.data.hash(&mut hasher);
+                result.data().hash(&mut hasher);
                 let result_hash = hasher.finish();
                 if !seen_results.insert(result_hash) {
                     warn!(
@@ -1327,35 +1095,38 @@ async fn run_tool_loop_inner(
         // Verbatim mode: skip delegation entirely, return raw results.
         if config.verbatim {
             debug!("Verbatim mode — skipping delegation LLM, returning raw results");
-            return Ok(ToolRunResult {
+            return ToolRunResult {
                 tool_results: all_results,
                 summary: None,
                 iterations_used,
                 error: None,
-            });
+            };
         }
 
         if config.short_circuit_chars > 0 {
             let threshold = config.short_circuit_chars;
             let all_short = all_results
                 .iter()
-                .all(|(_, _, data)| data.len() < threshold);
+                .all(|outcome| outcome.data.len() < threshold);
             // exec/web_search/web_fetch results need interpretation even when short
             // (e.g. a 50-char error message should be analyzed, not passed raw).
-            let needs_interpretation = all_results
-                .iter()
-                .any(|(_, name, _)| matches!(name.as_str(), "exec" | "web_search" | "web_fetch"));
+            let needs_interpretation = all_results.iter().any(|outcome| {
+                matches!(
+                    outcome.tool_name.as_str(),
+                    "exec" | "web_search" | "web_fetch"
+                )
+            });
             if all_short && !needs_interpretation {
                 debug!(
                     "All {} tool results are short (< {} chars) — skipping delegation LLM, returning raw results",
                     all_results.len(), threshold
                 );
-                return Ok(ToolRunResult {
+                return ToolRunResult {
                     tool_results: all_results,
                     summary: None,
                     iterations_used,
                     error: None,
-                });
+                };
             }
         }
 
@@ -1377,26 +1148,23 @@ async fn run_tool_loop_inner(
             &task_context,
             &mut all_results,
             scratch_rounds,
-            persistence,
-            lease,
-            ids,
         )
-        .await?;
-        return Ok(ToolRunResult {
+        .await;
+        return ToolRunResult {
             tool_results: all_results,
             summary,
             iterations_used,
             error: None,
-        });
+        };
     }
 
     // Ran out of iterations or broke out of loop.
-    Ok(ToolRunResult {
+    ToolRunResult {
         tool_results: all_results,
         summary: None,
         iterations_used,
         error: None,
-    })
+    }
 }
 
 /// Format tool run results for injection into the main LLM context.
@@ -1410,14 +1178,15 @@ pub fn format_results_for_context(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    for (_, tool_name, data) in &result.tool_results {
-        let compacted = compact_result_for_context(tool_name, data, max_result_chars);
+    for outcome in &result.tool_results {
+        let compacted =
+            compact_result_for_context(&outcome.tool_name, &outcome.data, max_result_chars);
         let visible = if let Some(g) = gate.as_deref_mut() {
             g.admit_simple(&compacted).into_text()
         } else {
             compacted
         };
-        parts.push(format!("[{}]: {}", tool_name, visible));
+        parts.push(format!("[{}]: {}", outcome.tool_name, visible));
     }
 
     if let Some(ref summary) = result.summary {
@@ -1438,7 +1207,7 @@ fn compact_result_for_context(tool_name: &str, data: &str, max_result_chars: usi
         "[tool result compacted for main context]\n\
          tool: {tool_name}\n\
          full_output: {total_chars} chars\n\
-         guidance: do not replay the same broad tool call; inspect a narrower range only if needed.\n\n\
+         guidance: do not replay the same broad tool .all(|outcome| outcome.data.len() < threshold); inspect a narrower range only if needed.\n\n\
          --- preview ---\n"
     );
     let footer = "\n\n[truncated; full output kept outside the hot prompt]";
@@ -1473,19 +1242,20 @@ async fn execute_with_retry(
     cancel: Option<&tokio_util::sync::CancellationToken>,
     max_retries: u32,
 ) -> crate::agent::tools::base::ToolExecutionResult {
-    use crate::agent::tools::base::{ToolExecutionContext, ToolExecutionResult};
+    use crate::agent::tools::base::{ToolContext, ToolExecutionResult};
 
     let mut attempts = 0u32;
     loop {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         drop(event_rx);
-        let ctx = ToolExecutionContext {
+        let ctx = ToolContext::new(
+            None,
             event_tx,
-            cancellation_token: cancel
+            cancel
                 .map(|token| token.child_token())
                 .unwrap_or_else(tokio_util::sync::CancellationToken::new),
-            tool_call_id: tool_call_id.to_string(),
-        };
+            tool_call_id,
+        );
         let result = tools
             .execute_with_context(name, arguments.clone(), &ctx)
             .await;
@@ -1510,7 +1280,7 @@ async fn execute_with_retry(
             attempts,
             max_retries + 1,
             backoff,
-            result.data
+            result.data()
         );
 
         // Sleep with cancellation awareness.

@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::shadow_unrelated)]
 //! JIT model safety gate for LM Studio and similar JIT-loading servers.
 //!
 //! When multiple providers share the same endpoint but request different models,
@@ -30,6 +36,7 @@ impl JitGate {
     }
 
     /// Acquire the single permit. Blocks until the previous request completes.
+    #[allow(clippy::expect_used)] // permit Arc is owned by self — cannot be closed
     pub async fn acquire(&self) -> OwnedSemaphorePermit {
         self.permit
             .clone()

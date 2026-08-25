@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions, clippy::shadow_unrelated)]
 //! Canonical message representation — independent of any LLM wire format.
 //!
 //! `Turn` is the single source of truth for conversation history. It is stored
@@ -106,28 +112,9 @@ impl Turn {
         matches!(self, Turn::Assistant { .. })
     }
 
-    /// Returns true if this is a user turn (not system, not tool result).
-    pub fn is_user(&self) -> bool {
-        matches!(self, Turn::User { .. })
-    }
-
     /// Returns true if this is a summary turn (LCM compaction output).
     pub fn is_summary(&self) -> bool {
         matches!(self, Turn::Summary { .. })
-    }
-
-    /// Returns true if this is a clear marker (from `/clear` command).
-    pub fn is_clear(&self) -> bool {
-        matches!(self, Turn::Clear)
-    }
-
-    /// Returns the assistant text content, if any.
-    pub fn assistant_text(&self) -> Option<&str> {
-        if let Turn::Assistant { text, .. } = self {
-            text.as_deref()
-        } else {
-            None
-        }
     }
 
     /// Returns tool calls from an assistant turn.

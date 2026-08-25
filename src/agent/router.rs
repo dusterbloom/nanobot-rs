@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse
+)]
 //! Router decision parsing and dispatch functions.
 //!
 //! Extracted from `agent_loop.rs` to isolate routing logic into a focused module.
@@ -23,6 +34,9 @@ use crate::agent::tool_guard::ToolGuard;
 use crate::agent::toolplan::{self, ToolPlanAction};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{LLMProvider, ToolCallRequest, ToolChoice};
+use crate::session::db::{
+    ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse, TurnReplayRecorder,
+};
 
 const ROUTER_SUSPICIOUS_TARGET_MAX_LEN: usize = 96;
 const ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS: usize = 220;
@@ -364,7 +378,47 @@ pub(crate) fn parse_lenient_router_decision(raw: &str) -> Option<role_policy::Ro
     }
 }
 
-#[instrument(name = "request_strict_router_decision", skip(provider, router_pack, tool_names), fields(
+/// Router/specialist lanes are auxiliary boundaries: a transient replay-journal
+/// write failure must not take routing down with it. The model call proceeds
+/// unjournaled and the session's replay degrades to `Incomplete`. The main
+/// agent-loop provider boundary stays fail-closed; only these lanes soften.
+async fn journal_aux_request(
+    replay: Option<&TurnReplayRecorder>,
+    purpose: ModelCallPurpose,
+    request: &RecordedProviderRequest,
+) -> Option<String> {
+    let replay = replay?;
+    match replay.request(purpose, request).await {
+        Ok(call_id) => Some(call_id),
+        Err(error) => {
+            warn!(%error, "aux lane replay request persistence failed; continuing unjournaled");
+            None
+        }
+    }
+}
+
+/// Close an auxiliary-lane journal entry after its provider call resolved.
+/// Callers skip this when the request itself could not be journaled — there
+/// is then nothing to close and replay already degraded.
+async fn journal_aux_terminal(
+    replay: &TurnReplayRecorder,
+    call_id: &str,
+    result: &anyhow::Result<crate::providers::base::LLMResponse>,
+) {
+    let journaled = match result {
+        Ok(response) => {
+            replay
+                .response(call_id, &RecordedProviderResponse::from(response))
+                .await
+        }
+        Err(error) => replay.failure(call_id, &error.to_string()).await,
+    };
+    if let Err(error) = journaled {
+        warn!(%error, "aux lane replay terminal persistence failed; replay degrades to incomplete");
+    }
+}
+
+#[instrument(name = "request_strict_router_decision", skip(provider, router_pack, tool_names, replay), fields(
     model,
     no_think,
     parse_strategy = tracing::field::Empty,
@@ -378,27 +432,21 @@ pub async fn request_strict_router_decision(
     top_p: f64,
     tool_names: &str,
     max_tokens: u32,
+    replay: Option<&TurnReplayRecorder>,
 ) -> Result<role_policy::RouterDecision, String> {
     info!(role = "router", model = %model, "router_decision_start");
+    // action=/target= are bare tokens ended by whitespace or a comma.
+    fn take_token(pack: &str, key: &str) -> Option<String> {
+        let start = pack.find(key)? + key.len();
+        let tail = &pack[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == ',')
+            .unwrap_or(tail.len());
+        Some(tail[..end].trim().to_string())
+    }
     fn parse_router_directive_pack(pack: &str) -> Option<role_policy::RouterDecision> {
-        let action = {
-            let pat = "action=";
-            let start = pack.find(pat)? + pat.len();
-            let tail = &pack[start..];
-            let end = tail
-                .find(|c: char| c.is_whitespace() || c == ',')
-                .unwrap_or(tail.len());
-            tail[..end].trim().to_string()
-        };
-        let target = {
-            let pat = "target=";
-            let start = pack.find(pat)? + pat.len();
-            let tail = &pack[start..];
-            let end = tail
-                .find(|c: char| c.is_whitespace() || c == ',')
-                .unwrap_or(tail.len());
-            tail[..end].trim().to_string()
-        };
+        let action = take_token(pack, "action=")?;
+        let target = take_token(pack, "target=")?;
         let args = if let Some(args_pos) = pack.find("args=") {
             let tail = &pack[args_pos + "args=".len()..];
             extract_json_object(tail)
@@ -488,7 +536,23 @@ pub async fn request_strict_router_decision(
             "content": user_content.clone()
         }),
     ];
-    if let Ok(tool_resp) = provider
+    let tool_call_id = journal_aux_request(
+        replay,
+        ModelCallPurpose::Router,
+        &RecordedProviderRequest {
+            messages: tool_messages.clone(),
+            tools: Some(tool_defs.clone()),
+            model: model.to_string(),
+            max_tokens,
+            temperature,
+            thinking_budget: None,
+            top_p: Some(top_p),
+            tool_choice: "required".to_string(),
+            streaming: false,
+        },
+    )
+    .await;
+    let tool_result = provider
         .chat_with_tool_choice(
             &tool_messages,
             Some(&tool_defs),
@@ -502,8 +566,11 @@ pub async fn request_strict_router_decision(
             // always a well-formed tool call (no fragile JSON-text fallback).
             ToolChoice::Required,
         )
-        .await
-    {
+        .await;
+    if let (Some(replay), Some(call_id)) = (replay, tool_call_id.as_deref()) {
+        journal_aux_terminal(replay, call_id, &tool_result).await;
+    }
+    if let Ok(tool_resp) = tool_result {
         if let Some(tc) = tool_resp.tool_calls.first() {
             if tc.name == "route_decision" {
                 let mut args_obj = tc
@@ -555,7 +622,23 @@ pub async fn request_strict_router_decision(
         }),
     ];
 
-    let router_resp = provider
+    let fallback_call_id = journal_aux_request(
+        replay,
+        ModelCallPurpose::Router,
+        &RecordedProviderRequest {
+            messages: router_messages.clone(),
+            tools: None,
+            model: model.to_string(),
+            max_tokens,
+            temperature,
+            thinking_budget: None,
+            top_p: Some(top_p),
+            tool_choice: "auto".to_string(),
+            streaming: false,
+        },
+    )
+    .await;
+    let router_result = provider
         .chat(
             &router_messages,
             None,
@@ -565,8 +648,11 @@ pub async fn request_strict_router_decision(
             None,
             Some(top_p),
         )
-        .await
-        .map_err(|e| format!("strict router call failed: {}", e))?;
+        .await;
+    if let (Some(replay), Some(call_id)) = (replay, fallback_call_id.as_deref()) {
+        journal_aux_terminal(replay, call_id, &router_result).await;
+    }
+    let router_resp = router_result.map_err(|e| format!("strict router call failed: {}", e))?;
     let raw_router_content = router_resp.content.unwrap_or_default();
     let raw = crate::agent::sanitize::sanitize_reasoning_output(&raw_router_content);
     let parsed = role_policy::parse_router_decision_strict(&raw)
@@ -620,7 +706,7 @@ pub async fn request_strict_router_decision(
 /// - `Err(msg)` on fatal error (break with msg)
 #[instrument(
     name = "dispatch_specialist",
-    skip(core, counters, router_args, user_content, context_summary, tool_list, messages),
+    skip(core, counters, router_args, user_content, context_summary, tool_list, messages, replay),
     fields(
         target = %target,
         outcome = tracing::field::Empty,
@@ -637,6 +723,7 @@ pub(crate) async fn dispatch_specialist(
     tool_list: &[String],
     messages: &[Value],
     schema_enabled: bool,
+    replay: Option<&TurnReplayRecorder>,
 ) -> Result<super::trace_store::DispatchRecord, String> {
     let start = std::time::Instant::now();
     info!(role = "specialist", target = %target, "dispatch_specialist_start");
@@ -692,7 +779,23 @@ pub(crate) async fn dispatch_specialist(
         json!({"role":"system","content": system_prompt}),
         json!({"role":"user","content": specialist_pack}),
     ];
-    match specialist_provider
+    let call_id = journal_aux_request(
+        replay,
+        ModelCallPurpose::Specialist,
+        &RecordedProviderRequest {
+            messages: specialist_messages.clone(),
+            tools: None,
+            model: specialist_model.clone(),
+            max_tokens: core.tool_delegation_config.max_tokens,
+            temperature: core.specialist_temperature,
+            thinking_budget: None,
+            top_p: Some(core.specialist_top_p),
+            tool_choice: "auto".to_string(),
+            streaming: false,
+        },
+    )
+    .await;
+    let specialist_result = specialist_provider
         .chat(
             &specialist_messages,
             None,
@@ -702,8 +805,11 @@ pub(crate) async fn dispatch_specialist(
             None,
             Some(core.specialist_top_p),
         )
-        .await
-    {
+        .await;
+    if let (Some(replay), Some(call_id)) = (replay, call_id.as_deref()) {
+        journal_aux_terminal(replay, call_id, &specialist_result).await;
+    }
+    match specialist_result {
         Ok(sp_resp) => {
             counters.trio_circuit_breaker.lock().record_success(&cb_key);
             let raw_text = sp_resp
@@ -767,7 +873,7 @@ pub(crate) async fn dispatch_subagent(
         return Ok(format!("[tool-guard] {}", e));
     }
     let spawn_result = tools.execute("spawn", params).await;
-    Ok(format!("[router:subagent] {}", spawn_result.data))
+    Ok(format!("[router:subagent] {}", spawn_result.data()))
 }
 
 // ---------------------------------------------------------------------------
@@ -798,11 +904,7 @@ pub(crate) fn subagent_preflight_result(subagent_result: &str) -> PreflightResul
 /// If `specialist_synthesis` is `Some`, use the specialist's synthesized
 /// response. If `None` (specialist unavailable), fall back to the raw tool
 /// result. Pure function — extracted for testability.
-pub(crate) fn tool_preflight_result(
-    _tool_name: &str,
-    _tool_result: &str,
-    specialist_synthesis: Option<String>,
-) -> PreflightResult {
+pub(crate) fn tool_preflight_result(specialist_synthesis: Option<String>) -> PreflightResult {
     match specialist_synthesis {
         Some(synthesized) => PreflightResult::Break(synthesized),
         None => PreflightResult::Continue,
@@ -953,6 +1055,12 @@ pub(crate) async fn router_preflight(
     };
 
     let router_start = std::time::Instant::now();
+    let replay = TurnReplayRecorder::new(
+        std::sync::Arc::clone(&ctx.core.sessions),
+        ctx.session_id.clone(),
+        ctx.request_id.clone(),
+        ctx.turn_count,
+    );
     let decision = match request_strict_router_decision(
         router_provider.as_ref(),
         &router_model,
@@ -962,6 +1070,7 @@ pub(crate) async fn router_preflight(
         ctx.core.router_top_p,
         &tool_list.join(", "),
         ctx.core.tool_delegation_config.router_tuning.max_tokens,
+        Some(&replay),
     )
     .await
     {
@@ -1035,6 +1144,7 @@ pub(crate) async fn router_preflight(
                 &tool_list,
                 &ctx.messages,
                 ctx.core.specialist_output_schema,
+                Some(&replay),
             )
             .await
             {
@@ -1134,10 +1244,10 @@ pub(crate) async fn router_preflight(
             let tr = ctx.tools.execute(&decision.target, params_map).await;
             if ctx.core.trace_log {
                 let mut trace = base_trace.clone();
-                trace.outcome = Some(tr.data.clone());
+                trace.outcome = Some(tr.data().to_string());
                 append_router_decision_trace(&trace);
             }
-            let content = extract_tool_content(&tr.data);
+            let content = extract_tool_content(tr.data());
             let truncated = truncate_tool_result(
                 &content,
                 ctx.core
@@ -1156,7 +1266,7 @@ pub(crate) async fn router_preflight(
                 )));
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some(decision.target.clone());
             ctx.used_tools.insert(decision.target.clone());
-            tool_preflight_result(&decision.target, &truncated, None)
+            tool_preflight_result(None)
         }
         "respond" => {
             tracing::Span::current().record("routing_decision", "respond");
@@ -1216,10 +1326,10 @@ pub(crate) async fn router_preflight(
             let tr = ctx.tools.execute("spawn", params).await;
             if ctx.core.trace_log {
                 let mut trace = base_trace.clone();
-                trace.outcome = Some(tr.data.clone());
+                trace.outcome = Some(tr.data().to_string());
                 append_router_decision_trace(&trace);
             }
-            let content = extract_tool_content(&tr.data);
+            let content = extract_tool_content(tr.data());
             let truncated = truncate_tool_result(
                 &content,
                 ctx.core
@@ -1338,6 +1448,12 @@ pub(crate) async fn route_tool_calls(
             ctx.core.router_model.as_deref(),
         ) {
             let router_start = std::time::Instant::now();
+            let replay = TurnReplayRecorder::new(
+                std::sync::Arc::clone(&ctx.core.sessions),
+                ctx.session_id.clone(),
+                ctx.request_id.clone(),
+                ctx.turn_count,
+            );
             match request_strict_router_decision(
                 router_provider.as_ref(),
                 router_model,
@@ -1347,6 +1463,7 @@ pub(crate) async fn route_tool_calls(
                 ctx.core.router_top_p,
                 &available_tools.join(", "),
                 ctx.core.tool_delegation_config.router_tuning.max_tokens,
+                Some(&replay),
             )
             .await
             {
@@ -1474,6 +1591,12 @@ pub(crate) async fn route_tool_calls(
                     .or_else(|| response_content.map(|s| s.to_string()))
                     .unwrap_or_else(|| "(empty)".to_string());
                 let context_summary = context_summary_owned.as_str();
+                let replay = TurnReplayRecorder::new(
+                    std::sync::Arc::clone(&ctx.core.sessions),
+                    ctx.session_id.clone(),
+                    ctx.request_id.clone(),
+                    ctx.turn_count,
+                );
                 match dispatch_specialist(
                     &ctx.core,
                     &ctx.counters,
@@ -1484,6 +1607,7 @@ pub(crate) async fn route_tool_calls(
                     &ctx.tools.tool_names(),
                     &ctx.messages,
                     ctx.core.specialist_output_schema,
+                    Some(&replay),
                 )
                 .await
                 {
@@ -1586,6 +1710,27 @@ pub(crate) async fn route_tool_calls(
             Ok(()) => allowed_calls.push(tc),
             Err(e) => {
                 warn!("{}", e);
+                if let Err(record_error) = ctx
+                    .core
+                    .sessions
+                    .record_tool_pre_execute(
+                        &ctx.session_id,
+                        &ctx.request_id,
+                        ctx.turn_count,
+                        &tc.id,
+                        &tc.name,
+                        &tc.arguments,
+                        crate::session::db::ToolPreExecuteDecision::Rejected {
+                            reason: "tool_guard".to_string(),
+                        },
+                    )
+                    .await
+                {
+                    return RouteResult::Break(format!(
+                        "tool {} was blocked but its pre-execution decision could not be recorded: {record_error}",
+                        tc.id
+                    ));
+                }
                 let key = ToolGuard::key(&tc.name, &tc.arguments);
                 if let Some(cached) = ctx.flow.tool_guard.get_cached_result(&key) {
                     blocked_with_result.push((tc, cached.chars().count()));
@@ -1611,8 +1756,8 @@ pub(crate) async fn route_tool_calls(
             let receipt = format!(
                 "duplicate {} call blocked; cached result from the earlier identical call \
                  was {} chars and is already represented in the conversation. Do not replay \
-                 this broad call; answer from the prior result, or use search_tool_result / \
-                 slice_tool_result when the previous output was stashed and needs filtering.",
+                 this broad call; answer from the prior result, or use inspect_tool_result \
+                 with a query or line range when the previous output was stashed.",
                 tc.name, cached_chars
             );
             ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &receipt);
@@ -2449,7 +2594,7 @@ mod tests {
     fn test_tool_arm_returns_continue_when_no_synthesis() {
         // Tool arm: when specialist is unavailable (None), should return Continue so the
         // main LLM loop can summarize the injected tool result rather than returning raw JSON.
-        let result = tool_preflight_result("web_fetch", "<html>Hacker News...</html>", None);
+        let result = tool_preflight_result(None);
         assert!(
             matches!(result, PreflightResult::Continue),
             "tool arm with no synthesis must return Continue, not Break"
@@ -2459,8 +2604,7 @@ mod tests {
     #[test]
     fn test_tool_arm_with_specialist_returns_synthesized() {
         let specialist_response = Some("Here are the top 5 HN stories...".to_string());
-        let result =
-            tool_preflight_result("web_fetch", "<html>raw content</html>", specialist_response);
+        let result = tool_preflight_result(specialist_response);
         match result {
             PreflightResult::Break(msg) => {
                 assert_eq!(msg, "Here are the top 5 HN stories...");
@@ -2576,13 +2720,13 @@ mod tests {
 
     #[test]
     fn test_tool_preflight_result_no_synthesis_returns_continue() {
-        let result = tool_preflight_result("web_fetch", "some data", None);
+        let result = tool_preflight_result(None);
         assert!(matches!(result, PreflightResult::Continue));
     }
 
     #[test]
     fn test_tool_preflight_result_with_synthesis_returns_break() {
-        let result = tool_preflight_result("web_fetch", "data", Some("Summary here".into()));
+        let result = tool_preflight_result(Some("Summary here".into()));
         match result {
             PreflightResult::Break(text) => assert_eq!(text, "Summary here"),
             _ => panic!("Expected Break with synthesis text"),

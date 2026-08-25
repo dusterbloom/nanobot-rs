@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::indexing_slicing, clippy::shadow_reuse)]
 //! Pure filtering functions for session message history.
 //!
 //! Extracted from the JSONL `SessionManager` for reuse by the SQLite
@@ -6,6 +12,7 @@
 use serde_json::Value;
 use tracing::warn;
 
+use crate::agent::context_hygiene::cap_tool_result_for_replay;
 #[cfg(test)]
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
 
@@ -160,7 +167,8 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     // Stage 5: filter and map each surviving message to wire format.
     let mapped: Vec<Value> = messages[safe_start..]
         .iter()
-        .filter(|m| {
+        .enumerate()
+        .filter(|(_, m)| {
             // Skip synthetic router/specialist injections. Cache-replay
             // scaffolds were already sent to the model, so dropping them on
             // reload would mutate the warm prompt prefix.
@@ -170,16 +178,40 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
                 // Skip internal LCM summary entries — not valid wire format.
                 && m.get("role").and_then(|r| r.as_str()) != Some("summary")
         })
-        .map(|m| {
+        .map(|(_offset, m)| {
             let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-            // Routine replay is an immutable projection of stored provider-visible
-            // bytes. Any budgeting or replacement must happen before persistence;
-            // explicit reset/compaction paths own later rewrites.
-            let content = m
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            // Tool results are the bulkiest, lowest-value-once-stale part of
+            // history (web_fetch / skill dumps). Cap their body to a generous,
+            // FIXED size so one large dump can't crowd conversation out of the
+            // token budget. The cap is applied identically on every reload (not
+            // age-based), so it never shifts the prompt prefix — no extra
+            // re-prefill, unlike dropping or sliding truncation.
+            //
+            // `recall_tool_result` bodies get NO special treatment. They used
+            // to be swapped for a short "[recalled earlier…]" receipt here, on
+            // the reasoning that a one-shot recall shouldn't balloon the
+            // prompt forever. That swap is a read-time byte change: the turn
+            // that recalled saw ~10 KB, the next turn replayed ~120 bytes, and
+            // the inference server — which matches on content — lost its KV
+            // prefix and re-prefilled everything. Measured in session
+            // 20260810_081050_8306f8: 8 tool messages 24907 → 15060 bytes,
+            // higgs `boundary_splice_failed` → 124.54s of cold prefill on a
+            // 9267-token prompt. The comment that justified it claimed "the
+            // Higgs radix cache is unaffected"; the log says otherwise.
+            // A recalled body is now just a tool result, capped like the rest.
+            let raw = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let content = if role == "tool"
+                && crate::agent::tool_engine::is_stable_tool_result_representation(raw)
+            {
+                // Handles and explicit retrieval excerpts are rendered once at
+                // ingestion: pass through byte-identical on reload so the
+                // prefix cache never sees a drift.
+                raw.to_string()
+            } else if role == "tool" {
+                cap_tool_body(raw)
+            } else {
+                raw.to_string()
+            };
             let mut msg = serde_json::json!({
                 "role": role,
                 "content": content,
@@ -282,6 +314,12 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
         );
     }
     mapped[keep_from..].to_vec()
+}
+
+/// Cap an oversized tool-result body to the shared replay limit. Deterministic
+/// in its input, so the same stored tool result always renders identically.
+fn cap_tool_body(content: &str) -> String {
+    cap_tool_result_for_replay(content)
 }
 
 #[cfg(test)]
@@ -1108,51 +1146,126 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_content_is_byte_identical_during_replay() {
-        let stored = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5_000);
+    fn test_oversized_tool_body_capped_deterministically() {
+        // A large tool result is capped to a fixed size with a marker, and the
+        // render is deterministic — the same stored result yields identical wire
+        // bytes on every reload, so it never shifts the prompt prefix (no extra
+        // re-prefill). Small tool bodies and non-tool content pass through.
+        let big = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5000);
         let messages = vec![
-            user("inspect"),
-            tool_call_assistant("call_1"),
-            json!({
-                "role": "tool",
-                "tool_call_id": "call_1",
-                "name": "exec",
-                "content": stored,
-            }),
+            user("fetch something"),
+            tool_call_assistant("t1"),
+            json!({"role": "tool", "tool_call_id": "t1", "name": "exec", "content": big}),
+            assistant("done"),
+            user("and a small one"),
+            tool_call_assistant("t2"),
+            json!({"role": "tool", "tool_call_id": "t2", "name": "exec", "content": "short result"}),
+            assistant("ok"),
         ];
+        // Stages 1/4/6 disabled (0,0) to isolate the Stage-5 tool-body cap.
+        let a = filter_history(&messages, 0, 0);
+        let b = filter_history(&messages, 0, 0);
+        assert_eq!(a, b, "render must be deterministic for prefix stability");
 
-        let replay = filter_history(&messages, 0, 0);
-        assert_eq!(replay[2]["content"], messages[2]["content"]);
+        let big_tool = a
+            .iter()
+            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "t1")
+            .unwrap();
+        let body = big_tool["content"].as_str().unwrap();
+        assert!(
+            body.len() <= TOOL_RESULT_REPLAY_MAX_BYTES + 40,
+            "oversized tool body must be capped"
+        );
+        assert!(
+            body.ends_with("[tool output truncated]"),
+            "truncation marker appended"
+        );
+
+        // Small tool body and non-tool content are untouched.
+        let small_tool = a
+            .iter()
+            .find(|m| role_of(m) == "tool" && m["tool_call_id"] == "t2")
+            .unwrap();
+        assert_eq!(
+            small_tool["content"], "short result",
+            "small tool unchanged"
+        );
+        assert_eq!(
+            a[0]["content"], "fetch something",
+            "user content not capped"
+        );
     }
 
+    /// Reload must be byte-stable: `filter_history` is applied to the SAME
+    /// stored rows on every turn, so running it twice must produce identical
+    /// content. A `recall_tool_result` body used to shrink to a short receipt
+    /// here, which meant turn N sent ~10 KB and turn N+1 sent ~120 bytes —
+    /// the inference server matches on content, so it dropped its KV prefix
+    /// and re-prefilled (124.54s measured, session 20260810_081050_8306f8).
+    ///
+    /// Asserted for a recalled body and a plain oversized body together: the
+    /// invariant is "reload is a pure function of stored bytes", not a fact
+    /// about one tool name.
     #[test]
-    fn recalled_result_content_is_byte_identical_during_replay() {
+    fn reload_is_byte_stable_for_tool_bodies() {
+        let big = "x".repeat(TOOL_RESULT_REPLAY_MAX_BYTES + 5000);
         let messages = vec![
             user("recall it"),
             json!({
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{
-                    "id": "recall_1",
-                    "type": "function",
-                    "function": {
-                        "name": "recall_tool_result",
-                        "arguments": "{\"tool_call_id\":\"original_tool_call\"}"
+                "tool_calls": [
+                    {
+                        "id": "recall_1",
+                        "type": "function",
+                        "function": {
+                            "name": "recall_tool_result",
+                            "arguments": "{\"tool_call_id\":\"original_tool_call\"}"
+                        }
+                    },
+                    {
+                        "id": "fetch_1",
+                        "type": "function",
+                        "function": { "name": "web_fetch", "arguments": "{}" }
                     }
-                }]
+                ]
             }),
             json!({
                 "role": "tool",
                 "tool_call_id": "recall_1",
                 "name": "recall_tool_result",
-                "content": "bounded exact recalled bytes",
+                "content": big.clone(),
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "fetch_1",
+                "name": "web_fetch",
+                "content": big,
             }),
         ];
 
-        let replay = filter_history(&messages, 0, 0);
+        let first = filter_history(&messages, 0, 0);
+        let second = filter_history(&messages, 0, 0);
+        assert_eq!(first, second, "reload must be deterministic");
+
+        let body = |out: &[Value], id: &str| -> String {
+            out.iter()
+                .find(|m| role_of(m) == "tool" && m["tool_call_id"] == id)
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // A recalled body is capped exactly like any other tool body — no
+        // tool-name-specific shrink that the live wire never applied.
         assert_eq!(
-            replay.last().unwrap()["content"],
-            "bounded exact recalled bytes"
+            body(&first, "recall_1"),
+            body(&first, "fetch_1"),
+            "recall_tool_result must not be treated differently from web_fetch"
+        );
+        assert!(
+            !body(&first, "recall_1").contains("recalled earlier"),
+            "the one-shot receipt must be gone"
         );
     }
 

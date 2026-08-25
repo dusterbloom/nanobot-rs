@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+    clippy::string_add
+)]
 //! Conversation protocol — renders canonical `Turn` history to LLM wire format.
 //!
 //! Two implementations:
@@ -22,12 +33,13 @@ use serde_json::{json, Value};
 use std::sync::LazyLock;
 
 use super::turn::{ToolCall, Turn};
-use crate::agent::model_capabilities::{lookup_default, ModelSizeClass};
+use crate::agent::model_capabilities::lookup_default;
 
 // Matches the outer `[I called: ...]` or `[Called: ...]` or `[called ...]` or
 // `[Calling tool: ...]` bracket. Captures the inner content.
 // The alternation handles both past tense (called/calling) and the extra "tool"
 // word that local models sometimes insert.
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static TEXTUAL_CALL_OUTER_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\[(?:I\s+)?call(?:ed|ing)(?:\s+tool)?[:\s]\s*(.*?)\]")
         .expect("textual call outer regex")
@@ -36,6 +48,7 @@ static TEXTUAL_CALL_OUTER_RE: Lazy<Regex> = Lazy::new(|| {
 // Matches a single `tool_name({...})` pair within the inner content.
 // The format rendered by TextualReplay is: tool_name({"arg": "val"})
 // Captures: (1) tool name, (2) JSON args string (including the braces)
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static TEXTUAL_CALL_ITEM_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(\w+)\s*\(\s*(\{[^}]*(?:\{[^}]*\}[^}]*)?\})\s*\)")
         .expect("textual call item regex")
@@ -206,7 +219,7 @@ impl LocalProtocol {
 
     pub fn auto_for_model(model: &str) -> Self {
         let caps = lookup_default(model);
-        if !caps.tool_calling || caps.size_class == ModelSizeClass::Small {
+        if !caps.tool_calling {
             Self::textual()
         } else {
             Self::native()
@@ -354,7 +367,11 @@ impl ConversationProtocol for LocalProtocol {
         // logs shared the literal sentinel hash 6787951084353679885).
         // Native tool-calling chat templates handle `tool → assistant` without
         // help; textual replay folds tool results into user messages already.
-        if out.last().map(|m| m["role"] == "assistant").unwrap_or(false) {
+        if out
+            .last()
+            .map(|m| m["role"] == "assistant")
+            .unwrap_or(false)
+        {
             out.push(json!({"role": "user", "content": CONTINUE_SENTINEL}));
         }
 
@@ -471,6 +488,7 @@ pub fn strip_textual_tool_calls(content: &str) -> String {
 // ─────────────────────────────────────────────────────────────
 
 // Matches `<tool_call>...</tool_call>` blocks (possibly multiline).
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static XML_TOOL_CALL_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?si)<tool_call>\s*(.*?)\s*</tool_call>").expect("xml tool_call block regex")
 });
@@ -481,12 +499,14 @@ static XML_TOOL_CALL_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
 // the function name, producing fragments like `<function=list_dir\n</function>`.
 // A permissive `[^">]+` capture turns that into a real tool name and leaks XML
 // into the tool engine/TUI.
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static XML_FUNCTION_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)<function(?:=|\s+name=)"?([A-Za-z_][A-Za-z0-9_]*)"?\s*>"#)
         .expect("xml function name regex")
 });
 
 // Extracts `<parameter=KEY>VALUE</parameter>` pairs.
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static XML_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?si)<parameter=(\w+)>\s*(.*?)\s*</parameter>"#).expect("xml parameter regex")
 });
@@ -588,18 +608,17 @@ fn parse_xml_tool_calls_lenient(text: &str) -> Vec<ParsedToolCall> {
         while let Some(po_rel) = inner[p..].find("<parameter=") {
             let po = p + po_rel;
             let key_start = po + "<parameter=".len();
-            let Some(key_end_rel) = inner[key_start..].find('>') else { break };
+            let Some(key_end_rel) = inner[key_start..].find('>') else {
+                break;
+            };
             let key = inner[key_start..key_start + key_end_rel].trim();
             let val_start = key_start + key_end_rel + 1;
             let tail = &inner[val_start..];
-            let val_end_rel = [
-                tail.find("</parameter>"),
-                tail.find("<parameter="),
-            ]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(tail.len());
+            let val_end_rel = [tail.find("</parameter>"), tail.find("<parameter=")]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(tail.len());
             let value = tail[..val_end_rel].trim();
             if !key.is_empty() {
                 let json_val = serde_json::from_str::<Value>(value)
@@ -1295,8 +1314,18 @@ mod tests {
     }
 
     #[test]
-    fn local_protocol_is_derived_from_small_model_capabilities() {
-        assert!(LocalProtocol::auto_for_model("nanbeige-3b").is_textual_replay());
+    fn native_tool_capability_wins_over_model_size() {
+        for model in ["nanbeige-3b", "functiongemma-2b", "lfm2.5-2.6b-8bit"] {
+            assert!(
+                !LocalProtocol::auto_for_model(model).is_textual_replay(),
+                "{model} advertises native tool calling and must replay native tool history"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_averse_model_uses_textual_replay() {
+        assert!(LocalProtocol::auto_for_model("vibethinker-3b").is_textual_replay());
     }
 
     #[test]
@@ -1500,7 +1529,8 @@ And also:
     /// recover it. This is the exact bytes from the incident.
     #[test]
     fn parse_xml_recovers_truncated_unclosed_block() {
-        let text = "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
+        let text =
+            "<tool_call>\n<function=exec>\n<parameter=command>\ncat ~/.config/higgs/config.toml";
         let calls = parse_xml_tool_calls(text);
         assert_eq!(calls.len(), 1, "truncated unclosed block must be recovered");
         assert_eq!(calls[0].tool, "exec");
@@ -1550,7 +1580,11 @@ And also:
         let text = "<tool_call>\n<function=exec>\n<parameter=a>1<parameter=b>2</parameter>";
         let calls = parse_xml_tool_calls(text);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].args["a"], serde_json::json!(1), "a must not swallow sibling b");
+        assert_eq!(
+            calls[0].args["a"],
+            serde_json::json!(1),
+            "a must not swallow sibling b"
+        );
         assert_eq!(calls[0].args["b"], serde_json::json!(2));
     }
 

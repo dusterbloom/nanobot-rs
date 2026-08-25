@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions, clippy::shadow_reuse)]
 //! Shell execution tool.
 
 use std::collections::HashMap;
@@ -12,13 +18,19 @@ use regex::Regex;
 use tokio::process::Command;
 
 // Static regexes for command normalization (compiled once).
-static RE_ESCAPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([^nrtav\\0])").unwrap());
-static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
-static RE_POSIX_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/[^\s"']+"#).unwrap());
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_ESCAPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\([^nrtav\\0])").expect("static regex"));
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("static regex"));
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_POSIX_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"/[^\s"']+"#).expect("static regex"));
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_WIN_PATH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).expect("static regex"));
 
-use super::base::{require_str, PermissionLevel, Tool, ToolExecutionContext};
+use super::base::{require_str, PermissionLevel, Tool, ToolContext};
 use crate::agent::audit::ToolEvent;
 
 /// Default deny patterns for dangerous shell commands.
@@ -374,14 +386,12 @@ impl Tool for ExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its output.\n\
-         Safe: ls, pwd, cat, grep, find, python, cargo, git, echo, curl.\n\
-         Blocked: rm -rf, sudo, eval, shred (destructive commands are rejected).\n\
-         Prefer read_file over cat, list_dir over ls when available.\n\
-         Prefer write_file for generated file content and edit_file for targeted file edits.\n\
-         Bulk edits (\u{2265}3 files): use `ambr 'old' 'new'` for codebase-wide replace,\n\
-         or `fd -e rs | xargs sd 'old' 'new'` for a typed subset.\n\
-         Don't loop edit_file across many files when one pipeline does it."
+        "Execute a shell command and return its output. \
+         Skills (installed in the workspace) are invoked through exec. Call get_skills first to read a skill's instructions, then follow its Quick start command. \
+         Other patterns: cargo build, git status, python script.py. \
+         Blocked: rm -rf, sudo, eval, shred (destructive commands rejected). \
+         Bulk edits: use ambr for codebase-wide replacements or sd for targeted replacements. \
+         Prefer write_file + edit_file over shell pipelines for text content."
     }
 
     fn permission(&self) -> PermissionLevel {
@@ -394,7 +404,7 @@ impl Tool for ExecTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "Shell command with arguments. Examples: webradio play jazz, cargo test, git log --oneline, python script.py"
                 },
                 "working_dir": {
                     "type": "string",
@@ -459,7 +469,7 @@ impl Tool for ExecTool {
     async fn execute_with_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> String {
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, BufReader};
@@ -473,9 +483,9 @@ impl Tool for ExecTool {
         }
 
         // Emit a "start" progress event so the REPL shows the command immediately.
-        let _ = ctx.event_tx.send(ToolEvent::Progress {
+        let _ = ctx.emit(ToolEvent::Progress {
             tool_name: "exec".to_string(),
-            tool_call_id: ctx.tool_call_id.clone(),
+            tool_call_id: ctx.call_id().to_string(),
             elapsed_ms: 0,
             output_preview: Some(format!("Running: {}", command)),
         });
@@ -500,8 +510,9 @@ impl Tool for ExecTool {
                 }
             };
 
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
+            let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+                return "Error: failed to capture command output".to_string();
+            };
 
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();
@@ -546,7 +557,7 @@ impl Tool for ExecTool {
                             _ => { stderr_open = false; }
                         }
                     }
-                    _ = ctx.cancellation_token.cancelled() => {
+                    _ = ctx.cancellation_token().cancelled() => {
                         let _ = child.kill().await;
                         return "Error: Command cancelled".to_string();
                     }
@@ -556,9 +567,9 @@ impl Tool for ExecTool {
                         } else {
                             Some(last_line.clone())
                         };
-                        let _ = ctx.event_tx.send(ToolEvent::Progress {
+                        let _ = ctx.emit(ToolEvent::Progress {
                             tool_name: "exec".to_string(),
-                            tool_call_id: ctx.tool_call_id.clone(),
+                            tool_call_id: ctx.call_id().to_string(),
                             elapsed_ms: start.elapsed().as_millis() as u64,
                             output_preview: preview,
                         });
@@ -687,11 +698,15 @@ mod tests {
 
         let result = tool.execute_with_result(params).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "non-zero shell exit must be a failed tool result"
         );
-        assert!(result.data.starts_with("Error:"), "{:?}", result.data);
-        assert!(result.data.contains("Exit code: 7"), "{:?}", result.data);
+        assert!(result.data().starts_with("Error:"), "{:?}", result.data());
+        assert!(
+            result.data().contains("Exit code: 7"),
+            "{:?}",
+            result.data()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1087,16 +1102,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_tool_emits_progress_events() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = make_exec_tool(false);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_stream".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_stream");
 
         let mut params = HashMap::new();
         // Command that takes ~2s and produces output at intervals
@@ -1129,16 +1140,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_tool_cancellation_kills_child() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = make_exec_tool(false);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token.clone(),
-            tool_call_id: "call_cancel".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token.clone(), "call_cancel".to_string());
 
         let mut params = HashMap::new();
         // Command that would take 10 seconds if not cancelled
@@ -1173,16 +1180,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_with_context_no_output_command() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = make_exec_tool(false);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_noop".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_noop".to_string());
 
         let mut params = HashMap::new();
         params.insert(
@@ -1222,16 +1225,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_with_context_stderr_only() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = make_exec_tool(false);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_stderr".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_stderr".to_string());
 
         let mut params = HashMap::new();
         params.insert(
@@ -1251,16 +1250,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_with_context_blocked_command() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = make_exec_tool(true);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_blocked".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_blocked".to_string());
 
         let mut params = HashMap::new();
         params.insert(
@@ -1279,16 +1274,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_with_context_emits_start_progress_with_command() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = make_exec_tool(false);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_start".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_start".to_string());
 
         let mut params = HashMap::new();
         params.insert(
@@ -1319,16 +1310,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_with_context_matches_execute_for_simple_command() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = make_exec_tool(false);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_compat".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_compat".to_string());
 
         let mut params = HashMap::new();
         params.insert(
@@ -1350,16 +1337,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_with_context_progress_has_output_preview() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = make_exec_tool(false);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_preview".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_preview".to_string());
 
         let mut params = HashMap::new();
         // Produce output then wait so ticker fires with output available
@@ -1392,16 +1375,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_with_context_nonzero_exit() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = make_exec_tool(false);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_exit".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_exit".to_string());
 
         let mut params = HashMap::new();
         params.insert(

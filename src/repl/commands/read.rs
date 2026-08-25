@@ -1,5 +1,25 @@
 //! Read-only REPL commands: /status, /context, /memory, /clear, /agents, /audit, /verify.
 
+// Interactive/app boundary (error-protocol layer 3 backlog): printing IS the
+// product here (REPL/TUI/CLI), and the thin glue code keeps pragmatic
+// unwraps on always-set state (rl, runtime, static regexes). The deny regime
+// in Cargo.toml stays live for the core; this module lands on the regime
+// when its backlog is migrated.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::format_push_string,
+    clippy::string_add
+)]
 use std::sync::atomic::Ordering;
 
 use crate::agent::context::PromptBlockKind;
@@ -698,23 +718,7 @@ impl ReplContext {
     /// Shared by the classic REPL command and the ratatui app so `/clear`
     /// means the same thing in both surfaces.
     pub(crate) async fn clear_session_state(&self) {
-        let core = self.core_handle.swappable();
-        let session_meta = core.sessions.get_or_resume(&self.session_id).await;
-        if core.memory_enabled {
-            if let Err(error) = core.working_memory.clear(&session_meta.id).await {
-                tracing::warn!(%error, session_id = %session_meta.id, "failed to clear working memory");
-            }
-        }
-        core.sessions.clear_history(&session_meta.id).await;
-        self.agent_loop.clear_lcm_engine(&session_meta.id).await;
-
-        let counters = &self.core_handle.counters;
-        counters.reset_session_prompt_state(&self.session_id);
-        counters.last_context_used.store(0, Ordering::Relaxed);
-        counters.last_message_count.store(0, Ordering::Relaxed);
-        counters
-            .last_working_memory_tokens
-            .store(0, Ordering::Relaxed);
+        self.agent_loop.clear_session_state(&self.session_id).await;
     }
 
     /// /clear — clear working memory and conversation history for the current session.

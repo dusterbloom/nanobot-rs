@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated
+)]
 //! Native Anthropic Messages API provider.
 //!
 //! Speaks the Anthropic Messages API (`POST /v1/messages`) directly, translating
@@ -5,6 +16,7 @@
 //! Anthropic-native format. Used with OAuth tokens from Claude Max subscriptions
 //! where the OpenAI-compat endpoint doesn't work.
 
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -16,7 +28,9 @@ use tracing::{debug, info, instrument, warn};
 
 use backon::Retryable;
 
-use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
+use super::base::{
+    FinishReason, LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest,
+};
 use super::retry;
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
@@ -312,14 +326,14 @@ fn parse_anthropic_response(data: &Value) -> Result<LLMResponse> {
         }
     }
 
-    // Map Anthropic stop_reason to OpenAI finish_reason.
+    // Map Anthropic stop_reason to OpenAI finish_reason at the wire boundary.
     let stop_reason = data["stop_reason"].as_str().unwrap_or("end_turn");
-    let finish_reason = match stop_reason {
+    let finish_reason = FinishReason::parse_finish_reason(match stop_reason {
         "tool_use" => "tool_calls",
         "end_turn" | "stop_sequence" => "stop",
         "max_tokens" => "length",
         other => other,
-    };
+    });
 
     let mut usage = HashMap::new();
     if let Some(u) = data["usage"].as_object() {
@@ -338,7 +352,7 @@ fn parse_anthropic_response(data: &Value) -> Result<LLMResponse> {
             Some(content_text)
         },
         tool_calls,
-        finish_reason: finish_reason.to_string(),
+        finish_reason,
         usage,
     })
 }
@@ -727,7 +741,7 @@ async fn parse_anthropic_sse(
 ) {
     let mut line_buffer = String::new();
     let mut full_content = String::new();
-    let mut finish_reason = String::from("stop");
+    let mut finish_reason = FinishReason::Stop;
     let mut usage: HashMap<String, i64> = HashMap::new();
 
     // Track content blocks by index.
@@ -836,12 +850,12 @@ async fn parse_anthropic_sse(
                 }
                 "message_delta" => {
                     if let Some(sr) = data["delta"]["stop_reason"].as_str() {
-                        finish_reason = match sr {
-                            "tool_use" => "tool_calls".to_string(),
-                            "end_turn" | "stop_sequence" => "stop".to_string(),
-                            "max_tokens" => "length".to_string(),
-                            other => other.to_string(),
-                        };
+                        finish_reason = FinishReason::parse_finish_reason(match sr {
+                            "tool_use" => "tool_calls",
+                            "end_turn" | "stop_sequence" => "stop",
+                            "max_tokens" => "length",
+                            other => other,
+                        });
                     }
                     if let Some(u) = data["usage"].as_object() {
                         if let Some(n) = u.get("output_tokens").and_then(|v| v.as_i64()) {
@@ -861,7 +875,9 @@ async fn parse_anthropic_sse(
                     let mut indices: Vec<u64> = tool_blocks.keys().copied().collect();
                     indices.sort();
                     for idx in indices {
-                        let (id, name, args_str) = tool_blocks.remove(&idx).unwrap();
+                        let Some((id, name, args_str)) = tool_blocks.remove(&idx) else {
+                            continue;
+                        };
                         let arguments: HashMap<String, Value> =
                             serde_json::from_str(&args_str).unwrap_or_default();
                         tool_calls.push(ToolCallRequest {
@@ -895,7 +911,9 @@ async fn parse_anthropic_sse(
     let mut indices: Vec<u64> = tool_blocks.keys().copied().collect();
     indices.sort();
     for idx in indices {
-        let (id, name, args_str) = tool_blocks.remove(&idx).unwrap();
+        let Some((id, name, args_str)) = tool_blocks.remove(&idx) else {
+            continue;
+        };
         let arguments: HashMap<String, Value> = serde_json::from_str(&args_str).unwrap_or_default();
         tool_calls.push(ToolCallRequest {
             id,
@@ -1029,7 +1047,7 @@ mod tests {
         let resp = parse_anthropic_response(&data).unwrap();
         assert_eq!(resp.content, Some("Hello world".to_string()));
         assert!(resp.tool_calls.is_empty());
-        assert_eq!(resp.finish_reason, "stop");
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
         assert_eq!(resp.usage["prompt_tokens"], 10);
         assert_eq!(resp.usage["completion_tokens"], 5);
     }
@@ -1055,7 +1073,7 @@ mod tests {
         assert_eq!(resp.tool_calls[0].name, "shell");
         assert_eq!(resp.tool_calls[0].id, "tu_1");
         assert_eq!(resp.tool_calls[0].arguments["command"], "ls");
-        assert_eq!(resp.finish_reason, "tool_calls");
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
     }
 
     #[test]

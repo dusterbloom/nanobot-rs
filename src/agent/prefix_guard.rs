@@ -19,8 +19,34 @@
 //! pass cannot see or mutate it — it operates only on the uncached tail. The
 //! companion diagnostic [`super::prompt_fingerprint`] classifies the result;
 //! under this guard, consecutive mid-turn prompts stay `AppendOnly`.
+//!
+//! # The head is the worst place to diverge
+//!
+//! `messages[0]` (the system prompt) is the *first* token block the template
+//! renders, so mutating it moves the first-divergent token to offset ~0: the
+//! server throws away the entire KV cache and re-prefills from scratch. Measured
+//! on a 9267-token prompt in session `20260810_081050_8306f8`: **124s** of dead
+//! wait for what should have been a warm-cache append.
+//!
+//! Six sites in this codebase rewrite `messages[0]` or insert before the last
+//! user turn (`prepare_context::append_continuity_to_system`,
+//! `agent_core::append_to_system_prompt`, the developer-message rewrite and
+//! `insert_tail_before_user` in `context`, and the developer→system fold in
+//! `providers::openai_compat`). Each was guarded only by a doc comment telling
+//! callers to pass the same bytes every turn. Comments are not enforcement:
+//! [`assert_stable_head`] replaces all six comment-contracts with one runtime
+//! check that hashes the head per session and screams when it moves.
 
+use std::collections::HashMap;
+
+use parking_lot::Mutex;
 use serde_json::Value;
+
+use crate::agent::prompt_fingerprint::hash_value;
+
+/// Chars of the mutated head echoed into the warning — enough to identify which
+/// of the six mutation sites fired without dumping a 9k-token prompt into logs.
+const PREVIEW_CHARS: usize = 200;
 
 /// Run `edit` on only the mutable tail (`messages[watermark..]`), leaving the
 /// frozen prefix `messages[..watermark]` byte-identical.
@@ -47,6 +73,64 @@ pub fn with_frozen_prefix(
     let mut tail = messages.split_off(w);
     edit(&mut tail);
     messages.append(&mut tail);
+}
+
+/// Enforce that `messages[0]` is byte-stable across every call in a session.
+///
+/// Hashes the head with [`hash_value`] (the same serialized form that reaches
+/// the server, so this sees exactly what the template renders) and compares it
+/// against the last hash recorded for `session_key` in `store`. The new hash is
+/// always recorded, so a permanently-changed head warns once rather than every
+/// turn thereafter.
+///
+/// Returns `true` when the head is stable — including the first observation of
+/// a session and an empty `messages`, which have nothing to diverge from.
+///
+/// On divergence: emits a `warn!` carrying the session, both hashes, and a
+/// [`PREVIEW_CHARS`]-char preview of the new head, then trips a `debug_assert!`
+/// so test and CI builds fail loudly while release builds degrade to the
+/// warning and return `false`. A caller that gets `false` has already lost the
+/// prefix cache for this turn; the value is there so it can be counted, not
+/// recovered from.
+pub fn assert_stable_head(
+    session_key: &str,
+    messages: &[Value],
+    store: &Mutex<HashMap<String, u64>>,
+) -> bool {
+    let Some(head) = messages.first() else {
+        return true;
+    };
+    let new_hash = hash_value(head);
+    // Lock scope ends with the statement: logging below must not hold it.
+    let Some(prev_hash) = store.lock().insert(session_key.to_owned(), new_hash) else {
+        return true; // first observation for this session
+    };
+    if prev_hash == new_hash {
+        return true;
+    }
+
+    // `chars().take(..)` rather than a byte slice: heads are UTF-8 prose.
+    let content_preview: String = head
+        .get("content")
+        .and_then(Value::as_str)
+        .map_or_else(|| head.to_string(), str::to_owned)
+        .chars()
+        .take(PREVIEW_CHARS)
+        .collect();
+    tracing::warn!(
+        session = %session_key,
+        prev_hash,
+        new_hash,
+        content_preview = %content_preview,
+        "prompt_head_changed — messages[0] mutated mid-session; server re-prefills the whole context"
+    );
+    debug_assert!(
+        false,
+        "prompt_head_changed — messages[0] mutated mid-session; server re-prefills the \
+         whole context (session={session_key}, prev_hash={prev_hash}, new_hash={new_hash}, \
+         preview={content_preview})"
+    );
+    false
 }
 
 #[cfg(test)]
@@ -171,7 +255,7 @@ mod tests {
             let frozen = if freeze { watermark } else { 0 };
             with_frozen_prefix(&mut messages, frozen, |m| {
                 crate::agent::context_hygiene::hygiene_pipeline(m, keep_last);
-                crate::agent::anti_drift::pre_completion_pipeline(m, iter, &cfg);
+                crate::agent::anti_drift::pre_completion_pipeline(m, iter, &cfg, false);
             });
 
             let fp = fingerprint(&messages);
@@ -235,7 +319,7 @@ mod tests {
             user("still nothing"),
         ];
         with_frozen_prefix(&mut messages, 0, |m| {
-            crate::agent::anti_drift::pre_completion_pipeline(m, 1, &cfg);
+            crate::agent::anti_drift::pre_completion_pipeline(m, 1, &cfg, false);
         });
         // At w==0 the pass is unrestricted: earlier identical calls collapse,
         // exactly as the direct-call anti_drift tests assert.
@@ -288,5 +372,77 @@ mod tests {
             "tail-resident tool result with an in-tail call must not be dropped"
         );
         assert_eq!(messages.len(), 6, "nothing should be removed");
+    }
+
+    // --- Test 5/6: the head-stability guard ---
+
+    /// A prompt whose head is `text`. Only `messages[0]` is under contract, so
+    /// the tail here is incidental.
+    fn headed(text: &str) -> Vec<Value> {
+        vec![system(text), user("turn")]
+    }
+
+    #[test]
+    fn test_stable_head_holds_across_turns_and_sessions() {
+        let store = Mutex::new(HashMap::new());
+
+        // Empty prompt: no head, nothing to diverge from.
+        assert!(assert_stable_head("s1", &[], &store));
+
+        // An unchanged head stays stable no matter how the tail grows —
+        // append-only tail growth is the whole point of the prefix cache.
+        let mut messages = headed("you are nano");
+        for turn in 0..3 {
+            assert!(
+                assert_stable_head("s1", &messages, &store),
+                "turn {turn}: unchanged head must be stable"
+            );
+            messages.push(assistant("appended tail"));
+        }
+
+        // A second session carrying a DIFFERENT head must not clobber the first.
+        assert!(assert_stable_head(
+            "s2",
+            &headed("you are someone else"),
+            &store
+        ));
+        assert!(
+            assert_stable_head("s1", &messages, &store),
+            "sessions must be keyed independently"
+        );
+    }
+
+    #[test]
+    fn test_mutated_head_is_reported() {
+        let store = Mutex::new(HashMap::new());
+        assert!(assert_stable_head("s1", &headed("you are nano"), &store));
+
+        // Debug/test builds trip the `debug_assert!`; release builds only warn
+        // and return `false`. Assert whichever contract the current profile
+        // actually promises rather than pinning the test to one of them.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_stable_head("s1", &headed("you are nano + continuity note"), &store)
+        }));
+        match outcome {
+            Err(payload) => {
+                let msg = payload.downcast_ref::<String>().map_or("", String::as_str);
+                assert!(
+                    msg.contains("prompt_head_changed"),
+                    "debug build must trip the guard's debug_assert; got {msg:?}"
+                );
+            }
+            Ok(stable) => assert!(
+                !stable,
+                "release build must report the mutated head as unstable"
+            ),
+        }
+
+        // The mutated hash was recorded before reporting, so the guard
+        // re-baselines instead of firing on every turn that follows.
+        assert!(assert_stable_head(
+            "s1",
+            &headed("you are nano + continuity note"),
+            &store
+        ));
     }
 }

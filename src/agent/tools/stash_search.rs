@@ -1,23 +1,27 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::shadow_reuse
+)]
 //! Bounded retrieval over stashed (truncated) tool results.
 //!
-//! Large tool outputs are stashed to SQLite and reduced to a head+tail preview
-//! in context (`build_tool_result_preview` in `tool_engine.rs`). The existing
-//! [`crate::agent::tools::recall_tool_result`] tool recovers the *full* body —
-//! but that re-pollutes context. This module adds two tools that query the
-//! stashed data *without* ever loading it whole:
-//!
-//! - [`SearchToolResultTool`]: grep within a stashed result (bounded).
-//! - [`SliceToolResultTool`]: extract a specific line range.
-//!
-//! Both share [`query_stashed_lines`], a single helper that loads the stashed
-//! body from SQLite once and hands it to a caller-supplied extraction
-//! closure. This keeps line-iteration and bounding logic in one place (DRY)
-//! and lets each tool own only its own query semantics (SRP).
+//! Large tool outputs are stashed to SQLite and represented in context by a
+//! handle. [`SearchToolResultTool`] is exposed as `inspect_tool_result`: one
+//! bounded operation that searches by query or reads a line range without ever
+//! loading the exact body into the transcript. The shared
+//! [`query_stashed_lines`] helper keeps storage and line iteration in one
+//! place.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
 
 use crate::agent::tools::base::Tool;
@@ -44,29 +48,43 @@ const MAX_OUTPUT_CHARS: usize = 4000;
 /// Maximum number of lines a single slice may return.
 const MAX_SLICE_LINES: usize = 2000;
 
+/// Default line span when an inspection omits `end_line`.
+const DEFAULT_SLICE_SPAN: usize = 50;
+
 // ---------------------------------------------------------------------------
 // Shared line-query helper (DRY).
 // ---------------------------------------------------------------------------
 
-/// Load a stashed tool result from SQLite and apply an extraction closure that
-/// receives a line iterator `(line_number, &str)`.
-///
-/// Returns `None` if the stashed body is missing. The closure produces the
-/// final bounded string. Centralising the load + line-split keeps both tools
-/// consistent and avoids two copies of the same plumbing.
-async fn query_stashed_lines<F>(
-    db_path: &PathBuf,
-    session_id: &str,
-    tool_call_id: &str,
-    extract: F,
-) -> Option<String>
-where
-    F: FnOnce(&[(usize, &str)]) -> String,
-{
-    let db = SessionDb::new(db_path);
-    let body = db.load_tool_result(session_id, tool_call_id).await?;
-    let lines: Vec<(usize, &str)> = body.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
-    Some(extract(&lines))
+/// One physical source line and its zero-based character offset in the exact
+/// stashed body. The offset lets a wide line fall back to a recoverable
+/// character page without changing the normal line-range contract.
+#[derive(Clone, Copy)]
+struct StashedLine<'a> {
+    number: usize,
+    start_char: usize,
+    text: &'a str,
+}
+
+/// Split like [`str::lines`] while retaining each line's character offset in
+/// the original body. Empty output has no lines, as with [`str::lines`].
+fn stashed_lines(body: &str) -> Vec<StashedLine<'_>> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+
+    let mut start_char = 0;
+    body.split_inclusive('\n')
+        .enumerate()
+        .map(|(index, fragment)| {
+            let line = StashedLine {
+                number: index + 1,
+                start_char,
+                text: fragment.trim_end_matches(|ch| ch == '\r' || ch == '\n'),
+            };
+            start_char += fragment.chars().count();
+            line
+        })
+        .collect()
 }
 
 /// Clamp `max_results` into the legal range `[1, MAX_SEARCH_RESULTS]`.
@@ -86,7 +104,7 @@ fn clamp_context(requested: Option<u64>) -> usize {
 fn render_with_context(
     line_no: usize,
     text: &str,
-    lines: &[(usize, &str)],
+    lines: &[StashedLine<'_>],
     context_lines: usize,
 ) -> String {
     if context_lines == 0 {
@@ -95,28 +113,60 @@ fn render_with_context(
     let start = line_no.saturating_sub(context_lines).max(1);
     let end = (line_no + context_lines).min(lines.len());
     let mut out = String::new();
-    for (n, l) in lines {
-        if *n < start {
+    for line in lines {
+        if line.number < start {
             continue;
         }
-        if *n > end {
+        if line.number > end {
             break;
         }
-        let marker = if *n == line_no { ">" } else { " " };
-        out.push_str(&format!("{} {}:{}\n", marker, n, l));
+        let marker = if line.number == line_no { ">" } else { " " };
+        out.push_str(&format!("{} {}:{}\n", marker, line.number, line.text));
     }
     out.trim_end().to_string()
 }
 
-/// Truncate `s` to `MAX_OUTPUT_CHARS` on a UTF-8 boundary with an overflow note.
-fn bounded(s: String) -> String {
-    if s.chars().count() <= MAX_OUTPUT_CHARS {
-        return s;
+/// Render a bounded page from an exact body using a zero-based character
+/// offset. This is the recovery path for a physical line that cannot fit on a
+/// line page; `next_char` always advances beyond the visible text.
+fn render_char_page(body: &str, artifact_tool_call_id: &str, start_char: usize) -> String {
+    let total = body.chars().count();
+    if start_char >= total {
+        return format!(
+            "[source={artifact_tool_call_id} chars {start_char} out of range (output has {total} chars)]"
+        );
     }
-    let mut t: String = s.chars().take(MAX_OUTPUT_CHARS).collect();
-    let overflow = s.chars().count() - MAX_OUTPUT_CHARS;
-    t.push_str(&format!("\n... (truncated, {} more chars)", overflow));
-    t
+
+    let header = |end_char: usize| {
+        let page_status = if end_char < total {
+            format!("next_char={end_char}")
+        } else {
+            "end".to_string()
+        };
+        format!(
+            "[source={artifact_tool_call_id} chars {start_char}..{end_char}/{total} {page_status}]\n"
+        )
+    };
+
+    let mut text = String::new();
+    let mut end_char = start_char;
+    for ch in body.chars().skip(start_char) {
+        text.push(ch);
+        let candidate_end = end_char + 1;
+        if header(candidate_end).chars().count() + text.chars().count() > MAX_OUTPUT_CHARS {
+            text.pop();
+            break;
+        }
+        end_char = candidate_end;
+    }
+
+    if text.is_empty() {
+        return format!(
+            "[source={artifact_tool_call_id} char page at {start_char} cannot fit within the {MAX_OUTPUT_CHARS}-char limit]"
+        );
+    }
+
+    format!("{}{text}", header(end_char))
 }
 
 /// Render one self-contained, line-aligned artifact page. The continuation is
@@ -124,7 +174,8 @@ fn bounded(s: String) -> String {
 /// page; applying [`bounded`] afterwards would advertise rows the model never
 /// saw and make them unreachable.
 fn render_slice_page(
-    lines: &[(usize, &str)],
+    body: &str,
+    lines: &[StashedLine<'_>],
     artifact_tool_call_id: &str,
     start: usize,
     end: usize,
@@ -154,38 +205,123 @@ fn render_slice_page(
 
     let mut rows = Vec::new();
     let mut last_line = None;
-    for (line_no, text) in lines {
-        if *line_no < clamped_start {
+    for line in lines {
+        if line.number < clamped_start {
             continue;
         }
-        if *line_no > clamped_end {
+        if line.number > clamped_end {
             break;
         }
-        let row = format!("{}:{}", line_no, text);
+        let row = format!("{}:{}", line.number, line.text);
         let mut candidate_rows = rows.clone();
         candidate_rows.push(row);
-        let candidate = format!("{}{}", header(*line_no), candidate_rows.join("\n"));
+        let candidate = format!("{}{}", header(line.number), candidate_rows.join("\n"));
         if candidate.chars().count() > MAX_OUTPUT_CHARS {
             break;
         }
         rows = candidate_rows;
-        last_line = Some(*line_no);
+        last_line = Some(line.number);
     }
 
     match last_line {
         Some(last_line) => format!("{}{}", header(last_line), rows.join("\n")),
-        None => format!(
-            "[source={artifact_tool_call_id} line {clamped_start} exceeds the {MAX_OUTPUT_CHARS}-char page limit; next={clamped_start}]"
+        None => render_char_page(
+            body,
+            artifact_tool_call_id,
+            lines
+                .iter()
+                .find(|line| line.number == clamped_start)
+                .map_or(0, |line| line.start_char),
         ),
     }
 }
 
+/// Return a bounded query result. A match or requested context that cannot fit
+/// becomes a character page beginning at the match, so no matching bytes are
+/// silently truncated or made unreachable.
+fn render_query_results(
+    body: &str,
+    lines: &[StashedLine<'_>],
+    artifact_tool_call_id: &str,
+    query: &str,
+    matcher: &Regex,
+    max_results: usize,
+    context_lines: usize,
+) -> String {
+    let matches: Vec<(StashedLine<'_>, usize)> = lines
+        .iter()
+        .filter_map(|line| {
+            matcher.find(line.text).map(|found| {
+                let match_offset = line.text[..found.start()].chars().count();
+                (*line, match_offset)
+            })
+        })
+        .collect();
+
+    let Some((first_match, first_match_offset)) = matches.first().copied() else {
+        return format!("No matching lines for '{query}'.");
+    };
+
+    if let Some((wide_match, wide_match_offset)) = matches.iter().copied().find(|(line, _)| {
+        render_with_context(line.number, line.text, lines, context_lines)
+            .chars()
+            .count()
+            > MAX_OUTPUT_CHARS
+    }) {
+        return render_char_page(
+            body,
+            artifact_tool_call_id,
+            wide_match.start_char + wide_match_offset,
+        );
+    }
+
+    let total_matches = matches.len();
+    let limit = total_matches.min(max_results);
+    let mut rendered = String::new();
+    let mut shown = 0usize;
+    for (line, _) in matches.into_iter().take(limit) {
+        let row = render_with_context(line.number, line.text, lines, context_lines);
+        let candidate = if rendered.is_empty() {
+            row
+        } else {
+            format!("{rendered}\n{row}")
+        };
+        let candidate_shown = shown + 1;
+        let footer = if total_matches > candidate_shown {
+            format!(
+                "\n[{candidate_shown} matches shown, {total_matches} total — refine query or narrow the range]"
+            )
+        } else {
+            String::new()
+        };
+        if candidate.chars().count() + footer.chars().count() > MAX_OUTPUT_CHARS {
+            break;
+        }
+        rendered = candidate;
+        shown = candidate_shown;
+    }
+
+    if shown == 0 {
+        return render_char_page(
+            body,
+            artifact_tool_call_id,
+            first_match.start_char + first_match_offset,
+        );
+    }
+    if total_matches > shown {
+        rendered.push_str(&format!(
+            "\n[{shown} matches shown, {total_matches} total — refine query or narrow the range]"
+        ));
+    }
+    rendered
+}
+
 // ===========================================================================
-// Tool 1: SearchToolResultTool
+// Model-facing bounded result inspection
 // ===========================================================================
 
-/// Search WITHIN a stashed (truncated) tool result without loading the full
-/// body into context. Returns matching lines with line numbers.
+/// Inspect a stashed tool result without loading its full body into context.
+/// A query searches matching lines; omitting it returns a bounded line page.
 pub struct SearchToolResultTool {
     db_path: PathBuf,
     session_id: String,
@@ -203,16 +339,16 @@ impl SearchToolResultTool {
 #[async_trait]
 impl Tool for SearchToolResultTool {
     fn name(&self) -> &str {
-        "search_tool_result"
+        "inspect_tool_result"
     }
 
     fn description(&self) -> &str {
-        "Search WITHIN a stashed (truncated) tool result without loading it \
-         all into context. Use this instead of recall_tool_result when you \
-         only need matching lines. Pass the tool_call_id from the \
-         [truncated: ...] preview block. Returns up to max_results matching \
-         lines with line numbers. Prefer this over recall_tool_result when \
-         the full body would be wasteful."
+        "Read a small part of a prior tool result. Pass tool_call_id from its \
+         TOOL_RESULT_HANDLE. Add query to find matching lines, or start_line \
+         and end_line to read a range. If a page returns next_char, pass that \
+         zero-based offset as start_char to continue a long line. Output is \
+         always bounded; the complete source remains stored for another \
+         narrower inspection."
     }
 
     fn parameters(&self) -> Value {
@@ -223,9 +359,21 @@ impl Tool for SearchToolResultTool {
                     "type": "string",
                     "description": "The tool_call_id from the [truncated: ...] preview block."
                 },
-                "pattern": {
+                "query": {
                     "type": "string",
                     "description": "Substring to search for (case-insensitive)."
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "First line to read when query is omitted (default 1)."
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Last line to read when query is omitted (default start_line + 50)."
+                },
+                "start_char": {
+                    "type": "integer",
+                    "description": "Continue a long-line page at this zero-based character offset. Use only after output gives next_char."
                 },
                 "max_results": {
                     "type": "integer",
@@ -236,7 +384,7 @@ impl Tool for SearchToolResultTool {
                     "description": "Lines of context around each match (default 0, max 5). 0 = match line only."
                 }
             },
-            "required": ["tool_call_id", "pattern"]
+            "required": ["tool_call_id"]
         })
     }
 
@@ -249,48 +397,49 @@ impl Tool for SearchToolResultTool {
                     .to_string();
             }
         };
-        let pattern = match params.get("pattern").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return "Error: pattern is required.".to_string(),
-        };
-        let pattern_lower = pattern.to_lowercase();
-        let max_results = clamp_results(params.get("max_results").and_then(|v| v.as_u64()));
-        let context_lines = clamp_context(params.get("context_lines").and_then(|v| v.as_u64()));
-
-        let result = query_stashed_lines(&self.db_path, &self.session_id, id, |lines| {
-            let mut out = String::new();
-            let mut shown = 0usize;
-            let mut total_matches = 0usize;
-            for (line_no, text) in lines {
-                if text.to_lowercase().contains(&pattern_lower) {
-                    total_matches += 1;
-                    if shown >= max_results {
-                        continue;
-                    }
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&render_with_context(*line_no, text, lines, context_lines));
-                    shown += 1;
-                }
-            }
-            if out.is_empty() {
-                format!("No matching lines for '{}'.", pattern)
-            } else if total_matches > shown {
-                format!(
-                    "{}\n[{} matches shown, {} total — refine the pattern or raise max_results]",
-                    out, shown, total_matches
+        let body = SessionDb::new(&self.db_path)
+            .load_tool_result(&self.session_id, id)
+            .await;
+        let result = if let Some(body) = body {
+            let lines = stashed_lines(&body);
+            if let Some(query) = params.get("query").and_then(|v| v.as_str()) {
+                let matcher = match RegexBuilder::new(&regex::escape(query))
+                    .case_insensitive(true)
+                    .build()
+                {
+                    Ok(matcher) => matcher,
+                    Err(_) => return "Error: query could not be compiled.".to_string(),
+                };
+                let max_results = clamp_results(params.get("max_results").and_then(|v| v.as_u64()));
+                let context_lines =
+                    clamp_context(params.get("context_lines").and_then(|v| v.as_u64()));
+                render_query_results(
+                    &body,
+                    &lines,
+                    id,
+                    query,
+                    &matcher,
+                    max_results,
+                    context_lines,
                 )
+            } else if let Some(start_char) = params.get("start_char").and_then(|v| v.as_u64()) {
+                render_char_page(&body, id, start_char as usize)
             } else {
-                out
+                let start = params
+                    .get("start_line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                let end = params
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(start as u64 + DEFAULT_SLICE_SPAN as u64)
+                    as usize;
+                render_slice_page(&body, &lines, id, start, end)
             }
-        })
-        .await;
-
-        match result {
-            Some(s) => bounded(s),
-            None => Self::not_found(id),
-        }
+        } else {
+            Self::not_found(id)
+        };
+        result
     }
 }
 
@@ -303,91 +452,6 @@ impl SearchToolResultTool {
         )
     }
 }
-
-// ===========================================================================
-// Tool 2: SliceToolResultTool
-// ===========================================================================
-
-/// Extract a specific line range from a stashed tool result without loading
-/// the full body into context.
-pub struct SliceToolResultTool {
-    db_path: PathBuf,
-    session_id: String,
-}
-
-impl SliceToolResultTool {
-    pub fn with_db(db_path: PathBuf, session_id: String) -> Self {
-        Self {
-            db_path,
-            session_id,
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for SliceToolResultTool {
-    fn name(&self) -> &str {
-        "slice_tool_result"
-    }
-
-    fn description(&self) -> &str {
-        "Extract a specific line range from a stashed (truncated) tool result \
-         without loading the full body. Use after search_tool_result to read \
-         a region in detail, or when you know the exact line numbers. \
-         Pass the tool_call_id from the [truncated: ...] preview block. \
-         The response reports next_start when more lines remain."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "tool_call_id": {
-                    "type": "string",
-                    "description": "The tool_call_id from the [truncated: ...] preview block."
-                },
-                "start": {
-                    "type": "integer",
-                    "description": "Starting line number (1-indexed, inclusive)."
-                },
-                "end": {
-                    "type": "integer",
-                    "description": "Ending line number (1-indexed, inclusive). Defaults to start + 50."
-                }
-            },
-            "required": ["tool_call_id", "start"]
-        })
-    }
-
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
-        let id = match params.get("tool_call_id").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => {
-                return "Error: tool_call_id is required. Pass the id from the \
-                        [truncated: ...] preview block."
-                    .to_string();
-            }
-        };
-        let start = params.get("start").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-        let end = params
-            .get("end")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(start as u64 + DEFAULT_SLICE_SPAN as u64) as usize;
-
-        let result = query_stashed_lines(&self.db_path, &self.session_id, id, |lines| {
-            render_slice_page(lines, id, start, end)
-        })
-        .await;
-
-        match result {
-            Some(s) => s,
-            None => SearchToolResultTool::not_found(id), // reuse the message
-        }
-    }
-}
-
-/// Default span when `end` is omitted.
-const DEFAULT_SLICE_SPAN: usize = 50;
 
 // ===========================================================================
 // Tests
@@ -423,9 +487,10 @@ mod tests {
         let tool = SearchToolResultTool::with_db(db_path, sid);
         let params = HashMap::from([
             ("tool_call_id".to_string(), json!("call_a")),
-            ("pattern".to_string(), json!("error")),
+            ("query".to_string(), json!("error")),
         ]);
         let out = tool.execute(params).await;
+        assert_eq!(tool.name(), "inspect_tool_result");
         assert!(out.contains("2:error here"));
         assert!(out.contains("4:error again"));
     }
@@ -439,7 +504,7 @@ mod tests {
         let tool = SearchToolResultTool::with_db(db_path, sid);
         let params = HashMap::from([
             ("tool_call_id".to_string(), json!("call_b")),
-            ("pattern".to_string(), json!("x")),
+            ("query".to_string(), json!("x")),
             ("max_results".to_string(), json!(3)),
         ]);
         let out = tool.execute(params).await;
@@ -455,7 +520,7 @@ mod tests {
         let tool = SearchToolResultTool::with_db(db_path, sid);
         let params = HashMap::from([
             ("tool_call_id".to_string(), json!("call_c")),
-            ("pattern".to_string(), json!("zzz")),
+            ("query".to_string(), json!("zzz")),
         ]);
         let out = tool.execute(params).await;
         assert!(out.contains("No matching lines"));
@@ -467,24 +532,24 @@ mod tests {
         let tool = SearchToolResultTool::with_db(db_path, sid);
         let params = HashMap::from([
             ("tool_call_id".to_string(), json!("ghost")),
-            ("pattern".to_string(), json!("x")),
+            ("query".to_string(), json!("x")),
         ]);
         let out = tool.execute(params).await;
         assert!(out.contains("No stored output"));
     }
 
     #[tokio::test]
-    async fn slice_extracts_line_range() {
+    async fn inspect_extracts_line_range() {
         let (_dir, db_path, sid) = make_db().await;
         let body: Vec<&str> = (1..=100).map(|_| "data").collect();
         let body = body.join("\n");
         seed(&db_path, &sid, "call_d", &body).await;
 
-        let tool = SliceToolResultTool::with_db(db_path, sid);
+        let tool = SearchToolResultTool::with_db(db_path, sid);
         let params = HashMap::from([
             ("tool_call_id".to_string(), json!("call_d")),
-            ("start".to_string(), json!(10)),
-            ("end".to_string(), json!(12)),
+            ("start_line".to_string(), json!(10)),
+            ("end_line".to_string(), json!(12)),
         ]);
         let out = tool.execute(params).await;
         assert!(out.contains("10:data"));
@@ -493,45 +558,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slice_reports_continuation_position() {
+    async fn inspect_reports_continuation_position() {
         let (_dir, db_path, sid) = make_db().await;
         let body: Vec<&str> = (1..=100).map(|_| "data").collect();
         seed(&db_path, &sid, "call_page", &body.join("\n")).await;
 
-        let tool = SliceToolResultTool::with_db(db_path, sid);
+        let tool = SearchToolResultTool::with_db(db_path, sid);
         let first_page = tool
             .execute(HashMap::from([
                 ("tool_call_id".to_string(), json!("call_page")),
-                ("start".to_string(), json!(10)),
+                ("start_line".to_string(), json!(10)),
             ]))
             .await;
         assert!(
             first_page.starts_with("[source=call_page lines 10-60/100 next=61]"),
-            "slice must tell the model how to request the next page: {first_page}"
+            "inspection must tell the model how to request the next page: {first_page}"
         );
 
         let last_page = tool
             .execute(HashMap::from([
                 ("tool_call_id".to_string(), json!("call_page")),
-                ("start".to_string(), json!(90)),
+                ("start_line".to_string(), json!(90)),
             ]))
             .await;
         assert!(
             last_page.starts_with("[source=call_page lines 90-100/100 end]"),
-            "slice must tell the model that paging is complete: {last_page}"
+            "inspection must tell the model that paging is complete: {last_page}"
         );
     }
 
     #[tokio::test]
-    async fn slice_repeats_immutable_artifact_id_for_follow_up_calls() {
+    async fn inspect_repeats_immutable_artifact_id_for_follow_up_calls() {
         let (_dir, db_path, sid) = make_db().await;
         seed(&db_path, &sid, "artifact_read_7", "alpha\nbeta\ngamma").await;
 
-        let tool = SliceToolResultTool::with_db(db_path, sid);
+        let tool = SearchToolResultTool::with_db(db_path, sid);
         let out = tool
             .execute(HashMap::from([
                 ("tool_call_id".to_string(), json!("artifact_read_7")),
-                ("start".to_string(), json!(2)),
+                ("start_line".to_string(), json!(2)),
             ]))
             .await;
 
@@ -542,7 +607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slice_wide_lines_never_advertises_unemitted_next_start() {
+    async fn inspect_wide_lines_never_advertises_unemitted_next_start() {
         let (_dir, db_path, sid) = make_db().await;
         let body = (1..=100)
             .map(|line| format!("{line}-{}", "x".repeat(180)))
@@ -550,12 +615,12 @@ mod tests {
             .join("\n");
         seed(&db_path, &sid, "wide_artifact", &body).await;
 
-        let tool = SliceToolResultTool::with_db(db_path, sid);
+        let tool = SearchToolResultTool::with_db(db_path, sid);
         let out = tool
             .execute(HashMap::from([
                 ("tool_call_id".to_string(), json!("wide_artifact")),
-                ("start".to_string(), json!(1)),
-                ("end".to_string(), json!(100)),
+                ("start_line".to_string(), json!(1)),
+                ("end_line".to_string(), json!(100)),
             ]))
             .await;
 
@@ -580,6 +645,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inspect_single_wide_line_pages_by_character_offset() {
+        let (_dir, db_path, sid) = make_db().await;
+        let body = format!("{}TAIL", "x".repeat(MAX_OUTPUT_CHARS + 300));
+        seed(&db_path, &sid, "wide_single_line", &body).await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let first = tool
+            .execute(HashMap::from([(
+                "tool_call_id".to_string(),
+                json!("wide_single_line"),
+            )]))
+            .await;
+
+        assert!(
+            first.starts_with("[source=wide_single_line chars 0.."),
+            "wide single-line output must expose a character page: {first}"
+        );
+        assert!(first.chars().count() <= MAX_OUTPUT_CHARS);
+        let next_char = first
+            .split("next_char=")
+            .nth(1)
+            .and_then(|tail| tail.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .expect("first character page must expose a continuation offset");
+
+        let second = tool
+            .execute(HashMap::from([
+                ("tool_call_id".to_string(), json!("wide_single_line")),
+                ("start_char".to_string(), json!(next_char)),
+            ]))
+            .await;
+
+        assert!(second.contains("TAIL"), "tail must be reachable: {second}");
+        assert!(
+            second.contains(" end]"),
+            "last page must terminate: {second}"
+        );
+        assert!(second.chars().count() <= MAX_OUTPUT_CHARS);
+    }
+
+    #[tokio::test]
+    async fn search_wide_line_centers_a_recoverable_page_on_the_match() {
+        let (_dir, db_path, sid) = make_db().await;
+        let body = format!("{}NEEDLE", "x".repeat(MAX_OUTPUT_CHARS + 200));
+        seed(&db_path, &sid, "wide_query", &body).await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let out = tool
+            .execute(HashMap::from([
+                ("tool_call_id".to_string(), json!("wide_query")),
+                ("query".to_string(), json!("needle")),
+            ]))
+            .await;
+
+        assert!(
+            out.starts_with("[source=wide_query chars 4200.."),
+            "wide query must locate the matching character range: {out}"
+        );
+        assert!(
+            out.contains("NEEDLE"),
+            "matching text must be visible: {out}"
+        );
+        assert!(out.chars().count() <= MAX_OUTPUT_CHARS);
+    }
+
+    #[tokio::test]
+    async fn search_finds_a_wide_match_after_a_short_match() {
+        let (_dir, db_path, sid) = make_db().await;
+        let body = format!(
+            "TAIL_ONLY_MATCH short\n{}TAIL_ONLY_MATCH",
+            "x".repeat(MAX_OUTPUT_CHARS + 200)
+        );
+        seed(&db_path, &sid, "mixed_query", &body).await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let out = tool
+            .execute(HashMap::from([
+                ("tool_call_id".to_string(), json!("mixed_query")),
+                ("query".to_string(), json!("tail_only_match")),
+            ]))
+            .await;
+
+        assert!(
+            out.starts_with("[source=mixed_query chars "),
+            "a later wide match must remain directly retrievable: {out}"
+        );
+        assert!(out.ends_with("TAIL_ONLY_MATCH"));
+        assert!(out.chars().count() <= MAX_OUTPUT_CHARS);
+    }
+
+    #[tokio::test]
     async fn search_context_lines_surround_match() {
         let (_dir, db_path, sid) = make_db().await;
         let body = "a\nb\nTARGET\nc\nd\n";
@@ -588,7 +744,7 @@ mod tests {
         let tool = SearchToolResultTool::with_db(db_path, sid);
         let params = HashMap::from([
             ("tool_call_id".to_string(), json!("call_e")),
-            ("pattern".to_string(), json!("target")),
+            ("query".to_string(), json!("target")),
             ("context_lines".to_string(), json!(1)),
         ]);
         let out = tool.execute(params).await;
@@ -605,7 +761,7 @@ mod tests {
         let tool = SearchToolResultTool::with_db(db_path, sid);
         let params = HashMap::from([
             ("tool_call_id".to_string(), json!("call_f")),
-            ("pattern".to_string(), json!("fatal error")),
+            ("query".to_string(), json!("fatal error")),
         ]);
         let out = tool.execute(params).await;
         assert!(out.contains("1:Fatal ERROR here"));

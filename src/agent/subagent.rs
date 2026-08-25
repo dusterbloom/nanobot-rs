@@ -1,3 +1,15 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse
+)]
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 #![allow(dead_code)]
 //! Subagent manager for background task execution.
 //!
@@ -78,14 +90,6 @@ fn local_response_token_limit(
     let adaptive =
         (ctx_limit / 6).clamp(min_response_tokens as usize, max_response_tokens as usize);
     adaptive as u32
-}
-
-/// Detect provider-side context overflow errors in a robust way.
-fn is_context_overflow_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_lowercase();
-    msg.contains("exceed_context_size_error")
-        || msg.contains("exceeds the available context size")
-        || msg.contains("context size")
 }
 
 /// Info about a running subagent task (cheaply cloneable).
@@ -653,10 +657,8 @@ impl SubagentManager {
         // Find the task and subscribe to its result channel.
         let mut rx = {
             let tasks = self.running_tasks.lock().await;
-            let key = tasks.keys().find(|k| k.starts_with(task_id)).cloned();
-            match key {
-                Some(k) => {
-                    let (info, _, result_tx) = tasks.get(&k).unwrap();
+            match tasks.iter().find(|(k, _)| k.starts_with(task_id)) {
+                Some((k, (info, _, result_tx))) => {
                     // Check if already finished (JoinHandle done but not yet cleaned up).
                     debug!("Waiting for subagent {} ({})", info.label, k);
                     result_tx.subscribe()
@@ -1069,7 +1071,10 @@ impl SubagentManager {
                 .await
             {
                 Ok(r) => r,
-                Err(e) if local_ctx_limit.is_some() && is_context_overflow_error(&e) => {
+                Err(e)
+                    if local_ctx_limit.is_some()
+                        && crate::errors::is_context_overflow_error(&e) =>
+                {
                     let ctx_limit = local_ctx_limit.unwrap_or(tuning.local_fallback_context);
                     let retry_ctx = ((ctx_limit as f64) * 0.85).round() as usize;
                     let retry_ctx = retry_ctx.max(tuning.local_min_context);
@@ -1107,9 +1112,9 @@ impl SubagentManager {
                 Err(e) => return Err(e),
             };
 
-            if let Some(err_msg) = response.error_detail() {
-                error!("Subagent {} LLM provider error: {}", task_id, err_msg);
-                return Err(anyhow::anyhow!("[LLM Error] {}", err_msg));
+            if let Err(crate::errors::ProviderError::EmptyStream(detail)) = response.outcome() {
+                error!("Subagent {} LLM provider error: {}", task_id, detail);
+                return Err(anyhow::anyhow!("[LLM Error] {}", detail));
             }
 
             if crate::agent::tool_runner::process_tool_response(&response, &mut messages, &tools)
@@ -1385,7 +1390,7 @@ pub fn format_status_block(running: &[SubagentInfo], recent_completed: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::base::{LLMResponse, ToolCallRequest};
+    use crate::providers::base::{FinishReason, LLMResponse, ToolCallRequest};
     use async_trait::async_trait;
 
     #[test]
@@ -1509,9 +1514,9 @@ mod tests {
         );
         let e3 = anyhow::anyhow!("network timeout");
 
-        assert!(is_context_overflow_error(&e1));
-        assert!(is_context_overflow_error(&e2));
-        assert!(!is_context_overflow_error(&e3));
+        assert!(crate::errors::is_context_overflow_error(&e1));
+        assert!(crate::errors::is_context_overflow_error(&e2));
+        assert!(!crate::errors::is_context_overflow_error(&e3));
     }
 
     /// Mock provider that captures messages and returns a tool call on first
@@ -1557,7 +1562,7 @@ mod tests {
                             m
                         },
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: HashMap::new(),
                 })
             } else {
@@ -1565,7 +1570,7 @@ mod tests {
                 Ok(LLMResponse {
                     content: Some("Task complete.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 })
             }
@@ -1660,7 +1665,7 @@ mod tests {
                 Ok(LLMResponse {
                     content: Some("Immediate answer.".to_string()),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: HashMap::new(),
                 })
             }

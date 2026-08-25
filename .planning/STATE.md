@@ -3,36 +3,44 @@ gsd_state_version: 1.0
 milestone: v0.4
 milestone_name: milestone
 current_plan: 4
-status: "Phase 09 Wave 3 COMPLETE — 0 swappable().is_local reads remain in src/. Only Wave 4 (delete now-dead is_local/local_tool_mode fields + provenance_warning_role bool) remains. Branch has grown ~6 features beyond the refactor; priority is now LANDING — 208 commits ahead of main, none merged since 2026-03-15."
-last_updated: "2026-06-19T00:00:00.000Z"
-last_activity: 2026-06-19
+status: "Phase 09 COMPLETE (Waves 0–4). Turn replay shipped. Error protocol Phase 0–1 done, Phase 2 partial (18 tool files unmigrated + 4 legacy deletions + trait flip). cua tool shipped with vision injection. Branch is 60 ahead / 22 BEHIND a diverged main (merge-base d7a801c, 2026-08-02) — priority is LANDING via squash-merge. See PLAN.md."
+last_updated: "2026-08-25T00:00:00.000Z"
+last_activity: 2026-08-25
 progress:
   total_phases: 3
   completed_phases: 0
   total_plans: 5
-  completed_plans: 4
-  percent: 90
+  completed_plans: 5
+  percent: 95
 ---
 
 # State: nanobot
 
 ## Current Position
 
-Milestone v0.4.0 Lean Runtime Refactor — refactor essentially DONE; branch became a feature drop
-Phase: 09 (Runtime Mode Spine) — Waves 0–3 complete (Wave 4 field-deletion + summaries remain)
-Current Plan: 04 (final-proof)
-Total Plans in Phase: 5
-Status: Wave 3 complete in code (commits 3b83b0d, e7a3aef, 6a9cc8d) — `rg 'swappable().is_local' src/` = 0. Wave 4 (delete dead fields, let rustc prove zero readers) is the only remainder. Tech-debt Commits A/B/C also shipped (8d8b5f0, 878368e, etc.).
-Progress: [█████████░] 90%
-Last activity: 2026-06-19
-Build: green · Lib tests: 2057 passed / 0 failed (2026-06-19)
+Milestone v0.4 Lean Runtime Refactor — refactor DONE in code; branch is a feature drop awaiting landing
+Phase: 09 (Runtime Mode Spine) — COMPLETE, Waves 0–4
+Current Plan: see PLAN.md (root) — landing + post-landing protocol, all pending
+Status: Phase 09 Wave 4 shipped (`local_tool_mode` and `provenance_warning_role` deleted; zero
+`swappable().is_local` code reads — only `migrated from swappable().is_local` comments remain).
+Dead `parsers/` module deleted. Exact Turn Replay complete (PLAN.md items all done, including
+review fixes). Error protocol: Phase 0–1 done (`ToolResult = Result<ToolOutput, ToolError>` in
+`src/agent/tools/base.rs`; `execute_typed` migration seam live; `ToolError` used in 7 tool files);
+Phase 2 codemod partial — exact remainder below. `cua` tool shipped (screenshot + vision turn
+injection, `src/agent/tools/cua.rs`). Owed from June plan: `09-03/09-04-SUMMARY.md` never written;
+3-way smoke transcripts never captured.
+Progress: [█████████▌] 95%
+Last activity: 2026-08-25
+Build: last verified green · 2057 lib tests (2026-06-19) — re-verify at landing gate
 
 ## Project Reference
 
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** Personal AI substrate across any model backend with persistent, adaptive memory
-**Current focus:** Typed runtime boundaries (Phase 09) and smaller orchestration seams (Phase 10). In-process training and MLX/candle compute are no longer part of this tree — they live in `~/Dev/higgs` and are consumed via the Higgs sidecar.
+**Current focus:** landing the branch (squash onto main), then error-protocol Phases 2–4 and a
+fresh tech-debt audit. In-process training and MLX/candle compute are no longer part of this tree —
+they live in `~/Dev/higgs` and are consumed via the Higgs sidecar.
 
 ## Accumulated Context
 
@@ -53,52 +61,51 @@ See: .planning/PROJECT.md (updated 2026-03-21)
 - **LCM fix**: system prompt excluded from compaction threshold (bbaf7be)
 - **Two token counters**: `token_budget.rs` uses tiktoken (accurate), `filters.rs` uses chars/4 (drifts 60%) — carried to v0.5.0 as PERF-02
 - Streaming path has `llm_stream_started` with `ttfb_ms` but NO completion telemetry — carried to v0.5.0 as PERF-01
-- Phase 06 state-driven refactor audit identified `is_local` cascades as the best refactor leverage — this is now Phase 09's target
+- Phase 06 state-driven refactor audit identified `is_local` cascades as the best refactor leverage — delivered by Phase 09
 - v0.4.0 intentionally prioritizes seam extraction and behavior preservation over broad cleanup
 
-### Post-pivot hotspot sizes
+### Post-pivot hotspot sizes (re-measured 2026-08-25)
 
-- `agent_loop.rs` 845 LOC (Phase 10 target)
-- `agent_core.rs` 772 LOC (Phase 09 target)
-- `agent_shared.rs` 1,799 LOC (Phase 10 target)
-- `providers/mlx.rs` — **deleted** (was 1,833 LOC pre-pivot)
+- `agent_loop.rs` and `agent_shared.rs` no longer exist — split into `src/agent/agent_loop/` module
+  (20,204 LOC total: tests.rs 9,864 · shared.rs 5,946 · response.rs 1,643 · heuristics.rs 867 · mod.rs 747)
+- `agent_core.rs` 3,351 LOC (grew from 772; absorbed Wave-2/3 migration surface)
+- TUI moved `tui_app/` → `src/tui_app/` (3 files, 8,651 LOC; `app.rs` 6,709 — largest file in tree)
+- `providers/mlx.rs` — deleted (was 1,833 LOC pre-pivot)
 
-### Phase 09 progress (active)
+### Phase 09 (COMPLETE)
 
-- **Wave 0 (commits `5c4fa7d`, `4c7d652`, `dbd68f4`):** Inline unit tests pinning the 11 + 5 `is_local` branch reads in `agent_shared.rs` / `agent_heuristics.rs`, plus 2 `_cloud` fixture variants in `agent_loop_tests.rs` that rebalance the 8:2 local/cloud asymmetry to 8:4. SUMMARY at `.planning/phases/09-runtime-mode-spine/09-00-SUMMARY.md`.
-- **Wave 1 (commit `7d6d2d3`):** `RuntimeMode` enum + 9 derivation methods + 27 invariant tests in `src/agent/runtime_mode.rs`. Parallel-rollout foundation; zero production callsite migrated.
-- **Open decisions from Wave 1:**
-  - Plan text referenced `LocalProtocolMode`; real type is `LocalReplayMode`. Real name used throughout. Wave 2 can assume the existing enum.
-  - Plan text pointed `ModelCapabilities` at `config::schema`; real path is `agent::model_capabilities`. Real path used. Fixture builders construct the full struct (caps contain `thinking`, `needs_native_lms_api`, `strict_alternation`, `reader_tier`, `parser` fields the plan did not enumerate).
-  - Env-var tests serialise on a module-local `Mutex` — any future env-coupled test in this module should follow the same `lock_env_cleared()` pattern.
-- **Wave 2 (commits `46b6d61`, `83b086c`):** SwappableCore.mode field + `mode()` accessor added alongside `is_local`; 4 roadmap-named derivations migrated (context constructor, budget scaling, memory provider, reserve cap). `resolve_memory_provider` free function extracted (~50 lines out of build_swappable_core). `match mode` occurrences in agent_core.rs: 4. 10 new invariant tests (2110 lib tests passing, zero new warnings). Cloud smoke green; Higgs smoke deferred (no sidecar on this machine). SUMMARY at `.planning/phases/09-runtime-mode-spine/09-02-SUMMARY.md`.
-- **Open decisions from Wave 2:**
-  - Branch 5 (delegation provider) evaluated NOT APPLICABLE — tool-runner resolution is driven by `tool_delegation.enabled` + `delegation_provider.is_some()`, not `is_local`. Already RuntimeMode-agnostic.
-  - `context.local_prompt_mode = is_local` reader NOT migrated — Wave 3 scope.
-  - `is_local: bool` remains canonical on SwappableCore; both fields reconciled at construction via `debug_assert_eq!(matches!(mode, Local {..}), is_local)`. Wave 3 reader migration relies on this invariant.
-  - Higgs smoke transcript still owed — user must configure sidecar and re-run before Wave 4's "final proof" phase.
-- **Wave 3 DONE** (commits `3b83b0d`, `e7a3aef`, `6a9cc8d`): all ~33 downstream `is_local` readers migrated to `core.mode()` dispatch. `rg 'swappable().is_local' src/` returns 0. Note: `09-03-SUMMARY.md` was never written — owed (Day 2). The mandated 3-way smoke (Cloud + Higgs + cluster-remote) was also never captured — owed (Day 5).
-- **Wave 4 remaining:** delete `is_local: bool` + `local_tool_mode` from `SwappableCore` (still present at `agent_core.rs:63`), migrate `provenance_warning_role(is_local: bool)` at `agent_core.rs:374` to take `&RuntimeMode`. Single rustc-driven commit — compiler proves zero readers.
+- **Wave 0 (commits `5c4fa7d`, `4c7d652`, `dbd68f4`):** tests pinning the 11 + 5 `is_local` branch reads + 2 `_cloud` fixture variants. SUMMARY at `09-00-SUMMARY.md`.
+- **Wave 1 (commit `7d6d2d3`):** `RuntimeMode` enum + 9 derivation methods + 27 invariant tests in `src/agent/runtime_mode.rs`. Real type is `LocalReplayMode` (not plan-text `LocalProtocolMode`); `ModelCapabilities` lives at `agent::model_capabilities`. SUMMARY at `09-01-SUMMARY.md`.
+- **Wave 2 (commits `46b6d61`, `83b086c`):** SwappableCore.mode field + `mode()` accessor; 4 roadmap-named derivations migrated; `resolve_memory_provider` extracted. Branch 5 (delegation provider) N/A — driven by `tool_delegation.enabled`, not `is_local`. SUMMARY at `09-02-SUMMARY.md`.
+- **Wave 3 (commits `3b83b0d`, `e7a3aef`, `6a9cc8d`):** all ~33 downstream `is_local` readers migrated to `core.mode()` dispatch. `rg 'swappable().is_local' src/` = 0 code reads (20 `migrated from …` comments remain as breadcrumbs). SUMMARY `09-03-SUMMARY.md` never written — owed.
+- **Wave 4 (DONE):** `is_local: bool`, `local_tool_mode`, and `provenance_warning_role` deleted from src/; rustc proved zero readers. SUMMARY `09-04-SUMMARY.md` never written — owed.
+- Owed alongside: 3-way smoke transcripts (Cloud + Higgs + cluster-remote) never captured.
 
-## Reality reconciliation — 2026-06-19
+### Error protocol (Phase 0–1 done, Phase 2 partial)
 
-STATE.md had drifted ~2 months. Ground truth as of this session:
+- **Phase 0–1 shipped** (~commit `8b1c8f9` area): `pub type ToolResult = Result<ToolOutput, crate::errors::ToolError>` (`base.rs:173`); additive `execute_typed -> ToolResult` seam with `funnel_legacy` default (`base.rs:341`); `execute_with_result`/`execute_with_result_and_context` render into legacy `ToolExecutionResult`. `FinishReason` live in `src/providers/openai_compat.rs`.
+- **Phase 2 exact remainder (counted 2026-08-25):** trait methods `execute` and `execute_with_context` in `base.rs` still return `String`. 22 tool files still override `execute -> String`; of those, 4 (message, recall, remember, spawn) already override `execute_typed` and only need their legacy `execute` deleted at trait flip; 18 files need full migration. `code_execution.rs` and `registry.rs` construct `ToolError` without overriding `execute_typed`.
+- **Phases 3–4:** not started — finish AFTER squash per owner decision.
 
-- **The documented v0.4 refactor is essentially done.** Phase 09 Waves 0–3 complete; TECH_DEBT_AUDIT Commits A/B/C shipped (parsers/ deleted, dead-code sweep, truncation helpers consolidated). Only Wave 4 (cheap) + summaries remain.
-- **The branch outgrew its name.** `refactoring/maximum-speed-with-less-code` now also carries: full ratatui TUI rewrite (`tui_app/` ≈6.7k LOC), voice mode, trio/Apple-FM routing, Higgs sidecar integration, local grammar-constrained tool-calling (Tier 1/2), query-aware skills + lean context, tool observability, and (committed this session) native TUI session snapshot/resume/export + vision detection.
-- **Headline risk = unlanded value.** 208 commits ahead of main; main frozen at `4252a4f` (2026-03-15). Net −20k LOC. Build green, 2057 lib tests green → the branch is landable today.
-- **New code reintroduced gate debt:** `./quality-sentinel.sh` = 11 hits (3 G1 mutable bools, 8 G5 else-if chains), all in new `tui_app/` + `cmd_mutation`; `tui_app/app.rs` is 4,924 LOC (larger than any old refactor target).
+## Reality reconciliation — 2026-08-25
 
-### Week plan (set 2026-06-19)
-- **Day 1 [DONE]:** committed WIP feature (`bc62b77`), GitNexus doc refresh (`41bec80`), ignored tooling cruft, moved scratch/SESSION_RESULTS into `.planning/`, this STATE rewrite.
-- **Day 2:** Phase 09 Wave 4 (delete dead fields) + write `09-03/09-04-SUMMARY.md`.
-- **Day 3:** clear the 11 sentinel violations; carve natural seams out of `app.rs` (no full SRP rewrite).
-- **Day 4:** LAND IT — merge strategy decision (rec: squash-drop whole branch vs stack-split), rebase onto main, full suite + release build.
-- **Day 5:** 3-way smoke (Cloud + Higgs + cluster-remote) with transcripts; refresh GitNexus index; buffer.
-- **Deferred (post-merge):** tech-debt D/E/F (require_str, SSE dedup, chat_stream extraction); v0.5.0 self-evolving-harness (blocked on v0.4 landing).
+- **Branch topology changed since June.** Not "208 commits ahead of a frozen main". Now: 60 commits
+  ahead, 22 BEHIND — main advanced to `c6103a2` (2026-08-02, delegated-tool invariants, lease
+  accounting, replay verification); merge-base is `d7a801c` (2026-08-02). Squash-merge must
+  reconcile those 22 main-side commits; it is not a fast-forward.
+- **Everything hard from the June plan happened.** Phase 09 Wave 4 shipped; parsers/ deleted; Exact
+  Turn Replay shipped with review fixes (durable compaction on journal failure, fail-soft aux
+  lanes, `StreamCancelGuard`, single-query artifact verification, real delegated timings); cua
+  tool shipped with vision-capable screenshot injection.
+- **Turn bench never ran** — local inference server down. Plan: bench against a reachable cloud
+  provider first; restore the local server only if a regression shows.
+- **June week-plan superseded** by PLAN.md (root): squash-merge first, error-protocol Phases 2–4
+  after, tech-debt audit re-run, cloud turn bench.
+- **GitNexus-index numbers from the 2026-06-19 note (gate hits, LOC) are stale**; re-run
+  `quality-sentinel.sh` and the audit fresh rather than trusting old counts.
 
 ### v0.5.0 readiness
 
 - Plan drafted at `.planning/self-evolving-harness-plan.md` (11 S-phases, 2026-04-20).
-- Dependencies on v0.4: S01 + S02 need Phase 09's runtime descriptor; S04 benefits from Phase 10's event extraction.
-- Do not start S-phases until v0.4.0 completes.
+- Dependencies on v0.4: S01 + S02 need Phase 09's runtime descriptor (now shipped); S04 benefits from Phase 10's event extraction.
+- Do not start S-phases until v0.4.0 lands.

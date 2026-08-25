@@ -94,6 +94,7 @@ def _rpc_call(tool_name, **kwargs):
 ///
 /// The listener is set to non-blocking mode with a 100 ms accept loop so the
 /// server can notice the stop signal promptly after the child process exits.
+#[allow(clippy::expect_used)] // Runtime::new in a spawn_blocking context without an ambient runtime
 fn run_rpc_server(
     listener: UnixListener,
     registry: Arc<ToolRegistry>,
@@ -158,10 +159,20 @@ fn run_rpc_server(
                                     .block_on(registry.execute(&tool_name, params)),
                             };
 
-                            if result.ok {
-                                json!({"result": result.data})
+                            if result.ok() {
+                                json!({"result": result.data()})
                             } else {
-                                json!({"error": result.error.unwrap_or(result.data)})
+                                // Wire-format note (error-protocol phase 2): since tools
+                                // return `ToolResult`, the `error` field here carries the
+                                // *typed* `ToolError` Display string (e.g. "Execution
+                                // failed: ..."), not the legacy pre-formatted "Error: ..."
+                                // message. The model-visible `Error: ...` string still
+                                // travels in `data` via `ToolError::render()`, so the
+                                // external RPC contract for `data`/`result` is unchanged;
+                                // only the `error` detail field switched to the typed
+                                // Display form. Keep it that way — `from_output` /
+                                // `classify_tool_error` no longer parse this channel.
+                                json!({"error": result.error().unwrap_or_else(|| result.data())})
                             }
                         }
                     }

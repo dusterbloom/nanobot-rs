@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated
+)]
 //! Web tools: web_search and web_fetch.
 
 use std::collections::HashMap;
@@ -9,7 +20,7 @@ use reqwest::Client;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::base::{require_str, PermissionLevel, Tool, ToolConcurrency, ToolExecutionContext};
+use super::base::{require_str, PermissionLevel, Tool, ToolConcurrency, ToolContext};
 use crate::agent::audit::ToolEvent;
 
 /// Shared user-agent string.
@@ -24,8 +35,11 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 // Static regexes (compiled once)
 // ---------------------------------------------------------------------------
-static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").unwrap());
-static RE_NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").expect("static regex"));
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_NEWLINES: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n{3,}").expect("static regex"));
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -284,13 +298,13 @@ impl Tool for WebSearchTool {
     async fn execute_with_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> String {
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
-        let _ = ctx.event_tx.send(ToolEvent::Progress {
+        let _ = ctx.emit(ToolEvent::Progress {
             tool_name: "web_search".to_string(),
-            tool_call_id: ctx.tool_call_id.clone(),
+            tool_call_id: ctx.call_id().to_string(),
             elapsed_ms: 0,
             output_preview: Some(format!("Searching: {}", query)),
         });
@@ -784,22 +798,22 @@ impl Tool for WebFetchTool {
     async fn execute_with_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> String {
         let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("");
 
-        let _ = ctx.event_tx.send(ToolEvent::Progress {
+        let _ = ctx.emit(ToolEvent::Progress {
             tool_name: "web_fetch".to_string(),
-            tool_call_id: ctx.tool_call_id.clone(),
+            tool_call_id: ctx.call_id().to_string(),
             elapsed_ms: 0,
             output_preview: Some(format!("Fetching: {}", url)),
         });
 
         let result = self.execute(params).await;
 
-        let _ = ctx.event_tx.send(ToolEvent::Progress {
+        let _ = ctx.emit(ToolEvent::Progress {
             tool_name: "web_fetch".to_string(),
-            tool_call_id: ctx.tool_call_id.clone(),
+            tool_call_id: ctx.call_id().to_string(),
             elapsed_ms: 0,
             output_preview: Some("Extracting content...".to_string()),
         });
@@ -826,12 +840,15 @@ fn extract_html_content(html: &str, mode: &str) -> String {
 /// images are dropped, links keep only their text. Pages like news front
 /// pages are mostly link targets by byte count.
 fn flatten_markdown_noise(text: &str) -> String {
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static RE_IMAGE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
+        LazyLock::new(|| Regex::new(r"!\[[^\]]*\]\([^)]*\)").expect("static regex"));
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static RE_LINK: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap());
+        LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\([^)]*\)").expect("static regex"));
+    #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
     static RE_MD_ESCAPE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\\([\\`*_{}\[\]()#+.!|-])").unwrap());
+        LazyLock::new(|| Regex::new(r"\\([\\`*_{}\[\]()#+.!|-])").expect("static regex"));
     let text = RE_IMAGE.replace_all(text, "");
     let text = RE_LINK.replace_all(&text, "$1");
     let text = RE_MD_ESCAPE.replace_all(&text, "$1");
@@ -1652,7 +1669,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     #[tokio::test]
     async fn test_web_search_emits_start_progress_event() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = WebSearchTool::new(
             Some(String::new()),
@@ -1663,11 +1680,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_search".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_search".to_string());
 
         let mut params = HashMap::new();
         params.insert(
@@ -1700,17 +1713,13 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     #[tokio::test]
     async fn test_web_fetch_emits_fetch_and_extract_progress_events() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = WebFetchTool::new(50000);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_fetch".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_fetch".to_string());
 
         let mut params = HashMap::new();
         params.insert(
@@ -1744,17 +1753,13 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     #[tokio::test]
     async fn test_web_fetch_emits_extracting_progress_after_fetch() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let tool = WebFetchTool::new(50000);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_fetch2".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_fetch2".to_string());
 
         let mut params = HashMap::new();
         params.insert(

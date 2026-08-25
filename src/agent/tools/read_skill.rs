@@ -33,8 +33,8 @@ impl Tool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Read a skill's full instructions by name. Call with no name (or empty) \
-         to list all available skills with their descriptions."
+        "List available skills (call with no arguments) or read a skill's full instructions by name. \
+         Always call this first to discover what skills are installed before trying to use a skill."
     }
 
     fn concurrency(&self) -> ToolConcurrency {
@@ -47,7 +47,7 @@ impl Tool for ReadSkillTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "The skill name (as shown in the skills list). Omit to list all skills."
+                    "description": "Skill name to read (e.g. webradio, newsreader). Omit this field entirely to list all installed skills."
                 }
             },
         })

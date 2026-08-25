@@ -1,6 +1,21 @@
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::format_push_string,
+    clippy::string_add
+)]
+
 //! Pure trio config helpers (testable without ReplContext).
 
-/// Enable trio mode on a Config. Returns `true` if router/specialist are missing (needs warning).
 pub(crate) fn trio_enable(cfg: &mut crate::config::schema::Config) -> bool {
     use crate::config::schema::DelegationMode;
 

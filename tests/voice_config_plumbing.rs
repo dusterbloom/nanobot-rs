@@ -1,3 +1,25 @@
+// Test crate — sanctioned escape hatch (research doc §3.6): integration tests
+// keep pragmatic unwraps without blocking the production deny regime.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::string_add,
+    clippy::format_push_string,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::pedantic,
+    clippy::nursery
+)]
 //! Verify that VoiceConfig.tts_voice and VoiceConfig.language reach the
 //! TTS engine via with_voice_config().
 //!

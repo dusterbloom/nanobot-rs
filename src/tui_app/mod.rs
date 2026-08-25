@@ -18,6 +18,26 @@
 //! input reader (freeing stdin), runs the real `ReplContext::dispatch`, then
 //! re-enters and redraws.
 
+// Interactive/app boundary (error-protocol layer 3 backlog): printing IS the
+// product here (REPL/TUI/CLI), and the thin glue code keeps pragmatic
+// unwraps on always-set state (rl, runtime, static regexes). The deny regime
+// in Cargo.toml stays live for the core; this module lands on the regime
+// when its backlog is migrated.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::format_push_string,
+    clippy::string_add
+)]
 mod app;
 mod render;
 
@@ -60,9 +80,30 @@ struct Session<'a> {
 
 /// Result of one streaming assistant turn.
 struct TurnOutcome {
-    #[cfg(feature = "voice")]
+    #[cfg(any(feature = "voice", test))]
     reply: String,
     queued_turn: Option<SubmittedTurn>,
+    quit: bool,
+}
+
+enum TurnFinalization {
+    Completed,
+    Cancelled,
+}
+
+#[cfg(any(feature = "voice", test))]
+enum VoiceCycleControl {
+    Continue,
+    Quit,
+}
+
+#[cfg(any(feature = "voice", test))]
+const fn voice_cycle_control(outcome: &TurnOutcome) -> VoiceCycleControl {
+    if outcome.quit {
+        VoiceCycleControl::Quit
+    } else {
+        VoiceCycleControl::Continue
+    }
 }
 
 /// Restores terminal modes on drop, including on panic. `ratatui::init`'s panic
@@ -301,16 +342,23 @@ async fn event_loop(
                             turn.media.clear();
                         }
                     }
-                    queued = run_turn(terminal, app, &session, &turn, "cli", ev_rx)
-                        .await?
-                        .queued_turn;
+                    let outcome = run_turn(terminal, app, &session, &turn, "cli", ev_rx).await?;
+                    if outcome.quit {
+                        break 'ui;
+                    }
+                    queued = outcome.queued_turn;
                     save_current_snapshot(app, ctx).await;
                 }
             }
             Action::Record => {
                 #[cfg(feature = "voice")]
                 {
-                    voice_cycle(terminal, app, ctx, ev_rx, paused).await?;
+                    if matches!(
+                        voice_cycle(terminal, app, ctx, ev_rx, paused).await?,
+                        VoiceCycleControl::Quit
+                    ) {
+                        break 'ui;
+                    }
                     save_current_snapshot(app, ctx).await;
                 }
             }
@@ -821,7 +869,7 @@ async fn voice_cycle(
     ctx: &mut ReplContext,
     ev_rx: &mut UnboundedReceiver<Event>,
     paused: &Arc<AtomicBool>,
-) -> std::io::Result<()> {
+) -> std::io::Result<VoiceCycleControl> {
     loop {
         // --- record (inline, no screen switch) ---
         app.set_recording(true);
@@ -843,13 +891,13 @@ async fn voice_cycle(
             Some(Ok(Some(t))) => t,
             Some(Ok(None)) => {
                 app.push_note("(no speech detected)".into());
-                return Ok(());
+                return Ok(VoiceCycleControl::Continue);
             }
             Some(Err(e)) => {
                 app.push_note(format!("voice error: {e}"));
-                return Ok(());
+                return Ok(VoiceCycleControl::Continue);
             }
-            None => return Ok(()),
+            None => return Ok(VoiceCycleControl::Continue),
         };
 
         // --- reply ---
@@ -872,10 +920,13 @@ async fn voice_cycle(
                 ev_rx,
             )
             .await?;
+            if matches!(voice_cycle_control(&outcome), VoiceCycleControl::Quit) {
+                return Ok(VoiceCycleControl::Quit);
+            }
             outcome.reply
         };
         if reply.trim().is_empty() {
-            return Ok(());
+            return Ok(VoiceCycleControl::Continue);
         }
 
         // --- speak, interruptible: Enter / Ctrl+Space drops TTS instantly ---
@@ -884,7 +935,7 @@ async fn voice_cycle(
         terminal.draw(|f| app.draw(f, &footer))?;
         let interrupted = {
             let Some(vs) = ctx.voice_session.as_mut() else {
-                return Ok(());
+                return Ok(VoiceCycleControl::Continue);
             };
             vs.clear_cancel();
             let cancel = vs.cancel_flag();
@@ -904,7 +955,7 @@ async fn voice_cycle(
 
         // Barge-in: if the user interrupted, record again immediately.
         if !interrupted {
-            return Ok(());
+            return Ok(VoiceCycleControl::Continue);
         }
     }
 }
@@ -956,6 +1007,9 @@ async fn run_turn(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut queued_turn = None;
+    let mut cancel_requested = false;
+    let mut quit = false;
+    let mut finalization = TurnFinalization::Completed;
     let response = loop {
         refresh_background_jobs(app, session.agent).await;
         let footer = footer_snapshot(session.core);
@@ -965,8 +1019,27 @@ async fn run_turn(
             Some(ev) = ev_rx.recv() => {
                 match app.on_streaming_event(ev) {
                     StreamingAction::Continue => {}
-                    StreamingAction::Cancel => stream.cancel(),
+                    StreamingAction::Cancel => {
+                        finalization = TurnFinalization::Cancelled;
+                        stream.cancel();
+                    }
+                    StreamingAction::CancelOrQuit => {
+                        finalization = TurnFinalization::Cancelled;
+                        if cancel_requested {
+                            stream.abort();
+                            quit = true;
+                        } else {
+                            cancel_requested = true;
+                            stream.cancel();
+                        }
+                    }
+                    StreamingAction::Quit => {
+                        finalization = TurnFinalization::Cancelled;
+                        stream.abort();
+                        quit = true;
+                    }
                     StreamingAction::CancelAndSubmit(turn) => {
+                        finalization = TurnFinalization::Cancelled;
                         queued_turn = Some(turn);
                         stream.cancel();
                     }
@@ -981,16 +1054,31 @@ async fn run_turn(
         }
     };
 
-    #[cfg(feature = "voice")]
-    let reply = response.clone();
-    app.finish_turn(response);
+    let reply = finalize_turn(app, response, finalization);
+    #[cfg(not(any(feature = "voice", test)))]
+    drop(reply);
     let footer = footer_snapshot(session.core);
     terminal.draw(|f| app.draw(f, &footer))?;
     Ok(TurnOutcome {
-        #[cfg(feature = "voice")]
+        #[cfg(any(feature = "voice", test))]
         reply,
         queued_turn,
+        quit,
     })
+}
+
+fn finalize_turn(app: &mut App, response: String, finalization: TurnFinalization) -> String {
+    match finalization {
+        TurnFinalization::Completed => {
+            let reply = response.clone();
+            app.finish_turn(response);
+            reply
+        }
+        TurnFinalization::Cancelled => {
+            app.cancel_turn();
+            String::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -998,6 +1086,77 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn voice_turn_control_propagates_quit_to_event_loop() {
+        let continuing = TurnOutcome {
+            reply: String::new(),
+            queued_turn: None,
+            quit: false,
+        };
+        let quitting = TurnOutcome {
+            reply: String::new(),
+            queued_turn: None,
+            quit: true,
+        };
+
+        assert!(matches!(
+            voice_cycle_control(&continuing),
+            VoiceCycleControl::Continue
+        ));
+        assert!(matches!(
+            voice_cycle_control(&quitting),
+            VoiceCycleControl::Quit
+        ));
+    }
+
+    #[test]
+    fn run_turn_finalization_routes_only_cancelled_outcomes_to_discard() {
+        let footer = Footer {
+            cwd: "~".into(),
+            model: "local:test".into(),
+            ctx_used: 0,
+            ctx_max: 4096,
+        };
+
+        let mut cancelled = App::new();
+        cancelled.begin_turn("cancelled question");
+        cancelled.on_delta("partial streamed answer");
+        let cancelled_reply = finalize_turn(
+            &mut cancelled,
+            "partial full response".to_string(),
+            TurnFinalization::Cancelled,
+        );
+        let mut cancelled_term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        cancelled_term
+            .draw(|frame| cancelled.draw(frame, &footer))
+            .unwrap();
+        let cancelled_text = buffer_text(cancelled_term.backend().buffer());
+        let cancelled_outcome = TurnOutcome {
+            reply: cancelled_reply,
+            queued_turn: None,
+            quit: false,
+        };
+        assert!(cancelled_outcome.reply.is_empty());
+        assert!(cancelled_text.contains("cancelled question"));
+        assert!(!cancelled_text.contains("partial streamed answer"));
+        assert!(!cancelled_text.contains("partial full response"));
+
+        let mut completed = App::new();
+        completed.begin_turn("completed question");
+        let completed_reply = finalize_turn(
+            &mut completed,
+            "complete non-streaming answer".to_string(),
+            TurnFinalization::Completed,
+        );
+        let mut completed_term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        completed_term
+            .draw(|frame| completed.draw(frame, &footer))
+            .unwrap();
+        let completed_text = buffer_text(completed_term.backend().buffer());
+        assert_eq!(completed_reply, "complete non-streaming answer");
+        assert!(completed_text.contains("complete non-streaming answer"));
+    }
 
     #[test]
     fn tui_defaults_on_for_ttys_and_env_overrides_both_ways() {

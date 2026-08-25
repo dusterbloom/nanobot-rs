@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::indexing_slicing, clippy::shadow_reuse)]
 #![allow(dead_code)]
 //! Tool registry for dynamic tool management.
 
@@ -8,17 +14,17 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::warn;
 
-use super::base::{
-    PermissionLevel, Tool, ToolConcurrency, ToolExecutionContext, ToolExecutionResult,
-};
+use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolExecutionResult};
 use super::filesystem::MAX_WRITE_FILE_PIECE_CHARS;
 use super::{
-    ApplyPatchTool, BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, FileInfoTool,
+    ApplyPatchTool, BrowserTool, CodeExecutionTool, CuaTool, EditFileTool, ExecTool, FileInfoTool,
     FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool,
     RememberTool, SearchFilesTool, SystemInfoTool, ToolStatusTool, WebFetchTool, WebSearchTool,
     WorkspaceDiffTool, WriteFileTool,
 };
 use crate::config::schema::CodeExecutionConfig;
+#[cfg(feature = "python-kernel")]
+use crate::config::schema::PythonKernelConfig;
 
 /// Configuration for building a standard tool registry.
 ///
@@ -49,6 +55,11 @@ pub struct ToolConfig {
     pub db_path: Option<PathBuf>,
     /// Code execution tool config. Disabled by default.
     pub code_execution: CodeExecutionConfig,
+    /// Stateful Python kernel tool config. Feature: `python-kernel`.
+    #[cfg(feature = "python-kernel")]
+    pub python_kernel: PythonKernelConfig,
+    /// Cua driver (local desktop computer-use) tool settings.
+    pub cua: crate::config::schema::CuaToolConfig,
     /// Optional health-registry handle. When set, the web_search tool checks
     /// the "searxng" probe before calling SearXNG and returns a clear
     /// "degraded, restart the container" message instead of silent zero results.
@@ -73,6 +84,9 @@ impl ToolConfig {
             search_max_results: 5,
             db_path: None,
             code_execution: CodeExecutionConfig::default(),
+            #[cfg(feature = "python-kernel")]
+            python_kernel: PythonKernelConfig::default(),
+            cua: crate::config::schema::CuaToolConfig::default(),
             health_registry: None,
         }
     }
@@ -87,6 +101,10 @@ pub struct ToolRegistry {
     max_permission: PermissionLevel,
     /// Optional hook scripts that run before/after tool calls.
     hooks: Option<crate::config::schema::HooksConfig>,
+    /// Typed host bridge injected at the registry boundary (research §3.5).
+    /// `None` in sandboxed registries (scripts, tests) — tools that require
+    /// the host fail with a typed `ToolError::Execution`.
+    host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
 }
 
 /// Fully decoded meaning of the compact `tool` proxy envelope.
@@ -257,6 +275,7 @@ impl ToolRegistry {
             tools: HashMap::new(),
             max_permission: PermissionLevel::System,
             hooks: None,
+            host: None,
         }
     }
 
@@ -269,12 +288,24 @@ impl ToolRegistry {
             tools: HashMap::new(),
             max_permission: max,
             hooks: None,
+            host: None,
         }
     }
 
     /// Set the maximum permission level for this registry.
     pub fn set_max_permission(&mut self, max: PermissionLevel) {
         self.max_permission = max;
+    }
+
+    /// Inject the typed host bridge (spawn/pipeline/loop/message). Builder
+    /// style so the registry stays immutable after construction; the single
+    /// production injection point is `tool_wiring::build_tools`.
+    pub fn with_host(
+        mut self,
+        host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
+    ) -> Self {
+        self.host = host;
+        self
     }
 
     /// Configure hook scripts that run before/after tool calls.
@@ -379,6 +410,13 @@ impl ToolRegistry {
         if should_include("browser") {
             self.register(Box::new(BrowserTool::new(config.max_tool_result_chars)));
         }
+        if should_include("cua") && config.cua.enabled {
+            self.register(Box::new(CuaTool::new(
+                &config.cua,
+                &config.workspace,
+                config.exec_timeout,
+            )));
+        }
         if should_include("recall") {
             // recall is the unified retrieval tool: it absorbs the dissolved
             // session_search + search_context. Attach the sessions database so
@@ -409,6 +447,12 @@ impl ToolRegistry {
                 config.code_execution.max_tool_calls,
                 available_tools,
                 None, // No nested tool_config — scripts get a stub-only registry.
+            )));
+        }
+        #[cfg(feature = "python-kernel")]
+        if config.python_kernel.enabled && should_include("python") {
+            self.register(Box::new(crate::agent::tools::PythonKernel::new(
+                config.python_kernel.timeout,
             )));
         }
     }
@@ -597,12 +641,12 @@ impl ToolRegistry {
             crate::agent::hooks::HookPhase::PostToolUse,
             name,
             params,
-            Some((&result.data, result.ok)),
+            Some((result.data(), result.ok())),
         )
         .await;
     }
 
-    /// Execute a tool by name with a [`ToolExecutionContext`] for progress
+    /// Execute a tool by name with a [`ToolContext`] for progress
     /// reporting and cancellation support.
     ///
     /// Same as [`Self::execute`] but passes the context through to the tool.
@@ -610,7 +654,7 @@ impl ToolRegistry {
         &self,
         name: &str,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> ToolExecutionResult {
         // Proxy intercept: "get_tools" (alias "tool") is the meta-tool, not a registered tool.
         if name == "get_tools" || name == "tool" {
@@ -626,11 +670,27 @@ impl ToolRegistry {
         &self,
         name: &str,
         params: HashMap<String, serde_json::Value>,
-        ctx: Option<&ToolExecutionContext>,
+        ctx: Option<&ToolContext>,
     ) -> ToolExecutionResult {
         let (name, params) = match Self::normalize_tool_request(name, params) {
             Ok(v) => v,
             Err(e) => return ToolExecutionResult::failure(e),
+        };
+        // The registry is the single ToolContext builder (research §3.5):
+        // the host is injected here, once, at the boundary. A caller-supplied
+        // context (streaming tools) keeps its event/cancel/call_id parts;
+        // sandboxed callers get a fresh default context.
+        let ctx = match ctx {
+            Some(c) => c.clone().with_host(self.host.clone()),
+            None => {
+                let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                ToolContext::new(
+                    self.host.clone(),
+                    event_tx,
+                    tokio_util::sync::CancellationToken::new(),
+                    String::new(),
+                )
+            }
         };
 
         let tool = match self.tools.get(&name) {
@@ -639,6 +699,9 @@ impl ToolRegistry {
                 return ToolExecutionResult::failure(format!("Tool '{}' not found", name));
             }
         };
+        if !tool.is_available() {
+            return ToolExecutionResult::failure(format!("Tool '{}' is unavailable", name));
+        }
 
         if tool.permission() > self.max_permission {
             return ToolExecutionResult::failure(format!(
@@ -653,18 +716,10 @@ impl ToolRegistry {
             return blocked;
         }
 
-        let unwound = match ctx {
-            Some(ctx) => {
-                let fut = std::panic::AssertUnwindSafe(
-                    tool.execute_with_result_and_context(params.clone(), ctx),
-                );
-                futures_util::FutureExt::catch_unwind(fut).await
-            }
-            None => {
-                let fut = std::panic::AssertUnwindSafe(tool.execute_with_result(params.clone()));
-                futures_util::FutureExt::catch_unwind(fut).await
-            }
-        };
+        let unwound = std::panic::AssertUnwindSafe(
+            tool.execute_with_result_and_context(params.clone(), &ctx),
+        );
+        let unwound = futures_util::FutureExt::catch_unwind(unwound).await;
         let mut result = match unwound {
             Ok(result) => result,
             Err(_) => {
@@ -683,19 +738,23 @@ impl ToolRegistry {
         // legacy tools whose error string still contains "is required" (e.g.
         // recall's "'query' parameter is required") keep getting a
         // schema-derived example until they migrate to the structured path.
-        if !result.ok {
-            let example = match &result.error_kind {
+        if !result.ok() {
+            let example = match result.error_kind() {
                 Some(crate::errors::ToolErrorKind::MissingArg { example, .. }) => {
                     Some(example.clone())
                 }
-                _ if result.data.contains("is required") => {
+                _ if result.data().contains("is required") => {
                     Self::worked_example_call(&name, &tool.parameters())
                 }
                 _ => None,
             };
             if let Some(example) = example {
-                let base = result.data.trim_end_matches('.');
-                result.data = format!("{}. Call as {}.", base, example);
+                // Migrated tools render the example into the wire string
+                // already (`ToolError::MissingArg::render` ends with
+                // "call as {example}"); appending again would double it.
+                if !result.data().contains(example.as_str()) {
+                    result.append_worked_example(&example);
+                }
             }
         }
 
@@ -722,15 +781,11 @@ impl ToolRegistry {
         "web_search",
         "web_fetch",
         "message",
-        "recall_tool_result",
-        // Bounded retrieval over stashed results (search/slice without loading
-        // the full body). See stash_search.rs.
-        "search_tool_result",
-        "slice_tool_result",
+        "inspect_tool_result",
         "todo",
         // The system prompt instructs the model to expand LCM summaries; the
         // schema must be advertised or local models fall back to guessing
-        // (observed: recall_tool_result with invented ids).
+        // (observed: legacy result retrieval with invented ids).
         "lcm_expand",
         // Memory tools: medium local models (e.g. Qwen3.6-35B-A3M) fail to route
         // through the `tool` proxy meta-tool reliably, so they get dedicated
@@ -739,7 +794,7 @@ impl ToolRegistry {
         "remember",
     ];
 
-    /// Hot tools advertised as native schemas at turn 1. Kept to the 5 the
+    /// Hot tools advertised as native schemas at turn 1. Kept to the 6 the
     /// model uses every turn — the rest go through the `tool` proxy to keep
     /// the tool-schema prefix small (~670 tok vs ~2000 tok for 14 native).
     /// `get_skills` is native (not proxied) so the model reads skill content
@@ -753,6 +808,7 @@ impl ToolRegistry {
         "write_file",
         "exec",
         "get_skills",
+        "inspect_tool_result",
     ];
 
     /// Tools kept registered and reachable via the `get_tools` proxy (call with
@@ -760,6 +816,10 @@ impl ToolRegistry {
     /// save cold-prefill tokens. Empirically 0 invocations across 17 days of
     /// sessions and peripheral to the hot path. `remember` and `lcm_expand` are
     /// intentionally NOT here (core to memory formation / LCM expansion).
+    ///
+    /// Result inspection is native because `TOOL_RESULT_HANDLE v1` receipts
+    /// point directly at it; a local model should never need a proxy round-trip
+    /// to recover a narrow slice of prior evidence.
     const RARELY_ADVERTISED_TOOLS: &'static [&'static str] = &[
         "file_preview",
         "file_info",
@@ -767,9 +827,6 @@ impl ToolRegistry {
         "system_info",
         "tool_status",
         "browser",
-        "recall_tool_result",
-        "search_tool_result",
-        "slice_tool_result",
     ];
 
     /// Internal Lean-catalog builder: condense every available schema before
@@ -873,9 +930,13 @@ impl ToolRegistry {
         // a proxy round-trip.
         const KEEP_PARAM_DESCRIPTIONS: &[&str] = &[
             "read_file",
+            "edit_file",
+            "write_file",
+            "exec",
             "get_skills",
             "recall",
             "remember",
+            "inspect_tool_result",
         ];
         for def in &mut defs {
             Self::remove_local_hot_model_hazards(def);
@@ -1031,7 +1092,11 @@ impl ToolRegistry {
             .filter(|t| t.is_available())
             .map(|t| Self::tool_hint(t.as_ref()))
             .filter(|h| !exclude.iter().any(|e| h.starts_with(e)))
-            .filter(|h| !Self::RARELY_ADVERTISED_TOOLS.iter().any(|r| h.starts_with(r)))
+            .filter(|h| {
+                !Self::RARELY_ADVERTISED_TOOLS
+                    .iter()
+                    .any(|r| h.starts_with(r))
+            })
             .collect();
         hints.sort();
 
@@ -1067,8 +1132,8 @@ impl ToolRegistry {
                         // 20260727_173522_263450) showed this 3× in a row.
                         // Back-compat: the dispatcher still accepts the
                         // legacy `name`/`args` keys for in-flight sessions.
-                        "tool_name": { "type": "string", "description": "Name of the tool to invoke (omit to list all available tools)" },
-                        "tool_args": { "type": "object", "description": "Arguments object for the tool named above (omit to inspect its schema)" }
+                        "tool_name": { "type": "string", "description": "Tool name to call (e.g. exec, webradio, newsreader). Omit to list all tools." },
+                        "tool_args": { "type": "object", "description": "Arguments for the tool (e.g. {\"command\":\"webradio play jazz\"}). Omit to inspect schema." }
                     }
                 }
             }
@@ -1260,7 +1325,7 @@ impl ToolRegistry {
     async fn execute_proxy(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: Option<&ToolExecutionContext>,
+        ctx: Option<&ToolContext>,
     ) -> ToolExecutionResult {
         match self.resolve_proxy_call(&params) {
             ProxyCall::Catalog | ProxyCall::MissingSelector => self.missing_name_result(&params),
@@ -1348,21 +1413,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
-    fn register_test_result_recall(registry: &mut ToolRegistry, db_path: std::path::PathBuf) {
-        registry.register(Box::new(
-            crate::agent::tools::recall_tool_result::RecallToolResultTool::with_db(
-                db_path.clone(),
-                "test-session".to_string(),
-            ),
-        ));
+    fn register_test_result_inspector(registry: &mut ToolRegistry, db_path: std::path::PathBuf) {
         registry.register(Box::new(
             crate::agent::tools::stash_search::SearchToolResultTool::with_db(
-                db_path.clone(),
-                "test-session".to_string(),
-            ),
-        ));
-        registry.register(Box::new(
-            crate::agent::tools::stash_search::SliceToolResultTool::with_db(
                 db_path,
                 "test-session".to_string(),
             ),
@@ -1380,7 +1433,7 @@ mod tests {
         let mut config = ToolConfig::new(ws.path());
         config.db_path = Some(ws.path().join("sessions.db"));
         let mut reg = ToolRegistry::with_standard_tools(&config);
-        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
         let count = reg.get_local_definitions().len();
         let full = TokenBudget::estimate_tool_def_tokens(&reg.get_definitions());
         let local = TokenBudget::estimate_tool_def_tokens(&reg.get_local_definitions());
@@ -1426,18 +1479,18 @@ mod tests {
         let mut config = ToolConfig::new(ws.path());
         config.db_path = Some(ws.path().join("sessions.db"));
         let mut reg = ToolRegistry::with_standard_tools(&config);
-        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
         reg.register(Box::new(crate::agent::tools::TodoTool::new(ws.path())));
         let defs = reg.get_core_plus_proxy_definitions();
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        // 5 hot native tools + 1 proxy = 6 total.
+        // 6 hot native tools + 1 proxy = 7 total.
         assert_eq!(
             names.len(),
-            6,
-            "core+proxy must be 5 native + 1 proxy, got {names:?}"
+            7,
+            "core+proxy must expose the bounded inspection tool directly, got {names:?}"
         );
         assert!(names.contains(&"get_tools"), "missing proxy: {names:?}");
         for expected in [
@@ -1446,6 +1499,7 @@ mod tests {
             "write_file",
             "exec",
             "get_skills",
+            "inspect_tool_result",
         ] {
             assert!(
                 names.contains(&expected),
@@ -1467,7 +1521,10 @@ mod tests {
             .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("get_tools"))
             .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
             .unwrap_or("");
-        assert!(proxy_desc.contains("Omit tool_name to list"), "{proxy_desc}");
+        assert!(
+            proxy_desc.contains("Omit tool_name to list"),
+            "{proxy_desc}"
+        );
         assert!(proxy_desc.contains("read_file"), "{proxy_desc}");
         assert!(proxy_desc.contains("todo"), "{proxy_desc}");
         assert!(proxy_desc.contains("validate"), "{proxy_desc}");
@@ -1477,7 +1534,7 @@ mod tests {
     fn test_artifact_core_plus_proxy_surface_matches_core_for_prefix_stability() {
         let ws = tempfile::tempdir().unwrap();
         let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
-        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
         let core_defs = reg.get_core_plus_proxy_definitions();
         let defs = reg.get_artifact_core_plus_proxy_definitions();
         // Both surfaces are pure-proxy; they must be byte-identical so the chat
@@ -1510,13 +1567,17 @@ mod tests {
     fn test_lean_definitions_surface() {
         let ws = tempfile::tempdir().unwrap();
         let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
-        register_test_result_recall(&mut reg, ws.path().join("sessions.db"));
+        register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
         let lean = reg.get_lean_definitions();
 
         // Lazy-load contract: exactly ONE tool advertised at turn 1.
         assert_eq!(lean.len(), 1, "lean surface must be the single proxy tool");
         let name = lean[0].pointer("/function/name").and_then(|v| v.as_str());
-        assert_eq!(name, Some("get_tools"), "only the proxy meta-tool is advertised");
+        assert_eq!(
+            name,
+            Some("get_tools"),
+            "only the proxy meta-tool is advertised"
+        );
 
         let desc = lean[0]
             .pointer("/function/description")
@@ -1883,9 +1944,9 @@ mod tests {
         );
 
         let result = registry.execute("echo", params).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "echo:hello");
-        assert!(result.error.is_none());
+        assert!(result.ok());
+        assert_eq!(result.data(), "echo:hello");
+        assert!(result.error().is_none());
     }
 
     #[tokio::test]
@@ -1894,14 +1955,10 @@ mod tests {
         let params = HashMap::new();
 
         let result = registry.execute("nonexistent", params).await;
-        assert!(!result.ok);
-        assert!(result.data.contains("Error"));
-        assert!(result.data.contains("nonexistent"));
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("not found"));
+        assert!(!result.ok());
+        assert!(result.data().contains("Error"));
+        assert!(result.data().contains("nonexistent"));
+        assert!(result.error().unwrap_or_default().contains("not found"));
     }
 
     #[tokio::test]
@@ -1916,8 +1973,8 @@ mod tests {
         );
 
         let result = registry.execute("wait", params).await;
-        assert!(result.ok, "{}", result.data);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "{}", result.data());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["action"], "wait");
         assert_eq!(parsed["task_id"], "abc123");
     }
@@ -1928,10 +1985,9 @@ mod tests {
         registry.register(Box::new(ParamEchoTool::new("spawn")));
 
         let result = registry.execute("spawn", HashMap::new()).await;
-        assert!(!result.ok);
+        assert!(!result.ok());
         assert!(result
-            .error
-            .as_deref()
+            .error()
             .unwrap_or_default()
             .contains("requires non-empty 'task'"));
     }
@@ -1948,10 +2004,9 @@ mod tests {
         );
 
         let result = registry.execute("spawn", params).await;
-        assert!(!result.ok);
+        assert!(!result.ok());
         assert!(result
-            .error
-            .as_deref()
+            .error()
             .unwrap_or_default()
             .contains("requires non-empty 'task_id'"));
     }
@@ -1968,8 +2023,8 @@ mod tests {
         );
 
         let result = registry.execute("web_search", params).await;
-        assert!(result.ok, "{}", result.data);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "{}", result.data());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["query"], "latest news");
     }
 
@@ -1985,8 +2040,8 @@ mod tests {
         );
 
         let result = registry.execute("read_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test.txt");
     }
 
@@ -2002,8 +2057,8 @@ mod tests {
         );
 
         let result = registry.execute("read_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test.txt");
     }
 
@@ -2019,8 +2074,8 @@ mod tests {
         );
 
         let result = registry.execute("read_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test.txt");
     }
 
@@ -2041,8 +2096,8 @@ mod tests {
         );
 
         let result = registry.execute("read_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/correct.txt");
     }
 
@@ -2062,8 +2117,8 @@ mod tests {
         );
 
         let result = registry.execute("write_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/out.txt");
     }
 
@@ -2083,8 +2138,8 @@ mod tests {
         );
 
         let result = registry.execute("write_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/out.txt");
     }
 
@@ -2100,8 +2155,8 @@ mod tests {
         );
 
         let result = registry.execute("edit_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/edit.txt");
     }
 
@@ -2117,8 +2172,8 @@ mod tests {
         );
 
         let result = registry.execute("edit_file", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp/edit.txt");
     }
 
@@ -2134,8 +2189,8 @@ mod tests {
         );
 
         let result = registry.execute("list_dir", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp");
     }
 
@@ -2151,8 +2206,8 @@ mod tests {
         );
 
         let result = registry.execute("list_dir", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp");
     }
 
@@ -2168,8 +2223,8 @@ mod tests {
         );
 
         let result = registry.execute("list_dir", params).await;
-        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
-        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
+        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
         assert_eq!(parsed["path"], "/tmp");
     }
 
@@ -2207,18 +2262,14 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_context() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("echo")));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_ctx".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_ctx");
 
         let mut params = HashMap::new();
         params.insert(
@@ -2227,29 +2278,25 @@ mod tests {
         );
 
         let result = registry.execute_with_context("echo", params, &ctx).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "echo:world");
+        assert!(result.ok());
+        assert_eq!(result.data(), "echo:world");
     }
 
     #[tokio::test]
     async fn test_execute_with_context_missing_tool() {
         use crate::agent::audit::ToolEvent;
-        use crate::agent::tools::base::ToolExecutionContext;
+        use crate::agent::tools::base::ToolContext;
 
         let registry = ToolRegistry::new();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_missing".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_missing");
 
         let result = registry
             .execute_with_context("nonexistent", HashMap::new(), &ctx)
             .await;
-        assert!(!result.ok);
-        assert!(result.data.contains("not found"));
+        assert!(!result.ok());
+        assert!(result.data().contains("not found"));
     }
 
     #[test]
@@ -2383,18 +2430,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unavailable_tool_can_still_be_executed() {
+    async fn test_unavailable_tool_is_rejected_by_every_execution_path() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolContext;
+
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(UnavailableTool));
 
-        // The tool is registered but not in definitions; execute() should still work.
-        let result = registry.execute("unavailable_test", HashMap::new()).await;
-        assert!(
-            result.ok,
-            "Unavailable tool should still execute when called directly: {:?}",
-            result.error
+        let direct = registry.execute("unavailable_test", HashMap::new()).await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let ctx = ToolContext::new(
+            None,
+            tx,
+            tokio_util::sync::CancellationToken::new(),
+            "unavailable-call",
         );
-        assert_eq!(result.data, "executed");
+        let contextual = registry
+            .execute_with_context("unavailable_test", HashMap::new(), &ctx)
+            .await;
+
+        let mut proxy_params = HashMap::new();
+        proxy_params.insert("name".to_string(), serde_json::json!("unavailable_test"));
+        proxy_params.insert("args".to_string(), serde_json::json!({}));
+        let proxied = registry.execute("tool", proxy_params).await;
+
+        for result in [direct, contextual, proxied] {
+            assert!(!result.ok(), "unavailable tool must not execute");
+            assert_eq!(
+                result.data(),
+                "Error: Tool 'unavailable_test' is unavailable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_available_tool_execution_remains_unchanged() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("available_tool")));
+        let mut params = HashMap::new();
+        params.insert("value".to_string(), serde_json::json!("still-runs"));
+
+        let result = registry.execute("available_tool", params).await;
+        assert!(result.ok());
+        assert_eq!(result.data(), "available_tool:still-runs");
     }
 
     #[test]
@@ -2775,16 +2854,16 @@ mod tests {
         params.insert("name".to_string(), serde_json::json!("read_file"));
 
         let result = registry.execute("get_tools", params).await;
-        assert!(result.ok, "Inspect should succeed: {:?}", result.error);
+        assert!(result.ok(), "Inspect should succeed: {:?}", result.error());
         assert!(
-            result.data.contains("parameters"),
+            result.data().contains("parameters"),
             "Inspect result should contain parameters schema: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("value"),
+            result.data().contains("value"),
             "Schema should mention required param 'value': {}",
-            result.data
+            result.data()
         );
     }
 
@@ -2797,11 +2876,11 @@ mod tests {
         params.insert("name".to_string(), serde_json::json!("nonexistent"));
 
         let result = registry.execute("get_tools", params).await;
-        assert!(!result.ok, "Unknown tool inspect should fail");
+        assert!(!result.ok(), "Unknown tool inspect should fail");
         assert!(
-            result.data.contains("read_file"),
+            result.data().contains("read_file"),
             "Error should list available tools: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -2816,14 +2895,14 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Proxy dispatch should succeed: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("hello"),
+            result.data().contains("hello"),
             "Should contain dispatched tool output: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -2880,14 +2959,14 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "dispatch via tool_name/tool_args must succeed: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("via_tool_name"),
+            result.data().contains("via_tool_name"),
             "should contain dispatched tool output: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -2906,11 +2985,11 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "legacy name/args must still be accepted for back-compat: {:?}",
-            result.error
+            result.error()
         );
-        assert!(result.data.contains("legacy"));
+        assert!(result.data().contains("legacy"));
     }
 
     /// The model emitting flattened args with no tool selector MUST produce
@@ -2931,10 +3010,10 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "flattened-form without tool selector must fail (not silently succeed)"
         );
-        let err = result.error.as_deref().unwrap_or("");
+        let err = result.error().unwrap_or("");
         assert!(
             err.contains("tool_name"),
             "error must reference `tool_name` (the new parameter), got: {err}"
@@ -2967,11 +3046,11 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
 
-        assert!(result.ok, "large complete proxy write failed: {result:?}");
+        assert!(result.ok(), "large complete proxy write failed: {result:?}");
         assert!(
-            result.data.contains("Validate the published artifact"),
+            result.data().contains("Validate the published artifact"),
             "publication must require validation: {}",
-            result.data
+            result.data()
         );
         assert_eq!(std::fs::metadata(file_path).unwrap().len(), 4097);
     }
@@ -2996,8 +3075,12 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
 
-        assert!(!result.ok, "oversized state=more must be rejected");
-        assert!(result.data.contains("state=\"more\""), "{}", result.data);
+        assert!(!result.ok(), "oversized state=more must be rejected");
+        assert!(
+            result.data().contains("state=\"more\""),
+            "{}",
+            result.data()
+        );
         assert!(!file_path.exists());
     }
 
@@ -3015,9 +3098,9 @@ mod tests {
         let result = registry.execute("write_file", params).await;
 
         assert!(
-            result.ok,
+            result.ok(),
             "proxy guard must not alter direct/cloud write_file calls: {:?}",
-            result.error
+            result.error()
         );
         assert_eq!(std::fs::metadata(file_path).unwrap().len(), 4097);
     }
@@ -3033,14 +3116,14 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Flattened proxy dispatch should succeed: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("latest"),
+            result.data().contains("latest"),
             "Flattened mode should be moved into args: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3055,19 +3138,19 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Stray metadata should not dispatch tool: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("\"parameters\""),
+            result.data().contains("\"parameters\""),
             "Stray metadata should leave proxy in inspect mode: {}",
-            result.data
+            result.data()
         );
         assert!(
-            !result.data.contains("read_file:default"),
+            !result.data().contains("read_file:default"),
             "Inspect mode must not execute the underlying tool: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3086,14 +3169,14 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Dispatch with alias should succeed: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("path"),
+            result.data().contains("path"),
             "Normalization should convert file_path to path: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3107,13 +3190,13 @@ mod tests {
 
         let result = registry.execute("get_tools", HashMap::new()).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Missing name should return success with tool list"
         );
         assert!(
-            result.data.contains("read_file"),
+            result.data().contains("read_file"),
             "Should list available tools: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3131,42 +3214,42 @@ mod tests {
 
         let result = registry.execute("get_tools", params).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "Missing tool_name with stray params should be FAILURE, not success catalog: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("'tool_name' is required"),
+            result.data().contains("'tool_name' is required"),
             "Error should mention tool_name is required: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("url"),
+            result.data().contains("url"),
             "Error should mention the stray parameter sent: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("web_fetch"),
+            result.data().contains("web_fetch"),
             "Error should list available tools including web_fetch: {}",
-            result.data
+            result.data()
         );
 
         // Case 2: Empty params (genuine discovery) → should still be SUCCESS with catalog.
         // This is the regression guard: the documented discovery path must work.
         let result = registry.execute("get_tools", HashMap::new()).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Empty params should return success with tool list (discovery path)"
         );
         assert!(
-            result.data.contains("Available tools:"),
+            result.data().contains("Available tools:"),
             "Should list available tools: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("web_fetch"),
+            result.data().contains("web_fetch"),
             "Should include web_fetch in tool list: {}",
-            result.data
+            result.data()
         );
 
         // Case 3: `args` present but no name. Observed in production — the model
@@ -3179,14 +3262,14 @@ mod tests {
         );
         let result = registry.execute("get_tools", params).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "args without tool_name must fail, not return the catalog: {}",
-            result.data
+            result.data()
         );
         assert!(
-            result.data.contains("'tool_name' is required"),
+            result.data().contains("'tool_name' is required"),
             "{}",
-            result.data
+            result.data()
         );
 
         // Case 4: blank filler around an otherwise bare call is still discovery.
@@ -3195,9 +3278,9 @@ mod tests {
         params.insert("name".to_string(), serde_json::Value::Null);
         let result = registry.execute("get_tools", params).await;
         assert!(
-            result.ok && result.data.contains("Available tools:"),
+            result.ok() && result.data().contains("Available tools:"),
             "empty args/null name is a bare discovery call: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3215,22 +3298,22 @@ mod tests {
         registry.register(Box::new(MockTool::new("read_file")));
 
         let result = registry.execute("get_tools", HashMap::new()).await;
-        assert!(result.ok, "discovery must succeed: {:?}", result.data);
+        assert!(result.ok(), "discovery must succeed: {:?}", result.data());
         assert!(
-            result.data.contains("Available tools:"),
+            result.data().contains("Available tools:"),
             "catalog must still list tools: {}",
-            result.data
+            result.data()
         );
         // The actionable hint: the model must learn, from THIS result, that
         // passing tool_name yields a schema. A flat "Available tools: a, b"
         // alone does not break the identical-retry loop.
         assert!(
-            result.data.contains("tool_name")
-                && (result.data.contains("schema")
-                    || result.data.contains("inspect")
-                    || result.data.contains("parameters")),
+            result.data().contains("tool_name")
+                && (result.data().contains("schema")
+                    || result.data().contains("inspect")
+                    || result.data().contains("parameters")),
             "catalog must direct the model to the inspect path (tool_name → schema): {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3258,9 +3341,8 @@ mod tests {
             "type": "object",
             "properties": {"query": {"type": "string"}, "mode": {"type": "string"}}
         });
-        let example =
-            ToolRegistry::worked_example_call("session_search", &schema_no_required)
-                .expect("first-property fallback must yield an example");
+        let example = ToolRegistry::worked_example_call("session_search", &schema_no_required)
+            .expect("first-property fallback must yield an example");
         assert!(
             example.starts_with("session_search({\""),
             "fallback example must include a property: {example}"
@@ -3268,7 +3350,10 @@ mod tests {
 
         // Genuinely no-arg tool → None (no augmentation possible).
         let no_args = serde_json::json!({"type": "object", "properties": {}});
-        assert_eq!(ToolRegistry::worked_example_call("system_info", &no_args), None);
+        assert_eq!(
+            ToolRegistry::worked_example_call("system_info", &no_args),
+            None
+        );
     }
 
     /// Old tool names from prior sessions must keep resolving to their dissolved
@@ -3277,10 +3362,7 @@ mod tests {
     /// a separate follow-up — not yet applied — so they aren't aliased here.)
     #[test]
     fn normalize_routes_old_tool_names_to_new_targets() {
-        for (old, new) in [
-            ("session_search", "recall"),
-            ("search_context", "recall"),
-        ] {
+        for (old, new) in [("session_search", "recall"), ("search_context", "recall")] {
             let (c, _) = ToolRegistry::normalize_tool_request(old, HashMap::new()).unwrap();
             assert_eq!(c, new, "alias {old} -> {new}");
         }
@@ -3320,20 +3402,22 @@ mod tests {
 
         let result = registry.execute("require_query", HashMap::new()).await;
         assert!(
-            !result.ok,
+            !result.ok(),
             "tool must still report failure (no silent success)"
         );
         // The corrective shape, derived from the schema's required params:
         assert!(
-            result.data.contains("Call as require_query({\"query\":\"...\"})"),
+            result
+                .data()
+                .contains("Call as require_query({\"query\":\"...\"})"),
             "missing-arg error must echo the schema-derived worked example: {}",
-            result.data
+            result.data()
         );
         // The original error text is preserved (augmented, not replaced):
         assert!(
-            result.data.contains("'query' parameter is required"),
+            result.data().contains("'query' parameter is required"),
             "augmentation must preserve the original error: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3360,19 +3444,18 @@ mod tests {
             async fn execute(&self, _: HashMap<String, serde_json::Value>) -> String {
                 "Error: provide facts".to_string() // NOTE: no "is required" substring
             }
-            async fn execute_with_result(
+            async fn execute_with_result_and_context(
                 &self,
                 _: HashMap<String, serde_json::Value>,
+                _ctx: &ToolContext,
             ) -> ToolExecutionResult {
-                ToolExecutionResult {
-                    ok: false,
-                    data: "Error: provide facts".to_string(),
-                    error: None,
-                    error_kind: Some(crate::errors::ToolErrorKind::MissingArg {
+                ToolExecutionResult::failure_with_kind(
+                    "Error: provide facts".to_string(),
+                    crate::errors::ToolErrorKind::MissingArg {
                         param: "facts".to_string(),
                         example: r#"structured_missing_arg({"facts":["..."]})"#.to_string(),
-                    }),
-                }
+                    },
+                )
             }
         }
 
@@ -3382,11 +3465,13 @@ mod tests {
         let result = registry
             .execute("structured_missing_arg", HashMap::new())
             .await;
-        assert!(!result.ok, "must still report failure");
+        assert!(!result.ok(), "must still report failure");
         assert!(
-            result.data.contains(r#"Call as structured_missing_arg({"facts":["..."]})"#),
+            result
+                .data()
+                .contains(r#"Call as structured_missing_arg({"facts":["..."]})"#),
             "structural MissingArg must append the example from error_kind: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3402,14 +3487,14 @@ mod tests {
 
         let result = registry.execute("tool", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Proxy intercept via execute() should work: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("test"),
+            result.data().contains("test"),
             "Should dispatch to real tool: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3424,14 +3509,14 @@ mod tests {
 
         let result = registry.execute("mock_tool", params).await;
         assert!(
-            result.ok,
+            result.ok(),
             "Direct call should still work: {:?}",
-            result.error
+            result.error()
         );
         assert!(
-            result.data.contains("direct"),
+            result.data().contains("direct"),
             "Should get direct tool output: {}",
-            result.data
+            result.data()
         );
     }
 
@@ -3529,8 +3614,8 @@ mod tests {
         registry.register(Box::new(ExecuteTool));
 
         let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(!result.ok);
-        assert!(result.data.contains("Permission denied"));
+        assert!(!result.ok());
+        assert!(result.data().contains("Permission denied"));
     }
 
     #[tokio::test]
@@ -3539,8 +3624,8 @@ mod tests {
         registry.register(Box::new(ExecuteTool));
 
         let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "executed");
+        assert!(result.ok());
+        assert_eq!(result.data(), "executed");
     }
 
     #[tokio::test]
@@ -3549,7 +3634,7 @@ mod tests {
         registry.register(Box::new(ExecuteTool));
 
         let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(result.ok);
+        assert!(result.ok());
     }
 
     #[test]
@@ -3558,5 +3643,36 @@ mod tests {
         assert_eq!(registry.max_permission, PermissionLevel::System);
         registry.set_max_permission(PermissionLevel::Write);
         assert_eq!(registry.max_permission, PermissionLevel::Write);
+    }
+
+    // -----------------------------------------------------------------------
+    // cua registration gating (register behind config.cua.enabled)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cua_registered_when_enabled() {
+        let ws = std::path::Path::new("/tmp");
+        let mut cfg = ToolConfig::new(ws);
+        cfg.cua.enabled = true;
+        let reg = ToolRegistry::with_standard_tools(&cfg);
+        assert!(reg.has("cua"), "cua should be registered when enabled");
+    }
+
+    #[test]
+    fn test_cua_not_registered_when_disabled() {
+        let ws = std::path::Path::new("/tmp");
+        let mut cfg = ToolConfig::new(ws);
+        cfg.cua.enabled = false;
+        let reg = ToolRegistry::with_standard_tools(&cfg);
+        assert!(!reg.has("cua"), "cua should be absent when disabled");
+    }
+
+    #[test]
+    fn test_cua_excluded_by_tools_filter() {
+        let ws = std::path::Path::new("/tmp");
+        let mut cfg = ToolConfig::new(ws);
+        cfg.tools_filter = Some(vec!["read_file".to_string()]);
+        let reg = ToolRegistry::with_standard_tools(&cfg);
+        assert!(!reg.has("cua"));
     }
 }

@@ -3,6 +3,26 @@
 //! Contains the main agent REPL, slash-command handlers, voice recording
 //! pipeline, and background channel management.
 
+// Interactive/app boundary (error-protocol layer 3 backlog): printing IS the
+// product here (REPL/TUI/CLI), and the thin glue code keeps pragmatic
+// unwraps on always-set state (rl, runtime, static regexes). The deny regime
+// in Cargo.toml stays live for the core; this module lands on the regime
+// when its backlog is migrated.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::format_push_string,
+    clippy::string_add
+)]
 pub(crate) mod commands;
 mod incremental;
 
@@ -499,16 +519,23 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
     }
 }
 
-/// Default Higgs keepalive interval (seconds). Short enough to keep the 35B
-/// resident across read/think pauses, long enough to be negligible compute.
-const DEFAULT_HIGGS_KEEPALIVE_SECS: u64 = 45;
+/// Default Higgs keepalive interval (seconds). `0` = disabled.
+///
+/// Off by default: Higgs pins model weights itself via the MLX wired limit
+/// (`mode="mlx_wired_limit"`), which is the mechanism this ping was written to
+/// substitute for. With weights wired, the ping buys nothing and still costs a
+/// real prefill on the live model every tick — 0.5–5.1s observed per tick in
+/// session 20260810_081050_8306f8, once every 45s for 28 minutes of idle.
+/// Set `NANOBOT_HIGGS_KEEPALIVE_SECS` to re-enable for a server without a
+/// wired limit.
+const DEFAULT_HIGGS_KEEPALIVE_SECS: u64 = 0;
 
 /// Decide whether (and how often) to run the Higgs warm-keep ping.
 ///
 /// Returns `Some(secs)` only for *our own* local Higgs sidecar
 /// (localhost/127.0.0.1) — we never keep a remote peer warm. The env var
-/// `NANOBOT_HIGGS_KEEPALIVE_SECS` overrides the interval; `0` disables it.
-/// A non-numeric value falls back to the default.
+/// `NANOBOT_HIGGS_KEEPALIVE_SECS` sets the interval; `0` (the default)
+/// disables it. A non-numeric value falls back to the default.
 pub(crate) fn higgs_keepalive_secs(
     backend: &str,
     api_base: &str,
@@ -526,14 +553,16 @@ pub(crate) fn higgs_keepalive_secs(
     if !is_local {
         return None;
     }
-    match env {
-        Some(v) => match v.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(n) => Some(n),
-            Err(_) => Some(DEFAULT_HIGGS_KEEPALIVE_SECS),
-        },
-        None => Some(DEFAULT_HIGGS_KEEPALIVE_SECS),
-    }
+    let secs = match env {
+        Some(v) => v
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_HIGGS_KEEPALIVE_SECS),
+        None => DEFAULT_HIGGS_KEEPALIVE_SECS,
+    };
+    // 0 disables — from the env var or from the default. Never return Some(0):
+    // the spawned task would sleep(0) in a tight loop.
+    (secs > 0).then_some(secs)
 }
 
 fn higgs_keepalive_request_body(model: &str) -> serde_json::Value {
@@ -1694,7 +1723,7 @@ pub(crate) fn cmd_agent(
                             crate::lms::resolve_model_name(&available, hint)
                         };
                         let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
-                        if let Err(e) = crate::lms::load_model("", lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
+                        if let Err(e) = crate::lms::load_model("", lms_port, &main_model, main_ctx).await {
                             eprintln!("Warning: lms load failed: {}", e);
                         } else {
                             local_model_name = main_model;
@@ -1739,7 +1768,6 @@ pub(crate) fn cmd_agent(
                                     lms_port,
                                     &config.trio.router_model,
                                     Some(config.trio.router_ctx_tokens),
-                                    config.timeouts.lms_load_secs,
                                 )
                                 .await;
                             }
@@ -1750,7 +1778,6 @@ pub(crate) fn cmd_agent(
                                     lms_port,
                                     &config.trio.specialist_model,
                                     Some(config.trio.specialist_ctx_tokens),
-                                    config.timeouts.lms_load_secs,
                                 )
                                 .await;
                             }
@@ -1812,7 +1839,7 @@ pub(crate) fn cmd_agent(
                         let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
                         print!("  Loading {}... ", main_model);
                         io::stdout().flush().ok();
-                        match crate::lms::load_model("", lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
+                        match crate::lms::load_model("", lms_port, &main_model, main_ctx).await {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
@@ -1837,7 +1864,7 @@ pub(crate) fn cmd_agent(
                             if !config.trio.router_model.is_empty() {
                                 print!("  Loading {}... ", config.trio.router_model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model("", lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens), config.timeouts.lms_load_secs).await {
+                                match crate::lms::load_model("", lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens)).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }
@@ -1845,7 +1872,7 @@ pub(crate) fn cmd_agent(
                             if !config.trio.specialist_model.is_empty() {
                                 print!("  Loading {}... ", config.trio.specialist_model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model("", lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens), config.timeouts.lms_load_secs).await {
+                                match crate::lms::load_model("", lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens)).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }
@@ -2571,6 +2598,8 @@ pub(crate) fn cmd_agent(
                 }
             }
 
+            ctx.agent_loop.drain_compaction_jobs().await;
+
             // Stop any active background channels
             for ch in &ctx.active_channels {
                 ch.stop.store(true, Ordering::Relaxed);
@@ -3097,19 +3126,24 @@ mod tests {
 
     // --- higgs_keepalive_secs (warm-keep decision) ---
 
+    /// Default is OFF: Higgs wires its own weights (MLX wired limit), so the
+    /// ping only buys a recurring prefill on the live model.
     #[test]
-    fn test_keepalive_local_higgs_default() {
-        let s = higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", None);
-        assert_eq!(s, Some(DEFAULT_HIGGS_KEEPALIVE_SECS));
-        // localhost host form also counts.
+    fn test_keepalive_default_is_disabled() {
+        assert_eq!(
+            higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", None),
+            None
+        );
+        // localhost host form resolves the same way.
         assert_eq!(
             higgs_keepalive_secs("higgs", "http://localhost:8000/v1", None),
-            Some(DEFAULT_HIGGS_KEEPALIVE_SECS)
+            None
         );
     }
 
     #[test]
     fn test_keepalive_env_override_and_disable() {
+        // Explicit opt-in re-enables it.
         assert_eq!(
             higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", Some("30")),
             Some(30)
@@ -3119,11 +3153,21 @@ mod tests {
             higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", Some("0")),
             None
         );
-        // Non-numeric → default.
+        // Non-numeric → default (disabled).
         assert_eq!(
             higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", Some("nope")),
-            Some(DEFAULT_HIGGS_KEEPALIVE_SECS)
+            None
         );
+    }
+
+    /// A zero interval must never reach the spawned task — `sleep(0)` in its
+    /// loop would busy-spin. Holds for every input, whatever the default is.
+    #[test]
+    fn test_keepalive_never_returns_zero_interval() {
+        for env in [None, Some("0"), Some("nope"), Some(""), Some("7")] {
+            let got = higgs_keepalive_secs("higgs", "http://127.0.0.1:8000/v1", env);
+            assert_ne!(got, Some(0), "zero interval leaked for env={env:?}");
+        }
     }
 
     #[test]

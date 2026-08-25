@@ -10,10 +10,10 @@ use crate::agent::router::{
     extract_json_object, parse_lenient_router_decision, request_strict_router_decision,
 };
 use crate::config::schema::{
-    AdaptiveTokenConfig, MemoryConfig, ProvenanceConfig, ProviderConfig, ToolDelegationConfig,
-    TrioConfig,
+    AdaptiveTokenConfig, CodeExecutionConfig, CuaToolConfig, MemoryConfig, ProvenanceConfig,
+    ProviderConfig, PythonKernelConfig, ToolDelegationConfig, TrioConfig,
 };
-use crate::providers::base::LLMProvider;
+use crate::providers::base::{FinishReason, LLMProvider};
 use crate::providers::openai_compat::OpenAICompatProvider;
 use async_trait::async_trait;
 use backon::BackoffBuilder;
@@ -51,7 +51,7 @@ impl LLMProvider for MockLLM {
         Ok(crate::providers::base::LLMResponse {
             content: Some("mock".to_string()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -106,7 +106,7 @@ impl LLMProvider for StaticResponseLLM {
         Ok(crate::providers::base::LLMResponse {
             content: Some(self.body.clone()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -163,6 +163,9 @@ fn build_test_core(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(sessions_db),
     })
@@ -215,11 +218,50 @@ async fn test_request_strict_router_decision_action_matrix() {
             1.0,
             "",
             256,
+            None,
         )
         .await
         .expect("valid strict router decision");
         assert_eq!(decision.action, expected_action);
     }
+}
+
+#[tokio::test]
+async fn router_journal_failure_degrades_instead_of_failing_routing() {
+    // Break caught: a transient replay-journal write failure aborted the
+    // strict router before the provider was even called, turning any
+    // SQLite stutter into a routing outage.
+    let dir = tempfile::tempdir().unwrap();
+    let sessions =
+        std::sync::Arc::new(crate::session::db::SessionDb::new(&dir.path().join("s.db")));
+    let meta = sessions.create_session("cli:router-journal-fault").await;
+    sessions.fail_model_request_writes_for_tests(1);
+    let replay = crate::session::db::TurnReplayRecorder::new(
+        std::sync::Arc::clone(&sessions),
+        meta.id.clone(),
+        "turn-1".to_string(),
+        1,
+    );
+    let llm = StaticResponseLLM::plain(
+        "router",
+        r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#,
+    );
+
+    let decision = request_strict_router_decision(
+        &llm,
+        "router",
+        "route this action with strict schema",
+        false,
+        0.6,
+        1.0,
+        "",
+        256,
+        Some(&replay),
+    )
+    .await
+    .expect("routing must survive a transient journal write failure");
+
+    assert_eq!(decision.action, "respond");
 }
 
 /// Real-provider trio probe.
@@ -286,6 +328,7 @@ async fn test_real_providers_trio_probe() {
             1.0,
             "",
             256,
+            None,
         )
         .await
         {
@@ -503,6 +546,9 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -570,6 +616,9 @@ fn test_delegation_with_is_local_true() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -639,6 +688,9 @@ fn test_delegation_with_is_local_false_cloud() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -725,6 +777,9 @@ fn test_local_reflection_and_delegation_providers_do_not_reroute_lcm() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -792,6 +847,9 @@ fn test_cloud_memory_and_delegation_do_not_reroute_lcm() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -902,6 +960,9 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1184,6 +1245,9 @@ fn build_trio_e2e_harness(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1644,6 +1708,9 @@ async fn test_trio_e2e_router_unreachable() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1760,6 +1827,9 @@ async fn test_trio_e2e_specialist_unreachable() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2051,7 +2121,7 @@ impl LLMProvider for SequenceProvider {
         Ok(crate::providers::base::LLMResponse {
             content: Some(response),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -2073,10 +2143,7 @@ async fn plain_text_response_is_final_answer() {
     ));
     let main_dyn: Arc<dyn LLMProvider> = main.clone();
     let (agent_loop, workspace) = build_local_inline_harness(main_dyn);
-    let session_key = format!(
-        "test-no-attestation-{}",
-        uuid::Uuid::new_v4().to_string()
-    );
+    let session_key = format!("test-no-attestation-{}", uuid::Uuid::new_v4().to_string());
 
     let response = agent_loop
         .process_direct("hi", &session_key, "test", "offline")
@@ -2144,7 +2211,7 @@ impl LLMProvider for ToolRoundBarrierProvider {
                     name: "list_dir".to_string(),
                     arguments,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             });
         }
@@ -2154,7 +2221,7 @@ impl LLMProvider for ToolRoundBarrierProvider {
         Ok(crate::providers::base::LLMResponse {
             content: Some(attested_text("done")),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -2200,7 +2267,7 @@ impl LLMProvider for ResponseSequenceProvider {
             response.unwrap_or_else(|| crate::providers::base::LLMResponse {
                 content: Some("ERROR: no responses left in ResponseSequenceProvider".to_string()),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             }),
         )
@@ -2312,7 +2379,7 @@ impl LLMProvider for StreamingThinkingProvider {
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("visible answer")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
         ));
@@ -2365,7 +2432,7 @@ impl LLMProvider for RecordingProvider {
         Ok(crate::providers::base::LLMResponse {
             content: Some(self.response.clone()),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         })
     }
@@ -2433,6 +2500,9 @@ fn build_trio_offline_harness(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2468,8 +2538,9 @@ fn build_local_inline_harness(main: Arc<dyn LLMProvider>) -> (AgentLoop, std::pa
 }
 
 /// Same as [`build_local_inline_harness`] but with a custom `max_iterations`.
-/// Convergence tests need this above the per-lease batch budget so lease
-/// exhaustion, renewal, and rejection happen before the iteration limit.
+/// Convergence tests need this above the lease coarse-family cap (6) so the
+/// sticky-strip path is actually reachable — the default of 5 stops the loop
+/// before the family cap can fire.
 fn build_local_inline_harness_with_iters(
     main: Arc<dyn LLMProvider>,
     max_iterations: u32,
@@ -2504,6 +2575,9 @@ fn build_local_inline_harness_with_iters(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2526,63 +2600,6 @@ fn build_local_inline_harness_with_iters(
         None,
         None,
         crate::config::schema::ProprioceptionConfig::default(),
-        LcmSchemaConfig::default(),
-        None,
-    );
-    (agent_loop, workspace)
-}
-
-fn build_preview_budget_harness(main: Arc<dyn LLMProvider>) -> (AgentLoop, std::path::PathBuf) {
-    let workspace = tempfile::tempdir().unwrap().keep();
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider: main,
-        workspace: workspace.clone(),
-        model: "local-qwen-test".to_string(),
-        max_iterations: 20,
-        max_continuations: 2,
-        max_tokens: 512,
-        temperature: 0.3,
-        max_context_tokens: 100_000,
-        brave_api_key: None,
-        search_provider: "searxng".to_string(),
-        searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
-        search_max_results: 5,
-        exec_timeout: 30,
-        restrict_to_workspace: true,
-        memory_config: MemoryConfig::default(),
-        is_local: true,
-        lane: Lane::default(),
-        tool_delegation: ToolDelegationConfig::default(),
-        provenance: ProvenanceConfig::default(),
-        max_tool_result_chars: 10_000,
-        delegation_provider: None,
-        specialist_provider: None,
-        trio_config: TrioConfig::default(),
-        model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
-        tool_heartbeat_secs: 2,
-        health_check_timeout_secs: 2,
-        adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(
-            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
-        ),
-    });
-    let counters = test_runtime_counters(100_000);
-    let core_handle = AgentHandle::new(core, counters);
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
-    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
-    let agent_loop = AgentLoop::new(
-        core_handle,
-        inbound_rx,
-        outbound_tx,
-        inbound_tx,
-        None,
-        1,
-        None,
-        None,
-        None,
-        ProprioceptionConfig::default(),
         LcmSchemaConfig::default(),
         None,
     );
@@ -2670,6 +2687,9 @@ fn build_local_inline_harness_with_memory_and_reflection(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2708,10 +2728,11 @@ fn build_local_inline_harness_with_memory_and_reflection(
 fn build_cloud_inline_harness_with_memory(
     main: Arc<dyn LLMProvider>,
     model: &str,
+    max_context_tokens: usize,
+    lcm_config: LcmSchemaConfig,
     memory_config: MemoryConfig,
 ) -> (AgentLoop, std::path::PathBuf) {
     let workspace = tempfile::tempdir().unwrap().keep();
-    let max_context_tokens = 128_000;
     let core = build_swappable_core(SwappableCoreConfig {
         provider: main,
         workspace: workspace.clone(),
@@ -2741,6 +2762,9 @@ fn build_cloud_inline_harness_with_memory(
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2764,7 +2788,7 @@ fn build_cloud_inline_harness_with_memory(
         None,
         None,
         ProprioceptionConfig::default(),
-        LcmSchemaConfig::default(),
+        lcm_config,
         None,
     );
 
@@ -2790,6 +2814,8 @@ async fn memory_md_appears_exactly_once_in_assembled_cloud_messages() {
     let (agent_loop, workspace) = build_cloud_inline_harness_with_memory(
         provider,
         "cloud-memory-dedup-test",
+        128_000,
+        LcmSchemaConfig::default(),
         MemoryConfig::default(),
     );
 
@@ -2832,12 +2858,73 @@ struct WireRecordingProvider {
     name: String,
     responses: std::sync::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
     calls: std::sync::Mutex<Vec<Vec<Value>>>,
-    tool_snapshots: std::sync::Mutex<Vec<Vec<Value>>>,
-    higgs_session_cache: bool,
 }
 
-/// Blocks the first provider request so a test can prove that another direct
-/// turn for the same session cannot enter the provider concurrently.
+impl WireRecordingProvider {
+    fn new(name: &str, responses: Vec<crate::providers::base::LLMResponse>) -> Self {
+        Self {
+            name: name.to_string(),
+            responses: std::sync::Mutex::new(responses.into()),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn text_response(content: &str) -> crate::providers::base::LLMResponse {
+        crate::providers::base::LLMResponse {
+            content: Some(attested_text(content)),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Internal compaction/reflection output is not an agent turn.
+    fn plain_text_response(content: &str) -> crate::providers::base::LLMResponse {
+        crate::providers::base::LLMResponse {
+            content: Some(content.to_string()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: std::collections::HashMap::new(),
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<Value>> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for WireRecordingProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let mut queue = self.responses.lock().unwrap();
+        Ok(if queue.len() > 1 {
+            queue.pop_front().unwrap()
+        } else {
+            queue
+                .front()
+                .cloned()
+                .unwrap_or_else(|| Self::text_response("done"))
+        })
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Blocks the first provider request so a test can prove that a queued
+/// same-session message cannot enter the provider concurrently and cannot
+/// starve another session's concurrency permit.
 struct BlockingFirstProvider {
     calls: std::sync::atomic::AtomicUsize,
     first_started: tokio::sync::Notify,
@@ -2868,7 +2955,7 @@ impl LLMProvider for BlockingFirstProvider {
         _thinking_budget: Option<u32>,
         _top_p: Option<f64>,
     ) -> anyhow::Result<crate::providers::base::LLMResponse> {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if call == 0 {
             self.first_started.notify_one();
             self.allow_first.notified().await;
@@ -2886,178 +2973,9 @@ impl LLMProvider for BlockingFirstProvider {
     }
 }
 
-impl WireRecordingProvider {
-    fn new(name: &str, responses: Vec<crate::providers::base::LLMResponse>) -> Self {
-        Self {
-            name: name.to_string(),
-            responses: std::sync::Mutex::new(responses.into()),
-            calls: std::sync::Mutex::new(Vec::new()),
-            tool_snapshots: std::sync::Mutex::new(Vec::new()),
-            higgs_session_cache: false,
-        }
-    }
-
-    fn with_higgs_session_cache(mut self) -> Self {
-        self.higgs_session_cache = true;
-        self
-    }
-
-    fn tool_call(id: &str, path: &str) -> crate::providers::base::ToolCallRequest {
-        let mut arguments = std::collections::HashMap::new();
-        arguments.insert("path".to_string(), json!(path));
-        crate::providers::base::ToolCallRequest {
-            id: id.to_string(),
-            name: "list_dir".to_string(),
-            arguments,
-        }
-    }
-
-    fn tool_response(id: &str, path: &str) -> crate::providers::base::LLMResponse {
-        crate::providers::base::LLMResponse {
-            content: Some(String::new()),
-            tool_calls: vec![Self::tool_call(id, path)],
-            finish_reason: "tool_calls".to_string(),
-            usage: std::collections::HashMap::new(),
-        }
-    }
-
-    fn text_response(content: &str) -> crate::providers::base::LLMResponse {
-        crate::providers::base::LLMResponse {
-            content: Some(attested_text(content)),
-            tool_calls: vec![],
-            finish_reason: "stop".to_string(),
-            usage: std::collections::HashMap::new(),
-        }
-    }
-
-    /// Internal compaction/reflection output is not an agent turn.
-    fn plain_text_response(content: &str) -> crate::providers::base::LLMResponse {
-        crate::providers::base::LLMResponse {
-            content: Some(content.to_string()),
-            tool_calls: vec![],
-            finish_reason: "stop".to_string(),
-            usage: std::collections::HashMap::new(),
-        }
-    }
-
-    fn calls(&self) -> Vec<Vec<Value>> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    fn call_count(&self) -> usize {
-        self.calls.lock().unwrap().len()
-    }
-
-    fn tool_snapshots(&self) -> Vec<Vec<Value>> {
-        self.tool_snapshots.lock().unwrap().clone()
-    }
-
-    fn higgs_requests(&self) -> Vec<Vec<Value>> {
-        self.calls()
-            .into_iter()
-            .filter(|messages| {
-                messages.first().is_some_and(|message| {
-                    message
-                        .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD)
-                        .is_some()
-                })
-            })
-            .collect()
-    }
-}
-
-#[async_trait]
-impl LLMProvider for WireRecordingProvider {
-    async fn chat(
-        &self,
-        messages: &[Value],
-        tools: Option<&[Value]>,
-        _model: Option<&str>,
-        _max_tokens: u32,
-        _temperature: f64,
-        _thinking_budget: Option<u32>,
-        _top_p: Option<f64>,
-    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
-        self.calls.lock().unwrap().push(messages.to_vec());
-        self.tool_snapshots
-            .lock()
-            .unwrap()
-            .push(tools.unwrap_or(&[]).to_vec());
-        let mut queue = self.responses.lock().unwrap();
-        Ok(if queue.len() > 1 {
-            queue.pop_front().unwrap()
-        } else {
-            queue
-                .front()
-                .cloned()
-                .unwrap_or_else(|| Self::text_response("done"))
-        })
-    }
-
-    fn get_default_model(&self) -> &str {
-        &self.name
-    }
-
-    fn get_api_base(&self) -> Option<&str> {
-        self.higgs_session_cache
-            .then_some("http://127.0.0.1:9000/v1")
-    }
-
-    fn supports_higgs_session_cache(&self) -> bool {
-        self.higgs_session_cache
-    }
-}
-
-#[tokio::test]
-async fn concurrent_direct_turns_for_one_session_are_serialized() {
-    let provider = Arc::new(BlockingFirstProvider::new());
-    let (agent_loop, workspace) =
-        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
-    let agent_loop = Arc::new(agent_loop);
-    let session_key = format!("serialized-direct-{}", uuid::Uuid::new_v4());
-
-    let first_started = provider.first_started.notified();
-    let first_loop = agent_loop.clone();
-    let first_session = session_key.clone();
-    let first = tokio::spawn(async move {
-        first_loop
-            .process_direct("first", &first_session, "cli", "offline")
-            .await
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(5), first_started)
-        .await
-        .expect("first turn must reach the provider");
-
-    let second_loop = agent_loop.clone();
-    let second_session = session_key.clone();
-    let second = tokio::spawn(async move {
-        second_loop
-            .process_direct("second", &second_session, "cli", "offline")
-            .await
-    });
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(150),
-            provider.second_started.notified(),
-        )
-        .await
-        .is_err(),
-        "the second same-session turn entered the provider before the first completed"
-    );
-
-    provider.allow_first.notify_one();
-    assert_eq!(first.await.unwrap(), "response 1");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        provider.second_started.notified(),
-    )
-    .await
-    .expect("second turn must proceed after the first releases the session");
-    assert_eq!(second.await.unwrap(), "response 2");
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
+/// Build an `AgentLoop` wired for gateway-mode `run()` tests: real inbound /
+/// outbound channels and `max_concurrent_chats = 2` so permit starvation is
+/// observable.
 fn build_gateway_harness(
     provider: Arc<dyn LLMProvider>,
 ) -> (
@@ -3082,7 +3000,7 @@ fn build_gateway_harness(
         None,
         None,
         None,
-        ProprioceptionConfig::default(),
+        crate::config::schema::ProprioceptionConfig::default(),
         LcmSchemaConfig::default(),
         None,
     );
@@ -3165,7 +3083,7 @@ async fn gateway_clear_waits_for_active_same_session_turn() {
     );
 
     drop(inbound_tx);
-    running.store(false, Ordering::SeqCst);
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
     tokio::time::timeout(std::time::Duration::from_secs(5), runner)
         .await
         .expect("gateway loop must stop after its input channel closes")
@@ -3212,12 +3130,12 @@ async fn cross_session_command_seen_during_coalescing_uses_gateway_dispatch() {
         "the cross-session /clear was routed to the model: {responses:?}"
     );
     assert_eq!(
-        provider.call_count(),
+        provider.calls().len(),
         1,
         "recognized gateway commands must not consume an inference request"
     );
 
-    running.store(false, Ordering::SeqCst);
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
     tokio::time::timeout(std::time::Duration::from_secs(5), runner)
         .await
         .expect("gateway loop must stop")
@@ -3470,6 +3388,2960 @@ async fn soft_lcm_uses_main_provider_and_preserves_foreground_context() {
     );
 }
 
+fn is_lcm_compaction_request(messages: &[Value]) -> bool {
+    messages
+        .first()
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .is_some_and(|content| content.contains("conversation-state compressor"))
+}
+
+async fn seed_compaction_history(
+    core: &SwappableCore,
+    session_id: &str,
+    turns: u64,
+    detail_repetitions: usize,
+) {
+    for turn in 0..turns {
+        core.sessions
+            .add_message(
+                session_id,
+                &json!({
+                    "role": "user",
+                    "content": format!(
+                        "turn {turn}: {}",
+                        "persistent project detail with decisions and constraints "
+                            .repeat(detail_repetitions)
+                    ),
+                    "_turn": turn,
+                }),
+            )
+            .await;
+        core.sessions
+            .add_message(
+                session_id,
+                &json!({
+                    "role": "assistant",
+                    "content": format!("acknowledged retained project detail for turn {turn}"),
+                    "_turn": turn,
+                }),
+            )
+            .await;
+    }
+}
+
+async fn persist_prior_summary(core: &SwappableCore, session_id: &str) {
+    let raw = core.sessions.get_all_messages(session_id).await;
+    let source_ids = raw
+        .iter()
+        .take(4)
+        .map(|message| message["_db_id"].as_u64().unwrap() as usize)
+        .collect::<Vec<_>>();
+    assert_eq!(source_ids.len(), 4, "prior summary needs four source rows");
+    let text = "Prior project details, decisions, constraints, and acknowledged outcomes.";
+    core.sessions
+        .save_compaction_checkpoint(
+            session_id,
+            0,
+            &source_ids,
+            &[],
+            text,
+            crate::agent::token_budget::TokenBudget::estimate_str_tokens(text),
+            1,
+            &crate::agent::lcm::SummaryManifest::default(),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+struct ForegroundPriorityProvider {
+    first_foreground_started: Arc<tokio::sync::Notify>,
+    release_first_foreground: Arc<tokio::sync::Notify>,
+    soft_generation_started: Arc<tokio::sync::Notify>,
+    foreground_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for ForegroundPriorityProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            self.soft_generation_started.notify_one();
+            return std::future::pending().await;
+        }
+
+        let call = self
+            .foreground_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if call == 0 {
+            self.first_foreground_started.notify_one();
+            self.release_first_foreground.notified().await;
+            return Ok(WireRecordingProvider::text_response("turn one reply"));
+        }
+        Ok(WireRecordingProvider::text_response("turn two reply"))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "foreground-priority-compaction-test"
+    }
+}
+
+#[tokio::test]
+async fn soft_compaction_waits_for_turn_end_and_next_foreground_preempts_generation() {
+    let first_foreground_started = Arc::new(tokio::sync::Notify::new());
+    let release_first_foreground = Arc::new(tokio::sync::Notify::new());
+    let soft_generation_started = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(ForegroundPriorityProvider {
+        first_foreground_started: first_foreground_started.clone(),
+        release_first_foreground: release_first_foreground.clone(),
+        soft_generation_started: soft_generation_started.clone(),
+        foreground_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider as Arc<dyn LLMProvider>,
+        "foreground-priority-compaction-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("foreground-priority-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    let mut turn_one = Box::pin(agent_loop.process_direct(
+        "Finish this foreground turn before compacting.",
+        &session_key,
+        "test",
+        "offline",
+    ));
+    await_compaction_sync("turn one to enter its foreground provider call", async {
+        tokio::select! {
+            response = turn_one.as_mut() => {
+                panic!("turn one returned before its provider barrier: {response}");
+            }
+            () = first_foreground_started.notified() => {}
+        }
+    })
+    .await;
+
+    assert!(
+        tokio::time::timeout(
+            COMPACTION_BLOCKED_OBSERVATION,
+            soft_generation_started.notified(),
+        )
+        .await
+        .is_err(),
+        "soft generation raced the still-running foreground model call"
+    );
+
+    release_first_foreground.notify_one();
+    assert_eq!(
+        await_compaction_sync("turn one to finish", turn_one.as_mut()).await,
+        "turn one reply"
+    );
+    await_compaction_sync(
+        "soft generation to start after the full foreground loop",
+        soft_generation_started.notified(),
+    )
+    .await;
+
+    let turn_two = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        agent_loop.process_direct(
+            "Foreground work must preempt soft generation.",
+            &session_key,
+            "test",
+            "offline",
+        ),
+    )
+    .await
+    .expect("turn two did not cancel soft generation and reach the foreground provider");
+    assert_eq!(turn_two, "turn two reply");
+}
+
+struct ReplayStableSoftProvider {
+    foreground_calls: std::sync::Mutex<Vec<Vec<Value>>>,
+    foreground_max_tokens: std::sync::Mutex<Vec<u32>>,
+    force_recovery_on_second: bool,
+}
+
+impl ReplayStableSoftProvider {
+    fn foreground_calls(&self) -> Vec<Vec<Value>> {
+        self.foreground_calls.lock().unwrap().clone()
+    }
+
+    fn foreground_max_tokens(&self) -> Vec<u32> {
+        self.foreground_max_tokens.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for ReplayStableSoftProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            return Ok(WireRecordingProvider::plain_text_response(
+                "- Persistent project details, decisions, constraints, acknowledged outcomes, and follow-up context remain available.",
+            ));
+        }
+
+        let call = {
+            let mut calls = self.foreground_calls.lock().unwrap();
+            calls.push(messages.to_vec());
+            self.foreground_max_tokens.lock().unwrap().push(max_tokens);
+            calls.len()
+        };
+        let mut response = if self.force_recovery_on_second && call == 2 {
+            WireRecordingProvider::plain_text_response(
+                "I'll read it.\n[Called read_file({\"path\":\"/x\"})]",
+            )
+        } else if self.force_recovery_on_second && call == 3 {
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("path".to_string(), json!("."));
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_lease_recovery".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments,
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            }
+        } else {
+            WireRecordingProvider::text_response(if call == 1 {
+                "turn one reply"
+            } else {
+                "turn two reply"
+            })
+        };
+        if call == 2 {
+            response
+                .usage
+                .insert("higgs_session_lease_active".to_string(), 1);
+        }
+        Ok(response)
+    }
+
+    fn get_default_model(&self) -> &str {
+        "replay-stable-soft-compaction-test"
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        Some("http://127.0.0.1:1234/v1")
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn published_soft_checkpoint_replays_and_installs_on_next_turn() {
+    let provider = Arc::new(ReplayStableSoftProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
+        force_recovery_on_second: false,
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "replay-stable-soft-compaction-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("replay-stable-soft-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    persist_prior_summary(&core, &session.id).await;
+
+    let mut probe = InboundMessage::new("test", "user", "offline", "probe prior summary");
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    assert!(prepared
+        .messages
+        .iter()
+        .any(|message| message.get("_lcm_summary").is_some()));
+    let compaction = prepared.compaction.clone();
+    drop(prepared);
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    await_compaction_sync("soft checkpoint publication and pending handoff", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(core.sessions.load_summary_nodes(&session.id).await.len() >= 2);
+
+    let epoch_before = agent_loop
+        .shared
+        .core_handle
+        .counters
+        .session_prompt_epoch(&session_key);
+    let installs_before = agent_loop
+        .shared
+        .core_handle
+        .counters
+        .lcm_compaction_count
+        .load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        agent_loop
+            .process_direct("Continue on turn two.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+
+    assert!(!compaction.has_pending().await);
+    assert!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .session_prompt_epoch(&session_key)
+            > epoch_before,
+        "installing the replayable soft checkpoint did not rotate the prompt cache"
+    );
+    assert!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .lcm_compaction_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > installs_before,
+        "the pending soft checkpoint was not installed"
+    );
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("To read the exact originals call"))
+    }));
+}
+
+#[tokio::test]
+async fn soft_checkpoint_survives_turn_finish_journal_failure() {
+    // Break caught: a durably-checkpointed LCM compaction was discarded when
+    // the final replay journal write failed, so the compacted context never
+    // installed on the next turn (prefix-divergence class).
+    let provider = Arc::new(ReplayStableSoftProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
+        force_recovery_on_second: false,
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "replay-stable-soft-compaction-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("replay-soft-fault-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    persist_prior_summary(&core, &session.id).await;
+
+    let mut probe = InboundMessage::new("test", "user", "offline", "probe prior summary");
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    assert!(prepared
+        .messages
+        .iter()
+        .any(|message| message.get("_lcm_summary").is_some()));
+    let compaction = prepared.compaction.clone();
+    drop(prepared);
+
+    // Fail both turn-finish journal writes of turn one: the foreground
+    // finalize and the compaction close. Reply and checkpoint must both
+    // survive; replay degrades to Incomplete.
+    core.sessions.fail_turn_finished_writes_for_tests(2);
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    await_compaction_sync(
+        "soft checkpoint publication despite journal failure",
+        async {
+            while !compaction.has_pending().await {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await;
+
+    let installs_before = agent_loop
+        .shared
+        .core_handle
+        .counters
+        .lcm_compaction_count
+        .load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        agent_loop
+            .process_direct("Continue on turn two.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+
+    assert!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .lcm_compaction_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > installs_before,
+        "the checkpoint must install despite the journal failure"
+    );
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("To read the exact originals call"))
+    }));
+}
+
+#[tokio::test]
+async fn exact_soft_compaction_leases_old_higgs_id_before_fresh_rotation() {
+    let provider = Arc::new(ReplayStableSoftProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
+        force_recovery_on_second: true,
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "exact-soft-checkpoint-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("exact-soft-checkpoint-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("exact soft checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let old_epoch = counters.session_prompt_epoch(&session_key);
+    let old_id = crate::agent::agent_core::stable_higgs_session_id(&session.id, old_epoch);
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+
+    let checkpoint = counters
+        .expansion_checkpoint(&session_key)
+        .expect("exact raw replacement must retain an expansion checkpoint");
+    assert_eq!(checkpoint.old_higgs_session_id, old_id);
+    assert!(checkpoint.lease_confirmed);
+    assert!(!checkpoint.replaced_span.is_empty());
+    assert!(checkpoint
+        .replaced_span
+        .iter()
+        .all(|message| message.get("_db_id").is_some()));
+    assert_eq!(counters.pending_higgs_session_lease(&session_key), None);
+    assert_ne!(
+        crate::agent::agent_core::stable_higgs_session_id(
+            &session.id,
+            counters.session_prompt_epoch(&session_key),
+        ),
+        old_id
+    );
+    assert!(!counters.record_higgs_session_id(&session_key, old_id));
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 4);
+    let second_request_id = calls[1][0]
+        .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD)
+        .and_then(Value::as_u64)
+        .expect("the second provider request must carry an active Higgs marker");
+    assert_ne!(second_request_id, old_id);
+    assert_eq!(
+        counters.active_higgs_session_id(&session_key),
+        Some(second_request_id)
+    );
+    assert_eq!(
+        calls[1][0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD],
+        json!({"session_id": old_id, "ttl_seconds": 300})
+    );
+    assert_eq!(
+        calls[1][0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+        json!("best_effort")
+    );
+    assert_eq!(
+        calls[1][0][crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD],
+        json!(1_000_000_u32.saturating_sub(provider.foreground_max_tokens()[1]))
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|messages| {
+                messages[0]
+                    .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD)
+                    .is_some()
+            })
+            .count(),
+        1,
+        "forced recovery and later tool iterations must not replay the one-shot lease"
+    );
+    assert!(calls[2][0]
+        .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD)
+        .is_none());
+}
+
+#[derive(Clone)]
+struct RetainedRouteCapture {
+    messages: Vec<Value>,
+    max_tokens: u32,
+}
+
+struct RetainedRouteProvider {
+    foreground_calls: std::sync::Mutex<Vec<RetainedRouteCapture>>,
+    route_failure: Option<RetainedRouteFailure>,
+}
+
+struct RetainedAbortProvider {
+    foreground_calls: std::sync::Mutex<usize>,
+    foreground_entered: tokio::sync::Notify,
+    preflight_watermark: std::sync::Mutex<
+        Option<(
+            Arc<crate::agent::agent_core::RuntimeCounters>,
+            String,
+            usize,
+        )>,
+    >,
+}
+
+#[async_trait]
+impl LLMProvider for RetainedAbortProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            return Ok(WireRecordingProvider::plain_text_response(
+                "- Persistent project details, decisions, constraints, acknowledged outcomes, and follow-up context remain available.",
+            ));
+        }
+        let call = {
+            let mut calls = self.foreground_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        match call {
+            1 => Ok(WireRecordingProvider::text_response("turn one reply")),
+            2 => {
+                let mut response = WireRecordingProvider::text_response("turn two reply");
+                response
+                    .usage
+                    .insert("higgs_session_lease_active".to_string(), 1);
+                Ok(response)
+            }
+            3 => {
+                if let Some((counters, session_key, watermark)) =
+                    self.preflight_watermark.lock().unwrap().take()
+                {
+                    counters
+                        .prompt_cache_watermark
+                        .lock()
+                        .insert(session_key, watermark);
+                }
+                Ok(crate::providers::base::LLMResponse {
+                    content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: FinishReason::Stop,
+                    usage: std::collections::HashMap::new(),
+                })
+            }
+            _ => {
+                self.foreground_entered.notify_one();
+                std::future::pending().await
+            }
+        }
+    }
+
+    fn get_default_model(&self) -> &str {
+        "retained-abort-test"
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        Some("http://127.0.0.1:1234/v1")
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RetainedRouteFailure {
+    PreflightUnavailable,
+    PreflightContextOverflow,
+    ForegroundUnavailable,
+    RecoveryUnavailable,
+    RecoveryContextOverflow,
+    PostToolUnavailable,
+    PostToolContextOverflow,
+}
+
+fn retained_route_provider_error(failure: RetainedRouteFailure) -> anyhow::Error {
+    let (status, message) = match failure {
+        RetainedRouteFailure::PreflightContextOverflow
+        | RetainedRouteFailure::RecoveryContextOverflow
+        | RetainedRouteFailure::PostToolContextOverflow => (
+            400,
+            r#"{"error":{"message":"maximum context length exceeded"}}"#,
+        ),
+        _ => (409, "retained session expired: prompt mismatch"),
+    };
+    crate::errors::ProviderError::HttpStatus {
+        status,
+        code: None,
+        message: message.to_string(),
+    }
+    .into()
+}
+
+impl RetainedRouteProvider {
+    fn foreground_calls(&self) -> Vec<RetainedRouteCapture> {
+        self.foreground_calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for RetainedRouteProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            return Ok(WireRecordingProvider::plain_text_response(
+                "- Persistent project details, decisions, constraints, acknowledged outcomes, and follow-up context remain available.",
+            ));
+        }
+
+        let call = {
+            let mut calls = self.foreground_calls.lock().unwrap();
+            calls.push(RetainedRouteCapture {
+                messages: messages.to_vec(),
+                max_tokens,
+            });
+            calls.len()
+        };
+        match call {
+            1 => Ok(WireRecordingProvider::text_response("turn one reply")),
+            2 => {
+                let mut response = WireRecordingProvider::text_response("turn two reply");
+                response
+                    .usage
+                    .insert("higgs_session_lease_active".to_string(), 1);
+                Ok(response)
+            }
+            3 => match self.route_failure {
+                Some(RetainedRouteFailure::PreflightUnavailable) => Err(
+                    retained_route_provider_error(RetainedRouteFailure::PreflightUnavailable),
+                ),
+                Some(RetainedRouteFailure::PreflightContextOverflow) => Err(
+                    retained_route_provider_error(RetainedRouteFailure::PreflightContextOverflow),
+                ),
+                Some(
+                    RetainedRouteFailure::ForegroundUnavailable
+                    | RetainedRouteFailure::RecoveryUnavailable
+                    | RetainedRouteFailure::RecoveryContextOverflow
+                    | RetainedRouteFailure::PostToolUnavailable
+                    | RetainedRouteFailure::PostToolContextOverflow,
+                )
+                | None => Ok(crate::providers::base::LLMResponse {
+                    content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: FinishReason::Stop,
+                    usage: std::collections::HashMap::new(),
+                }),
+            },
+            4 if matches!(
+                self.route_failure,
+                Some(
+                    RetainedRouteFailure::PreflightUnavailable
+                        | RetainedRouteFailure::PreflightContextOverflow
+                )
+            ) =>
+            {
+                Ok(WireRecordingProvider::text_response(
+                    "active fallback answer",
+                ))
+            }
+            4 if matches!(
+                self.route_failure,
+                Some(RetainedRouteFailure::ForegroundUnavailable)
+            ) =>
+            {
+                Err(retained_route_provider_error(
+                    RetainedRouteFailure::ForegroundUnavailable,
+                ))
+            }
+            4 if matches!(
+                self.route_failure,
+                Some(
+                    RetainedRouteFailure::RecoveryUnavailable
+                        | RetainedRouteFailure::RecoveryContextOverflow
+                )
+            ) =>
+            {
+                Ok(WireRecordingProvider::plain_text_response(
+                    "I'll read it.\n[Called read_file({\"path\":\"/x\"})]",
+                ))
+            }
+            4 => {
+                let mut arguments = std::collections::HashMap::new();
+                arguments.insert("path".to_string(), json!("."));
+                Ok(crate::providers::base::LLMResponse {
+                    content: None,
+                    tool_calls: vec![crate::providers::base::ToolCallRequest {
+                        id: "tc_retained_list".to_string(),
+                        name: "list_dir".to_string(),
+                        arguments,
+                    }],
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: std::collections::HashMap::new(),
+                })
+            }
+            5 if matches!(
+                self.route_failure,
+                Some(RetainedRouteFailure::ForegroundUnavailable)
+            ) =>
+            {
+                Ok(WireRecordingProvider::text_response(
+                    "active fallback answer",
+                ))
+            }
+            5 if matches!(
+                self.route_failure,
+                Some(
+                    RetainedRouteFailure::RecoveryUnavailable
+                        | RetainedRouteFailure::RecoveryContextOverflow
+                        | RetainedRouteFailure::PostToolUnavailable
+                        | RetainedRouteFailure::PostToolContextOverflow
+                )
+            ) =>
+            {
+                Err(retained_route_provider_error(self.route_failure.unwrap()))
+            }
+            5 => Ok(WireRecordingProvider::text_response(
+                "retained final answer",
+            )),
+            6 if matches!(
+                self.route_failure,
+                Some(
+                    RetainedRouteFailure::RecoveryUnavailable
+                        | RetainedRouteFailure::RecoveryContextOverflow
+                        | RetainedRouteFailure::PostToolUnavailable
+                        | RetainedRouteFailure::PostToolContextOverflow
+                )
+            ) =>
+            {
+                Ok(WireRecordingProvider::text_response(
+                    "active fallback answer",
+                ))
+            }
+            _ => Ok(WireRecordingProvider::text_response("next active answer")),
+        }
+    }
+
+    fn get_default_model(&self) -> &str {
+        "retained-route-e2e-test"
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        Some("http://127.0.0.1:1234/v1")
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        true
+    }
+}
+
+async fn confirmed_retained_route_harness(
+    failure: RetainedRouteFailure,
+) -> (
+    AgentLoop,
+    Arc<RetainedRouteProvider>,
+    String,
+    Arc<crate::agent::agent_core::RuntimeCounters>,
+    u64,
+    u64,
+) {
+    let provider = Arc::new(RetainedRouteProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        route_failure: Some(failure),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "retained-route-e2e-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("retained-route-review-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("review checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let old_id = crate::agent::agent_core::stable_higgs_session_id(
+        &session.id,
+        counters.session_prompt_epoch(&session_key),
+    );
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+    let fresh_id = counters.active_higgs_session_id(&session_key).unwrap();
+    (
+        agent_loop,
+        provider,
+        session_key,
+        counters,
+        old_id,
+        fresh_id,
+    )
+}
+
+fn without_higgs_control(mut messages: Vec<Value>) -> Vec<Value> {
+    if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
+        for field in [
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD,
+        ] {
+            first.remove(field);
+        }
+    }
+    messages
+}
+
+#[tokio::test]
+async fn retained_expansion_preflight_persists_old_route_through_tools_then_deletes() {
+    let provider = Arc::new(RetainedRouteProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        route_failure: None,
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "retained-route-e2e-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("retained-route-e2e-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("retained-route soft checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let old_id = crate::agent::agent_core::stable_higgs_session_id(
+        &session.id,
+        counters.session_prompt_epoch(&session_key),
+    );
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+    let checkpoint = counters
+        .expansion_checkpoint(&session_key)
+        .expect("turn two must leave a confirmed checkpoint");
+    assert!(checkpoint.lease_confirmed);
+    assert_eq!(checkpoint.old_higgs_session_id, old_id);
+    let fresh_id = counters
+        .active_higgs_session_id(&session_key)
+        .expect("compaction must activate a fresh compacted ID");
+    assert_ne!(fresh_id, old_id);
+
+    let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(
+        agent_loop
+            .process_direct_streaming(
+                "Use the persistent project detail decisions and constraints, inspect the workspace, then answer.",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                text_delta_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await,
+        "retained final answer"
+    );
+
+    assert_eq!(
+        agent_loop
+            .process_direct(
+                "Start the next active turn.",
+                &session_key,
+                "test",
+                "offline"
+            )
+            .await,
+        "next active answer"
+    );
+
+    let calls = provider.foreground_calls();
+    assert_eq!(
+        calls.len(),
+        6,
+        "unexpected foreground/preflight call sequence"
+    );
+    assert_eq!(
+        calls[2].max_tokens, 0,
+        "retained preflight must be non-generating"
+    );
+    for call in &calls[2..5] {
+        assert_eq!(
+            call.messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        assert_eq!(
+            call.messages[0]
+                [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+            json!("require_continuation")
+        );
+        assert!(call.messages[0]
+            .get(crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD)
+            .is_none());
+    }
+    let authoritative_limit = 1_000_000_u32.saturating_sub(calls[3].max_tokens);
+    assert_eq!(
+        calls[2].messages[0]
+            [crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD],
+        json!(authoritative_limit)
+    );
+    assert!(calls[2].messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("persistent project detail"))
+    }));
+    assert_eq!(
+        calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+        json!(fresh_id)
+    );
+    assert_eq!(
+        calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
+        json!(old_id),
+        "old retained ID must first be deleted after the terminal retained response"
+    );
+    assert_eq!(
+        counters.active_higgs_session_id(&session_key),
+        Some(fresh_id)
+    );
+    assert_eq!(counters.expansion_checkpoint(&session_key), None);
+    let replay = core
+        .sessions
+        .load_session_replay(&session.id)
+        .await
+        .unwrap();
+    assert!(replay.model_calls.iter().any(|call| {
+        call.purpose == crate::session::db::ModelCallPurpose::RetainedExpansionPreflight
+            && call.response.is_some()
+    }));
+}
+
+#[tokio::test]
+async fn retained_preflight_failures_fall_back_without_rotating_active_session() {
+    for failure in [
+        RetainedRouteFailure::PreflightUnavailable,
+        RetainedRouteFailure::PreflightContextOverflow,
+    ] {
+        let provider = Arc::new(RetainedRouteProvider {
+            foreground_calls: std::sync::Mutex::new(Vec::new()),
+            route_failure: Some(failure),
+        });
+        let lcm_config = LcmSchemaConfig {
+            tau_soft: 0.0001,
+            tau_hard: 10.0,
+            deterministic_target: 64,
+            ..Default::default()
+        };
+        let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+            provider.clone() as Arc<dyn LLMProvider>,
+            "retained-route-fallback-test",
+            1_000_000,
+            lcm_config,
+        );
+        let session_key = format!("retained-route-fallback-{}", uuid::Uuid::new_v4());
+        let core = agent_loop.shared.core_handle.swappable();
+        let counters = agent_loop.shared.core_handle.counters.clone();
+        let session = core.sessions.get_or_resume(&session_key).await;
+        seed_compaction_history(&core, &session.id, 12, 40).await;
+
+        assert_eq!(
+            agent_loop
+                .process_direct("Finish turn one.", &session_key, "test", "offline")
+                .await,
+            "turn one reply"
+        );
+        let compaction = agent_loop
+            .shared
+            .compaction_handle_for_session(&session.id)
+            .await;
+        await_compaction_sync("retained fallback checkpoint publication", async {
+            while !compaction.has_pending().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let old_id = crate::agent::agent_core::stable_higgs_session_id(
+            &session.id,
+            counters.session_prompt_epoch(&session_key),
+        );
+        assert_eq!(
+            agent_loop
+                .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+                .await,
+            "turn two reply"
+        );
+        let fresh_id = counters
+            .active_higgs_session_id(&session_key)
+            .expect("compaction must leave a fresh active session");
+        let epoch = counters.session_prompt_epoch(&session_key);
+
+        assert_eq!(
+            agent_loop
+                .process_direct(
+                    "Use the persistent project detail decisions and constraints.",
+                    &session_key,
+                    "test",
+                    "offline",
+                )
+                .await,
+            "active fallback answer"
+        );
+
+        let calls = provider.foreground_calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[2].max_tokens, 0);
+        assert_eq!(
+            calls[2].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        assert_eq!(
+            calls[2].messages[0]
+                [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+            json!("require_continuation")
+        );
+        assert_eq!(
+            calls[3].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(fresh_id)
+        );
+        assert_eq!(
+            calls[3].messages[0]
+                [crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        let active_prompt = serde_json::to_string(&calls[3].messages).unwrap();
+        match failure {
+            RetainedRouteFailure::PreflightUnavailable => assert!(
+                active_prompt.contains("[Auto-expanded originals"),
+                "409 fallback must use the bounded flattened reconstruction"
+            ),
+            RetainedRouteFailure::PreflightContextOverflow => assert!(
+                !active_prompt.contains("[Auto-expanded originals")
+                    && !active_prompt.contains("turn 0: persistent project detail"),
+                "overflow fallback must answer from the compacted summary"
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(counters.session_prompt_epoch(&session_key), epoch);
+        assert_eq!(
+            counters.active_higgs_session_id(&session_key),
+            Some(fresh_id)
+        );
+        assert_eq!(counters.expansion_checkpoint(&session_key), None);
+    }
+}
+
+#[tokio::test]
+async fn retained_foreground_409_retries_once_on_fresh_active_route() {
+    let provider = Arc::new(RetainedRouteProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        route_failure: Some(RetainedRouteFailure::ForegroundUnavailable),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "retained-route-foreground-409-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("retained-route-foreground-409-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("retained foreground checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let old_id = crate::agent::agent_core::stable_higgs_session_id(
+        &session.id,
+        counters.session_prompt_epoch(&session_key),
+    );
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+    let fresh_id = counters
+        .active_higgs_session_id(&session_key)
+        .expect("compaction must leave a fresh active session");
+    let epoch = counters.session_prompt_epoch(&session_key);
+
+    assert_eq!(
+        agent_loop
+            .process_direct(
+                "Use the persistent project detail decisions and constraints.",
+                &session_key,
+                "test",
+                "offline",
+            )
+            .await,
+        "active fallback answer"
+    );
+
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 5);
+    for call in &calls[2..4] {
+        assert_eq!(
+            call.messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        assert_eq!(
+            call.messages[0]
+                [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+            json!("require_continuation")
+        );
+    }
+    assert_eq!(
+        calls[4].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+        json!(fresh_id)
+    );
+    assert_eq!(
+        calls[4].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
+        json!(old_id)
+    );
+    assert!(serde_json::to_string(&calls[4].messages)
+        .unwrap()
+        .contains("[Auto-expanded originals"));
+    assert_eq!(counters.session_prompt_epoch(&session_key), epoch);
+    assert_eq!(
+        counters.active_higgs_session_id(&session_key),
+        Some(fresh_id)
+    );
+    assert_eq!(counters.expansion_checkpoint(&session_key), None);
+}
+
+#[tokio::test]
+async fn retained_forced_recovery_error_retries_on_active_bounded_route() {
+    for failure in [
+        RetainedRouteFailure::RecoveryUnavailable,
+        RetainedRouteFailure::RecoveryContextOverflow,
+    ] {
+        let (agent_loop, provider, session_key, counters, old_id, fresh_id) =
+            confirmed_retained_route_harness(failure).await;
+        assert_eq!(
+            agent_loop
+                .process_direct(
+                    "Use the persistent project detail decisions and constraints.",
+                    &session_key,
+                    "test",
+                    "offline",
+                )
+                .await,
+            "active fallback answer"
+        );
+        let calls = provider.foreground_calls();
+        assert_eq!(calls.len(), 6);
+        for call in &calls[2..5] {
+            assert_eq!(
+                call.messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+                json!(old_id)
+            );
+        }
+        assert_eq!(
+            calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(fresh_id)
+        );
+        let active_prompt = serde_json::to_string(&calls[5].messages).unwrap();
+        match failure {
+            RetainedRouteFailure::RecoveryUnavailable => {
+                assert!(active_prompt.contains("[Auto-expanded originals"));
+            }
+            RetainedRouteFailure::RecoveryContextOverflow => {
+                assert!(!active_prompt.contains("[Auto-expanded originals"));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(counters.expansion_checkpoint(&session_key), None);
+        assert_eq!(
+            counters.active_higgs_session_id(&session_key),
+            Some(fresh_id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn streamed_retained_recovery_failure_retracts_before_active_fallback() {
+    let (agent_loop, provider, session_key, _counters, old_id, fresh_id) =
+        confirmed_retained_route_harness(RetainedRouteFailure::RecoveryUnavailable).await;
+    let (text_delta_tx, mut text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(
+        agent_loop
+            .process_direct_streaming(
+                "Use the persistent project detail decisions and constraints.",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                text_delta_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await,
+        "active fallback answer"
+    );
+    let mut deltas = Vec::new();
+    while let Ok(delta) = text_delta_rx.try_recv() {
+        deltas.push(delta);
+    }
+    let streamed = deltas.join("");
+    let retract = crate::turn_stream::ControlMarker::RetractReply.encode();
+    let retract_at = streamed
+        .find(&retract)
+        .expect("malformed retained text must be retracted before fallback");
+    assert!(streamed[..retract_at].contains("I'll read it."));
+    let tail = &streamed[retract_at + retract.len()..];
+    assert_eq!(tail.matches("active fallback answer").count(), 1);
+    assert!(!tail.contains("I'll read it."));
+
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 6);
+    assert_eq!(
+        calls[4].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+        json!(old_id)
+    );
+    assert_eq!(
+        calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+        json!(fresh_id)
+    );
+}
+
+#[tokio::test]
+async fn post_tool_stream_failure_restores_active_cache_and_bounded_prompt() {
+    for failure in [
+        RetainedRouteFailure::PostToolUnavailable,
+        RetainedRouteFailure::PostToolContextOverflow,
+    ] {
+        let (agent_loop, provider, session_key, counters, old_id, fresh_id) =
+            confirmed_retained_route_harness(failure).await;
+        let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            agent_loop
+                .process_direct_streaming(
+                    "Use the persistent project detail decisions and constraints, inspect the workspace, then answer.",
+                    &session_key,
+                    "test",
+                    "offline",
+                    None,
+                    text_delta_tx,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+            "active fallback answer"
+        );
+        let calls = provider.foreground_calls();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(
+            calls[4].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+        assert_eq!(
+            calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(fresh_id)
+        );
+        let active_prompt = serde_json::to_string(&calls[5].messages).unwrap();
+        match failure {
+            RetainedRouteFailure::PostToolUnavailable => {
+                assert!(active_prompt.contains("[Auto-expanded originals"));
+            }
+            RetainedRouteFailure::PostToolContextOverflow => {
+                assert!(!active_prompt.contains("[Auto-expanded originals"));
+            }
+            _ => unreachable!(),
+        }
+        let expected_fingerprint = crate::agent::prompt_fingerprint::fingerprint(
+            &without_higgs_control(calls[5].messages.clone()),
+        );
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(&session_key),
+            Some(&expected_fingerprint)
+        );
+        assert_eq!(
+            counters.prompt_cache_watermark.lock().get(&session_key),
+            Some(&match failure {
+                RetainedRouteFailure::PostToolUnavailable => 21,
+                RetainedRouteFailure::PostToolContextOverflow => 20,
+                _ => unreachable!(),
+            }),
+            "the watermark must track the selected bounded logical prompt"
+        );
+        assert_eq!(
+            counters
+                .cache_diverged
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "leaving the retained route must not manufacture a cache divergence"
+        );
+        assert_eq!(counters.expansion_checkpoint(&session_key), None);
+        assert_eq!(
+            counters.active_higgs_session_id(&session_key),
+            Some(fresh_id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn abort_after_retained_preflight_discards_checkpoint_via_context_drop() {
+    let provider = Arc::new(RetainedAbortProvider {
+        foreground_calls: std::sync::Mutex::new(0),
+        foreground_entered: tokio::sync::Notify::new(),
+        preflight_watermark: std::sync::Mutex::new(None),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "retained-abort-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("retained-abort-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    let compaction = agent_loop
+        .shared
+        .compaction_handle_for_session(&session.id)
+        .await;
+    await_compaction_sync("retained abort checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        agent_loop
+            .process_direct("Install exact checkpoint.", &session_key, "test", "offline")
+            .await,
+        "turn two reply"
+    );
+    let checkpoint = counters.expansion_checkpoint(&session_key).unwrap();
+    let active_fingerprint = counters
+        .prompt_fingerprints
+        .lock()
+        .get(&session_key)
+        .cloned()
+        .expect("the compacted active route must have a fingerprint");
+    let active_watermark = counters
+        .prompt_cache_watermark
+        .lock()
+        .get(&session_key)
+        .copied()
+        .expect("the compacted active route must have a watermark");
+    *provider.preflight_watermark.lock().unwrap() =
+        Some((Arc::clone(&counters), session_key.clone(), active_watermark));
+
+    let mut retained_turn = Box::pin(agent_loop.process_direct(
+        "Use the persistent project detail decisions and constraints.",
+        &session_key,
+        "test",
+        "offline",
+    ));
+    tokio::select! {
+        () = provider.foreground_entered.notified() => {}
+        result = &mut retained_turn => panic!("retained foreground unexpectedly completed: {result}"),
+    }
+    drop(retained_turn);
+
+    assert_eq!(counters.expansion_checkpoint(&session_key), None);
+    assert_eq!(
+        counters.pending_higgs_session_drop_ids(&session_key),
+        vec![checkpoint.old_higgs_session_id]
+    );
+    assert_eq!(
+        counters.prompt_fingerprints.lock().get(&session_key),
+        Some(&active_fingerprint)
+    );
+    assert_eq!(
+        counters.prompt_cache_watermark.lock().get(&session_key),
+        Some(&active_watermark)
+    );
+}
+
+#[tokio::test]
+async fn cloud_working_memory_prefix_change_allows_soft_checkpoint_install() {
+    let provider = Arc::new(ReplayStableSoftProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
+        force_recovery_on_second: false,
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_cloud_inline_harness_with_memory(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "cloud-working-memory-soft-compaction-test",
+        1_000_000,
+        lcm_config,
+        MemoryConfig::default(),
+    );
+    let session_key = format!("cloud-working-memory-soft-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    persist_prior_summary(&core, &session.id).await;
+
+    let mut probe = InboundMessage::new("test", "user", "offline", "probe cloud prefix");
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    let developer_before = prepared
+        .messages
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("developer"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .expect("cloud prompt must have a developer prefix")
+        .to_string();
+    let compaction = prepared.compaction.clone();
+    drop(prepared);
+
+    assert_eq!(
+        agent_loop
+            .process_direct("Finish cloud turn one.", &session_key, "test", "offline")
+            .await,
+        "turn one reply"
+    );
+    await_compaction_sync("cloud soft checkpoint publication", async {
+        while !compaction.has_pending().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        core.working_memory
+            .get_context(&session.id, usize::MAX)
+            .await
+            .unwrap(),
+        "- Persistent project details, decisions, constraints, acknowledged outcomes, and follow-up context remain available."
+    );
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .lcm_compaction_count
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "publication must not install the checkpoint before the next turn"
+    );
+
+    let mut next_probe = InboundMessage::new("test", "user", "offline", "probe changed prefix");
+    next_probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&next_probe, None, None, None, None)
+        .await;
+    let developer_after = prepared
+        .messages
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("developer"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .expect("working memory must remain in the developer prefix");
+    assert_ne!(developer_after, developer_before);
+    assert!(developer_after.contains("Working Memory (Current Session)"));
+    assert!(developer_after.contains("Persistent project details"));
+    assert!(compaction.has_pending().await);
+    drop(prepared);
+
+    let (text_delta_tx, mut text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(
+        agent_loop
+            .process_direct_streaming(
+                "Continue cloud turn two.",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                text_delta_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await,
+        "turn two reply"
+    );
+
+    assert!(!compaction.has_pending().await);
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .lcm_compaction_count
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the pending cloud checkpoint was not installed exactly once"
+    );
+    assert!(
+        std::iter::from_fn(|| text_delta_rx.try_recv().ok())
+            .any(|delta| delta == "\0cache:reset:lcm_checkpoint"),
+        "installing after a developer-prefix change did not reset the prompt cache"
+    );
+    let calls = provider.foreground_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("To read the exact originals call"))
+    }));
+}
+
+struct SoftTurnCancellationProvider {
+    generation_started: Arc<tokio::sync::Notify>,
+    generation_dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl LLMProvider for SoftTurnCancellationProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            let _drop = CompactionTaskDrop(self.generation_dropped.clone());
+            self.generation_started.notify_one();
+            return std::future::pending().await;
+        }
+        Ok(WireRecordingProvider::text_response("foreground reply"))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "soft-turn-cancellation-test"
+    }
+}
+
+#[tokio::test]
+async fn turn_cancellation_after_soft_start_rolls_back_without_checkpoint() {
+    let generation_started = Arc::new(tokio::sync::Notify::new());
+    let generation_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = Arc::new(SoftTurnCancellationProvider {
+        generation_started: generation_started.clone(),
+        generation_dropped: generation_dropped.clone(),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider as Arc<dyn LLMProvider>,
+        "soft-turn-cancellation-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("soft-turn-cancellation-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+
+    let mut probe = InboundMessage::new("test", "user", "offline", "probe soft state");
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    let compaction = prepared.compaction.clone();
+    let engine = agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .unwrap();
+    let (active_before, dag_before, store_before) = {
+        let engine = engine.lock().await;
+        (
+            engine.active_context(),
+            serde_json::to_value(engine.dag()).unwrap(),
+            engine.store_len(),
+        )
+    };
+    drop(prepared);
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut turn = agent_loop.spawn_direct_streaming(
+        "Finish foreground work, then start soft generation.".to_string(),
+        session_key,
+        "test".to_string(),
+        "offline".to_string(),
+        None,
+        text_delta_tx,
+        None,
+        Some(cancellation.clone()),
+        None,
+    );
+    await_compaction_sync(
+        "soft generation to start after foreground work",
+        generation_started.notified(),
+    )
+    .await;
+    cancellation.cancel();
+    let _ = await_compaction_sync("foreground turn to finish", &mut turn)
+        .await
+        .unwrap();
+    await_compaction_sync(
+        "turn cancellation to finish owned soft generation",
+        compaction.wait_for_completion(),
+    )
+    .await;
+
+    assert!(generation_dropped.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!compaction.has_job().await);
+    assert!(!compaction.has_pending().await);
+    let engine = engine.lock().await;
+    assert_eq!(serde_json::to_value(engine.dag()).unwrap(), dag_before);
+    let active_after = engine.active_context();
+    let durable_turn_tail = active_after
+        .strip_prefix(active_before.as_slice())
+        .expect("cancellation changed the pre-turn active context");
+    assert_eq!(
+        durable_turn_tail
+            .iter()
+            .map(|message| (
+                message.get("role").and_then(Value::as_str),
+                message.get("content").and_then(Value::as_str),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                Some("user"),
+                Some("Finish foreground work, then start soft generation."),
+            ),
+            (Some("assistant"), Some("foreground reply")),
+        ]
+    );
+    assert_eq!(engine.store_len(), store_before + durable_turn_tail.len());
+    drop(engine);
+    assert!(core
+        .sessions
+        .load_summary_nodes(&session.id)
+        .await
+        .is_empty());
+}
+
+struct HardCancellationProvider {
+    compaction_started: Arc<tokio::sync::Notify>,
+    foreground_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for HardCancellationProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            self.compaction_started.notify_one();
+            return std::future::pending().await;
+        }
+        self.foreground_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(WireRecordingProvider::text_response(
+            "cancelled turn reached foreground inference",
+        ))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "hard-compaction-cancellation-test"
+    }
+}
+
+#[tokio::test]
+async fn cancelling_hard_compaction_restores_engine_without_publishing_checkpoint() {
+    const CANCELLATION_PROMPT: &str = "persistent project detail decisions constraints";
+    let compaction_started = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(HardCancellationProvider {
+        compaction_started: compaction_started.clone(),
+        foreground_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.05,
+        tau_hard: 0.10,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "hard-compaction-cancellation-test",
+        8192,
+        lcm_config,
+    );
+    let session_key = format!("hard-cancellation-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 20, 12).await;
+    persist_prior_summary(&core, &session.id).await;
+
+    let mut probe = InboundMessage::new("test", "user", "offline", CANCELLATION_PROMPT);
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let prepared = agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+    let compaction = prepared.compaction.clone();
+    let engine = agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .expect("hard-pressure session must own an LCM engine");
+    let (active_before, dag_before, store_before) = {
+        let engine = engine.lock().await;
+        (
+            engine.active_context(),
+            serde_json::to_value(engine.dag()).unwrap(),
+            engine.store_len(),
+        )
+    };
+    let durable_before = core.sessions.load_summary_nodes(&session.id).await;
+    drop(prepared);
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut turn = agent_loop.spawn_direct_streaming(
+        CANCELLATION_PROMPT.to_string(),
+        session_key,
+        "test".to_string(),
+        "offline".to_string(),
+        None,
+        text_delta_tx,
+        None,
+        Some(cancellation.clone()),
+        None,
+    );
+    await_compaction_sync(
+        "hard compaction to enter provider generation",
+        compaction_started.notified(),
+    )
+    .await;
+
+    cancellation.cancel();
+    let response = match tokio::time::timeout(std::time::Duration::from_secs(2), &mut turn).await {
+        Ok(joined) => joined.expect("hard-cancelled foreground task panicked"),
+        Err(_) => {
+            turn.abort();
+            let _ = await_compaction_sync("timed-out hard turn to abort", &mut turn).await;
+            panic!("hard compaction ignored the current turn cancellation token");
+        }
+    };
+    assert!(response.is_empty(), "cancelled turn returned: {response}");
+    assert_eq!(
+        provider
+            .foreground_calls
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a cancelled hard-compaction turn must not make a foreground model request"
+    );
+    assert!(!compaction.has_job().await);
+    assert!(!compaction.has_pending().await);
+
+    let engine = await_compaction_sync("restored LCM engine lock", engine.lock()).await;
+    assert_eq!(serde_json::to_value(engine.dag()).unwrap(), dag_before);
+    let active_after = engine.active_context();
+    assert!(
+        active_after.starts_with(&active_before),
+        "cancelled compaction did not restore the pre-existing active context"
+    );
+    assert_eq!(
+        active_after.len(),
+        active_before.len() + 1,
+        "only the eagerly persisted current user turn may extend active context"
+    );
+    assert_eq!(engine.store_len(), store_before + 1);
+    let expanded = engine.plan_auto_expansion(&core.token_budget, 0, 0);
+    assert!(
+        expanded.iter().any(|message| {
+            message
+                .flattened_fallback
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("persistent project detail"))
+        }),
+        "hard cancellation consumed prior-summary auto-expand eligibility"
+    );
+    drop(engine);
+    assert_eq!(
+        core.sessions.load_summary_nodes(&session.id).await,
+        durable_before,
+        "cancelled hard compaction changed durable summary checkpoints"
+    );
+}
+
+const COMPACTION_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const COMPACTION_BLOCKED_OBSERVATION: std::time::Duration = std::time::Duration::from_millis(250);
+
+async fn await_compaction_sync<T>(
+    context: &str,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::time::timeout(COMPACTION_SYNC_TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("timed out after {COMPACTION_SYNC_TIMEOUT:?} while waiting for {context}")
+        })
+}
+
+#[tokio::test]
+async fn cancelled_before_engine_lock_keeps_soft_compaction_retryable() {
+    use crate::agent::agent_loop::compaction::{execute_lcm_compaction, CompactionPublication};
+    use crate::agent::lcm::{CompactionAction, CompactionFailureMode, LcmConfig, LcmEngine};
+    use tokio_util::sync::CancellationToken;
+
+    let provider = MockLLM::named("cancelled-before-engine-lock-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_or_resume("cancelled-before-engine-lock")
+        .await;
+    let message = json!({
+        "role": "user",
+        "content": "soft pressure context ".repeat(100),
+        "_db_id": 1,
+    });
+    let messages = vec![message.clone()];
+    let mut engine = LcmEngine::new(LcmConfig {
+        tau_soft: 0.01,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+    });
+    engine.ingest(message);
+    assert_eq!(
+        engine.check_thresholds(&core.token_budget, 0),
+        CompactionAction::Async
+    );
+    let engine = Arc::new(tokio::sync::Mutex::new(engine));
+
+    let engine_guard = engine.lock().await;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let result = await_compaction_sync(
+        "pre-lock cancellation to finish without acquiring the engine",
+        execute_lcm_compaction(
+            core.clone(),
+            session.id,
+            engine.clone(),
+            messages,
+            1,
+            CompactionFailureMode::PreserveContext,
+            cancellation,
+            Arc::new(CompactionPublication::new()),
+        ),
+    )
+    .await;
+    assert!(result.is_none());
+    drop(engine_guard);
+
+    assert_eq!(
+        engine.lock().await.check_thresholds(&core.token_budget, 0),
+        CompactionAction::Async,
+        "cancellation before acquisition must leave soft compaction retryable"
+    );
+}
+
+struct BlockingCompactionProvider {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl LLMProvider for BlockingCompactionProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.started.notify_one();
+        await_compaction_sync(
+            "blocking compaction provider to receive its release",
+            self.release.notified(),
+        )
+        .await;
+        Ok(WireRecordingProvider::plain_text_response(
+            "- Prior turns retain project details, decisions, constraints, and follow-up context.",
+        ))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "owned-blocking-publication-test"
+    }
+}
+
+#[tokio::test]
+async fn blocking_compaction_publication_survives_foreground_abort() {
+    let compaction_started = Arc::new(tokio::sync::Notify::new());
+    let release_compaction = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(BlockingCompactionProvider {
+        started: compaction_started.clone(),
+        release: release_compaction.clone(),
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.05,
+        tau_hard: 0.10,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider as Arc<dyn LLMProvider>,
+        "owned-blocking-publication-test",
+        8192,
+        lcm_config,
+    );
+    let session_key = format!("owned-blocking-publication-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    for turn in 0..20_u64 {
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({
+                    "role": "user",
+                    "content": format!(
+                        "turn {turn}: {}",
+                        "persistent project detail with decisions and constraints ".repeat(12)
+                    ),
+                }),
+            )
+            .await;
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({
+                    "role": "assistant",
+                    "content": format!("acknowledged retained project detail for turn {turn}"),
+                }),
+            )
+            .await;
+    }
+
+    let mut msg = InboundMessage::new(
+        "test",
+        "user",
+        "offline",
+        "Use the retained project details to answer briefly.",
+    );
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key));
+    let context = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    let slot = context.compaction.slot.clone();
+    let compaction = context.compaction.clone();
+    let (text_delta_tx, _text_delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = agent_loop.spawn_direct_streaming(
+        "Use the retained project details to answer briefly.".to_string(),
+        session_key,
+        "test".to_string(),
+        "offline".to_string(),
+        None,
+        text_delta_tx,
+        None,
+        None,
+        None,
+    );
+    await_compaction_sync(
+        "real turn to enter LCM generation",
+        compaction_started.notified(),
+    )
+    .await;
+    let slot_guard = slot.lock().await;
+    release_compaction.notify_one();
+
+    await_compaction_sync("actual compaction to publish to SQLite", async {
+        loop {
+            if !core
+                .sessions
+                .load_summary_nodes(&session.id)
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    // Dropping the foreground waiter models Escape/Ctrl-C after durable
+    // publication but before the pending-slot handoff can acquire its lock.
+    turn.abort();
+    assert!(
+        await_compaction_sync("aborted foreground turn to join", turn)
+            .await
+            .unwrap_err()
+            .is_cancelled()
+    );
+    assert!(
+        compaction.has_job().await,
+        "blocking publication must remain owned after its foreground waiter is dropped"
+    );
+    drop(slot_guard);
+    await_compaction_sync("owned publication to finish pending-slot handoff", async {
+        loop {
+            if compaction.has_pending().await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    await_compaction_sync(
+        "blocking publication job to reap after handoff",
+        compaction.cancel_and_reap(),
+    )
+    .await;
+    assert!(!compaction.has_job().await);
+}
+
+#[tokio::test]
+async fn dropped_reaper_leaves_job_owned_for_next_reaper() {
+    let handle = CompactionHandle::new();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let cancellation_seen = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let task_started = started.clone();
+    let task_cancellation_seen = cancellation_seen.clone();
+    let task_release = release.clone();
+    let task_completed = completed.clone();
+    assert!(
+        handle
+            .try_start(move |cancellation, _publication| async move {
+                task_started.notify_one();
+                cancellation.cancelled().await;
+                task_cancellation_seen.notify_one();
+                await_compaction_sync(
+                    "retained owned job to receive its release",
+                    task_release.notified(),
+                )
+                .await;
+                task_completed.store(true, std::sync::atomic::Ordering::Release);
+                None
+            })
+            .await
+    );
+    await_compaction_sync("owned task to start", started.notified()).await;
+
+    let first_handle = handle.clone();
+    let first_reaper = tokio::spawn(async move {
+        await_compaction_sync(
+            "first reaper to finish after cancellation",
+            first_handle.cancel_and_reap(),
+        )
+        .await;
+    });
+    await_compaction_sync(
+        "first reaper to cancel generation",
+        cancellation_seen.notified(),
+    )
+    .await;
+    first_reaper.abort();
+    assert!(
+        await_compaction_sync("aborted first reaper to join", first_reaper)
+            .await
+            .unwrap_err()
+            .is_cancelled()
+    );
+    assert!(
+        handle.has_job().await,
+        "cancelling a reaper must not detach the job it was joining"
+    );
+
+    release.notify_one();
+    await_compaction_sync(
+        "later reaper to join the retained task",
+        handle.cancel_and_reap(),
+    )
+    .await;
+    assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!handle.has_job().await);
+}
+
+#[derive(Clone)]
+struct CompactionLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CompactionLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn panicked_owned_job_reaps_with_session_phase_context() {
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || CompactionLogWriter(writer.clone()))
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let provider = MockLLM::named("panic-session-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let session_key = format!("panic-session-{}", uuid::Uuid::new_v4());
+    let mut msg = InboundMessage::new("test", "user", "offline", "panic");
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key));
+    let context = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    let handle = context.compaction;
+    let session_id = context.session_id;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let task_started = started.clone();
+    assert!(
+        handle
+            .try_start(move |_cancellation, _publication| async move {
+                task_started.notify_one();
+                panic!("compaction panic");
+                #[allow(unreachable_code)]
+                None
+            })
+            .await
+    );
+    await_compaction_sync("panicking owned job to start", started.notified()).await;
+    await_compaction_sync("panicked owned job to reap", handle.cancel_and_reap()).await;
+
+    assert!(!handle.has_job().await, "a panicked job must be reaped");
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("owned compaction task failed"), "{logs}");
+    assert!(logs.contains(&format!("session_id={session_id}")), "{logs}");
+    assert!(logs.contains("phase=generating"), "{logs}");
+    assert!(
+        handle
+            .try_start(|_cancellation, _publication| async move { None })
+            .await,
+        "panic cleanup must leave the session restartable"
+    );
+    await_compaction_sync(
+        "restarted owned job to reap after panic cleanup",
+        handle.cancel_and_reap(),
+    )
+    .await;
+}
+
+struct CompactionTaskDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CompactionTaskDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[tokio::test]
+async fn final_handle_drop_aborts_generation_but_preserves_publication_handoff() {
+    let generation = CompactionHandle::new();
+    let generation_started = Arc::new(tokio::sync::Notify::new());
+    let generation_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_started = generation_started.clone();
+    let task_dropped = generation_dropped.clone();
+    assert!(
+        generation
+            .try_start(move |_cancellation, _publication| async move {
+                let _drop = CompactionTaskDrop(task_dropped);
+                task_started.notify_one();
+                std::future::pending::<Option<crate::agent::agent_core::PendingCompaction>>().await
+            })
+            .await
+    );
+    await_compaction_sync(
+        "generation job to start before final-owner drop",
+        generation_started.notified(),
+    )
+    .await;
+    drop(generation);
+    await_compaction_sync("final-owner drop to abort generation", async {
+        while !generation_dropped.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    let publishing = CompactionHandle::new();
+    let slot = publishing.slot.clone();
+    let enter_publication = Arc::new(tokio::sync::Notify::new());
+    let publication_claimed = Arc::new(tokio::sync::Notify::new());
+    let task_slot = slot.clone();
+    let task_enter_publication = enter_publication.clone();
+    let task_publication_claimed = publication_claimed.clone();
+    assert!(
+        publishing
+            .try_start(move |_cancellation, publication| async move {
+                await_compaction_sync(
+                    "publishing job to receive its entry signal",
+                    task_enter_publication.notified(),
+                )
+                .await;
+                assert!(publication.begin_publication());
+                task_publication_claimed.notify_one();
+                let guard = task_slot.lock().await;
+                drop(guard);
+                Some(crate::agent::agent_core::PendingCompaction {
+                    result: crate::agent::compaction::CompactionResult {
+                        messages: vec![json!({
+                            "role": "assistant",
+                            "content": "published-checkpoint",
+                        })],
+                    },
+                    snapshot: Vec::new(),
+                    summary_node_id: 0,
+                })
+            })
+            .await
+    );
+
+    let slot_guard = slot.lock().await;
+    enter_publication.notify_one();
+    await_compaction_sync(
+        "owned job to claim publication before final-owner drop",
+        publication_claimed.notified(),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    drop(publishing);
+    drop(slot_guard);
+
+    await_compaction_sync("publication to complete pending-slot handoff", async {
+        loop {
+            if slot.lock().await.as_ref().is_some_and(|pending| {
+                pending
+                    .result
+                    .messages
+                    .first()
+                    .and_then(|message| message.get("content"))
+                    .and_then(Value::as_str)
+                    == Some("published-checkpoint")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn compaction_shutdown_waits_for_publication_and_reaps_generation() {
+    let provider = MockLLM::named("compaction-shutdown-drain-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let publishing = CompactionHandle::for_session("shutdown-publishing");
+    let generating = CompactionHandle::for_session("shutdown-generating");
+    {
+        let mut handles = agent_loop.shared.compaction_handles.lock().await;
+        handles.insert("shutdown-publishing".to_string(), publishing.clone());
+        handles.insert("shutdown-generating".to_string(), generating.clone());
+    }
+
+    let slot = publishing.slot.clone();
+    let enter_publication = Arc::new(tokio::sync::Notify::new());
+    let publication_claimed = Arc::new(tokio::sync::Notify::new());
+    let task_enter_publication = enter_publication.clone();
+    let task_publication_claimed = publication_claimed.clone();
+    assert!(
+        publishing
+            .try_start(move |_cancellation, publication| async move {
+                task_enter_publication.notified().await;
+                assert!(publication.begin_publication());
+                task_publication_claimed.notify_one();
+                Some(crate::agent::agent_core::PendingCompaction {
+                    result: crate::agent::compaction::CompactionResult {
+                        messages: vec![json!({
+                            "role": "assistant",
+                            "content": "shutdown-published-checkpoint",
+                        })],
+                    },
+                    snapshot: Vec::new(),
+                    summary_node_id: 0,
+                })
+            })
+            .await
+    );
+    let slot_guard = slot.lock().await;
+    enter_publication.notify_one();
+    await_compaction_sync(
+        "shutdown publication to claim its atomic boundary",
+        publication_claimed.notified(),
+    )
+    .await;
+
+    let generation_cancelled = Arc::new(tokio::sync::Notify::new());
+    let task_generation_cancelled = generation_cancelled.clone();
+    assert!(
+        generating
+            .try_start(move |cancellation, _publication| async move {
+                cancellation.cancelled().await;
+                task_generation_cancelled.notify_one();
+                None
+            })
+            .await
+    );
+
+    let mut drain = Box::pin(agent_loop.drain_compaction_jobs());
+    await_compaction_sync(
+        "shutdown drain to cancel generation while publication stays blocked",
+        async {
+            tokio::select! {
+                () = drain.as_mut() => {
+                    panic!("shutdown drain returned before pending handoff was released");
+                }
+                () = generation_cancelled.notified() => {}
+            }
+        },
+    )
+    .await;
+
+    drop(slot_guard);
+    await_compaction_sync(
+        "shutdown drain to join publication after pending handoff",
+        drain.as_mut(),
+    )
+    .await;
+
+    assert!(!publishing.has_job().await);
+    assert!(!generating.has_job().await);
+    assert_eq!(
+        slot.lock()
+            .await
+            .as_ref()
+            .and_then(|pending| pending.result.messages.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str),
+        Some("shutdown-published-checkpoint")
+    );
+}
+
+#[tokio::test]
+async fn agent_clear_reaps_job_and_discards_pending_checkpoint() {
+    let provider = MockLLM::named("clear-owned-compaction-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let session_key = format!("clear-owned-compaction-{}", uuid::Uuid::new_v4());
+    let mut msg = InboundMessage::new("test", "user", "offline", "first");
+    msg.metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let context = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    let compaction = context.compaction.clone();
+    let publication_claimed = Arc::new(tokio::sync::Notify::new());
+    let release_publication = Arc::new(tokio::sync::Notify::new());
+    let task_publication_claimed = publication_claimed.clone();
+    let task_release_publication = release_publication.clone();
+    assert!(
+        compaction
+            .try_start(move |_cancellation, publication| async move {
+                assert!(publication.begin_publication());
+                task_publication_claimed.notify_one();
+                await_compaction_sync(
+                    "agent-clear publication barrier to release",
+                    task_release_publication.notified(),
+                )
+                .await;
+                Some(crate::agent::agent_core::PendingCompaction {
+                    result: crate::agent::compaction::CompactionResult {
+                        messages: vec![json!({
+                            "role": "assistant",
+                            "content": "pending checkpoint before agent clear",
+                        })],
+                    },
+                    snapshot: Vec::new(),
+                    summary_node_id: 0,
+                })
+            })
+            .await
+    );
+    await_compaction_sync(
+        "clear-owned compaction to claim publication",
+        publication_claimed.notified(),
+    )
+    .await;
+
+    let mut clear = Box::pin(agent_loop.clear_session_state(&session_key));
+    await_compaction_sync("agent clear to block while reaping publication", async {
+        tokio::select! {
+            () = clear.as_mut() => {
+                panic!("agent clear returned before publication handoff was released");
+            }
+            () = tokio::time::sleep(COMPACTION_BLOCKED_OBSERVATION) => {}
+        }
+    })
+    .await;
+    release_publication.notify_one();
+    await_compaction_sync(
+        "agent clear to reap publication and discard its checkpoint",
+        clear.as_mut(),
+    )
+    .await;
+
+    assert!(!compaction.has_job().await);
+    assert!(!compaction.has_pending().await);
+    assert!(!agent_loop
+        .shared
+        .compaction_handles
+        .lock()
+        .await
+        .contains_key(&context.session_id));
+    assert!(!agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .contains_key(&context.session_id));
+}
+
+fn repl_context_for_clear_test(
+    agent_loop: AgentLoop,
+    core_handle: SharedCoreHandle,
+    session_id: String,
+    workspace: std::path::PathBuf,
+) -> crate::repl::commands::ReplContext {
+    let (display_tx, display_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::repl::commands::ReplContext {
+        config: crate::config::schema::Config::default(),
+        core_handle,
+        agent_loop,
+        session_id,
+        lang: None,
+        srv: crate::repl::ServerState::new("0".to_string()),
+        current_model_path: workspace.clone(),
+        active_channels: Vec::new(),
+        display_tx,
+        display_rx,
+        cron_service: Arc::new(crate::cron::service::CronService::new(
+            workspace.join("cron.json"),
+        )),
+        email_config: None,
+        rl: None,
+        watchdog_handle: None,
+        restart_tx,
+        restart_rx,
+        health_registry: None,
+        #[cfg(feature = "voice")]
+        voice_session: None,
+        #[cfg(feature = "cluster")]
+        cluster_state: None,
+    }
+}
+
+#[tokio::test]
+async fn interactive_clear_is_atomic_against_session_admission() {
+    let provider = MockLLM::named("interactive-clear-admission-test");
+    let (agent_loop, workspace) = build_local_inline_harness_with_memory(
+        provider,
+        "interactive-clear-admission-test",
+        4096,
+        LcmSchemaConfig::default(),
+        MemoryConfig::default(),
+    );
+    let core_handle = agent_loop.shared.core_handle.clone();
+    let core = core_handle.swappable();
+    let session_key = format!("interactive-clear-admission-{}", uuid::Uuid::new_v4());
+    let session = core.sessions.get_or_resume(&session_key).await;
+    core.sessions
+        .add_message(
+            &session.id,
+            &json!({"role": "user", "content": "history before clear"}),
+        )
+        .await;
+    core.sessions
+        .save_working_memory(&session.id, "working memory before clear", "active", 1)
+        .await
+        .unwrap();
+
+    let mut first_msg = InboundMessage::new("test", "user", "offline", "first");
+    first_msg
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let first = agent_loop
+        .shared
+        .prepare_context(&first_msg, None, None, None, None)
+        .await;
+    let old_compaction = first.compaction.clone();
+    let old_engine = agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .unwrap();
+    let publication_claimed = Arc::new(tokio::sync::Notify::new());
+    let release_publication = Arc::new(tokio::sync::Notify::new());
+    let pending_handoff: Arc<
+        std::sync::Mutex<Option<crate::agent::agent_core::PendingCompaction>>,
+    > = Arc::new(std::sync::Mutex::new(None));
+    let task_publication_claimed = publication_claimed.clone();
+    let task_release_publication = release_publication.clone();
+    let task_pending_handoff = pending_handoff.clone();
+    assert!(
+        old_compaction
+            .try_start(move |_cancellation, publication| async move {
+                let pending = crate::agent::agent_core::PendingCompaction {
+                    result: crate::agent::compaction::CompactionResult {
+                        messages: vec![json!({
+                            "role": "assistant",
+                            "content": "pending checkpoint before interactive clear",
+                        })],
+                    },
+                    snapshot: Vec::new(),
+                    summary_node_id: 0,
+                };
+                assert!(publication.begin_publication());
+                *task_pending_handoff.lock().unwrap() = Some(pending);
+                task_publication_claimed.notify_one();
+                await_compaction_sync(
+                    "interactive-clear publication barrier to release",
+                    task_release_publication.notified(),
+                )
+                .await;
+                let pending = task_pending_handoff.lock().unwrap().take();
+                pending
+            })
+            .await
+    );
+    await_compaction_sync(
+        "interactive-clear fixture to claim real publication",
+        publication_claimed.notified(),
+    )
+    .await;
+
+    let counters = core_handle.counters.clone();
+    let stale_prompt_epoch = counters.reset_session_prompt_state(&session_key);
+    let stale_higgs_session_id = 9_001;
+    counters.record_higgs_session_id(&session_key, stale_higgs_session_id);
+    counters
+        .last_context_used
+        .store(123, std::sync::atomic::Ordering::Relaxed);
+    counters
+        .last_message_count
+        .store(45, std::sync::atomic::Ordering::Relaxed);
+    counters
+        .last_working_memory_tokens
+        .store(67, std::sync::atomic::Ordering::Relaxed);
+
+    let repl = repl_context_for_clear_test(
+        agent_loop,
+        core_handle.clone(),
+        session_key.clone(),
+        workspace,
+    );
+    let mut clear = Box::pin(repl.agent_loop.clear_session_state(&session_key));
+    await_compaction_sync(
+        "interactive clear to block while reaping publication",
+        async {
+            tokio::select! {
+                () = clear.as_mut() => {
+                    panic!("interactive clear returned before publication handoff was released");
+                }
+                () = tokio::time::sleep(COMPACTION_BLOCKED_OBSERVATION) => {}
+            }
+        },
+    )
+    .await;
+
+    let retained_history = core
+        .sessions
+        .get_history(&session.id, usize::MAX, usize::MAX)
+        .await;
+    assert!(retained_history.iter().any(|message| {
+        message.get("content").and_then(Value::as_str) == Some("history before clear")
+    }));
+    assert_eq!(
+        core.working_memory
+            .get_context(&session.id, usize::MAX)
+            .await
+            .unwrap(),
+        "working memory before clear"
+    );
+    {
+        // The real owned wrapper writes `slot` only after this publishing
+        // future returns. Holding the actual checkpoint here models the
+        // reachable pre-handoff state without fabricating job + populated slot.
+        let pending = pending_handoff.lock().unwrap();
+        let pending = pending
+            .as_ref()
+            .expect("publishing job must retain its pending checkpoint");
+        assert_eq!(
+            pending
+                .result
+                .messages
+                .first()
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str),
+            Some("pending checkpoint before interactive clear")
+        );
+    }
+    assert!(
+        !old_compaction.has_pending().await,
+        "the slot must remain empty until the publishing future hands off its checkpoint"
+    );
+    let retained_engine = repl
+        .agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .expect("old engine must remain installed while clear is reaping");
+    assert!(Arc::ptr_eq(&old_engine, &retained_engine));
+
+    let mut second_msg = InboundMessage::new("test", "user", "offline", "second");
+    second_msg
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    let waiter_counters = counters.clone();
+    let waiter_session_key = session_key.clone();
+    let mut prepare = Box::pin(async {
+        let fresh = repl
+            .agent_loop
+            .shared
+            .prepare_context(&second_msg, None, None, None, None)
+            .await;
+        let observed = (
+            waiter_counters.session_prompt_epoch(&waiter_session_key),
+            waiter_counters
+                .last_context_used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            waiter_counters
+                .last_message_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            waiter_counters
+                .last_working_memory_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            waiter_counters.pending_higgs_session_drop_ids(&waiter_session_key),
+        );
+        (fresh, observed)
+    });
+    await_compaction_sync(
+        "new preparation to remain blocked by interactive clear",
+        async {
+            tokio::select! {
+                _ = prepare.as_mut() => {
+                    panic!("preparation entered before interactive clear retired the old handle");
+                }
+                () = tokio::time::sleep(COMPACTION_BLOCKED_OBSERVATION) => {}
+            }
+        },
+    )
+    .await;
+
+    release_publication.notify_one();
+    let ((), (fresh, observed)) = await_compaction_sync(
+        "interactive clear and waiting preparation to finish after retirement",
+        async { tokio::join!(clear.as_mut(), prepare.as_mut()) },
+    )
+    .await;
+
+    assert_eq!(
+        observed.0,
+        stale_prompt_epoch.saturating_add(1),
+        "the admitted waiter observed the pre-clear prompt epoch"
+    );
+    assert_eq!(
+        (observed.1, observed.2, observed.3),
+        (0, 0, 0),
+        "the admitted waiter observed stale aggregate context counters"
+    );
+    assert!(
+        observed.4.contains(&stale_higgs_session_id),
+        "the admitted waiter did not observe the cleared Higgs session handoff"
+    );
+
+    let remaining_history = core
+        .sessions
+        .get_history(&session.id, usize::MAX, usize::MAX)
+        .await;
+    assert!(
+        remaining_history.is_empty(),
+        "history remained after clear: {}",
+        serde_json::to_string(&remaining_history).unwrap()
+    );
+    assert_eq!(
+        core.working_memory
+            .get_context(&session.id, usize::MAX)
+            .await
+            .unwrap(),
+        ""
+    );
+    assert!(pending_handoff.lock().unwrap().is_none());
+    assert!(!old_compaction.has_job().await);
+    assert!(!old_compaction.has_pending().await);
+    assert!(
+        !old_compaction
+            .try_start(|_cancellation, _publication| async move { None })
+            .await,
+        "the retired pre-clear handle must reject new compaction"
+    );
+    assert!(!Arc::ptr_eq(&old_compaction.slot, &fresh.compaction.slot));
+    let fresh_engine = repl
+        .agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old_engine, &fresh_engine));
+}
+
 #[tokio::test]
 async fn concrete_session_reuses_compaction_checkpoint_handle() {
     let provider = MockLLM::named("local-compaction-checkpoint-handle-test");
@@ -3495,9 +6367,24 @@ async fn concrete_session_reuses_compaction_checkpoint_handle() {
         "the pending checkpoint must remain visible across turns in one concrete session"
     );
     assert!(
-        Arc::ptr_eq(&first.compaction.in_flight, &second.compaction.in_flight),
-        "the in-flight barrier must remain visible across turns in one concrete session"
+        first
+            .compaction
+            .try_start(|cancellation, _publication| async move {
+                cancellation.cancelled().await;
+                None
+            })
+            .await
     );
+    assert!(
+        second.compaction.has_job().await,
+        "the owned job must remain visible across turns in one concrete session"
+    );
+    await_compaction_sync(
+        "shared session compaction job to reap",
+        second.compaction.cancel_and_reap(),
+    )
+    .await;
+    assert!(!first.compaction.has_job().await);
 }
 
 #[tokio::test]
@@ -3535,14 +6422,29 @@ async fn idle_rollover_does_not_reuse_compaction_checkpoint_handle() {
         &first.compaction.slot,
         &second.compaction.slot
     ));
-    assert!(!Arc::ptr_eq(
-        &first.compaction.in_flight,
-        &second.compaction.in_flight
-    ));
+    assert!(
+        first
+            .compaction
+            .try_start(|cancellation, _publication| async move {
+                cancellation.cancelled().await;
+                None
+            })
+            .await
+    );
+    assert!(first.compaction.has_job().await);
+    assert!(
+        !second.compaction.has_job().await,
+        "an idle rollover must own an independent compaction lifecycle"
+    );
+    await_compaction_sync(
+        "rolled-over session compaction job to reap",
+        first.compaction.cancel_and_reap(),
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn in_flight_compaction_checkpoint_hides_unpublished_dag() {
+async fn pending_compaction_checkpoint_hides_unpublished_dag() {
     let provider = MockLLM::named("local-compaction-checkpoint-visibility-test");
     let (agent_loop, _workspace) = build_local_inline_harness(provider);
     let session_key = format!("compaction-checkpoint-visibility-{}", uuid::Uuid::new_v4());
@@ -3599,31 +6501,7 @@ async fn in_flight_compaction_checkpoint_hides_unpublished_dag() {
         .unwrap();
     *engine.lock().await = rebuilt;
 
-    first
-        .compaction
-        .in_flight
-        .store(true, std::sync::atomic::Ordering::Release);
-    msg.content = "second".to_string();
-    let second = agent_loop
-        .shared
-        .prepare_context(&msg, None, None, None, None)
-        .await;
-    first
-        .compaction
-        .in_flight
-        .store(false, std::sync::atomic::Ordering::Release);
-
-    let assembled = serde_json::to_string(&second.messages).unwrap();
-    assert!(
-        assembled.contains("raw-source-marker"),
-        "raw history remains authoritative until the checkpoint is published"
-    );
-    assert!(
-        !assembled.contains("checkpoint-summary-marker"),
-        "an in-flight DAG mutation must not become prompt-visible before checkpoint publication"
-    );
-
-    let snapshot = second.messages[..second.new_start].to_vec();
+    let snapshot = first.messages[..first.new_start].to_vec();
     *first.compaction.slot.lock().await = Some(crate::agent::agent_core::PendingCompaction {
         result: crate::agent::compaction::CompactionResult {
             messages: vec![json!({
@@ -3632,15 +6510,16 @@ async fn in_flight_compaction_checkpoint_hides_unpublished_dag() {
             })],
         },
         snapshot,
+        summary_node_id: 0,
     });
-    msg.content = "third".to_string();
-    let third = agent_loop
+    msg.content = "second".to_string();
+    let second = agent_loop
         .shared
         .prepare_context(&msg, None, None, None, None)
         .await;
     *first.compaction.slot.lock().await = None;
 
-    let assembled = serde_json::to_string(&third.messages).unwrap();
+    let assembled = serde_json::to_string(&second.messages).unwrap();
     assert!(
         assembled.contains("raw-source-marker"),
         "raw history remains authoritative while the checkpoint is pending"
@@ -3760,292 +6639,6 @@ async fn test_local_wire_prompt_prefix_stable_across_turns() {
 }
 
 #[tokio::test]
-async fn unchanged_tool_topology_preserves_higgs_epoch() {
-    let provider = Arc::new(
-        WireRecordingProvider::new(
-            "local-higgs-test",
-            vec![
-                WireRecordingProvider::text_response("first"),
-                WireRecordingProvider::text_response("second"),
-            ],
-        )
-        .with_higgs_session_cache(),
-    );
-    let (agent_loop, workspace) =
-        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
-    let session_key = format!("higgs-stable-tools-{}", uuid::Uuid::new_v4());
-
-    agent_loop
-        .process_direct("first turn", &session_key, "test", "offline")
-        .await;
-    agent_loop
-        .process_direct("second turn", &session_key, "test", "offline")
-        .await;
-
-    assert_eq!(
-        agent_loop
-            .shared
-            .core_handle
-            .counters
-            .session_prompt_epoch(&session_key),
-        0
-    );
-    let requests = provider.higgs_requests();
-    assert_eq!(requests.len(), 2);
-    let first_id = requests[0][0]
-        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-        .as_u64()
-        .unwrap();
-    let second_id = requests[1][0]
-        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-        .as_u64()
-        .unwrap();
-    assert_eq!(first_id, second_id);
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-async fn retained_higgs_history_never_applies_routine_windowing() {
-    let provider = Arc::new(
-        WireRecordingProvider::new(
-            "local-higgs-test",
-            vec![WireRecordingProvider::text_response("reply")],
-        )
-        .with_higgs_session_cache(),
-    );
-    let memory_config = MemoryConfig {
-        max_history_turns: 2,
-        ..Default::default()
-    };
-    let (agent_loop, workspace) = build_local_inline_harness_with_memory(
-        provider.clone() as Arc<dyn LLMProvider>,
-        "local-higgs-test",
-        64_000,
-        LcmSchemaConfig::default(),
-        memory_config,
-    );
-    let session_key = format!("higgs-append-only-history-{}", uuid::Uuid::new_v4());
-
-    for turn in 0..4 {
-        agent_loop
-            .process_direct(
-                &format!("persisted turn {turn}"),
-                &session_key,
-                "test",
-                "offline",
-            )
-            .await;
-    }
-
-    let requests = provider.higgs_requests();
-    assert_eq!(requests.len(), 4);
-    for pair in requests.windows(2) {
-        assert_wire_prefix(&pair[0], &pair[1]);
-        let first_id = pair[0][0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-            .as_u64()
-            .unwrap();
-        let second_id = pair[1][0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-            .as_u64()
-            .unwrap();
-        assert_eq!(first_id, second_id);
-    }
-    assert_eq!(
-        agent_loop
-            .shared
-            .core_handle
-            .counters
-            .session_prompt_epoch(&session_key),
-        0
-    );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-async fn unexpected_replay_divergence_rotates_before_provider_io() {
-    let provider = Arc::new(
-        WireRecordingProvider::new(
-            "local-higgs-test",
-            vec![
-                WireRecordingProvider::text_response("first"),
-                WireRecordingProvider::text_response("second"),
-            ],
-        )
-        .with_higgs_session_cache(),
-    );
-    let (agent_loop, workspace) =
-        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
-    let session_key = format!("higgs-unexpected-divergence-{}", uuid::Uuid::new_v4());
-
-    agent_loop
-        .process_direct("original persisted bytes", &session_key, "test", "offline")
-        .await;
-    let first_requests = provider.higgs_requests();
-    assert_eq!(first_requests.len(), 1);
-    let first_id = first_requests[0][0]
-        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-        .as_u64()
-        .unwrap();
-
-    let core = agent_loop.shared.core_handle.swappable();
-    let session = core
-        .sessions
-        .get_latest_session(&session_key)
-        .await
-        .unwrap();
-    let connection = rusqlite::Connection::open(core.sessions.path()).unwrap();
-    let updated = connection
-        .execute(
-            "UPDATE messages SET content = ?1 WHERE session_id = ?2 AND role = 'user'",
-            rusqlite::params!["mutated persisted bytes", session.id],
-        )
-        .unwrap();
-    assert_eq!(updated, 1);
-
-    agent_loop
-        .process_direct("second turn", &session_key, "test", "offline")
-        .await;
-
-    let requests = provider.higgs_requests();
-    assert_eq!(requests.len(), 2);
-    let second_head = &requests[1][0];
-    let second_id = second_head[crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-        .as_u64()
-        .unwrap();
-    assert_ne!(second_id, first_id);
-    assert_eq!(
-        second_head[crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
-        json!(first_id)
-    );
-    assert_eq!(
-        agent_loop
-            .shared
-            .core_handle
-            .counters
-            .session_prompt_epoch(&session_key),
-        1
-    );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-async fn changed_tool_topology_rotates_before_request() {
-    let provider = Arc::new(
-        WireRecordingProvider::new(
-            "local-higgs-test",
-            vec![
-                WireRecordingProvider::text_response("first"),
-                WireRecordingProvider::text_response("second"),
-            ],
-        )
-        .with_higgs_session_cache(),
-    );
-    let (agent_loop, workspace) =
-        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
-    let session_key = format!("higgs-tool-change-{}", uuid::Uuid::new_v4());
-
-    agent_loop
-        .process_direct("first turn", &session_key, "cli", "offline")
-        .await;
-    let first_requests = provider.higgs_requests();
-    assert_eq!(first_requests.len(), 1);
-    let first_id = first_requests[0][0]
-        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-        .as_u64()
-        .unwrap();
-    let counters = &agent_loop.shared.core_handle.counters;
-
-    agent_loop
-        .process_direct("second turn", &session_key, "test", "offline")
-        .await;
-
-    assert_eq!(counters.session_prompt_epoch(&session_key), 1);
-    let tool_snapshots = provider.tool_snapshots();
-    assert_eq!(tool_snapshots.len(), 2);
-    assert_ne!(
-        tool_snapshots[0], tool_snapshots[1],
-        "the real channel-specific registry must change before cache rotation"
-    );
-    assert_ne!(
-        crate::agent::prompt_fingerprint::hash_tools(&tool_snapshots[0]),
-        crate::agent::prompt_fingerprint::hash_tools(&tool_snapshots[1]),
-        "the channel-specific registry change must alter serialized prompt-head bytes"
-    );
-    let requests = provider.higgs_requests();
-    assert_eq!(requests.len(), 2);
-    let second_head = &requests[1][0];
-    let second_id = second_head
-        [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-        .as_u64()
-        .unwrap();
-    assert_ne!(second_id, first_id);
-    assert_eq!(
-        second_head[crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD],
-        json!(first_id)
-    );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-async fn lease_exhaustion_keeps_one_higgs_epoch() {
-    let responses: Vec<_> = (0..=crate::agent::lease::DEFAULT_TOOLS_PER_LEASE)
-        .map(|n| {
-            WireRecordingProvider::tool_response(
-                &format!("tc_higgs_lease_{n}"),
-                &format!("higgs-lease-{n}"),
-            )
-        })
-        .collect();
-    let provider = Arc::new(
-        WireRecordingProvider::new("local-higgs-test", responses).with_higgs_session_cache(),
-    );
-    let (agent_loop, workspace) =
-        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
-    let session_key = format!("higgs-lease-stable-{}", uuid::Uuid::new_v4());
-
-    let response = agent_loop
-        .process_direct("keep listing", &session_key, "test", "offline")
-        .await;
-
-    assert_eq!(response, LEASE_OVER_BUDGET_FINAL);
-    assert_eq!(
-        agent_loop
-            .shared
-            .core_handle
-            .counters
-            .session_prompt_epoch(&session_key),
-        0
-    );
-    let requests = provider.higgs_requests();
-    assert_eq!(
-        requests.len(),
-        crate::agent::lease::DEFAULT_TOOLS_PER_LEASE as usize + 1
-    );
-    let ids: Vec<_> = requests
-        .iter()
-        .map(|request| {
-            request[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-                .as_u64()
-                .unwrap()
-        })
-        .collect();
-    assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
-    assert!(requests.iter().all(|request| {
-        request[0]
-            .get(crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD)
-            .is_none()
-            && request[0]
-                .get(crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD)
-                .is_none()
-    }));
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
 async fn test_local_wire_prompt_prefix_stable_when_second_turn_is_rich_artifact() {
     let provider = Arc::new(WireRecordingProvider::new(
         "local-qwen-test",
@@ -4137,7 +6730,7 @@ async fn test_local_wire_prompt_tool_result_appends_only() {
                     name: "list_dir".to_string(),
                     arguments: args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             WireRecordingProvider::text_response("listed."),
@@ -4157,166 +6750,6 @@ async fn test_local_wire_prompt_tool_result_appends_only() {
         calls.len()
     );
     assert_wire_prefix(&calls[0], &calls[1]);
-    let result = calls[1]
-        .iter()
-        .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some("tc_prefix"))
-        .expect("the second request must contain the first tool result");
-    assert!(
-        result
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .starts_with("[Lease usage after this batch: 1 of 12 calls"),
-        "prompt-visible tool results must carry the shared lease annotation"
-    );
-}
-
-#[tokio::test]
-async fn lease_rejects_crossing_batch_atomically_with_complete_protocol_pairing() {
-    let mut responses: Vec<_> = (0..11)
-        .map(|n| WireRecordingProvider::tool_response(&format!("tc_before_{n}"), &format!("dir{n}")))
-        .collect();
-    responses.push(crate::providers::base::LLMResponse {
-        content: Some(String::new()),
-        tool_calls: vec![
-            crate::providers::base::ToolCallRequest {
-                id: "tc_over_a".to_string(),
-                name: "write_file".to_string(),
-                arguments: std::collections::HashMap::from([
-                    ("path".to_string(), json!("over-a.txt")),
-                    ("content".to_string(), json!("must not be written")),
-                ]),
-            },
-            crate::providers::base::ToolCallRequest {
-                id: "tc_over_b".to_string(),
-                name: "write_file".to_string(),
-                arguments: std::collections::HashMap::from([
-                    ("path".to_string(), json!("over-b.txt")),
-                    ("content".to_string(), json!("must not be written")),
-                ]),
-            },
-        ],
-        finish_reason: "tool_calls".to_string(),
-        usage: std::collections::HashMap::new(),
-    });
-    let provider = Arc::new(WireRecordingProvider::new("local-main", responses));
-    let (agent_loop, workspace) =
-        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
-    let session_key = format!("lease-atomic-reject-{}", uuid::Uuid::new_v4());
-
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        agent_loop.process_direct("inspect until the lease ends", &session_key, "test", "offline"),
-    )
-    .await
-    .expect("over-budget batch must terminate without another inference");
-
-    assert_eq!(response, LEASE_OVER_BUDGET_FINAL);
-    assert_eq!(provider.call_count(), 12);
-    assert!(!workspace.join("over-a.txt").exists());
-    assert!(!workspace.join("over-b.txt").exists());
-    let snapshots = provider.tool_snapshots();
-    assert!(snapshots.iter().all(|tools| !tools.is_empty()));
-    assert!(snapshots.iter().all(|tools| tools == &snapshots[0]));
-
-    let core = agent_loop.shared.core_handle.swappable();
-    let meta = core
-        .sessions
-        .get_latest_session(&session_key)
-        .await
-        .expect("session should exist");
-    let raw = core.sessions.get_all_messages(&meta.id).await;
-    let carrier = raw
-        .iter()
-        .find(|message| {
-            message
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .is_some_and(|calls| {
-                    ["tc_over_a", "tc_over_b"].iter().all(|id| {
-                        calls
-                            .iter()
-                            .any(|call| call.get("id").and_then(Value::as_str) == Some(id))
-                    })
-                })
-        })
-        .expect("the rejected batch must retain its assistant carrier");
-    assert_eq!(
-        carrier
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(2)
-    );
-    for id in ["tc_over_a", "tc_over_b"] {
-        let receipt = raw
-            .iter()
-            .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some(id))
-            .unwrap_or_else(|| panic!("missing rejection receipt for {id}"));
-        assert_eq!(receipt.get("ok").and_then(Value::as_bool), Some(false));
-        assert!(
-            receipt
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .contains("lease exhausted")
-        );
-    }
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-async fn local_lease_does_not_renew_after_twelve_calls() {
-    let mut responses: Vec<_> = (0..12)
-        .map(|n| WireRecordingProvider::tool_response(&format!("tc_lease_{n}"), &format!("dir{n}")))
-        .collect();
-    let checkpoint =
-        "findings: inspected the first set\nnext: inspect the workspace root\nwill: list it once";
-    responses.push(WireRecordingProvider::text_response(checkpoint));
-    responses.push(WireRecordingProvider::tool_response("tc_thirteen", "."));
-    responses.push(WireRecordingProvider::text_response("done after renewal"));
-    let provider = Arc::new(WireRecordingProvider::new("local-main", responses));
-    let (agent_loop, workspace) =
-        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 25);
-    let session_key = format!("lease-valid-renewal-{}", uuid::Uuid::new_v4());
-
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        agent_loop.process_direct("inspect, renew, then finish", &session_key, "test", "offline"),
-    )
-    .await
-    .expect("zero-renewal local lease must terminate");
-
-    assert_eq!(response, checkpoint);
-    assert_eq!(
-        provider.call_count(),
-        crate::agent::lease::DEFAULT_TOOLS_PER_LEASE as usize + 1,
-        "the valid checkpoint must be treated as the final response"
-    );
-    let snapshots = provider.tool_snapshots();
-    assert!(snapshots.iter().all(|tools| !tools.is_empty()));
-    assert!(snapshots.iter().all(|tools| tools == &snapshots[0]));
-
-    assert!(provider.calls().iter().flatten().all(|message| {
-        !message
-            .get("content")
-            .and_then(Value::as_str)
-            .is_some_and(|content| content.contains("[Lease renewed"))
-    }));
-
-    let core = agent_loop.shared.core_handle.swappable();
-    let meta = core
-        .sessions
-        .get_latest_session(&session_key)
-        .await
-        .expect("session should exist");
-    let raw = core.sessions.get_all_messages(&meta.id).await;
-    assert!(raw.iter().all(|message| {
-        message.get("tool_call_id").and_then(Value::as_str) != Some("tc_thirteen")
-    }));
-
-    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 #[tokio::test]
@@ -4342,7 +6775,7 @@ async fn test_local_wire_prefix_stable_across_batched_tool_results_and_next_turn
                         arguments: args_b,
                     },
                 ],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             WireRecordingProvider::text_response("done turn one"),
@@ -4450,7 +6883,7 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
                 arguments: a2,
             },
         ],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
 
@@ -4489,7 +6922,7 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
                     arguments: pa2,
                 },
             ],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: std::collections::HashMap::new(),
         };
         // Replace the provider's queue with the seed batch first.
@@ -4522,7 +6955,10 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
             .load_tool_result(&session.id, "tc_conflict")
             .await;
         assert!(
-            stashed.as_deref().map(|s| s.contains("alpha")).unwrap_or(false),
+            stashed
+                .as_deref()
+                .map(|s| s.contains("alpha"))
+                .unwrap_or(false),
             "seed turn must have stashed body A under tc_conflict; got {stashed:?}"
         );
     }
@@ -4570,7 +7006,7 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
 /// STEP 2 integration test: a turn that produces a stashed (large/forced) tool
 /// A GENUINELY oversized (>8KB / TOOL_RESULT_REPLAY_MAX_BYTES) tool result
 /// must persist a HANDLE as the tool-result message content — not the raw
-/// body. The body lives only in the stash, fetchable via recall_tool_result.
+/// body. The body lives only in the stash, inspectable through inspect_tool_result.
 /// The handle is byte-identical live and after a SQLite round-trip (reload).
 /// Uses `exec seq` (~13KB) because read_file self-caps under the replay limit.
 #[tokio::test]
@@ -4586,7 +7022,7 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
             name: "exec".to_string(),
             arguments: a,
         }],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
 
@@ -4618,9 +7054,8 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert!(
-        content.starts_with("[Lease usage after this batch: 1 of 12 calls")
-            && content.contains(&format!("\n{TOOL_RESULT_HANDLE_MARKER}")),
-        "persisted tool-result content must be an annotated HANDLE; got: {content}"
+        content.starts_with(TOOL_RESULT_HANDLE_MARKER),
+        "persisted tool-result content must be a HANDLE; got: {content}"
     );
     // The raw body is NOT in the message — "2999" is a seq line, absent from
     // the handle (excerpt is "1"; args is "seq 1 3000").
@@ -4629,7 +7064,7 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
         "the handle must not contain the raw body; got: {content}"
     );
 
-    // The full body IS in the stash, fetchable by recall_tool_result.
+    // The full body IS in the stash, inspectable through inspect_tool_result.
     let stashed = core
         .sessions
         .load_tool_result(&session.id, "tc_handle")
@@ -4657,9 +7092,8 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert!(
-        live_content.starts_with("[Lease usage after this batch: 1 of 12 calls")
-            && live_content.contains(&format!("\n{TOOL_RESULT_HANDLE_MARKER}")),
-        "live prompt tool-result must be an annotated handle; got: {live_content}"
+        live_content.starts_with(TOOL_RESULT_HANDLE_MARKER),
+        "live prompt tool-result must be a handle; got: {live_content}"
     );
     assert_eq!(
         live_content, content,
@@ -4667,18 +7101,16 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
     );
 }
 
-/// A MEDIUM result (over the hot-prompt char cap but ≤8KB replay cap) must
-/// show actual CONTENT, NOT an opaque handle — the model needs bytes for
-/// normal read/exec work. Regression: the initial handles uproot handled these
-/// too, starving the model and forcing hallucination (2026-07-31). Only
-/// genuinely oversized (>8KB) results take the handle path.
+/// A MEDIUM ordinary result must be stored before prompt shaping and reach the
+/// model as a deterministic handle. This closes the raw-replay hole where a
+/// roughly 7KB web/file result was resent on every turn.
 #[tokio::test]
-async fn medium_tool_result_shows_content_not_handle() {
+async fn medium_tool_result_persists_handle_not_body() {
     use crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER;
 
     let files_dir = tempfile::tempdir().unwrap();
-    // ~5.6KB: over the small hot-prompt cap (stashed) but under the 8KB replay
-    // cap → must be content, not a handle.
+    // ~6.4KB: below the old replay-byte gate, but large enough to expose the
+    // raw replay behavior this regression is about.
     let body = "medium_line_one\nmedium_line_two\n".repeat(200);
     let path = files_dir.path().join("medium.txt");
     std::fs::write(&path, &body).unwrap();
@@ -4693,7 +7125,7 @@ async fn medium_tool_result_shows_content_not_handle() {
             name: "read_file".to_string(),
             arguments: a,
         }],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
     let provider = Arc::new(WireRecordingProvider::new(
@@ -4720,796 +7152,49 @@ async fn medium_tool_result_shows_content_not_handle() {
                 && m.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_medium")
         })
         .expect("tc_medium tool message must exist");
-    let content = tool_msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let content = tool_msg
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     assert!(
-        !content.starts_with(TOOL_RESULT_HANDLE_MARKER),
-        "medium (<=8KB) result must show CONTENT, not a handle; got: {content}"
+        content.starts_with(TOOL_RESULT_HANDLE_MARKER),
+        "ordinary medium result must be a handle, not raw content; got: {content}"
     );
     assert!(
-        content.contains("medium_line_one"),
-        "medium result must carry real body content; got: {content}"
+        !content.contains("medium_line_one"),
+        "ordinary medium result body must stay out of the message; got: {content}"
+    );
+
+    let stashed = core
+        .sessions
+        .load_tool_result(&session.id, "tc_medium")
+        .await
+        .expect("medium body must be durably stashed");
+    assert!(
+        stashed.contains("medium_line_one") && stashed.contains("medium_line_two"),
+        "stash must retain the exact tool output bytes; got: {stashed}"
+    );
+
+    let calls = provider.calls();
+    let live_msg = calls
+        .iter()
+        .flat_map(|call| call.iter())
+        .find(|message| {
+            message.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && message.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_medium")
+        })
+        .expect("next provider request must contain the medium tool message");
+    let live_content = live_msg
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        live_content, content,
+        "live and persisted medium handles must be byte-identical"
     );
 
     let _ = std::fs::remove_dir_all(files_dir);
-}
-
-#[tokio::test]
-async fn stored_tool_preview_reloads_byte_identically() {
-    use crate::agent::tool_engine::{TOOL_PREVIEW_BUDGET_CHARS, TOOL_RESULT_HANDLE_MARKER};
-
-    let files_dir = tempfile::tempdir().unwrap();
-    let mut responses = Vec::new();
-    for index in 0..4 {
-        let mut arguments = std::collections::HashMap::new();
-        let tool_name = if index == 3 {
-            arguments.insert("tool_call_id".to_string(), json!("tc_budget_0"));
-            "recall_tool_result"
-        } else if index % 2 == 0 {
-            let body = format!("medium_{index}_line\n").repeat(500);
-            let path = files_dir.path().join(format!("medium_{index}.txt"));
-            std::fs::write(&path, body).unwrap();
-            arguments.insert(
-                "path".to_string(),
-                json!(path.to_string_lossy().to_string()),
-            );
-            "read_file"
-        } else {
-            arguments.insert(
-                "command".to_string(),
-                json!(format!("seq 1 {}", 1_000 + index)),
-            );
-            "exec"
-        };
-        responses.push(crate::providers::base::LLMResponse {
-            content: Some(if index == 0 {
-                String::new()
-            } else {
-                "continuing".to_string()
-            }),
-            tool_calls: vec![crate::providers::base::ToolCallRequest {
-                id: format!("tc_budget_{index}"),
-                name: tool_name.to_string(),
-                arguments,
-            }],
-            finish_reason: "tool_calls".to_string(),
-            usage: std::collections::HashMap::new(),
-        });
-    }
-    responses.push(WireRecordingProvider::text_response("done"));
-
-    let provider = Arc::new(WireRecordingProvider::new("local-qwen-test", responses));
-    let (agent_loop, _ws) = build_preview_budget_harness(provider.clone() as Arc<dyn LLMProvider>);
-    let session_key = format!("turn-preview-budget-{}", uuid::Uuid::new_v4());
-
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        agent_loop.process_direct("read every file", &session_key, "test", "offline"),
-    )
-    .await
-    .expect("budgeted turn must terminate");
-    assert_eq!(response, "done");
-
-    let core = agent_loop.shared.core_handle.swappable();
-    let session = core.sessions.get_or_resume(&session_key).await;
-    let messages = core.sessions.get_all_messages(&session.id).await;
-    let tool_messages: Vec<_> = messages
-        .iter()
-        .filter(|message| message.get("role").and_then(|v| v.as_str()) == Some("tool"))
-        .collect();
-    assert_eq!(tool_messages.len(), 4);
-
-    let detailed_chars: usize = tool_messages
-        .iter()
-        .filter_map(|message| message.get("content").and_then(|v| v.as_str()))
-        .filter(|content| !content.contains(TOOL_RESULT_HANDLE_MARKER))
-        .map(|content| content.split_once('\n').map_or(content, |(_, body)| body))
-        .map(str::chars)
-        .map(Iterator::count)
-        .sum();
-    assert!(
-        detailed_chars <= TOOL_PREVIEW_BUDGET_CHARS,
-        "new detailed tool content exceeded the turn budget: {detailed_chars}"
-    );
-    assert!(tool_messages.iter().any(|message| {
-        message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .is_some_and(|content| content.contains(TOOL_RESULT_HANDLE_MARKER))
-    }));
-
-    for message in &tool_messages {
-        let tool_call_id = message
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .unwrap();
-        assert!(
-            core.sessions
-                .load_tool_result(&session.id, tool_call_id)
-                .await
-                .is_some(),
-            "handle/detail {tool_call_id} must resolve to its exact stored body"
-        );
-    }
-
-    let reloaded = core.sessions.get_history(&session.id, 0, 0).await;
-    for persisted in tool_messages {
-        let tool_call_id = persisted
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .unwrap();
-        let replayed = reloaded
-            .iter()
-            .find(|message| {
-                message.get("tool_call_id").and_then(|v| v.as_str()) == Some(tool_call_id)
-            })
-            .expect("persisted tool result must survive an unlimited replay");
-        assert_eq!(replayed.get("content"), persisted.get("content"));
-    }
-
-    let _ = std::fs::remove_dir_all(files_dir);
-}
-
-#[tokio::test]
-async fn inline_success_and_failure_store_exact_completed_bodies() {
-    let tool_calls = vec![
-        crate::providers::base::ToolCallRequest {
-            id: "tc_inline_ok".to_string(),
-            name: "exec".to_string(),
-            arguments: std::collections::HashMap::from([(
-                "command".to_string(),
-                json!("printf inline_success_exact"),
-            )]),
-        },
-        crate::providers::base::ToolCallRequest {
-            id: "tc_inline_err".to_string(),
-            name: "exec".to_string(),
-            arguments: std::collections::HashMap::from([(
-                "command".to_string(),
-                json!("printf inline_failure_exact >&2; exit 9"),
-            )]),
-        },
-    ];
-    let provider = Arc::new(WireRecordingProvider::new(
-        "local-qwen-test",
-        vec![
-            crate::providers::base::LLMResponse {
-                content: Some(String::new()),
-                tool_calls,
-                finish_reason: "tool_calls".to_string(),
-                usage: std::collections::HashMap::new(),
-            },
-            WireRecordingProvider::text_response("done"),
-        ],
-    ));
-    let (agent_loop, workspace) = build_local_inline_harness(provider as Arc<dyn LLMProvider>);
-    let session_key = format!("inline-exact-bodies-{}", uuid::Uuid::new_v4());
-
-    let response = agent_loop
-        .process_direct("run both", &session_key, "test", "offline")
-        .await;
-    assert_eq!(response, "done");
-
-    let core = agent_loop.shared.core_handle.swappable();
-    let session = core.sessions.get_or_resume(&session_key).await;
-    assert_eq!(
-        core.sessions
-            .load_tool_result(&session.id, "tc_inline_ok")
-            .await
-            .as_deref(),
-        Some("inline_success_exact")
-    );
-    assert_eq!(
-        core.sessions
-            .load_tool_result(&session.id, "tc_inline_err")
-            .await
-            .as_deref(),
-        Some("Error: Command failed\nSTDERR:\ninline_failure_exact\nExit code: 9")
-    );
-
-    let messages = core.sessions.get_all_messages(&session.id).await;
-    for (id, expected_ok) in [("tc_inline_ok", true), ("tc_inline_err", false)] {
-        let message = messages
-            .iter()
-            .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some(id))
-            .unwrap_or_else(|| panic!("missing persisted result {id}"));
-        assert_eq!(
-            message.get("ok").and_then(Value::as_bool),
-            Some(expected_ok)
-        );
-    }
-
-    let _ = std::fs::remove_dir_all(workspace);
-}
-
-#[tokio::test]
-async fn delegated_failure_is_stored_before_specialist_shaping() {
-    let specialist = Arc::new(BlockingFirstProvider::new());
-    let main = MockLLM::named("local-qwen-test");
-    let (agent_loop, workspace) = build_local_inline_harness_with_memory_and_reflection(
-        main,
-        "local-qwen-test",
-        4_096,
-        LcmSchemaConfig::default(),
-        MemoryConfig::default(),
-        Some(specialist.clone() as Arc<dyn LLMProvider>),
-    );
-    let session_key = format!("delegated-store-order-{}", uuid::Uuid::new_v4());
-    let mut message = InboundMessage::new("test", "user", "offline", "run delegated failure");
-    message
-        .metadata
-        .insert("session_key".to_string(), json!(session_key));
-    let mut ctx = agent_loop
-        .shared
-        .prepare_context(&message, None, None, None, None)
-        .await;
-    let sessions = ctx.core.sessions.clone();
-    let session_id = ctx.session_id.clone();
-    let counters = agent_loop.shared.core_handle.counters.clone();
-    let call = crate::providers::base::ToolCallRequest {
-        id: "tc_delegated_err".to_string(),
-        name: "exec".to_string(),
-        arguments: std::collections::HashMap::from([(
-            "command".to_string(),
-            json!("seq 1 10000 >&2; exit 7"),
-        )]),
-    };
-    let calls = vec![call];
-    let response = crate::providers::base::LLMResponse {
-        content: Some(String::new()),
-        tool_calls: calls.clone(),
-        finish_reason: "tool_calls".to_string(),
-        usage: std::collections::HashMap::new(),
-    };
-    let delegation_provider = Some(MockLLM::named("local-qwen-test"));
-    let delegation_model = Some("local-qwen-test".to_string());
-    let stored_before_shaping;
-    let handled = {
-        let specialist_started = specialist.first_started.notified();
-        tokio::pin!(specialist_started);
-        let delegated = crate::agent::tool_engine::execute_tools_delegated(
-            &mut ctx,
-            &counters,
-            &calls,
-            &response,
-            &delegation_provider,
-            &delegation_model,
-        );
-        tokio::pin!(delegated);
-
-        tokio::select! {
-            _ = &mut specialist_started => {}
-            handled = &mut delegated => panic!("delegated shaping completed before specialist blocked: {handled}"),
-        }
-        stored_before_shaping = sessions
-            .load_tool_result(&session_id, "tc_delegated_err")
-            .await;
-        specialist.allow_first.notify_one();
-        delegated.await
-    };
-    assert!(handled);
-
-    let stored = stored_before_shaping
-        .expect("completed delegated failure must be stored before specialist shaping starts");
-    assert!(stored.starts_with("Error: Command failed\nSTDERR:\n1\n2\n3"));
-    assert!(stored.contains("\n10000\nExit code: 7"));
-    let persisted = ctx
-        .messages
-        .iter()
-        .find(|message| {
-            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_delegated_err")
-        })
-        .expect("delegated failure receipt must be appended");
-    assert_eq!(persisted.get("ok").and_then(Value::as_bool), Some(false));
-
-    let _ = std::fs::remove_dir_all(workspace);
-}
-
-#[tokio::test]
-async fn delegated_scratchpad_results_store_exact_success_and_failure_bodies() {
-    struct BlockingSummaryProvider {
-        calls: std::sync::atomic::AtomicU32,
-        summary_started: tokio::sync::Notify,
-        allow_summary: tokio::sync::Notify,
-        scratchpad_calls: crate::providers::base::LLMResponse,
-    }
-
-    #[async_trait]
-    impl LLMProvider for BlockingSummaryProvider {
-        async fn chat(
-            &self,
-            _messages: &[Value],
-            _tools: Option<&[Value]>,
-            _model: Option<&str>,
-            _max_tokens: u32,
-            _temperature: f64,
-            _thinking_budget: Option<u32>,
-            _top_p: Option<f64>,
-        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
-            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                return Ok(self.scratchpad_calls.clone());
-            }
-            self.summary_started.notify_one();
-            self.allow_summary.notified().await;
-            Ok(WireRecordingProvider::text_response(
-                "scratch summary publishable",
-            ))
-        }
-
-        fn get_default_model(&self) -> &str {
-            "delegated-test"
-        }
-    }
-
-    let main = MockLLM::named("local-qwen-test");
-    let (agent_loop, workspace) = build_local_inline_harness(main);
-    let session_key = format!("delegated-scratchpad-store-{}", uuid::Uuid::new_v4());
-    let mut message = InboundMessage::new("test", "user", "offline", "run delegated tools");
-    message
-        .metadata
-        .insert("session_key".to_string(), json!(session_key));
-    let mut ctx = agent_loop
-        .shared
-        .prepare_context(&message, None, None, None, None)
-        .await;
-    let counters = agent_loop.shared.core_handle.counters.clone();
-
-    let routed_calls = vec![crate::providers::base::ToolCallRequest {
-        id: "tc_routed".to_string(),
-        name: "exec".to_string(),
-        arguments: std::collections::HashMap::from([(
-            "command".to_string(),
-            json!("printf routed_exact_body"),
-        )]),
-    }];
-    let response = crate::providers::base::LLMResponse {
-        content: Some(String::new()),
-        tool_calls: routed_calls.clone(),
-        finish_reason: "tool_calls".to_string(),
-        usage: std::collections::HashMap::new(),
-    };
-    let scratchpad_calls = crate::providers::base::LLMResponse {
-        content: Some(String::new()),
-        tool_calls: vec![
-            crate::providers::base::ToolCallRequest {
-                id: "scratch_ok".to_string(),
-                name: "exec".to_string(),
-                arguments: std::collections::HashMap::from([(
-                    "command".to_string(),
-                    json!("printf scratchpad_success_exact"),
-                )]),
-            },
-            crate::providers::base::ToolCallRequest {
-                id: "scratch_err".to_string(),
-                name: "exec".to_string(),
-                arguments: std::collections::HashMap::from([(
-                    "command".to_string(),
-                    json!("printf scratchpad_failure_exact >&2; exit 4"),
-                )]),
-            },
-        ],
-        finish_reason: "tool_calls".to_string(),
-        usage: std::collections::HashMap::new(),
-    };
-    let blocking_provider = Arc::new(BlockingSummaryProvider {
-        calls: std::sync::atomic::AtomicU32::new(0),
-        summary_started: tokio::sync::Notify::new(),
-        allow_summary: tokio::sync::Notify::new(),
-        scratchpad_calls,
-    });
-    let delegation_provider: Option<Arc<dyn LLMProvider>> = Some(blocking_provider.clone());
-    let delegation_model = Some("delegated-test".to_string());
-
-    let sessions = ctx.core.sessions.clone();
-    let session_id = ctx.session_id.clone();
-    ctx.flow.tool_preview_chars_remaining = 0;
-    let handled = {
-        let summary_started = blocking_provider.summary_started.notified();
-        tokio::pin!(summary_started);
-        let delegated = crate::agent::tool_engine::execute_tools_delegated(
-            &mut ctx,
-            &counters,
-            &routed_calls,
-            &response,
-            &delegation_provider,
-            &delegation_model,
-        );
-        tokio::pin!(delegated);
-
-        tokio::select! {
-            _ = &mut summary_started => {}
-            handled = &mut delegated => panic!("delegated execution completed before summary provider blocked: {handled}"),
-        }
-        assert_eq!(
-            sessions
-                .load_tool_result(&session_id, "tc_routed")
-                .await
-                .as_deref(),
-            Some("routed_exact_body"),
-            "the routed body must be durable before analysis completes",
-        );
-        blocking_provider.allow_summary.notify_one();
-        delegated.await
-    };
-    assert!(handled);
-
-    let extra_entries: Vec<_> = ctx
-        .turn_tool_entries
-        .iter()
-        .filter(|entry| entry.id != "tc_routed")
-        .collect();
-    assert_eq!(extra_entries.len(), 2);
-    assert_ne!(extra_entries[0].id, extra_entries[1].id);
-    assert!(extra_entries
-        .iter()
-        .all(|entry| entry.id.starts_with("sp_")));
-    for (entry, expected, expected_ok) in [
-        (&extra_entries[0], "scratchpad_success_exact", true),
-        (
-            &extra_entries[1],
-            "Error: Command failed\nSTDERR:\nscratchpad_failure_exact\nExit code: 4",
-            false,
-        ),
-    ] {
-        assert_eq!(
-            sessions
-                .load_tool_result_with_status(&session_id, &entry.id)
-                .await,
-            Some((expected.to_string(), Some(expected_ok)))
-        );
-    }
-    assert!(ctx.messages.iter().any(|message| {
-        message
-            .get("content")
-            .and_then(Value::as_str)
-            .is_some_and(|content| content.contains("scratch summary publishable"))
-    }));
-    for (id, expected_ok) in std::iter::once(("tc_routed", true)).chain(
-        extra_entries
-            .iter()
-            .map(|entry| (entry.id.as_str(), entry.ok)),
-    ) {
-        let entry = ctx
-            .turn_tool_entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .unwrap_or_else(|| panic!("missing turn audit entry {id}"));
-        assert_eq!(entry.ok, expected_ok);
-    }
-    let runner_summary = ctx
-        .messages
-        .iter()
-        .filter_map(|message| message.get("content").and_then(Value::as_str))
-        .find(|content| content.contains("[Tool runner executed 2 additional calls]"))
-        .expect("scratch extras need one prompt-visible summary");
-    assert!(!runner_summary.contains("routed_exact_body"));
-    for entry in extra_entries {
-        assert!(runner_summary.contains(&entry.id));
-    }
-    assert!(runner_summary.contains("ok:false"));
-    assert!(runner_summary.contains("recall_tool_result"));
-    assert_eq!(ctx.flow.tool_preview_chars_remaining, 0);
-    assert_eq!(
-        runner_summary
-            .matches(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)
-            .count(),
-        2,
-        "zero shared budget must render both extras as bounded handles",
-    );
-    assert!(!runner_summary.contains("[exec]: scratchpad_success_exact"));
-    assert!(!runner_summary.contains("[exec]: Error: Command failed"));
-
-    let _ = std::fs::remove_dir_all(workspace);
-}
-
-#[tokio::test]
-async fn delegated_missing_routed_result_aborts_without_synthetic_publication() {
-    let main = MockLLM::named("local-qwen-test");
-    let (agent_loop, workspace) = build_local_inline_harness(main);
-    let session_key = format!("delegated-missing-routed-{}", uuid::Uuid::new_v4());
-    let mut message = InboundMessage::new("test", "user", "offline", "list twice");
-    message
-        .metadata
-        .insert("session_key".to_string(), json!(session_key));
-    let mut ctx = agent_loop
-        .shared
-        .prepare_context(&message, None, None, None, None)
-        .await;
-    let counters = agent_loop.shared.core_handle.counters.clone();
-    let arguments = std::collections::HashMap::from([("path".to_string(), json!("."))]);
-    let routed_calls = vec![
-        crate::providers::base::ToolCallRequest {
-            id: "tc_kept".to_string(),
-            name: "list_dir".to_string(),
-            arguments: arguments.clone(),
-        },
-        crate::providers::base::ToolCallRequest {
-            id: "tc_deduplicated".to_string(),
-            name: "list_dir".to_string(),
-            arguments,
-        },
-    ];
-    let response = crate::providers::base::LLMResponse {
-        content: Some(String::new()),
-        tool_calls: routed_calls.clone(),
-        finish_reason: "tool_calls".to_string(),
-        usage: std::collections::HashMap::new(),
-    };
-    let delegation_provider = Some(MockLLM::named("local-qwen-test"));
-    let delegation_model = Some("local-qwen-test".to_string());
-
-    assert!(
-        crate::agent::tool_engine::execute_tools_delegated(
-            &mut ctx,
-            &counters,
-            &routed_calls,
-            &response,
-            &delegation_provider,
-            &delegation_model,
-        )
-        .await
-    );
-    assert!(
-        ctx.flow.infra_error.is_some(),
-        "a missing routed result must fail the turn closed"
-    );
-    assert!(ctx.messages.iter().all(|message| {
-        message
-            .get("content")
-            .and_then(Value::as_str)
-            .is_none_or(|content| !content.contains("(no result)"))
-    }));
-    for expected_id in ["tc_kept", "tc_deduplicated"] {
-        let receipts: Vec<&Value> = ctx
-            .messages
-            .iter()
-            .filter(|message| {
-                message.get("tool_call_id").and_then(Value::as_str) == Some(expected_id)
-            })
-            .collect();
-        assert_eq!(
-            receipts.len(),
-            1,
-            "every routed assistant call needs exactly one terminal receipt"
-        );
-        assert_eq!(receipts[0].get("ok").and_then(Value::as_bool), Some(false));
-    }
-    let persisted = ctx.core.sessions.get_all_messages(&ctx.session_id).await;
-    for expected_id in ["tc_kept", "tc_deduplicated"] {
-        assert_eq!(
-            persisted
-                .iter()
-                .filter(|message| {
-                    message.get("tool_call_id").and_then(Value::as_str) == Some(expected_id)
-                })
-                .count(),
-            1,
-            "aborted receipts must be durable before the turn returns"
-        );
-    }
-
-    let _ = std::fs::remove_dir_all(workspace);
-}
-
-#[tokio::test]
-async fn delegated_web_result_stores_raw_envelope_before_provider_extraction() {
-    struct RawEnvelopeWebTool;
-
-    #[async_trait]
-    impl crate::agent::tools::base::Tool for RawEnvelopeWebTool {
-        fn name(&self) -> &str {
-            "web_fetch"
-        }
-
-        fn description(&self) -> &str {
-            "Test web fetch returning a raw structured failure envelope"
-        }
-
-        fn parameters(&self) -> Value {
-            json!({"type": "object", "properties": {"url": {"type": "string"}}})
-        }
-
-        async fn execute(&self, params: std::collections::HashMap<String, Value>) -> String {
-            web_envelope_for(&params)
-        }
-
-        async fn execute_with_result_and_context(
-            &self,
-            params: std::collections::HashMap<String, Value>,
-            _ctx: &crate::agent::tools::base::ToolExecutionContext,
-        ) -> crate::agent::tools::base::ToolExecutionResult {
-            crate::agent::tools::base::ToolExecutionResult {
-                ok: false,
-                data: web_envelope_for(&params),
-                error: Some("upstream failed".to_string()),
-                error_kind: None,
-            }
-        }
-    }
-
-    fn raw_web_envelope() -> String {
-        r#"{"text":"provider-facing article","error":"upstream failed","raw_only":true}"#
-            .to_string()
-    }
-
-    fn web_envelope_for(params: &std::collections::HashMap<String, Value>) -> String {
-        if params
-            .get("url")
-            .and_then(Value::as_str)
-            .is_some_and(|url| url.contains("inline-large"))
-        {
-            serde_json::json!({
-                "text": "provider-facing article ".repeat(600),
-                "error": "upstream failed",
-                "raw_only": "exact stored envelope metadata",
-            })
-            .to_string()
-        } else {
-            raw_web_envelope()
-        }
-    }
-
-    let main = MockLLM::named("local-qwen-test");
-    let (agent_loop, workspace) = build_local_inline_harness(main);
-    let session_key = format!("delegated-raw-web-{}", uuid::Uuid::new_v4());
-    let mut message = InboundMessage::new("test", "user", "offline", "fetch test page");
-    message
-        .metadata
-        .insert("session_key".to_string(), json!(session_key));
-    let mut ctx = agent_loop
-        .shared
-        .prepare_context(&message, None, None, None, None)
-        .await;
-    ctx.tools.register(Box::new(RawEnvelopeWebTool));
-    let counters = agent_loop.shared.core_handle.counters.clone();
-    let routed_calls = vec![crate::providers::base::ToolCallRequest {
-        id: "tc_raw_web".to_string(),
-        name: "web_fetch".to_string(),
-        arguments: std::collections::HashMap::from([(
-            "url".to_string(),
-            json!("https://example.invalid"),
-        )]),
-    }];
-    let response = crate::providers::base::LLMResponse {
-        content: Some(String::new()),
-        tool_calls: routed_calls.clone(),
-        finish_reason: "tool_calls".to_string(),
-        usage: std::collections::HashMap::new(),
-    };
-    let delegation_provider = Some(MockLLM::named("local-qwen-test"));
-    let delegation_model = Some("local-qwen-test".to_string());
-
-    assert!(
-        crate::agent::tool_engine::execute_tools_delegated(
-            &mut ctx,
-            &counters,
-            &routed_calls,
-            &response,
-            &delegation_provider,
-            &delegation_model,
-        )
-        .await
-    );
-    assert_eq!(
-        ctx.core
-            .sessions
-            .load_tool_result(&ctx.session_id, "tc_raw_web")
-            .await,
-        Some(raw_web_envelope()),
-    );
-    let visible = ctx
-        .messages
-        .iter()
-        .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some("tc_raw_web"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .expect("delegated web result must be provider-visible");
-    assert!(visible.contains("provider-facing article"));
-    assert!(!visible.contains("raw_only"));
-    let audit = ctx
-        .turn_tool_entries
-        .iter()
-        .find(|entry| entry.id == "tc_raw_web")
-        .expect("delegated web result must have an audit entry");
-    assert!(
-        !audit.ok,
-        "audit status must come from the raw failed result"
-    );
-
-    ctx.flow.tool_preview_chars_remaining = 0;
-    let handle_calls = vec![crate::providers::base::ToolCallRequest {
-        id: "tc_raw_web_handle".to_string(),
-        name: "web_fetch".to_string(),
-        arguments: std::collections::HashMap::from([(
-            "url".to_string(),
-            json!("https://example.invalid/handle"),
-        )]),
-    }];
-    let handle_response = crate::providers::base::LLMResponse {
-        content: Some(String::new()),
-        tool_calls: handle_calls.clone(),
-        finish_reason: "tool_calls".to_string(),
-        usage: std::collections::HashMap::new(),
-    };
-    assert!(
-        crate::agent::tool_engine::execute_tools_delegated(
-            &mut ctx,
-            &counters,
-            &handle_calls,
-            &handle_response,
-            &delegation_provider,
-            &delegation_model,
-        )
-        .await
-    );
-
-    let stored_handle_body = ctx
-        .core
-        .sessions
-        .load_tool_result(&ctx.session_id, "tc_raw_web_handle")
-        .await
-        .expect("exhausted-budget body must remain exactly retrievable");
-    assert_eq!(stored_handle_body, raw_web_envelope());
-    assert_eq!(stored_handle_body.len(), 76);
-    assert_eq!(stored_handle_body.chars().count(), 76);
-    let handle = ctx
-        .messages
-        .iter()
-        .find(|message| {
-            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_raw_web_handle")
-        })
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .expect("exhausted-budget delegated web result must publish a handle");
-    assert!(handle.contains(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER));
-    assert!(handle.contains("id:\"tc_raw_web_handle\""));
-    assert!(handle.contains("| chars:76 |"));
-    assert!(handle
-        .contains("| sha256:81ad9c42e39774d1148dde99c31b0c46c4f6e915475dfd07cabda5beddc935f7 |"));
-    assert!(handle.contains(
-        r#"excerpt:"{\"text\":\"provider-facing article\",\"error\":\"upstream failed\",\"raw_only\":true}""#
-    ));
-
-    ctx.flow.tool_preview_chars_remaining = crate::agent::tool_engine::TOOL_PREVIEW_BUDGET_CHARS;
-    let inline_calls = vec![crate::providers::base::ToolCallRequest {
-        id: "tc_inline_large_raw_web".to_string(),
-        name: "web_fetch".to_string(),
-        arguments: std::collections::HashMap::from([(
-            "url".to_string(),
-            json!("https://example.invalid/inline-large"),
-        )]),
-    }];
-    let inline_response = crate::providers::base::LLMResponse {
-        content: Some(String::new()),
-        tool_calls: inline_calls.clone(),
-        finish_reason: "tool_calls".to_string(),
-        usage: std::collections::HashMap::new(),
-    };
-    crate::agent::tool_engine::execute_tools_inline(&mut ctx, &inline_calls, &inline_response)
-        .await;
-    let stored_inline = ctx
-        .core
-        .sessions
-        .load_tool_result(&ctx.session_id, "tc_inline_large_raw_web")
-        .await
-        .expect("inline raw envelope must be durable");
-    let inline_handle = ctx
-        .messages
-        .iter()
-        .find(|message| {
-            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_inline_large_raw_web")
-        })
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .expect("oversized inline web result must publish a handle");
-    use sha2::{Digest, Sha256};
-    let digest = format!("{:x}", Sha256::digest(stored_inline.as_bytes()));
-    assert!(inline_handle.contains(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER));
-    assert!(inline_handle.contains(&format!("| chars:{} |", stored_inline.chars().count())));
-    assert!(inline_handle.contains(&format!("| sha256:{digest} |")));
-    assert!(stored_inline.contains("exact stored envelope metadata"));
-
-    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[tokio::test]
@@ -5524,7 +7209,7 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
                 name: "list_dir".to_string(),
                 arguments,
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: std::collections::HashMap::new(),
         }
     };
@@ -5686,7 +7371,7 @@ async fn test_wire_prefix_stable_across_turn_after_side_effect_boundary_nudge() 
             name: "exec".to_string(),
             arguments: exec_args,
         }],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
     let mut ls_args = std::collections::HashMap::new();
@@ -5698,7 +7383,7 @@ async fn test_wire_prefix_stable_across_turn_after_side_effect_boundary_nudge() 
             name: "list_dir".to_string(),
             arguments: ls_args,
         }],
-        finish_reason: "tool_calls".to_string(),
+        finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
     // Turn 1: exec (arms boundary → nudge injected before the next call) then a
@@ -5765,7 +7450,7 @@ async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
                 name: "exec".to_string(),
                 arguments,
             }],
-            finish_reason: "tool_calls".to_string(),
+            finish_reason: FinishReason::ToolCalls,
             usage: std::collections::HashMap::new(),
         }
     };
@@ -5796,6 +7481,22 @@ async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
     let turn1_calls = provider.calls().len();
     assert!(turn1_calls >= 2, "turn 1 must make multiple provider calls");
 
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("boundary session should exist");
+    let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
+    assert!(replay.events.iter().any(|event| matches!(
+        &event.payload,
+        crate::session::db::SessionEventPayload::ToolPreExecute {
+            tool_call_id,
+            decision: crate::session::db::ToolPreExecuteDecision::Rejected { reason },
+            ..
+        } if tool_call_id == "tc_exec_2" && reason == "response_boundary"
+    )));
+
     tokio::time::timeout(
         std::time::Duration::from_secs(15),
         agent_loop.process_direct("so what happened?", &session_key, "test", "offline"),
@@ -5810,6 +7511,49 @@ async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
         calls.len()
     );
     assert_wire_prefix(&calls[turn1_calls - 1], &calls[turn1_calls]);
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn turn_finish_journal_failure_still_returns_the_reply() {
+    // Break caught: when the final turn-finished journal write failed, an
+    // already-generated and already-persisted reply was discarded and the
+    // user got nothing. The reply must survive; only replay availability
+    // degrades to Incomplete.
+    let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![crate::providers::base::LLMResponse {
+            content: Some(attested_text("still delivered")),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: std::collections::HashMap::new(),
+        }],
+    ));
+    let (agent_loop, workspace) = build_local_inline_harness(main);
+    let session_key = format!("journal-fault-reply-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+
+    core.sessions.fail_turn_finished_writes_for_tests(1);
+
+    let response = agent_loop
+        .process_direct("say the thing", &session_key, "test", "offline")
+        .await;
+    assert_eq!(response, "still delivered");
+
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("session should exist");
+    let messages = core.sessions.get_all_messages(&meta.id).await;
+    assert!(
+        messages.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("assistant")
+                && m.get("content").and_then(Value::as_str) == Some("still delivered")
+        }),
+        "the reply must remain in persisted history despite the journal failure"
+    );
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -5851,13 +7595,13 @@ async fn test_tool_call_carrier_persists_before_tool_result() {
                     name: "list_dir".to_string(),
                     arguments: args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("I listed the workspace.")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
         ],
@@ -5898,6 +7642,194 @@ async fn test_tool_call_carrier_persists_before_tool_result() {
         "tool result must point at the immediately preceding assistant call"
     );
 
+    let replay = core
+        .sessions
+        .load_session_replay(&meta.id)
+        .await
+        .expect("load tool replay");
+    assert_eq!(
+        replay.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| event.payload.kind())
+            .collect::<Vec<_>>(),
+        vec![
+            "turn_started",
+            "model_request",
+            "model_response",
+            "tool_pre_execute",
+            "tool_execute",
+            "tool_post_execute",
+            "model_request",
+            "model_response",
+            "turn_finished",
+        ]
+    );
+    assert_eq!(replay.model_calls.len(), 2);
+    let second_request: Value = serde_json::from_slice(&replay.model_calls[1].request).unwrap();
+    assert!(second_request["messages"]
+        .as_array()
+        .is_some_and(|messages| messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some("tc_list")
+        })));
+    let lifecycle: Vec<&crate::session::db::SessionEventPayload> = replay
+        .events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            payload @ (crate::session::db::SessionEventPayload::ToolPreExecute { .. }
+            | crate::session::db::SessionEventPayload::ToolExecute { .. }
+            | crate::session::db::SessionEventPayload::ToolPostExecute { .. }) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lifecycle.len(), 3);
+    assert!(matches!(
+        lifecycle[0],
+        crate::session::db::SessionEventPayload::ToolPreExecute {
+            tool_call_id,
+            decision: crate::session::db::ToolPreExecuteDecision::Ready,
+            ..
+        } if tool_call_id == "tc_list"
+    ));
+    assert!(matches!(
+        lifecycle[1],
+        crate::session::db::SessionEventPayload::ToolExecute {
+            tool_call_id,
+            ok: true,
+            ..
+        } if tool_call_id == "tc_list"
+    ));
+    assert!(matches!(
+        lifecycle[2],
+        crate::session::db::SessionEventPayload::ToolPostExecute {
+            tool_call_id,
+            message_id,
+            ..
+        } if tool_call_id == "tc_list" && *message_id > 0
+    ));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn exact_turn_replay_survives_workspace_prompt_changes() {
+    // Break caught: replay reconstructs the old provider request from today's
+    // workspace/system prompt instead of reading the exact durable call bytes.
+    let main: Arc<dyn LLMProvider> =
+        Arc::new(StaticResponseLLM::new("local-main", "recorded answer"));
+    let (agent_loop, workspace) = build_local_inline_harness(main);
+    let session_key = format!("exact-turn-replay-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct("preserve this exact turn", &session_key, "test", "offline")
+        .await;
+    assert_eq!(response, "recorded answer");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("session should exist");
+    let before = core
+        .sessions
+        .load_session_replay(&meta.id)
+        .await
+        .expect("load exact replay");
+    assert_eq!(
+        before.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+    assert_eq!(before.model_calls.len(), 1);
+    assert!(matches!(
+        before.events.last().map(|event| &event.payload),
+        Some(crate::session::db::SessionEventPayload::TurnFinished { outcome })
+            if outcome == "finished"
+    ));
+    let request: Value = serde_json::from_slice(&before.model_calls[0].request).unwrap();
+    assert_eq!(request.get("streaming"), Some(&Value::Bool(false)));
+    assert_eq!(
+        request.get("model").and_then(Value::as_str),
+        Some(core.model.as_str())
+    );
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("recorded messages");
+    assert!(messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("user")
+            && message.get("content").and_then(Value::as_str) == Some("preserve this exact turn")
+    }));
+
+    std::fs::write(workspace.join("IDENTITY.md"), "a different future identity").unwrap();
+    let after = core
+        .sessions
+        .load_session_replay(&meta.id)
+        .await
+        .expect("reload exact replay");
+    assert_eq!(after.model_calls[0].request, before.model_calls[0].request);
+    assert_eq!(
+        after.model_calls[0].response,
+        before.model_calls[0].response
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn pre_execute_persistence_failure_prevents_tool_side_effect() {
+    // Break caught: a tool enters its implementation even though the durable
+    // pre-execute decision failed, leaving an unreplayable side effect.
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: "tc-blocked-write".to_string(),
+                name: "write_file".to_string(),
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("blocked.txt")),
+                    ("content".to_string(), json!("must not exist")),
+                ]),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: HashMap::new(),
+        }],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let core = agent_loop.shared.core_handle.swappable();
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_tool_pre_replay \
+             BEFORE INSERT ON session_events \
+             WHEN NEW.event_kind = 'tool_pre_execute' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic pre-execute persistence failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct(
+            "write the blocked file",
+            &format!("pre-execute-failure-{}", uuid::Uuid::new_v4()),
+            "test",
+            "offline",
+        )
+        .await;
+
+    assert!(
+        response.contains("pre-execution decision could not be recorded"),
+        "unexpected failure response: {response:?}"
+    );
+    assert!(!workspace.join("blocked.txt").exists());
+    assert_eq!(provider.call_count(), 1);
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
@@ -5965,7 +7897,7 @@ async fn test_multiple_tool_round_carriers_persist_in_order() {
                     name: "list_dir".to_string(),
                     arguments: list_args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
@@ -5975,13 +7907,13 @@ async fn test_multiple_tool_round_carriers_persist_in_order() {
                     name: "exec".to_string(),
                     arguments: exec_args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("Done.")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
         ],
@@ -6038,7 +7970,7 @@ async fn test_local_truncated_response_requires_attested_correction_without_cont
         vec![crate::providers::base::LLMResponse {
             content: Some("Partial local answer".to_string()),
             tool_calls: vec![],
-            finish_reason: "length".to_string(),
+            finish_reason: FinishReason::Length,
             usage: std::collections::HashMap::new(),
         }],
     ));
@@ -6072,19 +8004,19 @@ async fn test_local_streaming_cache_markers_append_only_across_turns() {
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("one")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("two")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
             crate::providers::base::LLMResponse {
                 content: Some(attested_text("three")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             },
         ],
@@ -6146,16 +8078,26 @@ async fn test_local_streaming_cache_markers_append_only_across_turns() {
         cache_markers[0].starts_with("\u{0}cache:first:"),
         "first turn should establish the cache: {cache_markers:?}"
     );
-    // Routine DB replay preserves provider-visible bytes, so every later turn
-    // extends the retained prefix instead of discarding the prior fingerprint.
-    assert!(
-        cache_markers[1].starts_with("\u{0}cache:append:"),
-        "second turn extends the retained prefix: {cache_markers:?}"
-    );
-    assert!(
-        cache_markers[2].starts_with("\u{0}cache:append:"),
-        "third turn extends the retained prefix: {cache_markers:?}"
-    );
+    // Later turns must report AppendOnly, not First.
+    //
+    // The DB reload between turns is a pure function of the stored rows, so
+    // turn N+1's prompt is turn N's prompt plus the new messages. The
+    // fingerprint therefore survives the reload and the comparison is made
+    // ACROSS the turn boundary — which is the only place a reload that
+    // silently rewrote history can be caught.
+    //
+    // This previously asserted `first:` on every turn, because the fingerprint
+    // was cleared on each reload. That made cross-turn divergence structurally
+    // undetectable: session 20260810_081050_8306f8 shrank 8 tool results by
+    // ~9.8KB at a turn boundary, cost 124.54s of re-prefill on the server, and
+    // produced no nanobot log line at all.
+    for (i, marker) in cache_markers.iter().enumerate().skip(1) {
+        assert!(
+            marker.starts_with("\u{0}cache:append:"),
+            "turn {} must continue the previous turn's prefix, got {marker:?} in {cache_markers:?}",
+            i + 1
+        );
+    }
     assert!(
         cache_markers
             .iter()
@@ -6180,7 +8122,7 @@ async fn test_failed_local_call_does_not_seed_prompt_cache_marker() {
         crate::providers::base::LLMResponse {
             content: Some(attested_text("recovered")),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         },
     ));
@@ -6221,6 +8163,27 @@ async fn test_failed_local_call_does_not_seed_prompt_cache_marker() {
             .is_some_and(|m| m.starts_with("\u{0}cache:first:")),
         "failed call may diagnose cold cache, but must not commit it: {first_markers:?}"
     );
+    let core = agent_loop.shared.core_handle.swappable();
+    let failed_session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("failed turn session");
+    let failed_replay = core
+        .sessions
+        .load_session_replay(&failed_session.id)
+        .await
+        .expect("failed turn replay");
+    assert_eq!(
+        failed_replay.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+    assert!(failed_replay.model_calls[0]
+        .failure
+        .as_deref()
+        .is_some_and(|bytes| bytes
+            .windows("synthetic provider failure".len())
+            .any(|window| { window == "synthetic provider failure".as_bytes() })));
 
     let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let second = agent_loop
@@ -6315,6 +8278,22 @@ async fn test_direct_streaming_forwards_thinking_delta_with_ansi_marker() {
         deltas.iter().any(|delta| delta == "visible answer"),
         "visible answer text should still stream after thinking: {deltas:?}"
     );
+    let core = agent_loop.shared.core_handle.swappable();
+    let meta = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("streaming replay session");
+    let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
+    assert_eq!(
+        replay.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+    let recorded_request: Value = serde_json::from_slice(&replay.model_calls[0].request).unwrap();
+    assert_eq!(recorded_request["streaming"], json!(true));
+    let recorded_response: Value =
+        serde_json::from_slice(replay.model_calls[0].response.as_deref().unwrap()).unwrap();
+    assert_eq!(recorded_response["content"], json!("visible answer"));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -6767,6 +8746,9 @@ async fn test_trio_offline_e2e_health_gate() {
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -7260,6 +9242,9 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -7319,6 +9304,9 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -7376,6 +9364,9 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -7434,6 +9425,9 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -7479,6 +9473,9 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -7555,6 +9552,9 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -7607,6 +9607,9 @@ mod runtime_mode_parity_tests {
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -7626,18 +9629,15 @@ mod runtime_mode_parity_tests {
     // what the model emits, the loop must terminate in a BOUNDED number of
     // provider calls and return something — it must never spin. These tests
     // feed adversarial providers that never cooperate and assert bounded
-    // termination. They are the one e2e layer that would have caught the
-    // strip/restore churn, the phantom regression, and the family-cap spin.
+    // termination. They guard schema churn, phantom tool narration, and
+    // repeated tool-call loops.
 
-    /// A provider that emits a list_dir tool call on every turn, never
-    /// exhausts, and counts calls. Each call uses a DISTINCT path argument
-    /// (defeats the cached-duplicate breaker, which keys on name+args) so the
-    /// loop is forced through the per-turn lease. Every advertised tool array
-    /// is retained so the test can prove the provider schema never changes.
+    /// A provider that emits a distinct side-effect tool call on every turn.
+    /// The session replay records the main-call catalogs for the lease
+    /// convergence assertion.
     struct LoopingProvider {
         name: String,
         call_count: std::sync::atomic::AtomicU32,
-        tool_snapshots: std::sync::Mutex<Vec<Vec<Value>>>,
     }
 
     impl LoopingProvider {
@@ -7645,16 +9645,10 @@ mod runtime_mode_parity_tests {
             Self {
                 name: name.to_string(),
                 call_count: std::sync::atomic::AtomicU32::new(0),
-                tool_snapshots: std::sync::Mutex::new(Vec::new()),
             }
         }
-
         fn call_count(&self) -> u32 {
             self.call_count.load(std::sync::atomic::Ordering::Relaxed)
-        }
-
-        fn tool_snapshots(&self) -> Vec<Vec<Value>> {
-            self.tool_snapshots.lock().unwrap().clone()
         }
     }
 
@@ -7663,7 +9657,7 @@ mod runtime_mode_parity_tests {
         async fn chat(
             &self,
             _messages: &[Value],
-            tools: Option<&[Value]>,
+            _tools: Option<&[Value]>,
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
@@ -7673,23 +9667,20 @@ mod runtime_mode_parity_tests {
             let n = self
                 .call_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.tool_snapshots
-                .lock()
-                .unwrap()
-                .push(tools.unwrap_or(&[]).to_vec());
-            // Distinct path per call: the cached-duplicate breaker cannot arm,
-            // so the lease read-family cap is the only thing that can stop the
-            // run — exactly the 2026-07-30 incident path.
+            // Distinct command per call: the cached-duplicate breaker cannot
+            // arm, so the lease exhaustion path exercises paired rejections.
+            // Uses `exec` (side-effect) not `list_dir`
+            // (read-only) because read-only tools now auto-renew the lease.
             let mut args = std::collections::HashMap::new();
-            args.insert("path".to_string(), json!(format!("dir{n}")));
+            args.insert("command".to_string(), json!(format!("echo {n}")));
             Ok(crate::providers::base::LLMResponse {
                 content: Some(String::new()),
                 tool_calls: vec![crate::providers::base::ToolCallRequest {
                     id: format!("tc_loop_{n}"),
-                    name: "list_dir".to_string(),
+                    name: "exec".to_string(),
                     arguments: args,
                 }],
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: FinishReason::ToolCalls,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -7699,20 +9690,127 @@ mod runtime_mode_parity_tests {
         }
     }
 
-    /// Adversarial convergence: the model emits a fresh list_dir every turn
-    /// (distinct args, so no cached-duplicate shortcut) and NEVER writes a
-    /// final answer. The loop must still converge via the lease budget. The
-    /// first over-budget batch is rejected atomically and ends the
-    /// turn without another provider call or a tool-schema mutation.
+    /// A model that narrates a tool call it never emits (`higgs` + lfm2-2.6b
+    /// returns `[exec(command='date')]` as plain content with no `tool_calls`,
+    /// even under `tool_choice=required`). Nothing executes, so the narration
+    /// must NOT be left standing on the stream as if it were a result: it has
+    /// to be retracted and replaced by an explicit failure. Before the fix the
+    /// give-up message was suppressed by `content_was_streamed` and the user
+    /// saw only the phantom call.
+    struct PhantomToolProvider {
+        name: String,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PhantomToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::providers::base::LLMResponse {
+                content: Some(
+                    "Let me use the exec tool to run a command that will give me the current time.\
+                     [exec(command='date')]"
+                        .to_string(),
+                ),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            &self.name
+        }
+    }
+
     #[tokio::test]
-    async fn convergence_stops_first_over_budget_batch_with_stable_tools() {
-        let provider = Arc::new(LoopingProvider::new("local-main"));
-        // max_iterations must exceed the per-lease budget (DEFAULT_TOOLS_PER_LEASE
-        // = 12) so the next request reaches atomic lease rejection before the
-        // bare iteration limit stops the loop.
+    async fn phantom_tool_narration_is_retracted_not_surfaced_as_answer() {
+        let provider = Arc::new(PhantomToolProvider {
+            name: "local-main".to_string(),
+            calls: std::sync::atomic::AtomicU32::new(0),
+        });
         let (agent_loop, workspace) =
             build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
-        let session_key = format!("conv-stable-lease-{}", uuid::Uuid::new_v4());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let session_key = format!("phantom-tool-{}", uuid::Uuid::new_v4());
+
+        let final_text = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent_loop.process_direct_streaming(
+                "what is the time?",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                tx,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("turn must terminate");
+
+        let mut deltas = Vec::new();
+        while let Ok(d) = rx.try_recv() {
+            deltas.push(d);
+        }
+        let streamed = deltas.join("");
+
+        assert!(
+            streamed.contains(&crate::turn_stream::ControlMarker::RetractReply.encode()),
+            "phantom narration must be retracted from the stream, got: {streamed:?}"
+        );
+        let tail = streamed
+            .rsplit(&crate::turn_stream::ControlMarker::RetractReply.encode())
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !tail.contains("[exec(command='date')]"),
+            "phantom call survived the retraction: {tail:?}"
+        );
+        assert!(
+            final_text.contains("narrated a tool action"),
+            "turn must end with an explicit no-execution failure, got: {final_text:?}"
+        );
+        let core = agent_loop.shared.core_handle.swappable();
+        let meta = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .expect("phantom session");
+        let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
+        assert!(replay.model_calls.iter().any(|call| {
+            call.purpose == crate::session::db::ModelCallPurpose::ForcedToolRecovery
+                && call.response.is_some()
+        }));
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// Adversarial convergence: the model emits a fresh side-effect call every
+    /// turn and never writes a final answer. The loop must terminate after the
+    /// lease rejections, without changing the frozen catalog or orphaning any
+    /// rejected tool result.
+    #[tokio::test]
+    async fn convergence_loop_terminates_without_mutating_tool_catalog() {
+        let provider = Arc::new(LoopingProvider::new("local-main"));
+        // max_iterations must exceed the 12-call lease so the provider reaches
+        // paired lease rejections before the ordinary iteration limit.
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
+        let session_key = format!("conv-stable-catalog-{}", uuid::Uuid::new_v4());
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -7721,16 +9819,78 @@ mod runtime_mode_parity_tests {
         .await
         .expect("loop must terminate — it hung (convergence regression)");
 
-        assert_eq!(response, LEASE_OVER_BUDGET_FINAL);
-        let calls = provider.call_count();
-        assert_eq!(
-            calls,
-            crate::agent::lease::DEFAULT_TOOLS_PER_LEASE + 1,
-            "the first over-budget request must terminate immediately"
+        assert!(
+            !response.trim().is_empty(),
+            "a converged turn must return text, got empty"
         );
-        let snapshots = provider.tool_snapshots();
-        assert!(snapshots.iter().all(|tools| !tools.is_empty()));
-        assert!(snapshots.iter().all(|tools| tools == &snapshots[0]));
+        let calls = provider.call_count();
+        assert!(
+            calls < 25,
+            "loop made {calls} provider calls — did not converge (termination guard regressed)"
+        );
+
+        let core = agent_loop.shared.core_handle.swappable();
+        let meta = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .expect("loop session must exist");
+        let replay = core
+            .sessions
+            .load_session_replay(&meta.id)
+            .await
+            .expect("loop replay must be readable");
+        let main_catalogs: Vec<Option<Vec<Value>>> = replay
+            .model_calls
+            .iter()
+            .filter(|call| call.purpose == crate::session::db::ModelCallPurpose::Main)
+            .map(|call| {
+                serde_json::from_slice::<crate::session::db::RecordedProviderRequest>(&call.request)
+                    .expect("main request must decode")
+                    .tools
+            })
+            .collect();
+        assert!(
+            !main_catalogs.is_empty(),
+            "the foreground loop must record main provider calls"
+        );
+        assert!(
+            main_catalogs.windows(2).all(|pair| pair[0] == pair[1]),
+            "lease rejection changed the main-call tool catalog and would bust Higgs's cached prefix"
+        );
+        let raw = core.sessions.get_all_messages(&meta.id).await;
+        let carrier_ids: std::collections::HashSet<String> = raw
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            .flat_map(|message| {
+                message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+            .collect();
+        let blocked_ids: Vec<&str> = raw
+            .iter()
+            .filter(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.starts_with("lease exhausted:"))
+            })
+            .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
+            .collect();
+        assert!(
+            !blocked_ids.is_empty(),
+            "adversarial provider must reach lease-blocked receipts"
+        );
+        assert!(
+            blocked_ids.iter().all(|id| carrier_ids.contains(*id)),
+            "every lease rejection must have an assistant tool-call carrier: {blocked_ids:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -7738,16 +9898,17 @@ mod runtime_mode_parity_tests {
     /// Positive counterpart to the convergence test: legitimate bounded
     /// exploration — 8 distinct same-family (read) calls, the exact pattern the
     /// retired coarse-family cap used to block at 6 — must complete normally
-    /// with the model's own answer, WITHOUT arming any loop guard. Under the
-    /// OLD cap the 7th call would be blocked, so this asserts tools were present
-    /// on EVERY call and the turn reaches the model's answer.
+    /// with the model's own answer, without a lease rejection or loop guard.
+    /// Under the old cap the 7th call would be blocked, so this asserts tools
+    /// stay available and the turn reaches the model's answer.
     #[tokio::test]
     async fn convergence_legitimate_exploration_completes_without_guard() {
-        // A sequence provider that ALSO records whether any call observed
-        // `tools == None` (a schema-mutation signal). Without this, a blind
-        // sequence dequeue would pass even if the 7th call were capped.
+        // A sequence provider also records an absent tool catalog. Without
+        // this, a blind sequence dequeue would pass if a loop guard changed
+        // the schema before the model reached its answer.
         struct ExploringProvider {
-            responses: parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
+            responses:
+                parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
             calls: std::sync::atomic::AtomicU32,
             saw_tools_absent: std::sync::atomic::AtomicBool,
         }
@@ -7763,7 +9924,8 @@ mod runtime_mode_parity_tests {
                 _thinking_budget: Option<u32>,
                 _top_p: Option<f64>,
             ) -> anyhow::Result<crate::providers::base::LLMResponse> {
-                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if tools.is_none() {
                     self.saw_tools_absent
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -7772,7 +9934,7 @@ mod runtime_mode_parity_tests {
                     crate::providers::base::LLMResponse {
                         content: Some("ERROR: exploration sequence exhausted".to_string()),
                         tool_calls: vec![],
-                        finish_reason: "stop".to_string(),
+                        finish_reason: FinishReason::Stop,
                         usage: std::collections::HashMap::new(),
                     }
                 }))
@@ -7793,7 +9955,7 @@ mod runtime_mode_parity_tests {
                         name: "list_dir".to_string(),
                         arguments: a,
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: std::collections::HashMap::new(),
                 }
             })
@@ -7801,7 +9963,7 @@ mod runtime_mode_parity_tests {
         seq.push(crate::providers::base::LLMResponse {
             content: Some(attested_text("done exploring")),
             tool_calls: vec![],
-            finish_reason: "stop".to_string(),
+            finish_reason: FinishReason::Stop,
             usage: std::collections::HashMap::new(),
         });
         let provider = Arc::new(ExploringProvider {
@@ -7828,25 +9990,25 @@ mod runtime_mode_parity_tests {
         );
         assert!(
             !provider.saw_tools_absent.load(std::sync::atomic::Ordering::Relaxed),
-            "tools were stripped during exploration — a loop guard fired (regression of the family-cap retirement)"
+            "tools disappeared during exploration — a loop guard fired (regression of the family-cap retirement)"
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
-
     /// dropped the warm cache). The model runs a command whose output is huge
-    /// (stashed under its tool_call_id), then recalls it. The recalled result
-    /// persisted in the conversation must be bounded AND point at slice/search —
-    /// not the full body. This exercises the real tool-execution + shaping path
+    /// (stashed under its tool_call_id), then inspects it. The inspection result
+    /// persisted in the conversation must be bounded — not the full body. This
+    /// exercises the real tool-execution + shaping path
     /// end-to-end (the unit test only covers `digest_tool_result`).
     #[tokio::test]
-    async fn convergence_recall_of_oversized_body_stays_bounded() {
+    async fn convergence_inspection_of_oversized_body_stays_bounded() {
         let mut exec_args = std::collections::HashMap::new();
         // ~230KB of output — far over any in-context cap, guaranteed to stash.
         exec_args.insert("command".to_string(), json!("seq 1 40000"));
-        let mut recall_args = std::collections::HashMap::new();
-        recall_args.insert("tool_call_id".to_string(), json!("tc_big"));
+        let mut inspect_args = std::collections::HashMap::new();
+        inspect_args.insert("tool_call_id".to_string(), json!("tc_big"));
+        inspect_args.insert("query".to_string(), json!("39999"));
 
         let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
             "local-main",
@@ -7858,41 +10020,41 @@ mod runtime_mode_parity_tests {
                         name: "exec".to_string(),
                         arguments: exec_args,
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: std::collections::HashMap::new(),
                 },
                 crate::providers::base::LLMResponse {
                     content: Some(String::new()),
                     tool_calls: vec![crate::providers::base::ToolCallRequest {
-                        id: "tc_recall".to_string(),
-                        name: "recall_tool_result".to_string(),
-                        arguments: recall_args,
+                        id: "tc_inspect".to_string(),
+                        name: "inspect_tool_result".to_string(),
+                        arguments: inspect_args,
                     }],
-                    finish_reason: "tool_calls".to_string(),
+                    finish_reason: FinishReason::ToolCalls,
                     usage: std::collections::HashMap::new(),
                 },
                 crate::providers::base::LLMResponse {
                     content: Some(attested_text("done")),
                     tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
+                    finish_reason: FinishReason::Stop,
                     usage: std::collections::HashMap::new(),
                 },
             ],
         ));
         let (agent_loop, workspace) = build_local_inline_harness(main);
-        let session_key = format!("conv-recall-bound-{}", uuid::Uuid::new_v4());
+        let session_key = format!("conv-inspect-bound-{}", uuid::Uuid::new_v4());
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            agent_loop.process_direct("run then recall", &session_key, "test", "offline"),
+            agent_loop.process_direct("run then inspect", &session_key, "test", "offline"),
         )
         .await
-        .expect("recall e2e must terminate");
+        .expect("inspection e2e must terminate");
 
         assert_eq!(response, "done");
 
-        // The recalled body persisted in the conversation must be bounded, not
-        // the raw ~230KB, and must direct the model at slice/search.
+        // The inspected body persisted in the conversation must be bounded,
+        // not the raw ~230KB.
         let core = agent_loop.shared.core_handle.swappable();
         let meta = core
             .sessions
@@ -7900,22 +10062,22 @@ mod runtime_mode_parity_tests {
             .await
             .expect("session should exist");
         let msgs = core.sessions.get_all_messages(&meta.id).await;
-        let recall_result = msgs
+        let inspect_result = msgs
             .iter()
-            .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_recall"))
-            .expect("recall tool result must be persisted");
-        let content = recall_result
+            .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc_inspect"))
+            .expect("inspect tool result must be persisted");
+        let content = inspect_result
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert!(
             content.chars().count() < 5000,
-            "recalled body must be bounded in context, got {} chars (regression of the 172KB blowup)",
+            "inspected body must be bounded in context, got {} chars (regression of the 172KB blowup)",
             content.chars().count()
         );
         assert!(
-            content.contains("slice_tool_result") || content.contains("search_tool_result"),
-            "recalled preview must point at slice/search, got: {content}"
+            content.starts_with(crate::agent::tool_engine::TOOL_RESULT_EXCERPT_MARKER),
+            "inspection output must be the bounded projection, got: {content}"
         );
 
         let _ = std::fs::remove_dir_all(&workspace);

@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions, clippy::indexing_slicing)]
 //! Anti-drift hook pipeline for SLM context stabilization.
 //!
 //! Small local models (3B–8B) degrade as context fills with noise — filler
@@ -232,10 +238,11 @@ pub fn pre_completion_pipeline(
     messages: &mut Vec<Value>,
     iteration: u32,
     config: &AntiDriftConfig,
+    tools_active: bool,
 ) {
     let evicted = evict_polluted_turns(messages, config.pollution_threshold);
     let collapsed = collapse_repetitive_attempts(messages, config.repetition_min_count);
-    let anchored = inject_format_anchor(messages, iteration, config.anchor_interval);
+    let anchored = inject_format_anchor(messages, iteration, config.anchor_interval, tools_active);
 
     if evicted > 0 || collapsed > 0 || anchored {
         debug!(
@@ -382,13 +389,22 @@ fn collapse_repetitive_attempts(messages: &mut Vec<Value>, min_count: usize) -> 
 /// 15-iteration turn while the model called a tool every step). The interval is
 /// only a floor on how often the anchor *can* fire; the drift check gates
 /// whether it actually does.
-fn inject_format_anchor(messages: &mut Vec<Value>, iteration: u32, interval: u32) -> bool {
+fn inject_format_anchor(
+    messages: &mut Vec<Value>,
+    iteration: u32,
+    interval: u32,
+    tools_active: bool,
+) -> bool {
     if interval == 0 || iteration == 0 || iteration % interval != 0 {
         return false;
     }
     // On-task models don't get nagged: skip when a recent assistant turn made a
     // tool call. Only genuine drift (recent turns all text-only) earns an anchor.
-    if recent_assistant_used_tools(messages) {
+    // `tools_active` is computed on the FULL message array (before the
+    // frozen-prefix split in prefix_guard) so the check sees recent assistant
+    // turns even when they live in the cached prefix and are invisible to the
+    // tail-only view inside `with_frozen_prefix`.
+    if tools_active {
         return false;
     }
     // Don't inject if last message already contains an anchor
@@ -407,7 +423,7 @@ fn inject_format_anchor(messages: &mut Vec<Value>, iteration: u32, interval: u32
 /// True if any of the last two assistant turns made a tool call — i.e. the model
 /// is acting, not drifting into narration. Two turns (not one) so a single
 /// sanctioned text report after a boundary nudge doesn't read as drift.
-fn recent_assistant_used_tools(messages: &[Value]) -> bool {
+pub(crate) fn recent_assistant_used_tools(messages: &[Value]) -> bool {
     messages
         .iter()
         .rev()
@@ -642,13 +658,13 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
         ];
         // iteration 3, interval 3 → should inject
-        assert!(inject_format_anchor(&mut messages, 3, 3));
+        assert!(inject_format_anchor(&mut messages, 3, 3, false));
         assert_eq!(messages.len(), 3);
         let anchor = messages[2]["content"].as_str().unwrap();
         assert!(anchor.contains("[format-anchor]"));
 
         // Double injection should be prevented
-        assert!(!inject_format_anchor(&mut messages, 6, 3));
+        assert!(!inject_format_anchor(&mut messages, 6, 3, false));
     }
 
     #[test]
@@ -663,7 +679,7 @@ mod tests {
             json!({"role": "tool", "content": "contents", "tool_call_id": "t1"}),
         ];
         assert!(
-            !inject_format_anchor(&mut acting, 3, 3),
+            !inject_format_anchor(&mut acting, 3, 3, true),
             "anchor must be skipped while the model is actively calling tools"
         );
 
@@ -675,7 +691,7 @@ mod tests {
             json!({"role": "assistant", "content": "I believe it is probably fine, basically."}),
         ];
         assert!(
-            inject_format_anchor(&mut drifting, 3, 3),
+            inject_format_anchor(&mut drifting, 3, 3, false),
             "anchor should fire when recent assistant turns are all text-only"
         );
     }
@@ -742,7 +758,7 @@ mod tests {
         let original_len = messages.len();
 
         // Iteration 3 triggers anchor injection
-        pre_completion_pipeline(&mut messages, 3, &config);
+        pre_completion_pipeline(&mut messages, 3, &config, false);
 
         // At least one polluted turn should be evicted
         let evicted_count = messages
@@ -789,7 +805,7 @@ mod tests {
             repetition_min_count: 999, // no collapse
             ..Default::default()
         };
-        pre_completion_pipeline(&mut messages, 3, &no_evict_config);
+        pre_completion_pipeline(&mut messages, 3, &no_evict_config, false);
         assert_eq!(
             messages, original,
             "Impossible thresholds should produce no changes"
@@ -813,7 +829,7 @@ mod tests {
         ];
 
         let config = AntiDriftConfig::default();
-        pre_completion_pipeline(&mut messages, 1, &config);
+        pre_completion_pipeline(&mut messages, 1, &config, false);
 
         // The 3 identical assistant attempts should be collapsed (all but last replaced)
         let collapsed_count = messages
@@ -1041,7 +1057,7 @@ mod tests {
 
         // Step 2: anti-drift (quality)
         let config = AntiDriftConfig::default();
-        pre_completion_pipeline(&mut messages, 3, &config);
+        pre_completion_pipeline(&mut messages, 3, &config, false);
 
         // Filler-heavy message should be evicted (if not in safe window)
         let evicted = messages
@@ -1081,7 +1097,7 @@ mod tests {
             pollution_threshold: 0.0,
             ..Default::default()
         }; // evict everything
-        pre_completion_pipeline(&mut messages, 1, &config);
+        pre_completion_pipeline(&mut messages, 1, &config, false);
 
         // Messages in safe window (last 4, indices 3-6) should NOT be replaced
         assert_ne!(

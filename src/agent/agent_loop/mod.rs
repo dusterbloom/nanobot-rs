@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::shadow_reuse)]
 #![allow(dead_code)]
 //! Main agent loop that consumes inbound messages and produces responses.
 //!
@@ -18,7 +24,7 @@ use serde_json::json;
 use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::agent::reflector::Reflector;
 use crate::agent::subagent::SubagentManager;
@@ -69,16 +75,6 @@ use heuristics::{last_user_message, render_via_protocol, should_strip_tools_for_
 // AgentLoop (owns the receiver + orchestrates concurrency)
 // ---------------------------------------------------------------------------
 
-type SessionLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
-
-async fn session_lock_for(session_locks: &SessionLocks, session_key: &str) -> Arc<Mutex<()>> {
-    let mut locks = session_locks.lock().await;
-    locks
-        .entry(session_key.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
 /// The core agent loop.
 ///
 /// Consumes [`InboundMessage`]s from the bus, runs the LLM + tool loop, and
@@ -93,7 +89,6 @@ pub struct AgentLoop {
     running: Arc<AtomicBool>,
     max_concurrent_chats: usize,
     reflection_spawned: AtomicBool,
-    session_locks: SessionLocks,
 }
 
 impl AgentLoop {
@@ -200,7 +195,6 @@ impl AgentLoop {
             running: Arc::new(AtomicBool::new(false)),
             max_concurrent_chats,
             reflection_spawned: AtomicBool::new(false),
-            session_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -265,19 +259,21 @@ impl AgentLoop {
         Self::spawn_background_reflection(&self.shared);
 
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent_chats));
-        // Every entrypoint shares this map, so direct/TUI turns cannot race a
-        // gateway turn through prompt fingerprint and Higgs epoch state.
-        let session_locks = self.session_locks.clone();
+        // Per-session locks to serialize messages within the same conversation.
+        let session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         // Coalescing can observe the first message for another session. Retain
         // it for the next loop iteration so it traverses the exact same
-        // system/command/lock/permit path instead of a parallel side path.
+        // system/command/lock/permit path instead of a parallel side path
+        // (see main b9d0055).
         let mut pending_msg = None;
 
         while self.running.load(Ordering::SeqCst) {
             let msg = if let Some(msg) = pending_msg.take() {
                 msg
             } else {
-                match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv()).await
+                match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv())
+                    .await
                 {
                     Ok(Some(msg)) => msg,
                     Ok(None) => {
@@ -305,7 +301,10 @@ impl AgentLoop {
                             // Preserve the different-session message for the
                             // next normal iteration. This is the in-process
                             // equivalent of push-back without a second gateway
-                            // execution pipeline.
+                            // execution pipeline (see main b9d0055) — a side
+                            // path here would skip is_system + /-command
+                            // interception, letting a /clear from another
+                            // session reach the LLM as plain text.
                             pending_msg = Some(other);
                             break;
                         }
@@ -341,7 +340,13 @@ impl AgentLoop {
 
             // Get or create the per-session lock.
             let session_key = msg.session_key();
-            let session_lock = session_lock_for(&session_locks, &session_key).await;
+            let session_lock = {
+                let mut locks = session_locks.lock().await;
+                locks
+                    .entry(session_key)
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            };
 
             let shared = self.shared.clone();
             let outbound_tx = self.shared.bus_outbound_tx.clone();
@@ -354,9 +359,9 @@ impl AgentLoop {
 
                 // Commands such as /clear mutate session history and retained
                 // prompt state, so dispatch them under the same lock as normal
-                // turns. Keeping dispatch inside this spawned task preserves
-                // cross-session gateway concurrency while preventing an older
-                // in-flight turn from resurrecting state after the reset.
+                // turns — dispatching on the run() loop outside this lock lets
+                // a /clear race an in-flight turn and resurrect cleared
+                // history via later persists (see main 3cbc59d).
                 if msg.content.trim().starts_with('/') {
                     if let Some(response_text) =
                         crate::agent::gateway_commands::dispatch(&shared, &msg).await
@@ -373,10 +378,9 @@ impl AgentLoop {
                     }
                 }
 
-                // Same-session work waits on its ordering lock without
-                // reserving global inference capacity. Recognized commands do
-                // not need a model permit at all; unknown slash commands fall
-                // through and acquire one like any other inference request.
+                // Permit acquired post-lock so exhaustion can't stall command
+                // dispatch or other sessions; recognized commands never need
+                // one at all (see main 3fb926d).
                 let permit = match request_sem.acquire_owned().await {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -484,15 +488,86 @@ impl AgentLoop {
             .await
     }
 
-    /// Clear the LCM engine for a session (e.g. on /clear command).
-    ///
-    /// This resets the summary DAG and active context so stale summaries
-    /// don't pollute fresh conversations after /clear.
-    pub async fn clear_lcm_engine(&self, session_id: &str) {
-        let mut engines = self.shared.lcm_engines.lock().await;
-        if engines.remove(session_id).is_some() {
+    /// Cancel generation and join every compaction job owned by this loop.
+    pub(crate) async fn drain_compaction_jobs(&self) {
+        let handles = {
+            let handles = self.shared.compaction_handles.lock().await;
+            handles.values().cloned().collect::<Vec<_>>()
+        };
+        futures_util::future::join_all(handles.iter().map(|handle| handle.cancel_and_reap())).await;
+    }
+
+    /// Atomically clear all state owned by one concrete interactive session.
+    pub async fn clear_session_state(&self, session_key: &str) {
+        let core = self.shared.core_handle.swappable();
+        let session = core.sessions.get_or_resume(session_key).await;
+        let session_id = session.id;
+        let (compaction, closing) = self.begin_session_clear(&session_id).await;
+
+        compaction.cancel_and_reap().await;
+        *compaction.slot.lock().await = None;
+        if self
+            .shared
+            .lcm_engines
+            .lock()
+            .await
+            .remove(&session_id)
+            .is_some()
+        {
             debug!(%session_id, "LCM engine cleared");
         }
+        if core.memory_enabled {
+            if let Err(error) = core.working_memory.clear(&session_id).await {
+                warn!(%error, %session_id, "failed to clear working memory");
+            }
+        }
+        core.sessions.clear_history(&session_id).await;
+
+        let counters = &self.shared.core_handle.counters;
+        counters.reset_session_prompt_state(session_key);
+        counters.last_context_used.store(0, Ordering::Relaxed);
+        counters.last_message_count.store(0, Ordering::Relaxed);
+        counters
+            .last_working_memory_tokens
+            .store(0, Ordering::Relaxed);
+        self.retire_session_clear(&session_id, &compaction, closing)
+            .await;
+    }
+
+    async fn begin_session_clear(
+        &self,
+        session_id: &str,
+    ) -> (CompactionHandle, compaction::CompactionClosingAdmission) {
+        loop {
+            let candidate = self.shared.compaction_handle_for_session(session_id).await;
+            if let Some(closing) = candidate.begin_close().await {
+                return (candidate, closing);
+            }
+            self.shared
+                .remove_compaction_handle_if_owned(session_id, &candidate)
+                .await;
+        }
+    }
+
+    async fn retire_session_clear(
+        &self,
+        session_id: &str,
+        compaction: &CompactionHandle,
+        closing: compaction::CompactionClosingAdmission,
+    ) {
+        // Retire and remove only the handle whose closing admission spans this
+        // clear. Releasing the permit last wakes preparations against a fully
+        // cleared durable session; stale waiters then retry through the map.
+        let mut handles = self.shared.compaction_handles.lock().await;
+        closing.retire();
+        if handles
+            .get(session_id)
+            .is_some_and(|current| current.same_owner(compaction))
+        {
+            handles.remove(session_id);
+        }
+        drop(handles);
+        drop(closing);
     }
 
     /// Signal the agent loop to stop.
@@ -536,9 +611,6 @@ impl AgentLoop {
                 .insert("detected_language".to_string(), json!(lang));
         }
 
-        let session_lock = session_lock_for(&self.session_locks, session_key).await;
-        let _session_guard = session_lock.lock().await;
-
         match self
             .shared
             .process_message(&msg, None, None, None, None)
@@ -576,9 +648,6 @@ impl AgentLoop {
             detected_language,
             media_paths,
         );
-
-        let session_lock = session_lock_for(&self.session_locks, session_key).await;
-        let _session_guard = session_lock.lock().await;
 
         match self
             .shared
@@ -642,10 +711,7 @@ impl AgentLoop {
             Self::spawn_background_reflection(&self.shared);
         }
         let shared = self.shared.clone();
-        let session_locks = self.session_locks.clone();
         tokio::spawn(async move {
-            let session_lock = session_lock_for(&session_locks, &session_key).await;
-            let _session_guard = session_lock.lock().await;
             let msg = Self::build_direct_message(
                 &channel,
                 &chat_id,

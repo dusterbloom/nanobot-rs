@@ -1,3 +1,14 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse
+)]
 //! Lossless Context Management (LCM)
 //!
 //! Implements the LCM architecture from Ehrlich & Blackman (2026):
@@ -14,6 +25,7 @@
 //! SQLite message rows and summary nodes provide restart-safe storage. This
 //! module manages the in-memory DAG and active context assembly.
 
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -509,6 +521,18 @@ fn protect_tokens_for_budget(available_tokens: usize) -> usize {
 /// Nodes with `created_at_turn == 0` (back-compat rows, or test scaffolding
 /// that never set the turn) are always eligible.
 const FRESH_SUMMARY_COOLDOWN_TURNS: u64 = 1;
+
+/// One relevant summary selected for lossless auto-expansion. Planning is
+/// intentionally inert: callers decide how to represent the candidate on the
+/// wire and commit its node ID only after a successful provider response.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AutoExpansionCandidate {
+    pub(crate) node_id: usize,
+    pub(crate) source_ids: Vec<MessageId>,
+    pub(crate) estimated_tokens: usize,
+    pub(crate) flattened_fallback: Value,
+    pub(crate) summary_message: Value,
+}
 
 /// The LCM engine: manages the active context with lossless compaction.
 pub struct LcmEngine {
@@ -1054,14 +1078,12 @@ impl LcmEngine {
         self.find_oldest_raw_block_impl(protect_tokens, BlockSelection::AppendOnly)
     }
 
-    /// Auto-expand summaries that are relevant to the latest user message.
+    /// Plan summaries that are relevant to the latest user message.
     ///
-    /// Returns synthetic messages the caller should APPEND to the wire history
-    /// (after any frozen cache prefix). The summary itself is left in place, so
-    /// the cached prefix stays byte-stable — this works even on warm sessions,
-    /// unlike the old in-place splice which rewrote the prefix and was therefore
-    /// disabled whenever the cache was warm. Each summary is expanded at most
-    /// once (tracked in `auto_expanded`) so the pass never spams the tail.
+    /// The flattened fallback on each candidate is the synthetic message the
+    /// caller may append after any frozen cache prefix. Selection never updates
+    /// `auto_expanded`; the caller must explicitly commit the node only after a
+    /// successful provider response.
     ///
     /// `wire_tokens` is the actual rendered prompt size for this turn — what
     /// the provider will prefill. Headroom is computed against `wire_tokens`,
@@ -1073,13 +1095,13 @@ impl LcmEngine {
     ///
     /// Relevance uses semantic embeddings when available, else keyword overlap.
     ///
-    /// Returns the synthetic messages to append (empty if nothing was expanded).
-    pub fn auto_expand(
-        &mut self,
+    /// Returns bounded candidates (empty if nothing is eligible).
+    pub(crate) fn plan_auto_expansion(
+        &self,
         budget: &TokenBudget,
         tool_def_tokens: usize,
         wire_tokens: usize,
-    ) -> Vec<Value> {
+    ) -> Vec<AutoExpansionCandidate> {
         // Find the latest user message content.
         let user_text = self.active.iter().rev().find_map(|entry| {
             let msg = entry.message();
@@ -1122,19 +1144,19 @@ impl LcmEngine {
             return Vec::new();
         }
 
-        // Collect relevant, not-yet-expanded summary nodes (immutable borrow),
-        // then record them afterwards to satisfy the borrow checker.
-        let mut to_append: Vec<(usize, Value)> = Vec::new();
-        let candidates: Vec<usize> = self
+        let mut planned = Vec::new();
+        let candidates: Vec<(usize, Value)> = self
             .active
             .iter()
             .filter_map(|e| match e {
-                ContextEntry::Summary { node_id, .. } if !self.auto_expanded.contains(node_id) => {
-                    Some(*node_id)
+                ContextEntry::Summary { node_id, message }
+                    if !self.auto_expanded.contains(node_id) =>
+                {
+                    Some((*node_id, message.clone()))
                 }
                 _ => None,
             })
-            .filter(|&node_id| {
+            .filter(|(node_id, _)| {
                 // Fresh-summary cooldown: a node created within the last
                 // FRESH_SUMMARY_COOLDOWN_TURNS turns is ineligible. Without
                 // this, auto_expand on turn N+1 reinjects the originals of
@@ -1147,7 +1169,7 @@ impl LcmEngine {
                 // set the turn) are always eligible — we have no creation
                 // signal for them, and treating them as ancient history
                 // preserves pre-cooldown behaviour.
-                let Some(node) = self.dag.get(node_id) else {
+                let Some(node) = self.dag.get(*node_id) else {
                     return true;
                 };
                 if node.created_at_turn == 0 {
@@ -1158,7 +1180,7 @@ impl LcmEngine {
             })
             .collect();
 
-        for node_id in candidates {
+        for (node_id, summary_message) in candidates {
             let source_ids = self.dag.all_source_ids(node_id);
             let source_messages: Vec<Value> = source_ids
                 .iter()
@@ -1208,7 +1230,7 @@ impl LcmEngine {
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let msg = json!({
+            let flattened_fallback = json!({
                 "role": "user",
                 "content": format!(
                     "[Auto-expanded originals for the summary of messages {first}-{last}:]\n\n{body}"
@@ -1218,20 +1240,42 @@ impl LcmEngine {
                 "_synthetic": true,
             });
             headroom = headroom.saturating_sub(expansion_tokens);
-            to_append.push((node_id, msg));
+            planned.push(AutoExpansionCandidate {
+                node_id,
+                source_ids,
+                estimated_tokens: expansion_tokens,
+                flattened_fallback,
+                summary_message,
+            });
         }
 
-        // Record idempotency and return the messages for the caller to append to
-        // the wire history. We deliberately do NOT push these into `self.active`:
-        // active persists across turns while ctx.messages is rebuilt from history
-        // each turn, so pushing here would leak synthetic entries and inflate the
-        // engine's token accounting over time. The expansion is a per-turn nudge.
-        let mut appended = Vec::with_capacity(to_append.len());
-        for (node_id, msg) in to_append {
-            self.auto_expanded.insert(node_id);
-            appended.push(msg);
+        planned
+    }
+
+    /// Mark one planned node consumed after the provider accepted the prompt.
+    pub(crate) fn commit_auto_expansion(&mut self, node_id: usize) -> bool {
+        self.dag.get(node_id).is_some() && self.auto_expanded.insert(node_id)
+    }
+
+    /// Atomically mark one provider attempt's planned nodes consumed.
+    /// A stale or duplicate node rejects the whole batch so prompt publication
+    /// cannot get ahead of only a partial eligibility commit.
+    pub(crate) fn commit_auto_expansions(&mut self, node_ids: &[usize]) -> bool {
+        let mut unique = std::collections::HashSet::with_capacity(node_ids.len());
+        if node_ids.is_empty()
+            || node_ids.iter().any(|node_id| {
+                self.dag.get(*node_id).is_none()
+                    || self.auto_expanded.contains(node_id)
+                    || !unique.insert(*node_id)
+            })
+        {
+            return false;
         }
-        appended
+        for node_id in node_ids {
+            let committed = self.commit_auto_expansion(*node_id);
+            debug_assert!(committed, "batch was fully validated before commit");
+        }
+        true
     }
 
     /// Relevance of a summary's source text to the user message. Uses semantic
@@ -1840,7 +1884,7 @@ fn parse_id_runs(s: &str) -> Vec<usize> {
 mod tests {
     use super::*;
     use crate::agent::tools::base::Tool;
-    use crate::providers::base::{LLMProvider, LLMResponse};
+    use crate::providers::base::{FinishReason, LLMProvider, LLMResponse};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1863,7 +1907,7 @@ mod tests {
             Ok(LLMResponse {
                 content: Some("- User asked multiple questions about Rust ownership.".to_string()),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -1898,7 +1942,7 @@ mod tests {
                     .to_string(),
                 ),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -2035,7 +2079,7 @@ mod tests {
             Ok(LLMResponse {
                 content: Some(bullets.join("\n")),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -2069,7 +2113,7 @@ mod tests {
             Ok(LLMResponse {
                 content: Some(babble),
                 tool_calls: vec![],
-                finish_reason: "stop".to_string(),
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -2111,6 +2155,22 @@ mod tests {
     /// Ingest a `_db_id`-tagged message, asserting it was accepted.
     fn ingest(engine: &mut LcmEngine, id: usize, role: &str, content: &str) {
         assert_eq!(engine.ingest(msg(id, role, content)), Some(id));
+    }
+
+    fn plan_and_commit_auto_expansion(
+        engine: &mut LcmEngine,
+        budget: &TokenBudget,
+        tool_def_tokens: usize,
+        wire_tokens: usize,
+    ) -> Vec<Value> {
+        let candidates = engine.plan_auto_expansion(budget, tool_def_tokens, wire_tokens);
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                assert!(engine.commit_auto_expansion(candidate.node_id));
+                candidate.flattened_fallback
+            })
+            .collect()
     }
 
     fn serialize_wire(entries: &[ContextEntry]) -> Vec<u8> {
@@ -4185,7 +4245,8 @@ mod tests {
         );
 
         let budget = TokenBudget::new(100_000, 8192);
-        let appended = engine.auto_expand(&budget, 100, engine.active_tokens());
+        let active_tokens = engine.active_tokens();
+        let appended = plan_and_commit_auto_expansion(&mut engine, &budget, 100, active_tokens);
         assert_eq!(
             appended.len(),
             1,
@@ -4212,12 +4273,84 @@ mod tests {
         assert_eq!(appended[0]["_synthetic"], json!(true));
 
         // Idempotent: a second pass does not re-append the same node.
+        let active_tokens = engine.active_tokens();
         assert!(
-            engine
-                .auto_expand(&budget, 100, engine.active_tokens())
-                .is_empty(),
+            plan_and_commit_auto_expansion(&mut engine, &budget, 100, active_tokens).is_empty(),
             "already-expanded summary must not be appended twice"
         );
+    }
+
+    #[test]
+    fn auto_expansion_planning_is_non_mutating_until_explicit_commit() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.85,
+            deterministic_target: 64,
+        });
+        ingest(&mut engine, 1, "system", "You are helpful.");
+        ingest(
+            &mut engine,
+            2,
+            "user",
+            "Explain Rust ownership and borrowing rules.",
+        );
+        ingest(
+            &mut engine,
+            3,
+            "assistant",
+            "Rust ownership means each value has one owner.",
+        );
+        let node_id = engine
+            .dag
+            .create_node(
+                vec![2, 3],
+                vec![],
+                "Discussion about Rust ownership and borrowing.".to_string(),
+                SummaryManifest::default(),
+                1,
+            )
+            .id;
+        engine.active = vec![
+            engine.active[0].clone(),
+            ContextEntry::Summary {
+                node_id,
+                message: json!({
+                    "role": "user",
+                    "content": "[Summary of messages 2-3.] Rust ownership and borrowing."
+                }),
+            },
+        ];
+        ingest(
+            &mut engine,
+            4,
+            "user",
+            "Tell me more about Rust ownership and borrowing.",
+        );
+        let budget = TokenBudget::new(100_000, 8192);
+
+        let first = engine.plan_auto_expansion(&budget, 0, engine.active_tokens());
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].node_id, node_id);
+        assert_eq!(first[0].source_ids, vec![2, 3]);
+        assert!(first[0].estimated_tokens > 0);
+        assert!(first[0]
+            .flattened_fallback
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("each value has one owner")));
+
+        assert_eq!(
+            engine
+                .plan_auto_expansion(&budget, 0, engine.active_tokens())
+                .len(),
+            1,
+            "selection alone must not consume expansion eligibility"
+        );
+        assert!(engine.commit_auto_expansion(node_id));
+        assert!(engine
+            .plan_auto_expansion(&budget, 0, engine.active_tokens())
+            .is_empty());
+        assert!(!engine.commit_auto_expansion(node_id));
     }
 
     // -----------------------------------------------------------------------
@@ -4280,10 +4413,9 @@ mod tests {
 
         // Use a tiny budget where there's no headroom.
         let budget = TokenBudget::new(256, 128); // Very small
+        let active_tokens = engine.active_tokens();
         assert!(
-            engine
-                .auto_expand(&budget, 50, engine.active_tokens())
-                .is_empty(),
+            plan_and_commit_auto_expansion(&mut engine, &budget, 50, active_tokens).is_empty(),
             "Should NOT expand when budget headroom is insufficient"
         );
     }
@@ -4344,10 +4476,9 @@ mod tests {
         );
 
         let budget = TokenBudget::new(100_000, 8192);
+        let active_tokens = engine.active_tokens();
         assert!(
-            engine
-                .auto_expand(&budget, 100, engine.active_tokens())
-                .is_empty(),
+            plan_and_commit_auto_expansion(&mut engine, &budget, 100, active_tokens).is_empty(),
             "Should NOT expand for an irrelevant query"
         );
     }
@@ -4417,7 +4548,7 @@ mod tests {
         // auto_expand huge wire headroom so ONLY the cooldown can block it.
         engine.set_current_turn(6);
         ingest(&mut engine, 100, "user", topic);
-        let appended = engine.auto_expand(&budget, 0, /* wire_tokens */ 0);
+        let appended = plan_and_commit_auto_expansion(&mut engine, &budget, 0, 0);
         assert!(
             appended.is_empty(),
             "freshly-created summary (age=1, cooldown=1) must NOT be \
@@ -4428,7 +4559,7 @@ mod tests {
         // Sanity: at turn 8 (age=3, past cooldown), the same user message
         // CAN trigger expansion — the cooldown is not a permanent block.
         engine.set_current_turn(8);
-        let appended_later = engine.auto_expand(&budget, 0, /* wire_tokens */ 0);
+        let appended_later = plan_and_commit_auto_expansion(&mut engine, &budget, 0, 0);
         assert!(
             !appended_later.is_empty(),
             "at age=3 (past FRESH_SUMMARY_COOLDOWN_TURNS=1) the summary must \
@@ -4486,7 +4617,7 @@ mod tests {
 
         // Wire is already at hard_limit. Internal active is much smaller
         // (just the summary + recent raws), but the wire bound must win.
-        let appended = engine.auto_expand(&budget, 0, /* wire_tokens */ hard_limit);
+        let appended = plan_and_commit_auto_expansion(&mut engine, &budget, 0, hard_limit);
         assert!(
             appended.is_empty(),
             "wire_tokens={} (= hard_limit) must block reinjection even when \
@@ -4552,7 +4683,7 @@ mod tests {
         // size. This is the 12:13:06 pattern. Reinjection must be blocked.
         engine.set_current_turn(2);
         ingest(&mut engine, 200, "user", topic);
-        let appended = engine.auto_expand(&budget, 0, /* wire_tokens */ post_compact_tokens);
+        let appended = plan_and_commit_auto_expansion(&mut engine, &budget, 0, post_compact_tokens);
         assert!(
             appended.is_empty(),
             "fresh summary (age=1) must NOT be re-expanded; would reinject \

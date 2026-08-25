@@ -1,6 +1,7 @@
 //! Base class for agent tools.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -61,16 +62,49 @@ pub enum ToolConcurrency {
 }
 
 /// Structured outcome for a tool invocation.
+///
+/// Invariant: `ok == true` implies `error.is_none()`, and every failure
+/// carries a model-visible `Error: ...` string in `data`. The fields are
+/// private so the invariant cannot be violated from outside this module —
+/// the only ways to build a value are the constructors (all `#[must_use]`)
+/// and the `From<ToolResult>` conversion introduced with the typed error
+/// protocol. Readers use the accessors.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionResult {
-    pub ok: bool,
-    pub data: String,
-    pub error: Option<String>,
+    ok: bool,
+    data: String,
+    error: Option<String>,
     /// Structured error classification when available.
-    pub error_kind: Option<crate::errors::ToolErrorKind>,
+    error_kind: Option<crate::errors::ToolErrorKind>,
 }
 
 impl ToolExecutionResult {
+    /// Whether the tool call succeeded.
+    #[must_use]
+    pub fn ok(&self) -> bool {
+        self.ok
+    }
+
+    /// The model-facing output text. On failure this carries the rendered
+    /// `Error: ...` wire string.
+    #[must_use]
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+
+    /// The failure detail, when this is a failure.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// The structured error classification, when known.
+    #[must_use]
+    pub fn error_kind(&self) -> Option<&crate::errors::ToolErrorKind> {
+        self.error_kind.as_ref()
+    }
+
+    #[must_use]
     pub fn success(data: String) -> Self {
         Self {
             ok: true,
@@ -81,26 +115,30 @@ impl ToolExecutionResult {
     }
 
     /// Whether this result represents a retryable (transient) error.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         self.error_kind.as_ref().map_or(false, |k| k.is_retryable())
     }
 
-    /// Map a raw tool output string to a structured result.
-    /// Outputs starting with `Error:` are treated as failures.
-    pub fn from_output(out: String) -> Self {
-        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
-            let error_kind = crate::errors::classify_tool_error(&err);
-            Self {
-                ok: false,
-                data: out,
-                error: Some(err),
-                error_kind,
-            }
-        } else {
-            Self::success(out)
+    /// Build a failure from a message plus a structural classification.
+    ///
+    /// The `data` is the full model-visible string (already `Error:`-prefixed);
+    /// `error_kind` is produced at the source instead of by substring
+    /// classification. Transitional: used by the legacy registry
+    /// example-append path until Phase 3 deletes the legacy channel.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn failure_with_kind(data: String, error_kind: crate::errors::ToolErrorKind) -> Self {
+        Self {
+            ok: false,
+            data,
+            error: None,
+            error_kind: Some(error_kind),
         }
     }
 
+    #[must_use]
+    #[allow(clippy::disallowed_methods)] // legacy constructor — retained for ToolExecutionResult::failure compatibility (Phase 4)
     pub fn failure(message: String) -> Self {
         let error_kind = crate::errors::classify_tool_error(&message);
         Self {
@@ -110,17 +148,150 @@ impl ToolExecutionResult {
             error_kind,
         }
     }
+
+    /// Append a corrective worked example to a failure's model-visible text
+    /// (the registry's MissingArg path: `"... is required. Call as X."`).
+    /// Only meaningful on failures.
+    pub fn append_worked_example(&mut self, example: &str) {
+        let base = self.data.trim_end_matches('.');
+        self.data = format!("{}. Call as {}.", base, example);
+    }
 }
 
-/// Context passed to tools during execution for progress reporting
-/// and cancellation support.
-pub struct ToolExecutionContext {
-    /// Channel for emitting progress events to the REPL.
-    pub event_tx: UnboundedSender<ToolEvent>,
-    /// Token that signals the tool should abort gracefully.
-    pub cancellation_token: tokio_util::sync::CancellationToken,
-    /// The tool call ID for correlating events.
-    pub tool_call_id: String,
+/// The typed success payload of a tool call (error protocol, §2.2).
+///
+/// A plain struct rather than `String` so the registry can attach audit
+/// metadata later without a breaking change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutput {
+    /// The model-facing text. May carry `TOOL_RESULT_HANDLE v1` receipts,
+    /// `[truncated: …]` markers, or raw output.
+    pub text: String,
+}
+
+/// The one result type of the tool layer.
+pub type ToolResult = Result<ToolOutput, crate::errors::ToolError>;
+
+/// The shared legacy->typed funnel (error protocol §2.2): a tool's legacy
+/// `String` output becomes the typed [`ToolResult`], classifying `Error: ...`
+/// strings structurally via [`crate::errors::ToolError::from_legacy`].
+///
+/// NOTE: this must be a free function, NOT a call to the trait default.
+/// Calling `Tool::execute_typed(self, ...)` from inside an override of the
+/// same method dispatches back to the override under `#[async_trait]`
+/// (async-trait resolves the qualified call to the concrete impl), which
+/// recurses until the stack overflows. Overrides must call
+/// `self.execute_with_context(...)` and then this helper instead.
+pub fn funnel_legacy(out: String) -> ToolResult {
+    if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+        Err(crate::errors::ToolError::from_legacy(&err))
+    } else {
+        Ok(ToolOutput { text: out })
+    }
+}
+
+impl From<ToolResult> for ToolExecutionResult {
+    fn from(r: ToolResult) -> Self {
+        match r {
+            Ok(out) => ToolExecutionResult {
+                ok: true,
+                data: out.text,
+                error: None,
+                error_kind: None,
+            },
+            Err(e) => ToolExecutionResult {
+                ok: false,
+                data: e.render(),
+                error: Some(e.to_string()),
+                error_kind: crate::errors::legacy_kind_from_tool_error(&e),
+            },
+        }
+    }
+}
+
+/// Everything a tool may depend on, composed once at the registry boundary
+/// (research §3.5). Tools depend on this type — never on globals, never on
+/// concrete managers, never on `Arc<Mutex<Option<…>>>` callback slots.
+#[derive(Clone)]
+pub struct ToolContext {
+    /// Typed host bridge (spawn/pipeline/loop/message). `None` in sandboxed
+    /// registries (scripts, tests) — tools that require it fail with a typed
+    /// [`crate::errors::ToolError::Execution`] instead of
+    /// `"Error: Spawn callback not configured"`.
+    host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
+    /// Progress/audit event sink.
+    events: UnboundedSender<ToolEvent>,
+    /// Cooperative cancellation (the existing token, unchanged).
+    cancel: tokio_util::sync::CancellationToken,
+    /// Correlates this call across audit + REPL.
+    call_id: String,
+}
+
+impl ToolContext {
+    /// The single constructor — the registry is the only builder in
+    /// production; tests and streaming tools pass their own parts with
+    /// `host: None` (the registry injects its host).
+    pub fn new(
+        host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
+        events: UnboundedSender<ToolEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+        call_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            host,
+            events,
+            cancel,
+            call_id: call_id.into(),
+        }
+    }
+
+    /// The typed host bridge, or a typed error when this registry is
+    /// sandboxed. Replaces the `"… callback not configured"` string path.
+    #[cfg_attr(not(test), allow(dead_code))] // API of the composable context (doc §3.5); consumed by tests now, tools adopt it when the bridge lands in their execute path
+    pub fn host(
+        &self,
+    ) -> Result<&dyn crate::agent::host_bridge::HostBridge, crate::errors::ToolError> {
+        self.host
+            .as_deref()
+            .ok_or_else(|| crate::errors::ToolError::Execution {
+                message: "host capability not available in this context".to_string(),
+            })
+    }
+
+    /// Emit a progress/audit event.
+    pub fn emit(&self, event: ToolEvent) -> Result<(), crate::errors::ToolError> {
+        self.events
+            .send(event)
+            .map_err(|_| crate::errors::ToolError::Execution {
+                message: "event channel closed".to_string(),
+            })
+    }
+
+    /// Whether cooperative cancellation has been requested.
+    #[cfg_attr(not(test), allow(dead_code))] // same transitional status as `host` — streaming tools adopt it with the context migration
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// The cooperative cancellation token.
+    pub fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.cancel
+    }
+
+    /// The tool call ID correlating this call across audit + REPL.
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    /// Registry seam: rebind the host on a caller-supplied context (the
+    /// registry is the single builder — see `ToolRegistry::execute_inner`).
+    pub(crate) fn with_host(
+        mut self,
+        host: Option<Arc<dyn crate::agent::host_bridge::HostBridge>>,
+    ) -> Self {
+        self.host = host;
+        self
+    }
 }
 
 /// Abstract base trait for agent tools.
@@ -143,18 +314,6 @@ pub trait Tool: Send + Sync {
     /// Returns the result as a string.
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String;
 
-    /// Execute and return a structured outcome.
-    ///
-    /// Tools can override this to report explicit success/failure semantics.
-    /// The default implementation keeps backward compatibility and maps
-    /// `Error:`-prefixed outputs to failures.
-    async fn execute_with_result(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-    ) -> ToolExecutionResult {
-        ToolExecutionResult::from_output(self.execute(params).await)
-    }
-
     /// Execute the tool with an execution context for progress reporting
     /// and cancellation.
     ///
@@ -165,21 +324,57 @@ pub trait Tool: Send + Sync {
     async fn execute_with_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        _ctx: &ToolExecutionContext,
+        _ctx: &ToolContext,
     ) -> String {
         self.execute(params).await
     }
 
+    /// Execute and return the typed outcome (error protocol, Phase 1 —
+    /// additive). This is the migration seam: tools land on `ToolResult` by
+    /// overriding this method and building [`crate::errors::ToolError`]
+    /// variants at their failure sites.
+    ///
+    /// The default implementation funnels the legacy `String` channel through
+    /// [`crate::errors::ToolError::from_legacy`] so every unmigrated tool
+    /// keeps working — and keeps producing byte-identical `Error: ...` wire
+    /// strings — with no changes.
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolContext,
+    ) -> ToolResult {
+        let out = self.execute_with_context(params, ctx).await;
+        funnel_legacy(out)
+    }
+
+    /// Execute and return a structured outcome.
+    ///
+    /// Default renders the typed [`execute_typed`] result into the legacy
+    /// structured shape (`From<ToolResult> for ToolExecutionResult`).
+    async fn execute_with_result(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+    ) -> ToolExecutionResult {
+        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolContext::new(
+            None,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            String::new(),
+        );
+        ToolExecutionResult::from(self.execute_typed(params, &ctx).await)
+    }
+
     /// Like [`execute_with_result`] but with an execution context.
     ///
-    /// Default delegates to [`execute_with_context`] and maps `Error:`-prefixed
-    /// outputs to failures, same as [`execute_with_result`].
+    /// Default renders the typed [`execute_typed`] result into the legacy
+    /// structured shape.
     async fn execute_with_result_and_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> ToolExecutionResult {
-        ToolExecutionResult::from_output(self.execute_with_context(params, ctx).await)
+        ToolExecutionResult::from(self.execute_typed(params, ctx).await)
     }
 
     /// The permission level required to execute this tool.
@@ -334,9 +529,9 @@ mod tests {
             serde_json::Value::String("hello".to_string()),
         );
         let result = tool.execute_with_result(params).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "executed with: hello");
-        assert!(result.error.is_none());
+        assert!(result.ok());
+        assert_eq!(result.data(), "executed with: hello");
+        assert!(result.error().is_none());
     }
 
     #[tokio::test]
@@ -361,9 +556,12 @@ mod tests {
 
         let tool = ErrorTool;
         let result = tool.execute_with_result(HashMap::new()).await;
-        assert!(!result.ok);
-        assert_eq!(result.data, "Error: bad input");
-        assert_eq!(result.error.as_deref(), Some("bad input"));
+        assert!(!result.ok());
+        // Wire string stays byte-identical through the typed funnel.
+        assert_eq!(result.data(), "Error: bad input");
+        // The `error` field now carries the typed Display (internal channel);
+        // the model-visible string is `data()` (rendered).
+        assert_eq!(result.error(), Some("Execution failed: bad input"));
     }
 
     #[tokio::test]
@@ -372,11 +570,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_1".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_1");
 
         let tool = MockTool;
         let mut params = HashMap::new();
@@ -398,11 +592,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token,
-            tool_call_id: "call_1".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token, "call_1");
 
         let tool = MockTool;
         let mut params = HashMap::new();
@@ -412,8 +602,8 @@ mod tests {
         );
 
         let result = tool.execute_with_result_and_context(params, &ctx).await;
-        assert!(result.ok);
-        assert_eq!(result.data, "executed with: test");
+        assert!(result.ok());
+        assert_eq!(result.data(), "executed with: test");
     }
 
     #[test]
@@ -423,25 +613,21 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
 
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token.clone(),
+        let ctx = ToolContext::new(None, tx, token.clone(), "call_123");
+
+        // Verify accessors
+        assert_eq!(ctx.call_id(), "call_123");
+        assert!(!ctx.cancellation_token().is_cancelled());
+        assert!(!ctx.is_cancelled());
+
+        // Can emit events through the channel
+        ctx.emit(ToolEvent::Progress {
+            tool_name: "exec".to_string(),
             tool_call_id: "call_123".to_string(),
-        };
-
-        // Verify fields are accessible
-        assert_eq!(ctx.tool_call_id, "call_123");
-        assert!(!ctx.cancellation_token.is_cancelled());
-
-        // Can send events through the channel
-        ctx.event_tx
-            .send(ToolEvent::Progress {
-                tool_name: "exec".to_string(),
-                tool_call_id: "call_123".to_string(),
-                elapsed_ms: 1000,
-                output_preview: None,
-            })
-            .unwrap();
+            elapsed_ms: 1000,
+            output_preview: None,
+        })
+        .unwrap();
 
         let event = rx.try_recv().unwrap();
         match event {
@@ -457,15 +643,144 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
 
-        let ctx = ToolExecutionContext {
-            event_tx: tx,
-            cancellation_token: token.clone(),
-            tool_call_id: "call_456".to_string(),
-        };
+        let ctx = ToolContext::new(None, tx, token.clone(), "call_456");
 
-        assert!(!ctx.cancellation_token.is_cancelled());
+        assert!(!ctx.is_cancelled());
         token.cancel();
-        assert!(ctx.cancellation_token.is_cancelled());
+        assert!(ctx.is_cancelled());
+    }
+
+    #[test]
+    fn test_tool_context_composition() {
+        use crate::agent::host_bridge::{
+            CancelRequest, CheckRequest, HostBridge, HostDispatcher, ListReply, LoopHost,
+            LoopReply, LoopRequest, MessageHost, PipelineHost, PipelineReply, PipelineRequest,
+            SendMessageReply, SendMessageRequest, SpawnHost, SpawnReply, SpawnRequest, WaitReply,
+            WaitRequest,
+        };
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct NoopSpawn;
+        #[async_trait]
+        impl SpawnHost for NoopSpawn {
+            async fn spawn(
+                &self,
+                _r: SpawnRequest,
+            ) -> Result<SpawnReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
+            }
+            async fn list_subagents(&self) -> Result<ListReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
+            }
+            async fn cancel(
+                &self,
+                _r: CancelRequest,
+            ) -> Result<crate::agent::host_bridge::CancelReply, crate::errors::ToolError>
+            {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
+            }
+            async fn wait(&self, _r: WaitRequest) -> Result<WaitReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
+            }
+            async fn check(
+                &self,
+                _r: CheckRequest,
+            ) -> Result<crate::agent::host_bridge::CheckReply, crate::errors::ToolError>
+            {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
+            }
+        }
+        struct NoopPipeline;
+        #[async_trait]
+        impl PipelineHost for NoopPipeline {
+            async fn run_pipeline(
+                &self,
+                _r: PipelineRequest,
+            ) -> Result<PipelineReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
+            }
+        }
+        struct NoopLoop;
+        #[async_trait]
+        impl LoopHost for NoopLoop {
+            async fn run_loop(
+                &self,
+                _r: LoopRequest,
+            ) -> Result<LoopReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
+            }
+        }
+        struct NoopMessage;
+        #[async_trait]
+        impl MessageHost for NoopMessage {
+            async fn send(
+                &self,
+                _r: SendMessageRequest,
+            ) -> Result<SendMessageReply, crate::errors::ToolError> {
+                Err(crate::errors::ToolError::Execution {
+                    message: "noop".to_string(),
+                })
+            }
+        }
+
+        let host: Arc<dyn HostBridge> = Arc::new(HostDispatcher::new(
+            Arc::new(NoopSpawn),
+            Arc::new(NoopPipeline),
+            Arc::new(NoopLoop),
+            Arc::new(NoopMessage),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolContext::new(Some(host), tx, token.clone(), "call_composed");
+
+        // host is reachable through the context.
+        assert!(ctx.host().is_ok());
+        // events flow through emit().
+        ctx.emit(ToolEvent::Progress {
+            tool_name: "t".to_string(),
+            tool_call_id: "call_composed".to_string(),
+            elapsed_ms: 5,
+            output_preview: None,
+        })
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ToolEvent::Progress { elapsed_ms: 5, .. })
+        ));
+        // cancellation + correlation id.
+        assert!(!ctx.is_cancelled());
+        token.cancel();
+        assert!(ctx.is_cancelled());
+        assert!(ctx.cancellation_token().is_cancelled());
+        assert_eq!(ctx.call_id(), "call_composed");
+
+        // A sandboxed context reports the typed host error.
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let sandboxed =
+            ToolContext::new(None, tx2, tokio_util::sync::CancellationToken::new(), "s");
+        let err = match sandboxed.host() {
+            Err(e) => e,
+            Ok(_) => panic!("expected typed host error"),
+        };
+        assert_eq!(
+            err.render(),
+            "Error: host capability not available in this context"
+        );
     }
 
     #[test]

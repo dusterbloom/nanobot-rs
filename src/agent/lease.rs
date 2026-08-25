@@ -3,14 +3,14 @@
 //! See `docs/superpowers/specs/2026-07-27-tool-leases-design.md`.
 //!
 //! Each user turn starts with a tool lease of `TOOLS_PER_LEASE` tool
-//! iterations. After exhaustion, the model must produce a final text answer or
-//! emit a renewal checkpoint (findings + remaining question + next bounded
-//! actions). Together with `ToolGuard`'s per-key identical-call counter (which
-//! bounds the live 13-call identical-`exec grep` loop, session
-//! `20260727_161730_6e61a0`) and the no-progress hard stop, this makes runaway
-//! tool loops structurally impossible without a coarse-family cap (retired
-//! 2026-07-30 — it over-fired on legitimate exploration and busted the prefix
-//! cache).
+//! iterations. After exhaustion, tool definitions are stripped from the
+//! request: the model must produce a final text answer OR emit a renewal
+//! checkpoint (findings + remaining question + next bounded actions). Together
+//! with `ToolGuard`'s per-key identical-call counter (which bounds the live
+//! 13-call identical-`exec grep` loop, session `20260727_161730_6e61a0`) and
+//! the no-progress hard stop, this makes runaway tool loops structurally
+//! impossible without a coarse-family cap (retired 2026-07-30 — it over-fired
+//! on legitimate exploration and busted the prefix cache).
 
 /// Default per-lease tool budget. Tuned for coding tasks where the
 /// model needs to read multiple files, run searches, and exec commands
@@ -25,16 +25,15 @@ pub const DEFAULT_TOOLS_PER_LEASE: u32 = 12;
 /// validated checkpoint.
 pub const DEFAULT_MAX_LEASES_PER_TURN: u32 = 3;
 
-/// Local models get one atomic lease per turn. Their exhausted response must
-/// be final rather than opening another inference/tool cycle.
-pub const LOCAL_MAX_LEASE_RENEWALS: u32 = 0;
-
+// ---------------------------------------------------------------------------
+// Lease state machine
+// ---------------------------------------------------------------------------
 // Lease state machine
 // ---------------------------------------------------------------------------
 
 /// A per-turn tool lease. Counts tool iterations within the current
-/// lease; on exhaustion the caller requires the model to either answer or emit
-/// a renewal checkpoint without changing the advertised tool schema.
+/// lease; on exhaustion the caller must strip tool definitions and
+/// require the model to either answer or emit a renewal checkpoint.
 ///
 /// Renewal checkpoints must contain all three of `findings`, `next`,
 /// `will` (any case, colon-terminated). Anything else is rejected with
@@ -47,13 +46,33 @@ pub struct Lease {
     max_renewals: u32,
     iterations_used: u32,
     renewals_used: u32,
+    /// Checkpoint-free renewals spent on read-only tools. Separate from
+    /// `renewals_used` so exploration can't starve the write path.
+    read_only_renewals_used: u32,
 }
 
-/// Atomic admission outcome for one assistant tool-call batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchAdmission {
-    Admitted,
-    Rejected { remaining: u32 },
+/// Outcome of `record_tool_call`. The `reason` is a stable machine-readable
+/// code (`lease_exhausted`) so callers can route receipts without parsing
+/// prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallResult {
+    pub allowed: bool,
+    pub reason: Option<&'static str>,
+}
+
+impl ToolCallResult {
+    fn allowed() -> Self {
+        Self {
+            allowed: true,
+            reason: None,
+        }
+    }
+    fn blocked(reason: &'static str) -> Self {
+        Self {
+            allowed: false,
+            reason: Some(reason),
+        }
+    }
 }
 
 /// Outcome of `try_renew`. `missing_field` is `"findings"`, `"next"`,
@@ -118,43 +137,28 @@ impl Lease {
             max_renewals,
             iterations_used: 0,
             renewals_used: 0,
+            read_only_renewals_used: 0,
         }
     }
 
-    /// Admit a complete assistant tool-call batch or reject it without
-    /// consuming the remaining lease allowance.
-    pub fn admit_batch(&mut self, count: u32) -> BatchAdmission {
-        let remaining = self.lease_size.saturating_sub(self.iterations_used);
-        if count > remaining {
-            return BatchAdmission::Rejected { remaining };
+    /// Record one tool call against the per-lease budget. Returns whether the
+    /// call is allowed; once `lease_size` calls have been used this returns
+    /// `lease_exhausted` and the caller must strip tool_defs so the model
+    /// produces a final answer or a renewal checkpoint.
+    ///
+    /// There is NO consecutive-same-family cap anymore: it over-fired on
+    /// legitimate exploration (N different greps) and busted the prompt-prefix
+    /// cache when it triggered a strip (2026-07-30). Identical-call loops are
+    /// bounded by `ToolGuard`'s per-key `seen` counter (tool_guard.rs, applies
+    /// to all tools); different-args exploration is bounded by this per-lease
+    /// budget plus the no-progress hard stop. See
+    /// docs/superpowers/plans/2026-07-30-reuse-not-rerun-tool-dedup.md.
+    pub fn record_tool_call(&mut self) -> ToolCallResult {
+        if self.iterations_used >= self.lease_size {
+            return ToolCallResult::blocked("lease_exhausted");
         }
-        self.iterations_used = self.iterations_used.saturating_add(count);
-        BatchAdmission::Admitted
-    }
-
-    /// Prefix a prompt-visible tool result with the post-batch lease state.
-    pub fn annotate_result(&self, body: &str) -> String {
-        let renewals_remaining = self.max_renewals.saturating_sub(self.renewals_used);
-        let mut signal = format!(
-            "[Lease usage after this batch: {} of {} calls — {} renewals remaining.",
-            self.iterations_used, self.lease_size, renewals_remaining
-        );
-        if self.is_exhausted() {
-            if renewals_remaining == 0 {
-                signal.push_str(
-                    " Lease exhausted: your next response must be your final answer. Do not \
-                     request another tool.",
-                );
-            } else {
-                signal.push_str(
-                    " Lease exhausted: your next response must be either a final answer or a \
-                     renewal checkpoint containing findings:/next:/will:. Do not request \
-                     another tool before renewal.",
-                );
-            }
-        }
-        signal.push(']');
-        format!("{signal}\n{body}")
+        self.iterations_used += 1;
+        ToolCallResult::allowed()
     }
 
     pub fn is_exhausted(&self) -> bool {
@@ -169,17 +173,6 @@ impl Lease {
     /// can tell the model exactly how many calls it has after renewal.
     pub fn lease_size(&self) -> u32 {
         self.lease_size
-    }
-
-    /// Prompt instruction for a batch rejected by this lease. Local turns
-    /// cannot renew, so their receipt must end the current turn instead of
-    /// advertising a checkpoint the runtime will reject.
-    pub fn rejection_instruction(&self) -> &'static str {
-        if self.max_renewals == 0 {
-            "Finalize now without another tool; start a fresh user turn if more tool work is needed."
-        } else {
-            "Write a renewal checkpoint before requesting another tool."
-        }
     }
 
     /// Try to renew the lease with a model-emitted checkpoint. The
@@ -222,16 +215,81 @@ impl Lease {
         self.iterations_used = 0;
         RenewalResult::accepted()
     }
+
+    /// Auto-renew the lease for read-only tools without requiring a checkpoint.
+    /// Read-only tools (read_file, list_dir, etc.) can't cause destructive
+    /// loops, so blocking them behind a manual checkpoint ceremony wastes
+    /// 3 round-trips on legitimate multi-file exploration. Returns false
+    /// when out of auto-renewals.
+    ///
+    /// Spends a SEPARATE budget from `try_renew`: a read-heavy turn that
+    /// auto-renewed its way through the checkpoint budget would then hard-stop
+    /// on its first `write_file`, which is exactly backwards — the reads are
+    /// the cheap part. Both budgets are capped at `max_renewals`, so the worst
+    /// case is 2× leases per turn, half of them read-only.
+    pub fn auto_renew_for_read_only(&mut self) -> bool {
+        if self.read_only_renewals_used >= self.max_renewals {
+            return false;
+        }
+        self.read_only_renewals_used += 1;
+        self.iterations_used = 0;
+        true
+    }
+
+    /// Format the progress signal for inclusion in tool results.
+    ///
+    /// Reports the MINIMUM of the two remaining-lease counters (checkpoint
+    /// and read-only auto-renewal). Both are capped at `max_renewals`; the
+    /// model must see the binding constraint so it can plan tool use before
+    /// hitting a hard block with no warning.
+    ///
+    /// `N` is `iterations_used` — the call that just executed
+    /// (`record_tool_call` was already called by the time `tool_engine`
+    /// adds the result). For the first call this is 1, etc.
+    pub fn progress_signal(&self) -> String {
+        let current_call = self.iterations_used;
+        let checkpoint_remaining = self.max_renewals.saturating_sub(self.renewals_used);
+        let read_only_remaining = self
+            .max_renewals
+            .saturating_sub(self.read_only_renewals_used);
+        let leases_remaining = std::cmp::min(checkpoint_remaining, read_only_remaining);
+        format!(
+            "[Tool call {} of {} this lease — {} leases remaining]",
+            current_call, self.lease_size, leases_remaining
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Exhausting the read-only auto-renewal budget must leave the
+    /// checkpoint budget untouched: a turn that explored its way to the cap
+    /// can still renew for the write it was exploring toward.
+    #[test]
+    fn read_only_auto_renewals_do_not_spend_the_checkpoint_budget() {
+        let mut lease = Lease::new(2, 2);
+        for _ in 0..2 {
+            assert!(lease.auto_renew_for_read_only());
+        }
+        assert!(
+            !lease.auto_renew_for_read_only(),
+            "read-only budget must be capped at max_renewals"
+        );
+        assert_eq!(lease.renewals_used(), 0);
+
+        let checkpoint = "findings: read 4 files. next: confirm. will: write the fix.";
+        for _ in 0..2 {
+            assert!(lease.try_renew(checkpoint).is_valid());
+        }
+        assert_eq!(lease.try_renew(checkpoint).missing_field(), "out_of_leases");
+    }
+
     /// Advance the lease by one call. Used by the state-machine tests below to
     /// exercise exhaustion/renewal/progress in isolation.
     fn tick(lease: &mut Lease) -> bool {
-        lease.admit_batch(1) == BatchAdmission::Admitted
+        lease.record_tool_call().allowed
     }
 
     // -----------------------------------------------------------------
@@ -243,8 +301,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// A fresh lease allows `lease_size` tool iterations. The
-    /// `(iteration + 1) == lease_size`-th call must report exhaustion while
-    /// the caller keeps its advertised tool schema stable.
+    /// `(iteration + 1) == lease_size`-th call must report exhaustion
+    /// (tools should be stripped by the caller on the next LLM request).
     #[test]
     fn lease_allows_n_tool_calls_then_reports_exhausted() {
         let mut lease = Lease::new(3, 2);
@@ -415,75 +473,71 @@ mod tests {
         assert!(valid_result.was_attempted());
     }
 
+    /// There is NO consecutive-same-family cap anymore (retired 2026-07-30 — it
+    /// over-fired on legitimate exploration like N different greps and busted
+    /// the prompt-prefix cache). The lease now bounds only by `lease_size`;
+    /// identical-call loops are bounded by `ToolGuard`'s per-key counter. So
+    /// many calls up to `lease_size` are all allowed regardless of family, and
+    /// the only block reason is `lease_exhausted`.
     #[test]
-    fn batch_admission_is_atomic_at_remaining_boundary() {
-        let mut lease = Lease::new(3, 1);
-        assert_eq!(lease.admit_batch(2), BatchAdmission::Admitted);
-        assert_eq!(
-            lease.admit_batch(2),
-            BatchAdmission::Rejected { remaining: 1 }
+    fn record_tool_call_allows_up_to_lease_size_with_no_family_cap() {
+        let mut lease = Lease::new(5, 2);
+        // Five calls — all allowed, no matter how "same-family" they'd be.
+        for _ in 0..5 {
+            assert!(
+                lease.record_tool_call().allowed,
+                "calls within lease_size must be allowed (no family cap)"
+            );
+        }
+        // The 6th exhausts the lease — that is the only block path now.
+        let blocked = lease.record_tool_call();
+        assert!(
+            !blocked.allowed,
+            "lease_size+1 must be blocked by exhaustion"
         );
-        assert_eq!(lease.iterations_used, 2, "rejection must consume nothing");
-        assert_eq!(lease.admit_batch(1), BatchAdmission::Admitted);
+        assert_eq!(
+            blocked.reason,
+            Some("lease_exhausted"),
+            "the only block reason is lease_exhausted; no coarse_family_cap"
+        );
+    }
+
+    /// Tool results include the progress signal
+    /// `[Tool call N of M this lease — L leases remaining]`. The model
+    /// uses this to self-regulate instead of being interrupted.
+    /// `L = max_renewals - renewals_used` (number of future leases still
+    /// obtainable this turn). `N = iterations_used` — the call that just
+    /// ran (record_tool_call* was called before the result is formatted).
+    #[test]
+    fn lease_progress_signal_format() {
+        let mut lease = Lease::new(5, 3);
+        // First call records, then signal describes that call.
+        tick(&mut lease);
+        let s1 = lease.progress_signal();
+        assert!(s1.contains("Tool call 1 of 5"), "got: {s1}");
+        assert!(s1.contains("3 leases remaining"), "got: {s1}");
+
+        tick(&mut lease);
+        let s2 = lease.progress_signal();
+        assert!(s2.contains("Tool call 2 of 5"), "got: {s2}");
+        assert!(s2.contains("3 leases remaining"), "got: {s2}");
+
+        // Renew — now in lease 2; 2 future leases obtainable.
+        for _ in 0..3 {
+            tick(&mut lease);
+        }
         assert!(lease.is_exhausted());
-    }
-
-    #[test]
-    fn admitted_multi_call_batch_consumes_every_call() {
-        let mut lease = Lease::new(5, 2);
-        assert_eq!(lease.admit_batch(3), BatchAdmission::Admitted);
-        assert_eq!(lease.iterations_used, 3);
-        assert_eq!(lease.admit_batch(2), BatchAdmission::Admitted);
-        assert_eq!(lease.iterations_used, 5);
-    }
-
-    #[test]
-    fn result_annotation_reports_post_batch_usage() {
-        let mut lease = Lease::new(5, 2);
-        assert_eq!(lease.admit_batch(2), BatchAdmission::Admitted);
-        assert_eq!(
-            lease.annotate_result("payload"),
-            "[Lease usage after this batch: 2 of 5 calls — 2 renewals remaining.]\npayload"
+        lease.try_renew("Findings: x.\nNext: y.\nWill: z.");
+        // After renewal, the next call records as call 1 of the new lease.
+        tick(&mut lease);
+        let s_after = lease.progress_signal();
+        assert!(
+            s_after.contains("Tool call 1 of 5"),
+            "renewal must reset the per-lease counter, got: {s_after}"
         );
-    }
-
-    #[test]
-    fn final_batch_annotation_requires_answer_or_renewal() {
-        let mut lease = Lease::new(2, 3);
-        assert_eq!(lease.admit_batch(2), BatchAdmission::Admitted);
-        let annotated = lease.annotate_result("payload");
-        assert!(annotated.contains("Lease usage after this batch: 2 of 2 calls"));
-        assert!(annotated.contains("Lease exhausted"));
-        assert!(annotated.contains("findings:/next:/will:"));
-        assert!(annotated.contains("Do not request another tool before renewal"));
-        assert!(annotated.ends_with("\npayload"));
-    }
-
-    #[test]
-    fn zero_renewal_lease_requires_final_answer_at_exhaustion() {
-        let mut lease = Lease::new(2, 0);
-        assert_eq!(lease.admit_batch(2), BatchAdmission::Admitted);
-        let note = lease.annotate_result("evidence");
-        assert!(note.contains("final answer"));
-        assert!(!note.contains("findings:/next:/will:"));
-        assert_eq!(
-            lease
-                .try_renew("Findings: x\nNext: y\nWill: z")
-                .missing_field(),
-            "out_of_leases",
+        assert!(
+            s_after.contains("2 leases remaining"),
+            "one less lease remaining after renewal, got: {s_after}"
         );
-    }
-
-    #[test]
-    fn local_rejection_instruction_finalizes_without_renewal_language() {
-        let mut lease = Lease::new(1, LOCAL_MAX_LEASE_RENEWALS);
-        assert_eq!(lease.admit_batch(1), BatchAdmission::Admitted);
-
-        let instruction = lease.rejection_instruction();
-
-        let instruction = instruction.to_lowercase();
-        assert!(instruction.contains("finalize now"));
-        assert!(instruction.contains("fresh user turn"));
-        assert!(!instruction.contains("renewal checkpoint"));
     }
 }

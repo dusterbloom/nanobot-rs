@@ -10,39 +10,52 @@ use regex::Regex;
 use crate::agent::audit::AuditEntry;
 
 // Static regexes for claim extraction (compiled once).
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_FILE_REF: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(read|wrote|created|edited|deleted|found|opened)\b[^`\n]{0,20}[`]([/~][^\s`]+)[`]",
     )
-    .unwrap()
+    .expect("static regex")
 });
-static RE_CMD_REF: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`").unwrap());
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_CMD_REF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`").expect("static regex")
+});
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_QUOTED_OUTPUT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(output|result|returns?|shows?|returned|produced)\b[:\s]*\n?```[^\n]*\n([\s\S]*?)```").unwrap()
+    Regex::new(r"(?i)\b(output|result|returns?|shows?|returned|produced)\b[:\s]*\n?```[^\n]*\n([\s\S]*?)```").expect("static regex")
 });
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_ACTION_PAST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|listed|verified|built|compiled|installed|copied)\b").unwrap()
+    Regex::new(r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|listed|verified|built|compiled|installed|copied)\b").expect("static regex")
 });
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_ACTION_PRESENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b[Ll]et me (check|run|verify|look|see|test|try|build|install|copy)\b")
-        .unwrap()
+        .expect("static regex")
 });
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_ACTION_WHEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b").unwrap()
+    Regex::new(r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b")
+        .expect("static regex")
 });
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(\d+)\s+(files?|lines?|errors?|tests?|warnings?|results?|matches?|items?)\b")
-        .unwrap()
+        .expect("static regex")
 });
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_TOOL_RESULT_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(read_file|list_dir|find_files|search_files|exec|recall|remember|recall_tool_result|search_tool_result|slice_tool_result)\b[^.\n]{0,140}\b(succeeded|returned|showed|shows|listed|found|exists|contains|worked|completed|done|ready|updated|failed|error|not found|permission denied|timed? ?out)\b").unwrap()
+    Regex::new(r"(?i)\b(read_file|list_dir|find_files|search_files|exec|recall|remember|inspect_tool_result)\b[^.\n]{0,140}\b(succeeded|returned|showed|shows|listed|found|exists|contains|worked|completed|done|ready|updated|failed|error|not found|permission denied|timed? ?out)\b").expect("static regex")
 });
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
 static RE_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(build|compile|install|copy|cp|mv|mkdir|chmod|sudo|cargo|npm|pip|make|test|deploy|push|pull|merge)\b[^.\n]{0,30}\b(succeeded|failed|worked|completed|finished|passed|done|ready|updated|error|broke|broken|permission denied|not found|timed? ?out)\b").unwrap()
+    Regex::new(r"(?i)\b(build|compile|install|copy|cp|mv|mkdir|chmod|sudo|cargo|npm|pip|make|test|deploy|push|pull|merge)\b[^.\n]{0,30}\b(succeeded|failed|worked|completed|finished|passed|done|ready|updated|error|broke|broken|permission denied|not found|timed? ?out)\b").expect("static regex")
 });
-static RE_TIMESTAMP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").unwrap());
+#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
+static RE_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").expect("static regex")
+});
 
 const ACTION_CLAIM_MAX_TAIL_CHARS: usize = 240;
 

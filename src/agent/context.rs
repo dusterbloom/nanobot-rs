@@ -1,3 +1,15 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(
+    clippy::as_conversions,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::shadow_reuse,
+    clippy::string_add
+)]
 #![allow(dead_code)]
 //! Context builder for assembling agent prompts.
 //!
@@ -1256,10 +1268,11 @@ impl ContextBuilder {
                 format!(
                     "You are nanobot.\n\
                      Date: {today}. Model: {model_line}. Cwd: {cwd}. Workspace: {workspace_path}.\n\n\
-                     Native tools: read_file, edit_file, write_file, exec, get_skills — call with schema args; never wrap. \
+                     Native tools: read_file, edit_file, write_file, exec, get_skills, inspect_tool_result — call with schema args; never wrap. \
                      Other tools via `get_tools` proxy: omit tool_name to list; \
                      {{\"tool_name\":\"X\"}} inspect; {{\"tool_name\":\"X\",\"tool_args\":{{...}}}} invoke. \
                       get_skills: omit name to list, name to read; recall (memory + files + past sessions). \
+                     TOOL_RESULT_HANDLE v1 receipt → inspect a bounded part with inspect_tool_result({{\"tool_call_id\":\"<id>\",\"query\":\"...\"}}), or use start_line/end_line. \
                      Quote exact tool errors; never invent causes or tool results. \
                      edit_file uses path, old_text, new_text—not content. \
                      Never pass read_file line prefixes as args. \
@@ -1301,7 +1314,9 @@ impl ContextBuilder {
                 ),
                 format!("Home: {home_dir}\n"),
                 "\n- Reply directly for conversation; use 'message' tool only for chat channels.\n\
-                 - Use absolute paths or paths relative to the project directory."
+                 - Use absolute paths or paths relative to the project directory.\n\
+                 - Tool results may arrive as TOOL_RESULT_HANDLE v1 receipts (body stashed to save context); \
+                 inspect only the needed part with inspect_tool_result({\"tool_call_id\":\"<id>\",\"query\":\"...\"}}) or start_line/end_line."
                     .to_string(),
                 format!(
                     "## Memory\n\
@@ -1567,7 +1582,7 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
             if !path.is_file() {
                 continue;
             }
-            let mime = _guess_mime(path_str);
+            let mime = guess_mime(path_str);
             if !mime.starts_with("image/") {
                 continue;
             }
@@ -1724,8 +1739,8 @@ fn _voice_mode_instructions(detected_language: Option<&str>) -> String {
     text
 }
 
-/// Guess MIME type from a file extension.
-fn _guess_mime(path: &str) -> String {
+/// Guess a MIME type from a file extension (used for image content parts).
+pub(crate) fn guess_mime(path: &str) -> String {
     let lower = path.to_lowercase();
     if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
         "image/jpeg".to_string()
@@ -1900,47 +1915,59 @@ mod tests {
         );
     }
 
-    // ----- _guess_mime -----
+    // ----- guess_mime -----
 
     #[test]
     fn test_guess_mime_jpg() {
-        assert_eq!(_guess_mime("photo.jpg"), "image/jpeg");
+        assert_eq!(guess_mime("photo.jpg"), "image/jpeg");
     }
 
     #[test]
     fn test_guess_mime_jpeg() {
-        assert_eq!(_guess_mime("photo.jpeg"), "image/jpeg");
+        assert_eq!(guess_mime("photo.jpeg"), "image/jpeg");
     }
 
     #[test]
     fn test_guess_mime_png() {
-        assert_eq!(_guess_mime("image.png"), "image/png");
+        assert_eq!(guess_mime("image.png"), "image/png");
     }
 
     #[test]
     fn test_guess_mime_gif() {
-        assert_eq!(_guess_mime("anim.gif"), "image/gif");
+        assert_eq!(guess_mime("anim.gif"), "image/gif");
     }
 
     #[test]
     fn test_guess_mime_webp() {
-        assert_eq!(_guess_mime("pic.webp"), "image/webp");
+        assert_eq!(guess_mime("pic.webp"), "image/webp");
     }
 
     #[test]
     fn test_guess_mime_svg() {
-        assert_eq!(_guess_mime("icon.svg"), "image/svg+xml");
+        assert_eq!(guess_mime("icon.svg"), "image/svg+xml");
     }
 
     #[test]
     fn test_guess_mime_unknown() {
-        assert_eq!(_guess_mime("archive.tar.gz"), "application/octet-stream");
+        assert_eq!(guess_mime("archive.tar.gz"), "application/octet-stream");
     }
 
     #[test]
     fn test_guess_mime_case_insensitive() {
-        assert_eq!(_guess_mime("PHOTO.JPG"), "image/jpeg");
-        assert_eq!(_guess_mime("image.PNG"), "image/png");
+        assert_eq!(guess_mime("PHOTO.JPG"), "image/jpeg");
+        assert_eq!(guess_mime("image.PNG"), "image/png");
+    }
+
+    #[test]
+    fn test_guess_mime_shared_fn() {
+        // Same behavior as the former private helper, now a shared free fn.
+        assert_eq!(guess_mime("photo.jpg"), "image/jpeg");
+        assert_eq!(guess_mime("photo.jpeg"), "image/jpeg");
+        assert_eq!(guess_mime("image.png"), "image/png");
+        assert_eq!(guess_mime("anim.gif"), "image/gif");
+        assert_eq!(guess_mime("pic.webp"), "image/webp");
+        assert_eq!(guess_mime("img.svg"), "image/svg+xml");
+        assert_eq!(guess_mime("file.bin"), "application/octet-stream");
     }
 
     // ----- build_system_prompt -----
@@ -2074,7 +2101,9 @@ mod tests {
     fn test_local_system_prompt_under_180_tokens_without_inlined_catalog() {
         // Headline property: with a real workspace and a realistic long GGUF
         // model name, the assembled local system prompt stays small. The ceiling
-        // accommodates path interpolation + long model filenames.
+        // accommodates path interpolation + long model filenames + the
+        // TOOL_RESULT_HANDLE protocol line (which prevents local models from
+        // misrouting handle fetches to `recall` — session 20260804_204406_c16eb0).
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("AGENTS.md"),
@@ -2100,8 +2129,8 @@ mod tests {
         let tokens = TokenBudget::estimate_str_tokens(&prompt);
 
         assert!(
-            tokens <= 220,
-            "local system prompt must stay <= 220 tokens with realistic model name (got {tokens}):\n{prompt}"
+            tokens <= 260,
+            "local system prompt must stay <= 260 tokens with realistic model name (got {tokens}):\n{prompt}"
         );
 
         // Bootstrap catalog content must NOT be inlined — model fetches on demand.
@@ -2352,15 +2381,6 @@ mod tests {
         let mut messages: Vec<Value> = Vec::new();
         let body = "exact bytes that the caller already bounded";
         ContextBuilder::add_tool_result(&mut messages, "c1", "read_file", body);
-        assert_eq!(messages[0]["content"].as_str().unwrap(), body);
-    }
-
-    #[test]
-    fn test_add_tool_result_keeps_recall_tool_result_raw_for_live_turn() {
-        let mut messages: Vec<Value> = Vec::new();
-        let body = "x".repeat(crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES + 1024);
-        ContextBuilder::add_tool_result(&mut messages, "c1", "recall_tool_result", &body);
-
         assert_eq!(messages[0]["content"].as_str().unwrap(), body);
     }
 

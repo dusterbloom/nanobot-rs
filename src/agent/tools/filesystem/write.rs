@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions)]
 //! `write_file` tool.
 
 use std::collections::{HashMap, HashSet};
@@ -8,7 +14,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use super::super::base::{PermissionLevel, Tool, ToolExecutionContext};
+use super::super::base::{PermissionLevel, Tool, ToolContext};
 use super::{expand_path, require_param};
 
 pub(crate) const MAX_WRITE_FILE_PIECE_CHARS: usize = 4096;
@@ -313,7 +319,10 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "Write a file atomically. A state=complete call may contain the whole file at any size. For voluntary multi-call writes, keep each non-final state=more piece to 4096 characters or less; the final state=complete piece may be any size. Use state=append to add content, omit state for a complete one-call write, and never send offsets, hashes, IDs, or temporary paths. After publication, validate the artifact before claiming completion."
+        "Write or create a file with the given content at path. \
+         Omit state for a complete one-call write. Use state=more for multi-call pieces (≤4096 chars each), \
+         state=complete for the final piece, or state=append to add to an existing file. \
+         After writing, validate the file before claiming completion."
     }
 
     fn permission(&self) -> PermissionLevel {
@@ -350,9 +359,9 @@ impl Tool for WriteFileTool {
     async fn execute_with_context(
         &self,
         params: HashMap<String, serde_json::Value>,
-        ctx: &ToolExecutionContext,
+        ctx: &ToolContext,
     ) -> String {
-        self.execute_write(params, Some(&ctx.tool_call_id)).await
+        self.execute_write(params, Some(ctx.call_id())).await
     }
 }
 
@@ -553,12 +562,11 @@ mod tests {
         let description = tool.description();
 
         assert!(description.contains("complete"));
-        assert!(description.contains("any size"));
-        assert!(description.contains("4096 characters or less"));
         assert!(description.contains("state=more"));
         assert!(description.contains("state=complete"));
-        assert!(description.contains("never send offsets"));
-        assert!(description.contains("hashes"));
+        assert!(description.contains("state=append"));
+        assert!(description.contains("4096 chars"));
+        assert!(description.contains("validate"));
         assert!(
             schema.pointer("/properties/content/maxLength").is_none(),
             "the 4096 advisory applies only to state=more"
@@ -648,11 +656,12 @@ mod tests {
         std::fs::write(&file_path, "old").unwrap();
         let tool = WriteFileTool::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = crate::agent::tools::base::ToolExecutionContext {
+        let ctx = ToolContext::new(
+            None,
             event_tx,
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tool_call_id: "call-oversized".to_string(),
-        };
+            tokio_util::sync::CancellationToken::new(),
+            "call-oversized".to_string(),
+        );
 
         let content = "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1);
         let result = tool
@@ -783,11 +792,12 @@ mod tests {
         std::fs::write(&file_path, "old").unwrap();
         let tool = WriteFileTool::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = crate::agent::tools::base::ToolExecutionContext {
+        let ctx = ToolContext::new(
+            None,
             event_tx,
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tool_call_id: "call-1".to_string(),
-        };
+            tokio_util::sync::CancellationToken::new(),
+            "call-1".to_string(),
+        );
 
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
@@ -820,11 +830,12 @@ mod tests {
         std::fs::write(&file_path, "<script>run()").unwrap();
         let tool = WriteFileTool::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = crate::agent::tools::base::ToolExecutionContext {
+        let ctx = ToolContext::new(
+            None,
             event_tx,
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tool_call_id: "call-append".to_string(),
-        };
+            tokio_util::sync::CancellationToken::new(),
+            "call-append".to_string(),
+        );
         let params = make_params(&[
             ("path", file_path.to_str().unwrap()),
             ("content", "</script></html>"),
@@ -848,16 +859,18 @@ mod tests {
         let file_path = dir.path().join("artifact.html");
         let tool = WriteFileTool::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let first_ctx = crate::agent::tools::base::ToolExecutionContext {
-            event_tx: event_tx.clone(),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tool_call_id: "call-1".to_string(),
-        };
-        let final_ctx = crate::agent::tools::base::ToolExecutionContext {
+        let first_ctx = ToolContext::new(
+            None,
+            event_tx.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            "call-1".to_string(),
+        );
+        let final_ctx = ToolContext::new(
+            None,
             event_tx,
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tool_call_id: "call-2".to_string(),
-        };
+            tokio_util::sync::CancellationToken::new(),
+            "call-2".to_string(),
+        );
 
         tool.execute_with_context(
             make_params(&[

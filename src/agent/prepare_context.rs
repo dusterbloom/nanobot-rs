@@ -1,3 +1,9 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::as_conversions, clippy::shadow_reuse, clippy::shadow_unrelated)]
 //! Phase 1 of message processing: build the [`TurnContext`] from an inbound message.
 //!
 //! Extracted from `agent_loop.rs` to keep that file focused on the iteration
@@ -9,7 +15,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::agent::agent_core::SwappableCore;
-use crate::agent::agent_loop::{AgentLoopShared, CompactionHandle, FlowControl, TurnContext};
+use crate::agent::agent_loop::{AgentLoopShared, FlowControl, TurnContext};
 use crate::agent::audit::AuditLog;
 use crate::agent::context::PromptBlock;
 use crate::agent::context_gate::ContentGate;
@@ -270,16 +276,19 @@ impl AgentLoopShared {
             .get_or_resume_with_idle(&session_key, core.session_complete_after_secs)
             .await;
         let session_id = session_meta.id.clone();
-        let compaction = {
-            let mut handles = self.compaction_handles.lock().await;
-            handles
-                .entry(session_id.clone())
-                .or_insert_with(|| CompactionHandle {
-                    slot: Arc::new(tokio::sync::Mutex::new(None)),
-                    in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                })
-                .clone()
+        let (compaction, compaction_admission) = loop {
+            let candidate = self.compaction_handle_for_session(&session_id).await;
+            if let Some(admission) = candidate.admit().await {
+                break (candidate, admission);
+            }
+
+            // A waiter may have cloned the old handle before clear retired and
+            // removed it. Never replace a newer handle installed by a waiter
+            // that reached the map first.
+            self.remove_compaction_handle_if_owned(&session_id, &candidate)
+                .await;
         };
+        compaction.cancel_and_reap().await;
         if tools.contains("recall") {
             // recall absorbed session_search; re-register it bound to the
             // concrete session so the fetch/search legs exclude the turn in
@@ -316,41 +325,33 @@ impl AgentLoopShared {
                 } else {
                     LcmEngine::new(config)
                 };
-
                 engines.insert(
                     session_id.clone(),
                     std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
                 );
             }
-            engines.get(&session_id).cloned().unwrap()
+            match engines.get(&session_id) {
+                Some(e) => e.clone(),
+                // Inserted above or pre-existing under the same lock — absent
+                // only if the invariant broke; fall back to a fresh engine.
+                None => {
+                    use crate::agent::lcm::{LcmConfig, LcmEngine};
+                    std::sync::Arc::new(tokio::sync::Mutex::new(LcmEngine::new(LcmConfig::from(
+                        &self.lcm_config,
+                    ))))
+                }
+            }
         };
         use crate::agent::lcm::LcmExpandTool;
-        tools.register(Box::new(LcmExpandTool::new(lcm_engine)));
+        tools.register(Box::new(LcmExpandTool::new(lcm_engine.clone())));
 
         let lcm_setup_ms = lap_ms();
 
-        // Large results enter the prompt as bounded previews. Keep the direct
-        // recovery tool in every mode and bind it to this concrete session so
-        // a restarted process can load the exact original bytes from SQLite.
-        tools.register(Box::new(
-            crate::agent::tools::recall_tool_result::RecallToolResultTool::with_db(
-                core.sessions.path().to_path_buf(),
-                session_id.clone(),
-            ),
-        ));
-
-        // Bounded retrieval over stashed results: search (grep) and slice
-        // (line-range) without ever loading the full body into context.
-        // These complement recall_tool_result for the common case where only
-        // a few matching lines are needed.
+        // One bounded result-inspection tool replaces full recall plus separate
+        // search/slice verbs. Exact bodies remain in SQLite and no model call
+        // can request an unbounded replay into the transcript.
         tools.register(Box::new(
             crate::agent::tools::stash_search::SearchToolResultTool::with_db(
-                core.sessions.path().to_path_buf(),
-                session_id.clone(),
-            ),
-        ));
-        tools.register(Box::new(
-            crate::agent::tools::stash_search::SliceToolResultTool::with_db(
                 core.sessions.path().to_path_buf(),
                 session_id.clone(),
             ),
@@ -359,19 +360,35 @@ impl AgentLoopShared {
         // Get session history. Track count so we know where new messages start.
         // The trim ceiling must stay above LCM's soft
         // compaction threshold, or compaction never fires (see history_limit_lcm).
-        let retained_higgs = core.mode().is_local() && core.provider.supports_higgs_session_cache();
-        let (max_messages, max_turns) = if retained_higgs {
-            (0, 0)
-        } else {
-            (
-                crate::agent::agent_core::history_limit_lcm(core.token_budget.max_context()),
-                core.max_history_turns,
-            )
-        };
+        let max_messages =
+            crate::agent::agent_core::history_limit_lcm(core.token_budget.max_context());
         let history = core
             .sessions
-            .get_history(&session_id, max_messages, max_turns)
+            .get_history(&session_id, max_messages, core.max_history_turns)
             .await;
+        // The fingerprint deliberately SURVIVES the reload so the first call of
+        // each new user turn is compared against the last call of the previous
+        // one. That cross-turn comparison is the only thing that can catch a
+        // reload whose bytes differ from what was already sent.
+        //
+        // It used to be cleared here, justified by "get_history applies
+        // byte-changing transformations … the Higgs radix cache is unaffected
+        // (it matches by content, not by nanobot's fingerprint)". The first
+        // half was true and the second half was not: higgs matches on content,
+        // the content had changed, and it re-prefilled. Clearing the
+        // fingerprint only removed the evidence. Session
+        // 20260810_081050_8306f8 lost 124.54s that way with an empty log.
+        //
+        // The byte-changing transformations are gone (`session::filters` is now
+        // a pure function of the stored rows), so a divergence reported here is
+        // real and worth the WARN.
+        //
+        // The WATERMARK still must go: it is an index into the message array,
+        // and history windowing renumbers those. A stale watermark would freeze
+        // the wrong prefix range.
+        let _prompt_cache_transition = counters.lock_prompt_cache_transition();
+        counters.prompt_cache_watermark.lock().remove(&session_key);
+        drop(_prompt_cache_transition);
         let history_ms = lap_ms();
         // LCM history adoption: when the engine holds a summary DAG, the
         // engine's active context IS the conversation history — summary
@@ -383,30 +400,26 @@ impl AgentLoopShared {
         // trim would gut recent turns instead. Ingest first (idempotent by
         // `_db_id`) so a live session's rows are in the store, then adopt.
         let history = {
-            let engine_arc = self.lcm_engines.lock().await.get(&session_id).cloned();
-            if let Some(engine_arc) = engine_arc {
-                let mut engine = engine_arc.lock().await;
-                for msg in &history {
-                    engine.ingest(msg.clone());
-                }
-                // The background compactor mutates the shared DAG before it
-                // publishes the checkpoint that rotates Higgs's session ID.
-                // Keep raw SQLite history authoritative across that window;
-                // the existing checkpoint installer is the sole publication
-                // point for both the prompt rewrite and cache rotation.
-                let rewrite_unpublished = compaction.in_flight.load(Ordering::Acquire)
-                    || compaction.slot.lock().await.is_some();
-                if engine.dag().is_empty() || rewrite_unpublished {
-                    history
-                } else {
-                    engine
-                        .active_context()
-                        .into_iter()
-                        .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
-                        .collect()
-                }
-            } else {
+            // The session admission held above prevents a new compaction start
+            // between reaping and this normal cancellation-safe lock await.
+            let rewrite_unpublished = compaction.has_pending().await;
+            let mut engine = lcm_engine.lock().await;
+            for msg in &history {
+                engine.ingest(msg.clone());
+            }
+            // The background compactor mutates the shared DAG before it
+            // publishes the checkpoint that rotates Higgs's session ID.
+            // Keep raw SQLite history authoritative across that window;
+            // the existing checkpoint installer is the sole publication
+            // point for both the prompt rewrite and cache rotation.
+            if engine.dag().is_empty() || rewrite_unpublished {
                 history
+            } else {
+                engine
+                    .active_context()
+                    .into_iter()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
+                    .collect()
             }
         };
         let lcm_ingest_ms = lap_ms();
@@ -577,12 +590,8 @@ impl AgentLoopShared {
             }
             RuntimeMode::Local { .. } | RuntimeMode::Cloud => Arc::new(CloudProtocol),
         };
-        let max_lease_renewals = if core.mode().is_local() {
-            crate::agent::lease::LOCAL_MAX_LEASE_RENEWALS
-        } else {
-            crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN
-        };
 
+        drop(compaction_admission);
         TurnContext {
             core,
             request_id,
@@ -614,6 +623,10 @@ impl AgentLoopShared {
             iterations_used: 0,
             turn_start: std::time::Instant::now(),
             compaction,
+            soft_compaction_requested: false,
+            staged_auto_expansion: None,
+            higgs_session_route: Default::default(),
+            retained_route_cleanup: Default::default(),
             content_gate,
             counters: self.core_handle.counters.clone(),
             flow: FlowControl {
@@ -627,9 +640,8 @@ impl AgentLoopShared {
                 round_executed_no_tools: false,
                 lease: crate::agent::lease::Lease::new(
                     crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,
-                    max_lease_renewals,
+                    crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN,
                 ),
-                tool_preview_chars_remaining: crate::agent::tool_engine::TOOL_PREVIEW_BUDGET_CHARS,
                 llm_call_start: None,
                 ttft_ms: None,
                 provider_prompt_estimate: None,

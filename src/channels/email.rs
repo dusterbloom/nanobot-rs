@@ -3,6 +3,27 @@
 //! Receives messages by polling IMAP INBOX for UNSEEN messages, sends replies
 //! via SMTP with proper threading headers (`In-Reply-To`, `References`).
 
+// Interactive/app boundary (error-protocol layer 3 backlog): printing IS the
+// product here (REPL/TUI/CLI), and the thin glue code keeps pragmatic
+// unwraps on always-set state (rl, runtime, static regexes). The deny regime
+// in Cargo.toml stays live for the core; this module lands on the regime
+// when its backlog is migrated.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::shadow_same,
+    clippy::format_push_string,
+    clippy::string_add
+)]
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -550,7 +571,6 @@ mod tests {
             password: data["pass"].as_str()?.to_string(),
             poll_interval_secs: 5,
             allow_from: Vec::new(),
-            toolset: None,
         })
     }
 
@@ -682,7 +702,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 5,
             allow_from: Vec::new(),
-            toolset: None,
         };
         let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
         let result = poll_inbox(&config, &tx).await;
@@ -710,7 +729,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
         let msg = OutboundMessage::new("email", "email:test@example.com", "body");
         let result = send_email(&config, &msg).await;
@@ -731,7 +749,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
         // chat_id with invalid email after "email:" prefix
         let msg = OutboundMessage::new("email", "email:not-valid", "body");
@@ -754,7 +771,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
         // chat_id with prefix: recipient should be "recv@example.com"
         let msg = OutboundMessage::new("email", "email:recv@example.com", "body");
@@ -781,7 +797,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
         // chat_id WITHOUT "email:" prefix — should still work
         let msg = OutboundMessage::new("email", "recv@example.com", "body");
@@ -810,7 +825,6 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
 
         // With subject
@@ -1329,7 +1343,6 @@ mod tests {
             password: std::env::var("TEST_EMAIL_PASS").expect("TEST_EMAIL_PASS required"),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
 
         println!(
@@ -1431,7 +1444,6 @@ mod tests {
             password: std::env::var("TEST_AGENTMAIL_PASS").expect("TEST_AGENTMAIL_PASS required"),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
-            toolset: None,
         };
 
         println!("Polling agentmail.to API as {}", config.username);

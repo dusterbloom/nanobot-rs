@@ -1,3 +1,10 @@
+// Error-protocol layer-3 backlog (docs/research/2026-08-06-error-conventions-and-host-bridge.md §3.6):
+// the deny regime in Cargo.toml is live; this module still carries pre-existing
+// violations of the lints below. Remove this allow as the module migrates onto
+// the regime.
+// Tracking: docs/error-protocol-backlog.md
+#![allow(clippy::indexing_slicing, clippy::print_stderr, clippy::shadow_reuse)]
+#![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 #![allow(dead_code)]
 //! Utility functions for nanobot.
 
@@ -68,24 +75,6 @@ pub fn get_workspace_path(workspace: Option<&str>) -> PathBuf {
         }
     };
     ensure_dir(path)
-}
-
-/// Get the memory directory within the workspace.
-pub fn get_memory_path(workspace: Option<&Path>) -> PathBuf {
-    let ws = match workspace {
-        Some(p) => p.to_path_buf(),
-        None => get_workspace_path(None),
-    };
-    ensure_dir(ws.join("memory"))
-}
-
-/// Get the skills directory within the workspace.
-pub fn get_skills_path(workspace: Option<&Path>) -> PathBuf {
-    let ws = match workspace {
-        Some(p) => p.to_path_buf(),
-        None => get_workspace_path(None),
-    };
-    ensure_dir(ws.join("skills"))
 }
 
 /// Get today's date in YYYY-MM-DD format.
