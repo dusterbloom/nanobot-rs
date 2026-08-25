@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use super::super::base::{PermissionLevel, Tool, ToolContext};
-use super::{expand_path, require_param};
+use super::super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
+use super::{expand_path, require_param, idle_write_allowed, idle_write_denied_err};
+use crate::errors::ToolError;
 
 pub(crate) const MAX_WRITE_FILE_PIECE_CHARS: usize = 4096;
 const STAGED_WRITE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -133,14 +134,19 @@ impl WriteFileTool {
         &self,
         params: HashMap<String, serde_json::Value>,
         tool_call_id: Option<&str>,
-    ) -> String {
-        let path = match require_param(&params, "path") {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
+    ) -> ToolResult {
+        let path = require_param(&params, "path")?;
+        // An empty correlation id carries no identity: the default trait
+        // bridge passes Some("") where the legacy no-context path passed
+        // None, and staged-write dedup keyed on "" would false-positive.
+        let tool_call_id = tool_call_id.filter(|id| !id.is_empty());
         let content = match params.get("content").and_then(|v| v.as_str()) {
             Some(c) => c,
-            None => return "Error: 'content' parameter is required".to_string(),
+            None => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'content' parameter is required".to_string(),
+                })
+            }
         };
         let state = params
             .get("state")
@@ -149,22 +155,26 @@ impl WriteFileTool {
             .trim()
             .to_ascii_lowercase();
         if !matches!(state.as_str(), "more" | "complete" | "append") {
-            return "Error: 'state' must be one of: more, complete, append".to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "'state' must be one of: more, complete, append".to_string(),
+            });
         }
         let piece_chars = content.chars().count();
 
         let target_path = expand_write_path(path);
         if let Some(paths) = &self.idle_paths {
             let workspace = crate::utils::helpers::get_workspace_path(None);
-            if !super::idle_write_allowed(paths, &target_path, &workspace) {
-                return super::idle_write_denied(&target_path);
+            if !idle_write_allowed(paths, &target_path, &workspace) {
+                return Err(idle_write_denied_err(&target_path));
             }
         }
         if let Some(parent) = target_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return format!(
+                // Legacy quirk preserved: no "Error:" prefix → success channel.
+                return Ok(format!(
                     "Error creating directories: {e}. Hint: check file permissions or try a different path."
-                );
+                )
+                .into());
             }
         }
 
@@ -192,25 +202,28 @@ impl WriteFileTool {
                 completed.target_path == target_path && completed.content_digest == content_digest
             })
         {
-            return format!(
+            return Ok(format!(
                 "This write_file call already completed for {path}; total={} bytes.",
                 completed.total_bytes
-            );
+            )
+            .into());
         }
 
         if let Some(staged) = writer_state.staged_writes.get_mut(&target_path) {
             if state == "append" {
-                return "Error: cannot append while a staged write is active for this path; finish it with state=\"complete\" first."
-                    .to_string();
+                return Err(ToolError::InvalidArgs {
+                    message: "cannot append while a staged write is active for this path; finish it with state=\"complete\" first.".to_string(),
+                });
             }
             if tool_call_id.is_some_and(|id| staged.delivered_call_ids.contains(id)) {
-                return format!(
+                return Ok(format!(
                     "This write_file call was already staged for {path}; total={} bytes. Continue with state=\"more\", or send the final piece with state=\"complete\".",
                     staged.total_bytes
-                );
+                )
+                .into());
             }
             if state == "more" && piece_chars > MAX_WRITE_FILE_PIECE_CHARS {
-                return oversized_piece_error(piece_chars);
+                return Err(oversized_piece_error(piece_chars));
             }
 
             let previous_total = staged.total_bytes;
@@ -235,7 +248,7 @@ impl WriteFileTool {
 
             if state == "more" {
                 rollback.disarm();
-                return staged_receipt(path, content.len(), staged.total_bytes);
+                return Ok(staged_receipt(path, content.len(), staged.total_bytes).into());
             }
 
             let stage_path = staged.stage_path.clone();
@@ -260,12 +273,12 @@ impl WriteFileTool {
                     },
                 );
             }
-            return published_receipt("wrote", total_bytes, total_bytes, path);
+            return Ok(published_receipt("wrote", total_bytes, total_bytes, path).into());
         }
 
         if state == "more" {
             if piece_chars > MAX_WRITE_FILE_PIECE_CHARS {
-                return oversized_piece_error(piece_chars);
+                return Err(oversized_piece_error(piece_chars));
             }
             let stage_path = unique_staged_write_path(&target_path);
             let mut cleanup = RemoveOnDrop::new(stage_path.clone());
@@ -287,7 +300,7 @@ impl WriteFileTool {
                 },
             );
             cleanup.disarm();
-            return staged_receipt(path, content.len(), total_bytes);
+            return Ok(staged_receipt(path, content.len(), total_bytes).into());
         }
 
         if state == "append" {
@@ -304,7 +317,7 @@ impl WriteFileTool {
                             },
                         );
                     }
-                    published_receipt("appended", content.len() as u64, total_bytes, path)
+                    Ok(published_receipt("appended", content.len() as u64, total_bytes, path).into())
                 }
                 Err(e) => write_error(path, e),
             };
@@ -323,7 +336,13 @@ impl WriteFileTool {
                         },
                     );
                 }
-                published_receipt("wrote", content.len() as u64, content.len() as u64, path)
+                Ok(published_receipt(
+                    "wrote",
+                    content.len() as u64,
+                    content.len() as u64,
+                    path,
+                )
+                .into())
             }
             Err(e) => write_error(path, e),
         }
@@ -370,15 +389,11 @@ impl Tool for WriteFileTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        self.execute_write(params, None).await
-    }
-
-    async fn execute_with_context(
+    async fn execute_typed(
         &self,
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolContext,
-    ) -> String {
+    ) -> ToolResult {
         self.execute_write(params, Some(ctx.call_id())).await
     }
 }
@@ -422,29 +437,33 @@ fn published_receipt(action: &str, wrote: u64, total: u64, path: &str) -> String
     )
 }
 
-fn oversized_piece_error(actual_chars: usize) -> String {
-    format!(
-        "Error: write_file staged content is {actual_chars} characters; send pieces of {MAX_WRITE_FILE_PIECE_CHARS} characters or less."
-    )
-}
-
-fn write_error(path: &str, error: std::io::Error) -> String {
-    if error.kind() == std::io::ErrorKind::PermissionDenied {
-        format!(
-            "Error: Permission denied: {path}. Hint: check file permissions or try a different path."
-        )
-    } else {
-        format!("Error writing file: {error}")
+fn oversized_piece_error(actual_chars: usize) -> ToolError {
+    ToolError::InvalidArgs {
+        message: format!(
+            "write_file staged content is {actual_chars} characters; send pieces of {MAX_WRITE_FILE_PIECE_CHARS} characters or less."
+        ),
     }
 }
 
-fn publish_error(path: &str, error: std::io::Error) -> String {
+fn write_error(path: &str, error: std::io::Error) -> ToolResult {
     if error.kind() == std::io::ErrorKind::PermissionDenied {
-        format!(
-            "Error: Permission denied publishing {path}. Hint: check file permissions or try a different path."
-        )
+        Err(ToolError::PermissionDenied(format!(
+            "Permission denied: {path}. Hint: check file permissions or try a different path."
+        )))
     } else {
-        format!("Error publishing staged file: {error}")
+        // Legacy quirk preserved: no "Error:" prefix → success channel.
+        Ok(format!("Error writing file: {error}").into())
+    }
+}
+
+fn publish_error(path: &str, error: std::io::Error) -> ToolResult {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        Err(ToolError::PermissionDenied(format!(
+            "Permission denied publishing {path}. Hint: check file permissions or try a different path."
+        )))
+    } else {
+        // Legacy quirk preserved: no "Error:" prefix → success channel.
+        Ok(format!("Error publishing staged file: {error}").into())
     }
 }
 
@@ -683,7 +702,7 @@ mod tests {
 
         let content = "x".repeat(MAX_WRITE_FILE_PIECE_CHARS + 1);
         let result = tool
-            .execute_with_context(
+            .execute_typed(
                 make_params(&[
                     ("path", file_path.to_str().unwrap()),
                     ("content", &content),
@@ -691,7 +710,9 @@ mod tests {
                 ]),
                 &ctx,
             )
-            .await;
+            .await
+            .unwrap()
+            .text;
 
         assert!(
             result.starts_with("Successfully wrote 4097 bytes"),
@@ -822,8 +843,8 @@ mod tests {
             ("content", "<html>"),
             ("state", "more"),
         ]);
-        let first = tool.execute_with_context(params.clone(), &ctx).await;
-        let duplicate = tool.execute_with_context(params, &ctx).await;
+        let first = tool.execute_typed(params.clone(), &ctx).await.unwrap().text;
+        let duplicate = tool.execute_typed(params, &ctx).await.unwrap().text;
         assert!(first.contains("total=6"));
         assert!(duplicate.contains("already staged"));
 
@@ -860,8 +881,8 @@ mod tests {
             ("state", "append"),
         ]);
 
-        let first = tool.execute_with_context(params.clone(), &ctx).await;
-        let duplicate = tool.execute_with_context(params, &ctx).await;
+        let first = tool.execute_typed(params.clone(), &ctx).await.unwrap().text;
+        let duplicate = tool.execute_typed(params, &ctx).await.unwrap().text;
 
         assert!(first.starts_with("Successfully appended"), "{first}");
         assert!(duplicate.contains("already completed"), "{duplicate}");
@@ -890,7 +911,7 @@ mod tests {
             "call-2".to_string(),
         );
 
-        tool.execute_with_context(
+        tool.execute_typed(
             make_params(&[
                 ("path", file_path.to_str().unwrap()),
                 ("content", "<html>"),
@@ -905,9 +926,11 @@ mod tests {
             ("state", "complete"),
         ]);
         let first_publish = tool
-            .execute_with_context(final_params.clone(), &final_ctx)
-            .await;
-        let duplicate_publish = tool.execute_with_context(final_params, &final_ctx).await;
+            .execute_typed(final_params.clone(), &final_ctx)
+            .await
+            .unwrap()
+            .text;
+        let duplicate_publish = tool.execute_typed(final_params, &final_ctx).await.unwrap().text;
 
         assert!(first_publish.starts_with("Successfully wrote 13 bytes"));
         assert!(duplicate_publish.contains("already completed"));

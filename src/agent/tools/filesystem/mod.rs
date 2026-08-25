@@ -31,7 +31,8 @@ use regex::RegexBuilder;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
-use super::base::{PermissionLevel, Tool, ToolConcurrency};
+use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult};
+use crate::errors::ToolError;
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
 
 /// Leave room below the replay ceiling for wrappers while retaining a useful
@@ -41,14 +42,18 @@ use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
 const READ_FILE_REPLAY_SAFE_BYTES: usize = TOOL_RESULT_REPLAY_MAX_BYTES - 400;
 
 /// Extract a required string parameter, returning an error string on missing.
+/// Typed param extractor (error protocol Phase 2): the message preserves
+/// the legacy bytes so the registry's "is required" worked-example arm and
+/// exact-substring tests are unchanged.
 fn require_param<'a>(
     params: &'a HashMap<String, serde_json::Value>,
     key: &str,
-) -> Result<&'a str, String> {
-    params
-        .get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("Error: '{}' parameter is required", key))
+) -> Result<&'a str, crate::errors::ToolError> {
+    params.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+        crate::errors::ToolError::InvalidArgs {
+            message: format!("'{}' parameter is required", key),
+        }
+    })
 }
 
 /// Build a `HashMap<String, Value>` from `&str` pairs. Shared test helper used
@@ -141,19 +146,28 @@ impl Tool for ReadFileTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let path = match require_param(&params, "path") {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        let path = require_param(&params, "path")?;
 
         let file_path = resolve_read_path(path);
 
         if !file_path.exists() {
-            return format!("Error: File not found: {}. Hint: verify the path exists. Use list_dir to browse the directory.", path);
+            return Err(ToolError::NotFound(format!(
+                "File not found: {}. Hint: verify the path exists. Use list_dir to browse the directory.",
+                path
+            )));
         }
         if !file_path.is_file() {
-            return format!("Error: Not a file: {}. Hint: this path is a directory, not a file. Use list_dir to see its contents.", path);
+            return Err(ToolError::InvalidArgs {
+                message: format!(
+                    "Not a file: {}. Hint: this path is a directory, not a file. Use list_dir to see its contents.",
+                    path
+                ),
+            });
         }
 
         // Read raw bytes first for binary detection.
@@ -161,9 +175,13 @@ impl Tool for ReadFileTool {
             Ok(b) => b,
             Err(e) => {
                 return if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    format!("Error: Permission denied: {}. Hint: check file permissions or try a different path.", path)
+                    Err(ToolError::PermissionDenied(format!(
+                        "Permission denied: {}. Hint: check file permissions or try a different path.",
+                        path
+                    )))
                 } else {
-                    format!("Error reading file: {}", e)
+                    // Legacy quirk preserved: no "Error:" prefix → success channel.
+                    Ok(format!("Error reading file: {}", e).into())
                 }
             }
         };
@@ -171,31 +189,34 @@ impl Tool for ReadFileTool {
         // Binary detection: null bytes in first 512 bytes.
         let display_path = file_path.to_string_lossy().to_string();
         if crate::utils::helpers::is_binary(&bytes) {
-            return format!("[Binary file: {}, {} bytes]", display_path, bytes.len());
+            return Ok(format!("[Binary file: {}, {} bytes]", display_path, bytes.len()).into());
         }
 
         let content = String::from_utf8_lossy(&bytes).to_string();
         let content_sha256 = sha256_hex(&bytes);
         let total = content.lines().count();
         if total == 0 {
-            return format!("# {} (0 lines) sha256={}\n", display_path, content_sha256);
+            return Ok(
+                format!("# {} (0 lines) sha256={}\n", display_path, content_sha256).into(),
+            );
         }
 
         // Explicit range → render it. Bare read → first DEFAULT_READ_LINES,
         // ds4-style, so the model never dumps a whole file unless it asks
         // (lines="1:"). Both paths share the deterministic renderer below.
         if let Some(lines_param) = params.get("lines").and_then(|v| v.as_str()) {
-            return extract_line_range(
+            return Ok(extract_line_range(
                 &content,
                 lines_param,
                 &display_path,
                 self.char_budget,
                 &content_sha256,
-            );
+            )
+            .into());
         }
         let max_lines =
             bounded_usize_param(&params, "max_lines", DEFAULT_READ_LINES, MAX_READ_LINES);
-        render_range(
+        Ok(render_range(
             &content,
             1,
             max_lines.min(total),
@@ -204,6 +225,7 @@ impl Tool for ReadFileTool {
             self.char_budget,
             &content_sha256,
         )
+        .into())
     }
 }
 
@@ -355,62 +377,83 @@ impl Tool for EditFileTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let path = match require_param(&params, "path") {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        let path = require_param(&params, "path")?;
 
         let file_path = expand_path(path);
         if let Some(paths) = &self.idle_paths {
             let workspace = crate::utils::helpers::get_workspace_path(None);
             if !idle_write_allowed(paths, &file_path, &workspace) {
-                return idle_write_denied(&file_path);
+                return Err(idle_write_denied_err(&file_path));
             }
         }
 
         if !file_path.exists() {
-            return format!("Error: File not found: {}. Hint: verify the path exists. Use list_dir to browse the directory.", path);
+            return Err(ToolError::NotFound(format!(
+                "File not found: {}. Hint: verify the path exists. Use list_dir to browse the directory.",
+                path
+            )));
         }
 
+        // Legacy quirk preserved: no "Error:" prefix → success channel.
         let content = match tokio::fs::read_to_string(&file_path).await {
             Ok(c) => c,
-            Err(e) => return format!("Error reading file: {}", e),
+            Err(e) => return Ok(format!("Error reading file: {}", e).into()),
         };
 
         if let Some(expected) = params.get("expected_sha256").and_then(|v| v.as_str()) {
             if !is_sha256_hex(expected) {
-                return format!(
-                    "Error: invalid expected_sha256 '{}'. Omit expected_sha256 unless you copied the 64-character sha256 value from read_file or file_info.",
-                    expected.trim()
-                );
+                return Err(ToolError::InvalidArgs {
+                    message: format!(
+                        "invalid expected_sha256 '{}'. Omit expected_sha256 unless you copied the 64-character sha256 value from read_file or file_info.",
+                        expected.trim()
+                    ),
+                });
             }
             let actual = sha256_hex(content.as_bytes());
             if !expected.trim().eq_ignore_ascii_case(&actual) {
-                return format!(
-                    "Error: File changed before edit. expected_sha256={}, actual_sha256={}. Re-read the file or inspect workspace_diff before retrying; omit expected_sha256 if you did not copy it from read_file or file_info.",
-                    expected.trim(),
-                    actual
-                );
+                return Err(ToolError::InvalidArgs {
+                    message: format!(
+                        "File changed before edit. expected_sha256={}, actual_sha256={}. Re-read the file or inspect workspace_diff before retrying; omit expected_sha256 if you did not copy it from read_file or file_info.",
+                        expected.trim(),
+                        actual
+                    ),
+                });
             }
         }
 
         if let Some(patch) = params.get("patch").and_then(|v| v.as_str()) {
             if patch.trim().is_empty() {
-                return "Error: 'patch' parameter cannot be empty".to_string();
+                return Err(ToolError::InvalidArgs {
+                    message: "'patch' parameter cannot be empty".to_string(),
+                });
             }
             let (new_content, hunks) =
                 match super::apply_patch::apply_unified_patch_to_content(&content, patch) {
                     Ok(result) => result,
-                    Err(e) => return e,
+                    // Parser errors carry the legacy prefix; strip so render
+                    // re-prefixes exactly once.
+                    Err(e) => {
+                        return Err(ToolError::Execution {
+                            message: e.trim_start_matches("Error: ").to_string(),
+                        })
+                    }
                 };
             return match tokio::fs::write(&file_path, new_content).await {
-                Ok(()) => format!("Successfully patched {} ({} hunk(s))", path, hunks),
+                Ok(()) => Ok(format!("Successfully patched {} ({} hunk(s))", path, hunks).into()),
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        format!("Error: Permission denied: {}. Hint: check file permissions or try a different path.", path)
+                        Err(ToolError::PermissionDenied(format!(
+                            "Permission denied: {}. Hint: check file permissions or try a different path.",
+                            path
+                        )))
                     } else {
-                        format!("Error writing file: {}", e)
+                        // Legacy quirk preserved: success channel.
+                        Ok(format!("Error writing file: {}", e).into())
                     }
                 }
             };
@@ -419,44 +462,60 @@ impl Tool for EditFileTool {
         let old_text = match params.get("old_text").and_then(|v| v.as_str()) {
             Some(t) => t,
             None => {
-                return "Error: either 'patch' or both 'old_text' and 'new_text' are required"
-                    .to_string()
+                return Err(ToolError::InvalidArgs {
+                    message: "either 'patch' or both 'old_text' and 'new_text' are required"
+                        .to_string(),
+                })
             }
         };
         let new_text = match params.get("new_text").and_then(|v| v.as_str()) {
             Some(t) => t,
             None => {
-                return "Error: either 'patch' or both 'old_text' and 'new_text' are required"
-                    .to_string()
+                return Err(ToolError::InvalidArgs {
+                    message: "either 'patch' or both 'old_text' and 'new_text' are required"
+                        .to_string(),
+                })
             }
         };
         if old_text == new_text {
-            return "Error: old_text and new_text are identical; no change was made. Provide different replacement text, or call write_file with state=append to add a suffix."
-                .to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "old_text and new_text are identical; no change was made. Provide different replacement text, or call write_file with state=append to add a suffix.".to_string(),
+            });
         }
 
         if !content.contains(old_text) {
-            return diagnose_missing_old_text(&content, old_text);
+            return Err(ToolError::NotFound(diagnose_missing_old_text(
+                &content,
+                old_text,
+            )
+            .trim_start_matches("Error: ")
+            .to_string()));
         }
 
         // Count occurrences.
         let count = content.matches(old_text).count();
         if count > 1 {
-            return format!(
-                "Error: old_text appears {} times. Please provide more context to make it unique.",
-                count
-            );
+            return Err(ToolError::InvalidArgs {
+                message: format!(
+                    "old_text appears {} times. Please provide more context to make it unique.",
+                    count
+                ),
+            });
         }
 
         let new_content = content.replacen(old_text, new_text, 1);
 
         match tokio::fs::write(&file_path, new_content).await {
-            Ok(()) => format!("Successfully edited {}", path),
+            Ok(()) => Ok(format!("Successfully edited {}", path).into()),
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    format!("Error: Permission denied: {}. Hint: check file permissions or try a different path.", path)
+                    Err(ToolError::PermissionDenied(format!(
+                        "Permission denied: {}. Hint: check file permissions or try a different path.",
+                        path
+                    )))
                 } else {
-                    format!("Error writing file: {}", e)
+                    // Legacy quirk preserved: success channel.
+                    Ok(format!("Error writing file: {}", e).into())
                 }
             }
         }
@@ -497,19 +556,28 @@ impl Tool for ListDirTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let path = match require_param(&params, "path") {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        let path = require_param(&params, "path")?;
 
         let dir_path = expand_path(path);
 
         if !dir_path.exists() {
-            return format!("Error: Directory not found: {}. Hint: parent directory does not exist. Use list_dir to find the correct path.", path);
+            return Err(ToolError::NotFound(format!(
+                "Directory not found: {}. Hint: parent directory does not exist. Use list_dir to find the correct path.",
+                path
+            )));
         }
         if !dir_path.is_dir() {
-            return format!("Error: Not a directory: {}. Hint: this path is a file, not a directory. Use read_file instead.", path);
+            return Err(ToolError::InvalidArgs {
+                message: format!(
+                    "Not a directory: {}. Hint: this path is a file, not a directory. Use read_file instead.",
+                    path
+                ),
+            });
         }
 
         // Detect when the model is listing the workspace instead of the project.
@@ -541,12 +609,13 @@ impl Tool for ListDirTool {
                             items.push((is_dir, name));
                         }
                         Ok(None) => break,
-                        Err(e) => return format!("Error reading directory: {}", e),
+                        // Legacy quirk preserved: no "Error:" prefix → success channel.
+                        Err(e) => return Ok(format!("Error reading directory: {}", e).into()),
                     }
                 }
 
                 if items.is_empty() {
-                    return format!("Directory {} is empty", path);
+                    return Ok(format!("Directory {} is empty", path).into());
                 }
 
                 // Sort alphabetically.
@@ -575,13 +644,17 @@ impl Tool for ListDirTool {
                     ));
                 }
 
-                output
+                Ok(output.into())
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    format!("Error: Permission denied: {}. Hint: check file permissions or try a different path.", path)
+                    Err(ToolError::PermissionDenied(format!(
+                        "Permission denied: {}. Hint: check file permissions or try a different path.",
+                        path
+                    )))
                 } else {
-                    format!("Error listing directory: {}", e)
+                    // Legacy quirk preserved: no "Error:" prefix → success channel.
+                    Ok(format!("Error listing directory: {}", e).into())
                 }
             }
         }
@@ -642,7 +715,11 @@ impl Tool for FindFilesTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let pattern = params
             .get("pattern")
@@ -655,7 +732,9 @@ impl Tool for FindFilesTool {
             .and_then(|v| v.as_str())
             .unwrap_or("file");
         if !matches!(kind, "file" | "dir" | "all") {
-            return "Error: 'kind' must be one of: file, dir, all".to_string();
+            return Err(ToolError::InvalidArgs {
+                message: "'kind' must be one of: file, dir, all".to_string(),
+            });
         }
 
         let max_depth = bounded_usize_param(&params, "max_depth", 5, 20);
@@ -665,16 +744,18 @@ impl Tool for FindFilesTool {
 
         let root = expand_path(path);
         if !root.exists() {
-            return format!(
-                "Error: Directory not found: {}. Hint: verify the path or use list_dir on its parent.",
+            return Err(ToolError::NotFound(format!(
+                "Directory not found: {}. Hint: verify the path or use list_dir on its parent.",
                 path
-            );
+            )));
         }
         if !root.is_dir() {
-            return format!(
-                "Error: Not a directory: {}. Hint: use file_info or read_file for file paths.",
-                path
-            );
+            return Err(ToolError::InvalidArgs {
+                message: format!(
+                    "Not a directory: {}. Hint: use file_info or read_file for file paths.",
+                    path
+                ),
+            });
         }
 
         let root_canon = root.canonicalize().unwrap_or(root.clone());
@@ -691,7 +772,10 @@ impl Tool for FindFilesTool {
                     .filter_map(Result::ok)
                     .collect::<Vec<std::fs::DirEntry>>(),
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
-                Err(e) => return format!("Error reading directory {}: {}", dir.display(), e),
+                // Legacy quirk preserved: no "Error:" prefix → success channel.
+                Err(e) => {
+                    return Ok(format!("Error reading directory {}: {}", dir.display(), e).into())
+                }
             };
             children.sort_by_key(|e| e.file_name());
 
@@ -741,7 +825,7 @@ impl Tool for FindFilesTool {
         let total = matches.len();
         let shown = total.min(limit);
         if total == 0 {
-            return format!("No matches under {} for pattern=\"{}\".", path, pattern);
+            return Ok(format!("No matches under {} for pattern=\"{}\".", path, pattern).into());
         }
         let mut out = format!("{} matches (showing {}):", total, shown);
         for item in matches.iter().take(limit) {
@@ -763,7 +847,7 @@ impl Tool for FindFilesTool {
         if shown < total {
             out.push_str(&format!("\n[{} more matches not shown]", total - shown));
         }
-        out
+        Ok(out.into())
     }
 }
 
@@ -849,11 +933,19 @@ impl Tool for SearchFilesTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let query = match require_param(&params, "query") {
             Ok(q) if !q.trim().is_empty() => q.trim(),
-            Ok(_) => return "Error: 'query' parameter cannot be empty".to_string(),
-            Err(e) => return e,
+            Ok(_) => {
+                return Err(ToolError::InvalidArgs {
+                    message: "'query' parameter cannot be empty".to_string(),
+                })
+            }
+            Err(e) => return Err(e),
         };
         let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let pattern = params
@@ -878,21 +970,27 @@ impl Tool for SearchFilesTool {
 
         let matcher = match SearchMatcher::new(query, regex, case_sensitive) {
             Ok(m) => m,
-            Err(e) => return e,
+            Err(e) => {
+                return Err(ToolError::InvalidArgs {
+                    message: e.trim_start_matches("Error: ").to_string(),
+                })
+            }
         };
 
         let root = expand_path(path);
         if !root.exists() {
-            return format!(
-                "Error: Directory not found: {}. Hint: verify the path or use list_dir on its parent.",
+            return Err(ToolError::NotFound(format!(
+                "Directory not found: {}. Hint: verify the path or use list_dir on its parent.",
                 path
-            );
+            )));
         }
         if !root.is_dir() {
-            return format!(
-                "Error: Not a directory: {}. Hint: use read_file for a single file.",
-                path
-            );
+            return Err(ToolError::InvalidArgs {
+                message: format!(
+                    "Not a directory: {}. Hint: use read_file for a single file.",
+                    path
+                ),
+            });
         }
 
         let root_canon = root.canonicalize().unwrap_or(root.clone());
@@ -918,7 +1016,10 @@ impl Tool for SearchFilesTool {
                     skipped_unreadable += 1;
                     continue;
                 }
-                Err(e) => return format!("Error reading directory {}: {}", dir.display(), e),
+                // Legacy quirk preserved: no "Error:" prefix → success channel.
+                Err(e) => {
+                    return Ok(format!("Error reading directory {}: {}", dir.display(), e).into())
+                }
             };
             children.sort_by_key(|e| e.file_name());
 
@@ -1027,7 +1128,7 @@ impl Tool for SearchFilesTool {
                 limit
             ));
         }
-        out
+        Ok(out.into())
     }
 }
 
@@ -1128,29 +1229,31 @@ impl Tool for FileInfoTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let path = match require_param(&params, "path") {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        let path = require_param(&params, "path")?;
         let include_hash = bool_param(&params, "hash", true);
         let file_path = expand_path(path);
 
         let metadata = match tokio::fs::symlink_metadata(&file_path).await {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return format!(
-                    "Error: Path not found: {}. Hint: use find_files to locate it.",
+                return Err(ToolError::NotFound(format!(
+                    "Path not found: {}. Hint: use find_files to locate it.",
                     path
-                )
+                )))
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return format!(
-                    "Error: Permission denied: {}. Hint: check file permissions.",
+                return Err(ToolError::PermissionDenied(format!(
+                    "Permission denied: {}. Hint: check file permissions.",
                     path
-                )
+                )))
             }
-            Err(e) => return format!("Error reading metadata: {}", e),
+            // Legacy quirk preserved: no "Error:" prefix → success channel.
+            Err(e) => return Ok(format!("Error reading metadata: {}", e).into()),
         };
 
         let kind = if metadata.file_type().is_symlink() {
@@ -1202,7 +1305,7 @@ impl Tool for FileInfoTool {
             }
         }
 
-        out
+        Ok(out.into())
     }
 }
 
@@ -1243,7 +1346,11 @@ impl Tool for WorkspaceDiffTool {
         })
     }
 
-    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+    async fn execute_typed(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
         let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let include_diff = bool_param(&params, "include_diff", false);
         let max_chars = bounded_usize_param(&params, "max_chars", 12_000, 50_000);
@@ -1258,17 +1365,21 @@ impl Tool for WorkspaceDiffTool {
             requested.clone()
         };
         if !probe.exists() {
-            return format!(
-                "Error: Path not found: {}. Hint: use find_files or list_dir first.",
+            return Err(ToolError::NotFound(format!(
+                "Path not found: {}. Hint: use find_files or list_dir first.",
                 path
-            );
+            )));
         }
 
         let root_text =
             match run_git_command(&probe, vec!["rev-parse".into(), "--show-toplevel".into()]).await
             {
                 Ok(out) => out.trim().to_string(),
-                Err(e) => return format!("Error: Not a git workspace or git unavailable: {}", e),
+                Err(e) => {
+                    return Err(ToolError::Execution {
+                        message: format!("Not a git workspace or git unavailable: {}", e),
+                    })
+                }
             };
         let root = PathBuf::from(root_text);
         let pathspec = git_pathspec(&root, &requested);
@@ -1348,7 +1459,7 @@ impl Tool for WorkspaceDiffTool {
             out.push_str(&truncate_chars_with_notice(&patches, max_chars));
         }
 
-        out
+        Ok(out.into())
     }
 }
 
