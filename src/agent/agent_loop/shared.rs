@@ -779,6 +779,8 @@ impl TurnContext {
         // Do not rely solely on `new_start`: token trimming can remove old
         // history and shift every index during the turn. Persist by durable-id
         // presence instead; DB-loaded history already carries `_db_id`.
+        let mut pending_indices = Vec::new();
+        let mut pending_messages = Vec::new();
         for index in 0..self.messages.len() {
             let role = self.messages[index]
                 .get("role")
@@ -802,20 +804,39 @@ impl TurnContext {
                 continue;
             }
 
-            let message = self.messages[index].clone();
-            let Some(row_id) = self
-                .core
-                .sessions
-                .add_message(&self.session_id, &message)
-                .await
-            else {
+            pending_indices.push(index);
+            pending_messages.push(self.messages[index].clone());
+        }
+
+        if pending_messages.is_empty() {
+            self.new_start = self.messages.len();
+            return;
+        }
+
+        // One checked transaction — replay must observe the whole protocol
+        // group (carrier + receipts) or none of it. A per-message loop that
+        // breaks mid-group silently truncates protocol history (see main
+        // a05fc81).
+        let row_ids = match self
+            .core
+            .sessions
+            .add_messages_checked(&self.session_id, &pending_messages)
+            .await
+        {
+            Ok(row_ids) => row_ids,
+            Err(error) => {
                 warn!(
                     session = %self.session_key,
-                    role = message.get("role").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                    "active_turn_message_persist_failed"
+                    pending = pending_messages.len(),
+                    %error,
+                    "active_turn_protocol_group_persist_failed"
                 );
-                break;
-            };
+                // Leave the messages untagged (no `_db_id`) so the next
+                // persist retries the whole group; do not advance new_start.
+                return;
+            }
+        };
+        for (index, row_id) in pending_indices.into_iter().zip(row_ids) {
             self.messages[index]["_db_id"] = json!(row_id);
         }
         self.new_start = self.messages.len();

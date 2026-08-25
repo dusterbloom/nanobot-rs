@@ -389,7 +389,10 @@ fn build_tool_result_preview(
     let footer = "\n[...]\n";
     let fixed_chars = header.chars().count() + footer.chars().count();
     if fixed_chars >= cap {
-        return header;
+        // A long provider-controlled tool_call_id can push the header itself
+        // past the cap; bound it char-wise like the body paths below (see
+        // main 1957f5d).
+        return header.chars().take(cap).collect();
     }
     let preview_budget = cap.saturating_sub(fixed_chars).max(200);
     let head_chars = preview_budget * 2 / 3;
@@ -1999,6 +2002,24 @@ mod tests {
             name: name.to_string(),
             arguments: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn tool_result_preview_never_exceeds_cap_with_long_call_id() {
+        let call_id = "provider-controlled-id-".repeat(500);
+        let preview = build_tool_result_preview(
+            "read_file",
+            &HashMap::new(),
+            &"body".repeat(2_000),
+            64,
+            &call_id,
+        );
+
+        assert!(
+            preview.chars().count() <= 64,
+            "non-handle preview exceeded its append allowance: {} chars",
+            preview.chars().count()
+        );
     }
 
     #[test]

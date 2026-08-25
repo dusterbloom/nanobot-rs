@@ -262,17 +262,26 @@ impl AgentLoop {
         // Per-session locks to serialize messages within the same conversation.
         let session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        // Coalescing can observe the first message for another session. Retain
+        // it for the next loop iteration so it traverses the exact same
+        // system/command/lock/permit path instead of a parallel side path
+        // (see main b9d0055).
+        let mut pending_msg = None;
 
         while self.running.load(Ordering::SeqCst) {
-            let msg = match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv())
-                .await
-            {
-                Ok(Some(msg)) => msg,
-                Ok(None) => {
-                    info!("Inbound channel closed, stopping agent loop");
-                    break;
+            let msg = if let Some(msg) = pending_msg.take() {
+                msg
+            } else {
+                match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv())
+                    .await
+                {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
+                        info!("Inbound channel closed, stopping agent loop");
+                        break;
+                    }
+                    Err(_) => continue, // timeout - loop and check running flag
                 }
-                Err(_) => continue, // timeout - loop and check running flag
             };
 
             // Coalesce rapid messages from the same session (Telegram, WhatsApp).
@@ -289,32 +298,14 @@ impl AgentLoop {
                             batch.push(next);
                         }
                         Ok(Some(other)) => {
-                            // Different session — coalesce what we have, push other back.
-                            // Can't push back into mpsc, so process inline as separate spawn.
-                            let other_key = other.session_key();
-                            let other_lock = {
-                                let mut locks = session_locks.lock().await;
-                                locks
-                                    .entry(other_key)
-                                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                                    .clone()
-                            };
-                            let other_shared = self.shared.clone();
-                            let other_outbound_tx = self.shared.bus_outbound_tx.clone();
-                            let _other_display_tx = self.shared.repl_display_tx.clone();
-                            let other_sem = semaphore.clone();
-                            tokio::spawn(async move {
-                                if let Ok(permit) = other_sem.acquire_owned().await {
-                                    let _guard = other_lock.lock().await;
-                                    if let Some(resp) = other_shared
-                                        .process_message(&other, None, None, None, None)
-                                        .await
-                                    {
-                                        let _ = other_outbound_tx.send(resp);
-                                    }
-                                    drop(permit);
-                                }
-                            });
+                            // Preserve the different-session message for the
+                            // next normal iteration. This is the in-process
+                            // equivalent of push-back without a second gateway
+                            // execution pipeline (see main b9d0055) — a side
+                            // path here would skip is_system + /-command
+                            // interception, letting a /clear from another
+                            // session reach the LLM as plain text.
+                            pending_msg = Some(other);
                             break;
                         }
                         _ => break, // timeout or channel closed
@@ -347,32 +338,6 @@ impl AgentLoop {
                 continue;
             }
 
-            // Gateway slash command interception — handle before LLM processing.
-            if msg.content.trim().starts_with('/') {
-                if let Some(response_text) =
-                    crate::agent::gateway_commands::dispatch(&self.shared, &msg).await
-                {
-                    let outbound = crate::bus::events::OutboundMessage::new(
-                        &msg.channel,
-                        &msg.chat_id,
-                        &response_text,
-                    );
-                    if let Err(e) = self.shared.bus_outbound_tx.send(outbound) {
-                        tracing::error!("Failed to send command response: {}", e);
-                    }
-                    continue;
-                }
-            }
-
-            // Acquire a concurrency permit.
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    error!("Semaphore closed unexpectedly");
-                    break;
-                }
-            };
-
             // Get or create the per-session lock.
             let session_key = msg.session_key();
             let session_lock = {
@@ -386,10 +351,43 @@ impl AgentLoop {
             let shared = self.shared.clone();
             let outbound_tx = self.shared.bus_outbound_tx.clone();
             let display_tx = self.shared.repl_display_tx.clone();
+            let request_sem = semaphore.clone();
 
             tokio::spawn(async move {
                 // Serialize within the same session.
                 let _session_guard = session_lock.lock().await;
+
+                // Commands such as /clear mutate session history and retained
+                // prompt state, so dispatch them under the same lock as normal
+                // turns — dispatching on the run() loop outside this lock lets
+                // a /clear race an in-flight turn and resurrect cleared
+                // history via later persists (see main 3cbc59d).
+                if msg.content.trim().starts_with('/') {
+                    if let Some(response_text) =
+                        crate::agent::gateway_commands::dispatch(&shared, &msg).await
+                    {
+                        let outbound = crate::bus::events::OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            &response_text,
+                        );
+                        if let Err(error) = outbound_tx.send(outbound) {
+                            tracing::error!(%error, "Failed to send command response");
+                        }
+                        return;
+                    }
+                }
+
+                // Permit acquired post-lock so exhaustion can't stall command
+                // dispatch or other sessions; recognized commands never need
+                // one at all (see main 3fb926d).
+                let permit = match request_sem.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        error!("Semaphore closed unexpectedly");
+                        return;
+                    }
+                };
 
                 // Notify REPL about inbound channel message.
                 if let Some(ref dtx) = display_tx {

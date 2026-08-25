@@ -2400,25 +2400,39 @@ impl SessionDb {
         insert_message_locked(&conn, session_id, msg)
     }
 
+    /// Add a batch of raw JSON messages in one checked transaction.
+    ///
+    /// The returned row ids correspond one-for-one with `msgs`. Any failed
+    /// insert aborts the transaction, which is required for assistant
+    /// tool-call carriers and their result receipts: replay must observe the
+    /// entire protocol group or none of it (see main a05fc81).
+    pub(crate) async fn add_messages_checked(
+        &self,
+        session_id: &str,
+        msgs: &[Value],
+    ) -> anyhow::Result<Vec<i64>> {
+        if msgs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock().await;
+        // One transaction so the whole batch is atomic and the session's
+        // `updated_at` / `message_count` are updated once.
+        let tx = conn.transaction()?;
+        let mut row_ids = Vec::with_capacity(msgs.len());
+        for msg in msgs {
+            let row_id = insert_message_locked(&tx, session_id, msg).ok_or_else(|| {
+                anyhow::anyhow!("failed to insert message in atomic protocol batch")
+            })?;
+            row_ids.push(row_id);
+        }
+        tx.commit()?;
+        Ok(row_ids)
+    }
+
     /// Add a batch of raw JSON messages in a single transaction.
     pub async fn add_messages(&self, session_id: &str, msgs: &[Value]) {
-        let conn = self.conn.lock().await;
-
-        // Wrap in an explicit transaction so the whole batch is atomic and
-        // the session's `updated_at` / `message_count` are updated once.
-        let result = conn.execute_batch("BEGIN");
-        if let Err(e) = result {
-            warn!("Failed to begin transaction for batch insert: {}", e);
-            return;
-        }
-
-        for msg in msgs {
-            let _ = insert_message_locked(&conn, session_id, msg);
-        }
-
-        if let Err(e) = conn.execute_batch("COMMIT") {
-            warn!("Failed to commit batch insert: {}", e);
-            let _ = conn.execute_batch("ROLLBACK");
+        if let Err(error) = self.add_messages_checked(session_id, msgs).await {
+            warn!(%error, "Failed to persist atomic message batch");
         }
     }
 
@@ -4922,6 +4936,38 @@ mod tests {
 
         let all = db.get_all_messages(&meta.id).await;
         assert_eq!(all.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn checked_message_batch_rolls_back_when_middle_insert_fails() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:atomic-batch-failure").await;
+        {
+            let conn = db.conn.lock().await;
+            conn.execute_batch(
+                "CREATE TRIGGER fail_rejected_protocol_receipt
+                 BEFORE INSERT ON messages
+                 WHEN NEW.content = 'forced failure'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced middle insert failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let messages = vec![
+            json!({"role": "assistant", "content": "carrier"}),
+            json!({"role": "tool", "content": "forced failure", "tool_call_id": "tc_fail"}),
+            json!({"role": "tool", "content": "receipt", "tool_call_id": "tc_after"}),
+        ];
+
+        let result = db.add_messages_checked(&meta.id, &messages).await;
+
+        assert!(result.is_err());
+        assert!(
+            db.get_all_messages(&meta.id).await.is_empty(),
+            "a failed protocol group must leave no partial carrier or receipts"
+        );
     }
 
     #[tokio::test]

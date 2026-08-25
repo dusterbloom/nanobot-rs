@@ -2922,6 +2922,227 @@ impl LLMProvider for WireRecordingProvider {
     }
 }
 
+/// Blocks the first provider request so a test can prove that a queued
+/// same-session message cannot enter the provider concurrently and cannot
+/// starve another session's concurrency permit.
+struct BlockingFirstProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    first_started: tokio::sync::Notify,
+    allow_first: tokio::sync::Notify,
+    second_started: tokio::sync::Notify,
+}
+
+impl BlockingFirstProvider {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            first_started: tokio::sync::Notify::new(),
+            allow_first: tokio::sync::Notify::new(),
+            second_started: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for BlockingFirstProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            self.first_started.notify_one();
+            self.allow_first.notified().await;
+        } else {
+            self.second_started.notify_one();
+        }
+        Ok(WireRecordingProvider::text_response(&format!(
+            "response {}",
+            call + 1
+        )))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "local-qwen-test"
+    }
+}
+
+/// Build an `AgentLoop` wired for gateway-mode `run()` tests: real inbound /
+/// outbound channels and `max_concurrent_chats = 2` so permit starvation is
+/// observable.
+fn build_gateway_harness(
+    provider: Arc<dyn LLMProvider>,
+) -> (
+    AgentLoop,
+    tokio::sync::mpsc::UnboundedSender<InboundMessage>,
+    tokio::sync::mpsc::UnboundedReceiver<OutboundMessage>,
+    std::path::PathBuf,
+) {
+    let (base_loop, workspace) = build_local_inline_harness(provider);
+    let core_handle = base_loop.shared.core_handle.clone();
+    drop(base_loop);
+
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway_loop = AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx.clone(),
+        None,
+        2,
+        None,
+        None,
+        None,
+        crate::config::schema::ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    );
+    (gateway_loop, inbound_tx, outbound_rx, workspace)
+}
+
+#[tokio::test]
+async fn gateway_clear_waits_for_active_same_session_turn() {
+    let provider = Arc::new(BlockingFirstProvider::new());
+    let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+        build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let sessions = gateway_loop.shared.core_handle.swappable().sessions.clone();
+    let running = gateway_loop.running.clone();
+    let runner = tokio::spawn(async move { gateway_loop.run().await });
+    let session_key = "test:offline".to_string();
+
+    let first = InboundMessage::new("test", "user", "offline", "first");
+    let first_started = provider.first_started.notified();
+    inbound_tx.send(first).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), first_started)
+        .await
+        .expect("first gateway turn must reach the provider");
+
+    let clear = InboundMessage::new("test", "user", "offline", "/clear");
+    inbound_tx.send(clear).unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            outbound_rx.recv(),
+        )
+        .await
+        .is_err(),
+        "/clear completed while an older same-session turn still held the session lock"
+    );
+
+    let third = InboundMessage::new("test", "user", "other", "independent");
+    let independent_started = provider.second_started.notified();
+    inbound_tx.send(third).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        independent_started,
+    )
+    .await
+    .expect("a queued same-session clear must not consume another session's permit");
+    let independent_outbound = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        outbound_rx.recv(),
+    )
+    .await
+    .expect("independent response must arrive while the first turn remains blocked")
+    .expect("outbound channel must stay open");
+    assert_eq!(independent_outbound.content, "response 2");
+
+    provider.allow_first.notify_one();
+    let first_outbound = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        outbound_rx.recv(),
+    )
+    .await
+    .expect("first response must arrive")
+    .expect("outbound channel must stay open");
+    assert_eq!(first_outbound.content, "response 1");
+    let clear_outbound = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        outbound_rx.recv(),
+    )
+    .await
+    .expect("clear response must arrive after the active turn")
+    .expect("outbound channel must stay open");
+    assert_eq!(clear_outbound.content, "Working memory and history cleared.");
+
+    let session = sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("gateway session must exist");
+    let replay = sessions.get_history(&session.id, 100, 0).await;
+    assert!(
+        replay.is_empty(),
+        "the completed pre-clear turn must remain behind the clear marker on replay: {replay:?}"
+    );
+
+    drop(inbound_tx);
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+        .await
+        .expect("gateway loop must stop after its input channel closes")
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn cross_session_command_seen_during_coalescing_uses_gateway_dispatch() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-main",
+        vec![WireRecordingProvider::text_response("coalesced response")],
+    ));
+    let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+        build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let running = gateway_loop.running.clone();
+    let runner = tokio::spawn(async move { gateway_loop.run().await });
+
+    inbound_tx
+        .send(InboundMessage::new("test", "user", "first", "hello"))
+        .unwrap();
+    inbound_tx
+        .send(InboundMessage::new("test", "user", "second", "/clear"))
+        .unwrap();
+
+    let mut responses = Vec::new();
+    for _ in 0..2 {
+        responses.push(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                outbound_rx.recv(),
+            )
+            .await
+            .expect("both the normal turn and command must complete")
+            .expect("outbound channel must stay open")
+            .content,
+        );
+    }
+    assert!(responses.iter().any(|response| response == "coalesced response"));
+    assert!(
+        responses
+            .iter()
+            .any(|response| response == "Working memory and history cleared."),
+        "the cross-session /clear was routed to the model: {responses:?}"
+    );
+    assert_eq!(
+        provider.calls().len(),
+        1,
+        "recognized gateway commands must not consume an inference request"
+    );
+
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+        .await
+        .expect("gateway loop must stop")
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 #[tokio::test]
 async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
     let provider = Arc::new(WireRecordingProvider::new(

@@ -64,8 +64,9 @@ codebase with one well-tuned hot path per concern.
 
 ## Testing
 
-Use `cargo build` for build validation. Use `cargo test` for unit/regression
-tests. Use `scripts/turn_bench.sh` for matched speed regressions when changing
+Use `cargo build --release` for build validation. Use `cargo test --release`
+for unit/regression tests. Never build/test in debug mode: debug artifacts
+waste disk space. Use `scripts/turn_bench.sh` for matched speed regressions when changing
 the agent loop, provider client, or context builder. See `CONTRIBUTING.md` for
 the correctness and speed regression tracks.
 
