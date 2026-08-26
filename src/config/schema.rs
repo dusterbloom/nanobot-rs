@@ -2549,17 +2549,44 @@ impl Config {
                     .unwrap_or_else(|| OPENROUTER_API_BASE.to_string()),
             );
         }
+        // Every provider honors its configured `api_base` override
+        // (harvested from a stash: point deepseek/anthropic/openai/gemini at
+        // proxies or self-hosted gateways, e.g. higgs translation).
         if Self::is_provider_key_enabled(&self.providers.deepseek.api_key) {
-            return Some(DEEPSEEK_API_BASE.to_string());
+            return Some(
+                self.providers
+                    .deepseek
+                    .api_base
+                    .clone()
+                    .unwrap_or_else(|| DEEPSEEK_API_BASE.to_string()),
+            );
         }
         if Self::is_provider_key_enabled(&self.providers.anthropic.api_key) {
-            return Some(ANTHROPIC_API_BASE.to_string());
+            return Some(
+                self.providers
+                    .anthropic
+                    .api_base
+                    .clone()
+                    .unwrap_or_else(|| ANTHROPIC_API_BASE.to_string()),
+            );
         }
         if Self::is_provider_key_enabled(&self.providers.openai.api_key) {
-            return Some(OPENAI_API_BASE.to_string());
+            return Some(
+                self.providers
+                    .openai
+                    .api_base
+                    .clone()
+                    .unwrap_or_else(|| OPENAI_API_BASE.to_string()),
+            );
         }
         if Self::is_provider_key_enabled(&self.providers.gemini.api_key) {
-            return Some(GEMINI_API_BASE.to_string());
+            return Some(
+                self.providers
+                    .gemini
+                    .api_base
+                    .clone()
+                    .unwrap_or_else(|| GEMINI_API_BASE.to_string()),
+            );
         }
         if Self::is_provider_key_enabled(&self.providers.zhipu.api_key) {
             return Some(
@@ -2721,6 +2748,31 @@ mod tests {
     fn test_api_base_none_when_no_provider() {
         let cfg = Config::default();
         assert_eq!(cfg.get_api_base(), None);
+    }
+
+    #[test]
+    fn test_api_base_honors_per_provider_override() {
+        // Harvested-gem contract: deepseek/anthropic/openai/gemini respect a
+        // configured api_base (proxy / self-hosted gateway) instead of the
+        // hardcoded endpoint; unset → the provider default.
+        let mut cfg = Config::default();
+        cfg.providers.deepseek.api_key = "sk-ds-key".to_string();
+        cfg.providers.deepseek.api_base = Some("http://gateway.lan:9000/v1".to_string());
+        assert_eq!(
+            cfg.get_api_base(),
+            Some("http://gateway.lan:9000/v1".to_string()),
+            "deepseek override must win"
+        );
+
+        let mut cfg = Config::default();
+        cfg.providers.anthropic.api_key = "sk-ant-key".to_string();
+        cfg.providers.anthropic.api_base = Some("http://higgs.local/v1".to_string());
+        assert_eq!(cfg.get_api_base(), Some("http://higgs.local/v1".to_string()));
+
+        let mut cfg = Config::default();
+        cfg.providers.openai.api_key = "sk-key".to_string();
+        cfg.providers.openai.api_base = Some("http://proxy:9/v1".to_string());
+        assert_eq!(cfg.get_api_base(), Some("http://proxy:9/v1".to_string()));
     }
 
     #[test]
