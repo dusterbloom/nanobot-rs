@@ -1,0 +1,162 @@
+diff --git a/src/config/schema.rs b/src/config/schema.rs
+index 398a624..8338602 100644
+--- a/src/config/schema.rs
++++ b/src/config/schema.rs
+@@ -7,6 +7,11 @@ use std::path::PathBuf;
+ 
+ use serde::{Deserialize, Serialize};
+ 
++fn is_configured_api_key(key: &str) -> bool {
++    let trimmed = key.trim();
++    !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none")
++}
++
+ // ---------------------------------------------------------------------------
+ // Channel configs
+ // ---------------------------------------------------------------------------
+@@ -324,7 +329,7 @@ impl ProvidersConfig {
+         for (prefix, accessor, default_base) in PROVIDER_PREFIXES {
+             if let Some(rest) = model.strip_prefix(prefix) {
+                 let cfg = accessor(self);
+-                if !cfg.api_key.is_empty() {
++                if is_configured_api_key(&cfg.api_key) {
+                     let base = cfg.api_base.as_deref().unwrap_or(default_base);
+                     return Some((
+                         cfg.api_key.clone(),
+@@ -901,7 +906,7 @@ impl Config {
+             &self.providers.vllm.api_key,
+         ];
+         for key in candidates {
+-            if !key.is_empty() && key != "none" && key != "NONE" {
++            if is_configured_api_key(key) {
+                 return Some(key.clone());
+             }
+         }
+@@ -920,7 +925,7 @@ impl Config {
+     /// Detection order matches `get_api_key()` priority so that the key and
+     /// base always refer to the same provider.
+     pub fn get_api_base(&self) -> Option<String> {
+-        if !self.providers.openrouter.api_key.is_empty() {
++        if is_configured_api_key(&self.providers.openrouter.api_key) {
+             return Some(
+                 self.providers
+                     .openrouter
+@@ -929,19 +934,43 @@ impl Config {
+                     .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
+             );
+         }
+-        if !self.providers.deepseek.api_key.is_empty() {
+-            return Some("https://api.deepseek.com".to_string());
++        if is_configured_api_key(&self.providers.deepseek.api_key) {
++            return Some(
++                self.providers
++                    .deepseek
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
++            );
+         }
+-        if !self.providers.anthropic.api_key.is_empty() {
+-            return Some("https://api.anthropic.com/v1".to_string());
++        if is_configured_api_key(&self.providers.anthropic.api_key) {
++            return Some(
++                self.providers
++                    .anthropic
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
++            );
+         }
+-        if !self.providers.openai.api_key.is_empty() {
+-            return Some("https://api.openai.com/v1".to_string());
++        if is_configured_api_key(&self.providers.openai.api_key) {
++            return Some(
++                self.providers
++                    .openai
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
++            );
+         }
+-        if !self.providers.gemini.api_key.is_empty() {
+-            return Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string());
++        if is_configured_api_key(&self.providers.gemini.api_key) {
++            return Some(
++                self.providers
++                    .gemini
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta/openai".to_string()),
++            );
+         }
+-        if !self.providers.zhipu.api_key.is_empty() {
++        if is_configured_api_key(&self.providers.zhipu.api_key) {
+             return Some(
+                 self.providers
+                     .zhipu
+@@ -950,7 +979,7 @@ impl Config {
+                     .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
+             );
+         }
+-        if !self.providers.zhipu_coding.api_key.is_empty() {
++        if is_configured_api_key(&self.providers.zhipu_coding.api_key) {
+             return Some(
+                 self.providers
+                     .zhipu_coding
+@@ -959,10 +988,7 @@ impl Config {
+                     .unwrap_or_else(|| "https://api.z.ai/api/coding/paas/v4".to_string()),
+             );
+         }
+-        if !self.providers.groq.api_key.is_empty()
+-            && self.providers.groq.api_key != "none"
+-            && self.providers.groq.api_key != "NONE"
+-        {
++        if is_configured_api_key(&self.providers.groq.api_key) {
+             return Some(
+                 self.providers
+                     .groq
+@@ -971,8 +997,16 @@ impl Config {
+                     .unwrap_or_else(|| "https://api.groq.com/openai/v1".to_string()),
+             );
+         }
+-        if self.providers.vllm.api_base.is_some() {
+-            return self.providers.vllm.api_base.clone();
++        if is_configured_api_key(&self.providers.vllm.api_key)
++            || self.providers.vllm.api_base.is_some()
++        {
++            return Some(
++                self.providers
++                    .vllm
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "http://localhost:8080/v1".to_string()),
++            );
+         }
+         None
+     }
+@@ -1088,6 +1122,25 @@ mod tests {
+         assert_eq!(cfg.get_api_base(), None);
+     }
+ 
++    #[test]
++    fn test_api_base_ignores_none_sentinel() {
++        let mut cfg = Config::default();
++        cfg.providers.openrouter.api_key = "none".to_string();
++        cfg.providers.openrouter.api_base = Some("https://bad.example".to_string());
++        cfg.providers.openai.api_key = "sk-key".to_string();
++        assert_eq!(
++            cfg.get_api_base(),
++            Some("https://api.openai.com/v1".to_string())
++        );
++    }
++
++    #[test]
++    fn test_resolve_model_prefix_ignores_none_key() {
++        let mut cfg = Config::default();
++        cfg.providers.groq.api_key = "NONE".to_string();
++        assert_eq!(cfg.resolve_provider_for_model("groq/llama-3.3-70b"), None);
++    }
++
+     #[test]
+     fn test_tool_delegation_config_defaults() {
+         let td = ToolDelegationConfig::default();

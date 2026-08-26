@@ -1,0 +1,26 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 60c9b5c..8d243e9 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -103,7 +103,7 @@ All providers use OpenAI-compatible chat completions API via
+ <!-- gitnexus:start -->
+ # GitNexus — Code Intelligence
+ 
+-This project is indexed by GitNexus as **nanobot-rs** (12642 symbols, 35060 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
++This project is indexed by GitNexus as **nanobot-rs** (13238 symbols, 36718 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+ 
+ > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+ 
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 827d9c8..4914864 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -158,7 +158,7 @@ Keys match as case-insensitive substrings against the model name. Override `size
+ <!-- gitnexus:start -->
+ # GitNexus — Code Intelligence
+ 
+-This project is indexed by GitNexus as **nanobot-rs** (12642 symbols, 35060 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
++This project is indexed by GitNexus as **nanobot-rs** (13238 symbols, 36718 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+ 
+ > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+ 

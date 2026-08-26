@@ -1,0 +1,1211 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ea751ad..8e76f43 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1650,9 +1650,9 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+ 
+ [[package]]
+ name = "hmac-sha256"
+-version = "1.1.13"
++version = "1.1.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d0f0ae375a85536cac3a243e3a9cda80a47910348abdea7e2c22f8ec556d586d"
++checksum = "ec9d92d097f4749b64e8cc33d924d9f40a2d4eb91402b458014b781f5733d60f"
+ 
+ [[package]]
+ name = "home"
+@@ -2222,7 +2222,7 @@ checksum = "3d0b95e02c851351f877147b7deea7b1afb1df71b63aa5f8270716e0c5720616"
+ dependencies = [
+  "bitflags 2.10.0",
+  "libc",
+- "redox_syscall 0.7.0",
++ "redox_syscall 0.7.1",
+ ]
+ 
+ [[package]]
+@@ -2463,6 +2463,7 @@ dependencies = [
+  "crossterm 0.28.1",
+  "dirs 6.0.0",
+  "futures-util",
++ "hound",
+  "html-escape",
+  "jack-voice",
+  "lettre",
+@@ -2865,9 +2866,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "parakeet-rs"
+-version = "0.3.2"
++version = "0.3.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "adfea3cc9a40da848724e5b4be3b624fd8341f66390924c7e5f8d456315b656e"
++checksum = "ffb8f3a2abb6cf36b9d431a25ead23d4e19294169f0d99bc7f4d4a1478233fdc"
+ dependencies = [
+  "eyre",
+  "hound",
+@@ -3426,9 +3427,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "redox_syscall"
+-version = "0.7.0"
++version = "0.7.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "49f3fe0889e69e2ae9e41f4d6c4c0181701d00e4697b356fb1f74173a5e0ee27"
++checksum = "35985aa610addc02e24fc232012c86fd11f14111180f902b67e2d5331f8ebf2b"
+ dependencies = [
+  "bitflags 2.10.0",
+ ]
+@@ -4534,9 +4535,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "toml_parser"
+-version = "1.0.6+spec-1.1.0"
++version = "1.0.8+spec-1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a3198b4b0a8e11f09dd03e133c0280504d0801269e9afa46362ffde1cbeebf44"
++checksum = "0742ff5ff03ea7e67c8ae6c93cac239e0d9784833362da3f9a9c1da8dfefcbdc"
+ dependencies = [
+  "winnow 0.7.14",
+ ]
+diff --git a/Cargo.toml b/Cargo.toml
+index 1f57208..a02b8a4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -35,6 +35,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ # Date/time
+ chrono = { version = "0.4", features = ["serde"] }
+ 
++# WAV decoding (Pocket TTS HTTP backend)
++hound = "3.5"
++
+ # Regex
+ regex = "1"
+ 
+diff --git a/README.md b/README.md
+index bcbf691..73d08e2 100644
+--- a/README.md
++++ b/README.md
+@@ -183,6 +183,15 @@ cargo build --release --features voice
+ RUST_LOG=debug cargo run -- agent -m "Hello"
+ ```
+ 
++On macOS, if voice build fails inside `espeak-rs-sys`, use:
++
++```bash
++./scripts/build-voice-macos.sh
++# Optional gates:
++# ./scripts/build-voice-macos.sh --test
++# ./scripts/build-voice-macos.sh --integration
++```
++
+ ## Configuration
+ 
+ Config lives at `~/.nanobot/config.json` (camelCase keys). Workspace defaults to `~/.nanobot/workspace/`.
+@@ -196,7 +205,20 @@ Key agent settings in `config.json`:
+ | `agents.defaults.maxContextTokens` | `128000` | Context window size |
+ | `agents.defaults.maxConcurrentChats` | `4` | Parallel chat limit (gateway) |
+ 
+-For local mode, place GGUF models in `~/models/` and ensure llama.cpp is built at `~/llama.cpp/build/bin/llama-server`.
++For local mode, place GGUF models in `~/.nanobot/models/` (or legacy `~/models/`).
++
++`llama-server` is resolved in this order:
++- `NANOBOT_LLAMA_SERVER` (explicit path)
++- `~/llama.cpp/build/bin/llama-server`
++- `~/.nanobot/bin/llama-server`
++- `~/.local/bin/llama-server`
++- `llama-server` from `PATH`
++
++Optional model directory override:
++
++```bash
++export NANOBOT_MODELS_DIR=/path/to/gguf-models
++```
+ 
+ ## Architecture
+ 
+diff --git a/build.rs b/build.rs
+index b98c61c..d714e25 100644
+--- a/build.rs
++++ b/build.rs
+@@ -4,7 +4,14 @@ fn main() {
+     // it at runtime relative to the executable ($ORIGIN).
+     #[cfg(feature = "voice")]
+     {
+-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
++        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
++        if target_os == "macos" {
++            // macOS uses @loader_path instead of $ORIGIN.
++            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
++            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../lib");
++        } else {
++            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
++            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
++        }
+     }
+ }
+diff --git a/src/agent/agent_loop.rs b/src/agent/agent_loop.rs
+index 295238e..8db4aba 100644
+--- a/src/agent/agent_loop.rs
++++ b/src/agent/agent_loop.rs
+@@ -229,6 +229,168 @@ fn history_limit(max_context_tokens: usize) -> usize {
+     limit.clamp(6, 100)
+ }
+ 
++/// Decide whether to expose tools for the current user turn.
++///
++/// For CLI, default to direct text responses unless the user clearly asks for
++/// repo/file/command/web actions. This avoids slow tool-call loops for simple
++/// conversational prompts on local models.
++fn should_enable_tools_for_message(channel: &str, message: &str, voice_mode: bool) -> bool {
++    if voice_mode {
++        return false;
++    }
++
++    // Non-CLI channels keep existing behavior.
++    if channel != "cli" {
++        return true;
++    }
++
++    let lower = message.trim().to_lowercase();
++    if lower.is_empty() {
++        return false;
++    }
++
++    const COMMAND_PREFIXES: &[&str] = &[
++        "/", "!", "git ", "cargo ", "npm ", "pnpm ", "yarn ", "pip ", "uv ", "python ",
++        "node ", "make ", "cmake ", "rg ", "grep ", "ls ", "cat ", "pwd ", "cd ", "cp ",
++        "mv ", "rm ",
++    ];
++    if COMMAND_PREFIXES.iter().any(|p| lower.starts_with(p)) {
++        return true;
++    }
++
++    const TOOL_INTENT_MARKERS: &[&str] = &[
++        "read file",
++        "open file",
++        "write file",
++        "edit file",
++        "create file",
++        "update file",
++        "delete file",
++        "list dir",
++        "directory",
++        "folder",
++        "repo",
++        "repository",
++        "codebase",
++        "run command",
++        "shell command",
++        "terminal command",
++        "execute",
++        "build",
++        "compile",
++        "run tests",
++        "test suite",
++        "failing test",
++        "stack trace",
++        "fix bug",
++        "implement",
++        "patch",
++        "diff",
++        "commit",
++        "branch",
++        "pull request",
++        "search web",
++        "look up",
++        "http://",
++        "https://",
++        "url",
++        "download",
++        "install",
++    ];
++    if TOOL_INTENT_MARKERS.iter().any(|m| lower.contains(m)) {
++        return true;
++    }
++
++    lower.contains("```")
++        || lower.contains("src/")
++        || lower.contains(".rs")
++        || lower.contains(".toml")
++        || lower.contains(".json")
++}
++
++/// Heuristic filter for low-value assistant replies that can poison local
++/// conversational history (identity loops or malformed numeric noise).
++fn is_low_value_assistant_history(content: &str) -> bool {
++    let text = content.trim();
++    if text.is_empty() {
++        return true;
++    }
++
++    let lower = text.to_lowercase();
++    const SELF_INTRO_PATTERNS: &[&str] = &[
++        "i'm nanobot",
++        "i am nanobot",
++        "your ai assistant",
++        "your local ai assistant",
++        "how can i help you today",
++        "what's on your mind today",
++        "what can i assist you with today",
++        "i'm ready to help",
++        "i'm here to help",
++        "want to chat",
++    ];
++    if SELF_INTRO_PATTERNS
++        .iter()
++        .any(|pattern| lower.contains(pattern))
++        && text.chars().count() <= 320
++    {
++        return true;
++    }
++
++    let mut alpha = 0usize;
++    let mut digits = 0usize;
++    let mut punctuation = 0usize;
++    let mut total = 0usize;
++    for ch in text.chars() {
++        total += 1;
++        if ch.is_alphabetic() {
++            alpha += 1;
++        } else if ch.is_ascii_digit() {
++            digits += 1;
++        } else if ch.is_ascii_punctuation() {
++            punctuation += 1;
++        }
++    }
++
++    if total < 160 {
++        return false;
++    }
++    let alpha_ratio = alpha as f64 / total as f64;
++    let noisy_ratio = (digits + punctuation) as f64 / total as f64;
++    alpha_ratio < 0.22 && noisy_ratio > 0.60
++}
++
++/// For plain conversational CLI turns, trim poisoned assistant turns and keep a
++/// short recent window to reduce style-lock and latency.
++fn prepare_history_for_conversational_cli(mut history: Vec<Value>) -> Vec<Value> {
++    history.retain(|msg| {
++        let role = msg
++            .get("role")
++            .and_then(|v| v.as_str())
++            .unwrap_or_default();
++        if role == "assistant" {
++            return false;
++        }
++        if role == "tool" {
++            let content = msg
++                .get("content")
++                .and_then(|v| v.as_str())
++                .unwrap_or_default();
++            return !is_low_value_assistant_history(content);
++        }
++        if role != "user" {
++            return true;
++        }
++        true
++    });
++
++    const MAX_RECENT_MESSAGES: usize = 8;
++    if history.len() > MAX_RECENT_MESSAGES {
++        history = history[history.len() - MAX_RECENT_MESSAGES..].to_vec();
++    }
++    history
++}
++
+ // ---------------------------------------------------------------------------
+ // Background compaction helpers
+ // ---------------------------------------------------------------------------
+@@ -384,14 +546,34 @@ impl AgentLoopShared {
+             None
+         };
+ 
++        let is_voice_message = msg
++            .metadata
++            .get("voice_message")
++            .and_then(|v| v.as_bool())
++            .unwrap_or(false);
++        let voice_mode = msg.channel == "voice" || is_voice_message;
++        let tools_enabled = should_enable_tools_for_message(&msg.channel, &msg.content, voice_mode);
++
+         // Build per-message tools with context baked in.
+         let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
+ 
+         // Get session history.
+-        let history = core.sessions.get_history(
++        let mut history = core
++            .sessions
++            .get_history(
+                 &session_key,
+                 history_limit(core.token_budget.max_context()),
+-            ).await;
++            )
++            .await;
++        if msg.channel == "cli" && !tools_enabled {
++            let original_len = history.len();
++            history = prepare_history_for_conversational_cli(history);
++            debug!(
++                "CLI conversational history prepared: {} -> {} messages",
++                original_len,
++                history.len()
++            );
++        }
+ 
+         // Extract media paths.
+         let media_paths: Vec<String> = msg
+@@ -406,11 +588,6 @@ impl AgentLoopShared {
+             .unwrap_or_default();
+ 
+         // Build messages.
+-        let is_voice_message = msg
+-            .metadata
+-            .get("voice_message")
+-            .and_then(|v| v.as_bool())
+-            .unwrap_or(false);
+         let detected_language = msg
+             .metadata
+             .get("detected_language")
+@@ -435,6 +612,16 @@ impl AgentLoopShared {
+         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+ 
+         let mut final_content = String::new();
++        let max_iterations = if voice_mode || !tools_enabled {
++            1
++        } else {
++            core.max_iterations
++        };
++        let request_max_tokens = if voice_mode {
++            core.max_tokens.min(192)
++        } else {
++            core.max_tokens
++        };
+ 
+         // Background compaction state.
+         let compaction_slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>> =
+@@ -442,8 +629,13 @@ impl AgentLoopShared {
+         let compaction_in_flight = Arc::new(AtomicBool::new(false));
+ 
+         // Agent loop: call LLM, handle tool calls, repeat.
+-        for iteration in 0..core.max_iterations {
+-            debug!("Agent iteration{} {}/{}", if streaming { " (streaming)" } else { "" }, iteration + 1, core.max_iterations);
++        for iteration in 0..max_iterations {
++            debug!(
++                "Agent iteration{} {}/{}",
++                if streaming { " (streaming)" } else { "" },
++                iteration + 1,
++                max_iterations
++            );
+ 
+             // Check if background compaction finished — swap in compacted messages.
+             if let Ok(mut guard) = compaction_slot.try_lock() {
+@@ -459,7 +651,19 @@ impl AgentLoopShared {
+             }
+ 
+             // Filter tool definitions to relevant tools.
+-            let tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
++            let mut tool_defs = if tools_enabled {
++                tools.get_relevant_definitions(&messages, &used_tools)
++            } else {
++                Vec::new()
++            };
++            if msg.channel == "cli" || msg.channel == "voice" {
++                tool_defs.retain(|def| {
++                    def.get("function")
++                        .and_then(|f| f.get("name"))
++                        .and_then(|n| n.as_str())
++                        != Some("message")
++                });
++            }
+             let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+                 None
+             } else {
+@@ -471,6 +675,15 @@ impl AgentLoopShared {
+                 .token_budget
+                 .estimate_tool_def_tokens_with_fallback(tool_defs_opt.unwrap_or(&[]));
+             messages = core.token_budget.trim_to_fit(&messages, tool_def_tokens);
++            debug!(
++                "LLM request stats: messages={}, est_message_tokens={}, tool_defs={}, est_tool_tokens={}, voice_mode={}, tools_enabled={}",
++                messages.len(),
++                core.token_budget.estimate_tokens_with_fallback(&messages),
++                tool_defs.len(),
++                tool_def_tokens,
++                voice_mode,
++                tools_enabled
++            );
+ 
+             // Spawn background compaction when threshold exceeded.
+             if !compaction_in_flight.load(Ordering::Relaxed)
+@@ -517,7 +730,7 @@ impl AgentLoopShared {
+                         &messages,
+                         tool_defs_opt,
+                         Some(&core.model),
+-                        core.max_tokens,
++                        request_max_tokens,
+                         core.temperature,
+                     )
+                     .await
+@@ -558,7 +771,7 @@ impl AgentLoopShared {
+                         &messages,
+                         tool_defs_opt,
+                         Some(&core.model),
+-                        core.max_tokens,
++                        request_max_tokens,
+                         core.temperature,
+                     )
+                     .await
+@@ -573,6 +786,15 @@ impl AgentLoopShared {
+             };
+ 
+             if response.has_tool_calls() {
++                if !tools_enabled {
++                    debug!("Model emitted tool calls while tools are disabled; returning direct response");
++                    final_content = response.content.unwrap_or_else(|| {
++                        "I could not produce a direct response without tools. Please retry."
++                            .to_string()
++                    });
++                    break;
++                }
++
+                 // Check if we should delegate to the tool runner.
+                 if core.tool_delegation_config.enabled {
+                     if let (Some(ref tr_provider), Some(ref tr_model)) =
+@@ -1238,3 +1460,73 @@ impl crate::agent::tools::Tool for CronToolProxy {
+         self.0.execute(params).await
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{
++        is_low_value_assistant_history, prepare_history_for_conversational_cli,
++        should_enable_tools_for_message,
++    };
++    use serde_json::json;
++
++    #[test]
++    fn test_cli_conversational_prompt_disables_tools() {
++        assert!(!should_enable_tools_for_message(
++            "cli",
++            "Tell me one short joke.",
++            false
++        ));
++    }
++
++    #[test]
++    fn test_cli_repo_task_enables_tools() {
++        assert!(should_enable_tools_for_message(
++            "cli",
++            "Read file Cargo.toml and fix the failing test.",
++            false
++        ));
++    }
++
++    #[test]
++    fn test_voice_disables_tools_even_with_intent_markers() {
++        assert!(!should_enable_tools_for_message(
++            "voice",
++            "Run command cargo test",
++            true
++        ));
++    }
++
++    #[test]
++    fn test_non_cli_keeps_tools_enabled() {
++        assert!(should_enable_tools_for_message(
++            "telegram",
++            "hello there",
++            false
++        ));
++    }
++
++    #[test]
++    fn test_low_value_assistant_history_detects_intro_loop() {
++        assert!(is_low_value_assistant_history(
++            "Hello! I'm nanobot, your AI assistant. How can I help you today?"
++        ));
++        assert!(!is_low_value_assistant_history(
++            "Why did the nanobot bring a ladder? To reach the cloud."
++        ));
++    }
++
++    #[test]
++    fn test_prepare_history_for_conversational_cli_drops_assistant_turns() {
++        let history = vec![
++            json!({"role":"user","content":"tell me joke"}),
++            json!({"role":"assistant","content":"Hello! I'm nanobot, your AI assistant. How can I help you today?"}),
++            json!({"role":"assistant","content":"3.7.4.4.6:65,605.084.0.1.2.3.3.5.4.0.3.3.3.2.3.1.4.2.36.5.0.2.5.5.9.3.10.2.5.2.5.1.5.2.4.3.4.5.5.3.2.6.3.2.4.7.6.0.1.3.3.3.6.3.1.3.4.0.1.2.3.3.1.1.4.0.."}),
++            json!({"role":"assistant","content":"What do you call a fake noodle? An impasta."}),
++        ];
++
++        let filtered = prepare_history_for_conversational_cli(history);
++        assert_eq!(filtered.len(), 1);
++        assert_eq!(filtered[0]["role"], "user");
++        assert_eq!(filtered[0]["content"], "tell me joke");
++    }
++}
+diff --git a/src/agent/compaction.rs b/src/agent/compaction.rs
+index dd59b4d..e6b3ac2 100644
+--- a/src/agent/compaction.rs
++++ b/src/agent/compaction.rs
+@@ -88,6 +88,9 @@ impl ContextCompactor {
+             return false;
+         }
+         let available = budget.available_budget(tool_def_tokens);
++        if available == 0 {
++            return false;
++        }
+         let estimated = budget.estimate_tokens_with_fallback(messages);
+         let threshold = (available as f64 * 0.666) as usize;
+         estimated > threshold
+@@ -115,6 +118,12 @@ impl ContextCompactor {
+         }
+ 
+         let available = budget.available_budget(tool_def_tokens);
++        if available == 0 {
++            return CompactionResult {
++                messages: messages.to_vec(),
++                observation: None,
++            };
++        }
+         let current = budget.estimate_tokens_with_fallback(messages);
+ 
+         // Stage 1: Proactive compaction at 66.6% capacity.
+@@ -554,6 +563,24 @@ mod tests {
+         assert!(result.observation.is_none());
+     }
+ 
++    #[tokio::test]
++    async fn test_compaction_skips_when_available_budget_is_zero() {
++        let provider = Arc::new(MockProvider::new("summary"));
++        let compactor = ContextCompactor::new(provider, "test".into(), 100_000);
++        // 256 - 1024 - 100 => saturates to zero available message budget.
++        let budget = TokenBudget::new(256, 1024);
++
++        let messages = vec![
++            json!({"role": "system", "content": "You are helpful."}),
++            json!({"role": "user", "content": "Hello"}),
++        ];
++
++        assert!(!compactor.needs_compaction(&messages, &budget, 100));
++        let result = compactor.compact(&messages, &budget, 100).await;
++        assert_eq!(result.messages, messages);
++        assert!(result.observation.is_none());
++    }
++
+     #[tokio::test]
+     async fn test_compact_summarizes_old_messages() {
+         let provider = Arc::new(MockProvider::new("User discussed weather and cats."));
+diff --git a/src/agent/context.rs b/src/agent/context.rs
+index 9abade1..7fd1ef2 100644
+--- a/src/agent/context.rs
++++ b/src/agent/context.rs
+@@ -202,15 +202,21 @@ impl ContextBuilder {
+         detected_language: Option<&str>,
+     ) -> Vec<Value> {
+         let mut messages: Vec<Value> = Vec::new();
++        let voice_mode = matches!(channel, Some("voice")) || is_voice_message;
+ 
+         // System prompt.
+         let mut system_prompt = self.build_system_prompt(skill_names);
++        // Voice turns prioritize low-latency interaction over full workspace context.
++        // Keep the core identity and apply a tighter budget for the heavy prompt sections.
++        if voice_mode {
++            system_prompt = Self::_truncate_to_budget(&system_prompt, 700);
++        }
+         if let (Some(ch), Some(cid)) = (channel, chat_id) {
+             system_prompt.push_str(&format!(
+                 "\n\n## Current Session\nChannel: {}\nChat ID: {}",
+                 ch, cid
+             ));
+-            if ch == "voice" || is_voice_message {
++            if voice_mode {
+                 system_prompt.push_str(concat!(
+                     "\n\n## Voice Mode (IMPORTANT)\n",
+                     "The user is speaking via microphone and your response will be read aloud by TTS. ",
+@@ -631,6 +637,26 @@ mod tests {
+         assert_eq!(messages[1]["role"], "user");
+     }
+ 
++    #[test]
++    fn test_voice_messages_apply_tighter_system_prompt_budget() {
++        let tmp = TempDir::new().unwrap();
++        fs::write(tmp.path().join("AGENTS.md"), "x".repeat(12000)).unwrap();
++        let cb = ContextBuilder::new(tmp.path());
++        let messages = cb.build_messages(
++            &[],
++            "test voice",
++            None,
++            None,
++            Some("voice"),
++            Some("direct"),
++            false,
++            Some("en"),
++        );
++        let system = messages[0]["content"].as_str().unwrap();
++        assert!(system.contains("## Voice Mode (IMPORTANT)"));
++        assert!(system.contains("[truncated to fit token budget]"));
++    }
++
+     // ----- add_tool_result -----
+ 
+     #[test]
+diff --git a/src/agent/token_budget.rs b/src/agent/token_budget.rs
+index 562366e..556e0fc 100644
+--- a/src/agent/token_budget.rs
++++ b/src/agent/token_budget.rs
+@@ -179,8 +179,15 @@ impl TokenBudget {
+             let remaining_budget = budget.saturating_sub(system_tokens);
+ 
+             // Walk backwards from the end, keeping messages that fit.
++            // Always preserve the latest non-system message, even if it
++            // individually exceeds the remaining budget.
+             for msg in msgs[1..].iter().rev() {
+                 let msg_tokens = self.estimate_message_tokens_with_fallback(msg);
++                if kept_tail.is_empty() {
++                    kept_tail.push(msg.clone());
++                    tail_tokens += msg_tokens;
++                    continue;
++                }
+                 if tail_tokens + msg_tokens <= remaining_budget {
+                     kept_tail.push(msg.clone());
+                     tail_tokens += msg_tokens;
+@@ -342,6 +349,22 @@ mod tests {
+         assert_eq!(trimmed[0]["role"], "system");
+     }
+ 
++    #[test]
++    fn test_trim_preserves_latest_message_even_if_over_budget() {
++        // Budget too small for the latest message, but the latest user message
++        // must still be preserved to avoid prompt loss.
++        let budget = TokenBudget::new(120, 100); // tiny remaining budget
++        let messages = vec![
++            json!({"role": "system", "content": "System prompt that is somewhat long"}),
++            json!({"role": "user", "content": "x".repeat(200)}),
++        ];
++
++        let trimmed = budget.trim_to_fit(&messages, 0);
++        assert!(trimmed.len() >= 2, "latest message was dropped");
++        let last = trimmed.last().unwrap();
++        assert_eq!(last["role"], "user");
++    }
++
+     #[test]
+     fn test_available_budget() {
+         let budget = TokenBudget::new(128000, 8192);
+diff --git a/src/config/schema.rs b/src/config/schema.rs
+index fb9ee1a..f56b689 100644
+--- a/src/config/schema.rs
++++ b/src/config/schema.rs
+@@ -184,6 +184,8 @@ pub struct AgentDefaults {
+     pub workspace: String,
+     #[serde(default = "default_model")]
+     pub model: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub local_model: Option<String>,
+     #[serde(default = "default_max_tokens")]
+     pub max_tokens: u32,
+     #[serde(default = "default_temperature")]
+@@ -229,6 +231,7 @@ impl Default for AgentDefaults {
+         Self {
+             workspace: default_workspace(),
+             model: default_model(),
++            local_model: None,
+             max_tokens: default_max_tokens(),
+             temperature: default_temperature(),
+             max_tool_iterations: default_max_tool_iterations(),
+@@ -663,9 +666,20 @@ mod tests {
+         let json = serde_json::to_string_pretty(&cfg).unwrap();
+         let cfg2: Config = serde_json::from_str(&json).unwrap();
+         assert_eq!(cfg2.agents.defaults.model, "anthropic/claude-opus-4-5");
++        assert!(cfg2.agents.defaults.local_model.is_none());
+         assert_eq!(cfg2.gateway.port, 18790);
+     }
+ 
++    #[test]
++    fn test_local_model_config_roundtrip() {
++        let json = r#"{"agents":{"defaults":{"localModel":"my-model.gguf"}}}"#;
++        let cfg: Config = serde_json::from_str(json).unwrap();
++        assert_eq!(
++            cfg.agents.defaults.local_model.as_deref(),
++            Some("my-model.gguf")
++        );
++    }
++
+     #[test]
+     fn test_api_key_priority() {
+         let mut cfg = Config::default();
+diff --git a/src/main.rs b/src/main.rs
+index 595ff4c..6465ac5 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -171,11 +171,7 @@ fn main() {
+     // Safety net: kill orphaned llama-server on panic so it doesn't hold VRAM
+     let default_hook = std::panic::take_hook();
+     std::panic::set_hook(Box::new(move |info| {
+-        let _ = std::process::Command::new("pkill")
+-            .args(["-f", "llama-server"])
+-            .stdout(std::process::Stdio::null())
+-            .stderr(std::process::Stdio::null())
+-            .status();
++        server::kill_stale_llama_servers();
+         default_hook(info);
+     }));
+ 
+diff --git a/src/providers/openai_compat.rs b/src/providers/openai_compat.rs
+index 9f3ac26..1c001be 100644
+--- a/src/providers/openai_compat.rs
++++ b/src/providers/openai_compat.rs
+@@ -339,6 +339,8 @@ async fn parse_sse_stream(
+     byte_stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+     tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+ ) {
++    let stream_start = std::time::Instant::now();
++    let mut first_delta_ms: Option<u128> = None;
+     let mut line_buffer = String::new();
+     let mut full_content = String::new();
+     let mut finish_reason = String::from("stop");
+@@ -414,6 +416,13 @@ async fn parse_sse_stream(
+                     finish_reason: finish_reason.clone(),
+                     usage: usage.clone(),
+                 }));
++                debug!(
++                    "SSE done marker at {} ms (first_delta_ms={})",
++                    stream_start.elapsed().as_millis(),
++                    first_delta_ms
++                        .map(|ms| ms.to_string())
++                        .unwrap_or_else(|| "none".to_string())
++                );
+                 return;
+             }
+ 
+@@ -438,6 +447,13 @@ async fn parse_sse_stream(
+                         // Text content delta
+                         if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                             if !content.is_empty() {
++                                if first_delta_ms.is_none() {
++                                    first_delta_ms = Some(stream_start.elapsed().as_millis());
++                                    debug!(
++                                        "SSE first content delta at {} ms",
++                                        first_delta_ms.unwrap_or(0)
++                                    );
++                                }
+                                 full_content.push_str(content);
+                                 let _ = tx.send(StreamChunk::TextDelta(content.to_string()));
+                             }
+@@ -518,6 +534,13 @@ async fn parse_sse_stream(
+         finish_reason,
+         usage,
+     }));
++    debug!(
++        "SSE stream ended without [DONE] at {} ms (first_delta_ms={})",
++        stream_start.elapsed().as_millis(),
++        first_delta_ms
++            .map(|ms| ms.to_string())
++            .unwrap_or_else(|| "none".to_string())
++    );
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/server.rs b/src/server.rs
+index 1c70fbe..6d97e1d 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -4,6 +4,7 @@
+ //! parsing GGUF model metadata for auto-sizing context windows, and detecting available
+ //! system memory (VRAM/RAM).
+ 
++use std::env;
+ use std::net::TcpListener;
+ use std::path::{Path, PathBuf};
+ use std::process::{Child, Command, Stdio};
+@@ -50,24 +51,107 @@ pub(crate) fn find_available_port(start: u16) -> u16 {
+     start // fallback
+ }
+ 
+-/// List all GGUF models in `~/models/`, sorted by filename.
++/// Resolve the local GGUF models directory.
++///
++/// Priority:
++/// 1. `NANOBOT_MODELS_DIR`
++/// 2. `~/.nanobot/models` (if it exists)
++/// 3. `~/models` (legacy default)
++pub(crate) fn local_models_dir() -> PathBuf {
++    if let Ok(path) = env::var("NANOBOT_MODELS_DIR") {
++        let trimmed = path.trim();
++        if !trimmed.is_empty() {
++            return PathBuf::from(trimmed);
++        }
++    }
++
++    if let Some(home) = dirs::home_dir() {
++        let nanobot_models = home.join(".nanobot").join("models");
++        if nanobot_models.exists() {
++            return nanobot_models;
++        }
++        return home.join("models");
++    }
++
++    PathBuf::from("models")
++}
++
++/// Path to the default local model filename in the resolved models directory.
++pub(crate) fn default_local_model_path() -> PathBuf {
++    local_models_dir().join(DEFAULT_LOCAL_MODEL)
++}
++
++/// List all GGUF models in the resolved local models directory, sorted by filename.
+ pub(crate) fn list_local_models() -> Vec<PathBuf> {
+-    let home = match dirs::home_dir() {
+-        Some(h) => h,
+-        None => return vec![],
+-    };
+-    let models_dir = home.join("models");
++    let models_dir = local_models_dir();
+     let mut models: Vec<PathBuf> = std::fs::read_dir(&models_dir)
+         .into_iter()
+         .flatten()
+         .filter_map(|e| e.ok())
+         .map(|e| e.path())
+-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
++        .filter(|p| {
++            p.extension().and_then(|e| e.to_str()) == Some("gguf")
++                && p.is_file()
++        })
+         .collect();
+     models.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+     models
+ }
+ 
++fn command_exists_in_path(cmd: &str) -> bool {
++    let path_var = match env::var_os("PATH") {
++        Some(v) => v,
++        None => return false,
++    };
++    env::split_paths(&path_var).any(|dir| dir.join(cmd).exists())
++}
++
++fn resolve_llama_server_command() -> Result<PathBuf, String> {
++    if let Ok(path) = env::var("NANOBOT_LLAMA_SERVER") {
++        let trimmed = path.trim();
++        if !trimmed.is_empty() {
++            let candidate = PathBuf::from(trimmed);
++            if candidate.exists() {
++                return Ok(candidate);
++            }
++            return Err(format!(
++                "llama-server not found at NANOBOT_LLAMA_SERVER path {}",
++                candidate.display()
++            ));
++        }
++    }
++
++    let mut searched: Vec<PathBuf> = Vec::new();
++    if let Some(home) = dirs::home_dir() {
++        let candidates = [
++            home.join("llama.cpp/build/bin/llama-server"),
++            home.join(".nanobot/bin/llama-server"),
++            home.join(".local/bin/llama-server"),
++        ];
++        for candidate in candidates {
++            if candidate.exists() {
++                return Ok(candidate);
++            }
++            searched.push(candidate);
++        }
++    }
++
++    if command_exists_in_path("llama-server") {
++        return Ok(PathBuf::from("llama-server"));
++    }
++
++    let mut msg = String::from("llama-server not found. Set NANOBOT_LLAMA_SERVER or install it in PATH");
++    if !searched.is_empty() {
++        let locations = searched
++            .iter()
++            .map(|p| p.display().to_string())
++            .collect::<Vec<_>>()
++            .join(", ");
++        msg.push_str(&format!(" (searched: {})", locations));
++    }
++    Err(msg)
++}
++
+ /// Ensure the dedicated compaction model is available locally.
+ ///
+ /// Downloads Qwen3-0.6B Q4_K_M (~500MB) to `~/.nanobot/models/` if not already
+@@ -209,12 +293,23 @@ pub(crate) fn stop_compaction_server(
+ 
+ /// Kill any orphaned llama-server processes from previous runs.
+ pub(crate) fn kill_stale_llama_servers() {
+-    // Kill any orphaned llama-server processes from previous runs
+-    let _ = Command::new("pkill")
+-        .args(["-f", "llama-server"])
+-        .stdout(Stdio::null())
+-        .stderr(Stdio::null())
+-        .status();
++    #[cfg(unix)]
++    {
++        // Kill any orphaned llama-server processes from previous runs.
++        let _ = Command::new("pkill")
++            .args(["-f", "llama-server"])
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status();
++    }
++    #[cfg(windows)]
++    {
++        let _ = Command::new("taskkill")
++            .args(["/F", "/IM", "llama-server.exe"])
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status();
++    }
+     // Brief pause to let ports be released
+     std::thread::sleep(std::time::Duration::from_millis(300));
+ }
+@@ -350,7 +445,7 @@ pub(crate) fn parse_gguf_metadata(path: &Path) -> Option<GgufModelInfo> {
+     })
+ }
+ 
+-/// Detect available VRAM (via nvidia-smi) and RAM (via /proc/meminfo).
++/// Detect available VRAM (via nvidia-smi) and RAM (OS-specific probe).
+ /// Returns (vram_bytes, ram_bytes).
+ pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
+     // Try VRAM via nvidia-smi
+@@ -367,8 +462,14 @@ pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
+         })
+         .map(|mib| mib * 1024 * 1024);
+ 
+-    // RAM via /proc/meminfo
+-    let ram = std::fs::read_to_string("/proc/meminfo")
++    let ram = detect_available_ram_bytes().unwrap_or(8 * 1024 * 1024 * 1024); // 8 GB fallback
++
++    (vram, ram)
++}
++
++#[cfg(target_os = "linux")]
++fn detect_available_ram_bytes() -> Option<u64> {
++    std::fs::read_to_string("/proc/meminfo")
+         .ok()
+         .and_then(|contents| {
+             for line in contents.lines() {
+@@ -379,9 +480,29 @@ pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
+             }
+             None
+         })
+-        .unwrap_or(8 * 1024 * 1024 * 1024); // 8 GB fallback
++}
+ 
+-    (vram, ram)
++#[cfg(target_os = "macos")]
++fn detect_available_ram_bytes() -> Option<u64> {
++    // macOS does not expose a /proc-style MemAvailable counter.
++    // Use 70% of physical memory as a conservative proxy for available RAM.
++    let output = Command::new("sysctl")
++        .args(["-n", "hw.memsize"])
++        .output()
++        .ok()?;
++    if !output.status.success() {
++        return None;
++    }
++    let total = String::from_utf8_lossy(&output.stdout)
++        .trim()
++        .parse::<u64>()
++        .ok()?;
++    Some((total as f64 * 0.70) as u64)
++}
++
++#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++fn detect_available_ram_bytes() -> Option<u64> {
++    None
+ }
+ 
+ /// Practical context cap based on model file size (proxy for parameter count).
+@@ -486,15 +607,7 @@ pub(crate) fn spawn_compaction_server(
+     model_path: &Path,
+     ctx_size: usize,
+ ) -> Result<Child, String> {
+-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+-    let server_path = home.join("llama.cpp/build/bin/llama-server");
+-
+-    if !server_path.exists() {
+-        return Err(format!(
+-            "llama-server not found at {}",
+-            server_path.display()
+-        ));
+-    }
++    let server_cmd = resolve_llama_server_command()?;
+     if !model_path.exists() {
+         return Err(format!(
+             "Compaction model not found at {}",
+@@ -502,7 +615,7 @@ pub(crate) fn spawn_compaction_server(
+         ));
+     }
+ 
+-    Command::new(&server_path)
++    Command::new(&server_cmd)
+         .arg("--model")
+         .arg(model_path)
+         .arg("--port")
+@@ -527,20 +640,12 @@ pub(crate) fn spawn_llama_server(
+     model_path: &Path,
+     ctx_size: usize,
+ ) -> Result<Child, String> {
+-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+-    let server_path = home.join("llama.cpp/build/bin/llama-server");
+-
+-    if !server_path.exists() {
+-        return Err(format!(
+-            "llama-server not found at {}",
+-            server_path.display()
+-        ));
+-    }
++    let server_cmd = resolve_llama_server_command()?;
+     if !model_path.exists() {
+         return Err(format!("Model not found at {}", model_path.display()));
+     }
+ 
+-    Command::new(&server_path)
++    Command::new(&server_cmd)
+         .arg("--model")
+         .arg(model_path)
+         .arg("--port")
+@@ -666,17 +771,7 @@ pub(crate) async fn wait_for_server_ready(
+     false
+ }
+ 
+-/// Query the local llama.cpp server for its actual context size (`n_ctx`).
+-///
+-/// Returns the server's context window with 5% headroom subtracted (to account
+-/// for token-estimation drift). Falls back to `None` if the server is
+-/// unreachable or the response is unexpected.
+-pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
+-    let url = format!("http://localhost:{}/props", port);
+-    let props = reqwest::blocking::get(&url)
+-        .ok()?
+-        .json::<serde_json::Value>()
+-        .ok()?;
++fn parse_context_size_from_props(props: &serde_json::Value) -> Option<usize> {
+     let n_ctx = props
+         .get("default_generation_settings")
+         .and_then(|v| v.get("n_ctx"))
+@@ -694,6 +789,39 @@ pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
+     Some((per_request_ctx as f64 * 0.95) as usize)
+ }
+ 
++fn query_local_context_size_blocking(port: &str) -> Option<usize> {
++    let url = format!("http://localhost:{}/props", port);
++    let props = reqwest::blocking::get(&url)
++        .ok()?
++        .json::<serde_json::Value>()
++        .ok()?;
++    parse_context_size_from_props(&props)
++}
++
++/// Query the local llama.cpp server for its actual context size (`n_ctx`).
++///
++/// Returns the server's context window with 5% headroom subtracted (to account
++/// for token-estimation drift). Falls back to `None` if the server is
++/// unreachable or the response is unexpected.
++pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
++    if let Ok(handle) = tokio::runtime::Handle::try_current() {
++        match handle.runtime_flavor() {
++            tokio::runtime::RuntimeFlavor::MultiThread => {
++                tokio::task::block_in_place(|| query_local_context_size_blocking(port))
++            }
++            _ => {
++                let owned = port.to_string();
++                std::thread::spawn(move || query_local_context_size_blocking(&owned))
++                    .join()
++                    .ok()
++                    .flatten()
++            }
++        }
++    } else {
++        query_local_context_size_blocking(port)
++    }
++}
++
+ // ============================================================================
+ // Tests (RED — these should FAIL until we move the implementations)
+ // ============================================================================
+@@ -876,7 +1004,7 @@ mod tests {
+ 
+     #[test]
+     fn test_list_local_models_returns_sorted() {
+-        // This is a filesystem test — it may return empty if ~/models/ doesn't exist
++        // This is a filesystem test — it may return empty if no local model dir exists.
+         let models = list_local_models();
+         // If any models exist, they should be sorted and all .gguf
+         for (i, model) in models.iter().enumerate() {
+@@ -931,11 +1059,8 @@ mod tests {
+ 
+     #[test]
+     fn test_spawn_server_errors_when_binary_missing() {
+-        let home = dirs::home_dir().unwrap();
+-        let server_path = home.join("llama.cpp/build/bin/llama-server");
+-
+-        if !server_path.exists() {
+-            let fake_model = home.join("models/nonexistent.gguf");
++        if resolve_llama_server_command().is_err() {
++            let fake_model = local_models_dir().join("nonexistent.gguf");
+             let result = spawn_llama_server(19876, &fake_model, 8192);
+             assert!(result.is_err());
+             assert!(
+@@ -947,11 +1072,8 @@ mod tests {
+ 
+     #[test]
+     fn test_spawn_server_errors_when_model_missing() {
+-        let home = dirs::home_dir().unwrap();
+-        let server_path = home.join("llama.cpp/build/bin/llama-server");
+-        let model_path = home.join("models/nonexistent-test-model.gguf");
+-
+-        if server_path.exists() {
++        let model_path = local_models_dir().join("nonexistent-test-model.gguf");
++        if resolve_llama_server_command().is_ok() {
+             let result = spawn_llama_server(19877, &model_path, 8192);
+             assert!(result.is_err());
+             assert!(
+@@ -1043,7 +1165,10 @@ mod tests {
+     fn test_parse_real_gguf_if_available() {
+         let models = list_local_models();
+         if models.is_empty() {
+-            eprintln!("Skipping: no GGUF models found in ~/models/");
++            eprintln!(
++                "Skipping: no GGUF models found in {}",
++                local_models_dir().display()
++            );
+             return;
+         }
+ 
+@@ -1076,7 +1201,10 @@ mod tests {
+     fn test_compute_optimal_context_real_models() {
+         let models = list_local_models();
+         if models.is_empty() {
+-            eprintln!("Skipping: no GGUF models found in ~/models/");
++            eprintln!(
++                "Skipping: no GGUF models found in {}",
++                local_models_dir().display()
++            );
+             return;
+         }
+ 
+diff --git a/src/tui.rs b/src/tui.rs
+index 5dc0ad0..fe7b0ad 100644
+--- a/src/tui.rs
++++ b/src/tui.rs
+@@ -199,7 +199,13 @@ pub(crate) fn print_startup_splash(local_port: &str) {
+             config.agents.defaults.model
+         );
+     }
++    #[cfg(feature = "voice")]
+     println!("  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}", crate::VERSION);
++    #[cfg(not(feature = "voice"))]
++    println!(
++        "  {DIM}v{}  |  /local  /model  (voice disabled in this build)  Ctrl+C quit{RESET}",
++        crate::VERSION
++    );
+     println!();
+ 
+     // Brief loading animation

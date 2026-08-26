@@ -1,0 +1,4466 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2a74be3..2585136 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2193,9 +2193,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "hmac-sha256"
+-version = "1.1.13"
++version = "1.1.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d0f0ae375a85536cac3a243e3a9cda80a47910348abdea7e2c22f8ec556d586d"
++checksum = "ec9d92d097f4749b64e8cc33d924d9f40a2d4eb91402b458014b781f5733d60f"
+ 
+ [[package]]
+ name = "home"
+@@ -2859,7 +2859,7 @@ checksum = "3d0b95e02c851351f877147b7deea7b1afb1df71b63aa5f8270716e0c5720616"
+ dependencies = [
+  "bitflags 2.10.0",
+  "libc",
+- "redox_syscall 0.7.0",
++ "redox_syscall 0.7.1",
+ ]
+ 
+ [[package]]
+@@ -3243,6 +3243,7 @@ dependencies = [
+  "dirs 6.0.0",
+  "dom_smoothie",
+  "futures-util",
++ "hound",
+  "html-escape",
+  "jack-voice",
+  "lettre",
+@@ -3743,9 +3744,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "parakeet-rs"
+-version = "0.3.2"
++version = "0.3.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "adfea3cc9a40da848724e5b4be3b624fd8341f66390924c7e5f8d456315b656e"
++checksum = "ffb8f3a2abb6cf36b9d431a25ead23d4e19294169f0d99bc7f4d4a1478233fdc"
+ dependencies = [
+  "eyre",
+  "hound",
+@@ -4464,9 +4465,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "redox_syscall"
+-version = "0.7.0"
++version = "0.7.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "49f3fe0889e69e2ae9e41f4d6c4c0181701d00e4697b356fb1f74173a5e0ee27"
++checksum = "35985aa610addc02e24fc232012c86fd11f14111180f902b67e2d5331f8ebf2b"
+ dependencies = [
+  "bitflags 2.10.0",
+ ]
+@@ -5841,9 +5842,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "toml_parser"
+-version = "1.0.6+spec-1.1.0"
++version = "1.0.8+spec-1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a3198b4b0a8e11f09dd03e133c0280504d0801269e9afa46362ffde1cbeebf44"
++checksum = "0742ff5ff03ea7e67c8ae6c93cac239e0d9784833362da3f9a9c1da8dfefcbdc"
+ dependencies = [
+  "winnow 0.7.14",
+ ]
+diff --git a/Cargo.toml b/Cargo.toml
+index 90b1db2..b0c8269 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -36,6 +36,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ # Date/time
+ chrono = { version = "0.4", features = ["serde"] }
+ 
++# WAV decoding (Pocket TTS HTTP backend)
++hound = "3.5"
++
+ # Regex
+ regex = "1"
+ 
+diff --git a/README.md b/README.md
+index 192cc1e..c2fbb29 100644
+--- a/README.md
++++ b/README.md
+@@ -183,6 +183,15 @@ cargo build --release --features voice
+ RUST_LOG=debug cargo run -- agent -m "Hello"
+ ```
+ 
++On macOS, if voice build fails inside `espeak-rs-sys`, use:
++
++```bash
++./scripts/build-voice-macos.sh
++# Optional gates:
++# ./scripts/build-voice-macos.sh --test
++# ./scripts/build-voice-macos.sh --integration
++```
++
+ ## Configuration
+ 
+ Config lives at `~/.nanobot/config.json` (camelCase keys). Workspace defaults to `~/.nanobot/workspace/`.
+@@ -196,7 +205,20 @@ Key agent settings in `config.json`:
+ | `agents.defaults.maxContextTokens` | `128000` | Context window size |
+ | `agents.defaults.maxConcurrentChats` | `4` | Parallel chat limit (gateway) |
+ 
+-For local mode, place GGUF models in `~/models/` and ensure llama.cpp is built at `~/llama.cpp/build/bin/llama-server`.
++For local mode, place GGUF models in `~/.nanobot/models/` (or legacy `~/models/`).
++
++`llama-server` is resolved in this order:
++- `NANOBOT_LLAMA_SERVER` (explicit path)
++- `~/llama.cpp/build/bin/llama-server`
++- `~/.nanobot/bin/llama-server`
++- `~/.local/bin/llama-server`
++- `llama-server` from `PATH`
++
++Optional model directory override:
++
++```bash
++export NANOBOT_MODELS_DIR=/path/to/gguf-models
++```
+ 
+ ## Architecture
+ 
+diff --git a/build.rs b/build.rs
+index 58b68cc..d714e25 100644
+--- a/build.rs
++++ b/build.rs
+@@ -1,103 +1,17 @@
+-/// Copy src to dst, but skip if they are hardlinked (same inode) to avoid
+-/// truncating the source when sherpa-rs-sys creates hardlinks from cache to target.
+-fn safe_copy(src: &std::path::Path, dst: &std::path::Path) {
+-    use std::os::unix::fs::MetadataExt;
+-    if let (Ok(sm), Ok(dm)) = (src.metadata(), dst.metadata()) {
+-        if sm.ino() == dm.ino() && sm.dev() == dm.dev() {
+-            return;
+-        }
+-    }
+-    let _ = std::fs::copy(src, dst);
+-}
+-
+ fn main() {
+     // When the voice feature is enabled, sherpa-rs links against libsherpa-onnx-c-api.so
+     // which gets copied to the target dir at build time. Set rpath so the binary can find
+-    // it at runtime relative to the executable ($ORIGIN) and also at ~/.local/lib.
++    // it at runtime relative to the executable ($ORIGIN).
+     #[cfg(feature = "voice")]
+     {
+-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+-
+-        // Copy sherpa-onnx shared libraries to the target directory so they're
+-        // next to the binary after build. Also copy to ~/.local/lib for the
+-        // installed binary.
+-        if let Ok(out_dir) = std::env::var("OUT_DIR") {
+-            // Walk up from OUT_DIR to find the profile dir (target/release or target/debug).
+-            let mut target_dir = std::path::PathBuf::from(&out_dir);
+-            while target_dir.file_name().map_or(false, |f| f != "release" && f != "debug") {
+-                if !target_dir.pop() { break; }
+-            }
+-
+-            // Find the sherpa-onnx libs in the cache.
+-            let home = std::env::var("HOME").unwrap_or_default();
+-            let sherpa_cache = std::path::PathBuf::from(&home).join(".cache/sherpa-rs");
+-            if sherpa_cache.exists() {
+-                let libs = ["libsherpa-onnx-c-api.so", "libonnxruntime.so", "libsherpa-onnx-cxx-api.so"];
+-                let local_lib = std::path::PathBuf::from(&home).join(".local/lib");
+-                let _ = std::fs::create_dir_all(&local_lib);
+-
+-                for entry in walkdir(&sherpa_cache) {
+-                    let name = match entry.file_name() {
+-                        Some(n) => n.to_string_lossy().to_string(),
+-                        None => continue,
+-                    };
+-                    if libs.contains(&name.as_str()) {
+-                        // Copy to target dir (for cargo run).
+-                        safe_copy(&entry, &target_dir.join(&name));
+-                        // Copy to ~/.local/lib (for installed binary).
+-                        safe_copy(&entry, &local_lib.join(&name));
+-                    }
+-                }
+-            }
+-
+-            // Copy espeak-ng-data to ~/.local/share/espeak-ng-data/ so Kokoro TTS
+-            // works when the binary is installed outside the build tree.
+-            // espeak-rs-sys bakes the build-time path which breaks after `cp`.
+-            let build_dir = target_dir.join("build");
+-            if build_dir.exists() {
+-                for entry in walkdir(&build_dir) {
+-                    if entry.ends_with("share/espeak-ng-data/phontab") {
+-                        if let Some(espeak_data_dir) = entry.parent() {
+-                            let local_share = std::path::PathBuf::from(&home).join(".local/share/espeak-ng-data");
+-                            copy_dir_recursive(espeak_data_dir, &local_share);
+-                            break;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-    }
+-}
+-
+-/// Recursively copy a directory tree.
+-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+-    let _ = std::fs::create_dir_all(dst);
+-    if let Ok(entries) = std::fs::read_dir(src) {
+-        for entry in entries.flatten() {
+-            let path = entry.path();
+-            let dest = dst.join(entry.file_name());
+-            if path.is_dir() {
+-                copy_dir_recursive(&path, &dest);
+-            } else {
+-                let _ = std::fs::copy(&path, &dest);
+-            }
+-        }
+-    }
+-}
+-
+-/// Simple recursive directory walker (no extra deps).
+-fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+-    let mut results = Vec::new();
+-    if let Ok(entries) = std::fs::read_dir(dir) {
+-        for entry in entries.flatten() {
+-            let path = entry.path();
+-            if path.is_dir() {
+-                results.extend(walkdir(&path));
+-            } else {
+-                results.push(path);
+-            }
++        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
++        if target_os == "macos" {
++            // macOS uses @loader_path instead of $ORIGIN.
++            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
++            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../lib");
++        } else {
++            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
++            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+         }
+     }
+-    results
+ }
+diff --git a/src/agent/agent_loop.rs b/src/agent/agent_loop.rs
+index 0fdca5b..8db4aba 100644
+--- a/src/agent/agent_loop.rs
++++ b/src/agent/agent_loop.rs
+@@ -8,9 +8,7 @@
+ 
+ use std::collections::HashMap;
+ use std::path::PathBuf;
+-
+-use chrono::Utc;
+-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+@@ -23,19 +21,18 @@ use crate::agent::audit::{AuditLog, ToolEvent};
+ use crate::agent::compaction::ContextCompactor;
+ use crate::agent::context::ContextBuilder;
+ use crate::agent::learning::LearningStore;
++use crate::agent::observer::ObservationStore;
+ use crate::agent::reflector::Reflector;
+-use crate::agent::working_memory::WorkingMemoryStore;
+ use crate::agent::subagent::SubagentManager;
+ use crate::agent::thread_repair;
+ use crate::agent::token_budget::TokenBudget;
+ use crate::agent::tools::{
+     CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool, ListDirTool, MessageTool,
+-    CancelCallback, ListCallback, LoopCallback, PipelineCallback, ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry, WaitCallback,
++    ReadFileTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
+     WebFetchTool, WebSearchTool, WriteFileTool,
+ };
+-use crate::agent::pipeline;
+ use crate::bus::events::{InboundMessage, OutboundMessage};
+-use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
++use crate::agent::tool_runner::{self, ToolRunnerConfig};
+ use crate::config::schema::{EmailConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig};
+ use crate::cron::service::CronService;
+ use crate::providers::base::{LLMProvider, StreamChunk};
+@@ -46,11 +43,11 @@ use crate::session::manager::SessionManager;
+ // Shared core (identical across all agents, swappable on /local toggle)
+ // ---------------------------------------------------------------------------
+ 
+-/// Fields that change on `/local` and `/model` — behind `Arc<RwLock<Arc<>>>`.
++/// Core state shared identically across all agent instances.
+ ///
+-/// When the user toggles `/local` or `/model`, a new `SwappableCore` is built
++/// When the user toggles `/local` or `/model`, a new `SharedCore` is built
+ /// and swapped into the handle so every agent sees the change.
+-pub struct SwappableCore {
++pub struct SharedCore {
+     pub provider: Arc<dyn LLMProvider>,
+     pub workspace: PathBuf,
+     pub model: String,
+@@ -62,8 +59,6 @@ pub struct SwappableCore {
+     pub token_budget: TokenBudget,
+     pub compactor: ContextCompactor,
+     pub learning: LearningStore,
+-    pub working_memory: WorkingMemoryStore,
+-    pub working_memory_budget: usize,
+     pub brave_api_key: Option<String>,
+     pub exec_timeout: u64,
+     pub restrict_to_workspace: bool,
+@@ -71,97 +66,28 @@ pub struct SwappableCore {
+     pub memory_provider: Arc<dyn LLMProvider>,
+     pub memory_model: String,
+     pub reflection_threshold: usize,
++    pub learning_turn_counter: AtomicU64,
++    pub last_context_used: AtomicU64,
++    pub last_context_max: AtomicU64,
+     pub is_local: bool,
+     pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
+     pub tool_runner_model: Option<String>,
+     pub tool_delegation_config: ToolDelegationConfig,
+     pub provenance_config: ProvenanceConfig,
+-    pub max_tool_result_chars: usize,
+-    pub session_complete_after_secs: u64,
+-    pub max_message_age_turns: usize,
+-    pub max_history_turns: usize,
+ }
+ 
+-/// Atomic counters that survive core swaps — never behind `RwLock`.
++/// Handle for hot-swapping the shared core.
+ ///
+-/// These counters persist across `/local` and `/model` hot-swaps because
+-/// they live outside the swappable core. Previously they were inside
+-/// `SharedCore` and silently reset to zero on every swap.
+-pub struct RuntimeCounters {
+-    pub learning_turn_counter: AtomicU64,
+-    pub last_context_used: AtomicU64,
+-    pub last_context_max: AtomicU64,
+-    pub last_message_count: AtomicU64,
+-    pub last_working_memory_tokens: AtomicU64,
+-    pub last_tools_called: std::sync::Mutex<Vec<String>>,
+-    /// Tracks whether the delegation provider is alive. Set to `false` when
+-    /// the delegation LLM returns an error, causing subsequent calls to fall
+-    /// through to inline execution. Reset to `true` when the core is rebuilt
+-    /// (e.g. `/local` toggle restarts servers).
+-    pub delegation_healthy: AtomicBool,
+-    /// Counts tool calls since delegation was marked unhealthy. Used to
+-    /// periodically re-probe: every 10 inline calls, try delegation once
+-    /// more in case the server recovered.
+-    pub delegation_retry_counter: AtomicU64,
+-    /// Extended thinking budget in tokens. 0 = disabled, >0 = enabled with that budget.
+-    /// Toggled by `/think` or `/t`. `/think 16000` sets a specific budget.
+-    pub thinking_budget: AtomicU32,
+-}
++/// Readers clone the inner `Arc<SharedCore>` under a brief read lock.
++/// Writers (only `/local` toggle) take the write lock to replace the inner Arc.
++pub type SharedCoreHandle = Arc<std::sync::RwLock<Arc<SharedCore>>>;
+ 
+-impl RuntimeCounters {
+-    pub fn new(max_context_tokens: usize) -> Self {
+-        Self {
+-            learning_turn_counter: AtomicU64::new(0),
+-            last_context_used: AtomicU64::new(0),
+-            last_context_max: AtomicU64::new(max_context_tokens as u64),
+-            last_message_count: AtomicU64::new(0),
+-            last_working_memory_tokens: AtomicU64::new(0),
+-            last_tools_called: std::sync::Mutex::new(Vec::new()),
+-            delegation_healthy: AtomicBool::new(true),
+-            delegation_retry_counter: AtomicU64::new(0),
+-            thinking_budget: AtomicU32::new(0),
+-        }
+-    }
+-}
+-
+-/// Combined handle: cheap to clone (two pointer bumps).
+-///
+-/// `core` is swapped on `/local` and `/model`. `counters` persists forever.
+-#[derive(Clone)]
+-pub struct AgentHandle {
+-    core: Arc<std::sync::RwLock<Arc<SwappableCore>>>,
+-    pub counters: Arc<RuntimeCounters>,
+-}
+-
+-impl AgentHandle {
+-    /// Create a new handle from a swappable core and runtime counters.
+-    pub fn new(core: SwappableCore, counters: Arc<RuntimeCounters>) -> Self {
+-        Self {
+-            core: Arc::new(std::sync::RwLock::new(Arc::new(core))),
+-            counters,
+-        }
+-    }
+-
+-    /// Snapshot the current swappable core (cheap Arc clone under brief read lock).
+-    pub fn swappable(&self) -> Arc<SwappableCore> {
+-        self.core.read().unwrap().clone()
+-    }
+-
+-    /// Replace the swappable core (write lock). Counters are untouched.
+-    pub fn swap_core(&self, new_core: SwappableCore) {
+-        *self.core.write().unwrap() = Arc::new(new_core);
+-    }
+-}
+-
+-// Backward-compatibility alias during migration.
+-pub type SharedCoreHandle = AgentHandle;
+-
+-/// Build a `SwappableCore` from the given parameters.
++/// Build a `SharedCore` from the given parameters.
+ ///
+ /// When `is_local` is true, the compactor and memory operations use a dedicated
+ /// `compaction_provider` if supplied (e.g. a CPU-only Qwen3-0.6B server), or
+ /// fall back to the main (local) provider.
+-pub fn build_swappable_core(
++pub fn build_shared_core(
+     provider: Arc<dyn LLMProvider>,
+     workspace: PathBuf,
+     model: String,
+@@ -177,21 +103,21 @@ pub fn build_swappable_core(
+     compaction_provider: Option<Arc<dyn LLMProvider>>,
+     tool_delegation: ToolDelegationConfig,
+     provenance: ProvenanceConfig,
+-    max_tool_result_chars: usize,
+-    delegation_provider: Option<Arc<dyn LLMProvider>>,
+-) -> SwappableCore {
++) -> SharedCore {
+     let mut context = if is_local {
+         ContextBuilder::new_lite(&workspace)
+     } else {
+         ContextBuilder::new(&workspace)
+     };
+     context.model_name = model.clone();
++    if !is_local {
++        // Only override observation budget for cloud mode (lite mode has its own defaults)
++        context.observation_budget = memory_config.observation_budget;
++    }
+     // Inject provenance verification rules when enabled.
+     if provenance.enabled && provenance.system_prompt_rules {
+         context.provenance_enabled = true;
+     }
+-    // RLM lazy skills: skills loaded as summaries, fetched on demand.
+-    context.lazy_skills = memory_config.lazy_skills;
+     let sessions = SessionManager::new(&workspace);
+ 
+     // When local, use dedicated compaction provider if available, else main provider.
+@@ -231,41 +157,32 @@ pub fn build_swappable_core(
+     };
+ 
+     let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
+-    let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone(), max_context_tokens)
+-        .with_thresholds(memory_config.compaction_threshold_percent, memory_config.compaction_threshold_tokens);
++    let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone(), max_context_tokens);
+     let learning = LearningStore::new(&workspace);
+-    let working_memory = WorkingMemoryStore::new(&workspace);
+ 
+     // Build tool runner provider if delegation is enabled.
+     let (tool_runner_provider, tool_runner_model) = if tool_delegation.enabled {
+-        let tr_provider: Arc<dyn LLMProvider> = if let Some(dp) = delegation_provider {
+-            dp // Auto-spawned local delegation server
+-        } else if let Some(ref tr_cfg) = tool_delegation.provider {
+-            Arc::new(OpenAICompatProvider::new(
+-                &tr_cfg.api_key,
+-                tr_cfg.api_base.as_deref().or(Some("http://localhost:8080/v1")),
+-                None,
+-            ))
++        let tr_model = if tool_delegation.model.is_empty() {
++            model.clone()
+         } else {
+-            provider.clone() // Fallback to main
+-        };
+-        // Pick the delegation model. When config is empty, fall back to the
+-        // delegation provider's own default (e.g. local server's model) rather
+-        // than the main model — the main model may be a special prefix like
+-        // "claude-code/opus" that the delegation server doesn't understand.
+-        let tr_model = if !tool_delegation.model.is_empty() {
+             tool_delegation.model.clone()
+-        } else if model.starts_with("claude-max") {
+-            tr_provider.get_default_model().to_string()
+-        } else {
+-            model.clone()
+         };
++        let tr_provider: Arc<dyn LLMProvider> =
++            if let Some(ref tr_cfg) = tool_delegation.provider {
++                Arc::new(OpenAICompatProvider::new(
++                    &tr_cfg.api_key,
++                    tr_cfg.api_base.as_deref().or(Some("http://localhost:8080/v1")),
++                    None,
++                ))
++            } else {
++                provider.clone()
++            };
+         (Some(tr_provider), Some(tr_model))
+     } else {
+         (None, None)
+     };
+ 
+-    SwappableCore {
++    SharedCore {
+         provider,
+         workspace,
+         model,
+@@ -277,8 +194,6 @@ pub fn build_swappable_core(
+         token_budget,
+         compactor,
+         learning,
+-        working_memory,
+-        working_memory_budget: memory_config.working_memory_budget,
+         brave_api_key,
+         exec_timeout,
+         restrict_to_workspace,
+@@ -286,15 +201,14 @@ pub fn build_swappable_core(
+         memory_provider,
+         memory_model,
+         reflection_threshold: memory_config.reflection_threshold,
++        learning_turn_counter: AtomicU64::new(0),
++        last_context_used: AtomicU64::new(0),
++        last_context_max: AtomicU64::new(max_context_tokens as u64),
+         is_local,
+         tool_runner_provider,
+         tool_runner_model,
+         tool_delegation_config: tool_delegation,
+         provenance_config: provenance,
+-        max_tool_result_chars,
+-        session_complete_after_secs: memory_config.session_complete_after_secs,
+-        max_message_age_turns: memory_config.max_message_age_turns,
+-        max_history_turns: memory_config.max_history_turns,
+     }
+ }
+ 
+@@ -315,6 +229,168 @@ fn history_limit(max_context_tokens: usize) -> usize {
+     limit.clamp(6, 100)
+ }
+ 
++/// Decide whether to expose tools for the current user turn.
++///
++/// For CLI, default to direct text responses unless the user clearly asks for
++/// repo/file/command/web actions. This avoids slow tool-call loops for simple
++/// conversational prompts on local models.
++fn should_enable_tools_for_message(channel: &str, message: &str, voice_mode: bool) -> bool {
++    if voice_mode {
++        return false;
++    }
++
++    // Non-CLI channels keep existing behavior.
++    if channel != "cli" {
++        return true;
++    }
++
++    let lower = message.trim().to_lowercase();
++    if lower.is_empty() {
++        return false;
++    }
++
++    const COMMAND_PREFIXES: &[&str] = &[
++        "/", "!", "git ", "cargo ", "npm ", "pnpm ", "yarn ", "pip ", "uv ", "python ",
++        "node ", "make ", "cmake ", "rg ", "grep ", "ls ", "cat ", "pwd ", "cd ", "cp ",
++        "mv ", "rm ",
++    ];
++    if COMMAND_PREFIXES.iter().any(|p| lower.starts_with(p)) {
++        return true;
++    }
++
++    const TOOL_INTENT_MARKERS: &[&str] = &[
++        "read file",
++        "open file",
++        "write file",
++        "edit file",
++        "create file",
++        "update file",
++        "delete file",
++        "list dir",
++        "directory",
++        "folder",
++        "repo",
++        "repository",
++        "codebase",
++        "run command",
++        "shell command",
++        "terminal command",
++        "execute",
++        "build",
++        "compile",
++        "run tests",
++        "test suite",
++        "failing test",
++        "stack trace",
++        "fix bug",
++        "implement",
++        "patch",
++        "diff",
++        "commit",
++        "branch",
++        "pull request",
++        "search web",
++        "look up",
++        "http://",
++        "https://",
++        "url",
++        "download",
++        "install",
++    ];
++    if TOOL_INTENT_MARKERS.iter().any(|m| lower.contains(m)) {
++        return true;
++    }
++
++    lower.contains("```")
++        || lower.contains("src/")
++        || lower.contains(".rs")
++        || lower.contains(".toml")
++        || lower.contains(".json")
++}
++
++/// Heuristic filter for low-value assistant replies that can poison local
++/// conversational history (identity loops or malformed numeric noise).
++fn is_low_value_assistant_history(content: &str) -> bool {
++    let text = content.trim();
++    if text.is_empty() {
++        return true;
++    }
++
++    let lower = text.to_lowercase();
++    const SELF_INTRO_PATTERNS: &[&str] = &[
++        "i'm nanobot",
++        "i am nanobot",
++        "your ai assistant",
++        "your local ai assistant",
++        "how can i help you today",
++        "what's on your mind today",
++        "what can i assist you with today",
++        "i'm ready to help",
++        "i'm here to help",
++        "want to chat",
++    ];
++    if SELF_INTRO_PATTERNS
++        .iter()
++        .any(|pattern| lower.contains(pattern))
++        && text.chars().count() <= 320
++    {
++        return true;
++    }
++
++    let mut alpha = 0usize;
++    let mut digits = 0usize;
++    let mut punctuation = 0usize;
++    let mut total = 0usize;
++    for ch in text.chars() {
++        total += 1;
++        if ch.is_alphabetic() {
++            alpha += 1;
++        } else if ch.is_ascii_digit() {
++            digits += 1;
++        } else if ch.is_ascii_punctuation() {
++            punctuation += 1;
++        }
++    }
++
++    if total < 160 {
++        return false;
++    }
++    let alpha_ratio = alpha as f64 / total as f64;
++    let noisy_ratio = (digits + punctuation) as f64 / total as f64;
++    alpha_ratio < 0.22 && noisy_ratio > 0.60
++}
++
++/// For plain conversational CLI turns, trim poisoned assistant turns and keep a
++/// short recent window to reduce style-lock and latency.
++fn prepare_history_for_conversational_cli(mut history: Vec<Value>) -> Vec<Value> {
++    history.retain(|msg| {
++        let role = msg
++            .get("role")
++            .and_then(|v| v.as_str())
++            .unwrap_or_default();
++        if role == "assistant" {
++            return false;
++        }
++        if role == "tool" {
++            let content = msg
++                .get("content")
++                .and_then(|v| v.as_str())
++                .unwrap_or_default();
++            return !is_low_value_assistant_history(content);
++        }
++        if role != "user" {
++            return true;
++        }
++        true
++    });
++
++    const MAX_RECENT_MESSAGES: usize = 8;
++    if history.len() > MAX_RECENT_MESSAGES {
++        history = history[history.len() - MAX_RECENT_MESSAGES..].to_vec();
++    }
++    history
++}
++
+ // ---------------------------------------------------------------------------
+ // Background compaction helpers
+ // ---------------------------------------------------------------------------
+@@ -361,9 +437,9 @@ impl AgentLoopShared {
+     /// Build a fresh [`ToolRegistry`] with context-sensitive tools (message,
+     /// spawn, cron) pre-configured for a specific channel/chat_id.
+     ///
+-    /// Takes a snapshot of `SwappableCore` so the registry is consistent for the
++    /// Takes a snapshot of `SharedCore` so the registry is consistent for the
+     /// entire message processing.
+-    async fn build_tools(&self, core: &SwappableCore, channel: &str, chat_id: &str) -> ToolRegistry {
++    async fn build_tools(&self, core: &SharedCore, channel: &str, chat_id: &str) -> ToolRegistry {
+         let mut tools = ToolRegistry::new();
+ 
+         // File system tools (stateless).
+@@ -379,19 +455,12 @@ impl AgentLoopShared {
+             None,
+             None,
+             core.restrict_to_workspace,
+-            core.max_tool_result_chars,
+         )));
+ 
+         // Web (stateless config).
+         tools.register(Box::new(WebSearchTool::new(core.brave_api_key.clone(), 5)));
+         tools.register(Box::new(WebFetchTool::new(50_000)));
+ 
+-        // Memory recall (stateless config).
+-        tools.register(Box::new(RecallTool::new(&core.workspace)));
+-
+-        // Skill reader — on-demand skill loading (RLM lazy mode).
+-        tools.register(Box::new(ReadSkillTool::new(&core.workspace)));
+-
+         // Message tool - context baked in.
+         let outbound_tx_clone = self.bus_outbound_tx.clone();
+         let send_cb: SendCallback = Arc::new(move |msg: OutboundMessage| {
+@@ -406,137 +475,13 @@ impl AgentLoopShared {
+ 
+         // Spawn tool - context baked in.
+         let subagents_ref = self.subagents.clone();
+-        let spawn_cb: SpawnCallback = Arc::new(move |task, label, agent, model, ch, cid, working_dir| {
++        let spawn_cb: SpawnCallback = Arc::new(move |task, label, ch, cid| {
+             let mgr = subagents_ref.clone();
+-            Box::pin(async move { mgr.spawn(task, label, agent, model, ch, cid, working_dir).await })
+-        });
+-        let subagents_ref2 = self.subagents.clone();
+-        let list_cb: ListCallback = Arc::new(move || {
+-            let mgr = subagents_ref2.clone();
+-            Box::pin(async move {
+-                let running = mgr.list_running().await;
+-                if running.is_empty() {
+-                    "No subagents currently running.".to_string()
+-                } else {
+-                    let mut out = format!("{} subagent(s) running:\n", running.len());
+-                    for info in &running {
+-                        let elapsed = info.started_at.elapsed().as_secs();
+-                        out.push_str(&format!(
+-                            "  • {} (id: {}) — running for {}s\n",
+-                            info.label, info.task_id, elapsed
+-                        ));
+-                    }
+-                    out
+-                }
+-            })
+-        });
+-        let subagents_ref3 = self.subagents.clone();
+-        let cancel_cb: CancelCallback = Arc::new(move |task_id: String| {
+-            let mgr = subagents_ref3.clone();
+-            Box::pin(async move {
+-                if mgr.cancel(&task_id).await {
+-                    format!("Subagent '{}' cancelled.", task_id)
+-                } else {
+-                    format!("No running subagent found matching '{}'.", task_id)
+-                }
+-            })
+-        });
+-        let subagents_ref4 = self.subagents.clone();
+-        let wait_cb: WaitCallback = Arc::new(move |task_id: String, timeout_secs: u64| {
+-            let mgr = subagents_ref4.clone();
+-            Box::pin(async move {
+-                let timeout = std::time::Duration::from_secs(timeout_secs);
+-                mgr.wait_for(&task_id, timeout).await
+-            })
++            Box::pin(async move { mgr.spawn(task, label, ch, cid).await })
+         });
+-        // Pipeline callback: parse steps JSON, build PipelineConfig, run pipeline.
+-        // Uses the delegation provider/model (cheap) for pipeline LLM calls.
+-        let pipeline_provider = core.tool_runner_provider.clone()
+-            .unwrap_or_else(|| core.provider.clone());
+-        let pipeline_model = core.tool_runner_model.clone()
+-            .unwrap_or_else(|| core.model.clone());
+-        let pipeline_workspace = core.workspace.clone();
+-        let pipeline_cb: PipelineCallback = Arc::new(move |steps_json: String, ahead_by_k: usize| {
+-            let provider = pipeline_provider.clone();
+-            let model = pipeline_model.clone();
+-            let workspace = pipeline_workspace.clone();
+-            Box::pin(async move {
+-                // Parse steps from JSON.
+-                let steps: Vec<serde_json::Value> = match serde_json::from_str(&steps_json) {
+-                    Ok(s) => s,
+-                    Err(e) => return format!("Error parsing pipeline steps: {}", e),
+-                };
+-                let pipeline_steps: Vec<pipeline::PipelineStep> = steps
+-                    .iter()
+-                    .enumerate()
+-                    .map(|(i, s)| pipeline::PipelineStep {
+-                        index: i,
+-                        prompt: s["prompt"].as_str().unwrap_or("").to_string(),
+-                        expected: s["expected"].as_str().map(|s| s.to_string()),
+-                        tools: s["tools"].as_array().map(|arr| {
+-                            arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+-                        }),
+-                        max_iterations: s["max_iterations"].as_u64().map(|n| n as u32),
+-                    })
+-                    .collect();
+-                if pipeline_steps.is_empty() {
+-                    return "Error: no valid pipeline steps provided.".to_string();
+-                }
+-                let config = pipeline::PipelineConfig {
+-                    pipeline_id: format!("pipe-{}", chrono::Utc::now().timestamp_millis() % 100_000_000),
+-                    steps: pipeline_steps,
+-                    ahead_by_k,
+-                    max_voters: if ahead_by_k > 0 { ahead_by_k * 2 + 1 } else { 1 },
+-                    model: model.clone(),
+-                };
+-                let result = pipeline::run_pipeline(&config, provider.as_ref(), &workspace).await;
+-                // Format result for the agent.
+-                let mut output = format!(
+-                    "Pipeline '{}' completed: {}/{} steps\n",
+-                    result.pipeline_id, result.steps_completed, result.steps_total
+-                );
+-                for sr in &result.results {
+-                    let correct_str = match sr.correct {
+-                        Some(true) => " ✓",
+-                        Some(false) => " ✗",
+-                        None => "",
+-                    };
+-                    output.push_str(&format!(
+-                        "  Step {}: {}{} ({}ms, {} voters)\n",
+-                        sr.index,
+-                        sr.answer.chars().take(200).collect::<String>(),
+-                        correct_str,
+-                        sr.duration_ms,
+-                        sr.voters_used
+-                    ));
+-                }
+-                output.push_str(&format!("Total time: {}ms", result.total_duration_ms));
+-                output
+-            })
+-        });
+-
+-        // Loop callback: run an autonomous refinement loop via SubagentManager.
+-        let subagents_ref5 = self.subagents.clone();
+-        let loop_cb: LoopCallback = Arc::new(move |task: String,
+-                                                     max_rounds: u32,
+-                                                     tools_filter: Option<Vec<String>>,
+-                                                     stop_condition: Option<String>,
+-                                                     model: Option<String>,
+-                                                     working_dir: Option<String>| {
+-            let mgr = subagents_ref5.clone();
+-            Box::pin(async move {
+-                mgr.run_loop(task, max_rounds, tools_filter, stop_condition, model, working_dir).await
+-            })
+-        });
+-
+         let spawn_tool = Arc::new(SpawnTool::new());
+-        // Set callbacks and context before registering so they're ready for use.
++        // Set callback and context before registering so they're ready for use.
+         spawn_tool.set_callback(spawn_cb).await;
+-        spawn_tool.set_list_callback(list_cb).await;
+-        spawn_tool.set_cancel_callback(cancel_cb).await;
+-        spawn_tool.set_wait_callback(wait_cb).await;
+-        spawn_tool.set_pipeline_callback(pipeline_cb).await;
+-        spawn_tool.set_loop_callback(loop_cb).await;
+         spawn_tool.set_context(channel, chat_id).await;
+         tools.register(Box::new(SpawnToolProxy(spawn_tool)));
+ 
+@@ -569,15 +514,12 @@ impl AgentLoopShared {
+         msg: &InboundMessage,
+         text_delta_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+         tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
+-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+-        mut priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+     ) -> Option<OutboundMessage> {
+         let streaming = text_delta_tx.is_some();
+ 
+         // Snapshot core — instant Arc clone under brief read lock.
+-        let core = self.core_handle.swappable();
+-        let counters = &self.core_handle.counters;
+-        let turn_count = counters.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
++        let core = self.core_handle.read().unwrap().clone();
++        let turn_count = core.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
+         if turn_count % 50 == 0 {
+             core.learning.prune();
+         }
+@@ -604,18 +546,34 @@ impl AgentLoopShared {
+             None
+         };
+ 
++        let is_voice_message = msg
++            .metadata
++            .get("voice_message")
++            .and_then(|v| v.as_bool())
++            .unwrap_or(false);
++        let voice_mode = msg.channel == "voice" || is_voice_message;
++        let tools_enabled = should_enable_tools_for_message(&msg.channel, &msg.content, voice_mode);
++
+         // Build per-message tools with context baked in.
+         let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
+ 
+-        // Get session history. Track count so we know where new messages start.
+-        let history = core.sessions.get_history(
++        // Get session history.
++        let mut history = core
++            .sessions
++            .get_history(
+                 &session_key,
+                 history_limit(core.token_budget.max_context()),
+-                core.max_history_turns,
+-            ).await;
+-        // Track where new (unsaved) messages start. Updated after compaction
+-        // swaps to avoid re-persisting already-saved messages.
+-        let mut new_start = 1 + history.len();
++            )
++            .await;
++        if msg.channel == "cli" && !tools_enabled {
++            let original_len = history.len();
++            history = prepare_history_for_conversational_cli(history);
++            debug!(
++                "CLI conversational history prepared: {} -> {} messages",
++                original_len,
++                history.len()
++            );
++        }
+ 
+         // Extract media paths.
+         let media_paths: Vec<String> = msg
+@@ -630,11 +588,6 @@ impl AgentLoopShared {
+             .unwrap_or_default();
+ 
+         // Build messages.
+-        let is_voice_message = msg
+-            .metadata
+-            .get("voice_message")
+-            .and_then(|v| v.as_bool())
+-            .unwrap_or(false);
+         let detected_language = msg
+             .metadata
+             .get("detected_language")
+@@ -655,51 +608,34 @@ impl AgentLoopShared {
+             detected_language.as_deref(),
+         );
+ 
+-        // Inject per-session working memory into the system message.
+-        if core.memory_enabled {
+-            let mut wm = core.working_memory.get_context(&session_key, core.working_memory_budget);
+-            // Append learning context (tool patterns) if available.
+-            let learning_ctx = core.learning.get_learning_context();
+-            if !learning_ctx.is_empty() {
+-                wm.push_str("\n\n## Tool Patterns\n\n");
+-                wm.push_str(&learning_ctx);
+-            }
+-            if !wm.is_empty() {
+-                if let Some(system_content) = messages.first().and_then(|m| m["content"].as_str()).map(|s| s.to_string()) {
+-                    let enriched = format!(
+-                        "{}\n\n---\n\n# Working Memory (Current Session)\n\n{}",
+-                        system_content, wm
+-                    );
+-                    messages[0]["content"] = Value::String(enriched);
+-                }
+-            }
+-        }
+-
+-        // Tag the current user message (last in the array) with turn number
+-        // for age-based eviction in trim_to_fit.
+-        if let Some(last) = messages.last_mut() {
+-            last["_turn"] = json!(turn_count);
+-        }
+-
+         // Track which tools have been used for smart tool selection.
+         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+ 
+         let mut final_content = String::new();
+-
+-        // Collect tool call details for turn audit summary.
+-        let mut turn_tool_entries: Vec<crate::agent::audit::TurnToolEntry> = Vec::new();
++        let max_iterations = if voice_mode || !tools_enabled {
++            1
++        } else {
++            core.max_iterations
++        };
++        let request_max_tokens = if voice_mode {
++            core.max_tokens.min(192)
++        } else {
++            core.max_tokens
++        };
+ 
+         // Background compaction state.
+         let compaction_slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>> =
+             Arc::new(tokio::sync::Mutex::new(None));
+         let compaction_in_flight = Arc::new(AtomicBool::new(false));
+ 
+-        // Response boundary: after exec/write_file, force a text response.
+-        let mut force_response = false;
+-
+         // Agent loop: call LLM, handle tool calls, repeat.
+-        for iteration in 0..core.max_iterations {
+-            debug!("Agent iteration{} {}/{}", if streaming { " (streaming)" } else { "" }, iteration + 1, core.max_iterations);
++        for iteration in 0..max_iterations {
++            debug!(
++                "Agent iteration{} {}/{}",
++                if streaming { " (streaming)" } else { "" },
++                iteration + 1,
++                max_iterations
++            );
+ 
+             // Check if background compaction finished — swap in compacted messages.
+             if let Ok(mut guard) = compaction_slot.try_lock() {
+@@ -711,46 +647,21 @@ impl AgentLoopShared {
+                         messages.len().saturating_sub(pending.watermark)
+                     );
+                     apply_compaction_result(&mut messages, pending);
+-                    // After compaction, all messages in the array are "new" from
+-                    // the perspective of persistence (the session file was rebuilt).
+-                    new_start = messages.len();
+                 }
+             }
+ 
+-            // Response boundary: suppress exec/write_file tools to force text output.
+-            let boundary_active = force_response
+-                && core.provenance_config.enabled
+-                && core.provenance_config.response_boundary;
+-            if boundary_active {
+-                // Use "user" role, not "system". The Anthropic OpenAI-compat
+-                // endpoint strips mid-conversation system messages, which would
+-                // leave the conversation ending with an assistant message and
+-                // trigger a "does not support assistant message prefill" error.
+-                let remaining = core.max_iterations.saturating_sub(iteration as u32 + 1);
+-                let budget_note = if remaining <= 5 {
+-                    format!(" [Budget: {}/{} iterations remaining — wrap up soon]", remaining, core.max_iterations)
+-                } else {
+-                    String::new()
+-                };
+-                messages.push(json!({
+-                    "role": "user",
+-                    "content": format!(
+-                        "[system] You just executed a tool that modifies files or runs commands. \
+-                         Report the result to the user before making additional tool calls.{budget_note}"
+-                    )
+-                }));
+-                force_response = false;
+-            }
+-
+             // Filter tool definitions to relevant tools.
+-            let mut tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
+-            if boundary_active {
++            let mut tool_defs = if tools_enabled {
++                tools.get_relevant_definitions(&messages, &used_tools)
++            } else {
++                Vec::new()
++            };
++            if msg.channel == "cli" || msg.channel == "voice" {
+                 tool_defs.retain(|def| {
+-                    let name = def
+-                        .pointer("/function/name")
+-                        .and_then(|v| v.as_str())
+-                        .unwrap_or("");
+-                    name != "exec" && name != "write_file"
++                    def.get("function")
++                        .and_then(|f| f.get("name"))
++                        .and_then(|n| n.as_str())
++                        != Some("message")
+                 });
+             }
+             let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+@@ -760,9 +671,18 @@ impl AgentLoopShared {
+             };
+ 
+             // Trim messages to fit context budget.
+-            let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
+-            messages = core.token_budget.trim_to_fit_with_age(
+-                &messages, tool_def_tokens, turn_count, core.max_message_age_turns,
++            let tool_def_tokens = core
++                .token_budget
++                .estimate_tool_def_tokens_with_fallback(tool_defs_opt.unwrap_or(&[]));
++            messages = core.token_budget.trim_to_fit(&messages, tool_def_tokens);
++            debug!(
++                "LLM request stats: messages={}, est_message_tokens={}, tool_defs={}, est_tool_tokens={}, voice_mode={}, tools_enabled={}",
++                messages.len(),
++                core.token_budget.estimate_tokens_with_fallback(&messages),
++                tool_defs.len(),
++                tool_def_tokens,
++                voice_mode,
++                tools_enabled
+             );
+ 
+             // Spawn background compaction when threshold exceeded.
+@@ -785,7 +705,10 @@ impl AgentLoopShared {
+                         .await;
+                     if bg_core.memory_enabled {
+                         if let Some(ref summary) = result.observation {
+-                            bg_core.working_memory.update_from_compaction(&bg_session_key, summary);
++                            let observer = ObservationStore::new(&bg_core.workspace);
++                            if let Err(e) = observer.save(summary, &bg_session_key, Some(&bg_channel)) {
++                                tracing::warn!("Failed to save observation: {}", e);
++                            }
+                         }
+                     }
+                     if result.messages.len() < bg_messages.len() {
+@@ -798,40 +721,7 @@ impl AgentLoopShared {
+             // Repair any protocol violations before calling the LLM.
+             thread_repair::repair_messages(&mut messages);
+ 
+-            // Local models via --jinja may require strict user/assistant alternation.
+-            // Convert tool messages to user messages and tool_calls to text.
+-            if core.is_local {
+-                thread_repair::repair_for_strict_alternation(&mut messages);
+-            }
+-
+-            // Pre-flight context size check: emergency trim if we're about to
+-            // exceed the model's context window. The 95% threshold leaves room
+-            // for the response tokens.
+-            let estimated = TokenBudget::estimate_tokens(&messages);
+-            let max_ctx = core.token_budget.max_context();
+-            if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
+-                warn!(
+-                    "Pre-flight check: {}tok > 95% of {}tok — emergency trim",
+-                    estimated, max_ctx
+-                );
+-                // tool_def_tokens=0 is conservative (trims more aggressively).
+-                messages = core.token_budget.trim_to_fit(&messages, 0);
+-                // Re-run repair after trim in case truncation broke protocol.
+-                thread_repair::repair_messages(&mut messages);
+-                if core.is_local {
+-                    thread_repair::repair_for_strict_alternation(&mut messages);
+-                }
+-            }
+-
+             // Call LLM — streaming or blocking depending on mode.
+-            let thinking_budget = {
+-                let stored = counters.thinking_budget.load(Ordering::Relaxed);
+-                if stored > 0 {
+-                    Some(stored)
+-                } else {
+-                    None
+-                }
+-            };
+             let response = if let Some(ref delta_tx) = text_delta_tx {
+                 // Streaming path: forward text deltas as they arrive.
+                 let mut stream = match core
+@@ -840,9 +730,8 @@ impl AgentLoopShared {
+                         &messages,
+                         tool_defs_opt,
+                         Some(&core.model),
+-                        core.max_tokens,
++                        request_max_tokens,
+                         core.temperature,
+-                        thinking_budget,
+                     )
+                     .await
+                 {
+@@ -855,28 +744,12 @@ impl AgentLoopShared {
+                 };
+ 
+                 let mut streamed_response = None;
+-                let mut in_thinking = false;
+                 while let Some(chunk) = stream.rx.recv().await {
+                     match chunk {
+-                        StreamChunk::ThinkingDelta(delta) => {
+-                            // Render thinking tokens as dimmed text
+-                            if !in_thinking {
+-                                in_thinking = true;
+-                                let _ = delta_tx.send("\x1b[90m🧠 \x1b[2m".to_string());
+-                            }
+-                            let _ = delta_tx.send(delta);
+-                        }
+                         StreamChunk::TextDelta(delta) => {
+-                            if in_thinking {
+-                                in_thinking = false;
+-                                let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+-                            }
+                             let _ = delta_tx.send(delta);
+                         }
+                         StreamChunk::Done(resp) => {
+-                            if in_thinking {
+-                                let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+-                            }
+                             streamed_response = Some(resp);
+                         }
+                     }
+@@ -898,9 +771,8 @@ impl AgentLoopShared {
+                         &messages,
+                         tool_defs_opt,
+                         Some(&core.model),
+-                        core.max_tokens,
++                        request_max_tokens,
+                         core.temperature,
+-                        thinking_budget,
+                     )
+                     .await
+                 {
+@@ -913,69 +785,20 @@ impl AgentLoopShared {
+                 }
+             };
+ 
+-            // Check for LLM provider errors before processing the response.
+-            // openai_compat.rs wraps errors as Ok(LLMResponse { finish_reason: "error", ... })
+-            // so they slip through as normal responses unless explicitly caught.
+-            if response.finish_reason == "error" {
+-                let err_msg = response.content.as_deref().unwrap_or("Unknown LLM error");
+-                error!("LLM provider error: {}", err_msg);
+-
+-                // In local mode, check if the server is still alive.
+-                if core.is_local {
+-                    if let Some(base) = core.provider.get_api_base() {
+-                        if !crate::server::check_health(base).await {
+-                            error!("Local LLM server is down!");
+-                            final_content = "[LLM Error] Local server crashed. Use /restart or /local to recover.".into();
+-                            break;
+-                        }
+-                    }
+-                }
+-
+-                final_content = format!("[LLM Error] {}", err_msg);
+-                break;
+-            }
+-
+             if response.has_tool_calls() {
+-                // Context pressure check: if high, log a warning. The correct
+-                // response is compaction, NOT spawning the main model as its
+-                // own tool runner (which doubles cost for no benefit).
+-                let context_tokens = TokenBudget::estimate_tokens(&messages);
+-                let max_tokens = core.token_budget.max_context();
+-                let pressure = if max_tokens > 0 {
+-                    context_tokens as f64 / max_tokens as f64
+-                } else {
+-                    0.0
+-                };
+-                if pressure > 0.7 && !core.tool_delegation_config.enabled {
+-                    debug!(
+-                        "Context pressure {:.0}% but delegation disabled — consider enabling delegation or compaction",
+-                        pressure * 100.0,
+-                    );
++                if !tools_enabled {
++                    debug!("Model emitted tool calls while tools are disabled; returning direct response");
++                    final_content = response.content.unwrap_or_else(|| {
++                        "I could not produce a direct response without tools. Please retry."
++                            .to_string()
++                    });
++                    break;
+                 }
+ 
+                 // Check if we should delegate to the tool runner.
+-                // Skip delegation if the provider was previously marked dead.
+-                let mut delegation_alive = counters.delegation_healthy.load(Ordering::Relaxed);
+-                // Periodically re-probe: every 10 inline calls, try delegation
+-                // once in case the server recovered (e.g. user restarted it).
+-                if !delegation_alive && core.tool_delegation_config.enabled {
+-                    let retries = counters.delegation_retry_counter.fetch_add(1, Ordering::Relaxed);
+-                    if retries > 0 && retries % 10 == 0 {
+-                        info!("Re-probing delegation provider (attempt {} since failure)", retries);
+-                        delegation_alive = true; // try this one time
+-                    } else {
+-                        debug!("Delegation provider unhealthy — inline execution ({}/10 until re-probe)", retries % 10);
+-                    }
+-                }
+-                let should_delegate = core.tool_delegation_config.enabled
+-                    && delegation_alive;
+-                // Resolve provider+model from explicit config.
+-                let delegation_provider = core.tool_runner_provider.clone();
+-                let delegation_model = core.tool_runner_model.clone();
+-
+-                if should_delegate {
++                if core.tool_delegation_config.enabled {
+                     if let (Some(ref tr_provider), Some(ref tr_model)) =
+-                        (&delegation_provider, &delegation_model)
++                        (&core.tool_runner_provider, &core.tool_runner_model)
+                     {
+                         debug!(
+                             "Delegating {} tool calls to tool runner (model: {})",
+@@ -983,51 +806,11 @@ impl AgentLoopShared {
+                             tr_model
+                         );
+ 
+-                        // Local delegation providers (llama-server) require
+-                        // user-last messages for tool→generate flow.
+-                        let needs_user_cont = core.is_local;
+-
+-                        // Detect [VERBATIM] marker: the main model is asking for
+-                        // raw tool output instead of a delegation summary.
+-                        let verbatim = response.content.as_ref()
+-                            .map(|c| c.contains("[VERBATIM]"))
+-                            .unwrap_or(false);
+-
+-                        // The delegation model typically has a small context (4K tokens).
+-                        // Cap tool results to ~1500 tokens (~6000 chars) so the system
+-                        // prompt, tool call messages, and response all fit comfortably.
+-                        // Use the main model's limit only if it's already smaller.
+-                        let delegation_result_limit = core.max_tool_result_chars
+-                            .min(6000);
+-
+                         let runner_config = ToolRunnerConfig {
+                             provider: tr_provider.clone(),
+                             model: tr_model.clone(),
+                             max_iterations: core.tool_delegation_config.max_iterations,
+                             max_tokens: core.tool_delegation_config.max_tokens,
+-                            needs_user_continuation: needs_user_cont,
+-                            max_tool_result_chars: delegation_result_limit,
+-                            short_circuit_chars: 200,
+-                            depth: 0,
+-                            cancellation_token: cancellation_token.clone(),
+-                            verbatim,
+-                            budget: {
+-                                let cost_budget = core.tool_delegation_config.cost_budget;
+-                                if cost_budget > 0.0 {
+-                                    let prices = crate::agent::model_prices::ModelPrices::load().await;
+-                                    Some(Budget::root_with_cost(
+-                                        core.tool_delegation_config.max_iterations,
+-                                        2,
+-                                        cost_budget,
+-                                        std::sync::Arc::new(prices),
+-                                    ))
+-                                } else {
+-                                    Some(Budget::root(
+-                                        core.tool_delegation_config.max_iterations,
+-                                        2,
+-                                    ))
+-                                }
+-                            },
+                         };
+ 
+                         // Emit tool call start events for delegated calls.
+@@ -1046,69 +829,13 @@ impl AgentLoopShared {
+                             }
+                         }
+ 
+-                        // Build task description for the delegation model.
+-                        // Use the main model's content (alongside tool calls) as
+-                        // instructions — it naturally contains intent, constraints,
+-                        // and expected format. Fall back to the user message if
+-                        // the main model didn't produce text.
+-                        let tool_names: Vec<&str> = response.tool_calls
+-                            .iter()
+-                            .map(|tc| tc.name.as_str())
+-                            .collect();
+-                        let instructions = response.content.as_deref()
+-                            .filter(|c| !c.trim().is_empty())
+-                            .map(|c| c.chars().take(400).collect::<String>())
+-                            .unwrap_or_else(|| {
+-                                msg.content.chars().take(300).collect::<String>()
+-                            });
+-                        let task_desc = format!(
+-                            "Instructions: {}\nTools to execute: {}",
+-                            instructions,
+-                            tool_names.join(", ")
+-                        );
+-
+-                        let delegation_start = std::time::Instant::now();
+                         let run_result = tool_runner::run_tool_loop(
+                             &runner_config,
+                             &response.tool_calls,
+                             &tools,
+-                            &task_desc,
++                            &msg.content,
+                         )
+                         .await;
+-                        let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
+-
+-                        // If the runner returned no summary, diagnose why and
+-                        // mark unhealthy so future calls go inline.
+-                        if run_result.summary.is_none() && !run_result.tool_results.is_empty() {
+-                            let reason = if let Some(ref err) = run_result.error {
+-                                format!("delegation model errored: {}", err)
+-                            } else if delegation_elapsed_ms > 30_000 {
+-                                "delegation model timed out (>30s)".to_string()
+-                            } else {
+-                                "delegation model returned empty".to_string()
+-                            };
+-                            let results_preview: String = run_result.tool_results
+-                                .first()
+-                                .map(|(_, name, data)| {
+-                                    format!("[{}]: {}", name, data.chars().take(200).collect::<String>())
+-                                })
+-                                .unwrap_or_default();
+-                            warn!(
+-                                "Delegation failed — {}. model={}, iterations={}, results={}, preview={}. \
+-                                 Marking unhealthy. Restart servers or toggle /local to recover.",
+-                                reason,
+-                                tr_model,
+-                                run_result.iterations_used,
+-                                run_result.tool_results.len(),
+-                                results_preview,
+-                            );
+-                            counters.delegation_healthy.store(false, Ordering::Relaxed);
+-                        } else if !counters.delegation_healthy.load(Ordering::Relaxed) {
+-                            // Re-probe succeeded — server recovered!
+-                            info!("Delegation provider recovered — re-enabling delegation");
+-                            counters.delegation_healthy.store(true, Ordering::Relaxed);
+-                            counters.delegation_retry_counter.store(0, Ordering::Relaxed);
+-                        }
+ 
+                         debug!(
+                             "Tool runner completed: {} results in {} iterations",
+@@ -1139,108 +866,54 @@ impl AgentLoopShared {
+                         );
+ 
+                         // Add tool results from the runner to the main context.
+-                        // In slim mode, truncate results to save context budget —
+-                        // the runner's summary carries the meaning.
+-                        // Verbatim mode: never slim, the agent wants full output.
+-                        let slim = !verbatim
+-                            && core.tool_delegation_config.enabled
+-                            && core.tool_delegation_config.slim_results;
+-                        let preview_max = core.tool_delegation_config.max_result_preview_chars;
+-
++                        // We need to add results for the original tool calls first.
+                         for tc in &response.tool_calls {
+                             // Find the matching result from the runner.
+-                            let full_data = run_result
++                            let result_data = run_result
+                                 .tool_results
+                                 .iter()
+                                 .find(|(id, _, _)| id == &tc.id)
+                                 .map(|(_, _, data)| data.as_str())
+                                 .unwrap_or("(no result)");
+-
+-                            let injected = if slim && full_data.len() > preview_max {
+-                                format!(
+-                                    "{}… ({} chars total)",
+-                                    &full_data[..preview_max],
+-                                    full_data.len()
+-                                )
+-                            } else {
+-                                full_data.to_string()
+-                            };
+-
+-                            if core.provenance_config.enabled {
+-                                ContextBuilder::add_tool_result_immutable(
+-                                    &mut messages,
+-                                    &tc.id,
+-                                    &tc.name,
+-                                    &injected,
+-                                );
+-                            } else {
+-                                ContextBuilder::add_tool_result(
+-                                    &mut messages,
+-                                    &tc.id,
+-                                    &tc.name,
+-                                    &injected,
+-                                );
+-                            }
++                            ContextBuilder::add_tool_result(
++                                &mut messages,
++                                &tc.id,
++                                &tc.name,
++                                result_data,
++                            );
+                             used_tools.insert(tc.name.clone());
+                         }
+ 
+-                        // Inject the runner's summary so the main LLM knows what
+-                        // the tools found without needing full output.
+-                        let has_extra =
+-                            run_result.tool_results.len() > response.tool_calls.len();
+-                        if run_result.summary.is_some() || has_extra {
+-                            let summary_text = if has_extra {
+-                                let extra = tool_runner::format_results_for_context(
+-                                    &run_result,
+-                                    preview_max,
+-                                );
+-                                format!(
+-                                    "[Tool runner executed {} additional calls]\n{}",
+-                                    run_result.tool_results.len()
+-                                        - response.tool_calls.len(),
+-                                    extra
+-                                )
+-                            } else {
+-                                run_result
+-                                    .summary
+-                                    .clone()
+-                                    .unwrap_or_default()
+-                            };
+-                            if !summary_text.is_empty() {
+-                                // Inject as user role, not assistant. This is
+-                                // injected context about what the tool runner did,
+-                                // not an actual LLM response. Using assistant role
+-                                // causes "assistant message prefill" errors when
+-                                // the Anthropic API sees the conversation ending
+-                                // with an assistant message.
+-                                let prefix = if verbatim {
+-                                    "[tool runner output]"
+-                                } else {
+-                                    "[tool runner summary]"
+-                                };
+-                                messages.push(json!({
+-                                    "role": "user",
+-                                    "content": format!("{} {}", prefix, summary_text)
+-                                }));
+-                            }
++                        // If the runner executed additional tool calls beyond the
++                        // initial ones, inject a summary as a system-like message.
++                        if run_result.tool_results.len() > response.tool_calls.len() {
++                            let extra_summary =
++                                tool_runner::format_results_for_context(&run_result);
++                            ContextBuilder::add_assistant_message(
++                                &mut messages,
++                                Some(&format!(
++                                    "[Tool runner executed {} additional tool calls]\n{}",
++                                    run_result.tool_results.len() - response.tool_calls.len(),
++                                    extra_summary
++                                )),
++                                None,
++                            );
+                         }
+ 
+                         // Record learning + audit for all tool results.
+                         let executor = format!("tool_runner:{}", tr_model);
+-                        let n_results = run_result.tool_results.len().max(1) as u64;
+                         for (tool_call_id, tool_name, data) in &run_result.tool_results {
+                             let ok = !data.starts_with("Error:");
+-                            // Distribute total delegation time across tool results.
+-                            let per_tool_ms = delegation_elapsed_ms / n_results;
+ 
+                             // Emit tool call end event.
+                             if let Some(ref tx) = tool_event_tx {
++                                let preview: String = data.chars().take(80).collect();
+                                 let _ = tx.send(ToolEvent::CallEnd {
+                                     tool_name: tool_name.clone(),
+                                     tool_call_id: tool_call_id.clone(),
+-                                    result_data: data.clone(),
++                                    result_preview: preview,
+                                     ok,
+-                                    duration_ms: per_tool_ms,
++                                    duration_ms: 0,
+                                 });
+                             }
+ 
+@@ -1252,7 +925,7 @@ impl AgentLoopShared {
+                                     &json!({}), // args not available from runner results
+                                     data,
+                                     ok,
+-                                    per_tool_ms,
++                                    0, // duration not tracked per-tool in runner
+                                     &executor,
+                                 );
+                             }
+@@ -1269,20 +942,6 @@ impl AgentLoopShared {
+                             used_tools.insert(tool_name.clone());
+                         }
+ 
+-                        // Set response boundary flag if any delegated tool was exec/write_file.
+-                        for (_, tool_name, _) in &run_result.tool_results {
+-                            if tool_name == "exec" || tool_name == "write_file" {
+-                                force_response = true;
+-                                break;
+-                            }
+-                        }
+-
+-                        // Local models via --jinja require strict user/assistant alternation.
+-                        // Tool results are folded into user messages by
+-                        // repair_for_strict_alternation() at the top of the loop.
+-                        // Do NOT add extra user continuation — it would create
+-                        // consecutive user messages.
+-
+                         // Continue the main loop — the main LLM will see the results.
+                         continue;
+                     }
+@@ -1330,49 +989,7 @@ impl AgentLoopShared {
+                     }
+ 
+                     let start = std::time::Instant::now();
+-
+-                    // Spawn heartbeat that emits Progress every 2s for tools that
+-                    // don't emit their own (everything except exec).
+-                    let heartbeat = if let Some(ref tx) = tool_event_tx {
+-                        let hb_tx = tx.clone();
+-                        let hb_name = tc.name.clone();
+-                        let hb_id = tc.id.clone();
+-                        let hb_start = start;
+-                        Some(tokio::spawn(async move {
+-                            let mut interval = tokio::time::interval(Duration::from_secs(2));
+-                            interval.tick().await; // skip first immediate tick
+-                            loop {
+-                                interval.tick().await;
+-                                let _ = hb_tx.send(ToolEvent::Progress {
+-                                    tool_name: hb_name.clone(),
+-                                    tool_call_id: hb_id.clone(),
+-                                    elapsed_ms: hb_start.elapsed().as_millis() as u64,
+-                                    output_preview: None,
+-                                });
+-                            }
+-                        }))
+-                    } else {
+-                        None
+-                    };
+-
+-                    let result = if let Some(ref tx) = tool_event_tx {
+-                        use crate::agent::tools::base::ToolExecutionContext;
+-                        let ctx = ToolExecutionContext {
+-                            event_tx: tx.clone(),
+-                            cancellation_token: cancellation_token.as_ref()
+-                                .map(|t| t.child_token())
+-                                .unwrap_or_else(tokio_util::sync::CancellationToken::new),
+-                            tool_call_id: tc.id.clone(),
+-                        };
+-                        tools.execute_with_context(&tc.name, tc.arguments.clone(), &ctx).await
+-                    } else {
+-                        tools.execute(&tc.name, tc.arguments.clone()).await
+-                    };
+-
+-                    // Stop heartbeat when tool finishes.
+-                    if let Some(hb) = heartbeat {
+-                        hb.abort();
+-                    }
++                    let result = tools.execute(&tc.name, tc.arguments.clone()).await;
+                     let duration_ms = start.elapsed().as_millis() as u64;
+                     debug!(
+                         "Tool {} result ({}B, ok={}, {}ms)",
+@@ -1381,32 +998,15 @@ impl AgentLoopShared {
+                         result.ok,
+                         duration_ms
+                     );
+-                    // Cap tool result size to avoid blowing context (UTF-8 safe).
+-                    let data = if result.data.len() > core.max_tool_result_chars {
+-                        let safe_end = result.data.char_indices()
+-                            .take_while(|(i, _)| *i < core.max_tool_result_chars)
+-                            .last()
+-                            .map(|(i, c)| i + c.len_utf8())
+-                            .unwrap_or(0);
+-                        format!(
+-                            "{}\n\n[truncated: {} total chars, showing first {}]",
+-                            &result.data[..safe_end], result.data.len(), safe_end
+-                        )
+-                    } else {
+-                        result.data.clone()
+-                    };
+-                    if core.provenance_config.enabled {
+-                        ContextBuilder::add_tool_result_immutable(&mut messages, &tc.id, &tc.name, &data);
+-                    } else {
+-                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &data);
+-                    }
++                    ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
+ 
+                     // Emit tool call end event.
+                     if let Some(ref tx) = tool_event_tx {
++                        let preview: String = result.data.chars().take(80).collect();
+                         let _ = tx.send(ToolEvent::CallEnd {
+                             tool_name: tc.name.clone(),
+                             tool_call_id: tc.id.clone(),
+-                            result_data: result.data.clone(),
++                            result_preview: preview,
+                             ok: result.ok,
+                             duration_ms,
+                         });
+@@ -1429,15 +1029,6 @@ impl AgentLoopShared {
+                     // Track used tools.
+                     used_tools.insert(tc.name.clone());
+ 
+-                    // Collect for turn audit summary.
+-                    turn_tool_entries.push(crate::agent::audit::TurnToolEntry {
+-                        name: tc.name.clone(),
+-                        id: tc.id.clone(),
+-                        ok: result.ok,
+-                        duration_ms,
+-                        result_chars: result.data.len(),
+-                    });
+-
+                     // Record tool outcome for learning.
+                     let context_str: String = tc
+                         .arguments
+@@ -1454,33 +1045,6 @@ impl AgentLoopShared {
+                         &context_str,
+                         result.error.as_deref(),
+                     );
+-
+-                    // Set response boundary flag for exec/write_file.
+-                    if tc.name == "exec" || tc.name == "write_file" {
+-                        force_response = true;
+-                    }
+-                }
+-
+-                // Local models via --jinja require strict user/assistant alternation.
+-                // Tool results are folded into user messages by
+-                // repair_for_strict_alternation() at the top of the loop.
+-                // Do NOT add extra user continuation — it would create
+-                // consecutive user messages.
+-
+-                // Check for priority user messages injected mid-task.
+-                if let Some(ref mut rx) = priority_rx {
+-                    if let Ok(msg) = rx.try_recv() {
+-                        messages.push(json!({
+-                            "role": "user",
+-                            "content": format!("[PRIORITY USER MESSAGE]: {}", msg)
+-                        }));
+-                        // Continue to next LLM call — let the model see and adjust.
+-                    }
+-                }
+-
+-                // Check cancellation between tool call iterations.
+-                if cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+-                    break;
+                 }
+             } else {
+                 // No tool calls -- the agent is done.
+@@ -1490,132 +1054,28 @@ impl AgentLoopShared {
+         }
+ 
+         // Store context stats for status bar.
+-        let final_tokens = TokenBudget::estimate_tokens(&messages) as u64;
+-        counters.last_context_used
++        let final_tokens = core.token_budget.estimate_tokens_with_fallback(&messages) as u64;
++        core.last_context_used
+             .store(final_tokens, Ordering::Relaxed);
+-        counters.last_context_max
++        core.last_context_max
+             .store(core.token_budget.max_context() as u64, Ordering::Relaxed);
+-        counters.last_message_count
+-            .store(messages.len() as u64, Ordering::Relaxed);
+-        // Store working memory token count.
+-        let wm_tokens = if core.memory_enabled {
+-            let wm_text = core.working_memory.get_context(&session_key, usize::MAX);
+-            TokenBudget::estimate_str_tokens(&wm_text) as u64
+-        } else {
+-            0
+-        };
+-        counters.last_working_memory_tokens.store(wm_tokens, Ordering::Relaxed);
+-        // Store tools called this turn.
+-        {
+-            let tools_list: Vec<String> = used_tools.iter().cloned().collect();
+-            if let Ok(mut guard) = counters.last_tools_called.lock() {
+-                *guard = tools_list;
+-            }
+-        }
+-
+-        // Write per-turn audit summary.
+-        if core.provenance_config.enabled && core.provenance_config.audit_log {
+-            let summary = crate::agent::audit::TurnSummary {
+-                turn: turn_count,
+-                timestamp: Utc::now().to_rfc3339(),
+-                context_tokens: final_tokens as usize,
+-                message_count: messages.len(),
+-                tools_called: turn_tool_entries,
+-                working_memory_tokens: wm_tokens as usize,
+-            };
+-            crate::agent::audit::write_turn_summary(&core.workspace, &session_key, &summary);
+-        }
+ 
+         if final_content.is_empty() && messages.len() > 2 {
+             final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
+         }
+ 
+-        // Phase 3+4: Claim verification and context hygiene.
+-        if !final_content.is_empty()
+-            && core.provenance_config.enabled
+-            && core.provenance_config.verify_claims
+-        {
+-            if let Some(ref audit) = audit {
+-                let entries = audit.get_entries();
+-                let (claims, has_fabrication) =
+-                    crate::agent::provenance::verify_turn_claims(&final_content, &entries);
+-
+-                if has_fabrication && core.provenance_config.strict_mode {
+-                    let (redacted, redaction_count) =
+-                        crate::agent::provenance::redact_fabrications(&final_content, &claims);
+-                    final_content = redacted;
+-                    if redaction_count > 0 {
+-                        messages.push(json!({
+-                            "role": "system",
+-                            "content": format!(
+-                                "NOTICE: {} claim(s) in the previous response could not be \
+-                                 verified against tool outputs and were removed.",
+-                                redaction_count
+-                            )
+-                        }));
+-                    }
+-                }
+-            }
+-        }
+-
+-        // Phantom tool call detection: check if LLM claims tool results without calling tools.
+-        if !final_content.is_empty() && core.provenance_config.enabled {
+-            let tools_list: Vec<String> = used_tools.iter().cloned().collect();
+-            if let Some(detection) = crate::agent::provenance::detect_phantom_claims(&final_content, &tools_list) {
+-                warn!(
+-                    "Phantom tool claims detected ({} patterns): {:?}",
+-                    detection.matched_patterns.len(),
+-                    detection.matched_patterns
+-                );
+-
+-                // Hard block: annotate the response so the user sees the warning.
+-                if core.provenance_config.strict_mode {
+-                    final_content = crate::agent::provenance::annotate_phantom_response(
+-                        &final_content, &detection,
+-                    );
+-                }
+-
+-                // Inject system reminder for the next turn.
+-                messages.push(json!({
+-                    "role": "system",
+-                    "content": detection.system_warning
+-                }));
+-            }
+-        }
+-
+-        // Ensure the final text response is in the messages array for persistence.
+-        // Without this, text-only responses (no tool calls) would be lost.
+-        if !final_content.is_empty() {
+-            messages.push(json!({"role": "assistant", "content": final_content.clone()}));
+-        }
+-
+-        // Update session history — persist full message array including tool calls.
+-        // Skip system prompt (index 0) and pre-existing history.
+-        let new_messages: Vec<Value> = if new_start < messages.len() {
+-            messages[new_start..].to_vec()
++        // Update session history.
++        if final_content.is_empty() {
++            core.sessions
++                .add_message_and_save(&session_key, "user", &msg.content)
++                .await;
+         } else {
+-            // Fallback: save at least user + assistant text.
+-            let mut fallback = vec![json!({"role": "user", "content": msg.content.clone()})];
+-            if !final_content.is_empty() {
+-                fallback.push(json!({"role": "assistant", "content": final_content.clone()}));
+-            }
+-            fallback
+-        };
+-        if !new_messages.is_empty() {
+-            core.sessions.add_messages_raw(&session_key, &new_messages).await;
+-        }
+-
+-        // Auto-complete stale working memory sessions (runs on every message, cheap).
+-        if core.memory_enabled {
+-            for session in core.working_memory.list_active() {
+-                if session.session_key != session_key {
+-                    let age = Utc::now() - session.updated;
+-                    if age.num_seconds() > core.session_complete_after_secs as i64 {
+-                        core.working_memory.complete(&session.session_key);
+-                        debug!("Auto-completed stale session: {}", session.session_key);
+-                    }
+-                }
+-            }
++            core.sessions
++                .add_messages_and_save(
++                    &session_key,
++                    &[("user", &msg.content), ("assistant", &final_content)],
++                )
++                .await;
+         }
+ 
+         if final_content.is_empty() {
+@@ -1676,11 +1136,10 @@ impl AgentLoop {
+         max_concurrent_chats: usize,
+         email_config: Option<EmailConfig>,
+         repl_display_tx: Option<UnboundedSender<String>>,
+-        providers_config: Option<crate::config::schema::ProvidersConfig>,
+     ) -> Self {
+         // Read core to initialize the subagent manager.
+-        let core = core_handle.swappable();
+-        let mut subagent_mgr = SubagentManager::new(
++        let core = core_handle.read().unwrap().clone();
++        let subagents = Arc::new(SubagentManager::new(
+             core.provider.clone(),
+             core.workspace.clone(),
+             bus_inbound_tx.clone(),
+@@ -1688,19 +1147,7 @@ impl AgentLoop {
+             core.brave_api_key.clone(),
+             core.exec_timeout,
+             core.restrict_to_workspace,
+-            core.is_local,
+-        );
+-        if let Some(pc) = providers_config {
+-            subagent_mgr = subagent_mgr.with_providers_config(pc);
+-        }
+-        // Wire up the cheap default model for subagents from config.
+-        subagent_mgr = subagent_mgr.with_default_subagent_model(
+-            core.tool_delegation_config.default_subagent_model.clone(),
+-        );
+-        if let Some(ref dtx) = repl_display_tx {
+-            subagent_mgr = subagent_mgr.with_display_tx(dtx.clone());
+-        }
+-        let subagents = Arc::new(subagent_mgr);
++        ));
+ 
+         let shared = Arc::new(AgentLoopShared {
+             core_handle,
+@@ -1723,7 +1170,7 @@ impl AgentLoop {
+ 
+     /// Spawn a background reflection task if observations exceed threshold.
+     fn spawn_background_reflection(shared: &Arc<AgentLoopShared>) {
+-        let core = shared.core_handle.swappable();
++        let core = shared.core_handle.read().unwrap().clone();
+         if !core.memory_enabled {
+             return;
+         }
+@@ -1825,8 +1272,7 @@ impl AgentLoop {
+                 // Notify REPL about inbound channel message.
+                 if let Some(ref dtx) = display_tx {
+                     let preview = if msg.content.len() > 120 {
+-                        let end = crate::utils::helpers::floor_char_boundary(&msg.content, 120);
+-                        format!("{}...", &msg.content[..end])
++                        format!("{}...", &msg.content[..120])
+                     } else {
+                         msg.content.clone()
+                     };
+@@ -1836,14 +1282,13 @@ impl AgentLoop {
+                     ));
+                 }
+ 
+-                let response = shared.process_message(&msg, None, None, None, None).await;
++                let response = shared.process_message(&msg, None, None).await;
+ 
+                 if let Some(outbound) = response {
+                     // Notify REPL about outbound response.
+                     if let Some(ref dtx) = display_tx {
+                         let preview = if outbound.content.len() > 120 {
+-                            let end = crate::utils::helpers::floor_char_boundary(&outbound.content, 120);
+-                            format!("{}...", &outbound.content[..end])
++                            format!("{}...", &outbound.content[..120])
+                         } else {
+                             outbound.content.clone()
+                         };
+@@ -1910,7 +1355,7 @@ impl AgentLoop {
+                 .insert("detected_language".to_string(), json!(lang));
+         }
+ 
+-        match self.shared.process_message(&msg, None, None, None, None).await {
++        match self.shared.process_message(&msg, None, None).await {
+             Some(response) => response.content,
+             None => String::new(),
+         }
+@@ -1927,8 +1372,6 @@ impl AgentLoop {
+         detected_language: Option<&str>,
+         text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+         tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
+-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+-        priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+     ) -> String {
+         if !self.reflection_spawned.swap(true, Ordering::SeqCst) {
+             Self::spawn_background_reflection(&self.shared);
+@@ -1944,7 +1387,7 @@ impl AgentLoop {
+ 
+         match self
+             .shared
+-            .process_message(&msg, Some(text_delta_tx), tool_event_tx, cancellation_token, priority_rx)
++            .process_message(&msg, Some(text_delta_tx), tool_event_tx)
+             .await
+         {
+             Some(response) => response.content,
+@@ -2018,307 +1461,72 @@ impl crate::agent::tools::Tool for CronToolProxy {
+     }
+ }
+ 
+-// ============================================================================
+-// Tests
+-// ============================================================================
+-
+ #[cfg(test)]
+ mod tests {
+-    use super::*;
+-    use crate::config::schema::ProviderConfig;
+-    use async_trait::async_trait;
+-
+-    /// Minimal mock LLM provider for wiring tests.
+-    struct MockLLM {
+-        name: String,
+-    }
+-
+-    impl MockLLM {
+-        fn named(name: &str) -> Arc<dyn LLMProvider> {
+-            Arc::new(Self { name: name.to_string() })
+-        }
+-    }
+-
+-    #[async_trait]
+-    impl LLMProvider for MockLLM {
+-        async fn chat(
+-            &self,
+-            _messages: &[Value],
+-            _tools: Option<&[Value]>,
+-            _model: Option<&str>,
+-            _max_tokens: u32,
+-            _temperature: f64,
+-            _thinking_budget: Option<u32>,
+-        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+-            Ok(crate::providers::base::LLMResponse {
+-                content: Some("mock".to_string()),
+-                tool_calls: vec![],
+-                finish_reason: "stop".to_string(),
+-                usage: std::collections::HashMap::new(),
+-            })
+-        }
+-
+-        fn get_default_model(&self) -> &str {
+-            &self.name
+-        }
+-    }
+-
+-    /// Helper to build a SwappableCore with minimal config for wiring tests.
+-    fn build_test_core(
+-        delegation_enabled: bool,
+-        delegation_provider: Option<Arc<dyn LLMProvider>>,
+-        config_provider: Option<ProviderConfig>,
+-    ) -> SwappableCore {
+-        let workspace = tempfile::tempdir().unwrap().into_path();
+-        let main = MockLLM::named("main-provider");
+-        let td = ToolDelegationConfig {
+-            enabled: delegation_enabled,
+-            model: "delegation-model".to_string(),
+-            provider: config_provider,
+-            auto_local: true,
+-            ..Default::default()
+-        };
+-        build_swappable_core(
+-            main,
+-            workspace,
+-            "main-model".to_string(),
+-            10,
+-            4096,
+-            0.7,
+-            16384,
+-            None,
+-            30,
+-            false,
+-            MemoryConfig::default(),
+-            false,
+-            None,
+-            td,
+-            ProvenanceConfig::default(),
+-            2000,
+-            delegation_provider,
+-        )
+-    }
+-
+-    // -- Delegation provider wiring tests --
+-
+-    #[test]
+-    fn test_delegation_disabled_no_runner_provider() {
+-        let core = build_test_core(false, None, None);
+-        assert!(
+-            core.tool_runner_provider.is_none(),
+-            "When delegation is disabled, tool_runner_provider should be None"
+-        );
+-        assert!(core.tool_runner_model.is_none());
+-    }
+-
+-    #[test]
+-    fn test_delegation_enabled_with_auto_provider() {
+-        // When an auto-spawned delegation provider is passed, it should be used
+-        let dp = MockLLM::named("auto-delegation");
+-        let core = build_test_core(true, Some(dp), None);
+-
+-        assert!(core.tool_runner_provider.is_some());
+-        let provider = core.tool_runner_provider.as_ref().unwrap();
+-        assert_eq!(
+-            provider.get_default_model(),
+-            "auto-delegation",
+-            "Should use the auto-spawned delegation provider"
+-        );
+-        assert_eq!(core.tool_runner_model.as_deref(), Some("delegation-model"));
+-    }
+-
+-    #[test]
+-    fn test_delegation_auto_provider_takes_priority_over_config() {
+-        // Auto-spawned provider should take priority over config provider
+-        let dp = MockLLM::named("auto-delegation");
+-        let config_provider = ProviderConfig {
+-            api_key: "key".to_string(),
+-            api_base: Some("http://localhost:9999/v1".to_string()),
+-        };
+-        let core = build_test_core(true, Some(dp), Some(config_provider));
+-
+-        let provider = core.tool_runner_provider.as_ref().unwrap();
+-        assert_eq!(
+-            provider.get_default_model(),
+-            "auto-delegation",
+-            "Auto-spawned provider should beat config provider"
+-        );
+-    }
+-
+-    #[test]
+-    fn test_delegation_config_provider_used_when_no_auto() {
+-        // When no auto provider, but config has one, it should create OpenAICompatProvider
+-        let config_provider = ProviderConfig {
+-            api_key: "key".to_string(),
+-            api_base: Some("http://localhost:9999/v1".to_string()),
+-        };
+-        let core = build_test_core(true, None, Some(config_provider));
+-
+-        assert!(
+-            core.tool_runner_provider.is_some(),
+-            "Should have a provider from config"
+-        );
+-    }
++    use super::{
++        is_low_value_assistant_history, prepare_history_for_conversational_cli,
++        should_enable_tools_for_message,
++    };
++    use serde_json::json;
+ 
+     #[test]
+-    fn test_delegation_falls_back_to_main_provider() {
+-        // When delegation enabled but no auto provider and no config provider,
+-        // should fall back to main
+-        let core = build_test_core(true, None, None);
+-
+-        assert!(core.tool_runner_provider.is_some());
+-        let provider = core.tool_runner_provider.as_ref().unwrap();
+-        assert_eq!(
+-            provider.get_default_model(),
+-            "main-provider",
+-            "Should fall back to main provider"
+-        );
++    fn test_cli_conversational_prompt_disables_tools() {
++        assert!(!should_enable_tools_for_message(
++            "cli",
++            "Tell me one short joke.",
++            false
++        ));
+     }
+ 
+     #[test]
+-    fn test_delegation_model_uses_config_model() {
+-        let core = build_test_core(true, None, None);
+-        assert_eq!(
+-            core.tool_runner_model.as_deref(),
+-            Some("delegation-model"),
+-            "Should use the model from ToolDelegationConfig"
+-        );
++    fn test_cli_repo_task_enables_tools() {
++        assert!(should_enable_tools_for_message(
++            "cli",
++            "Read file Cargo.toml and fix the failing test.",
++            false
++        ));
+     }
+ 
+     #[test]
+-    fn test_delegation_model_falls_back_to_main_when_empty() {
+-        let workspace = tempfile::tempdir().unwrap().into_path();
+-        let main = MockLLM::named("main-provider");
+-        let td = ToolDelegationConfig {
+-            enabled: true,
+-            model: String::new(), // Empty → fall back to main model
+-            auto_local: true,
+-            ..Default::default()
+-        };
+-        let core = build_swappable_core(
+-            main,
+-            workspace,
+-            "main-model".to_string(),
+-            10,
+-            4096,
+-            0.7,
+-            16384,
+-            None,
+-            30,
+-            false,
+-            MemoryConfig::default(),
+-            false,
+-            None,
+-            td,
+-            ProvenanceConfig::default(),
+-            2000,
+-            None,
+-        );
+-        assert_eq!(
+-            core.tool_runner_model.as_deref(),
+-            Some("main-model"),
+-            "Empty delegation model should fall back to main model"
+-        );
++    fn test_voice_disables_tools_even_with_intent_markers() {
++        assert!(!should_enable_tools_for_message(
++            "voice",
++            "Run command cargo test",
++            true
++        ));
+     }
+ 
+     #[test]
+-    fn test_delegation_disabled_ignores_passed_provider() {
+-        // Even if a delegation_provider is passed, it should be ignored
+-        // when delegation is disabled.
+-        let dp = MockLLM::named("auto-delegation");
+-        let core = build_test_core(false, Some(dp), None);
+-
+-        assert!(
+-            core.tool_runner_provider.is_none(),
+-            "Delegation disabled should ignore passed provider"
+-        );
+-        assert!(core.tool_runner_model.is_none());
++    fn test_non_cli_keeps_tools_enabled() {
++        assert!(should_enable_tools_for_message(
++            "telegram",
++            "hello there",
++            false
++        ));
+     }
+ 
+     #[test]
+-    fn test_delegation_with_is_local_true() {
+-        // Verify wiring works when is_local=true (uses lite context builder)
+-        let workspace = tempfile::tempdir().unwrap().into_path();
+-        let main = MockLLM::named("local-main");
+-        let dp = MockLLM::named("local-delegation");
+-        let td = ToolDelegationConfig {
+-            enabled: true,
+-            model: "delegation-model".to_string(),
+-            auto_local: true,
+-            ..Default::default()
+-        };
+-        let core = build_swappable_core(
+-            main,
+-            workspace,
+-            "local-model".to_string(),
+-            10,
+-            4096,
+-            0.7,
+-            16384,
+-            None,
+-            30,
+-            false,
+-            MemoryConfig::default(),
+-            true, // is_local = true
+-            None,
+-            td,
+-            ProvenanceConfig::default(),
+-            2000,
+-            Some(dp),
+-        );
+-
+-        assert!(core.is_local);
+-        assert!(core.tool_runner_provider.is_some());
+-        assert_eq!(
+-            core.tool_runner_provider.as_ref().unwrap().get_default_model(),
+-            "local-delegation",
+-            "Local mode should still use the delegation provider"
+-        );
++    fn test_low_value_assistant_history_detects_intro_loop() {
++        assert!(is_low_value_assistant_history(
++            "Hello! I'm nanobot, your AI assistant. How can I help you today?"
++        ));
++        assert!(!is_low_value_assistant_history(
++            "Why did the nanobot bring a ladder? To reach the cloud."
++        ));
+     }
+ 
+     #[test]
+-    fn test_delegation_with_compaction_and_delegation_providers() {
+-        // Both compaction and delegation providers set — should not interfere
+-        let workspace = tempfile::tempdir().unwrap().into_path();
+-        let main = MockLLM::named("main");
+-        let compaction = MockLLM::named("compaction");
+-        let delegation = MockLLM::named("delegation");
+-        let td = ToolDelegationConfig {
+-            enabled: true,
+-            model: "deleg-model".to_string(),
+-            auto_local: true,
+-            ..Default::default()
+-        };
+-        let core = build_swappable_core(
+-            main,
+-            workspace,
+-            "main-model".to_string(),
+-            10,
+-            4096,
+-            0.7,
+-            16384,
+-            None,
+-            30,
+-            false,
+-            MemoryConfig::default(),
+-            true,
+-            Some(compaction),
+-            td,
+-            ProvenanceConfig::default(),
+-            2000,
+-            Some(delegation),
+-        );
+-
+-        // Compaction provider goes to memory_provider, delegation to tool_runner
+-        assert_eq!(
+-            core.memory_provider.get_default_model(),
+-            "compaction",
+-            "Memory should use compaction provider"
+-        );
+-        assert_eq!(
+-            core.tool_runner_provider.as_ref().unwrap().get_default_model(),
+-            "delegation",
+-            "Tool runner should use delegation provider"
+-        );
++    fn test_prepare_history_for_conversational_cli_drops_assistant_turns() {
++        let history = vec![
++            json!({"role":"user","content":"tell me joke"}),
++            json!({"role":"assistant","content":"Hello! I'm nanobot, your AI assistant. How can I help you today?"}),
++            json!({"role":"assistant","content":"3.7.4.4.6:65,605.084.0.1.2.3.3.5.4.0.3.3.3.2.3.1.4.2.36.5.0.2.5.5.9.3.10.2.5.2.5.1.5.2.4.3.4.5.5.3.2.6.3.2.4.7.6.0.1.3.3.3.6.3.1.3.4.0.1.2.3.3.1.1.4.0.."}),
++            json!({"role":"assistant","content":"What do you call a fake noodle? An impasta."}),
++        ];
++
++        let filtered = prepare_history_for_conversational_cli(history);
++        assert_eq!(filtered.len(), 1);
++        assert_eq!(filtered[0]["role"], "user");
++        assert_eq!(filtered[0]["content"], "tell me joke");
+     }
+ }
+diff --git a/src/agent/compaction.rs b/src/agent/compaction.rs
+index 0989408..e6b3ac2 100644
+--- a/src/agent/compaction.rs
++++ b/src/agent/compaction.rs
+@@ -54,10 +54,6 @@ pub struct ContextCompactor {
+     disabled: AtomicBool,
+     /// Context window size of the compaction model (tokens).
+     compaction_context_size: usize,
+-    /// Compaction threshold as percentage of available context (e.g. 66.6).
+-    threshold_percent: f64,
+-    /// Compaction threshold in absolute tokens. Whichever fires first wins.
+-    threshold_tokens: usize,
+ }
+ 
+ impl ContextCompactor {
+@@ -74,18 +70,9 @@ impl ContextCompactor {
+             summary_max_tokens: 1024,
+             disabled: AtomicBool::new(false),
+             compaction_context_size,
+-            threshold_percent: 66.6,
+-            threshold_tokens: 100_000,
+         }
+     }
+ 
+-    /// Set the compaction thresholds (from config).
+-    pub fn with_thresholds(mut self, percent: f64, tokens: usize) -> Self {
+-        self.threshold_percent = percent;
+-        self.threshold_tokens = tokens;
+-        self
+-    }
+-
+     /// Dynamic input budget derived from the compaction model's context size.
+     ///
+     /// Reserves space for the system prompt (~200 tokens), the summary
+@@ -95,20 +82,17 @@ impl ContextCompactor {
+         self.compaction_context_size.saturating_sub(reserved)
+     }
+ 
+-    /// Compute the effective compaction threshold (the lower of percent-based and token-based).
+-    fn effective_threshold(&self, available: usize) -> usize {
+-        let pct_threshold = (available as f64 * self.threshold_percent / 100.0) as usize;
+-        pct_threshold.min(self.threshold_tokens)
+-    }
+-
+-    /// Check whether the conversation needs compaction.
++    /// Check whether the conversation needs compaction (>66.6% of budget).
+     pub fn needs_compaction(&self, messages: &[Value], budget: &TokenBudget, tool_def_tokens: usize) -> bool {
+         if self.disabled.load(Ordering::Relaxed) {
+             return false;
+         }
+         let available = budget.available_budget(tool_def_tokens);
+-        let estimated = TokenBudget::estimate_tokens(messages);
+-        let threshold = self.effective_threshold(available);
++        if available == 0 {
++            return false;
++        }
++        let estimated = budget.estimate_tokens_with_fallback(messages);
++        let threshold = (available as f64 * 0.666) as usize;
+         estimated > threshold
+     }
+ 
+@@ -134,10 +118,16 @@ impl ContextCompactor {
+         }
+ 
+         let available = budget.available_budget(tool_def_tokens);
+-        let current = TokenBudget::estimate_tokens(messages);
++        if available == 0 {
++            return CompactionResult {
++                messages: messages.to_vec(),
++                observation: None,
++            };
++        }
++        let current = budget.estimate_tokens_with_fallback(messages);
+ 
+-        // Stage 1: Proactive compaction (configurable threshold).
+-        let threshold = self.effective_threshold(available);
++        // Stage 1: Proactive compaction at 66.6% capacity.
++        let threshold = (available as f64 * 0.666) as usize;
+         if current <= threshold {
+             return CompactionResult {
+                 messages: messages.to_vec(),
+@@ -155,7 +145,7 @@ impl ContextCompactor {
+         // Try LLM summarization.
+         match self.compact_via_summary(messages, available, budget).await {
+             Ok((compacted, summary)) => {
+-                let new_size = TokenBudget::estimate_tokens(&compacted);
++                let new_size = budget.estimate_tokens_with_fallback(&compacted);
+                 debug!("Compacted {} -> {} tokens", current, new_size);
+                 CompactionResult {
+                     messages: compacted,
+@@ -194,7 +184,7 @@ impl ContextCompactor {
+ 
+         // Always keep the system message (first).
+         let system_msg = messages[0].clone();
+-        let system_tokens = TokenBudget::estimate_tokens(&[system_msg.clone()]);
++        let system_tokens = budget.estimate_tokens_with_fallback(&[system_msg.clone()]);
+ 
+         // Reserve space: system + summary overhead + some headroom.
+         let summary_headroom = 400; // ~400 tokens for the summary message
+@@ -212,27 +202,13 @@ impl ContextCompactor {
+         let recent_budget = (remaining as f64 * 0.6) as usize;
+ 
+         // Walk backwards from the end to find recent messages that fit in ~60% of budget.
+-        // Messages containing subagent results are force-included to prevent
+-        // compaction from summarizing away important delegated work.
+         let body = &messages[1..];
+         let mut recent_start = body.len();
+         let mut recent_tokens = 0;
+ 
+-        // First pass: identify subagent result messages to protect.
+-        let protected: std::collections::HashSet<usize> = body
+-            .iter()
+-            .enumerate()
+-            .filter(|(_, msg)| {
+-                let content = msg["content"].as_str().unwrap_or("");
+-                content.contains("[Subagent ") || content.contains("subagent-")
+-                    || content.contains("Result also saved to:")
+-            })
+-            .map(|(i, _)| i)
+-            .collect();
+-
+         for (i, msg) in body.iter().enumerate().rev() {
+-            let msg_tokens = TokenBudget::estimate_tokens(&[msg.clone()]);
+-            if recent_tokens + msg_tokens > recent_budget && !protected.contains(&i) {
++            let msg_tokens = budget.estimate_tokens_with_fallback(&[msg.clone()]);
++            if recent_tokens + msg_tokens > recent_budget {
+                 recent_start = i + 1;
+                 break;
+             }
+@@ -336,7 +312,6 @@ impl ContextCompactor {
+                 Some(&self.model),
+                 self.summary_max_tokens,
+                 0.3, // low temperature for factual summaries
+-                None,
+             )
+             .await?;
+ 
+@@ -514,7 +489,6 @@ mod tests {
+             _model: Option<&str>,
+             _max_tokens: u32,
+             _temperature: f64,
+-            _thinking_budget: Option<u32>,
+         ) -> Result<LLMResponse> {
+             Ok(LLMResponse {
+                 content: Some(self.response.clone()),
+@@ -541,7 +515,6 @@ mod tests {
+             _model: Option<&str>,
+             _max_tokens: u32,
+             _temperature: f64,
+-            _thinking_budget: Option<u32>,
+         ) -> Result<LLMResponse> {
+             Err(anyhow::anyhow!("LLM unavailable"))
+         }
+@@ -564,7 +537,6 @@ mod tests {
+             _model: Option<&str>,
+             _max_tokens: u32,
+             _temperature: f64,
+-            _thinking_budget: Option<u32>,
+         ) -> Result<LLMResponse> {
+             self.calls.fetch_add(1, Ordering::SeqCst);
+             Err(anyhow::anyhow!("LLM unavailable"))
+@@ -591,6 +563,24 @@ mod tests {
+         assert!(result.observation.is_none());
+     }
+ 
++    #[tokio::test]
++    async fn test_compaction_skips_when_available_budget_is_zero() {
++        let provider = Arc::new(MockProvider::new("summary"));
++        let compactor = ContextCompactor::new(provider, "test".into(), 100_000);
++        // 256 - 1024 - 100 => saturates to zero available message budget.
++        let budget = TokenBudget::new(256, 1024);
++
++        let messages = vec![
++            json!({"role": "system", "content": "You are helpful."}),
++            json!({"role": "user", "content": "Hello"}),
++        ];
++
++        assert!(!compactor.needs_compaction(&messages, &budget, 100));
++        let result = compactor.compact(&messages, &budget, 100).await;
++        assert_eq!(result.messages, messages);
++        assert!(result.observation.is_none());
++    }
++
+     #[tokio::test]
+     async fn test_compact_summarizes_old_messages() {
+         let provider = Arc::new(MockProvider::new("User discussed weather and cats."));
+@@ -684,58 +674,4 @@ mod tests {
+             "compaction provider should be called only once after first failure"
+         );
+     }
+-
+-    #[test]
+-    fn test_configurable_threshold_percent() {
+-        let provider = Arc::new(MockProvider::new("Summary."));
+-        let compactor = ContextCompactor::new(provider, "test".into(), 100_000)
+-            .with_thresholds(20.0, 100_000);
+-        let budget = TokenBudget::new(1200, 200);
+-        // available = 1200 - 200 = 1000. threshold = 20% of 1000 = 200 tokens.
+-
+-        // Messages well under 200 tokens → no compaction needed.
+-        let messages = vec![
+-            json!({"role": "system", "content": "S"}),
+-            json!({"role": "user", "content": "Hi"}),
+-        ];
+-        assert!(!compactor.needs_compaction(&messages, &budget, 0));
+-
+-        // Messages well above 200 tokens → needs compaction.
+-        let mut messages = vec![json!({"role": "system", "content": "S"})];
+-        for i in 0..20 {
+-            messages.push(json!({"role": "user", "content": format!("Message number {} with enough content to push us past the threshold surely.", i)}));
+-        }
+-        let est = TokenBudget::estimate_tokens(&messages);
+-        assert!(est > 200, "messages should be above threshold, got {} tokens", est);
+-        assert!(compactor.needs_compaction(&messages, &budget, 0));
+-    }
+-
+-    #[test]
+-    fn test_configurable_threshold_tokens() {
+-        let provider = Arc::new(MockProvider::new("Summary."));
+-        // Set token threshold very low (50 tokens), percent very high (99%).
+-        let compactor = ContextCompactor::new(provider, "test".into(), 100_000)
+-            .with_thresholds(99.0, 50);
+-        let budget = TokenBudget::new(100_000, 8192);
+-
+-        // Even though 99% of budget is huge, the 50-token cap fires first.
+-        let mut messages = vec![json!({"role": "system", "content": "S"})];
+-        for i in 0..5 {
+-            messages.push(json!({"role": "user", "content": format!("Message {}", i)}));
+-        }
+-        // Should need compaction because total tokens > 50.
+-        let total = TokenBudget::estimate_tokens(&messages);
+-        if total > 50 {
+-            assert!(compactor.needs_compaction(&messages, &budget, 0));
+-        }
+-    }
+-
+-    #[test]
+-    fn test_effective_threshold_uses_minimum() {
+-        let provider = Arc::new(MockProvider::new("Summary."));
+-        let compactor = ContextCompactor::new(provider, "test".into(), 100_000)
+-            .with_thresholds(50.0, 200);
+-        // available = 1000. 50% of 1000 = 500. Token cap = 200. min(500, 200) = 200.
+-        assert_eq!(compactor.effective_threshold(1000), 200);
+-    }
+ }
+diff --git a/src/agent/context.rs b/src/agent/context.rs
+index c6ba2c4..e5fcad2 100644
+--- a/src/agent/context.rs
++++ b/src/agent/context.rs
+@@ -188,15 +188,21 @@ impl ContextBuilder {
+         detected_language: Option<&str>,
+     ) -> Vec<Value> {
+         let mut messages: Vec<Value> = Vec::new();
++        let voice_mode = matches!(channel, Some("voice")) || is_voice_message;
+ 
+         // System prompt.
+         let mut system_prompt = self.build_system_prompt(skill_names);
++        // Voice turns prioritize low-latency interaction over full workspace context.
++        // Keep the core identity and apply a tighter budget for the heavy prompt sections.
++        if voice_mode {
++            system_prompt = Self::_truncate_to_budget(&system_prompt, 700);
++        }
+         if let (Some(ch), Some(cid)) = (channel, chat_id) {
+             system_prompt.push_str(&format!(
+                 "\n\n## Current Session\nChannel: {}\nChat ID: {}",
+                 ch, cid
+             ));
+-            if ch == "voice" || is_voice_message {
++            if voice_mode {
+                 system_prompt.push_str(concat!(
+                     "\n\n## Voice Mode (IMPORTANT)\n",
+                     "The user is speaking via microphone and your response will be read aloud by TTS. ",
+@@ -662,6 +668,26 @@ mod tests {
+         assert_eq!(messages[1]["role"], "user");
+     }
+ 
++    #[test]
++    fn test_voice_messages_apply_tighter_system_prompt_budget() {
++        let tmp = TempDir::new().unwrap();
++        fs::write(tmp.path().join("AGENTS.md"), "x".repeat(12000)).unwrap();
++        let cb = ContextBuilder::new(tmp.path());
++        let messages = cb.build_messages(
++            &[],
++            "test voice",
++            None,
++            None,
++            Some("voice"),
++            Some("direct"),
++            false,
++            Some("en"),
++        );
++        let system = messages[0]["content"].as_str().unwrap();
++        assert!(system.contains("## Voice Mode (IMPORTANT)"));
++        assert!(system.contains("[truncated to fit token budget]"));
++    }
++
+     // ----- add_tool_result -----
+ 
+     #[test]
+diff --git a/src/agent/token_budget.rs b/src/agent/token_budget.rs
+index 5f2b0ef..556e0fc 100644
+--- a/src/agent/token_budget.rs
++++ b/src/agent/token_budget.rs
+@@ -3,8 +3,6 @@
+ //! Uses character-based estimation (1 token ~ 4 chars) rather than a
+ //! tokenizer crate. Good enough for budget management.
+ 
+-use std::collections::HashSet;
+-
+ use serde_json::Value;
+ 
+ /// Manages the token budget for LLM context windows.
+@@ -32,15 +30,23 @@ impl TokenBudget {
+         self.max_context
+     }
+ 
++    /// Backward-compatible no-op.
++    ///
++    /// Local tokenizer HTTP calls were removed to avoid blocking/brick behavior
++    /// when `/tokenize` is unavailable.
++    pub fn with_tokenizer_endpoint(self, _endpoint: Option<String>) -> Self {
++        self
++    }
++
+     /// Estimate token count for a string (~4 chars per token).
+     pub fn estimate_str_tokens(s: &str) -> usize {
+         // Add 1 to avoid underestimating short strings.
+         (s.len() + 3) / 4
+     }
+ 
+-    /// Estimate token count for a single message Value (public variant).
+-    pub fn estimate_message_tokens_pub(msg: &Value) -> usize {
+-        Self::estimate_message_tokens(msg)
++    /// Estimate token count for a string (heuristic).
++    pub fn estimate_str_tokens_with_fallback(&self, s: &str) -> usize {
++        Self::estimate_str_tokens(s)
+     }
+ 
+     /// Estimate token count for a single message Value.
+@@ -83,17 +89,32 @@ impl TokenBudget {
+         tokens
+     }
+ 
++    /// Estimate token count for a single message (heuristic).
++    fn estimate_message_tokens_with_fallback(&self, msg: &Value) -> usize {
++        Self::estimate_message_tokens(msg)
++    }
++
+     /// Estimate total tokens for a message array.
+     pub fn estimate_tokens(messages: &[Value]) -> usize {
+         messages.iter().map(Self::estimate_message_tokens).sum()
+     }
+ 
++    /// Estimate total tokens (heuristic).
++    pub fn estimate_tokens_with_fallback(&self, messages: &[Value]) -> usize {
++        Self::estimate_tokens(messages)
++    }
++
+     /// Estimate tokens for tool definitions.
+     pub fn estimate_tool_def_tokens(tool_defs: &[Value]) -> usize {
+         let json = serde_json::to_string(tool_defs).unwrap_or_default();
+         Self::estimate_str_tokens(&json)
+     }
+ 
++    /// Estimate tool definition tokens (heuristic).
++    pub fn estimate_tool_def_tokens_with_fallback(&self, tool_defs: &[Value]) -> usize {
++        Self::estimate_tool_def_tokens(tool_defs)
++    }
++
+     /// Available budget for messages (after reserving response + tool defs).
+     pub fn available_budget(&self, tool_def_tokens: usize) -> usize {
+         self.max_context
+@@ -103,75 +124,19 @@ impl TokenBudget {
+ 
+     /// Trim message history to fit within the token budget.
+     ///
+-    /// Strategy (4 stages):
++    /// Strategy (3 stages):
+     /// 1. **Soft**: Truncate old tool results to summaries.
+-    /// 1.5. **Age-based**: Drop messages older than `max_age_turns` (if set).
+     /// 2. **Medium**: Drop oldest history messages (keep system + recent).
+     /// 3. **Hard**: Keep only system prompt + last user message + summary.
+     ///
+     /// The system prompt (first message) and the most recent user message
+     /// (last message) are always preserved.
+     pub fn trim_to_fit(&self, messages: &[Value], tool_def_tokens: usize) -> Vec<Value> {
+-        self.trim_to_fit_with_age(messages, tool_def_tokens, 0, 0)
+-    }
+-
+-    /// Like `trim_to_fit`, but with age-based eviction.
+-    ///
+-    /// `current_turn` is the current turn number (from learning_turn_counter).
+-    /// `max_age_turns` is the maximum age in turns before a message is preferred
+-    /// for eviction (0 = disabled).
+-    pub fn trim_to_fit_with_age(
+-        &self,
+-        messages: &[Value],
+-        tool_def_tokens: usize,
+-        current_turn: u64,
+-        max_age_turns: usize,
+-    ) -> Vec<Value> {
+         let budget = self.available_budget(tool_def_tokens);
+         let mut msgs = messages.to_vec();
+ 
+-        // Stage 0: Proactive age-based eviction — runs even when within budget.
+-        // This prevents context rot from old messages accumulating in large windows.
+-        if max_age_turns > 0 && current_turn > 0 && msgs.len() > 2 {
+-            let age_threshold = current_turn.saturating_sub(max_age_turns as u64);
+-            let last_idx = msgs.len() - 1;
+-            msgs = msgs
+-                .into_iter()
+-                .enumerate()
+-                .filter(|(i, m)| {
+-                    if *i == 0 || *i == last_idx {
+-                        return true;
+-                    }
+-                    if let Some(turn) = m.get("_turn").and_then(|v| v.as_u64()) {
+-                        turn >= age_threshold
+-                    } else {
+-                        true
+-                    }
+-                })
+-                .map(|(_, m)| m)
+-                .collect();
+-
+-            // Remove orphaned tool results whose assistant was age-evicted.
+-            let known_call_ids: HashSet<String> = msgs
+-                .iter()
+-                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+-                .filter_map(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
+-                .flat_map(|tcs| tcs.iter())
+-                .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()).map(String::from))
+-                .collect();
+-            msgs.retain(|m| {
+-                if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
+-                    return true;
+-                }
+-                m.get("tool_call_id")
+-                    .and_then(|id| id.as_str())
+-                    .map(|id| known_call_ids.contains(id))
+-                    .unwrap_or(true) // keep tool msgs without tool_call_id (legacy)
+-            });
+-        }
+-
+         // Already within budget?
+-        if Self::estimate_tokens(&msgs) <= budget {
++        if self.estimate_tokens_with_fallback(&msgs) <= budget {
+             return msgs;
+         }
+ 
+@@ -190,7 +155,7 @@ impl TokenBudget {
+                     if content.len() > 200 {
+                         let summary = format!(
+                             "[truncated: {}... ({} chars)]",
+-                            &content[..crate::utils::helpers::floor_char_boundary(content, 100)],
++                            &content[..100],
+                             content.len()
+                         );
+                         msgs[idx]["content"] = Value::String(summary);
+@@ -199,7 +164,7 @@ impl TokenBudget {
+             }
+         }
+ 
+-        if Self::estimate_tokens(&msgs) <= budget {
++        if self.estimate_tokens_with_fallback(&msgs) <= budget {
+             return msgs;
+         }
+ 
+@@ -207,71 +172,37 @@ impl TokenBudget {
+         // Keep: system (index 0) + last N messages that fit.
+         if msgs.len() > 2 {
+             let system_msg = msgs[0].clone();
+-            let system_tokens = Self::estimate_message_tokens(&system_msg);
++            let system_tokens = self.estimate_message_tokens_with_fallback(&system_msg);
+ 
+             let mut kept_tail: Vec<Value> = Vec::new();
+             let mut tail_tokens = 0;
+             let remaining_budget = budget.saturating_sub(system_tokens);
+ 
+             // Walk backwards from the end, keeping messages that fit.
+-            // Track tool_call IDs from skipped assistant messages so we also
+-            // skip their orphaned tool results (protocol safety).
+-            let mut skipped_call_ids: HashSet<String> = HashSet::new();
+-
++            // Always preserve the latest non-system message, even if it
++            // individually exceeds the remaining budget.
+             for msg in msgs[1..].iter().rev() {
+-                let msg_tokens = Self::estimate_message_tokens(msg);
+-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+-
+-                // Skip tool results whose assistant was already skipped.
+-                if role == "tool" {
+-                    if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+-                        if skipped_call_ids.contains(id) {
+-                            continue;
+-                        }
+-                    }
++                let msg_tokens = self.estimate_message_tokens_with_fallback(msg);
++                if kept_tail.is_empty() {
++                    kept_tail.push(msg.clone());
++                    tail_tokens += msg_tokens;
++                    continue;
+                 }
+-
+                 if tail_tokens + msg_tokens <= remaining_budget {
+                     kept_tail.push(msg.clone());
+                     tail_tokens += msg_tokens;
+                 } else {
+-                    // Track tool_call IDs from skipped assistant messages.
+-                    if role == "assistant" {
+-                        if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+-                            for tc in tcs {
+-                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+-                                    skipped_call_ids.insert(id.to_string());
+-                                }
+-                            }
+-                        }
+-                    }
+-                    continue;
++                    break;
+                 }
+             }
+ 
+             kept_tail.reverse();
+-
+-            // Post-walk cleanup: remove tool results whose assistant was
+-            // skipped. This catches cases where the backward walk saw the tool
+-            // result before discovering its assistant would be skipped.
+-            if !skipped_call_ids.is_empty() {
+-                kept_tail.retain(|m| {
+-                    if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
+-                        return true;
+-                    }
+-                    m.get("tool_call_id")
+-                        .and_then(|id| id.as_str())
+-                        .map(|id| !skipped_call_ids.contains(id))
+-                        .unwrap_or(true)
+-                });
+-            }
+-
+             let mut result = vec![system_msg];
+             result.extend(kept_tail);
+             msgs = result;
+         }
+ 
+-        if Self::estimate_tokens(&msgs) <= budget {
++        if self.estimate_tokens_with_fallback(&msgs) <= budget {
+             return msgs;
+         }
+ 
+@@ -419,27 +350,19 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_trim_stage2_skips_oversized_keeps_smaller() {
+-        // One oversized message in the middle should be skipped, not block
+-        // earlier messages from being kept.
+-        let budget = TokenBudget::new(400, 50);
+-        let mut messages = vec![json!({"role": "system", "content": "S"})];
+-        // Small message.
+-        messages.push(json!({"role": "user", "content": "tiny"}));
+-        // Oversized message (fills most of the budget).
+-        messages.push(json!({"role": "assistant", "content": "x".repeat(2000)}));
+-        // Small message at the end.
+-        messages.push(json!({"role": "user", "content": "latest"}));
+-
+-        let trimmed = budget.trim_to_fit(&messages, 10);
+-        // The oversized message should be skipped, but both small messages
+-        // should survive (system + tiny + latest).
+-        let contents: Vec<&str> = trimmed
+-            .iter()
+-            .filter_map(|m| m["content"].as_str())
+-            .collect();
+-        assert!(contents.contains(&"latest"), "latest message must survive");
+-        assert!(contents.contains(&"tiny"), "earlier small message should survive when oversized one is skipped");
++    fn test_trim_preserves_latest_message_even_if_over_budget() {
++        // Budget too small for the latest message, but the latest user message
++        // must still be preserved to avoid prompt loss.
++        let budget = TokenBudget::new(120, 100); // tiny remaining budget
++        let messages = vec![
++            json!({"role": "system", "content": "System prompt that is somewhat long"}),
++            json!({"role": "user", "content": "x".repeat(200)}),
++        ];
++
++        let trimmed = budget.trim_to_fit(&messages, 0);
++        assert!(trimmed.len() >= 2, "latest message was dropped");
++        let last = trimmed.last().unwrap();
++        assert_eq!(last["role"], "user");
+     }
+ 
+     #[test]
+@@ -464,139 +387,10 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_age_based_eviction_drops_old_messages() {
+-        // Budget is generous — age eviction should fire before size eviction.
+-        let budget = TokenBudget::new(100_000, 8192);
+-        let mut messages = vec![json!({"role": "system", "content": "System prompt"})];
+-
+-        // Add messages with turn tags. Turns 1-10 are "old", turn 50 is current.
+-        for turn in 1..=10 {
+-            messages.push(json!({"role": "user", "content": format!("Old msg turn {}", turn), "_turn": turn}));
+-            messages.push(json!({"role": "assistant", "content": format!("Old reply {}", turn), "_turn": turn}));
+-        }
+-        // Recent messages.
+-        messages.push(json!({"role": "user", "content": "Recent question", "_turn": 50}));
+-
+-        let original_count = messages.len();
+-
+-        // max_age_turns=10, current_turn=50 → threshold = 40. All turns 1-10 < 40 → evicted.
+-        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+-
+-        // Old messages (turns 1-10) should be evicted, system + recent kept.
+-        assert!(trimmed.len() < original_count, "should have evicted old messages");
+-        assert_eq!(trimmed[0]["role"], "system");
+-        let last = trimmed.last().unwrap();
+-        assert_eq!(last["content"], "Recent question");
+-    }
+-
+-    #[test]
+-    fn test_age_based_eviction_keeps_recent_messages() {
+-        let budget = TokenBudget::new(100_000, 8192);
+-        let mut messages = vec![json!({"role": "system", "content": "System"})];
+-
+-        // All messages are recent (turns 45-50, threshold=40 with max_age=10, current=50).
+-        for turn in 45..=50 {
+-            messages.push(json!({"role": "user", "content": format!("Msg {}", turn), "_turn": turn}));
+-        }
+-
+-        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+-        // No eviction — all messages are within age window.
+-        assert_eq!(trimmed.len(), messages.len());
+-    }
+-
+-    #[test]
+-    fn test_age_based_eviction_preserves_untagged_messages() {
+-        let budget = TokenBudget::new(100_000, 8192);
+-        let mut messages = vec![json!({"role": "system", "content": "System"})];
+-
+-        // Mix of tagged and untagged messages.
+-        messages.push(json!({"role": "user", "content": "No turn tag"})); // no _turn
+-        messages.push(json!({"role": "user", "content": "Old", "_turn": 1}));
+-        messages.push(json!({"role": "user", "content": "Recent", "_turn": 50}));
+-
+-        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+-        // Untagged message preserved, old tagged dropped.
+-        let contents: Vec<&str> = trimmed.iter().filter_map(|m| m["content"].as_str()).collect();
+-        assert!(contents.contains(&"No turn tag"), "untagged messages must survive");
+-        assert!(contents.contains(&"Recent"), "recent messages must survive");
+-        assert!(!contents.contains(&"Old"), "old tagged messages should be evicted");
+-    }
+-
+-    #[test]
+-    fn test_stage2_skips_tool_results_when_assistant_skipped() {
+-        // Tight budget: system + large assistant+tool_calls should be skipped,
+-        // and the tool result must also be skipped (not orphaned).
+-        let budget = TokenBudget::new(300, 50);
+-        let messages = vec![
+-            json!({"role": "system", "content": "sys"}),
+-            json!({"role": "user", "content": "question"}),
+-            json!({
+-                "role": "assistant", "content": "x".repeat(2000),
+-                "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]
+-            }),
+-            json!({"role": "tool", "tool_call_id": "tc_1", "name": "read_file", "content": "data"}),
+-            json!({"role": "user", "content": "latest question"}),
+-        ];
+-        let trimmed = budget.trim_to_fit(&messages, 10);
+-        // The tool result should NOT survive if its assistant was dropped.
+-        let has_orphan = trimmed.iter().any(|m| {
+-            m.get("role").and_then(|r| r.as_str()) == Some("tool")
+-                && !trimmed.iter().any(|a| {
+-                    a.get("tool_calls")
+-                        .and_then(|tc| tc.as_array())
+-                        .map(|tcs| {
+-                            tcs.iter().any(|t| {
+-                                t.get("id").and_then(|i| i.as_str()) == Some("tc_1")
+-                            })
+-                        })
+-                        .unwrap_or(false)
+-                })
+-        });
+-        assert!(!has_orphan, "Tool result must not survive when its assistant is dropped");
+-    }
+-
+-    #[test]
+-    fn test_age_eviction_removes_orphaned_tool_results() {
+-        // Age-evict a user message at the start of a turn, which should also
+-        // clean up the subsequent tool results from that turn's assistant.
+-        let budget = TokenBudget::new(100_000, 8192);
+-        let messages = vec![
+-            json!({"role": "system", "content": "System"}),
+-            // Old turn with tool calls — user gets _turn tag, assistant+tool don't.
+-            json!({"role": "user", "content": "Old question", "_turn": 1}),
+-            json!({
+-                "role": "assistant", "content": "",
+-                "tool_calls": [{"id": "tc_old", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
+-            }),
+-            json!({"role": "tool", "tool_call_id": "tc_old", "name": "exec", "content": "result"}),
+-            json!({"role": "assistant", "content": "Done with old task"}),
+-            // Recent turn.
+-            json!({"role": "user", "content": "New question", "_turn": 50}),
+-        ];
+-
+-        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+-        // The tool result for tc_old should be removed because its assistant survived
+-        // but only if the assistant also got removed. Let's check for orphans.
+-        for m in &trimmed {
+-            if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
+-                let tool_call_id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+-                // Verify the matching assistant is also present.
+-                let has_matching_assistant = trimmed.iter().any(|a| {
+-                    a.get("tool_calls")
+-                        .and_then(|tc| tc.as_array())
+-                        .map(|tcs| {
+-                            tcs.iter().any(|t| {
+-                                t.get("id").and_then(|i| i.as_str()) == Some(tool_call_id)
+-                            })
+-                        })
+-                        .unwrap_or(false)
+-                });
+-                assert!(
+-                    has_matching_assistant,
+-                    "Tool result for '{}' is orphaned — its assistant was evicted",
+-                    tool_call_id
+-                );
+-            }
+-        }
++    fn test_local_tokenizer_fallback_when_unavailable() {
++        let budget = TokenBudget::new(128000, 8192)
++            .with_tokenizer_endpoint(Some("http://127.0.0.1:1/tokenize".to_string()));
++        // Unreachable endpoint should gracefully fall back to heuristic.
++        assert_eq!(budget.estimate_str_tokens_with_fallback("hello"), 2);
+     }
+ }
+diff --git a/src/config/schema.rs b/src/config/schema.rs
+index ffaf662..2d84823 100644
+--- a/src/config/schema.rs
++++ b/src/config/schema.rs
+@@ -184,6 +184,8 @@ pub struct AgentDefaults {
+     pub workspace: String,
+     #[serde(default = "default_model")]
+     pub model: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub local_model: Option<String>,
+     #[serde(default = "default_max_tokens")]
+     pub max_tokens: u32,
+     #[serde(default = "default_temperature")]
+@@ -236,6 +238,7 @@ impl Default for AgentDefaults {
+         Self {
+             workspace: default_workspace(),
+             model: default_model(),
++            local_model: None,
+             max_tokens: default_max_tokens(),
+             temperature: default_temperature(),
+             max_tool_iterations: default_max_tool_iterations(),
+@@ -922,9 +925,20 @@ mod tests {
+         let json = serde_json::to_string_pretty(&cfg).unwrap();
+         let cfg2: Config = serde_json::from_str(&json).unwrap();
+         assert_eq!(cfg2.agents.defaults.model, "anthropic/claude-opus-4-5");
++        assert!(cfg2.agents.defaults.local_model.is_none());
+         assert_eq!(cfg2.gateway.port, 18790);
+     }
+ 
++    #[test]
++    fn test_local_model_config_roundtrip() {
++        let json = r#"{"agents":{"defaults":{"localModel":"my-model.gguf"}}}"#;
++        let cfg: Config = serde_json::from_str(json).unwrap();
++        assert_eq!(
++            cfg.agents.defaults.local_model.as_deref(),
++            Some("my-model.gguf")
++        );
++    }
++
+     #[test]
+     fn test_api_key_priority() {
+         let mut cfg = Config::default();
+diff --git a/src/main.rs b/src/main.rs
+index 32300d6..6465ac5 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -22,7 +22,6 @@ mod voice;
+ #[cfg(feature = "voice")]
+ mod voice_pipeline;
+ 
+-use std::io::IsTerminal;
+ use std::sync::atomic::AtomicBool;
+ 
+ use clap::{Parser, Subcommand};
+@@ -55,7 +54,7 @@ enum Commands {
+         /// Use local LLM instead of cloud API.
+         #[arg(short, long)]
+         local: bool,
+-        /// Language hint for voice TTS engine (e.g. "en" uses faster Pocket).
++        /// Language hint for voice TTS engine (e.g. "en" uses faster Supertonic).
+         #[arg(long)]
+         lang: Option<String>,
+     },
+@@ -98,29 +97,6 @@ enum Commands {
+         #[arg(short, long)]
+         token: Option<String>,
+     },
+-    /// Ingest documents into the knowledge store for search.
+-    Ingest {
+-        /// File path(s) to ingest.
+-        #[arg(required = true)]
+-        files: Vec<String>,
+-        /// Custom source name (defaults to filename).
+-        #[arg(short, long)]
+-        name: Option<String>,
+-        /// Chunk size in characters. Default: 4096.
+-        #[arg(long, default_value_t = 4096)]
+-        chunk_size: usize,
+-        /// Overlap between chunks in characters. Default: 256.
+-        #[arg(long, default_value_t = 256)]
+-        overlap: usize,
+-    },
+-    /// Search the knowledge store.
+-    Search {
+-        /// Search query.
+-        query: String,
+-        /// Maximum results. Default: 5.
+-        #[arg(short, long, default_value_t = 5)]
+-        limit: usize,
+-    },
+     /// Quick-start Email channel.
+     Email {
+         /// IMAP host (prompted interactively if not provided).
+@@ -136,95 +112,6 @@ enum Commands {
+         #[arg(short, long)]
+         password: Option<String>,
+     },
+-    /// Run evaluation benchmarks.
+-    Eval {
+-        #[command(subcommand)]
+-        action: EvalAction,
+-    },
+-}
+-
+-#[derive(Subcommand)]
+-enum EvalAction {
+-    /// Run Towers of Hanoi benchmark (MAKER replication).
+-    Hanoi {
+-        /// Number of disks. Default: 5.
+-        #[arg(short, long, default_value_t = 5)]
+-        disks: u8,
+-        /// Run calibration (measure model accuracy on sampled steps).
+-        #[arg(long)]
+-        calibrate: bool,
+-        /// Number of calibration samples. Default: 100.
+-        #[arg(long, default_value_t = 100)]
+-        samples: usize,
+-        /// Run full solve with MAKER voting.
+-        #[arg(long)]
+-        solve: bool,
+-        /// Enable CATTS confidence gating.
+-        #[arg(long)]
+-        catts: bool,
+-        /// Ahead-by-k margin for voting. Default: 1.
+-        #[arg(short, long, default_value_t = 1)]
+-        k: usize,
+-        /// Use local LLM (llama-server).
+-        #[arg(short, long)]
+-        local: bool,
+-        /// Local server port. Default: 8080.
+-        #[arg(long, default_value_t = 8080)]
+-        port: u16,
+-    },
+-    /// Run Aggregation Haystack benchmark (Oolong-inspired).
+-    Haystack {
+-        /// Number of synthetic facts. Default: 50.
+-        #[arg(long, default_value_t = 50)]
+-        facts: usize,
+-        /// Total document length in characters. Default: 100000.
+-        #[arg(long, default_value_t = 100_000)]
+-        length: usize,
+-        /// Run Tier 2: aggregation tasks with LLM.
+-        #[arg(long)]
+-        aggregate: bool,
+-        /// Use local LLM (llama-server).
+-        #[arg(short, long)]
+-        local: bool,
+-        /// Local server port. Default: 8080.
+-        #[arg(long, default_value_t = 8080)]
+-        port: u16,
+-    },
+-    /// Run Learning Curve benchmark (SWE-Bench-CL inspired).
+-    Learn {
+-        /// Task family: arithmetic, fact-retrieval, tool-chain.
+-        #[arg(long, default_value = "arithmetic")]
+-        family: String,
+-        /// Number of tasks in the curriculum. Default: 50.
+-        #[arg(long, default_value_t = 50)]
+-        tasks: usize,
+-        /// Depth/complexity parameter. Default: 3.
+-        #[arg(long, default_value_t = 3)]
+-        depth: usize,
+-        /// Use local LLM (llama-server).
+-        #[arg(short, long)]
+-        local: bool,
+-        /// Local server port. Default: 8080.
+-        #[arg(long, default_value_t = 8080)]
+-        port: u16,
+-    },
+-    /// Run Research Sprint compound benchmark.
+-    Sprint {
+-        /// Corpus size in characters. Default: 500000.
+-        #[arg(long, default_value_t = 500_000)]
+-        corpus_size: usize,
+-        /// Number of questions. Default: 20.
+-        #[arg(long, default_value_t = 20)]
+-        questions: usize,
+-        /// Use local LLM (llama-server).
+-        #[arg(short, long)]
+-        local: bool,
+-        /// Local server port. Default: 8080.
+-        #[arg(long, default_value_t = 8080)]
+-        port: u16,
+-    },
+-    /// Show saved evaluation results.
+-    Report,
+ }
+ 
+ #[derive(Subcommand)]
+@@ -281,62 +168,22 @@ enum CronAction {
+ }
+ 
+ fn main() {
+-    // Safety net: restore terminal state and kill orphaned llama-server on panic
++    // Safety net: kill orphaned llama-server on panic so it doesn't hold VRAM
+     let default_hook = std::panic::take_hook();
+     std::panic::set_hook(Box::new(move |info| {
+-        // Restore terminal before printing panic message
+-        tui::force_exit_raw_mode();
+-        print!("\x1b[r");  // reset scroll region
+-        print!("\x1b[?25h"); // show cursor
+-        let _ = std::io::Write::flush(&mut std::io::stdout());
+-
+-        let _ = std::process::Command::new("pkill")
+-            .args(["-f", "llama-server"])
+-            .stdout(std::process::Stdio::null())
+-            .stderr(std::process::Stdio::null())
+-            .status();
++        server::kill_stale_llama_servers();
+         default_hook(info);
+     }));
+ 
+     let cli = Cli::parse();
+ 
+-    // Detect interactive REPL mode: `nanobot agent` with no -m message and a TTY.
+-    let is_interactive_repl = matches!(&cli.command, Commands::Agent { message: None, .. })
+-        && std::io::stdout().is_terminal();
+-
+-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+-        tracing_subscriber::EnvFilter::new("warn,ort=off,pocket_tts=off,html5ever=error")
+-    });
+-
+-    if is_interactive_repl {
+-        // Redirect tracing to a log file to prevent WARN logs from interleaving
+-        // with streaming output on stderr. Logs are still available in the file.
+-        let log_path = dirs::home_dir()
+-            .unwrap_or_default()
+-            .join(".nanobot")
+-            .join("nanobot.log");
+-        let log_file = std::fs::OpenOptions::new()
+-            .create(true)
+-            .append(true)
+-            .open(&log_path)
+-            .ok();
+-        if let Some(file) = log_file {
+-            tracing_subscriber::fmt()
+-                .with_env_filter(env_filter)
+-                .with_writer(std::sync::Mutex::new(file))
+-                .with_ansi(false)
+-                .init();
+-        } else {
+-            // Fallback: just write to stderr if we can't open the log file.
+-            tracing_subscriber::fmt()
+-                .with_env_filter(env_filter)
+-                .init();
+-        }
+-    } else {
+-        tracing_subscriber::fmt()
+-            .with_env_filter(env_filter)
+-            .init();
+-    }
++    tracing_subscriber::fmt()
++        .with_env_filter(
++            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
++                tracing_subscriber::EnvFilter::new("warn,ort=off,supertonic=off")
++            }),
++        )
++        .init();
+ 
+     match cli.command {
+         Commands::Onboard => cli::cmd_onboard(),
+@@ -366,8 +213,6 @@ fn main() {
+             CronAction::Remove { job_id } => cli::cmd_cron_remove(job_id),
+             CronAction::Enable { job_id, disable } => cli::cmd_cron_enable(job_id, disable),
+         },
+-        Commands::Ingest { files, name, chunk_size, overlap } => cli::cmd_ingest(files, name, chunk_size, overlap),
+-        Commands::Search { query, limit } => cli::cmd_search(query, limit),
+         Commands::WhatsApp => cli::cmd_whatsapp(),
+         Commands::Telegram { token } => cli::cmd_telegram(token),
+         Commands::Email {
+@@ -376,21 +221,6 @@ fn main() {
+             username,
+             password,
+         } => cli::cmd_email(imap_host, smtp_host, username, password),
+-        Commands::Eval { action } => match action {
+-            EvalAction::Hanoi { disks, calibrate, samples, solve, catts, k, local, port } => {
+-                cli::cmd_eval_hanoi(disks, calibrate, samples, solve, catts, k, local, port)
+-            }
+-            EvalAction::Haystack { facts, length, aggregate, local, port } => {
+-                cli::cmd_eval_haystack(facts, length, aggregate, local, port)
+-            }
+-            EvalAction::Learn { family, tasks, depth, local, port } => {
+-                cli::cmd_eval_learn(family, tasks, depth, local, port)
+-            }
+-            EvalAction::Sprint { corpus_size, questions, local, port } => {
+-                cli::cmd_eval_sprint(corpus_size, questions, local, port)
+-            }
+-            EvalAction::Report => cli::cmd_eval_report(),
+-        },
+     }
+ }
+ 
+diff --git a/src/providers/openai_compat.rs b/src/providers/openai_compat.rs
+index c7f82a9..d672e0f 100644
+--- a/src/providers/openai_compat.rs
++++ b/src/providers/openai_compat.rs
+@@ -391,6 +391,8 @@ async fn parse_sse_stream(
+     byte_stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+     tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+ ) {
++    let stream_start = std::time::Instant::now();
++    let mut first_delta_ms: Option<u128> = None;
+     let mut line_buffer = String::new();
+     let mut full_content = String::new();
+     let mut full_reasoning = String::new();
+@@ -470,6 +472,13 @@ async fn parse_sse_stream(
+                     finish_reason: finish_reason.clone(),
+                     usage: usage.clone(),
+                 }));
++                debug!(
++                    "SSE done marker at {} ms (first_delta_ms={})",
++                    stream_start.elapsed().as_millis(),
++                    first_delta_ms
++                        .map(|ms| ms.to_string())
++                        .unwrap_or_else(|| "none".to_string())
++                );
+                 return;
+             }
+ 
+@@ -502,6 +511,13 @@ async fn parse_sse_stream(
+                         // Text content delta
+                         if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                             if !content.is_empty() {
++                                if first_delta_ms.is_none() {
++                                    first_delta_ms = Some(stream_start.elapsed().as_millis());
++                                    debug!(
++                                        "SSE first content delta at {} ms",
++                                        first_delta_ms.unwrap_or(0)
++                                    );
++                                }
+                                 full_content.push_str(content);
+                                 let _ = tx.send(StreamChunk::TextDelta(content.to_string()));
+                             }
+@@ -585,6 +601,13 @@ async fn parse_sse_stream(
+         finish_reason,
+         usage,
+     }));
++    debug!(
++        "SSE stream ended without [DONE] at {} ms (first_delta_ms={})",
++        stream_start.elapsed().as_millis(),
++        first_delta_ms
++            .map(|ms| ms.to_string())
++            .unwrap_or_else(|| "none".to_string())
++    );
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/server.rs b/src/server.rs
+index ace296a..6d97e1d 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -4,7 +4,7 @@
+ //! parsing GGUF model metadata for auto-sizing context windows, and detecting available
+ //! system memory (VRAM/RAM).
+ 
+-use std::collections::HashMap;
++use std::env;
+ use std::net::TcpListener;
+ use std::path::{Path, PathBuf};
+ use std::process::{Child, Command, Stdio};
+@@ -51,24 +51,107 @@ pub(crate) fn find_available_port(start: u16) -> u16 {
+     start // fallback
+ }
+ 
+-/// List all GGUF models in `~/models/`, sorted by filename.
++/// Resolve the local GGUF models directory.
++///
++/// Priority:
++/// 1. `NANOBOT_MODELS_DIR`
++/// 2. `~/.nanobot/models` (if it exists)
++/// 3. `~/models` (legacy default)
++pub(crate) fn local_models_dir() -> PathBuf {
++    if let Ok(path) = env::var("NANOBOT_MODELS_DIR") {
++        let trimmed = path.trim();
++        if !trimmed.is_empty() {
++            return PathBuf::from(trimmed);
++        }
++    }
++
++    if let Some(home) = dirs::home_dir() {
++        let nanobot_models = home.join(".nanobot").join("models");
++        if nanobot_models.exists() {
++            return nanobot_models;
++        }
++        return home.join("models");
++    }
++
++    PathBuf::from("models")
++}
++
++/// Path to the default local model filename in the resolved models directory.
++pub(crate) fn default_local_model_path() -> PathBuf {
++    local_models_dir().join(DEFAULT_LOCAL_MODEL)
++}
++
++/// List all GGUF models in the resolved local models directory, sorted by filename.
+ pub(crate) fn list_local_models() -> Vec<PathBuf> {
+-    let home = match dirs::home_dir() {
+-        Some(h) => h,
+-        None => return vec![],
+-    };
+-    let models_dir = home.join("models");
++    let models_dir = local_models_dir();
+     let mut models: Vec<PathBuf> = std::fs::read_dir(&models_dir)
+         .into_iter()
+         .flatten()
+         .filter_map(|e| e.ok())
+         .map(|e| e.path())
+-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
++        .filter(|p| {
++            p.extension().and_then(|e| e.to_str()) == Some("gguf")
++                && p.is_file()
++        })
+         .collect();
+     models.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+     models
+ }
+ 
++fn command_exists_in_path(cmd: &str) -> bool {
++    let path_var = match env::var_os("PATH") {
++        Some(v) => v,
++        None => return false,
++    };
++    env::split_paths(&path_var).any(|dir| dir.join(cmd).exists())
++}
++
++fn resolve_llama_server_command() -> Result<PathBuf, String> {
++    if let Ok(path) = env::var("NANOBOT_LLAMA_SERVER") {
++        let trimmed = path.trim();
++        if !trimmed.is_empty() {
++            let candidate = PathBuf::from(trimmed);
++            if candidate.exists() {
++                return Ok(candidate);
++            }
++            return Err(format!(
++                "llama-server not found at NANOBOT_LLAMA_SERVER path {}",
++                candidate.display()
++            ));
++        }
++    }
++
++    let mut searched: Vec<PathBuf> = Vec::new();
++    if let Some(home) = dirs::home_dir() {
++        let candidates = [
++            home.join("llama.cpp/build/bin/llama-server"),
++            home.join(".nanobot/bin/llama-server"),
++            home.join(".local/bin/llama-server"),
++        ];
++        for candidate in candidates {
++            if candidate.exists() {
++                return Ok(candidate);
++            }
++            searched.push(candidate);
++        }
++    }
++
++    if command_exists_in_path("llama-server") {
++        return Ok(PathBuf::from("llama-server"));
++    }
++
++    let mut msg = String::from("llama-server not found. Set NANOBOT_LLAMA_SERVER or install it in PATH");
++    if !searched.is_empty() {
++        let locations = searched
++            .iter()
++            .map(|p| p.display().to_string())
++            .collect::<Vec<_>>()
++            .join(", ");
++        msg.push_str(&format!(" (searched: {})", locations));
++    }
++    Err(msg)
++}
++
+ /// Ensure the dedicated compaction model is available locally.
+ ///
+ /// Downloads Qwen3-0.6B Q4_K_M (~500MB) to `~/.nanobot/models/` if not already
+@@ -160,7 +243,6 @@ pub(crate) async fn start_compaction_if_available(
+ 
+     match spawn_compaction_server(port, &model_path, main_ctx_size) {
+         Ok(child) => {
+-            record_server_pid("compaction", child.id());
+             *compaction_process = Some(child);
+             if wait_for_server_ready(port, 15, compaction_process).await {
+                 *compaction_port = Some(port.to_string());
+@@ -202,238 +284,36 @@ pub(crate) fn stop_compaction_server(
+     compaction_port: &mut Option<String>,
+ ) {
+     if let Some(ref mut child) = compaction_process {
+-        let pid = child.id();
+         child.kill().ok();
+         child.wait().ok();
+-        unrecord_server_pid(pid);
+     }
+     *compaction_process = None;
+     *compaction_port = None;
+ }
+ 
+-// ============================================================================
+-// Delegation server (auto-spawned for tool delegation in local mode)
+-// ============================================================================
+-
+-/// Model preferences for the auto-spawned delegation server, in priority order.
+-/// The first model found in `~/models/` wins.
+-const DELEGATION_MODEL_PREFERENCES: &[&str] = &[
+-    "Ministral-3",
+-    "nanbeige",
+-    "Qwen3-0.6B",
+-    "Ministral-8B",
+-    "Nemotron-Nano-9B",
+-];
+-
+-/// Find a suitable delegation model from `~/models/` using the preference list.
+-///
+-/// Scans `list_local_models()` and returns the first match against
+-/// `DELEGATION_MODEL_PREFERENCES` (case-insensitive substring match).
+-pub(crate) fn find_delegation_model() -> Option<PathBuf> {
+-    pick_preferred_model(&list_local_models(), DELEGATION_MODEL_PREFERENCES)
+-}
+-
+-/// Pure priority-matching: given a list of model paths and an ordered preference
+-/// list, return the first model that matches the highest-priority preference
+-/// (case-insensitive substring match on filename).
+-fn pick_preferred_model(models: &[PathBuf], preferences: &[&str]) -> Option<PathBuf> {
+-    for pref in preferences {
+-        let pref_lower = pref.to_lowercase();
+-        if let Some(m) = models.iter().find(|p| {
+-            p.file_name()
+-                .and_then(|n| n.to_str())
+-                .map(|n| n.to_lowercase().contains(&pref_lower))
+-                .unwrap_or(false)
+-        }) {
+-            return Some(m.clone());
+-        }
+-    }
+-    None
+-}
+-
+-/// Start the dedicated delegation server if a suitable model is available.
+-///
+-/// Spawns a GPU-accelerated llama-server on port 8091+ with a small context
+-/// window (4096 tokens — tool work is short). Uses 10 GPU layers to avoid
+-/// competing with the main model for VRAM.
+-pub(crate) async fn start_delegation_if_available(
+-    delegation_process: &mut Option<Child>,
+-    delegation_port: &mut Option<String>,
+-) {
+-    // Already running?
+-    if delegation_process.is_some() {
+-        return;
+-    }
+-
+-    let model_path = match find_delegation_model() {
+-        Some(p) => p,
+-        None => return,
+-    };
+-
+-    let model_name = model_path
+-        .file_name()
+-        .and_then(|n| n.to_str())
+-        .unwrap_or("delegation-model");
+-    let port = find_available_port(8091);
+-    let ctx_size = 4096; // Tool work is short — no need for large context
+-
+-    // Compute GPU layers based on available VRAM (after main model is loaded).
+-    let gpu_layers = compute_gpu_layers_for_model(&model_path, ctx_size);
+-    let gpu_label = if gpu_layers >= 99 {
+-        "full GPU".to_string()
+-    } else if gpu_layers == 0 {
+-        "CPU".to_string()
+-    } else {
+-        format!("{} GPU layers", gpu_layers)
+-    };
+-
+-    println!(
+-        "  {}{}Starting{} delegation server ({}, port {}, ctx: {}K, {})...",
+-        crate::tui::BOLD,
+-        crate::tui::YELLOW,
+-        crate::tui::RESET,
+-        model_name,
+-        port,
+-        ctx_size / 1024,
+-        gpu_label,
+-    );
+-
+-    match spawn_delegation_server(port, &model_path, ctx_size, gpu_layers) {
+-        Ok(child) => {
+-            record_server_pid("delegation", child.id());
+-            *delegation_process = Some(child);
+-            if wait_for_server_ready(port, 30, delegation_process).await {
+-                *delegation_port = Some(port.to_string());
+-                println!(
+-                    "  {}{}Delegation server ready{} ({} on GPU)",
+-                    crate::tui::BOLD,
+-                    crate::tui::GREEN,
+-                    crate::tui::RESET,
+-                    model_name,
+-                );
+-            } else {
+-                println!(
+-                    "  {}{}Delegation server failed to start{} (tool delegation will use main model)",
+-                    crate::tui::BOLD,
+-                    crate::tui::YELLOW,
+-                    crate::tui::RESET,
+-                );
+-                if let Some(ref mut child) = delegation_process {
+-                    child.kill().ok();
+-                    child.wait().ok();
+-                }
+-                *delegation_process = None;
+-            }
+-        }
+-        Err(e) => {
+-            println!(
+-                "  {}{}Delegation server failed:{} {} (tool delegation will use main model)",
+-                crate::tui::BOLD,
+-                crate::tui::YELLOW,
+-                crate::tui::RESET,
+-                e,
+-            );
+-        }
+-    }
+-}
+-
+-/// Stop the delegation server and clear state.
+-pub(crate) fn stop_delegation_server(
+-    delegation_process: &mut Option<Child>,
+-    delegation_port: &mut Option<String>,
+-) {
+-    if let Some(ref mut child) = delegation_process {
+-        let pid = child.id();
+-        child.kill().ok();
+-        child.wait().ok();
+-        unrecord_server_pid(pid);
+-    }
+-    *delegation_process = None;
+-    *delegation_port = None;
+-}
+-
+-/// Path to the PID file for tracking spawned llama-server processes.
+-fn pid_file_path() -> Option<PathBuf> {
+-    Some(dirs::home_dir()?.join(".nanobot").join(".server-pids"))
+-}
+-
+-/// Record a server PID in the tracking file (format: `role:pid` per line).
+-pub(crate) fn record_server_pid(role: &str, pid: u32) {
+-    if let Some(path) = pid_file_path() {
+-        if let Some(parent) = path.parent() {
+-            std::fs::create_dir_all(parent).ok();
+-        }
+-        use std::io::Write;
+-        if let Ok(mut f) = std::fs::OpenOptions::new()
+-            .create(true)
+-            .append(true)
+-            .open(&path)
+-        {
+-            let _ = writeln!(f, "{}:{}", role, pid);
+-        }
+-    }
+-}
+-
+-/// Remove a specific PID from the tracking file.
+-pub(crate) fn unrecord_server_pid(pid: u32) {
+-    if let Some(path) = pid_file_path() {
+-        if let Ok(contents) = std::fs::read_to_string(&path) {
+-            let remaining: Vec<&str> = contents
+-                .lines()
+-                .filter(|line| {
+-                    line.split(':')
+-                        .nth(1)
+-                        .and_then(|p| p.parse::<u32>().ok())
+-                        != Some(pid)
+-                })
+-                .collect();
+-            if remaining.is_empty() {
+-                std::fs::remove_file(&path).ok();
+-            } else {
+-                std::fs::write(&path, remaining.join("\n") + "\n").ok();
+-            }
+-        }
++/// Kill any orphaned llama-server processes from previous runs.
++pub(crate) fn kill_stale_llama_servers() {
++    #[cfg(unix)]
++    {
++        // Kill any orphaned llama-server processes from previous runs.
++        let _ = Command::new("pkill")
++            .args(["-f", "llama-server"])
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status();
+     }
+-}
+-
+-/// Kill llama-server processes tracked from previous nanobot runs.
+-///
+-/// Only kills PIDs recorded in `~/.nanobot/.server-pids`, not system-wide.
+-/// Replaces the former `pkill -f llama-server` approach.
+-pub(crate) fn kill_tracked_servers() {
+-    let path = match pid_file_path() {
+-        Some(p) => p,
+-        None => return,
+-    };
+-    let contents = match std::fs::read_to_string(&path) {
+-        Ok(c) => c,
+-        Err(_) => return, // No PID file — nothing to kill
+-    };
+-
+-    for line in contents.lines() {
+-        if let Some(pid_str) = line.split(':').nth(1) {
+-            if let Ok(pid) = pid_str.parse::<i32>() {
+-                // Send SIGKILL to the specific PID (safe: only our tracked PIDs)
+-                unsafe {
+-                    libc::kill(pid, libc::SIGKILL);
+-                }
+-            }
+-        }
++    #[cfg(windows)]
++    {
++        let _ = Command::new("taskkill")
++            .args(["/F", "/IM", "llama-server.exe"])
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status();
+     }
+-
+-    // Clean up the file
+-    std::fs::remove_file(&path).ok();
+     // Brief pause to let ports be released
+     std::thread::sleep(std::time::Duration::from_millis(300));
+ }
+ 
+-/// Kill any orphaned llama-server processes from previous runs.
+-///
+-/// Uses PID-based tracking. Falls back to the tracking file only.
+-pub(crate) fn kill_stale_llama_servers() {
+-    kill_tracked_servers();
+-}
+-
+ /// Parse architecture-specific metadata from a GGUF file header.
+ pub(crate) fn parse_gguf_metadata(path: &Path) -> Option<GgufModelInfo> {
+     use std::io::{Read, Seek, SeekFrom};
+@@ -565,7 +445,7 @@ pub(crate) fn parse_gguf_metadata(path: &Path) -> Option<GgufModelInfo> {
+     })
+ }
+ 
+-/// Detect available VRAM (via nvidia-smi) and RAM (via /proc/meminfo).
++/// Detect available VRAM (via nvidia-smi) and RAM (OS-specific probe).
+ /// Returns (vram_bytes, ram_bytes).
+ pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
+     // Try VRAM via nvidia-smi
+@@ -582,8 +462,14 @@ pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
+         })
+         .map(|mib| mib * 1024 * 1024);
+ 
+-    // RAM via /proc/meminfo
+-    let ram = std::fs::read_to_string("/proc/meminfo")
++    let ram = detect_available_ram_bytes().unwrap_or(8 * 1024 * 1024 * 1024); // 8 GB fallback
++
++    (vram, ram)
++}
++
++#[cfg(target_os = "linux")]
++fn detect_available_ram_bytes() -> Option<u64> {
++    std::fs::read_to_string("/proc/meminfo")
+         .ok()
+         .and_then(|contents| {
+             for line in contents.lines() {
+@@ -594,9 +480,29 @@ pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
+             }
+             None
+         })
+-        .unwrap_or(8 * 1024 * 1024 * 1024); // 8 GB fallback
++}
+ 
+-    (vram, ram)
++#[cfg(target_os = "macos")]
++fn detect_available_ram_bytes() -> Option<u64> {
++    // macOS does not expose a /proc-style MemAvailable counter.
++    // Use 70% of physical memory as a conservative proxy for available RAM.
++    let output = Command::new("sysctl")
++        .args(["-n", "hw.memsize"])
++        .output()
++        .ok()?;
++    if !output.status.success() {
++        return None;
++    }
++    let total = String::from_utf8_lossy(&output.stdout)
++        .trim()
++        .parse::<u64>()
++        .ok()?;
++    Some((total as f64 * 0.70) as u64)
++}
++
++#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++fn detect_available_ram_bytes() -> Option<u64> {
++    None
+ }
+ 
+ /// Practical context cap based on model file size (proxy for parameter count).
+@@ -696,164 +602,66 @@ pub(crate) fn compute_optimal_context_size(model_path: &Path) -> usize {
+ ///
+ /// Uses GPU acceleration and matches the main model's context size so
+ /// large conversations can be summarized in a single LLM call.
+-/// Estimate VRAM needed to fully offload a GGUF model (weights + small KV cache).
+-///
+-/// Returns bytes needed for full GPU offload. Uses file size as a proxy for
+-/// weight memory (GGUF file ≈ quantized weights + small overhead).
+-pub(crate) fn estimate_model_vram(model_path: &Path, ctx_size: usize) -> u64 {
+-    let file_size = std::fs::metadata(model_path)
+-        .map(|m| m.len())
+-        .unwrap_or(5 * 1024 * 1024 * 1024); // 5GB fallback
+-
+-    // Parse GGUF for KV cache estimation if possible.
+-    let kv_bytes = match parse_gguf_metadata(model_path) {
+-        Some(meta) => {
+-            let head_dim = meta.embedding_dim / meta.n_heads.max(1);
+-            let kv_per_token = 2 * meta.n_layers * meta.n_kv_heads * head_dim * 2;
+-            (kv_per_token as u64 * ctx_size as u64)
+-        }
+-        None => {
+-            // Rough estimate: ~2MB per 1K context for 8B model
+-            (ctx_size as u64 / 1024) * 2 * 1024 * 1024
+-        }
+-    };
+-
+-    file_size + kv_bytes + 256 * 1024 * 1024 // weights + KV + 256MB overhead
+-}
+-
+-/// Compute how many GPU layers a model can use given available VRAM.
+-///
+-/// If the model fits entirely, returns 99 (full offload). Otherwise,
+-/// proportionally allocates layers based on how much VRAM is free.
+-pub(crate) fn compute_gpu_layers_for_model(model_path: &Path, ctx_size: usize) -> u32 {
+-    let (vram, _ram) = detect_available_memory();
+-    let Some(free_vram) = vram else {
+-        return 0; // No GPU detected
+-    };
+-
+-    let needed = estimate_model_vram(model_path, ctx_size);
+-
+-    if free_vram >= needed {
+-        99 // Full offload — plenty of room
+-    } else if free_vram < 512 * 1024 * 1024 {
+-        0 // Less than 512MB free — CPU only
+-    } else {
+-        // Proportional: if we have 60% of needed VRAM, use ~60% of layers.
+-        // Parse layer count from GGUF, fall back to 32 (typical for 8B models).
+-        let total_layers = parse_gguf_metadata(model_path)
+-            .map(|m| m.n_layers)
+-            .unwrap_or(32) as u64;
+-        let proportion = free_vram as f64 / needed as f64;
+-        let layers = (total_layers as f64 * proportion).floor() as u32;
+-        layers.max(1) // At least 1 layer on GPU
+-    }
+-}
+-
+-/// Configuration for spawning a llama-server process.
+-pub(crate) struct SpawnConfig<'a> {
+-    pub port: u16,
+-    pub model_path: &'a Path,
+-    pub ctx_size: usize,
+-    pub gpu_layers: u32,
+-    pub role: &'a str, // "main", "compaction", "delegation" — for error messages
+-}
+-
+-/// Spawn a llama-server with the given configuration.
+-///
+-/// Single implementation replacing the former per-role spawn functions.
+-pub(crate) fn spawn_server(config: &SpawnConfig) -> Result<Child, String> {
+-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+-    let server_path = home.join("llama.cpp/build/bin/llama-server");
+-
+-    if !server_path.exists() {
+-        return Err(format!(
+-            "llama-server not found at {}",
+-            server_path.display()
+-        ));
+-    }
+-    if !config.model_path.exists() {
++pub(crate) fn spawn_compaction_server(
++    port: u16,
++    model_path: &Path,
++    ctx_size: usize,
++) -> Result<Child, String> {
++    let server_cmd = resolve_llama_server_command()?;
++    if !model_path.exists() {
+         return Err(format!(
+-            "{} model not found at {}",
+-            capitalize(config.role),
+-            config.model_path.display()
++            "Compaction model not found at {}",
++            model_path.display()
+         ));
+     }
+ 
+-    Command::new(&server_path)
++    Command::new(&server_cmd)
+         .arg("--model")
+-        .arg(config.model_path)
++        .arg(model_path)
+         .arg("--port")
+-        .arg(config.port.to_string())
++        .arg(port.to_string())
+         .arg("--ctx-size")
+-        .arg(config.ctx_size.to_string())
++        .arg(ctx_size.to_string())
+         .arg("--parallel")
+         .arg("1")
+         .arg("--n-gpu-layers")
+-        .arg(config.gpu_layers.to_string())
++        .arg("10")
+         .arg("--flash-attn")
+         .arg("on")
+-        // Jinja required for tool calling (Mistral/Ministral templates).
+-        .arg("--jinja")
+-        // Prevent prefill errors when conversation ends with tool results.
+-        .arg("--no-prefill-assistant")
+         .stdout(Stdio::null())
+         .stderr(Stdio::piped())
+         .spawn()
+-        .map_err(|e| format!("Failed to spawn {} server: {}", config.role, e))
+-}
+-
+-fn capitalize(s: &str) -> String {
+-    let mut c = s.chars();
+-    match c.next() {
+-        None => String::new(),
+-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+-    }
++        .map_err(|e| format!("Failed to spawn compaction server: {}", e))
+ }
+ 
+-/// Convenience wrapper: spawn the main model server (full GPU offload).
++/// Spawn a llama-server for the main model.
+ pub(crate) fn spawn_llama_server(
+     port: u16,
+     model_path: &Path,
+     ctx_size: usize,
+ ) -> Result<Child, String> {
+-    spawn_server(&SpawnConfig {
+-        port,
+-        model_path,
+-        ctx_size,
+-        gpu_layers: 99,
+-        role: "main",
+-    })
+-}
+-
+-/// Convenience wrapper: spawn the compaction server (10 GPU layers).
+-pub(crate) fn spawn_compaction_server(
+-    port: u16,
+-    model_path: &Path,
+-    ctx_size: usize,
+-) -> Result<Child, String> {
+-    spawn_server(&SpawnConfig {
+-        port,
+-        model_path,
+-        ctx_size,
+-        gpu_layers: 10,
+-        role: "compaction",
+-    })
+-}
++    let server_cmd = resolve_llama_server_command()?;
++    if !model_path.exists() {
++        return Err(format!("Model not found at {}", model_path.display()));
++    }
+ 
+-/// Convenience wrapper: spawn the delegation server (configurable GPU layers).
+-pub(crate) fn spawn_delegation_server(
+-    port: u16,
+-    model_path: &Path,
+-    ctx_size: usize,
+-    gpu_layers: u32,
+-) -> Result<Child, String> {
+-    spawn_server(&SpawnConfig {
+-        port,
+-        model_path,
+-        ctx_size,
+-        gpu_layers,
+-        role: "delegation",
+-    })
++    Command::new(&server_cmd)
++        .arg("--model")
++        .arg(model_path)
++        .arg("--port")
++        .arg(port.to_string())
++        .arg("--ctx-size")
++        .arg(ctx_size.to_string())
++        .arg("--parallel")
++        .arg("1")
++        .arg("--n-gpu-layers")
++        .arg("99")
++        .arg("--flash-attn")
++        .arg("on")
++        .stdout(Stdio::null())
++        .stderr(Stdio::piped())
++        .spawn()
++        .map_err(|e| format!("Failed to spawn llama-server: {}", e))
+ }
+ 
+ /// Wait for a llama-server to be healthy (responds to /health).
+@@ -963,92 +771,7 @@ pub(crate) async fn wait_for_server_ready(
+     false
+ }
+ 
+-/// Quick health check: is the local llama-server at the given base URL alive?
+-///
+-/// Sends a GET to `/health` with a 2-second timeout. Returns `true` if the
+-/// server responds with 200, `false` otherwise.
+-pub(crate) async fn check_health(api_base: &str) -> bool {
+-    // api_base is typically "http://localhost:PORT/v1" — strip to get the root.
+-    let base = api_base
+-        .trim_end_matches('/')
+-        .trim_end_matches("/v1")
+-        .trim_end_matches('/');
+-    let url = format!("{}/health", base);
+-    let client = reqwest::Client::builder()
+-        .timeout(std::time::Duration::from_secs(2))
+-        .build()
+-        .unwrap_or_default();
+-    match client.get(&url).send().await {
+-        Ok(resp) => resp.status().is_success(),
+-        Err(_) => false,
+-    }
+-}
+-
+-/// Background health watchdog for local llama-server processes.
+-///
+-/// Pings `/health` every 30 seconds on all active server ports. When a server
+-/// goes down, sends a one-line warning to `alert_tx` (displayed in the REPL
+-/// before the next prompt).
+-pub(crate) fn start_health_watchdog(
+-    ports: Vec<(String, String)>, // (role, port)
+-    alert_tx: tokio::sync::mpsc::UnboundedSender<String>,
+-) -> tokio::task::JoinHandle<()> {
+-    tokio::spawn(async move {
+-        let client = reqwest::Client::builder()
+-            .timeout(std::time::Duration::from_secs(3))
+-            .build()
+-            .unwrap_or_default();
+-
+-        // Track which servers were healthy on last check.
+-        let mut was_healthy: HashMap<String, bool> = ports
+-            .iter()
+-            .map(|(role, _)| (role.clone(), true))
+-            .collect();
+-
+-        loop {
+-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+-
+-            for (role, port) in &ports {
+-                let url = format!("http://localhost:{}/health", port);
+-                let healthy = match client.get(&url).send().await {
+-                    Ok(resp) => resp.status().is_success(),
+-                    Err(_) => false,
+-                };
+-
+-                let prev = was_healthy.get(role).copied().unwrap_or(true);
+-                if !healthy && prev {
+-                    // Server just went down — alert once.
+-                    let msg = format!(
+-                        "\x1b[RAW]\n  \x1b[31m\u{25cf}\x1b[0m \x1b[1m{} server (port {})\x1b[0m \x1b[31mDOWN\x1b[0m — use /restart or /local to recover\n",
+-                        role, port
+-                    );
+-                    let _ = alert_tx.send(msg);
+-                } else if healthy && !prev {
+-                    // Server recovered.
+-                    let msg = format!(
+-                        "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m \x1b[1m{} server (port {})\x1b[0m \x1b[32mrecovered\x1b[0m\n",
+-                        role, port
+-                    );
+-                    let _ = alert_tx.send(msg);
+-                }
+-
+-                was_healthy.insert(role.clone(), healthy);
+-            }
+-        }
+-    })
+-}
+-
+-/// Query the local llama.cpp server for its actual context size (`n_ctx`).
+-///
+-/// Returns the server's context window with 5% headroom subtracted (to account
+-/// for token-estimation drift). Falls back to `None` if the server is
+-/// unreachable or the response is unexpected.
+-pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
+-    let url = format!("http://localhost:{}/props", port);
+-    let props = reqwest::blocking::get(&url)
+-        .ok()?
+-        .json::<serde_json::Value>()
+-        .ok()?;
++fn parse_context_size_from_props(props: &serde_json::Value) -> Option<usize> {
+     let n_ctx = props
+         .get("default_generation_settings")
+         .and_then(|v| v.get("n_ctx"))
+@@ -1066,6 +789,39 @@ pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
+     Some((per_request_ctx as f64 * 0.95) as usize)
+ }
+ 
++fn query_local_context_size_blocking(port: &str) -> Option<usize> {
++    let url = format!("http://localhost:{}/props", port);
++    let props = reqwest::blocking::get(&url)
++        .ok()?
++        .json::<serde_json::Value>()
++        .ok()?;
++    parse_context_size_from_props(&props)
++}
++
++/// Query the local llama.cpp server for its actual context size (`n_ctx`).
++///
++/// Returns the server's context window with 5% headroom subtracted (to account
++/// for token-estimation drift). Falls back to `None` if the server is
++/// unreachable or the response is unexpected.
++pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
++    if let Ok(handle) = tokio::runtime::Handle::try_current() {
++        match handle.runtime_flavor() {
++            tokio::runtime::RuntimeFlavor::MultiThread => {
++                tokio::task::block_in_place(|| query_local_context_size_blocking(port))
++            }
++            _ => {
++                let owned = port.to_string();
++                std::thread::spawn(move || query_local_context_size_blocking(&owned))
++                    .join()
++                    .ok()
++                    .flatten()
++            }
++        }
++    } else {
++        query_local_context_size_blocking(port)
++    }
++}
++
+ // ============================================================================
+ // Tests (RED — these should FAIL until we move the implementations)
+ // ============================================================================
+@@ -1248,7 +1004,7 @@ mod tests {
+ 
+     #[test]
+     fn test_list_local_models_returns_sorted() {
+-        // This is a filesystem test — it may return empty if ~/models/ doesn't exist
++        // This is a filesystem test — it may return empty if no local model dir exists.
+         let models = list_local_models();
+         // If any models exist, they should be sorted and all .gguf
+         for (i, model) in models.iter().enumerate() {
+@@ -1303,11 +1059,8 @@ mod tests {
+ 
+     #[test]
+     fn test_spawn_server_errors_when_binary_missing() {
+-        let home = dirs::home_dir().unwrap();
+-        let server_path = home.join("llama.cpp/build/bin/llama-server");
+-
+-        if !server_path.exists() {
+-            let fake_model = home.join("models/nonexistent.gguf");
++        if resolve_llama_server_command().is_err() {
++            let fake_model = local_models_dir().join("nonexistent.gguf");
+             let result = spawn_llama_server(19876, &fake_model, 8192);
+             assert!(result.is_err());
+             assert!(
+@@ -1319,15 +1072,12 @@ mod tests {
+ 
+     #[test]
+     fn test_spawn_server_errors_when_model_missing() {
+-        let home = dirs::home_dir().unwrap();
+-        let server_path = home.join("llama.cpp/build/bin/llama-server");
+-        let model_path = home.join("models/nonexistent-test-model.gguf");
+-
+-        if server_path.exists() {
++        let model_path = local_models_dir().join("nonexistent-test-model.gguf");
++        if resolve_llama_server_command().is_ok() {
+             let result = spawn_llama_server(19877, &model_path, 8192);
+             assert!(result.is_err());
+             assert!(
+-                result.unwrap_err().contains("model not found"),
++                result.unwrap_err().contains("Model not found"),
+                 "Should report missing model"
+             );
+         }
+@@ -1415,7 +1165,10 @@ mod tests {
+     fn test_parse_real_gguf_if_available() {
+         let models = list_local_models();
+         if models.is_empty() {
+-            eprintln!("Skipping: no GGUF models found in ~/models/");
++            eprintln!(
++                "Skipping: no GGUF models found in {}",
++                local_models_dir().display()
++            );
+             return;
+         }
+ 
+@@ -1448,7 +1201,10 @@ mod tests {
+     fn test_compute_optimal_context_real_models() {
+         let models = list_local_models();
+         if models.is_empty() {
+-            eprintln!("Skipping: no GGUF models found in ~/models/");
++            eprintln!(
++                "Skipping: no GGUF models found in {}",
++                local_models_dir().display()
++            );
+             return;
+         }
+ 
+@@ -1476,220 +1232,4 @@ mod tests {
+             eprintln!("  No GPU detected. RAM: {:.1} GB", ram as f64 / 1e9);
+         }
+     }
+-
+-    // -- find_delegation_model / pick_preferred_model tests --
+-
+-    #[test]
+-    fn test_find_delegation_model_preference_constants() {
+-        assert_eq!(DELEGATION_MODEL_PREFERENCES[0], "Ministral-3");
+-        assert_eq!(DELEGATION_MODEL_PREFERENCES[1], "nanbeige");
+-        assert_eq!(DELEGATION_MODEL_PREFERENCES[2], "Qwen3-0.6B");
+-        assert_eq!(DELEGATION_MODEL_PREFERENCES[3], "Ministral-8B");
+-        assert_eq!(DELEGATION_MODEL_PREFERENCES[4], "Nemotron-Nano-9B");
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_empty_list() {
+-        let models: Vec<PathBuf> = vec![];
+-        assert!(pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES).is_none());
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_no_match() {
+-        let models = vec![
+-            PathBuf::from("/models/llama-70B.gguf"),
+-            PathBuf::from("/models/qwen-7B.gguf"),
+-        ];
+-        assert!(pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES).is_none());
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_single_match() {
+-        let models = vec![
+-            PathBuf::from("/models/llama-70B.gguf"),
+-            PathBuf::from("/models/Nemotron-Nano-9B-Q4.gguf"),
+-        ];
+-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+-        assert_eq!(
+-            result.as_deref(),
+-            Some(Path::new("/models/Nemotron-Nano-9B-Q4.gguf"))
+-        );
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_priority_ordering() {
+-        // Both Ministral-3 and Nemotron present — Ministral-3 wins (higher priority)
+-        let models = vec![
+-            PathBuf::from("/models/Nemotron-Nano-9B-v2-Q4_K_M.gguf"),
+-            PathBuf::from("/models/Ministral-3-Instruct-Q4_K_M.gguf"),
+-        ];
+-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+-        assert!(
+-            result.as_ref().unwrap().to_string_lossy().contains("Ministral-3"),
+-            "Ministral-3 should beat Nemotron, got: {:?}",
+-            result
+-        );
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_all_three_present() {
+-        let models = vec![
+-            PathBuf::from("/models/Nemotron-Nano-9B.gguf"),
+-            PathBuf::from("/models/Ministral-3-Q4.gguf"),
+-            PathBuf::from("/models/Ministral-8B-Q4.gguf"),
+-        ];
+-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+-        assert!(
+-            result.as_ref().unwrap().to_string_lossy().contains("Ministral-3"),
+-            "Ministral-3 is highest priority, got: {:?}",
+-            result
+-        );
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_case_insensitive() {
+-        let models = vec![
+-            PathBuf::from("/models/MINISTRAL-8B-INSTRUCT.gguf"),
+-        ];
+-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+-        assert!(result.is_some(), "Should match case-insensitively");
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_mixed_case() {
+-        let models = vec![
+-            PathBuf::from("/models/ministral-8b-instruct-Q4_K_M.gguf"),
+-        ];
+-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+-        assert!(result.is_some(), "Should match lowercase filename against mixed-case preference");
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_substring_match() {
+-        // "Ministral-3" should match "Ministral-3B-Instruct-Q4.gguf" via substring
+-        let models = vec![
+-            PathBuf::from("/models/Ministral-3B-Instruct-Q4.gguf"),
+-        ];
+-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+-        assert!(result.is_some(), "Substring match should work");
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_nanbeige_match() {
+-        let models = vec![
+-            PathBuf::from("/models/nanbeige4.1-3b-q8_0.gguf"),
+-        ];
+-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+-        assert!(result.is_some(), "nanbeige should match nanbeige4.1-3b-q8_0.gguf");
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_nanbeige_vs_qwen() {
+-        // Nanbeige has higher priority than Qwen3-0.6B
+-        let models = vec![
+-            PathBuf::from("/models/Qwen3-0.6B-Q4.gguf"),
+-            PathBuf::from("/models/nanbeige4.1-3b-q8_0.gguf"),
+-        ];
+-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+-        assert!(
+-            result.as_ref().unwrap().to_string_lossy().contains("nanbeige"),
+-            "nanbeige should beat Qwen3-0.6B, got: {:?}",
+-            result
+-        );
+-    }
+-
+-    #[test]
+-    fn test_pick_preferred_model_empty_preferences() {
+-        let models = vec![PathBuf::from("/models/anything.gguf")];
+-        let prefs: &[&str] = &[];
+-        assert!(pick_preferred_model(&models, prefs).is_none());
+-    }
+-
+-    #[test]
+-    fn test_find_delegation_model_uses_real_filesystem() {
+-        // Integration test: delegates to pick_preferred_model with real ~/models/
+-        let result = find_delegation_model();
+-        if let Some(ref path) = result {
+-            let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+-            let matches_any = DELEGATION_MODEL_PREFERENCES
+-                .iter()
+-                .any(|pref| name.contains(&pref.to_lowercase()));
+-            assert!(matches_any, "Real match '{}' should be in preferences", name);
+-            eprintln!("  Found delegation model: {}", path.display());
+-        } else {
+-            eprintln!("  No delegation model in ~/models/ (OK in CI)");
+-        }
+-    }
+-
+-    // -- stop_delegation_server tests --
+-
+-    #[test]
+-    fn test_stop_delegation_server_clears_state() {
+-        let mut process: Option<Child> = None;
+-        let mut port: Option<String> = Some("8091".to_string());
+-
+-        stop_delegation_server(&mut process, &mut port);
+-
+-        assert!(process.is_none());
+-        assert!(port.is_none());
+-    }
+-
+-    #[test]
+-    fn test_stop_delegation_server_noop_when_empty() {
+-        let mut process: Option<Child> = None;
+-        let mut port: Option<String> = None;
+-
+-        // Should not panic when nothing to stop
+-        stop_delegation_server(&mut process, &mut port);
+-
+-        assert!(process.is_none());
+-        assert!(port.is_none());
+-    }
+-
+-    #[test]
+-    fn test_stop_delegation_server_kills_real_process() {
+-        // Spawn a harmless process, then stop it
+-        let child = Command::new("sleep")
+-            .arg("60")
+-            .stdout(Stdio::null())
+-            .stderr(Stdio::null())
+-            .spawn();
+-
+-        if let Ok(child) = child {
+-            let pid = child.id();
+-            let mut process = Some(child);
+-            let mut port = Some("8091".to_string());
+-
+-            stop_delegation_server(&mut process, &mut port);
+-
+-            assert!(process.is_none());
+-            assert!(port.is_none());
+-
+-            // Verify the process is actually dead
+-            let status = Command::new("kill")
+-                .args(["-0", &pid.to_string()])
+-                .status();
+-            // kill -0 should fail (process doesn't exist)
+-            if let Ok(s) = status {
+-                assert!(!s.success(), "Process {} should be dead after stop", pid);
+-            }
+-        }
+-    }
+-
+-    // -- Delegation vs compaction server symmetry --
+-
+-    #[test]
+-    fn test_stop_delegation_mirrors_stop_compaction() {
+-        // Both stop functions should behave identically for state cleanup
+-        let mut d_process: Option<Child> = None;
+-        let mut d_port: Option<String> = Some("8091".to_string());
+-        let mut c_process: Option<Child> = None;
+-        let mut c_port: Option<String> = Some("8090".to_string());
+-
+-        stop_delegation_server(&mut d_process, &mut d_port);
+-        stop_compaction_server(&mut c_process, &mut c_port);
+-
+-        assert_eq!(d_process.is_none(), c_process.is_none());
+-        assert_eq!(d_port.is_none(), c_port.is_none());
+-    }
+ }
+diff --git a/src/tui.rs b/src/tui.rs
+index 96834df..312a290 100644
+--- a/src/tui.rs
++++ b/src/tui.rs
+@@ -526,7 +526,13 @@ pub(crate) fn print_startup_splash(local_port: &str) {
+             config.agents.defaults.model
+         );
+     }
++    #[cfg(feature = "voice")]
+     println!("  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}", crate::VERSION);
++    #[cfg(not(feature = "voice"))]
++    println!(
++        "  {DIM}v{}  |  /local  /model  (voice disabled in this build)  Ctrl+C quit{RESET}",
++        crate::VERSION
++    );
+     println!();
+ 
+     // Brief loading animation

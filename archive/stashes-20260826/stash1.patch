@@ -1,0 +1,5060 @@
+diff --git a/src/agent/agent_loop/compaction.rs b/src/agent/agent_loop/compaction.rs
+index dbd53f6..3204ae4 100644
+--- a/src/agent/agent_loop/compaction.rs
++++ b/src/agent/agent_loop/compaction.rs
+@@ -19,6 +19,7 @@ use tracing::warn;
+ use crate::agent::agent_core::{PendingCompaction, SwappableCore};
+ use crate::agent::lcm::{CompactionFailureMode, LcmCompactionState, LcmEngine};
+ use crate::agent::token_budget::TokenBudget;
++use crate::session::db::{ModelCallPurpose, ReplayRecordingProvider, TurnReplayRecorder};
+ 
+ #[derive(Clone, Copy)]
+ enum CompactionPhase {
+@@ -433,11 +434,24 @@ pub(super) async fn execute_lcm_compaction(
+     if failure_mode == CompactionFailureMode::PreserveContext {
+         mutation.engine_mut().request_async_compaction();
+     }
++    let replay = TurnReplayRecorder::new(
++        Arc::clone(&core.sessions),
++        session_id.clone(),
++        format!("compaction:{session_turn}:{}", uuid::Uuid::new_v4()),
++        session_turn,
++    );
++    let recorded_provider: Arc<dyn crate::providers::base::LLMProvider> =
++        Arc::new(ReplayRecordingProvider::new(
++            Arc::clone(&core.provider),
++            replay.clone(),
++            ModelCallPurpose::Compaction,
++        ));
++    let compactor = core.compactor.with_provider(recorded_provider);
+     let summary_turn = tokio::select! {
+         biased;
+         () = cancellation.cancelled() => return None,
+         summary = mutation.engine_mut().compact(
+-            Some(&core.compactor),
++            Some(&compactor),
+             &core.token_budget,
+             0,
+             failure_mode,
+@@ -515,6 +529,7 @@ pub(super) async fn execute_lcm_compaction(
+     };
+ 
+     if pending.is_some() && (cancellation.is_cancelled() || !publication.begin_publication()) {
++        let _ = replay.turn_finished("cancelled_before_publication").await;
+         return None;
+     }
+ 
+@@ -557,6 +572,24 @@ pub(super) async fn execute_lcm_compaction(
+     }
+     drop(mutation);
+     drop(engine);
++    // The checkpoint itself is durable (engine commit + SQLite row above),
++    // so a failed replay finalization must not discard it. Warn and hand the
++    // pending compaction to the foreground; the session's replay degrades to
++    // Incomplete, which is exactly what that availability level exists for.
++    if let Err(error) = replay
++        .turn_finished(if checkpoint_persisted {
++            "finished"
++        } else {
++            "checkpoint_failed"
++        })
++        .await
++    {
++        warn!(
++            %error,
++            %session_id,
++            "compaction replay finalization failed; replay degrades to incomplete"
++        );
++    }
+     if checkpoint_persisted {
+         pending
+     } else {
+diff --git a/src/agent/agent_loop/response.rs b/src/agent/agent_loop/response.rs
+index d7c031d..81ed789 100644
+--- a/src/agent/agent_loop/response.rs
++++ b/src/agent/agent_loop/response.rs
+@@ -26,10 +26,91 @@ use crate::agent::token_budget::TokenBudget;
+ use crate::agent::validation;
+ use crate::errors::ProviderError;
+ use crate::providers::base::{FinishReason, LLMResponse, ToolCallRequest};
++use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
+ use crate::turn_stream::ControlMarker;
+ 
+ use super::{AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnContext};
+ 
++async fn recorded_auxiliary_chat(
++    ctx: &TurnContext,
++    purpose: ModelCallPurpose,
++    messages: &[Value],
++    max_tokens: u32,
++    temperature: f64,
++) -> anyhow::Result<LLMResponse> {
++    let request = RecordedProviderRequest {
++        messages: messages.to_vec(),
++        tools: None,
++        model: ctx.core.model.clone(),
++        max_tokens,
++        temperature,
++        thinking_budget: None,
++        top_p: None,
++        tool_choice: "auto".to_string(),
++        streaming: false,
++    };
++    let call_id = ctx
++        .core
++        .sessions
++        .record_model_request(
++            &ctx.session_id,
++            &ctx.request_id,
++            ctx.turn_count,
++            purpose,
++            &request,
++        )
++        .await
++        .map_err(|error| anyhow::anyhow!("auxiliary model request was not recorded: {error}"))?;
++    let result = ctx
++        .core
++        .provider
++        .chat(
++            messages,
++            None,
++            Some(&ctx.core.model),
++            max_tokens,
++            temperature,
++            None,
++            None,
++        )
++        .await;
++    match result {
++        Ok(response) => {
++            ctx.core
++                .sessions
++                .record_model_response(
++                    &ctx.session_id,
++                    &ctx.request_id,
++                    ctx.turn_count,
++                    &call_id,
++                    &RecordedProviderResponse::from(&response),
++                )
++                .await
++                .map_err(|error| {
++                    anyhow::anyhow!("auxiliary model response was not recorded: {error}")
++                })?;
++            Ok(response)
++        }
++        Err(error) => {
++            if let Err(record_error) = ctx
++                .core
++                .sessions
++                .record_model_failure(
++                    &ctx.session_id,
++                    &ctx.request_id,
++                    ctx.turn_count,
++                    &call_id,
++                    &error.to_string(),
++                )
++                .await
++            {
++                warn!(%record_error, "auxiliary_model_failure_replay_persist_failed");
++            }
++            Err(error)
++        }
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // ResponseKind — pure classification of an LLM response
+ // ---------------------------------------------------------------------------
+@@ -871,19 +952,14 @@ impl AgentLoopShared {
+             }
+ 
+             counters.mark_inference_started();
+-            let cont_result = ctx
+-                .core
+-                .provider
+-                .chat(
+-                    &cont_messages,
+-                    None,
+-                    Some(&ctx.core.model),
+-                    ctx.core.max_tokens,
+-                    ctx.core.temperature,
+-                    None,
+-                    None,
+-                )
+-                .await;
++            let cont_result = recorded_auxiliary_chat(
++                ctx,
++                ModelCallPurpose::Continuation,
++                &cont_messages,
++                ctx.core.max_tokens,
++                ctx.core.temperature,
++            )
++            .await;
+             counters.mark_inference_finished();
+ 
+             match cont_result {
+@@ -934,19 +1010,14 @@ impl AgentLoopShared {
+             let rescue_tokens = ctx.core.max_tokens.min(384).max(128);
+             let rescue_messages = prepare_rescue_messages(&ctx.messages, &*ctx.protocol);
+             counters.mark_inference_started();
+-            let rescue_result = ctx
+-                .core
+-                .provider
+-                .chat(
+-                    &rescue_messages,
+-                    None,
+-                    Some(&ctx.core.model),
+-                    rescue_tokens,
+-                    0.2,
+-                    None,
+-                    None,
+-                )
+-                .await;
++            let rescue_result = recorded_auxiliary_chat(
++                ctx,
++                ModelCallPurpose::EmptyResponseRescue,
++                &rescue_messages,
++                rescue_tokens,
++                0.2,
++            )
++            .await;
+             counters.mark_inference_finished();
+ 
+             match rescue_result {
+diff --git a/src/agent/agent_loop/shared.rs b/src/agent/agent_loop/shared.rs
+index ef13874..480b4a5 100644
+--- a/src/agent/agent_loop/shared.rs
++++ b/src/agent/agent_loop/shared.rs
+@@ -53,6 +53,7 @@ use crate::errors::{
+     classify_retained_session_error, is_retryable_provider_error, RetainedSessionErrorKind,
+ };
+ use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
++use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
+ 
+ use crate::agent::agent_core::{
+     append_to_system_prompt, apply_compaction_result, ExpansionCheckpoint, PendingCompaction,
+@@ -2856,6 +2857,28 @@ impl AgentLoopShared {
+     // Step 3: Calling — invoke the LLM (streaming or blocking)
+     // -----------------------------------------------------------------------
+ 
++    async fn persist_model_failure(ctx: &TurnContext, call_id: &str, detail: &str) {
++        if let Err(record_error) = ctx
++            .core
++            .sessions
++            .record_model_failure(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                call_id,
++                detail,
++            )
++            .await
++        {
++            error!(
++                session = %ctx.session_key,
++                call_id,
++                error = %record_error,
++                "model_failure_replay_persist_failed"
++            );
++        }
++    }
++
+     /// Handle an LLM provider error: retry once if retryable, otherwise return error.
+     async fn handle_llm_error(
+         e: anyhow::Error,
+@@ -3013,6 +3036,45 @@ impl AgentLoopShared {
+             .map(|staged| staged.rendered_messages.clone())
+             .unwrap_or_else(|| render_via_protocol(&*ctx.protocol, &ctx.messages));
+         attach_higgs_session_control(&mut messages, reservation.control());
++        let recorded_request = RecordedProviderRequest {
++            messages: messages.clone(),
++            tools: tool_defs_opt.map(<[Value]>::to_vec),
++            model: ctx.core.model.clone(),
++            max_tokens: 0,
++            temperature: ctx.core.temperature,
++            thinking_budget: None,
++            top_p: None,
++            tool_choice: "auto".to_string(),
++            streaming: false,
++        };
++        let call_id = match ctx
++            .core
++            .sessions
++            .record_model_request(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                ModelCallPurpose::RetainedExpansionPreflight,
++                &recorded_request,
++            )
++            .await
++        {
++            Ok(call_id) => call_id,
++            Err(error) => {
++                warn!(
++                    session = %ctx.session_key,
++                    %error,
++                    "retained_expansion_preflight_replay_persist_failed"
++                );
++                drop(reservation);
++                Self::discard_selected_expansion_checkpoint(
++                    ctx,
++                    &plan.checkpoint,
++                    RetainedExpansionFailure::Unavailable,
++                );
++                return;
++            }
++        };
+         let result = ctx
+             .core
+             .provider
+@@ -3027,8 +3089,30 @@ impl AgentLoopShared {
+             )
+             .await;
+         let failure = match result {
+-            Ok(response) => response.outcome().err().map(anyhow::Error::new),
+-            Err(error) => Some(error),
++            Ok(response) => {
++                if let Err(error) = ctx
++                    .core
++                    .sessions
++                    .record_model_response(
++                        &ctx.session_id,
++                        &ctx.request_id,
++                        ctx.turn_count,
++                        &call_id,
++                        &RecordedProviderResponse::from(&response),
++                    )
++                    .await
++                {
++                    Some(anyhow::anyhow!(
++                        "retained preflight response replay persistence failed: {error}"
++                    ))
++                } else {
++                    response.outcome().err().map(anyhow::Error::new)
++                }
++            }
++            Err(error) => {
++                Self::persist_model_failure(ctx, &call_id, &error.to_string()).await;
++                Some(error)
++            }
+         };
+         drop(reservation);
+         if let Some(error) = failure {
+@@ -3474,6 +3558,48 @@ impl AgentLoopShared {
+             attach_higgs_session_control(&mut messages_for_llm, control);
+         }
+ 
++        // The provider boundary is the exact model-visible contract: protocol
++        // rendering, tool presentation, retained-session controls, and sampling
++        // settings are final here. Make it durable before the call so neither a
++        // workspace change nor a crash can force replay to regenerate bytes.
++        let recorded_request = RecordedProviderRequest {
++            messages: messages_for_llm.clone(),
++            tools: tool_defs_opt.map(<[Value]>::to_vec),
++            model: ctx.core.model.clone(),
++            max_tokens,
++            temperature: ctx.core.temperature,
++            thinking_budget,
++            top_p: None,
++            tool_choice: "auto".to_string(),
++            streaming: ctx.text_delta_tx.is_some(),
++        };
++        let model_call_id = match ctx
++            .core
++            .sessions
++            .record_model_request(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                ModelCallPurpose::Main,
++                &recorded_request,
++            )
++            .await
++        {
++            Ok(call_id) => call_id,
++            Err(record_error) => {
++                counters.mark_inference_finished();
++                error!(
++                    session = %ctx.session_key,
++                    error = %record_error,
++                    "model_request_replay_persist_failed"
++                );
++                return StepResult::Done(IterationOutcome::Error(
++                    "I could not durably record the model request, so I stopped before sending it."
++                        .to_string(),
++                ));
++            }
++        };
++
+         let no_progress_timeout = local_stream_no_progress_timeout(ctx);
+         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
+             // Streaming path: forward text deltas to the REPL/voice renderer as
+@@ -3499,6 +3625,7 @@ impl AgentLoopShared {
+                 match tokio::time::timeout(timeout, stream_call).await {
+                     Ok(Ok(s)) => s,
+                     Ok(Err(e)) => {
++                        Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
+                         if Self::handle_retained_route_error(ctx, &e) {
+                             counters.mark_inference_finished();
+                             return StepResult::Done(IterationOutcome::Continue);
+@@ -3515,6 +3642,7 @@ impl AgentLoopShared {
+                     Err(_) => {
+                         counters.mark_inference_finished();
+                         let detail = local_no_stream_headers_error(timeout);
++                        Self::persist_model_failure(ctx, &model_call_id, &detail).await;
+                         error!(
+                             model = %ctx.core.model,
+                             timeout_secs = timeout.as_secs(),
+@@ -3528,6 +3656,7 @@ impl AgentLoopShared {
+                 match stream_call.await {
+                     Ok(s) => s,
+                     Err(e) => {
++                        Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
+                         if Self::handle_retained_route_error(ctx, &e) {
+                             counters.mark_inference_finished();
+                             return StepResult::Done(IterationOutcome::Continue);
+@@ -3588,6 +3717,7 @@ impl AgentLoopShared {
+                             None => std::time::Duration::ZERO,
+                         };
+                         let detail = local_no_stream_progress_error(timeout);
++                        Self::persist_model_failure(ctx, &model_call_id, &detail).await;
+                         error!(
+                             model = %ctx.core.model,
+                             timeout_secs = timeout.as_secs(),
+@@ -3688,6 +3818,12 @@ impl AgentLoopShared {
+                     // Stream ended without Done — either cancelled or genuine error.
+                     if ctx.is_cancelled() {
+                         // Cancelled mid-stream — exit cleanly.
++                        Self::persist_model_failure(
++                            ctx,
++                            &model_call_id,
++                            "stream cancelled before terminal response",
++                        )
++                        .await;
+                         emit_stream_abort_metrics(
+                             ctx,
+                             "The stream was cancelled before the backend returned a final response.",
+@@ -3695,6 +3831,12 @@ impl AgentLoopShared {
+                         return StepResult::Done(IterationOutcome::Finished(String::new()));
+                     }
+                     error!("LLM stream ended without Done");
++                    Self::persist_model_failure(
++                        ctx,
++                        &model_call_id,
++                        "stream ended without terminal response",
++                    )
++                    .await;
+                     emit_stream_abort_metrics(
+                         ctx,
+                         "The LLM stream ended without a final response.",
+@@ -3722,6 +3864,7 @@ impl AgentLoopShared {
+             {
+                 Ok(r) => r,
+                 Err(e) => {
++                    Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
+                     if Self::handle_retained_route_error(ctx, &e) {
+                         counters.mark_inference_finished();
+                         return StepResult::Done(IterationOutcome::Continue);
+@@ -3732,6 +3875,31 @@ impl AgentLoopShared {
+             }
+         };
+ 
++        if let Err(record_error) = ctx
++            .core
++            .sessions
++            .record_model_response(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                &model_call_id,
++                &RecordedProviderResponse::from(&response),
++            )
++            .await
++        {
++            counters.mark_inference_finished();
++            error!(
++                session = %ctx.session_key,
++                call_id = %model_call_id,
++                error = %record_error,
++                "model_response_replay_persist_failed"
++            );
++            return StepResult::Done(IterationOutcome::Error(
++                "I received a model response but could not record it durably, so I stopped before acting on it."
++                    .to_string(),
++            ));
++        }
++
+         if !pending_higgs_drop.is_empty() {
+             counters.clear_pending_higgs_session_drop_ids(&ctx.session_key, &pending_higgs_drop);
+         }
+@@ -3855,7 +4023,40 @@ impl AgentLoopShared {
+             model = %ctx.core.model,
+             "forced_tool_recovery: botched tool intent — re-issuing with tool_choice=required"
+         );
+-        match ctx
++        let request = RecordedProviderRequest {
++            messages: messages_for_llm.to_vec(),
++            tools: tool_defs_opt.map(<[Value]>::to_vec),
++            model: ctx.core.model.clone(),
++            max_tokens,
++            temperature: ctx.core.temperature,
++            thinking_budget: None,
++            top_p: None,
++            tool_choice: "required".to_string(),
++            streaming: false,
++        };
++        let call_id = match ctx
++            .core
++            .sessions
++            .record_model_request(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                ModelCallPurpose::ForcedToolRecovery,
++                &request,
++            )
++            .await
++        {
++            Ok(call_id) => call_id,
++            Err(error) => {
++                return ForcedToolRecoveryOutcome::ProviderError {
++                    original: response,
++                    error: anyhow::anyhow!(
++                        "forced-tool recovery was not sent because replay persistence failed: {error}"
++                    ),
++                };
++            }
++        };
++        let recovered = ctx
+             .core
+             .provider
+             .chat_with_tool_choice(
+@@ -3868,22 +4069,44 @@ impl AgentLoopShared {
+                 None,
+                 ToolChoice::Required,
+             )
+-            .await
+-        {
+-            Ok(recovered) if recovered.has_tool_calls() => {
++            .await;
++        match recovered {
++            Ok(recovered) => {
++                if let Err(error) = ctx
++                    .core
++                    .sessions
++                    .record_model_response(
++                        &ctx.session_id,
++                        &ctx.request_id,
++                        ctx.turn_count,
++                        &call_id,
++                        &RecordedProviderResponse::from(&recovered),
++                    )
++                    .await
++                {
++                    return ForcedToolRecoveryOutcome::ProviderError {
++                        original: response,
++                        error: anyhow::anyhow!(
++                            "forced-tool recovery response could not be recorded: {error}"
++                        ),
++                    };
++                }
++                if !recovered.has_tool_calls() {
++                    return ForcedToolRecoveryOutcome::Response(response);
++                }
+                 info!("forced_tool_recovery: recovered a constrained tool call");
+                 if ctx.flow.content_was_streamed {
+                     send_retract_reply_marker(&ctx.text_delta_tx);
+                 }
+                 ForcedToolRecoveryOutcome::Response(recovered)
+             }
+-            // No tool call (e.g. constraint disabled server-side): fall back
+-            // to the original response and the hint-retry path.
+-            Ok(_) => ForcedToolRecoveryOutcome::Response(response),
+-            Err(error) => ForcedToolRecoveryOutcome::ProviderError {
+-                original: response,
+-                error,
+-            },
++            Err(error) => {
++                Self::persist_model_failure(ctx, &call_id, &error.to_string()).await;
++                ForcedToolRecoveryOutcome::ProviderError {
++                    original: response,
++                    error,
++                }
++            }
+         }
+     }
+ 
+@@ -4016,6 +4239,27 @@ impl AgentLoopShared {
+                 allowed_calls.push(tc);
+             } else {
+                 let reason = result.reason.unwrap_or("lease_blocked");
++                if let Err(error) = ctx
++                    .core
++                    .sessions
++                    .record_tool_pre_execute(
++                        &ctx.session_id,
++                        &ctx.request_id,
++                        ctx.turn_count,
++                        &tc.id,
++                        &tc.name,
++                        &tc.arguments,
++                        crate::session::db::ToolPreExecuteDecision::Rejected {
++                            reason: format!("lease:{reason}"),
++                        },
++                    )
++                    .await
++                {
++                    return StepResult::Done(IterationOutcome::Error(format!(
++                        "tool {} was rejected but its pre-execution decision could not be recorded: {error}",
++                        tc.id
++                    )));
++                }
+                 let name = tc.name.clone();
+                 let id = tc.id.clone();
+                 blocked_calls.push((name, id, reason));
+diff --git a/src/agent/agent_loop/tests.rs b/src/agent/agent_loop/tests.rs
+index d20a1c7..593bcad 100644
+--- a/src/agent/agent_loop/tests.rs
++++ b/src/agent/agent_loop/tests.rs
+@@ -217,6 +217,7 @@ async fn test_request_strict_router_decision_action_matrix() {
+             1.0,
+             "",
+             256,
++            None,
+         )
+         .await
+         .expect("valid strict router decision");
+@@ -224,6 +225,44 @@ async fn test_request_strict_router_decision_action_matrix() {
+     }
+ }
+ 
++#[tokio::test]
++async fn router_journal_failure_degrades_instead_of_failing_routing() {
++    // Break caught: a transient replay-journal write failure aborted the
++    // strict router before the provider was even called, turning any
++    // SQLite stutter into a routing outage.
++    let dir = tempfile::tempdir().unwrap();
++    let sessions =
++        std::sync::Arc::new(crate::session::db::SessionDb::new(&dir.path().join("s.db")));
++    let meta = sessions.create_session("cli:router-journal-fault").await;
++    sessions.fail_model_request_writes_for_tests(1);
++    let replay = crate::session::db::TurnReplayRecorder::new(
++        std::sync::Arc::clone(&sessions),
++        meta.id.clone(),
++        "turn-1".to_string(),
++        1,
++    );
++    let llm = StaticResponseLLM::plain(
++        "router",
++        r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#,
++    );
++
++    let decision = request_strict_router_decision(
++        &llm,
++        "router",
++        "route this action with strict schema",
++        false,
++        0.6,
++        1.0,
++        "",
++        256,
++        Some(&replay),
++    )
++    .await
++    .expect("routing must survive a transient journal write failure");
++
++    assert_eq!(decision.action, "respond");
++}
++
+ /// Real-provider trio probe.
+ ///
+ /// Runs against live OpenAI-compatible endpoints (e.g. LM Studio):
+@@ -288,6 +327,7 @@ async fn test_real_providers_trio_probe() {
+             1.0,
+             "",
+             256,
++            None,
+         )
+         .await
+         {
+@@ -3486,6 +3526,103 @@ async fn published_soft_checkpoint_replays_and_installs_on_next_turn() {
+     }));
+ }
+ 
++#[tokio::test]
++async fn soft_checkpoint_survives_turn_finish_journal_failure() {
++    // Break caught: a durably-checkpointed LCM compaction was discarded when
++    // the final replay journal write failed, so the compacted context never
++    // installed on the next turn (prefix-divergence class).
++    let provider = Arc::new(ReplayStableSoftProvider {
++        foreground_calls: std::sync::Mutex::new(Vec::new()),
++        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
++        force_recovery_on_second: false,
++    });
++    let lcm_config = LcmSchemaConfig {
++        tau_soft: 0.0001,
++        tau_hard: 10.0,
++        deterministic_target: 64,
++        ..Default::default()
++    };
++    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
++        provider.clone() as Arc<dyn LLMProvider>,
++        "replay-stable-soft-compaction-test",
++        1_000_000,
++        lcm_config,
++    );
++    let session_key = format!("replay-soft-fault-{}", uuid::Uuid::new_v4());
++    let core = agent_loop.shared.core_handle.swappable();
++    let session = core.sessions.get_or_resume(&session_key).await;
++    seed_compaction_history(&core, &session.id, 12, 40).await;
++    persist_prior_summary(&core, &session.id).await;
++
++    let mut probe = InboundMessage::new("test", "user", "offline", "probe prior summary");
++    probe
++        .metadata
++        .insert("session_key".to_string(), json!(session_key.clone()));
++    let prepared = agent_loop
++        .shared
++        .prepare_context(&probe, None, None, None, None)
++        .await;
++    assert!(prepared
++        .messages
++        .iter()
++        .any(|message| message.get("_lcm_summary").is_some()));
++    let compaction = prepared.compaction.clone();
++    drop(prepared);
++
++    // Fail both turn-finish journal writes of turn one: the foreground
++    // finalize and the compaction close. Reply and checkpoint must both
++    // survive; replay degrades to Incomplete.
++    core.sessions.fail_turn_finished_writes_for_tests(2);
++
++    assert_eq!(
++        agent_loop
++            .process_direct("Finish turn one.", &session_key, "test", "offline")
++            .await,
++        "turn one reply"
++    );
++    await_compaction_sync(
++        "soft checkpoint publication despite journal failure",
++        async {
++            while !compaction.has_pending().await {
++                tokio::task::yield_now().await;
++            }
++        },
++    )
++    .await;
++
++    let installs_before = agent_loop
++        .shared
++        .core_handle
++        .counters
++        .lcm_compaction_count
++        .load(std::sync::atomic::Ordering::Acquire);
++    assert_eq!(
++        agent_loop
++            .process_direct("Continue on turn two.", &session_key, "test", "offline")
++            .await,
++        "turn two reply"
++    );
++
++    assert!(
++        agent_loop
++            .shared
++            .core_handle
++            .counters
++            .lcm_compaction_count
++            .load(std::sync::atomic::Ordering::Acquire)
++            > installs_before,
++        "the checkpoint must install despite the journal failure"
++    );
++    let calls = provider.foreground_calls();
++    assert_eq!(calls.len(), 2);
++    assert!(calls[1].iter().any(|message| {
++        message
++            .get("content")
++            .and_then(Value::as_str)
++            .is_some_and(|content| content.contains("To read the exact originals call"))
++    }));
++}
++
+ #[tokio::test]
+ async fn exact_soft_compaction_leases_old_higgs_id_before_fresh_rotation() {
+     let provider = Arc::new(ReplayStableSoftProvider {
+@@ -4104,6 +4241,15 @@ async fn retained_expansion_preflight_persists_old_route_through_tools_then_dele
+         Some(fresh_id)
+     );
+     assert_eq!(counters.expansion_checkpoint(&session_key), None);
++    let replay = core
++        .sessions
++        .load_session_replay(&session.id)
++        .await
++        .unwrap();
++    assert!(replay.model_calls.iter().any(|call| {
++        call.purpose == crate::session::db::ModelCallPurpose::RetainedExpansionPreflight
++            && call.response.is_some()
++    }));
+ }
+ 
+ #[tokio::test]
+@@ -7074,6 +7220,22 @@ async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
+     let turn1_calls = provider.calls().len();
+     assert!(turn1_calls >= 2, "turn 1 must make multiple provider calls");
+ 
++    let core = agent_loop.shared.core_handle.swappable();
++    let meta = core
++        .sessions
++        .get_latest_session(&session_key)
++        .await
++        .expect("boundary session should exist");
++    let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
++    assert!(replay.events.iter().any(|event| matches!(
++        &event.payload,
++        crate::session::db::SessionEventPayload::ToolPreExecute {
++            tool_call_id,
++            decision: crate::session::db::ToolPreExecuteDecision::Rejected { reason },
++            ..
++        } if tool_call_id == "tc_exec_2" && reason == "response_boundary"
++    )));
++
+     tokio::time::timeout(
+         std::time::Duration::from_secs(15),
+         agent_loop.process_direct("so what happened?", &session_key, "test", "offline"),
+@@ -7092,6 +7254,49 @@ async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
+     let _ = std::fs::remove_dir_all(&workspace);
+ }
+ 
++#[tokio::test]
++async fn turn_finish_journal_failure_still_returns_the_reply() {
++    // Break caught: when the final turn-finished journal write failed, an
++    // already-generated and already-persisted reply was discarded and the
++    // user got nothing. The reply must survive; only replay availability
++    // degrades to Incomplete.
++    let main: Arc<dyn LLMProvider> = Arc::new(ResponseSequenceProvider::new(
++        "local-main",
++        vec![crate::providers::base::LLMResponse {
++            content: Some(attested_text("still delivered")),
++            tool_calls: vec![],
++            finish_reason: FinishReason::Stop,
++            usage: std::collections::HashMap::new(),
++        }],
++    ));
++    let (agent_loop, workspace) = build_local_inline_harness(main);
++    let session_key = format!("journal-fault-reply-{}", uuid::Uuid::new_v4());
++    let core = agent_loop.shared.core_handle.swappable();
++
++    core.sessions.fail_turn_finished_writes_for_tests(1);
++
++    let response = agent_loop
++        .process_direct("say the thing", &session_key, "test", "offline")
++        .await;
++    assert_eq!(response, "still delivered");
++
++    let meta = core
++        .sessions
++        .get_latest_session(&session_key)
++        .await
++        .expect("session should exist");
++    let messages = core.sessions.get_all_messages(&meta.id).await;
++    assert!(
++        messages.iter().any(|m| {
++            m.get("role").and_then(Value::as_str) == Some("assistant")
++                && m.get("content").and_then(Value::as_str) == Some("still delivered")
++        }),
++        "the reply must remain in persisted history despite the journal failure"
++    );
++
++    let _ = std::fs::remove_dir_all(&workspace);
++}
++
+ struct EnvVarGuard {
+     key: &'static str,
+     saved: Option<std::ffi::OsString>,
+@@ -7176,6 +7381,194 @@ async fn test_tool_call_carrier_persists_before_tool_result() {
+         "tool result must point at the immediately preceding assistant call"
+     );
+ 
++    let replay = core
++        .sessions
++        .load_session_replay(&meta.id)
++        .await
++        .expect("load tool replay");
++    assert_eq!(
++        replay.availability,
++        crate::session::db::ReplayAvailability::Exact
++    );
++    assert_eq!(
++        replay
++            .events
++            .iter()
++            .map(|event| event.payload.kind())
++            .collect::<Vec<_>>(),
++        vec![
++            "turn_started",
++            "model_request",
++            "model_response",
++            "tool_pre_execute",
++            "tool_execute",
++            "tool_post_execute",
++            "model_request",
++            "model_response",
++            "turn_finished",
++        ]
++    );
++    assert_eq!(replay.model_calls.len(), 2);
++    let second_request: Value = serde_json::from_slice(&replay.model_calls[1].request).unwrap();
++    assert!(second_request["messages"]
++        .as_array()
++        .is_some_and(|messages| messages.iter().any(|message| {
++            message.get("role").and_then(Value::as_str) == Some("tool")
++                && message.get("tool_call_id").and_then(Value::as_str) == Some("tc_list")
++        })));
++    let lifecycle: Vec<&crate::session::db::SessionEventPayload> = replay
++        .events
++        .iter()
++        .filter_map(|event| match &event.payload {
++            payload @ (crate::session::db::SessionEventPayload::ToolPreExecute { .. }
++            | crate::session::db::SessionEventPayload::ToolExecute { .. }
++            | crate::session::db::SessionEventPayload::ToolPostExecute { .. }) => Some(payload),
++            _ => None,
++        })
++        .collect();
++    assert_eq!(lifecycle.len(), 3);
++    assert!(matches!(
++        lifecycle[0],
++        crate::session::db::SessionEventPayload::ToolPreExecute {
++            tool_call_id,
++            decision: crate::session::db::ToolPreExecuteDecision::Ready,
++            ..
++        } if tool_call_id == "tc_list"
++    ));
++    assert!(matches!(
++        lifecycle[1],
++        crate::session::db::SessionEventPayload::ToolExecute {
++            tool_call_id,
++            ok: true,
++            ..
++        } if tool_call_id == "tc_list"
++    ));
++    assert!(matches!(
++        lifecycle[2],
++        crate::session::db::SessionEventPayload::ToolPostExecute {
++            tool_call_id,
++            message_id,
++            ..
++        } if tool_call_id == "tc_list" && *message_id > 0
++    ));
++
++    let _ = std::fs::remove_dir_all(&workspace);
++}
++
++#[tokio::test]
++async fn exact_turn_replay_survives_workspace_prompt_changes() {
++    // Break caught: replay reconstructs the old provider request from today's
++    // workspace/system prompt instead of reading the exact durable call bytes.
++    let main: Arc<dyn LLMProvider> =
++        Arc::new(StaticResponseLLM::new("local-main", "recorded answer"));
++    let (agent_loop, workspace) = build_local_inline_harness(main);
++    let session_key = format!("exact-turn-replay-{}", uuid::Uuid::new_v4());
++
++    let response = agent_loop
++        .process_direct("preserve this exact turn", &session_key, "test", "offline")
++        .await;
++    assert_eq!(response, "recorded answer");
++
++    let core = agent_loop.shared.core_handle.swappable();
++    let meta = core
++        .sessions
++        .get_latest_session(&session_key)
++        .await
++        .expect("session should exist");
++    let before = core
++        .sessions
++        .load_session_replay(&meta.id)
++        .await
++        .expect("load exact replay");
++    assert_eq!(
++        before.availability,
++        crate::session::db::ReplayAvailability::Exact
++    );
++    assert_eq!(before.model_calls.len(), 1);
++    assert!(matches!(
++        before.events.last().map(|event| &event.payload),
++        Some(crate::session::db::SessionEventPayload::TurnFinished { outcome })
++            if outcome == "finished"
++    ));
++    let request: Value = serde_json::from_slice(&before.model_calls[0].request).unwrap();
++    assert_eq!(request.get("streaming"), Some(&Value::Bool(false)));
++    assert_eq!(
++        request.get("model").and_then(Value::as_str),
++        Some(core.model.as_str())
++    );
++    let messages = request
++        .get("messages")
++        .and_then(Value::as_array)
++        .expect("recorded messages");
++    assert!(messages.iter().any(|message| {
++        message.get("role").and_then(Value::as_str) == Some("user")
++            && message.get("content").and_then(Value::as_str) == Some("preserve this exact turn")
++    }));
++
++    std::fs::write(workspace.join("IDENTITY.md"), "a different future identity").unwrap();
++    let after = core
++        .sessions
++        .load_session_replay(&meta.id)
++        .await
++        .expect("reload exact replay");
++    assert_eq!(after.model_calls[0].request, before.model_calls[0].request);
++    assert_eq!(
++        after.model_calls[0].response,
++        before.model_calls[0].response
++    );
++
++    let _ = std::fs::remove_dir_all(&workspace);
++}
++
++#[tokio::test]
++async fn pre_execute_persistence_failure_prevents_tool_side_effect() {
++    // Break caught: a tool enters its implementation even though the durable
++    // pre-execute decision failed, leaving an unreplayable side effect.
++    let provider = Arc::new(ResponseSequenceProvider::new(
++        "local-main",
++        vec![crate::providers::base::LLMResponse {
++            content: Some(String::new()),
++            tool_calls: vec![crate::providers::base::ToolCallRequest {
++                id: "tc-blocked-write".to_string(),
++                name: "write_file".to_string(),
++                arguments: HashMap::from([
++                    ("path".to_string(), json!("blocked.txt")),
++                    ("content".to_string(), json!("must not exist")),
++                ]),
++            }],
++            finish_reason: FinishReason::ToolCalls,
++            usage: HashMap::new(),
++        }],
++    ));
++    let (agent_loop, workspace) =
++        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
++    let core = agent_loop.shared.core_handle.swappable();
++    {
++        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
++        conn.execute_batch(
++            "CREATE TRIGGER fail_tool_pre_replay \
++             BEFORE INSERT ON session_events \
++             WHEN NEW.event_kind = 'tool_pre_execute' \
++             BEGIN SELECT RAISE(ABORT, 'synthetic pre-execute persistence failure'); END;",
++        )
++        .unwrap();
++    }
++
++    let response = agent_loop
++        .process_direct(
++            "write the blocked file",
++            &format!("pre-execute-failure-{}", uuid::Uuid::new_v4()),
++            "test",
++            "offline",
++        )
++        .await;
++
++    assert!(
++        response.contains("pre-execution decision could not be recorded"),
++        "unexpected failure response: {response:?}"
++    );
++    assert!(!workspace.join("blocked.txt").exists());
++    assert_eq!(provider.call_count(), 1);
+     let _ = std::fs::remove_dir_all(&workspace);
+ }
+ 
+@@ -7509,6 +7902,27 @@ async fn test_failed_local_call_does_not_seed_prompt_cache_marker() {
+             .is_some_and(|m| m.starts_with("\u{0}cache:first:")),
+         "failed call may diagnose cold cache, but must not commit it: {first_markers:?}"
+     );
++    let core = agent_loop.shared.core_handle.swappable();
++    let failed_session = core
++        .sessions
++        .get_latest_session(&session_key)
++        .await
++        .expect("failed turn session");
++    let failed_replay = core
++        .sessions
++        .load_session_replay(&failed_session.id)
++        .await
++        .expect("failed turn replay");
++    assert_eq!(
++        failed_replay.availability,
++        crate::session::db::ReplayAvailability::Exact
++    );
++    assert!(failed_replay.model_calls[0]
++        .failure
++        .as_deref()
++        .is_some_and(|bytes| bytes
++            .windows("synthetic provider failure".len())
++            .any(|window| { window == "synthetic provider failure".as_bytes() })));
+ 
+     let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+     let second = agent_loop
+@@ -7603,6 +8017,22 @@ async fn test_direct_streaming_forwards_thinking_delta_with_ansi_marker() {
+         deltas.iter().any(|delta| delta == "visible answer"),
+         "visible answer text should still stream after thinking: {deltas:?}"
+     );
++    let core = agent_loop.shared.core_handle.swappable();
++    let meta = core
++        .sessions
++        .get_latest_session(&session_key)
++        .await
++        .expect("streaming replay session");
++    let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
++    assert_eq!(
++        replay.availability,
++        crate::session::db::ReplayAvailability::Exact
++    );
++    let recorded_request: Value = serde_json::from_slice(&replay.model_calls[0].request).unwrap();
++    assert_eq!(recorded_request["streaming"], json!(true));
++    let recorded_response: Value =
++        serde_json::from_slice(replay.model_calls[0].response.as_deref().unwrap()).unwrap();
++    assert_eq!(recorded_response["content"], json!("visible answer"));
+ 
+     let _ = std::fs::remove_dir_all(&workspace);
+ }
+@@ -9100,6 +9530,17 @@ mod runtime_mode_parity_tests {
+             final_text.contains("narrated a tool action"),
+             "turn must end with an explicit no-execution failure, got: {final_text:?}"
+         );
++        let core = agent_loop.shared.core_handle.swappable();
++        let meta = core
++            .sessions
++            .get_latest_session(&session_key)
++            .await
++            .expect("phantom session");
++        let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
++        assert!(replay.model_calls.iter().any(|call| {
++            call.purpose == crate::session::db::ModelCallPurpose::ForcedToolRecovery
++                && call.response.is_some()
++        }));
+ 
+         let _ = std::fs::remove_dir_all(&workspace);
+     }
+diff --git a/src/agent/compaction.rs b/src/agent/compaction.rs
+index 9cecb1c..d672ba7 100644
+--- a/src/agent/compaction.rs
++++ b/src/agent/compaction.rs
+@@ -161,6 +161,15 @@ impl ContextCompactor {
+         }
+     }
+ 
++    pub(crate) fn with_provider(&self, provider: Arc<dyn LLMProvider>) -> Self {
++        Self {
++            provider,
++            model: self.model.clone(),
++            summary_max_tokens: self.summary_max_tokens,
++            compaction_context_size: self.compaction_context_size,
++        }
++    }
++
+     #[cfg(test)]
+     pub(crate) fn model(&self) -> &str {
+         &self.model
+diff --git a/src/agent/finalize_response.rs b/src/agent/finalize_response.rs
+index 7b2130e..137dccd 100644
+--- a/src/agent/finalize_response.rs
++++ b/src/agent/finalize_response.rs
+@@ -230,6 +230,34 @@ impl AgentLoopShared {
+ 
+         ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
+ 
++        let turn_outcome = if ctx.is_cancelled() {
++            "cancelled"
++        } else if ctx.final_content.is_empty() {
++            "empty"
++        } else {
++            "finished"
++        };
++        // The reply is already generated and persisted by this point. A
++        // failed turn-finish journal write must not discard it: warn and
++        // deliver, letting the session's replay degrade to Incomplete.
++        if let Err(error) = ctx
++            .core
++            .sessions
++            .record_turn_finished(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                turn_outcome,
++            )
++            .await
++        {
++            warn!(
++                %error,
++                session = %ctx.session_key,
++                "turn_finished_replay_persist_failed; replay degrades to incomplete"
++            );
++        }
++
+         let cache = counters.session_cache_metrics(&ctx.session_id);
+         info!(
+             logical_session = %ctx.session_id,
+diff --git a/src/agent/router.rs b/src/agent/router.rs
+index dbba83e..f01cdfb 100644
+--- a/src/agent/router.rs
++++ b/src/agent/router.rs
+@@ -34,6 +34,9 @@ use crate::agent::tool_guard::ToolGuard;
+ use crate::agent::toolplan::{self, ToolPlanAction};
+ use crate::agent::tools::registry::ToolRegistry;
+ use crate::providers::base::{LLMProvider, ToolCallRequest, ToolChoice};
++use crate::session::db::{
++    ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse, TurnReplayRecorder,
++};
+ 
+ const ROUTER_SUSPICIOUS_TARGET_MAX_LEN: usize = 96;
+ const ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS: usize = 220;
+@@ -375,7 +378,47 @@ pub(crate) fn parse_lenient_router_decision(raw: &str) -> Option<role_policy::Ro
+     }
+ }
+ 
+-#[instrument(name = "request_strict_router_decision", skip(provider, router_pack, tool_names), fields(
++/// Router/specialist lanes are auxiliary boundaries: a transient replay-journal
++/// write failure must not take routing down with it. The model call proceeds
++/// unjournaled and the session's replay degrades to `Incomplete`. The main
++/// agent-loop provider boundary stays fail-closed; only these lanes soften.
++async fn journal_aux_request(
++    replay: Option<&TurnReplayRecorder>,
++    purpose: ModelCallPurpose,
++    request: &RecordedProviderRequest,
++) -> Option<String> {
++    let replay = replay?;
++    match replay.request(purpose, request).await {
++        Ok(call_id) => Some(call_id),
++        Err(error) => {
++            warn!(%error, "aux lane replay request persistence failed; continuing unjournaled");
++            None
++        }
++    }
++}
++
++/// Close an auxiliary-lane journal entry after its provider call resolved.
++/// Callers skip this when the request itself could not be journaled — there
++/// is then nothing to close and replay already degraded.
++async fn journal_aux_terminal(
++    replay: &TurnReplayRecorder,
++    call_id: &str,
++    result: &anyhow::Result<crate::providers::base::LLMResponse>,
++) {
++    let journaled = match result {
++        Ok(response) => {
++            replay
++                .response(call_id, &RecordedProviderResponse::from(response))
++                .await
++        }
++        Err(error) => replay.failure(call_id, &error.to_string()).await,
++    };
++    if let Err(error) = journaled {
++        warn!(%error, "aux lane replay terminal persistence failed; replay degrades to incomplete");
++    }
++}
++
++#[instrument(name = "request_strict_router_decision", skip(provider, router_pack, tool_names, replay), fields(
+     model,
+     no_think,
+     parse_strategy = tracing::field::Empty,
+@@ -389,6 +432,7 @@ pub async fn request_strict_router_decision(
+     top_p: f64,
+     tool_names: &str,
+     max_tokens: u32,
++    replay: Option<&TurnReplayRecorder>,
+ ) -> Result<role_policy::RouterDecision, String> {
+     info!(role = "router", model = %model, "router_decision_start");
+     fn parse_router_directive_pack(pack: &str) -> Option<role_policy::RouterDecision> {
+@@ -499,7 +543,23 @@ pub async fn request_strict_router_decision(
+             "content": user_content.clone()
+         }),
+     ];
+-    if let Ok(tool_resp) = provider
++    let tool_call_id = journal_aux_request(
++        replay,
++        ModelCallPurpose::Router,
++        &RecordedProviderRequest {
++            messages: tool_messages.clone(),
++            tools: Some(tool_defs.clone()),
++            model: model.to_string(),
++            max_tokens,
++            temperature,
++            thinking_budget: None,
++            top_p: Some(top_p),
++            tool_choice: "required".to_string(),
++            streaming: false,
++        },
++    )
++    .await;
++    let tool_result = provider
+         .chat_with_tool_choice(
+             &tool_messages,
+             Some(&tool_defs),
+@@ -513,8 +573,11 @@ pub async fn request_strict_router_decision(
+             // always a well-formed tool call (no fragile JSON-text fallback).
+             ToolChoice::Required,
+         )
+-        .await
+-    {
++        .await;
++    if let (Some(replay), Some(call_id)) = (replay, tool_call_id.as_deref()) {
++        journal_aux_terminal(replay, call_id, &tool_result).await;
++    }
++    if let Ok(tool_resp) = tool_result {
+         if let Some(tc) = tool_resp.tool_calls.first() {
+             if tc.name == "route_decision" {
+                 let mut args_obj = tc
+@@ -566,7 +629,23 @@ pub async fn request_strict_router_decision(
+         }),
+     ];
+ 
+-    let router_resp = provider
++    let fallback_call_id = journal_aux_request(
++        replay,
++        ModelCallPurpose::Router,
++        &RecordedProviderRequest {
++            messages: router_messages.clone(),
++            tools: None,
++            model: model.to_string(),
++            max_tokens,
++            temperature,
++            thinking_budget: None,
++            top_p: Some(top_p),
++            tool_choice: "auto".to_string(),
++            streaming: false,
++        },
++    )
++    .await;
++    let router_result = provider
+         .chat(
+             &router_messages,
+             None,
+@@ -576,8 +655,11 @@ pub async fn request_strict_router_decision(
+             None,
+             Some(top_p),
+         )
+-        .await
+-        .map_err(|e| format!("strict router call failed: {}", e))?;
++        .await;
++    if let (Some(replay), Some(call_id)) = (replay, fallback_call_id.as_deref()) {
++        journal_aux_terminal(replay, call_id, &router_result).await;
++    }
++    let router_resp = router_result.map_err(|e| format!("strict router call failed: {}", e))?;
+     let raw_router_content = router_resp.content.unwrap_or_default();
+     let raw = crate::agent::sanitize::sanitize_reasoning_output(&raw_router_content);
+     let parsed = role_policy::parse_router_decision_strict(&raw)
+@@ -631,7 +713,7 @@ pub async fn request_strict_router_decision(
+ /// - `Err(msg)` on fatal error (break with msg)
+ #[instrument(
+     name = "dispatch_specialist",
+-    skip(core, counters, router_args, user_content, context_summary, tool_list, messages),
++    skip(core, counters, router_args, user_content, context_summary, tool_list, messages, replay),
+     fields(
+         target = %target,
+         outcome = tracing::field::Empty,
+@@ -648,6 +730,7 @@ pub(crate) async fn dispatch_specialist(
+     tool_list: &[String],
+     messages: &[Value],
+     schema_enabled: bool,
++    replay: Option<&TurnReplayRecorder>,
+ ) -> Result<super::trace_store::DispatchRecord, String> {
+     let start = std::time::Instant::now();
+     info!(role = "specialist", target = %target, "dispatch_specialist_start");
+@@ -703,7 +786,23 @@ pub(crate) async fn dispatch_specialist(
+         json!({"role":"system","content": system_prompt}),
+         json!({"role":"user","content": specialist_pack}),
+     ];
+-    match specialist_provider
++    let call_id = journal_aux_request(
++        replay,
++        ModelCallPurpose::Specialist,
++        &RecordedProviderRequest {
++            messages: specialist_messages.clone(),
++            tools: None,
++            model: specialist_model.clone(),
++            max_tokens: core.tool_delegation_config.max_tokens,
++            temperature: core.specialist_temperature,
++            thinking_budget: None,
++            top_p: Some(core.specialist_top_p),
++            tool_choice: "auto".to_string(),
++            streaming: false,
++        },
++    )
++    .await;
++    let specialist_result = specialist_provider
+         .chat(
+             &specialist_messages,
+             None,
+@@ -713,8 +812,11 @@ pub(crate) async fn dispatch_specialist(
+             None,
+             Some(core.specialist_top_p),
+         )
+-        .await
+-    {
++        .await;
++    if let (Some(replay), Some(call_id)) = (replay, call_id.as_deref()) {
++        journal_aux_terminal(replay, call_id, &specialist_result).await;
++    }
++    match specialist_result {
+         Ok(sp_resp) => {
+             counters.trio_circuit_breaker.lock().record_success(&cb_key);
+             let raw_text = sp_resp
+@@ -964,6 +1066,12 @@ pub(crate) async fn router_preflight(
+     };
+ 
+     let router_start = std::time::Instant::now();
++    let replay = TurnReplayRecorder::new(
++        std::sync::Arc::clone(&ctx.core.sessions),
++        ctx.session_id.clone(),
++        ctx.request_id.clone(),
++        ctx.turn_count,
++    );
+     let decision = match request_strict_router_decision(
+         router_provider.as_ref(),
+         &router_model,
+@@ -973,6 +1081,7 @@ pub(crate) async fn router_preflight(
+         ctx.core.router_top_p,
+         &tool_list.join(", "),
+         ctx.core.tool_delegation_config.router_tuning.max_tokens,
++        Some(&replay),
+     )
+     .await
+     {
+@@ -1046,6 +1155,7 @@ pub(crate) async fn router_preflight(
+                 &tool_list,
+                 &ctx.messages,
+                 ctx.core.specialist_output_schema,
++                Some(&replay),
+             )
+             .await
+             {
+@@ -1349,6 +1459,12 @@ pub(crate) async fn route_tool_calls(
+             ctx.core.router_model.as_deref(),
+         ) {
+             let router_start = std::time::Instant::now();
++            let replay = TurnReplayRecorder::new(
++                std::sync::Arc::clone(&ctx.core.sessions),
++                ctx.session_id.clone(),
++                ctx.request_id.clone(),
++                ctx.turn_count,
++            );
+             match request_strict_router_decision(
+                 router_provider.as_ref(),
+                 router_model,
+@@ -1358,6 +1474,7 @@ pub(crate) async fn route_tool_calls(
+                 ctx.core.router_top_p,
+                 &available_tools.join(", "),
+                 ctx.core.tool_delegation_config.router_tuning.max_tokens,
++                Some(&replay),
+             )
+             .await
+             {
+@@ -1485,6 +1602,12 @@ pub(crate) async fn route_tool_calls(
+                     .or_else(|| response_content.map(|s| s.to_string()))
+                     .unwrap_or_else(|| "(empty)".to_string());
+                 let context_summary = context_summary_owned.as_str();
++                let replay = TurnReplayRecorder::new(
++                    std::sync::Arc::clone(&ctx.core.sessions),
++                    ctx.session_id.clone(),
++                    ctx.request_id.clone(),
++                    ctx.turn_count,
++                );
+                 match dispatch_specialist(
+                     &ctx.core,
+                     &ctx.counters,
+@@ -1495,6 +1618,7 @@ pub(crate) async fn route_tool_calls(
+                     &ctx.tools.tool_names(),
+                     &ctx.messages,
+                     ctx.core.specialist_output_schema,
++                    Some(&replay),
+                 )
+                 .await
+                 {
+@@ -1597,6 +1721,27 @@ pub(crate) async fn route_tool_calls(
+             Ok(()) => allowed_calls.push(tc),
+             Err(e) => {
+                 warn!("{}", e);
++                if let Err(record_error) = ctx
++                    .core
++                    .sessions
++                    .record_tool_pre_execute(
++                        &ctx.session_id,
++                        &ctx.request_id,
++                        ctx.turn_count,
++                        &tc.id,
++                        &tc.name,
++                        &tc.arguments,
++                        crate::session::db::ToolPreExecuteDecision::Rejected {
++                            reason: "tool_guard".to_string(),
++                        },
++                    )
++                    .await
++                {
++                    return RouteResult::Break(format!(
++                        "tool {} was blocked but its pre-execution decision could not be recorded: {record_error}",
++                        tc.id
++                    ));
++                }
+                 let key = ToolGuard::key(&tc.name, &tc.arguments);
+                 if let Some(cached) = ctx.flow.tool_guard.get_cached_result(&key) {
+                     blocked_with_result.push((tc, cached.chars().count()));
+diff --git a/src/agent/tool_engine.rs b/src/agent/tool_engine.rs
+index 5185aca..fc0a040 100644
+--- a/src/agent/tool_engine.rs
++++ b/src/agent/tool_engine.rs
+@@ -27,7 +27,10 @@ use crate::agent::markers::{
+ };
+ use crate::agent::role_policy;
+ use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
+-use crate::providers::base::{LLMResponse, ToolCallRequest};
++use crate::providers::base::{LLMProvider, LLMResponse, ToolCallRequest};
++use crate::session::db::{
++    ModelCallPurpose, ReplayRecordingProvider, ToolPreExecuteDecision, TurnReplayRecorder,
++};
+ use std::sync::Arc;
+ 
+ use super::agent_loop::{ResponseBoundary, TurnContext};
+@@ -473,6 +476,17 @@ pub(crate) async fn execute_tools_delegated(
+             return false;
+         }
+     };
++    let replay = TurnReplayRecorder::new(
++        Arc::clone(&ctx.core.sessions),
++        ctx.session_id.clone(),
++        ctx.request_id.clone(),
++        ctx.turn_count,
++    );
++    let tr_provider: Arc<dyn LLMProvider> = Arc::new(ReplayRecordingProvider::new(
++        tr_provider,
++        replay,
++        ModelCallPurpose::ToolRunner,
++    ));
+ 
+     let tool_names_summary: String = routed_tool_calls
+         .iter()
+@@ -616,6 +630,29 @@ pub(crate) async fn execute_tools_delegated(
+     );
+     ctx.persist_pending_protocol_messages().await;
+ 
++    for tc in routed_tool_calls {
++        if let Err(error) = ctx
++            .core
++            .sessions
++            .record_tool_pre_execute(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                &tc.id,
++                &tc.name,
++                &tc.arguments,
++                ToolPreExecuteDecision::Ready,
++            )
++            .await
++        {
++            ctx.flow.infra_error = Some(format!(
++                "delegated tool {} was not started because its pre-execution decision could not be recorded: {error}",
++                tc.id
++            ));
++            return true;
++        }
++    }
++
+     let run_result =
+         tool_runner::run_tool_loop(&runner_config, routed_tool_calls, &ctx.tools, &task_desc).await;
+     let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
+@@ -630,8 +667,12 @@ pub(crate) async fn execute_tools_delegated(
+         let results_preview: String = run_result
+             .tool_results
+             .first()
+-            .map(|(_, name, data)| {
+-                format!("[{}]: {}", name, data.chars().take(200).collect::<String>())
++            .map(|outcome| {
++                format!(
++                    "[{}]: {}",
++                    outcome.tool_name,
++                    outcome.data.chars().take(200).collect::<String>()
++                )
+             })
+             .unwrap_or_default();
+         warn!(
+@@ -676,12 +717,39 @@ pub(crate) async fn execute_tools_delegated(
+     let force_routed_stash = routed_tool_calls.len() > 1;
+ 
+     for tc in routed_tool_calls {
+-        let full_data = run_result
++        let routed_result = run_result
+             .tool_results
+             .iter()
+-            .find(|(id, _, _)| id == &tc.id)
+-            .map(|(_, _, data)| data.as_str())
++            .find(|outcome| outcome.tool_call_id == tc.id);
++        let full_data = routed_result
++            .map(|outcome| outcome.data.as_str())
+             .unwrap_or("(no result)");
++        let raw_ok = routed_result.is_some() && tool_result_ok(full_data);
++        // Implementation-exit timing as measured by the runner; 0 when the
++        // runner produced no outcome for this call.
++        let routed_duration_ms = routed_result
++            .map(|outcome| outcome.duration_ms)
++            .unwrap_or(0);
++        if let Err(error) = ctx
++            .core
++            .sessions
++            .record_tool_execute(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                &tc.id,
++                full_data,
++                raw_ok,
++                routed_duration_ms,
++            )
++            .await
++        {
++            ctx.flow.infra_error = Some(format!(
++                "delegated tool execution result for {} could not be recorded: {error}",
++                tc.id
++            ));
++            return true;
++        }
+ 
+         let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
+ 
+@@ -704,10 +772,20 @@ pub(crate) async fn execute_tools_delegated(
+             }
+         } else if full_tokens > threshold {
+             if let Some(specialist) = ctx.core.specialist_provider.as_ref() {
++                let replay_provider = ReplayRecordingProvider::new(
++                    Arc::clone(specialist),
++                    TurnReplayRecorder::new(
++                        Arc::clone(&ctx.core.sessions),
++                        ctx.session_id.clone(),
++                        ctx.request_id.clone(),
++                        ctx.turn_count,
++                    ),
++                    ModelCallPurpose::ToolResultSummary,
++                );
+                 ctx.content_gate
+                     .admit_with_specialist(
+                         full_data,
+-                        specialist.as_ref(),
++                        &replay_provider,
+                         ctx.core.specialist_model.as_deref().unwrap_or(""),
+                     )
+                     .await
+@@ -799,6 +877,41 @@ pub(crate) async fn execute_tools_delegated(
+         );
+         ctx.used_tools.insert(tc.name.clone());
+         ctx.persist_pending_protocol_messages().await;
++        let persisted_message_id = ctx
++            .messages
++            .iter()
++            .rev()
++            .find(|message| {
++                message.get("tool_call_id").and_then(Value::as_str) == Some(tc.id.as_str())
++            })
++            .and_then(|message| message.get("_db_id"))
++            .and_then(Value::as_i64);
++        let Some(persisted_message_id) = persisted_message_id else {
++            ctx.flow.infra_error = Some(format!(
++                "model-visible delegated tool result for {} was not durably persisted",
++                tc.id
++            ));
++            return true;
++        };
++        if let Err(error) = ctx
++            .core
++            .sessions
++            .record_tool_post_execute(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                &tc.id,
++                &injected,
++                persisted_message_id,
++            )
++            .await
++        {
++            ctx.flow.infra_error = Some(format!(
++                "delegated tool post-execution result for {} could not be recorded: {error}",
++                tc.id
++            ));
++            return true;
++        }
+     }
+ 
+     // Inject the runner's summary so the main LLM knows what
+@@ -836,21 +949,20 @@ pub(crate) async fn execute_tools_delegated(
+ 
+     // Record learning + audit for all tool results.
+     let executor = format!("tool_runner:{}", tr_model);
+-    let n_results = run_result.tool_results.len().max(1) as u64;
+-    for (tool_call_id, tool_name, data) in &run_result.tool_results {
+-        let ok = !data.starts_with("Error:");
+-        let per_tool_ms = delegation_elapsed_ms / n_results;
++    for outcome in &run_result.tool_results {
++        let ok = !outcome.data.starts_with("Error:");
++        let per_tool_ms = outcome.duration_ms;
+ 
+         // Only render CallEnd in the TUI for results that the caller asked
+-        // for. Internal scratchpad calls the runner made on its own already
++        // for. Internal scratchpad calls the runner made on their own already
+         // roll up into the runner-summary user message — emitting a CallEnd
+         // for them produces a duplicate identical-duration block per tool.
+         if let Some(ref tx) = ctx.tool_event_tx {
+-            if is_routed_call(tool_call_id, routed_tool_calls) {
++            if is_routed_call(&outcome.tool_call_id, routed_tool_calls) {
+                 let _ = tx.send(ToolEvent::CallEnd {
+-                    tool_name: tool_name.clone(),
+-                    tool_call_id: tool_call_id.clone(),
+-                    result_data: data.clone(),
++                    tool_name: outcome.tool_name.clone(),
++                    tool_call_id: outcome.tool_call_id.clone(),
++                    result_data: outcome.data.clone(),
+                     ok,
+                     duration_ms: per_tool_ms,
+                 });
+@@ -859,29 +971,29 @@ pub(crate) async fn execute_tools_delegated(
+ 
+         if let Some(ref audit) = ctx.audit {
+             let _ = audit.record(
+-                tool_name,
+-                tool_call_id,
++                &outcome.tool_name,
++                &outcome.tool_call_id,
+                 &json!({}),
+-                data,
++                &outcome.data,
+                 ok,
+                 per_tool_ms,
+                 &executor,
+             );
+         }
+ 
+-        ctx.used_tools.insert(tool_name.clone());
++        ctx.used_tools.insert(outcome.tool_name.clone());
+         ctx.turn_tool_entries
+             .push(crate::agent::audit::TurnToolEntry {
+-                name: tool_name.clone(),
+-                id: tool_call_id.clone(),
++                name: outcome.tool_name.clone(),
++                id: outcome.tool_call_id.clone(),
+                 ok,
+                 duration_ms: per_tool_ms,
+-                result_chars: data.len(),
++                result_chars: outcome.data.len(),
+             });
+ 
+         // Taint tracking: mark context tainted when a web tool ran via delegation.
+         // We don't have the original arguments here, so pass None for detail.
+-        ctx.taint_state.mark_tainted(tool_name, None);
++        ctx.taint_state.mark_tainted(&outcome.tool_name, None);
+     }
+ 
+     // Behavioral response-boundary arming (mirrors execute_tools_inline).
+@@ -889,7 +1001,7 @@ pub(crate) async fn execute_tools_delegated(
+     let executed: Vec<&str> = run_result
+         .tool_results
+         .iter()
+-        .map(|(_, tool_name, _)| tool_name.as_str())
++        .map(|outcome| outcome.tool_name.as_str())
+         .collect();
+     if should_arm_boundary(response.content.as_deref(), &executed) {
+         ctx.flow.boundary = ResponseBoundary::Pending;
+@@ -968,6 +1080,39 @@ struct SingleToolResult {
+     arguments: std::collections::HashMap<String, serde_json::Value>,
+     result: crate::agent::tools::base::ToolExecutionResult,
+     duration_ms: u64,
++    replay_error: Option<String>,
++}
++
++#[derive(Clone)]
++struct ToolReplayRecorder {
++    sessions: Arc<crate::session::SessionDb>,
++    session_id: String,
++    turn_request_id: String,
++    turn_tag: u64,
++}
++
++async fn record_completed_tool(
++    mut result: SingleToolResult,
++    recorder: Option<&ToolReplayRecorder>,
++) -> SingleToolResult {
++    if let Some(recorder) = recorder {
++        if let Err(error) = recorder
++            .sessions
++            .record_tool_execute(
++                &recorder.session_id,
++                &recorder.turn_request_id,
++                recorder.turn_tag,
++                &result.tool_id,
++                result.result.data(),
++                result.result.ok(),
++                result.duration_ms,
++            )
++            .await
++        {
++            result.replay_error = Some(error.to_string());
++        }
++    }
++    result
+ }
+ 
+ fn completed_reportable_tool(result: &SingleToolResult) -> Option<&str> {
+@@ -998,6 +1143,7 @@ async fn execute_single_tool(
+     cancellation_token: &Option<tokio_util::sync::CancellationToken>,
+     tool_heartbeat_secs: u64,
+     taint_warning: Option<String>,
++    replay_recorder: Option<&ToolReplayRecorder>,
+ ) -> SingleToolResult {
+     let tool_span = tracing::info_span!(
+         "execute_tool_inline",
+@@ -1039,15 +1185,20 @@ async fn execute_single_tool(
+             .as_ref()
+             .is_some_and(|token| token.is_cancelled())
+         {
+-            return SingleToolResult {
+-                tool_name: tc.name.clone(),
+-                tool_id: tc.id.clone(),
+-                arguments: tc.arguments.clone(),
+-                result: crate::agent::tools::base::ToolExecutionResult::failure(
+-                    "tool call cancelled".to_string(),
+-                ),
+-                duration_ms: 0,
+-            };
++            return record_completed_tool(
++                SingleToolResult {
++                    tool_name: tc.name.clone(),
++                    tool_id: tc.id.clone(),
++                    arguments: tc.arguments.clone(),
++                    result: crate::agent::tools::base::ToolExecutionResult::failure(
++                        "tool call cancelled".to_string(),
++                    ),
++                    duration_ms: 0,
++                    replay_error: None,
++                },
++                replay_recorder,
++            )
++            .await;
+         }
+ 
+         // Spawn heartbeat that emits Progress ticks until the tool finishes.
+@@ -1129,13 +1280,18 @@ async fn execute_single_tool(
+             duration_ms
+         );
+ 
+-        SingleToolResult {
+-            tool_name: tc.name.clone(),
+-            tool_id: tc.id.clone(),
+-            arguments: tc.arguments.clone(),
+-            result,
+-            duration_ms,
+-        }
++        record_completed_tool(
++            SingleToolResult {
++                tool_name: tc.name.clone(),
++                tool_id: tc.id.clone(),
++                arguments: tc.arguments.clone(),
++                result,
++                duration_ms,
++                replay_error: None,
++            },
++            replay_recorder,
++        )
++        .await
+     }
+     .instrument(tool_span)
+     .await
+@@ -1151,6 +1307,7 @@ async fn execute_tool_calls_ordered(
+     cancellation_token: &Option<tokio_util::sync::CancellationToken>,
+     tool_heartbeat_secs: u64,
+     taints: Vec<Option<String>>,
++    replay_recorder: Option<&ToolReplayRecorder>,
+ ) -> Vec<SingleToolResult> {
+     let mut results = Vec::with_capacity(calls.len());
+     let mut start = 0;
+@@ -1176,6 +1333,7 @@ async fn execute_tool_calls_ordered(
+                             cancellation_token,
+                             tool_heartbeat_secs,
+                             taint,
++                            replay_recorder,
+                         )
+                     });
+                 results.extend(futures_util::future::join_all(futures).await);
+@@ -1190,6 +1348,7 @@ async fn execute_tool_calls_ordered(
+                     cancellation_token,
+                     tool_heartbeat_secs,
+                     taints[start].clone(),
++                    replay_recorder,
+                 )
+                 .await,
+             );
+@@ -1211,6 +1370,14 @@ async fn inject_tool_result(
+     prompt_cap: usize,
+     force_stash_raw: bool,
+ ) {
++    if let Some(record_error) = &r.replay_error {
++        ctx.flow.infra_error = Some(format!(
++            "tool execution result for {} could not be recorded: {record_error}",
++            r.tool_id
++        ));
++        return;
++    }
++
+     // For web_fetch/web_search: unwrap the JSON envelope so the model
+     // sees clean article text rather than a JSON metadata summary.
+     let result_data = if r.tool_name == "web_fetch" || r.tool_name == "web_search" {
+@@ -1277,15 +1444,26 @@ async fn inject_tool_result(
+             }
+         };
+         let summarized = match ctx.core.specialist_provider.as_ref() {
+-            Some(specialist) => ctx
+-                .content_gate
+-                .admit_with_specialist(
+-                    &result_data,
+-                    specialist.as_ref(),
+-                    ctx.core.specialist_model.as_deref().unwrap_or(""),
+-                )
+-                .await
+-                .into_text(),
++            Some(specialist) => {
++                let replay_provider = ReplayRecordingProvider::new(
++                    Arc::clone(specialist),
++                    TurnReplayRecorder::new(
++                        Arc::clone(&ctx.core.sessions),
++                        ctx.session_id.clone(),
++                        ctx.request_id.clone(),
++                        ctx.turn_count,
++                    ),
++                    ModelCallPurpose::ToolResultSummary,
++                );
++                ctx.content_gate
++                    .admit_with_specialist(
++                        &result_data,
++                        &replay_provider,
++                        ctx.core.specialist_model.as_deref().unwrap_or(""),
++                    )
++                    .await
++                    .into_text()
++            }
+             // Defensive: the caller previously panicked here if the provider
+             // was None; fall back to the simple admit instead.
+             None => ctx.content_gate.admit_simple(&result_data).into_text(),
+@@ -1367,6 +1545,41 @@ async fn inject_tool_result(
+         );
+     }
+     ctx.persist_pending_protocol_messages().await;
++    let persisted_message_id = ctx
++        .messages
++        .iter()
++        .rev()
++        .find(|message| {
++            message.get("tool_call_id").and_then(Value::as_str) == Some(r.tool_id.as_str())
++        })
++        .and_then(|message| message.get("_db_id"))
++        .and_then(Value::as_i64);
++    let Some(persisted_message_id) = persisted_message_id else {
++        ctx.flow.infra_error = Some(format!(
++            "model-visible tool result for {} was not durably persisted",
++            r.tool_id
++        ));
++        return;
++    };
++    if let Err(record_error) = ctx
++        .core
++        .sessions
++        .record_tool_post_execute(
++            &ctx.session_id,
++            &ctx.request_id,
++            ctx.turn_count,
++            &r.tool_id,
++            &data,
++            persisted_message_id,
++        )
++        .await
++    {
++        ctx.flow.infra_error = Some(format!(
++            "tool post-execution result for {} could not be recorded: {record_error}",
++            r.tool_id
++        ));
++        return;
++    }
+     ctx.flow.tool_guard.record_result_with_status(
+         &r.tool_name,
+         &r.arguments,
+@@ -1562,6 +1775,28 @@ pub(crate) async fn execute_tools_inline(
+         .iter()
+         .partition(|tc| blocks && requires_result_report(&tc.name));
+     for tc in &blocked {
++        if let Err(record_error) = ctx
++            .core
++            .sessions
++            .record_tool_pre_execute(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                &tc.id,
++                &tc.name,
++                &tc.arguments,
++                ToolPreExecuteDecision::Rejected {
++                    reason: "response_boundary".to_string(),
++                },
++            )
++            .await
++        {
++            ctx.flow.infra_error = Some(format!(
++                "tool {} rejection could not be recorded: {record_error}",
++                tc.id
++            ));
++            return;
++        }
+         inject_boundary_rejection(ctx, tc);
+     }
+     ctx.persist_pending_protocol_messages().await;
+@@ -1578,6 +1813,38 @@ pub(crate) async fn execute_tools_inline(
+         })
+         .collect();
+ 
++    // All policy checks are complete and the assistant carrier is already
++    // durable. Record each ready decision before any tool implementation can
++    // produce a side effect. A storage failure aborts the batch fail-closed.
++    for tc in &allowed {
++        if let Err(record_error) = ctx
++            .core
++            .sessions
++            .record_tool_pre_execute(
++                &ctx.session_id,
++                &ctx.request_id,
++                ctx.turn_count,
++                &tc.id,
++                &tc.name,
++                &tc.arguments,
++                ToolPreExecuteDecision::Ready,
++            )
++            .await
++        {
++            ctx.flow.infra_error = Some(format!(
++                "tool {} was not started because its pre-execution decision could not be recorded: {record_error}",
++                tc.id
++            ));
++            return;
++        }
++    }
++
++    let replay_recorder = ToolReplayRecorder {
++        sessions: Arc::clone(&ctx.core.sessions),
++        session_id: ctx.session_id.clone(),
++        turn_request_id: ctx.request_id.clone(),
++        turn_tag: ctx.turn_count,
++    };
+     let ordered_results = execute_tool_calls_ordered(
+         &allowed,
+         &ctx.tools,
+@@ -1585,6 +1852,7 @@ pub(crate) async fn execute_tools_inline(
+         &ctx.cancellation_token,
+         ctx.core.tool_heartbeat_secs,
+         taints,
++        Some(&replay_recorder),
+     )
+     .await;
+     let result_cap = inline_hot_prompt_result_cap_for_ctx_batch(ctx, ordered_results.len());
+@@ -1726,6 +1994,7 @@ mod tests {
+             &cancellation,
+             60,
+             vec![None; calls.len()],
++            None,
+         )
+         .await
+     }
+@@ -2224,6 +2493,7 @@ mod tests {
+                 arguments,
+                 result: crate::agent::tools::base::ToolExecutionResult::success("ok".to_string()),
+                 duration_ms: 0,
++                replay_error: None,
+             }
+         };
+ 
+@@ -2254,7 +2524,8 @@ mod tests {
+             ]),
+         };
+         for _ in 0..2 {
+-            let result = execute_single_tool(&staged, &registry, &None, &None, 60, None).await;
++            let result =
++                execute_single_tool(&staged, &registry, &None, &None, 60, None, None).await;
+             assert!(result.result.ok(), "{:?}", result.result.error());
+         }
+ 
+@@ -2267,7 +2538,8 @@ mod tests {
+                 ("state".to_string(), json!("complete")),
+             ]),
+         };
+-        let result = execute_single_tool(&final_piece, &registry, &None, &None, 60, None).await;
++        let result =
++            execute_single_tool(&final_piece, &registry, &None, &None, 60, None, None).await;
+         assert!(result.result.ok(), "{:?}", result.result.error());
+         assert_eq!(std::fs::read_to_string(path).unwrap(), "once-done");
+     }
+@@ -2332,6 +2604,103 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn tool_execute_events_follow_actual_parallel_completion_order() {
++        // Break caught: raw execution exits are journaled later during
++        // provider-order message injection, obscuring which parallel tool
++        // actually completed first.
++        let state = ProbeState::new();
++        let slow_gate = tokio_util::sync::CancellationToken::new();
++        let fast_gate = tokio_util::sync::CancellationToken::new();
++        let mut registry = ToolRegistry::new();
++        register_probe(
++            &mut registry,
++            "slow",
++            ToolConcurrency::ParallelSafe,
++            &state,
++            Some(slow_gate.clone()),
++            false,
++        );
++        register_probe(
++            &mut registry,
++            "fast",
++            ToolConcurrency::ParallelSafe,
++            &state,
++            Some(fast_gate.clone()),
++            false,
++        );
++        let calls = vec![make_tc("slow", "tc-slow"), make_tc("fast", "tc-fast")];
++
++        let dir = tempfile::tempdir().unwrap();
++        let sessions = Arc::new(crate::session::SessionDb::new(
++            &dir.path().join("sessions.db"),
++        ));
++        let session = sessions.create_session("cli:completion-order").await;
++        for call in &calls {
++            sessions
++                .record_tool_pre_execute(
++                    &session.id,
++                    "turn-tools",
++                    1,
++                    &call.id,
++                    &call.name,
++                    &call.arguments,
++                    ToolPreExecuteDecision::Ready,
++                )
++                .await
++                .unwrap();
++        }
++        let recorder = ToolReplayRecorder {
++            sessions: Arc::clone(&sessions),
++            session_id: session.id.clone(),
++            turn_request_id: "turn-tools".to_string(),
++            turn_tag: 1,
++        };
++        let refs = calls.iter().collect::<Vec<_>>();
++        let execution = execute_tool_calls_ordered(
++            &refs,
++            &registry,
++            &None,
++            &None,
++            60,
++            vec![None; calls.len()],
++            Some(&recorder),
++        );
++        let release =
++            async {
++                tokio::time::timeout(Duration::from_secs(1), state.wait_for_started(2))
++                    .await
++                    .expect("parallel calls did not start");
++                fast_gate.cancel();
++                loop {
++                    let events = sessions.load_session_events(&session.id).await.unwrap();
++                    if events.iter().any(|event| matches!(
++                    &event.payload,
++                    crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. }
++                        if tool_call_id == "tc-fast"
++                )) {
++                    break;
++                }
++                    tokio::task::yield_now().await;
++                }
++                slow_gate.cancel();
++            };
++        let (_results, ()) = tokio::join!(execution, release);
++        let completion_order = sessions
++            .load_session_events(&session.id)
++            .await
++            .unwrap()
++            .into_iter()
++            .filter_map(|event| match event.payload {
++                crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. } => {
++                    Some(tool_call_id)
++                }
++                _ => None,
++            })
++            .collect::<Vec<_>>();
++        assert_eq!(completion_order, vec!["tc-fast", "tc-slow"]);
++    }
++
+     #[tokio::test]
+     async fn sequential_tool_is_an_ordering_barrier() {
+         let state = ProbeState::new();
+diff --git a/src/agent/tool_runner/mod.rs b/src/agent/tool_runner/mod.rs
+index 1ca3d24..c8daaea 100644
+--- a/src/agent/tool_runner/mod.rs
++++ b/src/agent/tool_runner/mod.rs
+@@ -149,11 +149,22 @@ impl Budget {
+     }
+ }
+ 
++/// One delegated tool outcome. `duration_ms` is the implementation-exit
++/// timing (the tool implementation itself, excluding delegation LLM
++/// iterations), matching the journal schema for `tool_execute` events.
++#[derive(Debug, Clone)]
++pub struct ToolRunOutcome {
++    pub tool_call_id: String,
++    pub tool_name: String,
++    pub data: String,
++    pub duration_ms: u64,
++}
++
+ /// Result of a delegated tool execution loop.
+ #[derive(Debug, Clone)]
+ pub struct ToolRunResult {
+-    /// Collected (tool_call_id, tool_name, result_data) from all iterations.
+-    pub tool_results: Vec<(String, String, String)>,
++    /// Collected outcomes (tool_call_id, tool_name, result_data, duration) from all iterations.
++    pub tool_results: Vec<ToolRunOutcome>,
+     /// Optional summary from the cheap model about what happened.
+     pub summary: Option<String>,
+     /// How many iterations were used.
+@@ -217,7 +228,7 @@ async fn analyze_via_scratch_pad(
+     allowed_tools: &std::collections::HashSet<&str>,
+     tools: &ToolRegistry,
+     task_context: &str,
+-    all_results: &mut Vec<(String, String, String)>,
++    all_results: &mut Vec<ToolRunOutcome>,
+     max_rounds: usize,
+ ) -> Option<String> {
+     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+@@ -417,15 +428,23 @@ async fn analyze_via_scratch_pad(
+                         _ => {} // scratch_store/scratch_recall/set_phase handle persistence internally
+                     }
+                 } else if worker_tools::is_worker_tool(&tc.name) {
++                    let started = std::time::Instant::now();
+                     let result =
+                         worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
++                    let duration_ms = started.elapsed().as_millis() as u64;
+                     let (_, _metadata) = context_store.store(result.clone());
+                     let original_id = format!("sp{:07}", id_counter);
+                     id_counter += 1;
+-                    all_results.push((original_id, tc.name.clone(), result));
++                    all_results.push(ToolRunOutcome {
++                        tool_call_id: original_id,
++                        tool_name: tc.name.clone(),
++                        data: result,
++                        duration_ms,
++                    });
+                 } else {
+                     // Real tool — execute with retry on transient errors.
+                     debug!("Scratch pad executing real tool: {}", tc.name);
++                    let started = std::time::Instant::now();
+                     let result = execute_with_retry(
+                         tools,
+                         &tc.name,
+@@ -435,10 +454,16 @@ async fn analyze_via_scratch_pad(
+                         TOOL_MAX_RETRIES,
+                     )
+                     .await;
++                    let duration_ms = started.elapsed().as_millis() as u64;
+                     let (_, _metadata) = context_store.store(result.data().to_string());
+                     let original_id = format!("sp{:07}", id_counter);
+                     id_counter += 1;
+-                    all_results.push((original_id, tc.name.clone(), result.data().to_string()));
++                    all_results.push(ToolRunOutcome {
++                        tool_call_id: original_id,
++                        tool_name: tc.name.clone(),
++                        data: result.data().to_string(),
++                        duration_ms,
++                    });
+                 }
+             }
+             // Continue to next round — fresh call with updated state.
+@@ -540,7 +565,7 @@ pub async fn run_tool_loop(
+         tools = initial_tool_calls.len(),
+         "tool_delegation_start"
+     );
+-    let mut all_results: Vec<(String, String, String)> = Vec::new();
++    let mut all_results: Vec<ToolRunOutcome> = Vec::new();
+     let mut iterations_used: u32 = 0;
+     let mut id_counter: usize = 0;
+     // Track tool calls we've already executed to detect loops.
+@@ -755,7 +780,13 @@ pub async fn run_tool_loop(
+                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
+                         let original_id =
+                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+-                        all_results.push((original_id, tc.name.clone(), result));
++                        all_results.push(ToolRunOutcome {
++                            tool_call_id: original_id,
++                            tool_name: tc.name.clone(),
++                            data: result,
++                            // No implementation ran.
++                            duration_ms: 0,
++                        });
+                         continue;
+                     }
+                 };
+@@ -897,11 +928,20 @@ pub async fn run_tool_loop(
+                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
+                         let original_id =
+                             id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+-                        all_results.push((original_id, tc.name.clone(), result));
++                        all_results.push(ToolRunOutcome {
++                            tool_call_id: original_id,
++                            tool_name: tc.name.clone(),
++                            data: result,
++                            // Provider failed before any child implementation ran.
++                            duration_ms: 0,
++                        });
+                         continue;
+                     }
+                 };
+ 
++                // The delegate tool's implementation is the child loop (or
++                // the direct child response) plus its provider call.
++                let started = std::time::Instant::now();
+                 let result = if child_response.has_tool_calls() {
+                     // Child wants to use tools — run the tool loop.
+                     let child_result = Box::pin(run_tool_loop(
+@@ -916,8 +956,12 @@ pub async fn run_tool_loop(
+                         child_result
+                             .tool_results
+                             .iter()
+-                            .map(|(_, name, data)| {
+-                                format!("[{}]: {}", name, &data[..data.len().min(500)])
++                            .map(|outcome| {
++                                format!(
++                                    "[{}]: {}",
++                                    outcome.tool_name,
++                                    &outcome.data[..outcome.data.len().min(500)]
++                                )
+                             })
+                             .collect::<Vec<_>>()
+                             .join("\n")
+@@ -928,6 +972,7 @@ pub async fn run_tool_loop(
+                         .content
+                         .unwrap_or_else(|| "No result from delegate.".to_string())
+                 };
++                let delegate_duration_ms = started.elapsed().as_millis() as u64;
+ 
+                 // Store delegate result like any other tool.
+                 let (_, metadata) = context_store.store(result.clone());
+@@ -938,11 +983,18 @@ pub async fn run_tool_loop(
+                 };
+                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
+                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+-                all_results.push((original_id, tc.name.clone(), result));
++                all_results.push(ToolRunOutcome {
++                    tool_call_id: original_id,
++                    tool_name: tc.name.clone(),
++                    data: result,
++                    duration_ms: delegate_duration_ms,
++                });
+             } else if worker_tools::is_worker_tool(&tc.name) {
+                 // Async worker tool: runs a command/script and returns result.
+                 debug!("Worker tool: {} (id: {})", tc.name, tc.id);
++                let started = std::time::Instant::now();
+                 let result = worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
++                let duration_ms = started.elapsed().as_millis() as u64;
+                 // Store result in ContextStore for subsequent micro-tool access.
+                 let (_, metadata) = context_store.store(result.clone());
+                 let delegation_data = if result.len() > config.max_tool_result_chars {
+@@ -952,14 +1004,19 @@ pub async fn run_tool_loop(
+                 };
+                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
+                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+-                all_results.push((original_id, tc.name.clone(), result));
++                all_results.push(ToolRunOutcome {
++                    tool_call_id: original_id,
++                    tool_name: tc.name.clone(),
++                    data: result,
++                    duration_ms,
++                });
+ 
+                 // Track result hashes for loop detection.
+                 use std::hash::{Hash, Hasher};
+                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                 tc.name.hash(&mut hasher);
+                 if let Some(last) = all_results.last() {
+-                    last.2.hash(&mut hasher);
++                    last.data.hash(&mut hasher);
+                 }
+                 let result_hash = hasher.finish();
+                 if !seen_results.insert(result_hash) {
+@@ -978,6 +1035,7 @@ pub async fn run_tool_loop(
+             } else {
+                 // Real tool: execute with retry on transient errors.
+                 debug!("Tool runner executing: {} (id: {})", tc.name, tc.id);
++                let started = std::time::Instant::now();
+                 let result = execute_with_retry(
+                     tools,
+                     &tc.name,
+@@ -987,6 +1045,7 @@ pub async fn run_tool_loop(
+                     TOOL_MAX_RETRIES,
+                 )
+                 .await;
++                let duration_ms = started.elapsed().as_millis() as u64;
+                 // For web_fetch/web_search: unwrap the JSON envelope so the model
+                 // sees clean article text rather than a JSON metadata summary.
+                 let raw_data = if tc.name == "web_fetch" || tc.name == "web_search" {
+@@ -1005,7 +1064,12 @@ pub async fn run_tool_loop(
+                 };
+                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
+                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+-                all_results.push((original_id, tc.name.clone(), stripped));
++                all_results.push(ToolRunOutcome {
++                    tool_call_id: original_id,
++                    tool_name: tc.name.clone(),
++                    data: stripped,
++                    duration_ms,
++                });
+ 
+                 // Track result hashes for loop detection.
+                 use std::hash::{Hash, Hasher};
+@@ -1043,12 +1107,15 @@ pub async fn run_tool_loop(
+             let threshold = config.short_circuit_chars;
+             let all_short = all_results
+                 .iter()
+-                .all(|(_, _, data)| data.len() < threshold);
++                .all(|outcome| outcome.data.len() < threshold);
+             // exec/web_search/web_fetch results need interpretation even when short
+             // (e.g. a 50-char error message should be analyzed, not passed raw).
+-            let needs_interpretation = all_results
+-                .iter()
+-                .any(|(_, name, _)| matches!(name.as_str(), "exec" | "web_search" | "web_fetch"));
++            let needs_interpretation = all_results.iter().any(|outcome| {
++                matches!(
++                    outcome.tool_name.as_str(),
++                    "exec" | "web_search" | "web_fetch"
++                )
++            });
+             if all_short && !needs_interpretation {
+                 debug!(
+                     "All {} tool results are short (< {} chars) — skipping delegation LLM, returning raw results",
+@@ -1111,14 +1178,15 @@ pub fn format_results_for_context(
+ ) -> String {
+     let mut parts: Vec<String> = Vec::new();
+ 
+-    for (_, tool_name, data) in &result.tool_results {
+-        let compacted = compact_result_for_context(tool_name, data, max_result_chars);
++    for outcome in &result.tool_results {
++        let compacted =
++            compact_result_for_context(&outcome.tool_name, &outcome.data, max_result_chars);
+         let visible = if let Some(g) = gate.as_deref_mut() {
+             g.admit_simple(&compacted).into_text()
+         } else {
+             compacted
+         };
+-        parts.push(format!("[{}]: {}", tool_name, visible));
++        parts.push(format!("[{}]: {}", outcome.tool_name, visible));
+     }
+ 
+     if let Some(ref summary) = result.summary {
+@@ -1139,7 +1207,7 @@ fn compact_result_for_context(tool_name: &str, data: &str, max_result_chars: usi
+         "[tool result compacted for main context]\n\
+          tool: {tool_name}\n\
+          full_output: {total_chars} chars\n\
+-         guidance: do not replay the same broad tool call; inspect a narrower range only if needed.\n\n\
++         guidance: do not replay the same broad tool .all(|outcome| outcome.data.len() < threshold); inspect a narrower range only if needed.\n\n\
+          --- preview ---\n"
+     );
+     let footer = "\n\n[truncated; full output kept outside the hot prompt]";
+diff --git a/src/agent/tool_runner/tests.rs b/src/agent/tool_runner/tests.rs
+index 85abf54..7adc2d0 100644
+--- a/src/agent/tool_runner/tests.rs
++++ b/src/agent/tool_runner/tests.rs
+@@ -59,6 +59,98 @@ struct CountingTool {
+     call_count: AtomicU32,
+ }
+ 
++/// Tool with a controllable runtime, for per-tool timing assertions.
++struct TimedTool {
++    name: String,
++    sleep_ms: u64,
++}
++
++#[async_trait]
++impl Tool for TimedTool {
++    fn name(&self) -> &str {
++        &self.name
++    }
++    fn description(&self) -> &str {
++        "A timed test tool"
++    }
++    fn parameters(&self) -> Value {
++        json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]})
++    }
++    async fn execute(&self, _params: HashMap<String, Value>) -> String {
++        if self.sleep_ms > 0 {
++            tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
++        }
++        format!("{} result", self.name)
++    }
++}
++
++#[tokio::test]
++async fn tool_results_report_per_tool_implementation_timing() {
++    // Break caught: delegated duration_ms was fabricated as
++    // total_delegation_time / count, so a 150ms tool and a 0ms tool both
++    // reported the same averaged value in the audit journal and TUI.
++    let provider = Arc::new(MockProvider::new(vec![
++        // After initial tool execution, model says "done".
++        crate::providers::base::LLMResponse {
++            content: Some("All done.".to_string()),
++            tool_calls: vec![],
++            finish_reason: FinishReason::Stop,
++            usage: HashMap::new(),
++        },
++    ]));
++
++    let mut tools = ToolRegistry::new();
++    tools.register(Box::new(TimedTool {
++        name: "fast_tool".to_string(),
++        sleep_ms: 0,
++    }));
++    tools.register(Box::new(TimedTool {
++        name: "slow_tool".to_string(),
++        sleep_ms: 150,
++    }));
++
++    let config = ToolRunnerConfig {
++        provider,
++        model: "mock".to_string(),
++        max_iterations: 10,
++        max_tokens: 4096,
++
++        max_tool_result_chars: 30000,
++        short_circuit_chars: 0,
++        depth: 0,
++        cancellation_token: None,
++        verbatim: false,
++        budget: None,
++    };
++
++    let result = run_tool_loop(
++        &config,
++        &make_tool_calls(&["fast_tool", "slow_tool"]),
++        &tools,
++        "timing context",
++    )
++    .await;
++
++    assert_eq!(result.tool_results.len(), 2);
++    let duration_of = |name: &str| {
++        result
++            .tool_results
++            .iter()
++            .find(|outcome| outcome.tool_name == name)
++            .unwrap_or_else(|| panic!("no outcome for {name}"))
++            .duration_ms
++    };
++    let fast = duration_of("fast_tool");
++    let slow = duration_of("slow_tool");
++    assert!(
++        slow >= 140,
++        "slow tool must report its own runtime, got {slow}ms"
++    );
++    assert!(
++        fast * 3 < slow,
++        "fast tool runtime must be measured, not a fabricated average: fast={fast}ms slow={slow}ms"
++    );
++}
+ impl CountingTool {
+     fn new() -> Self {
+         Self {
+@@ -137,6 +229,15 @@ fn make_tool_calls(names: &[&str]) -> Vec<ToolCallRequest> {
+         .collect()
+ }
+ 
++fn outcome(id: &str, name: &str, data: &str) -> ToolRunOutcome {
++    ToolRunOutcome {
++        tool_call_id: id.to_string(),
++        tool_name: name.to_string(),
++        data: data.to_string(),
++        duration_ms: 0,
++    }
++}
++
+ #[tokio::test]
+ async fn test_run_tool_loop_executes_tools() {
+     let provider = Arc::new(MockProvider::new(vec![
+@@ -175,8 +276,8 @@ async fn test_run_tool_loop_executes_tools() {
+     .await;
+ 
+     assert_eq!(result.tool_results.len(), 1);
+-    assert_eq!(result.tool_results[0].1, "test_tool");
+-    assert_eq!(result.tool_results[0].2, "tool result data");
++    assert_eq!(result.tool_results[0].tool_name, "test_tool");
++    assert_eq!(result.tool_results[0].data, "tool result data");
+     assert_eq!(result.summary.as_deref(), Some("All done."));
+     assert_eq!(result.iterations_used, 1);
+ }
+@@ -329,12 +430,8 @@ async fn test_run_tool_loop_returns_on_no_more_tool_calls() {
+ fn test_aggregate_results_formatting() {
+     let result = ToolRunResult {
+         tool_results: vec![
+-            (
+-                "id1".into(),
+-                "read_file".into(),
+-                "file contents here".into(),
+-            ),
+-            ("id2".into(), "exec".into(), "command output".into()),
++            outcome("id1", "read_file", "file contents here"),
++            outcome("id2", "exec", "command output"),
+         ],
+         summary: Some("Read a file and ran a command.".to_string()),
+         iterations_used: 1,
+@@ -351,7 +448,7 @@ fn test_aggregate_results_formatting() {
+ fn test_aggregate_results_compacts_long_output() {
+     let long_data = "x".repeat(3000);
+     let result = ToolRunResult {
+-        tool_results: vec![("id1".into(), "big_tool".into(), long_data.clone())],
++        tool_results: vec![outcome("id1", "big_tool", &long_data)],
+         summary: None,
+         iterations_used: 1,
+         error: None,
+@@ -368,7 +465,7 @@ fn test_aggregate_results_compacts_long_output() {
+ fn test_results_preview_with_summary() {
+     let data = "x".repeat(500);
+     let result = ToolRunResult {
+-        tool_results: vec![("id1".into(), "read_file".into(), data.clone())],
++        tool_results: vec![outcome("id1", "read_file", &data)],
+         summary: Some("Found a large file.".to_string()),
+         iterations_used: 1,
+         error: None,
+@@ -630,7 +727,7 @@ async fn test_tool_loop_provider_error_still_returns_results() {
+ 
+     // Tool was executed before the LLM call failed
+     assert_eq!(result.tool_results.len(), 1);
+-    assert_eq!(result.tool_results[0].1, "test_tool");
++    assert_eq!(result.tool_results[0].tool_name, "test_tool");
+     // Scratch pad LLM call fails, falls back to None (no memory findings).
+     assert!(
+         result.summary.is_none(),
+@@ -738,7 +835,7 @@ async fn test_tool_loop_normalizes_ids_in_messages() {
+ 
+     // Result should use ORIGINAL ID (for main model correlation)
+     assert_eq!(
+-        result.tool_results[0].0, "toolu_01XYZabc123def456ghi789",
++        result.tool_results[0].tool_call_id, "toolu_01XYZabc123def456ghi789",
+         "Results should preserve original tool call ID"
+     );
+ 
+@@ -799,8 +896,8 @@ async fn test_tool_loop_id_mapping_preserves_originals() {
+     let result = run_tool_loop(&config, &calls, &tools, "test").await;
+ 
+     assert_eq!(result.tool_results.len(), 2);
+-    assert_eq!(result.tool_results[0].0, "toolu_01AAAA");
+-    assert_eq!(result.tool_results[1].0, "toolu_01BBBB");
++    assert_eq!(result.tool_results[0].tool_call_id, "toolu_01AAAA");
++    assert_eq!(result.tool_results[1].tool_call_id, "toolu_01BBBB");
+ }
+ 
+ // -- Truncation tests --
+@@ -864,7 +961,7 @@ async fn test_large_result_injects_metadata() {
+ 
+     // all_results should have full 500-char data
+     assert_eq!(result.tool_results.len(), 1);
+-    assert_eq!(result.tool_results[0].2.len(), 500);
++    assert_eq!(result.tool_results[0].data.len(), 500);
+ 
+     // Scratch pad receives variable metadata in the user message state.
+     let captured = provider.captured_messages.lock().await;
+@@ -921,7 +1018,7 @@ async fn test_small_result_injects_directly() {
+     let result = run_tool_loop(&config, &calls, &tools, "test").await;
+ 
+     // Full data in both places
+-    assert_eq!(result.tool_results[0].2.len(), 50);
++    assert_eq!(result.tool_results[0].data.len(), 50);
+ 
+     // Scratch pad receives variable metadata in user message state.
+     let captured = provider.captured_messages.lock().await;
+@@ -972,7 +1069,7 @@ async fn test_short_circuit_skips_llm_for_trivial_results() {
+ 
+     // Tool was executed
+     assert_eq!(result.tool_results.len(), 1);
+-    assert_eq!(result.tool_results[0].2, "tool result data");
++    assert_eq!(result.tool_results[0].data, "tool result data");
+     // No summary — LLM was skipped
+     assert!(
+         result.summary.is_none(),
+@@ -1107,7 +1204,7 @@ async fn test_tool_filtering_blocks_uninvited_tools() {
+         1,
+         "Only initial tool should execute"
+     );
+-    assert_eq!(result.tool_results[0].1, "test_tool");
++    assert_eq!(result.tool_results[0].tool_name, "test_tool");
+     // dangerous_tool was blocked; early-break optimization means summary
+     // may be None (no useful work to summarize), which is correct.
+ }
+@@ -1172,8 +1269,8 @@ async fn test_tool_filtering_allows_same_tool_different_args() {
+         2,
+         "Should have 2 results (initial + chain)"
+     );
+-    assert_eq!(result.tool_results[0].1, "test_tool");
+-    assert_eq!(result.tool_results[1].1, "test_tool");
++    assert_eq!(result.tool_results[0].tool_name, "test_tool");
++    assert_eq!(result.tool_results[1].tool_name, "test_tool");
+ }
+ 
+ #[tokio::test]
+@@ -1283,7 +1380,7 @@ async fn test_micro_tool_results_not_in_all_results() {
+         1,
+         "Micro-tool results should not be in all_results"
+     );
+-    assert_eq!(result.tool_results[0].1, "test_tool");
++    assert_eq!(result.tool_results[0].tool_name, "test_tool");
+ }
+ 
+ #[tokio::test]
+@@ -1442,7 +1539,7 @@ async fn test_short_circuit_bypasses_context_store() {
+ 
+     // Tool was executed and full result returned
+     assert_eq!(result.tool_results.len(), 1);
+-    assert_eq!(result.tool_results[0].2, "tool result data");
++    assert_eq!(result.tool_results[0].data, "tool result data");
+     // No LLM call (short-circuited)
+     assert!(result.summary.is_none());
+     let captured = provider.captured_messages.lock().await;
+@@ -1621,7 +1718,7 @@ async fn test_ctx_summarize_produces_summary() {
+ 
+     // Real tool result preserved
+     assert_eq!(result.tool_results.len(), 1);
+-    assert_eq!(result.tool_results[0].1, "verbose_tool");
++    assert_eq!(result.tool_results[0].tool_name, "verbose_tool");
+     // Provider was called at least 2 times (outer + sub-loop)
+     let total_calls = call_count.load(Ordering::SeqCst);
+     assert!(
+@@ -1856,8 +1953,8 @@ async fn test_verbatim_skips_delegation_returns_raw() {
+ 
+     // Tools are executed.
+     assert_eq!(result.tool_results.len(), 1);
+-    assert_eq!(result.tool_results[0].1, "test_tool");
+-    assert_eq!(result.tool_results[0].2, "tool result data");
++    assert_eq!(result.tool_results[0].tool_name, "test_tool");
++    assert_eq!(result.tool_results[0].data, "tool result data");
+     // Delegation model NOT called — no summary.
+     assert!(
+         result.summary.is_none(),
+diff --git a/src/bin/trio_bench.rs b/src/bin/trio_bench.rs
+index 5daf76a..94e3e30 100644
+--- a/src/bin/trio_bench.rs
++++ b/src/bin/trio_bench.rs
+@@ -599,6 +599,7 @@ async fn main() {
+                     config.trio.router_top_p,
+                     tool_names,
+                     config.tool_delegation.router_tuning.max_tokens,
++                    None,
+                 )
+                 .await;
+                 let router_ms = t_router.elapsed().as_millis() as u64;
+diff --git a/src/session/db.rs b/src/session/db.rs
+index cd2e8bb..265eefd 100644
+--- a/src/session/db.rs
++++ b/src/session/db.rs
+@@ -28,9 +28,15 @@ use std::collections::HashMap;
+ use std::fmt;
+ use std::fs;
+ use std::path::{Path, PathBuf};
++#[cfg(test)]
++use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+ 
+ use chrono::{DateTime, Utc};
+-use rusqlite::{params, types::Value as SqlValue, Connection, OptionalExtension, Transaction};
++use rusqlite::{
++    params,
++    types::{Type, Value as SqlValue},
++    Connection, OptionalExtension, Transaction,
++};
+ use serde::{Deserialize, Serialize};
+ use serde_json::{json, Value};
+ use sha2::{Digest, Sha256};
+@@ -152,6 +158,27 @@ CREATE INDEX IF NOT EXISTS idx_legacy_imports_session
+     ON legacy_imports(session_id);
+ CREATE INDEX IF NOT EXISTS idx_legacy_imports_content
+     ON legacy_imports(content_sha256);
++
++CREATE TABLE IF NOT EXISTS session_replay_artifacts (
++    session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
++    digest        TEXT NOT NULL,
++    media_type    TEXT NOT NULL,
++    content       BLOB NOT NULL,
++    created_at    TEXT NOT NULL,
++    PRIMARY KEY (session_id, digest)
++);
++
++CREATE TABLE IF NOT EXISTS session_events (
++    id              INTEGER PRIMARY KEY AUTOINCREMENT,
++    session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
++    turn_request_id TEXT NOT NULL,
++    turn_tag        INTEGER NOT NULL,
++    event_kind      TEXT NOT NULL,
++    payload_json    TEXT NOT NULL,
++    created_at      TEXT NOT NULL
++);
++CREATE INDEX IF NOT EXISTS idx_session_events_order
++    ON session_events(session_id, id);
+ "#;
+ 
+ const WORKING_MEMORY_COLUMNS: &str = "\
+@@ -252,6 +279,632 @@ pub struct WorkingMemoryRecord {
+     pub updated_at: DateTime<Utc>,
+ }
+ 
++/// Why a model call was made during a foreground turn.
++///
++/// This is persisted instead of inferred from the surrounding messages so a
++/// replay can distinguish ordinary inference from recovery without consulting
++/// the current agent implementation.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ModelCallPurpose {
++    Main,
++    ForcedToolRecovery,
++    RetainedExpansionPreflight,
++    Continuation,
++    EmptyResponseRescue,
++    Router,
++    Specialist,
++    ToolRunner,
++    ToolResultSummary,
++    Compaction,
++}
++
++/// Exact normalized arguments passed to an [`LLMProvider`](crate::providers::base::LLMProvider).
++/// Transport headers are deliberately absent because they are not model-visible
++/// and may contain credentials.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub(crate) struct RecordedProviderRequest {
++    pub(crate) messages: Vec<Value>,
++    pub(crate) tools: Option<Vec<Value>>,
++    pub(crate) model: String,
++    pub(crate) max_tokens: u32,
++    pub(crate) temperature: f64,
++    pub(crate) thinking_budget: Option<u32>,
++    pub(crate) top_p: Option<f64>,
++    pub(crate) tool_choice: String,
++    pub(crate) streaming: bool,
++}
++
++/// Exact terminal provider response consumed by the turn state machine.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub(crate) struct RecordedProviderResponse {
++    pub(crate) content: Option<String>,
++    pub(crate) tool_calls: Vec<crate::providers::base::ToolCallRequest>,
++    pub(crate) finish_reason: String,
++    pub(crate) usage: HashMap<String, i64>,
++}
++
++/// Durable decision made before entering a tool implementation.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(tag = "status", rename_all = "snake_case")]
++pub enum ToolPreExecuteDecision {
++    Ready,
++    Rejected { reason: String },
++}
++
++impl From<&crate::providers::base::LLMResponse> for RecordedProviderResponse {
++    fn from(response: &crate::providers::base::LLMResponse) -> Self {
++        Self {
++            content: response.content.clone(),
++            tool_calls: response.tool_calls.clone(),
++            finish_reason: response.finish_reason.wire_str().to_string(),
++            usage: response.usage.clone(),
++        }
++    }
++}
++
++/// One append-only event in the exact session replay log.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(tag = "kind", rename_all = "snake_case")]
++pub enum SessionEventPayload {
++    TurnStarted {
++        prior_unrecorded_history: bool,
++    },
++    ModelRequest {
++        call_id: String,
++        purpose: ModelCallPurpose,
++        request_digest: String,
++    },
++    ModelResponse {
++        call_id: String,
++        response_digest: String,
++    },
++    ModelFailed {
++        call_id: String,
++        error_digest: String,
++    },
++    ToolPreExecute {
++        tool_call_id: String,
++        tool_name: String,
++        arguments_digest: String,
++        decision: ToolPreExecuteDecision,
++    },
++    ToolExecute {
++        tool_call_id: String,
++        raw_result_digest: String,
++        ok: bool,
++        duration_ms: u64,
++    },
++    ToolPostExecute {
++        tool_call_id: String,
++        model_result_digest: String,
++        message_id: i64,
++    },
++    TurnFinished {
++        outcome: String,
++    },
++}
++
++impl SessionEventPayload {
++    pub const fn kind(&self) -> &'static str {
++        match self {
++            Self::TurnStarted { .. } => "turn_started",
++            Self::ModelRequest { .. } => "model_request",
++            Self::ModelResponse { .. } => "model_response",
++            Self::ModelFailed { .. } => "model_failed",
++            Self::ToolPreExecute { .. } => "tool_pre_execute",
++            Self::ToolExecute { .. } => "tool_execute",
++            Self::ToolPostExecute { .. } => "tool_post_execute",
++            Self::TurnFinished { .. } => "turn_finished",
++        }
++    }
++}
++
++/// Persisted event plus its durable ordering metadata.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SessionEvent {
++    pub id: i64,
++    pub turn_request_id: String,
++    pub turn_tag: u64,
++    pub payload: SessionEventPayload,
++    pub created_at: DateTime<Utc>,
++}
++
++/// Whether the stored prefix is sufficient for deterministic replay.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ReplayAvailability {
++    Exact,
++    Unavailable,
++    Partial { first_event: i64 },
++    Incomplete { reason: String },
++}
++
++/// Exact recorded bytes for one provider call.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RecordedModelCall {
++    pub call_id: String,
++    pub purpose: ModelCallPurpose,
++    pub request: Vec<u8>,
++    pub response: Option<Vec<u8>>,
++    pub failure: Option<Vec<u8>>,
++}
++
++/// Read-only fold of one session's durable replay events.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SessionReplay {
++    pub availability: ReplayAvailability,
++    pub events: Vec<SessionEvent>,
++    pub model_calls: Vec<RecordedModelCall>,
++}
++
++/// Cloneable turn-local handle used by auxiliary provider boundaries that do
++/// not otherwise own the full agent turn context.
++#[derive(Clone)]
++pub struct TurnReplayRecorder {
++    sessions: std::sync::Arc<SessionDb>,
++    session_id: String,
++    turn_request_id: String,
++    turn_tag: u64,
++}
++
++impl TurnReplayRecorder {
++    pub(crate) fn new(
++        sessions: std::sync::Arc<SessionDb>,
++        session_id: String,
++        turn_request_id: String,
++        turn_tag: u64,
++    ) -> Self {
++        Self {
++            sessions,
++            session_id,
++            turn_request_id,
++            turn_tag,
++        }
++    }
++
++    pub(crate) async fn request(
++        &self,
++        purpose: ModelCallPurpose,
++        request: &RecordedProviderRequest,
++    ) -> Result<String, ReplayError> {
++        self.sessions
++            .record_model_request(
++                &self.session_id,
++                &self.turn_request_id,
++                self.turn_tag,
++                purpose,
++                request,
++            )
++            .await
++    }
++
++    pub(crate) async fn response(
++        &self,
++        call_id: &str,
++        response: &RecordedProviderResponse,
++    ) -> Result<(), ReplayError> {
++        self.sessions
++            .record_model_response(
++                &self.session_id,
++                &self.turn_request_id,
++                self.turn_tag,
++                call_id,
++                response,
++            )
++            .await
++    }
++
++    pub(crate) async fn failure(&self, call_id: &str, error: &str) -> Result<(), ReplayError> {
++        self.sessions
++            .record_model_failure(
++                &self.session_id,
++                &self.turn_request_id,
++                self.turn_tag,
++                call_id,
++                error,
++            )
++            .await
++    }
++
++    pub(crate) async fn turn_finished(&self, outcome: &str) -> Result<(), ReplayError> {
++        self.sessions
++            .record_turn_finished(
++                &self.session_id,
++                &self.turn_request_id,
++                self.turn_tag,
++                outcome,
++            )
++            .await
++    }
++}
++
++/// Closes a streamed model call's journal entry when its forward task is
++/// aborted (consumer dropped the stream handle mid-stream). Inline recording
++/// cannot run in that case: task abortion unwinds the future without
++/// executing the code after the loop.
++struct StreamCancelGuard {
++    armed: bool,
++    replay: TurnReplayRecorder,
++    call_id: String,
++}
++
++impl Drop for StreamCancelGuard {
++    fn drop(&mut self) {
++        if self.armed {
++            let replay = self.replay.clone();
++            let call_id = std::mem::take(&mut self.call_id);
++            tokio::spawn(async move {
++                let _ = replay
++                    .failure(&call_id, "stream cancelled before terminal response")
++                    .await;
++            });
++        }
++    }
++}
++
++/// Provider decorator that makes every call durable before it crosses the
++/// provider boundary and records its terminal response before returning it.
++pub(crate) struct ReplayRecordingProvider {
++    inner: std::sync::Arc<dyn crate::providers::base::LLMProvider>,
++    replay: TurnReplayRecorder,
++    purpose: ModelCallPurpose,
++}
++
++impl ReplayRecordingProvider {
++    pub(crate) fn new(
++        inner: std::sync::Arc<dyn crate::providers::base::LLMProvider>,
++        replay: TurnReplayRecorder,
++        purpose: ModelCallPurpose,
++    ) -> Self {
++        Self {
++            inner,
++            replay,
++            purpose,
++        }
++    }
++
++    fn request(
++        &self,
++        messages: &[Value],
++        tools: Option<&[Value]>,
++        model: Option<&str>,
++        max_tokens: u32,
++        temperature: f64,
++        thinking_budget: Option<u32>,
++        top_p: Option<f64>,
++        tool_choice: crate::providers::base::ToolChoice,
++        streaming: bool,
++    ) -> RecordedProviderRequest {
++        let tool_choice = match tool_choice {
++            crate::providers::base::ToolChoice::Auto => "auto",
++            crate::providers::base::ToolChoice::Required => "required",
++            crate::providers::base::ToolChoice::None => "none",
++        };
++        RecordedProviderRequest {
++            messages: messages.to_vec(),
++            tools: tools.map(<[Value]>::to_vec),
++            model: model
++                .unwrap_or_else(|| self.inner.get_default_model())
++                .to_string(),
++            max_tokens,
++            temperature,
++            thinking_budget,
++            top_p,
++            tool_choice: tool_choice.to_string(),
++            streaming,
++        }
++    }
++
++    async fn finish(
++        &self,
++        call_id: &str,
++        result: anyhow::Result<crate::providers::base::LLMResponse>,
++    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
++        match result {
++            Ok(response) => {
++                self.replay
++                    .response(call_id, &RecordedProviderResponse::from(&response))
++                    .await
++                    .map_err(|error| {
++                        anyhow::anyhow!("model response replay persistence failed: {error}")
++                    })?;
++                Ok(response)
++            }
++            Err(error) => {
++                self.replay
++                    .failure(call_id, &error.to_string())
++                    .await
++                    .map_err(|record_error| {
++                        anyhow::anyhow!(
++                            "provider failed with {error}; replay failure persistence also failed: {record_error}"
++                        )
++                    })?;
++                Err(error)
++            }
++        }
++    }
++}
++
++#[async_trait::async_trait]
++impl crate::providers::base::LLMProvider for ReplayRecordingProvider {
++    async fn chat(
++        &self,
++        messages: &[Value],
++        tools: Option<&[Value]>,
++        model: Option<&str>,
++        max_tokens: u32,
++        temperature: f64,
++        thinking_budget: Option<u32>,
++        top_p: Option<f64>,
++    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
++        let call_id = self
++            .replay
++            .request(
++                self.purpose,
++                &self.request(
++                    messages,
++                    tools,
++                    model,
++                    max_tokens,
++                    temperature,
++                    thinking_budget,
++                    top_p,
++                    crate::providers::base::ToolChoice::Auto,
++                    false,
++                ),
++            )
++            .await
++            .map_err(|error| anyhow::anyhow!("model request replay persistence failed: {error}"))?;
++        self.finish(
++            &call_id,
++            self.inner
++                .chat(
++                    messages,
++                    tools,
++                    model,
++                    max_tokens,
++                    temperature,
++                    thinking_budget,
++                    top_p,
++                )
++                .await,
++        )
++        .await
++    }
++
++    async fn chat_with_tool_choice(
++        &self,
++        messages: &[Value],
++        tools: Option<&[Value]>,
++        model: Option<&str>,
++        max_tokens: u32,
++        temperature: f64,
++        thinking_budget: Option<u32>,
++        top_p: Option<f64>,
++        tool_choice: crate::providers::base::ToolChoice,
++    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
++        let call_id = self
++            .replay
++            .request(
++                self.purpose,
++                &self.request(
++                    messages,
++                    tools,
++                    model,
++                    max_tokens,
++                    temperature,
++                    thinking_budget,
++                    top_p,
++                    tool_choice,
++                    false,
++                ),
++            )
++            .await
++            .map_err(|error| anyhow::anyhow!("model request replay persistence failed: {error}"))?;
++        self.finish(
++            &call_id,
++            self.inner
++                .chat_with_tool_choice(
++                    messages,
++                    tools,
++                    model,
++                    max_tokens,
++                    temperature,
++                    thinking_budget,
++                    top_p,
++                    tool_choice,
++                )
++                .await,
++        )
++        .await
++    }
++
++    async fn chat_stream(
++        &self,
++        messages: &[Value],
++        tools: Option<&[Value]>,
++        model: Option<&str>,
++        max_tokens: u32,
++        temperature: f64,
++        thinking_budget: Option<u32>,
++        top_p: Option<f64>,
++    ) -> anyhow::Result<crate::providers::base::StreamHandle> {
++        let call_id = self
++            .replay
++            .request(
++                self.purpose,
++                &self.request(
++                    messages,
++                    tools,
++                    model,
++                    max_tokens,
++                    temperature,
++                    thinking_budget,
++                    top_p,
++                    crate::providers::base::ToolChoice::Auto,
++                    true,
++                ),
++            )
++            .await
++            .map_err(|error| anyhow::anyhow!("model request replay persistence failed: {error}"))?;
++        let mut inner_stream = match self
++            .inner
++            .chat_stream(
++                messages,
++                tools,
++                model,
++                max_tokens,
++                temperature,
++                thinking_budget,
++                top_p,
++            )
++            .await
++        {
++            Ok(stream) => stream,
++            Err(error) => {
++                self.replay
++                    .failure(&call_id, &error.to_string())
++                    .await
++                    .map_err(|record_error| {
++                        anyhow::anyhow!(
++                            "stream failed with {error}; replay failure persistence also failed: {record_error}"
++                        )
++                    })?;
++                return Err(error);
++            }
++        };
++        let replay = self.replay.clone();
++        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
++        let forward = tokio::spawn(async move {
++            let mut saw_terminal = false;
++            // Dropping the consumer aborts this task at its next await point,
++            // so inline post-loop recording never runs on cancellation. This
++            // guard is the only reliable close for that path; the spawned
++            // task bridges the sync Drop into the async journal write.
++            let mut cancel_guard = StreamCancelGuard {
++                armed: true,
++                replay: replay.clone(),
++                call_id: call_id.clone(),
++            };
++            while let Some(chunk) = inner_stream.rx.recv().await {
++                match chunk {
++                    crate::providers::base::StreamChunk::Done(response) => {
++                        saw_terminal = true;
++                        match replay
++                            .response(&call_id, &RecordedProviderResponse::from(&response))
++                            .await
++                        {
++                            Ok(()) => {
++                                cancel_guard.armed = false;
++                                let _ =
++                                    tx.send(crate::providers::base::StreamChunk::Done(response));
++                            }
++                            Err(error) => {
++                                // Fail-closed: an unjournaled terminal response
++                                // must not drive the consumer. The channel
++                                // cannot carry errors, so the stream just ends
++                                // and the consumer's no-terminal path reports
++                                // it. Close the journal as a model failure.
++                                warn!(%error, "stream terminal response replay persistence failed");
++                                cancel_guard.armed = false;
++                                let _ = replay
++                                    .failure(
++                                        &call_id,
++                                        &format!(
++                                            "stream terminal response replay persistence failed: {error}"
++                                        ),
++                                    )
++                                    .await;
++                            }
++                        }
++                        break;
++                    }
++                    other => {
++                        if tx.send(other).is_err() {
++                            // Consumer gone; the guard records the failure.
++                            break;
++                        }
++                    }
++                }
++            }
++            if !saw_terminal {
++                cancel_guard.armed = false;
++                let _ = replay
++                    .failure(&call_id, "stream ended without terminal response")
++                    .await;
++            }
++        });
++        Ok(crate::providers::base::StreamHandle {
++            rx,
++            abort_on_drop: Some(forward),
++        })
++    }
++
++    fn get_default_model(&self) -> &str {
++        self.inner.get_default_model()
++    }
++
++    fn get_api_base(&self) -> Option<&str> {
++        self.inner.get_api_base()
++    }
++
++    fn supports_higgs_session_cache(&self) -> bool {
++        self.inner.supports_higgs_session_cache()
++    }
++}
++
++/// A replay cannot silently regenerate missing or malformed recorded bytes.
++#[derive(Debug)]
++pub enum ReplayError {
++    Database(rusqlite::Error),
++    Serialization(serde_json::Error),
++    MissingArtifact { digest: String },
++    CorruptArtifact { digest: String },
++    InvalidTransition { detail: String },
++}
++
++impl fmt::Display for ReplayError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Database(error) => write!(f, "replay database error: {error}"),
++            Self::Serialization(error) => write!(f, "replay serialization error: {error}"),
++            Self::MissingArtifact { digest } => {
++                write!(f, "replay artifact {digest} is missing")
++            }
++            Self::CorruptArtifact { digest } => {
++                write!(f, "replay artifact {digest} failed its SHA-256 check")
++            }
++            Self::InvalidTransition { detail } => {
++                write!(f, "invalid replay transition: {detail}")
++            }
++        }
++    }
++}
++
++impl std::error::Error for ReplayError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Database(error) => Some(error),
++            Self::Serialization(error) => Some(error),
++            Self::MissingArtifact { .. }
++            | Self::CorruptArtifact { .. }
++            | Self::InvalidTransition { .. } => None,
++        }
++    }
++}
++
++impl From<rusqlite::Error> for ReplayError {
++    fn from(value: rusqlite::Error) -> Self {
++        Self::Database(value)
++    }
++}
++
++impl From<serde_json::Error> for ReplayError {
++    fn from(value: serde_json::Error) -> Self {
++        Self::Serialization(value)
++    }
++}
++
+ /// Result of importing one legacy JSONL session file.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum LegacyImportOutcome {
+@@ -344,6 +997,62 @@ impl From<rusqlite::Error> for LegacyImportError {
+ pub struct SessionDb {
+     conn: Mutex<Connection>,
+     path: PathBuf,
++    #[cfg(test)]
++    test_journal_faults: JournalFaultsForTests,
++}
++
++/// Test-only one-shot write failures at specific journal boundaries. These
++/// simulate transient SQLite errors so tests can prove the release path
++/// degrades (warn + `ReplayAvailability::Incomplete`) instead of discarding
++/// already-durable work. Each arm consumes N journal writes of that kind.
++#[cfg(test)]
++#[derive(Default)]
++pub(crate) struct JournalFaultsForTests {
++    turn_finished: AtomicUsize,
++    model_request: AtomicUsize,
++    model_response: AtomicUsize,
++}
++
++#[cfg(test)]
++impl SessionDb {
++    /// Make the next `count` `turn_finished` journal writes fail.
++    pub(crate) fn fail_turn_finished_writes_for_tests(&self, count: usize) {
++        self.test_journal_faults
++            .turn_finished
++            .store(count, AtomicOrdering::SeqCst);
++    }
++
++    /// Make the next `count` `model_request` journal writes fail.
++    pub(crate) fn fail_model_request_writes_for_tests(&self, count: usize) {
++        self.test_journal_faults
++            .model_request
++            .store(count, AtomicOrdering::SeqCst);
++    }
++
++    /// Make the next `count` `model_response` journal writes fail.
++    pub(crate) fn fail_model_response_writes_for_tests(&self, count: usize) {
++        self.test_journal_faults
++            .model_response
++            .store(count, AtomicOrdering::SeqCst);
++    }
++
++    fn consume_test_fault(&self, arm: &AtomicUsize) -> Result<(), ReplayError> {
++        // Synthetic one-shot failure standing in for a transient SQLite
++        // error. `fetch_update` returns Ok(previous) only when it consumed
++        // one unit of the remaining count.
++        let armed = arm
++            .fetch_update(
++                AtomicOrdering::SeqCst,
++                AtomicOrdering::SeqCst,
++                |remaining| remaining.checked_sub(1),
++            )
++            .is_ok();
++        if armed {
++            Err(ReplayError::Database(rusqlite::Error::InvalidQuery))
++        } else {
++            Ok(())
++        }
++    }
+ }
+ 
+ /// Outcome of [`SessionDb::store_tool_result_immutable`]. The tool-result
+@@ -494,6 +1203,8 @@ impl SessionDb {
+         Self {
+             conn: Mutex::new(conn),
+             path: db_path.to_path_buf(),
++            #[cfg(test)]
++            test_journal_faults: JournalFaultsForTests::default(),
+         }
+     }
+ 
+@@ -504,55 +1215,707 @@ impl SessionDb {
+     }
+ 
+     // -----------------------------------------------------------------------
+-    // Session CRUD
++    // Exact replay log
+     // -----------------------------------------------------------------------
+ 
+-    /// Create a brand-new session for `key` and return its metadata.
+-    pub async fn create_session(&self, key: &str) -> SessionMeta {
+-        let now = Utc::now();
+-        let id = generate_session_id(&now);
+-        let created_str = now.to_rfc3339();
+-
++    /// Store exact replay bytes once per session and return their SHA-256 id.
++    ///
++    /// Artifacts are session-scoped so normal session deletion also removes
++    /// prompts and tool data that may contain private conversation content.
++    pub(crate) async fn store_replay_artifact(
++        &self,
++        session_id: &str,
++        media_type: &str,
++        content: &[u8],
++    ) -> rusqlite::Result<String> {
++        let digest = sha256_hex(content);
+         let conn = self.conn.lock().await;
+-        conn.execute(
+-            "INSERT INTO sessions (id, session_key, created_at, updated_at, message_count, metadata) \
+-             VALUES (?1, ?2, ?3, ?3, 0, '{}')",
+-            params![id, key, created_str],
+-        )
+-        .unwrap_or_else(|e| {
+-            warn!("Failed to create session for key {}: {}", key, e);
+-            0
+-        });
++        let inserted = conn.execute(
++            "INSERT OR IGNORE INTO session_replay_artifacts \
++             (session_id, digest, media_type, content, created_at) \
++             VALUES (?1, ?2, ?3, ?4, ?5)",
++            params![
++                session_id,
++                digest,
++                media_type,
++                content,
++                Utc::now().to_rfc3339()
++            ],
++        )?;
+ 
+-        SessionMeta {
+-            id,
+-            session_key: key.to_string(),
+-            created_at: now,
+-            updated_at: now,
+-            message_count: 0,
++        // A digest must identify one immutable byte string. Fresh inserts
++        // (rows affected == 1) are already the exact bytes; only when the
++        // insert was ignored does the collision contract need the stored
++        // bytes re-read and compared.
++        if inserted == 0 {
++            let stored: Vec<u8> = conn.query_row(
++                "SELECT content FROM session_replay_artifacts \
++                 WHERE session_id = ?1 AND digest = ?2",
++                params![session_id, digest],
++                |row| row.get(0),
++            )?;
++            if stored != content {
++                return Err(rusqlite::Error::InvalidQuery);
++            }
+         }
++        Ok(digest)
+     }
+ 
+-    /// Return the most recent session for `key`, or create a new one.
+-    ///
+-    /// Resume the most recent session for `key`, or create a new one.
+-    ///
+-    /// If `max_idle_secs > 0` and the latest session hasn't been updated in
+-    /// that many seconds, a fresh session is created instead of resuming the
+-    /// stale one. Pass `0` to always resume (the old behaviour).
+-    pub async fn get_or_resume(&self, key: &str) -> SessionMeta {
+-        self.get_or_resume_with_idle(key, 0).await
++    /// Load exact replay bytes by their session-scoped digest.
++    pub async fn load_replay_artifact(
++        &self,
++        session_id: &str,
++        digest: &str,
++    ) -> rusqlite::Result<Option<Vec<u8>>> {
++        let conn = self.conn.lock().await;
++        conn.query_row(
++            "SELECT content FROM session_replay_artifacts \
++             WHERE session_id = ?1 AND digest = ?2",
++            params![session_id, digest],
++            |row| row.get(0),
++        )
++        .optional()
+     }
+ 
+-    /// Like [`get_or_resume`] but with an explicit idle timeout.
+-    pub async fn get_or_resume_with_idle(&self, key: &str, max_idle_secs: u64) -> SessionMeta {
+-        if let Some(meta) = self.get_latest_session(key).await {
+-            if max_idle_secs > 0 {
+-                let idle = chrono::Utc::now() - meta.updated_at;
+-                if idle.num_seconds() > max_idle_secs as i64 {
+-                    tracing::info!(
+-                        session_key = %key,
+-                        idle_secs = idle.num_seconds(),
++    async fn resolve_replay_artifact(
++        &self,
++        session_id: &str,
++        digest: &str,
++    ) -> Result<Vec<u8>, ReplayError> {
++        let content = self
++            .load_replay_artifact(session_id, digest)
++            .await?
++            .ok_or_else(|| ReplayError::MissingArtifact {
++                digest: digest.to_string(),
++            })?;
++        if sha256_hex(&content) != digest {
++            return Err(ReplayError::CorruptArtifact {
++                digest: digest.to_string(),
++            });
++        }
++        Ok(content)
++    }
++
++    /// Durably record a provider request before any model-visible call occurs.
++    pub(crate) async fn record_model_request(
++        &self,
++        session_id: &str,
++        turn_request_id: &str,
++        turn_tag: u64,
++        purpose: ModelCallPurpose,
++        request: &RecordedProviderRequest,
++    ) -> Result<String, ReplayError> {
++        #[cfg(test)]
++        self.consume_test_fault(&self.test_journal_faults.model_request)?;
++        let bytes = serde_json::to_vec(request)?;
++        let digest = self
++            .store_replay_artifact(session_id, "application/json", &bytes)
++            .await?;
++        self.ensure_turn_started(session_id, turn_request_id, turn_tag)
++            .await?;
++        let call_id = uuid::Uuid::new_v4().to_string();
++        self.append_session_event(
++            session_id,
++            turn_request_id,
++            turn_tag,
++            &SessionEventPayload::ModelRequest {
++                call_id: call_id.clone(),
++                purpose,
++                request_digest: digest,
++            },
++        )
++        .await?;
++        Ok(call_id)
++    }
++
++    async fn ensure_turn_started(
++        &self,
++        session_id: &str,
++        turn_request_id: &str,
++        turn_tag: u64,
++    ) -> Result<(), ReplayError> {
++        let turn_tag = i64::try_from(turn_tag)
++            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
++        let conn = self.conn.lock().await;
++        let already_started: bool = conn.query_row(
++            "SELECT EXISTS(SELECT 1 FROM session_events \
++             WHERE session_id = ?1 AND turn_request_id = ?2 AND event_kind = 'turn_started')",
++            params![session_id, turn_request_id],
++            |row| row.get(0),
++        )?;
++        if already_started {
++            return Ok(());
++        }
++        let has_replay_events: bool = conn.query_row(
++            "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id = ?1)",
++            params![session_id],
++            |row| row.get(0),
++        )?;
++        let prior_unrecorded_history = !has_replay_events
++            && conn.query_row(
++                "SELECT EXISTS(SELECT 1 FROM messages \
++                 WHERE session_id = ?1 AND role = 'assistant')",
++                params![session_id],
++                |row| row.get(0),
++            )?;
++        let payload = SessionEventPayload::TurnStarted {
++            prior_unrecorded_history,
++        };
++        let payload_json = serde_json::to_string(&payload)?;
++        conn.execute(
++            "INSERT INTO session_events \
++             (session_id, turn_request_id, turn_tag, event_kind, payload_json, created_at) \
++             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
++            params![
++                session_id,
++                turn_request_id,
++                turn_tag,
++                payload.kind(),
++                payload_json,
++                Utc::now().to_rfc3339()
++            ],
++        )?;
++        Ok(())
++    }
++
++    /// Durably record the terminal response before it can drive tools or a
++    /// subsequent provider request.
++    pub(crate) async fn record_model_response(
++        &self,
++        session_id: &str,
++        turn_request_id: &str,
++        turn_tag: u64,
++        call_id: &str,
++        response: &RecordedProviderResponse,
++    ) -> Result<(), ReplayError> {
++        #[cfg(test)]
++        self.consume_test_fault(&self.test_journal_faults.model_response)?;
++        let bytes = serde_json::to_vec(response)?;
++        let digest = self
++            .store_replay_artifact(session_id, "application/json", &bytes)
++            .await?;
++        self.append_session_event(
++            session_id,
++            turn_request_id,
++            turn_tag,
++            &SessionEventPayload::ModelResponse {
++                call_id: call_id.to_string(),
++                response_digest: digest,
++            },
++        )
++        .await?;
++        Ok(())
++    }
++
++    /// Close a recorded provider request whose transport or provider call
++    /// failed before a terminal response was available.
++    pub(crate) async fn record_model_failure(
++        &self,
++        session_id: &str,
++        turn_request_id: &str,
++        turn_tag: u64,
++        call_id: &str,
++        error: &str,
++    ) -> Result<(), ReplayError> {
++        let error_digest = self
++            .store_replay_artifact(session_id, "text/plain; charset=utf-8", error.as_bytes())
++            .await?;
++        self.append_session_event(
++            session_id,
++            turn_request_id,
++            turn_tag,
++            &SessionEventPayload::ModelFailed {
++                call_id: call_id.to_string(),
++                error_digest,
++            },
++        )
++        .await?;
++        Ok(())
++    }
++
++    /// Mark the durable end of a foreground turn after all model/tool effects
++    /// that can affect its outcome have been journaled.
++    pub(crate) async fn record_turn_finished(
++        &self,
++        session_id: &str,
++        turn_request_id: &str,
++        turn_tag: u64,
++        outcome: &str,
++    ) -> Result<(), ReplayError> {
++        #[cfg(test)]
++        self.consume_test_fault(&self.test_journal_faults.turn_finished)?;
++        self.ensure_turn_started(session_id, turn_request_id, turn_tag)
++            .await?;
++        self.append_session_event(
++            session_id,
++            turn_request_id,
++            turn_tag,
++            &SessionEventPayload::TurnFinished {
++                outcome: outcome.to_string(),
++            },
++        )
++        .await?;
++        Ok(())
++    }
++
++    /// Record validation and policy disposition before entering a tool.
++    pub(crate) async fn record_tool_pre_execute(
++        &self,
++        session_id: &str,
++        turn_request_id: &str,
++        turn_tag: u64,
++        tool_call_id: &str,
++        tool_name: &str,
++        arguments: &HashMap<String, Value>,
++        decision: ToolPreExecuteDecision,
++    ) -> Result<(), ReplayError> {
++        let bytes = serde_json::to_vec(arguments)?;
++        let arguments_digest = self
++            .store_replay_artifact(session_id, "application/json", &bytes)
++            .await?;
++        self.ensure_turn_started(session_id, turn_request_id, turn_tag)
++            .await?;
++        self.append_session_event(
++            session_id,
++            turn_request_id,
++            turn_tag,
++            &SessionEventPayload::ToolPreExecute {
++                tool_call_id: tool_call_id.to_string(),
++                tool_name: tool_name.to_string(),
++                arguments_digest,
++                decision,
++            },
++        )
++        .await?;
++        Ok(())
++    }
++
++    /// Record the raw tool outcome immediately after the implementation exits.
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) async fn record_tool_execute(
++        &self,
++        session_id: &str,
++        turn_request_id: &str,
++        turn_tag: u64,
++        tool_call_id: &str,
++        raw_result: &str,
++        ok: bool,
++        duration_ms: u64,
++    ) -> Result<(), ReplayError> {
++        let raw_result_digest = self
++            .store_replay_artifact(
++                session_id,
++                "text/plain; charset=utf-8",
++                raw_result.as_bytes(),
++            )
++            .await?;
++        self.append_session_event(
++            session_id,
++            turn_request_id,
++            turn_tag,
++            &SessionEventPayload::ToolExecute {
++                tool_call_id: tool_call_id.to_string(),
++                raw_result_digest,
++                ok,
++                duration_ms,
++            },
++        )
++        .await?;
++        Ok(())
++    }
++
++    /// Record the exact result bytes committed to model-visible history.
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) async fn record_tool_post_execute(
++        &self,
++        session_id: &str,
++        turn_request_id: &str,
++        turn_tag: u64,
++        tool_call_id: &str,
++        model_result: &str,
++        message_id: i64,
++    ) -> Result<(), ReplayError> {
++        let model_result_digest = self
++            .store_replay_artifact(
++                session_id,
++                "text/plain; charset=utf-8",
++                model_result.as_bytes(),
++            )
++            .await?;
++        self.append_session_event(
++            session_id,
++            turn_request_id,
++            turn_tag,
++            &SessionEventPayload::ToolPostExecute {
++                tool_call_id: tool_call_id.to_string(),
++                model_result_digest,
++                message_id,
++            },
++        )
++        .await?;
++        Ok(())
++    }
++
++    /// Append one typed event to the durable per-session replay order.
++    pub(crate) async fn append_session_event(
++        &self,
++        session_id: &str,
++        turn_request_id: &str,
++        turn_tag: u64,
++        payload: &SessionEventPayload,
++    ) -> rusqlite::Result<i64> {
++        let payload_json = serde_json::to_string(payload)
++            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
++        let turn_tag = i64::try_from(turn_tag)
++            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
++        let conn = self.conn.lock().await;
++        conn.execute(
++            "INSERT INTO session_events \
++             (session_id, turn_request_id, turn_tag, event_kind, payload_json, created_at) \
++             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
++            params![
++                session_id,
++                turn_request_id,
++                turn_tag,
++                payload.kind(),
++                payload_json,
++                Utc::now().to_rfc3339()
++            ],
++        )?;
++        Ok(conn.last_insert_rowid())
++    }
++
++    /// Load typed replay events in the exact order they were committed.
++    pub async fn load_session_events(
++        &self,
++        session_id: &str,
++    ) -> rusqlite::Result<Vec<SessionEvent>> {
++        let conn = self.conn.lock().await;
++        let mut stmt = conn.prepare(
++            "SELECT id, turn_request_id, turn_tag, payload_json, created_at \
++             FROM session_events WHERE session_id = ?1 ORDER BY id ASC",
++        )?;
++        let rows = stmt.query_map(params![session_id], |row| {
++            let id = row.get(0)?;
++            let turn_request_id = row.get(1)?;
++            let stored_turn: i64 = row.get(2)?;
++            let turn_tag = u64::try_from(stored_turn).map_err(|error| {
++                rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error))
++            })?;
++            let payload_json: String = row.get(3)?;
++            let payload = serde_json::from_str(&payload_json).map_err(|error| {
++                rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
++            })?;
++            let created_text: String = row.get(4)?;
++            let created_at = DateTime::parse_from_rfc3339(&created_text)
++                .map(|value| value.with_timezone(&Utc))
++                .map_err(|error| {
++                    rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(error))
++                })?;
++            Ok(SessionEvent {
++                id,
++                turn_request_id,
++                turn_tag,
++                payload,
++                created_at,
++            })
++        })?;
++        rows.collect()
++    }
++
++    /// Reconstruct recorded provider calls without consulting current prompts,
++    /// tools, configuration, or a live model.
++    pub async fn load_session_replay(
++        &self,
++        session_id: &str,
++    ) -> Result<SessionReplay, ReplayError> {
++        let events = self.load_session_events(session_id).await?;
++        if events.is_empty() {
++            return Ok(SessionReplay {
++                availability: ReplayAvailability::Unavailable,
++                events,
++                model_calls: Vec::new(),
++            });
++        }
++
++        let mut calls = Vec::<RecordedModelCall>::new();
++        let mut call_indices = HashMap::<String, usize>::new();
++        #[derive(Clone, Copy)]
++        enum ToolPhase {
++            Ready,
++            Rejected,
++            Executed,
++            Posted,
++        }
++        let mut tool_phases = HashMap::<String, ToolPhase>::new();
++        let mut tool_order = Vec::<String>::new();
++        let mut turn_finished = HashMap::<String, bool>::new();
++        let mut turn_order = Vec::<String>::new();
++        for event in &events {
++            if !matches!(
++                &event.payload,
++                SessionEventPayload::TurnStarted { .. } | SessionEventPayload::TurnFinished { .. }
++            ) {
++                match turn_finished.get(&event.turn_request_id) {
++                    None => {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!(
++                                "{} precedes turn start {}",
++                                event.payload.kind(),
++                                event.turn_request_id
++                            ),
++                        });
++                    }
++                    Some(true) => {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!(
++                                "{} follows turn finish {}",
++                                event.payload.kind(),
++                                event.turn_request_id
++                            ),
++                        });
++                    }
++                    Some(false) => {}
++                }
++            }
++            match &event.payload {
++                SessionEventPayload::TurnStarted { .. } => {
++                    if turn_finished
++                        .insert(event.turn_request_id.clone(), false)
++                        .is_some()
++                    {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!("duplicate turn start {}", event.turn_request_id),
++                        });
++                    }
++                    turn_order.push(event.turn_request_id.clone());
++                }
++                SessionEventPayload::TurnFinished { .. } => {
++                    let Some(finished) = turn_finished.get_mut(&event.turn_request_id) else {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!("turn finish {} has no start", event.turn_request_id),
++                        });
++                    };
++                    if *finished {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!("duplicate turn finish {}", event.turn_request_id),
++                        });
++                    }
++                    *finished = true;
++                }
++                SessionEventPayload::ModelRequest {
++                    call_id,
++                    purpose,
++                    request_digest,
++                } => {
++                    if call_indices.contains_key(call_id) {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!("duplicate model request {call_id}"),
++                        });
++                    }
++                    let request = self
++                        .resolve_replay_artifact(session_id, request_digest)
++                        .await?;
++                    call_indices.insert(call_id.clone(), calls.len());
++                    calls.push(RecordedModelCall {
++                        call_id: call_id.clone(),
++                        purpose: *purpose,
++                        request,
++                        response: None,
++                        failure: None,
++                    });
++                }
++                SessionEventPayload::ModelResponse {
++                    call_id,
++                    response_digest,
++                } => {
++                    let Some(index) = call_indices.get(call_id).copied() else {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!("model response {call_id} has no request"),
++                        });
++                    };
++                    if calls[index].response.is_some() || calls[index].failure.is_some() {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!("model call {call_id} has two terminal events"),
++                        });
++                    }
++                    calls[index].response = Some(
++                        self.resolve_replay_artifact(session_id, response_digest)
++                            .await?,
++                    );
++                }
++                SessionEventPayload::ModelFailed {
++                    call_id,
++                    error_digest,
++                } => {
++                    let Some(index) = call_indices.get(call_id).copied() else {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!("model failure {call_id} has no request"),
++                        });
++                    };
++                    if calls[index].response.is_some() || calls[index].failure.is_some() {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!("model call {call_id} has two terminal events"),
++                        });
++                    }
++                    calls[index].failure = Some(
++                        self.resolve_replay_artifact(session_id, error_digest)
++                            .await?,
++                    );
++                }
++                SessionEventPayload::ToolPreExecute {
++                    tool_call_id,
++                    arguments_digest,
++                    decision,
++                    ..
++                } => {
++                    if tool_phases.contains_key(tool_call_id) {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!("duplicate tool pre-execute {tool_call_id}"),
++                        });
++                    }
++                    self.resolve_replay_artifact(session_id, arguments_digest)
++                        .await?;
++                    tool_phases.insert(
++                        tool_call_id.clone(),
++                        match decision {
++                            ToolPreExecuteDecision::Ready => ToolPhase::Ready,
++                            ToolPreExecuteDecision::Rejected { .. } => ToolPhase::Rejected,
++                        },
++                    );
++                    tool_order.push(tool_call_id.clone());
++                }
++                SessionEventPayload::ToolExecute {
++                    tool_call_id,
++                    raw_result_digest,
++                    ..
++                } => {
++                    if !matches!(tool_phases.get(tool_call_id), Some(ToolPhase::Ready)) {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!(
++                                "tool execute {tool_call_id} does not follow a ready pre-execute"
++                            ),
++                        });
++                    }
++                    self.resolve_replay_artifact(session_id, raw_result_digest)
++                        .await?;
++                    tool_phases.insert(tool_call_id.clone(), ToolPhase::Executed);
++                }
++                SessionEventPayload::ToolPostExecute {
++                    tool_call_id,
++                    model_result_digest,
++                    ..
++                } => {
++                    if !matches!(tool_phases.get(tool_call_id), Some(ToolPhase::Executed)) {
++                        return Err(ReplayError::InvalidTransition {
++                            detail: format!(
++                                "tool post-execute {tool_call_id} does not follow execution"
++                            ),
++                        });
++                    }
++                    self.resolve_replay_artifact(session_id, model_result_digest)
++                        .await?;
++                    tool_phases.insert(tool_call_id.clone(), ToolPhase::Posted);
++                }
++            }
++        }
++
++        let incomplete = calls
++            .iter()
++            .find(|call| call.response.is_none() && call.failure.is_none())
++            .map(|call| ReplayAvailability::Incomplete {
++                reason: format!("model call {} has no terminal event", call.call_id),
++            })
++            .or_else(|| {
++                tool_order
++                    .iter()
++                    .find_map(|tool_call_id| match tool_phases.get(tool_call_id) {
++                        Some(ToolPhase::Ready) => Some(ReplayAvailability::Incomplete {
++                            reason: format!("tool call {tool_call_id} has no execute event"),
++                        }),
++                        Some(ToolPhase::Executed) => Some(ReplayAvailability::Incomplete {
++                            reason: format!("tool call {tool_call_id} has no post-execute event"),
++                        }),
++                        Some(ToolPhase::Rejected | ToolPhase::Posted) | None => None,
++                    })
++            })
++            .or_else(|| {
++                turn_order.iter().find_map(|turn_request_id| {
++                    (!turn_finished[turn_request_id]).then(|| ReplayAvailability::Incomplete {
++                        reason: format!("turn {turn_request_id} has no finished event"),
++                    })
++                })
++            });
++        let availability = incomplete.unwrap_or_else(|| {
++            events
++                .iter()
++                .find_map(|event| match event.payload {
++                    SessionEventPayload::TurnStarted {
++                        prior_unrecorded_history: true,
++                    } => Some(ReplayAvailability::Partial {
++                        first_event: event.id,
++                    }),
++                    _ => None,
++                })
++                .unwrap_or(ReplayAvailability::Exact)
++        });
++        Ok(SessionReplay {
++            availability,
++            events,
++            model_calls: calls,
++        })
++    }
++
++    // -----------------------------------------------------------------------
++    // Session CRUD
++    // -----------------------------------------------------------------------
++
++    /// Create a brand-new session for `key` and return its metadata.
++    pub async fn create_session(&self, key: &str) -> SessionMeta {
++        let now = Utc::now();
++        let id = generate_session_id(&now);
++        let created_str = now.to_rfc3339();
++
++        let conn = self.conn.lock().await;
++        conn.execute(
++            "INSERT INTO sessions (id, session_key, created_at, updated_at, message_count, metadata) \
++             VALUES (?1, ?2, ?3, ?3, 0, '{}')",
++            params![id, key, created_str],
++        )
++        .unwrap_or_else(|e| {
++            warn!("Failed to create session for key {}: {}", key, e);
++            0
++        });
++
++        SessionMeta {
++            id,
++            session_key: key.to_string(),
++            created_at: now,
++            updated_at: now,
++            message_count: 0,
++        }
++    }
++
++    /// Return the most recent session for `key`, or create a new one.
++    ///
++    /// Resume the most recent session for `key`, or create a new one.
++    ///
++    /// If `max_idle_secs > 0` and the latest session hasn't been updated in
++    /// that many seconds, a fresh session is created instead of resuming the
++    /// stale one. Pass `0` to always resume (the old behaviour).
++    pub async fn get_or_resume(&self, key: &str) -> SessionMeta {
++        self.get_or_resume_with_idle(key, 0).await
++    }
++
++    /// Like [`get_or_resume`] but with an explicit idle timeout.
++    pub async fn get_or_resume_with_idle(&self, key: &str, max_idle_secs: u64) -> SessionMeta {
++        if let Some(meta) = self.get_latest_session(key).await {
++            if max_idle_secs > 0 {
++                let idle = chrono::Utc::now() - meta.updated_at;
++                if idle.num_seconds() > max_idle_secs as i64 {
++                    tracing::info!(
++                        session_key = %key,
++                        idle_secs = idle.num_seconds(),
+                         max_idle_secs,
+                         "session_expired: creating fresh session"
+                     );
+@@ -2279,6 +3642,7 @@ fn reconstruct_message(
+ mod tests {
+     use super::*;
+     use crate::agent::lcm::ManifestItem;
++    use crate::providers::base::LLMProvider;
+     use serde_json::json;
+     use tempfile::tempdir;
+ 
+@@ -2330,6 +3694,777 @@ mod tests {
+         assert_eq!(loaded.session_key, "cli:default");
+     }
+ 
++    #[tokio::test]
++    async fn replay_artifacts_are_byte_exact_deduplicated_and_session_scoped() {
++        // Break caught: storing the same provider payload twice creates duplicate
++        // rows, changes its bytes, or leaves replay data behind after deletion.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:replay-artifact").await;
++        let body = br#"{"messages":[{"role":"system","content":"exact"}]}"#;
++
++        let first = db
++            .store_replay_artifact(&meta.id, "application/json", body)
++            .await
++            .expect("first replay artifact");
++        let second = db
++            .store_replay_artifact(&meta.id, "application/json", body)
++            .await
++            .expect("deduplicated replay artifact");
++
++        assert_eq!(first, second);
++        assert_eq!(
++            db.load_replay_artifact(&meta.id, &first)
++                .await
++                .expect("load replay artifact")
++                .expect("artifact exists"),
++            body
++        );
++
++        assert!(db.delete_session(&meta.id).await.expect("delete session"));
++        assert!(db
++            .load_replay_artifact(&meta.id, &first)
++            .await
++            .expect("load deleted artifact")
++            .is_none());
++    }
++
++    /// Fake provider whose stream emits text deltas then one Done response.
++    /// `hang_after_first` parks the inner stream forever after the first
++    /// delta so a test can deterministically drop the consumer mid-stream.
++    struct SequencedStreamFakeProvider {
++        hang_after_first: bool,
++    }
++
++    #[async_trait::async_trait]
++    impl crate::providers::base::LLMProvider for SequencedStreamFakeProvider {
++        async fn chat(
++            &self,
++            _messages: &[Value],
++            _tools: Option<&[Value]>,
++            _model: Option<&str>,
++            _max_tokens: u32,
++            _temperature: f64,
++            _thinking_budget: Option<u32>,
++            _top_p: Option<f64>,
++        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
++            unreachable!("stream fake only supports chat_stream")
++        }
++
++        async fn chat_with_tool_choice(
++            &self,
++            _messages: &[Value],
++            _tools: Option<&[Value]>,
++            _model: Option<&str>,
++            _max_tokens: u32,
++            _temperature: f64,
++            _thinking_budget: Option<u32>,
++            _top_p: Option<f64>,
++            _tool_choice: crate::providers::base::ToolChoice,
++        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
++            unreachable!("stream fake only supports chat_stream")
++        }
++
++        async fn chat_stream(
++            &self,
++            _messages: &[Value],
++            _tools: Option<&[Value]>,
++            _model: Option<&str>,
++            _max_tokens: u32,
++            _temperature: f64,
++            _thinking_budget: Option<u32>,
++            _top_p: Option<f64>,
++        ) -> anyhow::Result<crate::providers::base::StreamHandle> {
++            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
++            let hang_after_first = self.hang_after_first;
++            let task = tokio::spawn(async move {
++                let _ = tx.send(crate::providers::base::StreamChunk::TextDelta(
++                    "part ".to_string(),
++                ));
++                if hang_after_first {
++                    std::future::pending::<()>().await;
++                }
++                let _ = tx.send(crate::providers::base::StreamChunk::TextDelta(
++                    "two ".to_string(),
++                ));
++                let _ = tx.send(crate::providers::base::StreamChunk::Done(
++                    crate::providers::base::LLMResponse {
++                        content: Some("part two final".to_string()),
++                        tool_calls: vec![],
++                        finish_reason: crate::providers::base::FinishReason::Stop,
++                        usage: std::collections::HashMap::new(),
++                    },
++                ));
++            });
++            Ok(crate::providers::base::StreamHandle {
++                rx,
++                abort_on_drop: Some(task),
++            })
++        }
++
++        fn get_default_model(&self) -> &str {
++            "fake-stream-model"
++        }
++    }
++
++    async fn recorded_stream_failure_text(
++        db: &SessionDb,
++        session_id: &str,
++    ) -> Option<(String, String)> {
++        let events = db.load_session_events(session_id).await.ok()?;
++        for event in events {
++            if let SessionEventPayload::ModelFailed {
++                call_id,
++                error_digest,
++            } = &event.payload
++            {
++                let text = db
++                    .load_replay_artifact(session_id, error_digest)
++                    .await
++                    .ok()
++                    .flatten()
++                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
++                    .unwrap_or_default();
++                return Some((call_id.clone(), text));
++            }
++        }
++        None
++    }
++
++    #[tokio::test]
++    async fn chat_stream_terminal_persist_failure_ends_stream_and_closes_journal() {
++        // Break caught: a terminal response whose journal write fails was
++        // silently dropped, leaving the consumer with a stream that just ends
++        // and a model call pending forever in the replay journal.
++        let dir = tempdir().expect("tempdir");
++        let db = std::sync::Arc::new(SessionDb::new(&dir.path().join("sessions.db")));
++        let meta = db.create_session("cli:stream-fault").await;
++        db.fail_model_response_writes_for_tests(1);
++
++        let provider = ReplayRecordingProvider::new(
++            std::sync::Arc::new(SequencedStreamFakeProvider {
++                hang_after_first: false,
++            }),
++            TurnReplayRecorder::new(
++                std::sync::Arc::clone(&db),
++                meta.id.clone(),
++                "turn-1".to_string(),
++                1,
++            ),
++            ModelCallPurpose::ToolRunner,
++        );
++        let mut handle = provider
++            .chat_stream(
++                &[json!({"role":"user","content":"hi"})],
++                None,
++                None,
++                8,
++                0.1,
++                None,
++                None,
++            )
++            .await
++            .expect("stream must start");
++
++        let mut saw_done = false;
++        while let Some(chunk) = handle.rx.recv().await {
++            if matches!(chunk, crate::providers::base::StreamChunk::Done(_)) {
++                saw_done = true;
++            }
++        }
++        assert!(
++            !saw_done,
++            "an unjournaled terminal response must not be delivered"
++        );
++
++        let (call_id, failure) = recorded_stream_failure_text(&db, &meta.id)
++            .await
++            .expect("journal must close the failed call instead of leaving it pending");
++        assert!(!call_id.is_empty());
++        assert!(
++            failure.contains("replay persistence failed"),
++            "failure text should name the persist failure, got: {failure}"
++        );
++    }
++
++    #[tokio::test]
++    async fn chat_stream_consumer_drop_records_cancellation_failure() {
++        // Break caught: dropping the stream handle mid-stream aborted the
++        // forward task without recording anything, leaving the call pending.
++        let dir = tempdir().expect("tempdir");
++        let db = std::sync::Arc::new(SessionDb::new(&dir.path().join("sessions.db")));
++        let meta = db.create_session("cli:stream-drop").await;
++
++        let provider = ReplayRecordingProvider::new(
++            std::sync::Arc::new(SequencedStreamFakeProvider {
++                hang_after_first: true,
++            }),
++            TurnReplayRecorder::new(
++                std::sync::Arc::clone(&db),
++                meta.id.clone(),
++                "turn-1".to_string(),
++                1,
++            ),
++            ModelCallPurpose::ToolRunner,
++        );
++        let mut handle = provider
++            .chat_stream(
++                &[json!({"role":"user","content":"hi"})],
++                None,
++                None,
++                8,
++                0.1,
++                None,
++                None,
++            )
++            .await
++            .expect("stream must start");
++
++        let first = handle.rx.recv().await;
++        assert!(matches!(
++            first,
++            Some(crate::providers::base::StreamChunk::TextDelta(_))
++        ));
++        drop(handle);
++
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
++        loop {
++            if let Some((_call_id, failure)) = recorded_stream_failure_text(&db, &meta.id).await {
++                assert!(
++                    failure.contains("cancelled"),
++                    "drop should record a cancellation, got: {failure}"
++                );
++                break;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "journal never recorded the cancelled stream"
++            );
++            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
++        }
++    }
++
++    #[tokio::test]
++    async fn session_events_round_trip_in_append_order() {
++        // Break caught: event persistence reorders correlated model calls or
++        // loses exact request/response artifact references across a DB read.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:replay-events").await;
++        let request = SessionEventPayload::ModelRequest {
++            call_id: "model-1".to_string(),
++            purpose: ModelCallPurpose::Main,
++            request_digest: "request-digest".to_string(),
++        };
++        let response = SessionEventPayload::ModelResponse {
++            call_id: "model-1".to_string(),
++            response_digest: "response-digest".to_string(),
++        };
++
++        let first = db
++            .append_session_event(&meta.id, "turn-1", 7, &request)
++            .await
++            .expect("append request");
++        let second = db
++            .append_session_event(&meta.id, "turn-1", 7, &response)
++            .await
++            .expect("append response");
++        let loaded = db.load_session_events(&meta.id).await.expect("load events");
++
++        assert!(first < second);
++        assert_eq!(loaded.len(), 2);
++        assert_eq!(loaded[0].payload, request);
++        assert_eq!(loaded[1].payload, response);
++        assert_eq!(loaded[0].turn_request_id, "turn-1");
++        assert_eq!(loaded[0].turn_tag, 7);
++    }
++
++    #[tokio::test]
++    async fn exact_replay_resolves_recorded_model_call_bytes_without_live_inputs() {
++        // Break caught: replay regenerates a prompt from current state instead
++        // of resolving the exact request and response bytes recorded at call time.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:exact-replay").await;
++        let request_bytes =
++            br#"{"messages":[{"role":"system","content":"old prompt"}],"temperature":0.2}"#;
++        let response_bytes =
++            br#"{"content":"done","tool_calls":[],"finish_reason":"stop","usage":{}}"#;
++        let request_digest = db
++            .store_replay_artifact(&meta.id, "application/json", request_bytes)
++            .await
++            .unwrap();
++        let response_digest = db
++            .store_replay_artifact(&meta.id, "application/json", response_bytes)
++            .await
++            .unwrap();
++        db.append_session_event(
++            &meta.id,
++            "turn-exact",
++            1,
++            &SessionEventPayload::TurnStarted {
++                prior_unrecorded_history: false,
++            },
++        )
++        .await
++        .unwrap();
++        db.append_session_event(
++            &meta.id,
++            "turn-exact",
++            1,
++            &SessionEventPayload::ModelRequest {
++                call_id: "call-1".to_string(),
++                purpose: ModelCallPurpose::Main,
++                request_digest,
++            },
++        )
++        .await
++        .unwrap();
++        db.append_session_event(
++            &meta.id,
++            "turn-exact",
++            1,
++            &SessionEventPayload::ModelResponse {
++                call_id: "call-1".to_string(),
++                response_digest,
++            },
++        )
++        .await
++        .unwrap();
++        db.record_turn_finished(&meta.id, "turn-exact", 1, "finished")
++            .await
++            .unwrap();
++
++        let replay = db.load_session_replay(&meta.id).await.unwrap();
++        assert_eq!(replay.availability, ReplayAvailability::Exact);
++        assert_eq!(replay.model_calls.len(), 1);
++        assert_eq!(replay.model_calls[0].request, request_bytes);
++        assert_eq!(
++            replay.model_calls[0].response.as_deref(),
++            Some(response_bytes.as_slice())
++        );
++    }
++
++    #[tokio::test]
++    async fn exact_replay_marks_unanswered_model_request_incomplete() {
++        // Break caught: a crash between durable request and provider completion
++        // is reported as a complete replay or silently drops the pending call.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:incomplete-replay").await;
++        let request_digest = db
++            .store_replay_artifact(&meta.id, "application/json", b"{}")
++            .await
++            .unwrap();
++        db.append_session_event(
++            &meta.id,
++            "turn-incomplete",
++            2,
++            &SessionEventPayload::TurnStarted {
++                prior_unrecorded_history: false,
++            },
++        )
++        .await
++        .unwrap();
++        db.append_session_event(
++            &meta.id,
++            "turn-incomplete",
++            2,
++            &SessionEventPayload::ModelRequest {
++                call_id: "pending-call".to_string(),
++                purpose: ModelCallPurpose::Main,
++                request_digest,
++            },
++        )
++        .await
++        .unwrap();
++
++        let replay = db.load_session_replay(&meta.id).await.unwrap();
++        assert_eq!(
++            replay.availability,
++            ReplayAvailability::Incomplete {
++                reason: "model call pending-call has no terminal event".to_string()
++            }
++        );
++        assert_eq!(replay.model_calls.len(), 1);
++        assert!(replay.model_calls[0].response.is_none());
++    }
++
++    #[tokio::test]
++    async fn exact_replay_marks_unfinished_turn_incomplete_after_terminal_call() {
++        // Break caught: a crash after the final provider response but before
++        // turn finalization is incorrectly advertised as an exact full turn.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:unfinished-turn").await;
++        let request = RecordedProviderRequest {
++            messages: vec![json!({"role":"user","content":"almost done"})],
++            tools: None,
++            model: "model".to_string(),
++            max_tokens: 16,
++            temperature: 0.0,
++            thinking_budget: None,
++            top_p: None,
++            tool_choice: "auto".to_string(),
++            streaming: false,
++        };
++        let call_id = db
++            .record_model_request(
++                &meta.id,
++                "turn-unfinished",
++                1,
++                ModelCallPurpose::Main,
++                &request,
++            )
++            .await
++            .unwrap();
++        db.record_model_response(
++            &meta.id,
++            "turn-unfinished",
++            1,
++            &call_id,
++            &RecordedProviderResponse {
++                content: Some("terminal".to_string()),
++                tool_calls: Vec::new(),
++                finish_reason: "stop".to_string(),
++                usage: HashMap::new(),
++            },
++        )
++        .await
++        .unwrap();
++
++        let replay = db.load_session_replay(&meta.id).await.unwrap();
++        assert_eq!(
++            replay.availability,
++            ReplayAvailability::Incomplete {
++                reason: "turn turn-unfinished has no finished event".to_string()
++            }
++        );
++    }
++
++    #[tokio::test]
++    async fn exact_replay_accepts_model_failure_as_a_terminal_event() {
++        // Break caught: a provider error is recorded only as a pending request,
++        // making a completely observed failed call look like crash corruption.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:failed-model-call").await;
++        let request = RecordedProviderRequest {
++            messages: vec![json!({"role":"user","content":"fail exactly"})],
++            tools: None,
++            model: "model".to_string(),
++            max_tokens: 64,
++            temperature: 0.0,
++            thinking_budget: None,
++            top_p: None,
++            tool_choice: "auto".to_string(),
++            streaming: false,
++        };
++        let call_id = db
++            .record_model_request(&meta.id, "turn-failed", 1, ModelCallPurpose::Main, &request)
++            .await
++            .unwrap();
++        db.record_model_failure(&meta.id, "turn-failed", 1, &call_id, "provider_timeout")
++            .await
++            .unwrap();
++        db.record_turn_finished(&meta.id, "turn-failed", 1, "provider_error")
++            .await
++            .unwrap();
++
++        let replay = db.load_session_replay(&meta.id).await.unwrap();
++        assert_eq!(replay.availability, ReplayAvailability::Exact);
++        assert_eq!(
++            replay.model_calls[0].failure.as_deref(),
++            Some(b"provider_timeout".as_slice())
++        );
++        assert!(replay.model_calls[0].response.is_none());
++    }
++
++    #[tokio::test]
++    async fn exact_replay_rejects_corrupted_artifact_bytes() {
++        // Break caught: SQLite bytes no longer match the digest carried by an
++        // event, but replay trusts the row and silently feeds altered content.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:corrupt-replay").await;
++        let digest = db
++            .store_replay_artifact(&meta.id, "application/json", b"{\"exact\":true}")
++            .await
++            .unwrap();
++        db.append_session_event(
++            &meta.id,
++            "turn-corrupt",
++            1,
++            &SessionEventPayload::TurnStarted {
++                prior_unrecorded_history: false,
++            },
++        )
++        .await
++        .unwrap();
++        db.append_session_event(
++            &meta.id,
++            "turn-corrupt",
++            1,
++            &SessionEventPayload::ModelRequest {
++                call_id: "call-corrupt".to_string(),
++                purpose: ModelCallPurpose::Main,
++                request_digest: digest.clone(),
++            },
++        )
++        .await
++        .unwrap();
++        {
++            let conn = db.conn.lock().await;
++            conn.execute(
++                "UPDATE session_replay_artifacts SET content = ?3 \
++                 WHERE session_id = ?1 AND digest = ?2",
++                params![meta.id, digest, b"{\"exact\":false}"],
++            )
++            .unwrap();
++        }
++
++        let error = db.load_session_replay(&meta.id).await.unwrap_err();
++        assert!(matches!(
++            error,
++            ReplayError::CorruptArtifact { digest: actual } if actual == digest
++        ));
++    }
++
++    #[tokio::test]
++    async fn replay_validates_tool_lifecycle_transitions() {
++        // Break caught: execution can appear without a durable pre-execute
++        // decision, or a ready tool can vanish before post-execute persistence.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:tool-transition").await;
++        db.record_tool_execute(&meta.id, "turn-tools", 1, "tc-orphan", "orphan", true, 1)
++            .await
++            .unwrap();
++        let error = db.load_session_replay(&meta.id).await.unwrap_err();
++        assert!(matches!(error, ReplayError::InvalidTransition { .. }));
++
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:tool-incomplete").await;
++        db.record_tool_pre_execute(
++            &meta.id,
++            "turn-tools",
++            1,
++            "tc-ready",
++            "read_file",
++            &HashMap::new(),
++            ToolPreExecuteDecision::Ready,
++        )
++        .await
++        .unwrap();
++        db.record_tool_execute(&meta.id, "turn-tools", 1, "tc-ready", "raw", true, 2)
++            .await
++            .unwrap();
++        let replay = db.load_session_replay(&meta.id).await.unwrap();
++        assert_eq!(
++            replay.availability,
++            ReplayAvailability::Incomplete {
++                reason: "tool call tc-ready has no post-execute event".to_string()
++            }
++        );
++    }
++
++    #[tokio::test]
++    async fn whole_turn_snapshot_preserves_model_bytes_and_phase_order() {
++        // Break caught: a schema/refactor changes the stable whole-turn replay
++        // projection or drops bytes that were visible at a provider boundary.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:whole-turn-snapshot").await;
++        let request = RecordedProviderRequest {
++            messages: vec![json!({"role":"user","content":"list it"})],
++            tools: Some(vec![
++                json!({"type":"function","function":{"name":"list_dir"}}),
++            ]),
++            model: "snapshot-model".to_string(),
++            max_tokens: 128,
++            temperature: 0.25,
++            thinking_budget: None,
++            top_p: Some(0.9),
++            tool_choice: "auto".to_string(),
++            streaming: false,
++        };
++        let call_id = db
++            .record_model_request(
++                &meta.id,
++                "turn-snapshot",
++                4,
++                ModelCallPurpose::Main,
++                &request,
++            )
++            .await
++            .unwrap();
++        db.record_model_response(
++            &meta.id,
++            "turn-snapshot",
++            4,
++            &call_id,
++            &RecordedProviderResponse {
++                content: Some("done".to_string()),
++                tool_calls: Vec::new(),
++                finish_reason: "stop".to_string(),
++                usage: HashMap::from([("completion_tokens".to_string(), 1)]),
++            },
++        )
++        .await
++        .unwrap();
++        db.record_turn_finished(&meta.id, "turn-snapshot", 4, "finished")
++            .await
++            .unwrap();
++
++        let replay = db.load_session_replay(&meta.id).await.unwrap();
++        let phases = replay
++            .events
++            .iter()
++            .map(|event| event.payload.kind())
++            .collect::<Vec<_>>();
++        let snapshot = json!({
++            "availability": match replay.availability {
++                ReplayAvailability::Exact => "exact",
++                _ => "unexpected",
++            },
++            "phases": phases,
++            "request": serde_json::from_slice::<Value>(&replay.model_calls[0].request).unwrap(),
++            "response": serde_json::from_slice::<Value>(
++                replay.model_calls[0].response.as_deref().unwrap()
++            ).unwrap(),
++        });
++        assert_eq!(
++            snapshot,
++            json!({
++                "availability": "exact",
++                "phases": ["turn_started", "model_request", "model_response", "turn_finished"],
++                "request": {
++                    "messages": [{"role":"user","content":"list it"}],
++                    "tools": [{"type":"function","function":{"name":"list_dir"}}],
++                    "model": "snapshot-model",
++                    "max_tokens": 128,
++                    "temperature": 0.25,
++                    "thinking_budget": null,
++                    "top_p": 0.9,
++                    "tool_choice": "auto",
++                    "streaming": false
++                },
++                "response": {
++                    "content": "done",
++                    "tool_calls": [],
++                    "finish_reason": "stop",
++                    "usage": {"completion_tokens": 1}
++                }
++            })
++        );
++    }
++
++    #[tokio::test]
++    async fn exact_replay_survives_database_reopen() {
++        // Break caught: replay depends on in-memory turn state and cannot be
++        // reconstructed after a process restart from SQLite alone.
++        let dir = tempdir().expect("tempdir");
++        let path = dir.path().join("sessions.db");
++        let db = SessionDb::new(&path);
++        let meta = db.create_session("cli:restart-replay").await;
++        let request = RecordedProviderRequest {
++            messages: vec![json!({"role":"user","content":"survive restart"})],
++            tools: None,
++            model: "model".to_string(),
++            max_tokens: 32,
++            temperature: 0.1,
++            thinking_budget: None,
++            top_p: None,
++            tool_choice: "auto".to_string(),
++            streaming: false,
++        };
++        let call_id = db
++            .record_model_request(
++                &meta.id,
++                "turn-restart",
++                1,
++                ModelCallPurpose::Main,
++                &request,
++            )
++            .await
++            .unwrap();
++        db.record_model_response(
++            &meta.id,
++            "turn-restart",
++            1,
++            &call_id,
++            &RecordedProviderResponse {
++                content: Some("persisted".to_string()),
++                tool_calls: Vec::new(),
++                finish_reason: "stop".to_string(),
++                usage: HashMap::new(),
++            },
++        )
++        .await
++        .unwrap();
++        db.record_turn_finished(&meta.id, "turn-restart", 1, "finished")
++            .await
++            .unwrap();
++        let before = db.load_session_replay(&meta.id).await.unwrap();
++        drop(db);
++
++        let reopened = SessionDb::new(&path);
++        let after = reopened.load_session_replay(&meta.id).await.unwrap();
++        assert_eq!(after, before);
++    }
++
++    #[tokio::test]
++    async fn first_recorded_turn_marks_preexisting_conversation_partial() {
++        // Break caught: a legacy session with historical assistant output is
++        // falsely advertised as exactly replayable from its beginning.
++        let (db, _dir) = make_db();
++        let meta = db.create_session("cli:legacy-prefix").await;
++        db.add_messages(
++            &meta.id,
++            &[
++                json!({"role":"user","content":"old question"}),
++                json!({"role":"assistant","content":"old answer"}),
++                json!({"role":"user","content":"new recorded turn"}),
++            ],
++        )
++        .await;
++        let request = RecordedProviderRequest {
++            messages: vec![json!({"role":"user","content":"new recorded turn"})],
++            tools: None,
++            model: "model".to_string(),
++            max_tokens: 64,
++            temperature: 0.0,
++            thinking_budget: None,
++            top_p: None,
++            tool_choice: "auto".to_string(),
++            streaming: false,
++        };
++        let call_id = db
++            .record_model_request(&meta.id, "turn-new", 3, ModelCallPurpose::Main, &request)
++            .await
++            .unwrap();
++        db.record_model_response(
++            &meta.id,
++            "turn-new",
++            3,
++            &call_id,
++            &RecordedProviderResponse {
++                content: Some("new answer".to_string()),
++                tool_calls: Vec::new(),
++                finish_reason: "stop".to_string(),
++                usage: HashMap::new(),
++            },
++        )
++        .await
++        .unwrap();
++        db.record_turn_finished(&meta.id, "turn-new", 3, "finished")
++            .await
++            .unwrap();
++
++        let replay = db.load_session_replay(&meta.id).await.unwrap();
++        assert!(matches!(
++            replay.availability,
++            ReplayAvailability::Partial { first_event } if first_event > 0
++        ));
++        assert!(matches!(
++            replay.events.first().map(|event| &event.payload),
++            Some(SessionEventPayload::TurnStarted {
++                prior_unrecorded_history: true
++            })
++        ));
++    }
++
+     #[tokio::test]
+     async fn test_get_or_resume_idempotent() {
+         let (db, _dir) = make_db();
+diff --git a/src/session/mod.rs b/src/session/mod.rs
+index 67005c1..4193771 100644
+--- a/src/session/mod.rs
++++ b/src/session/mod.rs
+@@ -1,4 +1,7 @@
+ pub mod db;
+ pub mod filters;
+ 
+-pub use db::{SearchResult, SessionDb, SessionMeta};
++pub use db::{
++    ModelCallPurpose, RecordedModelCall, ReplayAvailability, ReplayError, SearchResult, SessionDb,
++    SessionEvent, SessionEventPayload, SessionMeta, SessionReplay, ToolPreExecuteDecision,
++};

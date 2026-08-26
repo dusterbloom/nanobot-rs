@@ -1,0 +1,2379 @@
+diff --git a/src/agent/agent_core.rs b/src/agent/agent_core.rs
+index aabc263..b2df11f 100644
+--- a/src/agent/agent_core.rs
++++ b/src/agent/agent_core.rs
+@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+ use std::sync::Arc;
+ 
+ use serde_json::Value;
++use tracing::debug;
+ 
+ use crate::agent::agent_profiles;
+ use crate::agent::compaction::ContextCompactor;
+@@ -407,7 +408,16 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
+         (mem_provider, mem_model)
+     };
+ 
+-    let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
++    // For local models, cap response reserve to 25% of context to avoid
++    // starving the message budget. With 4096 context and 2048 reserve,
++    // tool defs would leave only ~500 tokens for messages, triggering
++    // LCM compaction on the first prompt.
++    let effective_reserve = if is_local {
++        (max_tokens as usize).min(max_context_tokens / 4)
++    } else {
++        max_tokens as usize
++    };
++    let token_budget = TokenBudget::new(max_context_tokens, effective_reserve);
+     let compaction_ctx_size = if memory_config.compaction_model_context_size > 0 {
+         memory_config.compaction_model_context_size
+     } else {
+@@ -423,6 +433,11 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
+         memory_config.compaction_threshold_tokens,
+     )
+     .with_max_merge_rounds(memory_config.compaction.max_merge_rounds);
++    debug!(
++        memory_model = %memory_model,
++        compaction_ctx_size = compaction_ctx_size,
++        "agent_core: compactor initialized"
++    );
+     let learning = LearningStore::new(&workspace);
+     let working_memory = WorkingMemoryStore::new(&workspace);
+ 
+diff --git a/src/agent/agent_loop.rs b/src/agent/agent_loop.rs
+index c3a4eea..5046b91 100644
+--- a/src/agent/agent_loop.rs
++++ b/src/agent/agent_loop.rs
+@@ -375,7 +375,10 @@ impl AgentLoopShared {
+             .get("detected_language")
+             .and_then(|v| v.as_str())
+             .map(|s| s.to_string());
+-        let user_content = if core.main_no_think {
++        // `/no_think` prefix is only needed for template-level thinking models
++        // (e.g. Nemotron native LMS mode). For most local models this prefix
++        // pollutes user content and gets misinterpreted as a filesystem path.
++        let user_content = if core.main_no_think && core.model_capabilities.needs_native_lms_api {
+             format!(" /no_think\n{}", msg.content)
+         } else {
+             msg.content.clone()
+@@ -1136,39 +1139,34 @@ impl AgentLoopShared {
+                     if v > 0 { Some(v - 1) } else { None }
+                 })
+                 .is_ok();
+-            if had_long {
+-                base.max(8192)
+-            } else {
+-                // Detect long-form triggers in the user message.
+-                let user_text = ctx.messages
+-                    .last()
+-                    .and_then(|m| m.get("content"))
+-                    .and_then(|c| c.as_str())
+-                    .unwrap_or("");
+-                let lower = user_text.to_lowercase();
+-                let is_long_form = lower.contains("explain in detail")
+-                    || lower.contains("write a ")
+-                    || lower.contains("create a script")
+-                    || lower.contains("write code")
+-                    || lower.contains("implement ")
+-                    || lower.contains("full example")
+-                    || lower.starts_with("write ")
+-                    || user_text.len() > 500;
+-                // Count recent tool calls: if tool-heavy, use smaller budget.
+-                let recent_tool_calls = ctx.messages
+-                    .iter()
+-                    .rev()
+-                    .take(6)
+-                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+-                    .count();
+-                if is_long_form {
+-                    base.max(4096)
+-                } else if recent_tool_calls > 3 {
+-                    base.min(1024).max(512)
++            let user_text = ctx.messages
++                .last()
++                .and_then(|m| m.get("content"))
++                .and_then(|c| c.as_str())
++                .unwrap_or("");
++            // Count recent tool calls: if tool-heavy, use smaller budget.
++            let recent_tool_calls = ctx.messages
++                .iter()
++                .rev()
++                .take(6)
++                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
++                .count();
++            let thinking_budget = {
++                let stored = counters.thinking_budget.load(Ordering::Relaxed);
++                if stored > 0 {
++                    Some(stored)
+                 } else {
+-                    base
++                    None
+                 }
+-            }
++            };
++            adaptive_max_tokens(
++                base,
++                had_long,
++                user_text,
++                recent_tool_calls,
++                ctx.core.is_local,
++                thinking_budget,
++            )
+         };
+ 
+         StepResult::Next(IterationPhase::Calling {
+@@ -1211,7 +1209,7 @@ impl AgentLoopShared {
+                 // Small local models can burn the whole completion budget in reasoning.
+                 // Hard-cap explicit thinking to keep them action-oriented.
+                 if ctx.core.is_local && ctx.core.model_capabilities.size_class == crate::agent::model_capabilities::ModelSizeClass::Small {
+-                    Some(stored.min(256))
++                    Some(stored.min(LOCAL_SMALL_MODEL_THINKING_CAP_TOKENS))
+                 } else {
+                     Some(stored)
+                 }
+@@ -1974,6 +1972,56 @@ fn should_strip_tools_for_trio(
+     result
+ }
+ 
++const LOCAL_THINKING_TOOLCALL_RESERVE_TOKENS: u32 = 512;
++const LOCAL_THINKING_MIN_COMPLETION_TOKENS: u32 = 256;
++const LOCAL_SMALL_MODEL_THINKING_CAP_TOKENS: u32 = 256;
++const ADAPTIVE_LONG_MODE_MIN_TOKENS: u32 = 8192;
++const ADAPTIVE_LONG_FORM_MIN_TOKENS: u32 = 4096;
++const ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD: usize = 3;
++const ADAPTIVE_TOOL_HEAVY_MAX_TOKENS: u32 = 1024;
++const ADAPTIVE_TOOL_HEAVY_MIN_TOKENS: u32 = 512;
++const ADAPTIVE_LONG_FORM_TRIGGER_CHARS: usize = 500;
++
++fn adaptive_max_tokens(
++    base: u32,
++    had_long: bool,
++    user_text: &str,
++    recent_tool_calls: usize,
++    is_local: bool,
++    thinking_budget: Option<u32>,
++) -> u32 {
++    let mut effective = if had_long {
++        base.max(ADAPTIVE_LONG_MODE_MIN_TOKENS)
++    } else {
++        let lower = user_text.to_lowercase();
++        let is_long_form = lower.contains("explain in detail")
++            || lower.contains("write a ")
++            || lower.contains("create a script")
++            || lower.contains("write code")
++            || lower.contains("implement ")
++            || lower.contains("full example")
++            || lower.starts_with("write ")
++            || user_text.len() > ADAPTIVE_LONG_FORM_TRIGGER_CHARS;
++
++        if is_long_form {
++            base.max(ADAPTIVE_LONG_FORM_MIN_TOKENS)
++        } else if recent_tool_calls > ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD {
++            base.min(ADAPTIVE_TOOL_HEAVY_MAX_TOKENS)
++                .max(ADAPTIVE_TOOL_HEAVY_MIN_TOKENS)
++        } else {
++            base
++        }
++    };
++
++    if is_local && thinking_budget.is_some() {
++        effective = effective
++            .saturating_sub(LOCAL_THINKING_TOOLCALL_RESERVE_TOKENS)
++            .max(LOCAL_THINKING_MIN_COMPLETION_TOKENS);
++    }
++
++    effective
++}
++
+ // ---------------------------------------------------------------------------
+ // AgentLoop (owns the receiver + orchestrates concurrency)
+ // ---------------------------------------------------------------------------
+@@ -2362,6 +2410,17 @@ impl AgentLoop {
+         self.shared.subagents.clone()
+     }
+ 
++    /// Clear the LCM engine for a session (e.g. on /clear command).
++    ///
++    /// This resets the summary DAG and active context so stale summaries
++    /// don't pollute fresh conversations after /clear.
++    pub async fn clear_lcm_engine(&self, session_key: &str) {
++        let mut engines = self.shared.lcm_engines.lock().await;
++        if engines.remove(session_key).is_some() {
++            debug!(session = %session_key, "LCM engine cleared");
++        }
++    }
++
+     /// Signal the agent loop to stop.
+     pub fn stop(&self) {
+         self.running.store(false, Ordering::SeqCst);
+@@ -3996,6 +4055,30 @@ mod tests {
+         assert!(!should_strip_tools_for_trio(true, true, false, false));
+     }
+ 
++    #[test]
++    fn test_adaptive_max_tokens_reserves_budget_for_local_thinking() {
++        let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, Some(512));
++        assert_eq!(out, 3584);
++    }
++
++    #[test]
++    fn test_adaptive_max_tokens_no_reserve_without_thinking() {
++        let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, None);
++        assert_eq!(out, 4096);
++    }
++
++    #[test]
++    fn test_adaptive_max_tokens_no_reserve_for_cloud() {
++        let out = adaptive_max_tokens(4096, false, "What time is it?", 0, false, Some(512));
++        assert_eq!(out, 4096);
++    }
++
++    #[test]
++    fn test_adaptive_max_tokens_keeps_floor_when_base_is_small() {
++        let out = adaptive_max_tokens(512, false, "short", 0, true, Some(128));
++        assert_eq!(out, 256);
++    }
++
+     // -----------------------------------------------------------------------
+     // Offline trio E2E tests (no network required — all providers are mocks)
+     // -----------------------------------------------------------------------
+@@ -4061,6 +4144,54 @@ mod tests {
+         }
+     }
+ 
++    struct RecordingProvider {
++        name: String,
++        response: String,
++        last_max_tokens: std::sync::atomic::AtomicU32,
++    }
++
++    impl RecordingProvider {
++        fn new(name: &str, response: &str) -> Self {
++            Self {
++                name: name.to_string(),
++                response: response.to_string(),
++                last_max_tokens: std::sync::atomic::AtomicU32::new(0),
++            }
++        }
++
++        fn last_max_tokens(&self) -> u32 {
++            self.last_max_tokens
++                .load(std::sync::atomic::Ordering::Relaxed)
++        }
++    }
++
++    #[async_trait]
++    impl LLMProvider for RecordingProvider {
++        async fn chat(
++            &self,
++            _messages: &[Value],
++            _tools: Option<&[Value]>,
++            _model: Option<&str>,
++            max_tokens: u32,
++            _temperature: f64,
++            _thinking_budget: Option<u32>,
++            _top_p: Option<f64>,
++        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
++            self.last_max_tokens
++                .store(max_tokens, std::sync::atomic::Ordering::Relaxed);
++            Ok(crate::providers::base::LLMResponse {
++                content: Some(self.response.clone()),
++                tool_calls: vec![],
++                finish_reason: "stop".to_string(),
++                usage: std::collections::HashMap::new(),
++            })
++        }
++
++        fn get_default_model(&self) -> &str {
++            &self.name
++        }
++    }
++
+     /// Build an offline trio harness from pre-built mock providers.
+     ///
+     /// Mirrors `build_trio_e2e_harness` but accepts providers directly rather
+@@ -4192,6 +4323,41 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&workspace);
+     }
+ 
++    #[tokio::test]
++    async fn test_local_thinking_reserves_max_tokens_end_to_end() {
++        let router_resp = r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#;
++        let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
++            "offline-router",
++            vec![router_resp, router_resp, router_resp],
++        ));
++        let main = Arc::new(RecordingProvider::new("offline-main", "ok"));
++        let main_dyn: Arc<dyn LLMProvider> = main.clone();
++        let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
++            "offline-specialist",
++            "unused",
++        ));
++
++        let (agent_loop, workspace) = build_trio_offline_harness(main_dyn, router, specialist);
++        agent_loop
++            .shared
++            .core_handle
++            .counters
++            .thinking_budget
++            .store(128, std::sync::atomic::Ordering::Relaxed);
++
++        let _ = agent_loop
++            .process_direct("What is the current date?", "reserve-max-tokens", "test", "offline")
++            .await;
++
++        assert_eq!(
++            main.last_max_tokens(),
++            256,
++            "local thinking should reserve tool-call budget from base max_tokens=512"
++        );
++
++        let _ = std::fs::remove_dir_all(&workspace);
++    }
++
+     // -----------------------------------------------------------------------
+     // Test 2: router decides "specialist" — specialist is called
+     // -----------------------------------------------------------------------
+diff --git a/src/agent/compaction.rs b/src/agent/compaction.rs
+index 88abe86..92b414e 100644
+--- a/src/agent/compaction.rs
++++ b/src/agent/compaction.rs
+@@ -991,10 +991,13 @@ impl ContextCompactor {
+     }
+ }
+ 
+-/// Strip `<thinking>...</thinking>` blocks from model output.
++/// Strip leaked reasoning/template markers from model output.
+ ///
+-/// Small models (Qwen3-0.6B, 1.7B) sometimes leak chain-of-thought tags
+-/// into their output. This prevents garbage from leaking into summaries.
++/// Small local models sometimes emit internal tags such as:
++/// - `<thinking>...</thinking>`
++/// - Qwen chat template tokens (`<|im_start|>`, `<|im_end|>`)
++///
++/// This helper removes those artifacts from both summaries and normal replies.
+ pub fn strip_thinking_tags(text: &str) -> String {
+     let mut result = String::with_capacity(text.len());
+     let mut remaining = text;
+@@ -1008,7 +1011,29 @@ pub fn strip_thinking_tags(text: &str) -> String {
+         }
+     }
+     result.push_str(remaining);
+-    result.trim().to_string()
++
++    // Remove leaked chat-template markers used by some local models.
++    let mut cleaned = result;
++    for marker in [
++        "<|im_start|>",
++        "<|im_end|>",
++        "<|assistant|>",
++        "<|user|>",
++        "<|system|>",
++        "<|endoftext|>",
++    ] {
++        cleaned = cleaned.replace(marker, "");
++    }
++
++    // Normalise leftover whitespace after marker removal.
++    let cleaned = cleaned
++        .lines()
++        .map(str::trim)
++        .filter(|l| !l.is_empty())
++        .collect::<Vec<_>>()
++        .join("\n");
++
++    cleaned.trim().to_string()
+ }
+ 
+ fn format_message_for_transcript(msg: &Value) -> String {
+@@ -1261,6 +1286,20 @@ mod tests {
+         assert!(result.observation.is_none());
+     }
+ 
++    #[test]
++    fn test_strip_thinking_tags_removes_qwen_template_tokens() {
++        let input = "<|im_start|><|im_start|>Need to answer\n<|im_end|>";
++        let out = strip_thinking_tags(input);
++        assert_eq!(out, "Need to answer");
++    }
++
++    #[test]
++    fn test_strip_thinking_tags_removes_thinking_block_and_markers() {
++        let input = "before <thinking>hidden</thinking> after <|assistant|>";
++        let out = strip_thinking_tags(input);
++        assert_eq!(out, "before  after");
++    }
++
+     #[tokio::test]
+     async fn test_compact_summarizes_old_messages() {
+         let provider = Arc::new(MockProvider::new("User discussed weather and cats."));
+diff --git a/src/agent/context.rs b/src/agent/context.rs
+index fbf6820..dddf6f5 100644
+--- a/src/agent/context.rs
++++ b/src/agent/context.rs
+@@ -592,11 +592,12 @@ You are nanobot, a helpful AI assistant with tools for file I/O, shell, web, mes
+ ## Context
+ Time: {now}{model_section}
+ Home: {home_dir}
+-Workspace: {workspace_path}
+-Working directory: {cwd}
++Shell working directory: {cwd}
++Persistent memory location: {workspace_path}
+ 
+ Be concise (1-5 sentences) unless asked for detail. Use tools to verify; never fabricate.
+-When using file tools, use paths relative to workspace or absolute paths starting with {home_dir}.
++When asked about the current/working directory, use `exec` to run `pwd` or use `list_dir` on `.` to verify.
++When using file tools, use paths relative to the shell working directory or absolute paths starting with {home_dir}.
+ Reply directly for conversation; use 'message' tool only for chat channels.{delegation_hint}
+ 
+ ## Memory
+diff --git a/src/agent/context_gate.rs b/src/agent/context_gate.rs
+index daea150..56f5164 100644
+--- a/src/agent/context_gate.rs
++++ b/src/agent/context_gate.rs
+@@ -11,6 +11,8 @@ use std::path::PathBuf;
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::time::Duration;
+ 
++use serde_json::Value;
++
+ use crate::agent::compaction::ContextCompactor;
+ use crate::agent::token_budget::TokenBudget;
+ 
+@@ -190,7 +192,11 @@ impl ContentGate {
+     /// and a navigation hint. Useful when no compactor is available.
+     pub fn admit_simple(&mut self, content: &str) -> GateResult {
+         self.admit(content, |c, target_tokens| {
+-            build_simple_briefing(c, target_tokens)
++            if let Some(json_summary) = build_json_briefing(c, target_tokens) {
++                json_summary
++            } else {
++                build_simple_briefing(c, target_tokens)
++            }
+         })
+     }
+ 
+@@ -256,6 +262,18 @@ impl ContentGate {
+         let cache_ref = self.cache.store(content);
+         let target_tokens = available / 2;
+ 
++        // JSON tool output is handled deterministically to avoid model drift.
++        // This path preserves exact values and avoids hallucinated fields.
++        if let Some(summary) = build_json_briefing(content, target_tokens) {
++            let summary_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(&summary);
++            self.budget.consume(summary_tokens);
++            return GateResult::Briefing {
++                summary,
++                cache_ref,
++                original_size: content.len(),
++            };
++        }
++
+         // Try specialist summarization, fall back to mechanical briefing.
+         let summary = match specialist_summarize(provider, model, content, target_tokens).await {
+             Ok(s) => s,
+@@ -337,6 +355,298 @@ fn build_simple_briefing(content: &str, target_tokens: usize) -> String {
+     )
+ }
+ 
++fn parse_json_content(content: &str) -> Option<Value> {
++    let trimmed = content.trim();
++    if trimmed.is_empty() {
++        return None;
++    }
++
++    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
++        return Some(v);
++    }
++
++    if trimmed.starts_with("```") {
++        let first_nl = trimmed.find('\n')?;
++        let last_fence = trimmed.rfind("```")?;
++        if last_fence > first_nl {
++            let body = &trimmed[first_nl + 1..last_fence];
++            if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
++                return Some(v);
++            }
++        }
++    }
++
++    None
++}
++
++fn signal_key(key: &str) -> bool {
++    let k = key.to_ascii_lowercase();
++    k.contains("id")
++        || k.contains("error")
++        || k.contains("status")
++        || k.contains("path")
++        || k.contains("request")
++        || k.contains("latency")
++        || k.contains("count")
++        || k.contains("total")
++        || k.contains("fail")
++        || k.contains("code")
++        || k.contains("max")
++        || k.contains("min")
++}
++
++fn scalar_string(v: &Value) -> Option<String> {
++    match v {
++        Value::String(s) => {
++            if s.is_empty() {
++                None
++            } else {
++                Some(format!("\"{}\"", s.chars().take(180).collect::<String>()))
++            }
++        }
++        Value::Number(n) => Some(n.to_string()),
++        Value::Bool(b) => Some(b.to_string()),
++        Value::Null => Some("null".to_string()),
++        _ => None,
++    }
++}
++
++fn is_ok_status(s: &str) -> bool {
++    matches!(
++        s.to_ascii_lowercase().as_str(),
++        "ok" | "success" | "passed" | "pass" | "none"
++    )
++}
++
++fn anomaly_line_for_object(path: &str, map: &serde_json::Map<String, Value>) -> Option<String> {
++    let status = map.get("status").and_then(|v| v.as_str());
++    let error = map.get("error").and_then(|v| v.as_str());
++    let latency = map.get("latencyMs").and_then(|v| v.as_i64());
++
++    let mut notes = Vec::new();
++    if let Some(s) = status {
++        if !is_ok_status(s) {
++            notes.push(format!("status=\"{}\"", s));
++        }
++    }
++    if let Some(e) = error {
++        if !e.trim().is_empty() {
++            notes.push(format!("error=\"{}\"", e.chars().take(120).collect::<String>()));
++        }
++    }
++    if let Some(ms) = latency {
++        if ms >= 1000 {
++            notes.push(format!("latencyMs={}", ms));
++        }
++    }
++
++    if notes.is_empty() {
++        None
++    } else {
++        Some(format!("{}: {}", path, notes.join(", ")))
++    }
++}
++
++fn collect_signal_facts(value: &Value, path: &str, out: &mut Vec<String>, limit: usize) {
++    if out.len() >= limit {
++        return;
++    }
++
++    match value {
++        Value::Object(map) => {
++            let mut scalar_facts = Vec::new();
++            for (k, v) in map {
++                if signal_key(k) {
++                    if let Some(s) = scalar_string(v) {
++                        let child = if path.is_empty() {
++                            k.to_string()
++                        } else {
++                            format!("{}.{}", path, k)
++                        };
++                        scalar_facts.push((k.to_ascii_lowercase(), format!("{} = {}", child, s)));
++                    }
++                }
++            }
++
++            scalar_facts.sort_by_key(|(k, _)| {
++                if k.contains("requestid") || k == "request" {
++                    0usize
++                } else if k.contains("error") {
++                    1usize
++                } else if k.contains("status") {
++                    2usize
++                } else if k.contains("path") {
++                    3usize
++                } else if k.contains("latency") || k.contains("max") {
++                    4usize
++                } else {
++                    10usize
++                }
++            });
++
++            for (_, line) in scalar_facts {
++                if out.len() >= limit {
++                    return;
++                }
++                out.push(line);
++            }
++
++            if let Some(anomaly) = anomaly_line_for_object(path, map) {
++                out.push(anomaly);
++                if out.len() >= limit {
++                    return;
++                }
++            }
++
++            for (k, v) in map {
++                if out.len() >= limit {
++                    return;
++                }
++                let child = if path.is_empty() {
++                    k.to_string()
++                } else {
++                    format!("{}.{}", path, k)
++                };
++                if matches!(v, Value::Object(_) | Value::Array(_)) {
++                    collect_signal_facts(v, &child, out, limit);
++                }
++            }
++        }
++        Value::Array(arr) => {
++            // First pass: anomalies across the full array so we do not miss critical rows.
++            let mut anomaly_indexes = std::collections::BTreeSet::new();
++            for (i, v) in arr.iter().enumerate() {
++                if out.len() >= limit {
++                    return;
++                }
++                if let Value::Object(map) = v {
++                    let child = format!("{}[{}]", path, i);
++                    if let Some(anomaly) = anomaly_line_for_object(&child, map) {
++                        out.push(anomaly);
++                        anomaly_indexes.insert(i);
++                        for key in ["id", "invoiceId", "path", "error", "latencyMs", "status"] {
++                            if out.len() >= limit {
++                                return;
++                            }
++                            if let Some(val) = map.get(key).and_then(scalar_string) {
++                                out.push(format!("{}.{} = {}", child, key, val));
++                            }
++                        }
++                    }
++                }
++            }
++
++            for (i, v) in arr.iter().enumerate() {
++                if out.len() >= limit {
++                    return;
++                }
++
++                if anomaly_indexes.contains(&i) {
++                    continue;
++                }
++
++                let should_scan = i < 4 || i + 1 == arr.len();
++                if !should_scan {
++                    if let Value::Object(map) = v {
++                        if anomaly_line_for_object(&format!("{}[{}]", path, i), map).is_none() {
++                            continue;
++                        }
++                    } else {
++                        continue;
++                    }
++                }
++
++                let child = format!("{}[{}]", path, i);
++                collect_signal_facts(v, &child, out, limit);
++            }
++        }
++        _ => {}
++    }
++}
++
++fn collect_key_lines(content: &str, limit: usize) -> Vec<String> {
++    let mut out = Vec::new();
++    for line in content.lines() {
++        if out.len() >= limit {
++            break;
++        }
++        let lower = line.to_ascii_lowercase();
++        if lower.contains("\"error\"")
++            || lower.contains("\"status\"")
++            || lower.contains("\"requestid\"")
++            || lower.contains("\"latency")
++            || lower.contains("\"path\"")
++            || lower.contains("\"invoice")
++        {
++            out.push(line.trim().chars().take(220).collect::<String>());
++        }
++    }
++    out
++}
++
++fn build_json_briefing(content: &str, target_tokens: usize) -> Option<String> {
++    let parsed = parse_json_content(content)?;
++    let lines = content.lines().count();
++    let bytes = content.len();
++    let target = target_tokens.max(200);
++    let fact_limit = (target / 24).clamp(10, 40);
++
++    let mut structure = Vec::new();
++    match &parsed {
++        Value::Object(map) => {
++            let keys = map.keys().take(20).cloned().collect::<Vec<_>>();
++            structure.push(format!("root: object with {} keys", map.len()));
++            if !keys.is_empty() {
++                structure.push(format!("top_keys: {}", keys.join(", ")));
++            }
++            for (k, v) in map {
++                if let Value::Array(arr) = v {
++                    structure.push(format!("array {} length={}", k, arr.len()));
++                }
++            }
++        }
++        Value::Array(arr) => structure.push(format!("root: array length={}", arr.len())),
++        other => structure.push(format!("root: {}", other)),
++    }
++
++    let mut facts = Vec::new();
++    collect_signal_facts(&parsed, "$", &mut facts, fact_limit);
++    let key_lines = collect_key_lines(content, (fact_limit / 2).max(4));
++
++    let mut out = String::new();
++    out.push_str(&format!(
++        "# JSON Summary ({} lines, {} bytes)\n\n",
++        lines, bytes
++    ));
++    out.push_str("## Structure\n");
++    for item in structure.into_iter().take(12) {
++        out.push_str("- ");
++        out.push_str(&item);
++        out.push('\n');
++    }
++
++    if !facts.is_empty() {
++        out.push_str("\n## Extracted Facts\n");
++        for fact in facts.into_iter().take(fact_limit) {
++            out.push_str("- ");
++            out.push_str(&fact);
++            out.push('\n');
++        }
++    }
++
++    if !key_lines.is_empty() {
++        out.push_str("\n## Key Source Lines\n");
++        out.push_str("```json\n");
++        for line in key_lines {
++            out.push_str(&line);
++            out.push('\n');
++        }
++        out.push_str("```\n");
++    }
++
++    Some(out)
++}
++
+ /// Ask the specialist provider to summarize a tool result.
+ async fn specialist_summarize(
+     provider: &dyn crate::providers::base::LLMProvider,
+@@ -349,9 +659,12 @@ async fn specialist_summarize(
+         json!({
+             "role": "system",
+             "content": format!(
+-                "Summarize the following tool output concisely in ~{} tokens. \
+-                 Preserve key facts, numbers, file paths, and error messages. \
+-                 Omit boilerplate and repetition.",
++                "Summarize this tool output in <= {} tokens.\n\
++                 Rules:\n\
++                 1) Copy values exactly (numbers, IDs, file paths, error strings).\n\
++                 2) If a fact cannot be copied exactly, omit it.\n\
++                 3) No chain-of-thought, no speculation, no invented fields.\n\
++                 4) Output only bullets grouped as: Key Facts, Failures, Next Checks.",
+                 target_tokens
+             )
+         }),
+@@ -360,11 +673,21 @@ async fn specialist_summarize(
+             "content": content
+         }),
+     ];
++    // Keep output budget tight to avoid runaway local generation latency.
++    // Previously this allowed 2x target tokens, then clamped locally, wasting
++    // generation time and hurting p95 latency on small local models.
++    let max_response_tokens = (target_tokens as u32).saturating_add(48).clamp(96, 320);
+     let resp = provider
+-        .chat(&messages, None, Some(model), (target_tokens as u32) * 2, 0.2, None, None)
++        .chat(&messages, None, Some(model), max_response_tokens, 0.2, None, None)
+         .await
+         .map_err(|e| format!("specialist chat failed: {}", e))?;
+-    resp.content.ok_or_else(|| "specialist returned no content".to_string())
++    let raw = resp
++        .content
++        .ok_or_else(|| "specialist returned no content".to_string())?;
++    let cleaned = crate::agent::compaction::strip_thinking_tags(&raw);
++    let max_chars = target_tokens.saturating_mul(6).max(240);
++    let clamped: String = cleaned.chars().take(max_chars).collect();
++    Ok(clamped)
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -374,8 +697,33 @@ async fn specialist_summarize(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use async_trait::async_trait;
+     use std::path::Path;
+ 
++    use crate::providers::base::{LLMProvider, LLMResponse};
++
++    struct PanicProvider;
++
++    #[async_trait]
++    impl LLMProvider for PanicProvider {
++        async fn chat(
++            &self,
++            _messages: &[serde_json::Value],
++            _tools: Option<&[serde_json::Value]>,
++            _model: Option<&str>,
++            _max_tokens: u32,
++            _temperature: f64,
++            _thinking_budget: Option<u32>,
++            _top_p: Option<f64>,
++        ) -> anyhow::Result<LLMResponse> {
++            panic!("provider should not be called for JSON deterministic briefing")
++        }
++
++        fn get_default_model(&self) -> &str {
++            "panic"
++        }
++    }
++
+     fn test_cache_dir(name: &str) -> PathBuf {
+         let dir =
+             std::env::temp_dir().join(format!("nanobot_gate_test_{}_{}", std::process::id(), name));
+@@ -585,6 +933,30 @@ mod tests {
+         assert!(briefing.contains("line number 1"));
+     }
+ 
++    #[test]
++    fn test_json_briefing_extracts_signal_values() {
++        let content = r#"{
++  "requestId": "req-7f3d9ab2",
++  "entries": [
++    {"id": 1, "status": "ok", "latencyMs": 140, "error": ""},
++    {"id": 173, "status": "error", "latencyMs": 9821, "error": "checksum mismatch for invoice hash", "invoiceId": "INV-2026-0173", "path": "/v1/invoices/reconcile"}
++  ]
++}"#;
++        let briefing = build_json_briefing(content, 360).expect("json briefing expected");
++        assert!(briefing.contains("JSON Summary"));
++        assert!(briefing.contains("req-7f3d9ab2"));
++        assert!(briefing.contains("INV-2026-0173"));
++        assert!(briefing.contains("checksum mismatch for invoice hash"));
++    }
++
++    #[test]
++    fn test_json_briefing_parses_fenced_json() {
++        let content = "```json\n{\"status\":\"error\",\"requestId\":\"abc-1\"}\n```";
++        let briefing = build_json_briefing(content, 220).expect("fenced json should parse");
++        assert!(briefing.contains("abc-1"));
++        assert!(briefing.contains("status"));
++    }
++
+     #[test]
+     fn test_budget_tracks_across_multiple_admits() {
+         let dir = test_cache_dir("multi_admits");
+@@ -600,4 +972,32 @@ mod tests {
+ 
+         cleanup(&dir);
+     }
++
++    #[tokio::test]
++    async fn test_admit_with_specialist_uses_deterministic_json_path() {
++        let dir = test_cache_dir("specialist_json_bypass");
++        let mut gate = ContentGate::new(40, 0.20, dir.clone());
++        let content = r#"{
++  "requestId": "req-abc",
++  "entries": [
++    {"status": "ok", "latencyMs": 10, "error": ""},
++    {"status": "error", "latencyMs": 5000, "error": "bad checksum", "path": "/v1/jobs/reconcile"}
++  ]
++}"#;
++
++        let result = gate
++            .admit_with_specialist(content, &PanicProvider, "any-model")
++            .await;
++
++        match result {
++            GateResult::Raw(_) => panic!("expected briefing for oversized content"),
++            GateResult::Briefing { summary, .. } => {
++                assert!(summary.contains("JSON Summary"));
++                assert!(summary.contains("bad checksum"));
++                assert!(summary.contains("/v1/jobs/reconcile"));
++            }
++        }
++
++        cleanup(&dir);
++    }
+ }
+diff --git a/src/agent/lcm.rs b/src/agent/lcm.rs
+index 9701e4c..536e6a9 100644
+--- a/src/agent/lcm.rs
++++ b/src/agent/lcm.rs
+@@ -219,6 +219,9 @@ impl LcmEngine {
+     /// - All summary nodes (representing compacted older messages)
+     /// - Raw messages after the last summary
+     ///
++    /// Respects `Turn::Clear` markers: everything before the last clear marker
++    /// is ignored, starting fresh from that point.
++    ///
+     /// # Arguments
+     /// * `turns` - All turns from the session, including `Turn::Summary` entries
+     /// * `protocol` - The conversation protocol for rendering
+@@ -229,14 +232,19 @@ impl LcmEngine {
+         _protocol: &dyn ConversationProtocol,
+         _system_prompt: &str,
+     ) -> Self {
+-        let mut engine = Self::new(config);
++        let mut engine = Self::new(config.clone());
++        
++        // Find the last clear marker - everything before it is ignored.
++        let clear_idx = turns.iter().rposition(|t| matches!(t, Turn::Clear));
++        let start_idx = clear_idx.map(|i| i + 1).unwrap_or(0);
++        let turns_to_process = &turns[start_idx..];
+         
+         // Track which raw message IDs have been summarized
+         let mut summarized_ids: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
+         let mut last_summary_end: Option<MessageId> = None;
+         
+         // First pass: ingest all raw messages into store, track summaries
+-        for turn in turns {
++        for turn in turns_to_process {
+             match turn {
+                 Turn::User { content, media: _ } => {
+                     let msg = serde_json::json!({"role": "user", "content": content});
+@@ -286,6 +294,12 @@ impl LcmEngine {
+                     
+                     // Summaries are NOT added to store - they reference store entries
+                 }
++                Turn::Clear => {
++                    // Should not happen since we sliced turns_to_process,
++                    // but handle defensively by resetting the engine.
++                    debug!("LCM rebuild: unexpected Clear marker in processed turns, resetting");
++                    return Self::new(config);
++                }
+             }
+         }
+         
+@@ -326,10 +340,11 @@ impl LcmEngine {
+         }
+         
+         debug!(
+-            "LCM rebuild: {} store entries, {} summary nodes, {} active entries",
++            "LCM rebuild: {} store entries, {} summary nodes, {} active entries (cleared at idx {:?})",
+             engine.store.len(),
+             engine.dag.len(),
+-            engine.active.len()
++            engine.active.len(),
++            clear_idx
+         );
+         
+         engine
+@@ -427,7 +442,7 @@ impl LcmEngine {
+ 
+         // Find the oldest contiguous block of raw messages to compact.
+         // Skip the system message (index 0) and any existing summaries.
+-        let (block_start, block_end) = match self.find_oldest_raw_block() {
++        let (block_start, block_end) = match self.find_oldest_raw_block_impl() {
+             Some(range) => range,
+             None => {
+                 debug!("LCM: no raw block to compact");
+@@ -527,12 +542,28 @@ impl LcmEngine {
+         })
+     }
+ 
+-    /// Find the oldest contiguous block of raw messages (skipping system prompt).
+-    fn find_oldest_raw_block(&self) -> Option<(usize, usize)> {
++    /// Find the oldest contiguous block of raw messages after the last summary.
++    ///
++    /// If no summary exists, starts from the beginning (after system prompt).
++    /// This ensures we don't re-compact messages that have already been summarized.
++    fn find_oldest_raw_block_impl(&self) -> Option<(usize, usize)> {
++        let mut last_summary_idx: Option<usize> = None;
++        
++        // Find the position of the last summary in active context
++        for (i, entry) in self.active.iter().enumerate() {
++            if matches!(entry, ContextEntry::Summary { .. }) {
++                last_summary_idx = Some(i);
++            }
++        }
++        
++        // Start searching for raw messages after the last summary
++        let search_start = last_summary_idx.map(|idx| idx + 1).unwrap_or(0);
++        
+         let mut start = None;
+         let mut end = 0;
+ 
+-        for (i, entry) in self.active.iter().enumerate() {
++        for i in search_start..self.active.len() {
++            let entry = &self.active[i];
+             match entry {
+                 ContextEntry::Raw { msg_id: _, message } => {
+                     // Skip system message.
+@@ -546,7 +577,8 @@ impl LcmEngine {
+                     end = i + 1;
+                 }
+                 ContextEntry::Summary { .. } => {
+-                    // If we've found a raw block before this summary, use it.
++                    // Shouldn't happen since we start after the last summary,
++                    // but handle it just in case.
+                     if start.is_some() {
+                         break;
+                     }
+@@ -628,14 +660,19 @@ impl LcmEngine {
+     }
+ 
+     /// Access the summary DAG (for inspection in tests).
+-    pub(crate) fn dag_ref(&self) -> &SummaryDag {
++    pub fn dag_ref(&self) -> &SummaryDag {
+         &self.dag
+     }
+ 
+     /// Access the active context entries (for inspection in tests).
+-    pub(crate) fn active_entries(&self) -> &[ContextEntry] {
++    pub fn active_entries(&self) -> &[ContextEntry] {
+         &self.active
+     }
++
++    /// Find the oldest contiguous block of raw messages (for testing).
++    pub fn find_oldest_raw_block(&self) -> Option<(usize, usize)> {
++        self.find_oldest_raw_block_impl()
++    }
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -671,21 +708,29 @@ async fn escalated_summary(
+     // Level 1: Preserve details.
+     if let Ok(summary) = compactor.summarize_for_lcm(messages, "preserve_details").await {
+         let tokens = TokenBudget::estimate_str_tokens(&summary);
+-        if tokens < original_tokens {
++        if tokens < original_tokens && !contains_refusal_pattern(&summary) {
+             debug!("LCM escalation: Level 1 succeeded ({} -> {} tokens)", original_tokens, tokens);
+             return (summary, 1);
+         }
+-        debug!("LCM escalation: Level 1 failed (output {} >= input {})", tokens, original_tokens);
++        if contains_refusal_pattern(&summary) {
++            debug!("LCM escalation: Level 1 contained refusal pattern, escalating");
++        } else {
++            debug!("LCM escalation: Level 1 failed (output {} >= input {})", tokens, original_tokens);
++        }
+     }
+ 
+     // Level 2: Bullet points, half the target.
+     if let Ok(summary) = compactor.summarize_for_lcm(messages, "bullet_points").await {
+         let tokens = TokenBudget::estimate_str_tokens(&summary);
+-        if tokens < original_tokens {
++        if tokens < original_tokens && !contains_refusal_pattern(&summary) {
+             debug!("LCM escalation: Level 2 succeeded ({} -> {} tokens)", original_tokens, tokens);
+             return (summary, 2);
+         }
+-        debug!("LCM escalation: Level 2 failed (output {} >= input {})", tokens, original_tokens);
++        if contains_refusal_pattern(&summary) {
++            debug!("LCM escalation: Level 2 contained refusal pattern, escalating");
++        } else {
++            debug!("LCM escalation: Level 2 failed (output {} >= input {})", tokens, original_tokens);
++        }
+     }
+ 
+     // Level 3: Deterministic truncation — guaranteed convergence, no LLM.
+@@ -773,6 +818,47 @@ fn first_sentence(text: &str) -> &str {
+     &trimmed[..end]
+ }
+ 
++/// Check if text contains an LLM refusal pattern.
++///
++/// Refusal patterns indicate the LLM declined to help, which should not
++/// be captured in summaries as it pollutes future context.
++pub fn contains_refusal_pattern(text: &str) -> bool {
++    let lower = text.to_lowercase();
++    let refusal_indicators = [
++        "i cannot",
++        "i can't",
++        "i'm unable",
++        "i am unable",
++        "i apologize",
++        "i'm sorry",
++        "as an ai",
++        "as a language model",
++        "unable to help",
++        "cannot assist",
++        "can't assist",
++        "cannot fulfill",
++        "can't fulfill",
++        "not able to provide",
++        "unable to provide",
++        "i won't",
++        "i will not",
++        "against my guidelines",
++        "violates my",
++        "i'm not comfortable",
++        "i am not comfortable",
++        "ethically",
++        "unethical",
++        "harmful",
++    ];
++    
++    for indicator in &refusal_indicators {
++        if lower.contains(indicator) {
++            return true;
++        }
++    }
++    false
++}
++
+ // ---------------------------------------------------------------------------
+ // LCM Expand Tool
+ // ---------------------------------------------------------------------------
+diff --git a/src/agent/mod.rs b/src/agent/mod.rs
+index 247c4a4..352b644 100644
+--- a/src/agent/mod.rs
++++ b/src/agent/mod.rs
+@@ -26,6 +26,7 @@ pub mod lcm;
+ pub mod learning;
+ pub mod lora_bridge;
+ pub mod memory;
++pub mod markers;
+ pub mod metrics;
+ pub mod model_capabilities;
+ pub mod model_feature_cache;
+diff --git a/src/agent/protocol.rs b/src/agent/protocol.rs
+index 988b2d9..20fdaa7 100644
+--- a/src/agent/protocol.rs
++++ b/src/agent/protocol.rs
+@@ -19,6 +19,11 @@ use serde_json::{json, Value};
+ 
+ use super::turn::{ToolCall, Turn};
+ 
++const CONTINUE_SENTINEL: &str = "Continue.";
++const SYSTEM_NOTICE_PREFIX: &str = "[System notice]";
++const TOOL_RESULT_PREFIX: &str = "[Tool result from";
++const CONTEXT_SUMMARY_PREFIX: &str = "[Context summary]:";
++
+ // ─────────────────────────────────────────────────────────────
+ // Trait
+ // ─────────────────────────────────────────────────────────────
+@@ -100,12 +105,15 @@ impl ConversationProtocol for CloudProtocol {
+                     // Summaries render as assistant messages summarising prior context.
+                     out.push(json!({"role": "assistant", "content": text}));
+                 }
++                Turn::Clear => {
++                    // Clear marker is not rendered - it only affects LCM rebuild.
++                }
+             }
+         }
+ 
+         // Anthropic compat: must not end with assistant.
+         if out.last().map(|m| m["role"] == "assistant").unwrap_or(false) {
+-            out.push(json!({"role": "user", "content": "Continue."}));
++            out.push(json!({"role": "user", "content": CONTINUE_SENTINEL}));
+         }
+ 
+         out
+@@ -125,7 +133,7 @@ impl ConversationProtocol for CloudProtocol {
+ /// Invariants enforced:
+ /// - No `role:tool` — tool results become user messages.
+ /// - No `role:system` after index 0 — mid-thread system turns become user messages.
+-/// - Assistant `tool_calls` are converted to a text summary `"(used tools: name1, name2)"`.
++/// - Assistant `tool_calls` are PRESERVED (LM Studio supports native tool calling).
+ /// - Consecutive same-role messages are merged.
+ /// - Output always ends with `role:user`.
+ pub struct LocalProtocol;
+@@ -141,34 +149,37 @@ impl ConversationProtocol for LocalProtocol {
+             let msg = match turn {
+                 Turn::System { content } => {
+                     // Mid-thread system → user notice.
+-                    json!({"role": "user", "content": format!("[System notice] {}", content)})
++                    json!({"role": "user", "content": format!("{} {}", SYSTEM_NOTICE_PREFIX, content)})
+                 }
+                 Turn::User { content, .. } => {
+                     json!({"role": "user", "content": content})
+                 }
+                 Turn::Assistant { text, tool_calls } => {
+-                    // Convert tool_calls to a compact text summary; no tool_calls field.
+-                    let tool_summary = if tool_calls.is_empty() {
+-                        String::new()
+-                    } else {
+-                        let names: Vec<&str> =
+-                            tool_calls.iter().map(|tc| tc.tool.as_str()).collect();
+-                        format!("(used tools: {})", names.join(", "))
+-                    };
+-                    let content = match text.as_deref() {
+-                        Some(t) if !t.is_empty() && !tool_summary.is_empty() => {
+-                            format!("{}\n{}", t, tool_summary)
+-                        }
+-                        Some(t) if !t.is_empty() => t.to_string(),
+-                        _ if !tool_summary.is_empty() => tool_summary,
+-                        _ => String::new(),
++                    // PRESERVE tool_calls field so model learns proper format.
++                    // LM Studio supports native OpenAI-style tool calling.
++                    let content_val = match text {
++                        Some(t) if !t.is_empty() => Value::String(t.clone()),
++                        _ => Value::Null,
+                     };
+-                    json!({"role": "assistant", "content": content})
++                    if tool_calls.is_empty() {
++                        json!({"role": "assistant", "content": content_val})
++                    } else {
++                        let tc_json: Vec<Value> = tool_calls
++                            .iter()
++                            .map(tool_call_to_openai_json)
++                            .collect();
++                        json!({
++                            "role": "assistant",
++                            "content": content_val,
++                            "tool_calls": tc_json,
++                        })
++                    }
+                 }
+                 Turn::ToolResult { tool, call_id, result, .. } => {
++                    // Tool results become user messages for alternation compliance.
+                     json!({
+                         "role": "user",
+-                        "content": format!("[Tool result from {} ({})]: {}", tool, call_id, result),
++                        "content": format!("{} {} ({})]: {}", TOOL_RESULT_PREFIX, tool, call_id, result),
+                     })
+                 }
+                 Turn::Summary { text, .. } => {
+@@ -176,9 +187,13 @@ impl ConversationProtocol for LocalProtocol {
+                     // assistant-role summaries reliably).
+                     json!({
+                         "role": "user",
+-                        "content": format!("[Context summary]: {}", text),
++                        "content": format!("{} {}", CONTEXT_SUMMARY_PREFIX, text),
+                     })
+                 }
++                Turn::Clear => {
++                    // Clear marker is not rendered - it only affects LCM rebuild.
++                    continue;
++                }
+             };
+             out.push(msg);
+         }
+@@ -188,7 +203,7 @@ impl ConversationProtocol for LocalProtocol {
+ 
+         // Must always end with user.
+         if out.last().map(|m| m["role"] != "user").unwrap_or(true) {
+-            out.push(json!({"role": "user", "content": "Continue."}));
++            out.push(json!({"role": "user", "content": CONTINUE_SENTINEL}));
+         }
+ 
+         out
+@@ -273,6 +288,10 @@ fn merge_consecutive_role(messages: Vec<Value>) -> Vec<Value> {
+             let last_role = last["role"].as_str().unwrap_or("");
+             // Don't merge system messages.
+             if last_role == role && role != "system" {
++                if !is_merge_safe(last, &msg, &role) {
++                    out.push(msg);
++                    continue;
++                }
+                 let last_content = last["content"].as_str().unwrap_or("").to_string();
+                 let merged = if last_content.is_empty() {
+                     content
+@@ -290,6 +309,35 @@ fn merge_consecutive_role(messages: Vec<Value>) -> Vec<Value> {
+     out
+ }
+ 
++fn is_merge_safe(last: &Value, current: &Value, role: &str) -> bool {
++    if role == "assistant" {
++        // Assistant metadata like tool_calls must never be dropped by merge.
++        let last_has_tool_calls = last
++            .get("tool_calls")
++            .and_then(|v| v.as_array())
++            .map(|arr| !arr.is_empty())
++            .unwrap_or(false);
++        let current_has_tool_calls = current
++            .get("tool_calls")
++            .and_then(|v| v.as_array())
++            .map(|arr| !arr.is_empty())
++            .unwrap_or(false);
++        if last_has_tool_calls || current_has_tool_calls {
++            return false;
++        }
++    }
++
++    let last_has_extra_fields = has_non_content_fields(last);
++    let current_has_extra_fields = has_non_content_fields(current);
++    !(last_has_extra_fields || current_has_extra_fields)
++}
++
++fn has_non_content_fields(msg: &Value) -> bool {
++    msg.as_object()
++        .map(|obj| obj.keys().any(|k| k != "role" && k != "content"))
++        .unwrap_or(false)
++}
++
+ // ─────────────────────────────────────────────────────────────
+ // Tests
+ // ─────────────────────────────────────────────────────────────
+@@ -338,11 +386,15 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn local_assistant_has_no_tool_calls_field() {
++    fn local_assistant_preserves_tool_calls() {
+         let wire = LocalProtocol.render("sys", &tool_turns());
+-        for msg in &wire {
+-            if msg["role"] == "assistant" {
+-                assert!(msg.get("tool_calls").is_none());
++        // LocalProtocol now preserves tool_calls for native tool-calling support (LM Studio).
++        let assistant_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "assistant").collect();
++        assert!(!assistant_msgs.is_empty(), "Should have assistant messages");
++        for msg in &assistant_msgs {
++            if msg.get("tool_calls").is_some() {
++                let tc = msg["tool_calls"].as_array().unwrap();
++                assert!(!tc.is_empty(), "tool_calls should not be empty if present");
+             }
+         }
+     }
+@@ -402,4 +454,26 @@ mod tests {
+         assert!(merged[1]["content"].as_str().unwrap().contains("hello"));
+         assert!(merged[1]["content"].as_str().unwrap().contains("world"));
+     }
++
++    #[test]
++    fn merge_consecutive_role_preserves_assistant_tool_call_metadata() {
++        let msgs = vec![
++            json!({"role": "system", "content": "sys"}),
++            json!({
++                "role": "assistant",
++                "content": null,
++                "tool_calls": [{
++                    "id": "tc_1",
++                    "type": "function",
++                    "function": {"name": "read_file", "arguments": "{}"}
++                }]
++            }),
++            json!({"role": "assistant", "content": "Calling tool now"}),
++            json!({"role": "user", "content": "continue"}),
++        ];
++
++        let merged = merge_consecutive_role(msgs);
++        assert_eq!(merged.len(), 4, "assistant entries with metadata must not merge");
++        assert!(merged[1].get("tool_calls").is_some());
++    }
+ }
+diff --git a/src/agent/router.rs b/src/agent/router.rs
+index 5a250c3..560bd84 100644
+--- a/src/agent/router.rs
++++ b/src/agent/router.rs
+@@ -17,10 +17,22 @@ use crate::agent::role_policy::{build_specialist_system_prompt, parse_specialist
+ use crate::agent::router_fallback;
+ use crate::agent::tool_guard::ToolGuard;
+ use crate::agent::toolplan::{self, ToolPlanAction};
++use crate::agent::markers::{
++    TOOL_ANALYSIS_FULL_OUTPUT_MARKER, TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
++};
+ use crate::agent::tools::registry::ToolRegistry;
+ use crate::providers::base::{LLMProvider, ToolCallRequest};
+ use super::trace_store::{RouterDecisionTrace, append_router_decision_trace};
+ 
++const ROUTER_MAX_TOKENS: u32 = 256;
++const ROUTER_SUSPICIOUS_TARGET_MAX_LEN: usize = 96;
++const ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS: usize = 220;
++const ROUTER_USER_MSG_TRACE_PREVIEW_CHARS: usize = 80;
++const ROUTER_TAIL_MAX_PAIRS: usize = 5;
++const ROUTER_TAIL_MAX_MSG_CHARS: usize = 200;
++const ROUTER_TAIL_MAX_CHARS: usize = 800;
++const SCRATCH_PAD_LOOKBACK_MESSAGES: usize = 10;
++
+ /// Per-domain ring buffer for specialist multi-turn memory.
+ /// Stores compressed summaries of past specialist outputs so subsequent
+ /// specialist calls in the same domain can build on prior analysis.
+@@ -85,15 +97,16 @@ impl Default for SpecialistMemory {
+ /// Search backwards through recent messages for a scratch pad summary.
+ /// Returns the summary text if found, otherwise None.
+ pub fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String> {
+-    for msg in messages.iter().rev().take(10) {
++    for msg in messages.iter().rev().take(SCRATCH_PAD_LOOKBACK_MESSAGES) {
+         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+         if content.is_empty() {
+             continue;
+         }
+         // Standalone summary from tool_engine.rs line 327: "[tool runner summary] ..."
+-        if role == "user" && content.starts_with("[tool runner summary] ") {
+-            if let Some(rest) = content.strip_prefix("[tool runner summary] ") {
++        if role == "user" && content.starts_with(TOOL_RUNNER_SUMMARY_PREFIX) {
++            if let Some(rest) = content.strip_prefix(TOOL_RUNNER_SUMMARY_PREFIX) {
++                let rest = rest.trim_start();
+                 let s = rest.trim().to_string();
+                 if !s.is_empty() {
+                     return Some(s);
+@@ -101,10 +114,11 @@ pub fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String
+             }
+         }
+         // Inline summary from tool_engine.rs line 267: "[Tool analysis summary]\n..."
+-        if role == "tool" && content.starts_with("[Tool analysis summary]\n") {
+-            if let Some(rest) = content.strip_prefix("[Tool analysis summary]\n") {
++        if role == "tool" && content.starts_with(TOOL_ANALYSIS_SUMMARY_PREFIX) {
++            if let Some(rest) = content.strip_prefix(TOOL_ANALYSIS_SUMMARY_PREFIX) {
++                let rest = rest.trim_start_matches('\n');
+                 let summary = rest
+-                    .split("\n\n[Full output:")
++                    .split(TOOL_ANALYSIS_FULL_OUTPUT_MARKER)
+                     .next()
+                     .unwrap_or(rest)
+                     .trim()
+@@ -406,8 +420,12 @@ pub async fn request_strict_router_decision(
+         }
+     }
+ 
+-    // Build user content with optional /no_think prefix for Nemotron-Orchestrator-8B
+-    let user_content = if no_think {
++    // Build user content with optional /no_think prefix, but only for
++    // models that actually require template-level no_think handling.
++    let model_needs_no_think_prefix =
++        crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new())
++            .needs_native_lms_api;
++    let user_content = if no_think && model_needs_no_think_prefix {
+         format!(" /no_think\n{}", router_pack)
+     } else {
+         router_pack.to_string()
+@@ -463,7 +481,15 @@ pub async fn request_strict_router_decision(
+         }),
+     ];
+     if let Ok(tool_resp) = provider
+-        .chat(&tool_messages, Some(&tool_defs), Some(model), 256, temperature, None, Some(top_p))
++        .chat(
++            &tool_messages,
++            Some(&tool_defs),
++            Some(model),
++            ROUTER_MAX_TOKENS,
++            temperature,
++            None,
++            Some(top_p),
++        )
+         .await
+     {
+         if let Some(tc) = tool_resp.tool_calls.first() {
+@@ -510,7 +536,15 @@ pub async fn request_strict_router_decision(
+     ];
+ 
+     let router_resp = provider
+-        .chat(&router_messages, None, Some(model), 256, temperature, None, Some(top_p))
++        .chat(
++            &router_messages,
++            None,
++            Some(model),
++            ROUTER_MAX_TOKENS,
++            temperature,
++            None,
++            Some(top_p),
++        )
+         .await
+         .map_err(|e| format!("strict router call failed: {}", e))?;
+     let raw_router_content = router_resp.content.unwrap_or_default();
+@@ -530,7 +564,7 @@ pub async fn request_strict_router_decision(
+         Ok(mut decision) => {
+             let suspicious = raw.contains('|')
+                 || decision.target.contains("\"target\"")
+-                || decision.target.len() > 96;
++                || decision.target.len() > ROUTER_SUSPICIOUS_TARGET_MAX_LEN;
+             if suspicious {
+                 if let Some(from_pack) = parse_router_directive_pack(router_pack) {
+                     decision = from_pack;
+@@ -551,7 +585,9 @@ pub async fn request_strict_router_decision(
+             Err(format!(
+                 "strict router parse failed: {}. raw={}",
+                 e,
+-                raw.chars().take(220).collect::<String>()
++                raw.chars()
++                    .take(ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS)
++                    .collect::<String>()
+             ))
+         }
+     }
+@@ -607,7 +643,12 @@ pub(crate) async fn dispatch_specialist(
+         "Target: {}\nRouter args: {}\nUser intent: {}",
+         target, router_args, context_summary
+     );
+-    let conv_tail = build_conversation_tail(messages, 5, 200, 800);
++    let conv_tail = build_conversation_tail(
++        messages,
++        ROUTER_TAIL_MAX_PAIRS,
++        ROUTER_TAIL_MAX_MSG_CHARS,
++        ROUTER_TAIL_MAX_CHARS,
++    );
+     let specialist_pack = if core.tool_delegation_config.role_scoped_context_packs {
+         role_policy::build_context_pack(
+             role_policy::Role::Specialist,
+@@ -766,7 +807,11 @@ pub(crate) enum PreflightResult {
+     name = "router_preflight",
+     skip(ctx, health_registry),
+     fields(
+-        user_msg = %ctx.user_content.chars().take(80).collect::<String>(),
++        user_msg = %ctx
++            .user_content
++            .chars()
++            .take(ROUTER_USER_MSG_TRACE_PREVIEW_CHARS)
++            .collect::<String>(),
+         routing_decision = tracing::field::Empty,
+     )
+ )]
+@@ -835,7 +880,12 @@ pub(crate) async fn router_preflight(
+     } else {
+         ctx.tools.tool_names()
+     };
+-    let conv_tail = build_conversation_tail(&ctx.messages, 5, 200, 800);
++    let conv_tail = build_conversation_tail(
++        &ctx.messages,
++        ROUTER_TAIL_MAX_PAIRS,
++        ROUTER_TAIL_MAX_MSG_CHARS,
++        ROUTER_TAIL_MAX_CHARS,
++    );
+     let task_state = if conv_tail.is_empty() {
+         format!("Strict preflight.\nUser message: {}", ctx.user_content)
+     } else {
+@@ -1115,7 +1165,12 @@ pub(crate) async fn route_tool_calls(
+                 .collect::<Vec<_>>()
+                 .join(", ")
+         );
+-        let conv_tail = build_conversation_tail(&ctx.messages, 5, 200, 800);
++        let conv_tail = build_conversation_tail(
++            &ctx.messages,
++            ROUTER_TAIL_MAX_PAIRS,
++            ROUTER_TAIL_MAX_MSG_CHARS,
++            ROUTER_TAIL_MAX_CHARS,
++        );
+         let router_pack = if ctx.core.tool_delegation_config.role_scoped_context_packs {
+             role_policy::build_context_pack(
+                 role_policy::Role::Router,
+@@ -2164,4 +2219,3 @@ mod tests {
+         assert!(!ctx.contains("truncated"));
+     }
+ }
+-
+diff --git a/src/agent/thread_repair.rs b/src/agent/thread_repair.rs
+index e27b570..dd6b7eb 100644
+--- a/src/agent/thread_repair.rs
++++ b/src/agent/thread_repair.rs
+@@ -30,6 +30,9 @@ static STRIP_INTENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+         .expect("Invalid intent pattern regex")
+ });
+ 
++const SYSTEM_NOTICE_PREFIX: &str = "[System notice]";
++const TOOL_RESULT_PREFIX: &str = "[Tool result from";
++
+ /// Repair protocol violations in a message array.
+ ///
+ /// Fixes:
+@@ -358,7 +361,7 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
+             .to_string();
+         *msg = json!({
+             "role": "user",
+-            "content": format!("[System notice] {}", content)
++            "content": format!("{} {}", SYSTEM_NOTICE_PREFIX, content)
+         });
+     }
+ 
+@@ -428,7 +431,7 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
+ 
+         *msg = json!({
+             "role": "user",
+-            "content": format!("[Tool result from {} ({})]: {}", tool_name, call_id, content)
++            "content": format!("{} {} ({})]: {}", TOOL_RESULT_PREFIX, tool_name, call_id, content)
+         });
+     }
+ 
+@@ -1088,7 +1091,7 @@ mod tests {
+                     && m.get("content")
+                         .and_then(|c| c.as_str())
+                         .unwrap_or("")
+-                        .contains("[System notice]")
++                        .contains(SYSTEM_NOTICE_PREFIX)
+             }),
+             "Expected converted system notice as user message"
+         );
+diff --git a/src/agent/tool_engine.rs b/src/agent/tool_engine.rs
+index c8fb861..fe55055 100644
+--- a/src/agent/tool_engine.rs
++++ b/src/agent/tool_engine.rs
+@@ -11,6 +11,9 @@ use tracing::{debug, info, instrument, warn};
+ use crate::agent::agent_core::RuntimeCounters;
+ use crate::agent::audit::ToolEvent;
+ use crate::agent::context::ContextBuilder;
++use crate::agent::markers::{
++    TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_OUTPUT_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
++};
+ use crate::agent::role_policy;
+ use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
+ use crate::providers::base::{LLMResponse, ToolCallRequest};
+@@ -18,6 +21,8 @@ use std::sync::Arc;
+ 
+ use super::agent_loop::TurnContext;
+ 
++const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
++
+ /// Execute tool calls via the delegation (tool-runner) path.
+ ///
+ /// Returns `true` if delegation was used (caller should `continue` the main loop).
+@@ -261,11 +266,12 @@ pub(crate) async fn execute_tools_delegated(
+ 
+         let injected = if let Some(ref summary) = run_result.summary {
+             // Summary exists from scratch-pad analysis.
+-            if full_tokens > 500 {
++            if full_tokens > LARGE_TOOL_RESULT_TOKEN_THRESHOLD {
+                 // Large data + good summary available: use the summary so compaction
+                 // can never destroy the content by proportional truncation.
+                 format!(
+-                    "[Tool analysis summary]\n{}\n\n[Full output: {} chars, cached in context store]",
++                    "{}\n{}\n\n[Full output: {} chars, cached in context store]",
++                    TOOL_ANALYSIS_SUMMARY_PREFIX,
+                     summary,
+                     full_data.len()
+                 )
+@@ -273,7 +279,9 @@ pub(crate) async fn execute_tools_delegated(
+                 // Small data — raw injection is safe; compaction won't truncate it.
+                 ctx.content_gate.admit_simple(full_data).into_text()
+             }
+-        } else if ctx.core.specialist_provider.is_some() && full_tokens > 500 {
++        } else if ctx.core.specialist_provider.is_some()
++            && full_tokens > LARGE_TOOL_RESULT_TOKEN_THRESHOLD
++        {
+             ctx.content_gate
+                 .admit_with_specialist(
+                     full_data,
+@@ -325,9 +333,9 @@ pub(crate) async fn execute_tools_delegated(
+         };
+         if !summary_text.is_empty() {
+             let prefix = if verbatim {
+-                "[tool runner output]"
++                TOOL_RUNNER_OUTPUT_PREFIX
+             } else {
+-                "[tool runner summary]"
++                TOOL_RUNNER_SUMMARY_PREFIX
+             };
+             ctx.messages.push(json!({
+                 "role": "user",
+diff --git a/src/agent/tools/filesystem.rs b/src/agent/tools/filesystem.rs
+index 7c4a4b7..117e2c9 100644
+--- a/src/agent/tools/filesystem.rs
++++ b/src/agent/tools/filesystem.rs
+@@ -1,7 +1,7 @@
+ //! File system tools: read, write, edit, list.
+ 
+ use std::collections::HashMap;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ 
+ use async_trait::async_trait;
+ 
+@@ -47,7 +47,7 @@ impl Tool for ReadFileTool {
+             None => return "Error: 'path' parameter is required".to_string(),
+         };
+ 
+-        let file_path = expand_path(path);
++        let file_path = resolve_read_path(path);
+ 
+         if !file_path.exists() {
+             return format!("Error: File not found: {}. Hint: verify the path exists. Use list_dir to browse the directory.", path);
+@@ -423,16 +423,54 @@ fn expand_path(path: &str) -> PathBuf {
+         if p.is_absolute() {
+             p
+         } else {
+-            // Resolve relative paths against the workspace directory.
++            // Resolve relative paths against the shell working directory first
++            // (matches exec/pwd behavior), then fall back to workspace for
++            // memory/bootstrap convenience.
++            let cwd = std::env::current_dir().ok();
++            let workspace = crate::utils::helpers::get_workspace_path(None);
++            resolve_relative_path(&p, cwd.as_deref(), &workspace)
++        }
++    }
++}
++
++fn resolve_read_path(path: &str) -> PathBuf {
++    let expanded = expand_path(path);
++    if expanded.exists() {
++        return expanded;
++    }
++
++    // SLMs sometimes hallucinate an absolute path under ~/.nanobot/workspace
++    // even when CWD is a repository root. If that exact workspace-prefixed path
++    // does not exist, map the relative tail onto CWD for read-only resolution.
++    if expanded.is_absolute() {
++        if let Ok(cwd) = std::env::current_dir() {
+             let workspace = crate::utils::helpers::get_workspace_path(None);
+-            let resolved = workspace.join(&p);
+-            if resolved.exists() {
+-                resolved
+-            } else {
+-                p // fall back to CWD-relative (original behavior)
++            if let Ok(rel) = expanded.strip_prefix(&workspace) {
++                let cwd_candidate = cwd.join(rel);
++                if cwd_candidate.exists() {
++                    return cwd_candidate;
++                }
+             }
+         }
+     }
++
++    expanded
++}
++
++fn resolve_relative_path(relative: &Path, cwd: Option<&Path>, workspace: &Path) -> PathBuf {
++    if let Some(cwd_path) = cwd {
++        let cwd_resolved = cwd_path.join(relative);
++        if cwd_resolved.exists() {
++            return cwd_resolved;
++        }
++    }
++
++    let workspace_resolved = workspace.join(relative);
++    if workspace_resolved.exists() {
++        return workspace_resolved;
++    }
++
++    relative.to_path_buf()
+ }
+ 
+ #[cfg(test)]
+@@ -457,6 +495,53 @@ mod tests {
+         assert_eq!(result, PathBuf::from("foo/bar.txt"));
+     }
+ 
++    #[test]
++    fn test_resolve_relative_path_prefers_cwd() {
++        let tmp = TempDir::new().unwrap();
++        let cwd = tmp.path().join("cwd");
++        let ws = tmp.path().join("workspace");
++        std::fs::create_dir_all(&cwd).unwrap();
++        std::fs::create_dir_all(&ws).unwrap();
++        std::fs::write(cwd.join("note.txt"), "from-cwd").unwrap();
++        std::fs::write(ws.join("note.txt"), "from-workspace").unwrap();
++
++        let out = resolve_relative_path(Path::new("note.txt"), Some(&cwd), &ws);
++        assert_eq!(out, cwd.join("note.txt"));
++    }
++
++    #[test]
++    fn test_resolve_relative_path_falls_back_to_workspace() {
++        let tmp = TempDir::new().unwrap();
++        let cwd = tmp.path().join("cwd");
++        let ws = tmp.path().join("workspace");
++        std::fs::create_dir_all(&cwd).unwrap();
++        std::fs::create_dir_all(&ws).unwrap();
++        std::fs::write(ws.join("note.txt"), "from-workspace").unwrap();
++
++        let out = resolve_relative_path(Path::new("note.txt"), Some(&cwd), &ws);
++        assert_eq!(out, ws.join("note.txt"));
++    }
++
++    #[test]
++    fn test_resolve_read_path_maps_missing_workspace_prefixed_file_to_cwd() {
++        let tmp = TempDir::new().unwrap();
++        let cwd = tmp.path().join("repo");
++        std::fs::create_dir_all(&cwd).unwrap();
++        let name = "__unit_workspace_alias_resolution__.md";
++        std::fs::write(cwd.join(name), "repo-arch").unwrap();
++
++        let original_cwd = std::env::current_dir().unwrap();
++        std::env::set_current_dir(&cwd).unwrap();
++
++        let input = crate::utils::helpers::get_workspace_path(None).join(name);
++        let out = resolve_read_path(input.to_str().unwrap());
++
++        std::env::set_current_dir(original_cwd).unwrap();
++        let out_canon = std::fs::canonicalize(out).unwrap();
++        let expected_canon = std::fs::canonicalize(cwd.join(name)).unwrap();
++        assert_eq!(out_canon, expected_canon);
++    }
++
+     #[test]
+     fn test_expand_path_tilde() {
+         let result = expand_path("~");
+diff --git a/src/agent/tools/registry.rs b/src/agent/tools/registry.rs
+index 99e7946..9d2401f 100644
+--- a/src/agent/tools/registry.rs
++++ b/src/agent/tools/registry.rs
+@@ -42,7 +42,7 @@ impl ToolConfig {
+             workspace: workspace.to_path_buf(),
+             exec_timeout: 30,
+             restrict_to_workspace: false,
+-            max_tool_result_chars: 30_000,
++            max_tool_result_chars: crate::config::schema::DEFAULT_MAX_TOOL_RESULT_CHARS,
+             brave_api_key: None,
+             read_only: false,
+             tools_filter: None,
+@@ -266,7 +266,11 @@ impl ToolRegistry {
+             let exec_cwd = config
+                 .exec_working_dir
+                 .clone()
+-                .unwrap_or_else(|| config.workspace.to_string_lossy().to_string());
++                .unwrap_or_else(|| {
++                    std::env::current_dir()
++                        .map(|p| p.to_string_lossy().to_string())
++                        .unwrap_or_else(|_| config.workspace.to_string_lossy().to_string())
++                });
+             self.register(Box::new(ExecTool::new(
+                 config.exec_timeout,
+                 Some(exec_cwd),
+@@ -766,6 +770,15 @@ mod tests {
+         assert_eq!(registry.len(), 0);
+     }
+ 
++    #[test]
++    fn test_tool_config_new_uses_global_default_max_tool_result_chars() {
++        let cfg = ToolConfig::new(std::path::Path::new("/tmp"));
++        assert_eq!(
++            cfg.max_tool_result_chars,
++            crate::config::schema::DEFAULT_MAX_TOOL_RESULT_CHARS
++        );
++    }
++
+     #[test]
+     fn test_register_tool() {
+         let mut registry = ToolRegistry::new();
+diff --git a/src/agent/turn.rs b/src/agent/turn.rs
+index 63da270..6304916 100644
+--- a/src/agent/turn.rs
++++ b/src/agent/turn.rs
+@@ -87,6 +87,10 @@ pub enum Turn {
+         /// Compaction level (1 = preserve_details, 2 = bullet_points, 3 = deterministic).
+         level: u8,
+     },
++
++    /// A clear marker appended by `/clear` command.
++    /// LCM rebuild ignores everything before the last clear marker.
++    Clear,
+ }
+ 
+ impl Turn {
+@@ -105,6 +109,11 @@ impl Turn {
+         matches!(self, Turn::Summary { .. })
+     }
+ 
++    /// Returns true if this is a clear marker (from `/clear` command).
++    pub fn is_clear(&self) -> bool {
++        matches!(self, Turn::Clear)
++    }
++
+     /// Returns the assistant text content, if any.
+     pub fn assistant_text(&self) -> Option<&str> {
+         if let Turn::Assistant { text, .. } = self {
+@@ -225,6 +234,10 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
+                 .unwrap_or(1);
+             Some(Turn::Summary { text, source_ids, level })
+         }
++        "clear" => {
++            // Clear marker from /clear command.
++            Some(Turn::Clear)
++        }
+         _ => None,
+     }
+ }
+diff --git a/src/config/schema.rs b/src/config/schema.rs
+index 397450b..d382f00 100644
+--- a/src/config/schema.rs
++++ b/src/config/schema.rs
+@@ -267,8 +267,10 @@ fn default_max_concurrent_chats() -> usize {
+     4
+ }
+ 
++pub const DEFAULT_MAX_TOOL_RESULT_CHARS: usize = 10_000;
++
+ fn default_max_tool_result_chars() -> usize {
+-    10_000
++    DEFAULT_MAX_TOOL_RESULT_CHARS
+ }
+ 
+ fn default_lms_port() -> u16 {
+@@ -1930,6 +1932,15 @@ mod tests {
+         assert_eq!(cfg.agents.defaults.local_max_context_tokens, 32768);
+     }
+ 
++    #[test]
++    fn test_max_tool_result_chars_default_constant() {
++        let cfg = Config::default();
++        assert_eq!(
++            cfg.agents.defaults.max_tool_result_chars,
++            DEFAULT_MAX_TOOL_RESULT_CHARS
++        );
++    }
++
+     // -- ModelEndpoint + TrioConfig endpoint tests --
+ 
+     #[test]
+diff --git a/src/lms.rs b/src/lms.rs
+index e11cac2..9a209a5 100644
+--- a/src/lms.rs
++++ b/src/lms.rs
+@@ -161,10 +161,57 @@ pub(crate) async fn load_model(
+ ) -> Result<(), String> {
+     // Check if already loaded
+     let loaded = list_loaded(port).await;
+-    if loaded.iter().any(|m| m == model || m.contains(model) || model.contains(m)) {
++    if should_skip_load(&loaded, model, context_length) {
+         return Ok(());
+     }
+ 
++    post_load_model(port, model, context_length).await
++}
++
++/// Reload a model with a specific context length.
++///
++/// Unlike `load_model`, this forces a reload when the model is already loaded,
++/// so context-size changes actually take effect.
++pub(crate) async fn reload_model_with_context(
++    port: u16,
++    model: &str,
++    context_length: usize,
++) -> Result<(), String> {
++    let loaded = list_loaded(port).await;
++    for loaded_model in loaded.iter().filter(|m| model_matches(m, model)) {
++        if let Err(e) = unload_model(port, loaded_model).await {
++            tracing::warn!(
++                "lms unload before reload failed: model={} loaded_model={} error={}",
++                model,
++                loaded_model,
++                e
++            );
++        }
++    }
++
++    post_load_model(port, model, Some(context_length)).await
++}
++
++fn model_matches(loaded: &str, model: &str) -> bool {
++    loaded == model || loaded.contains(model) || model.contains(loaded)
++}
++
++fn should_skip_load(loaded: &[String], model: &str, context_length: Option<usize>) -> bool {
++    // If caller requests a specific context length, we must NOT skip because
++    // context changes require an explicit reload.
++    if context_length.is_some() {
++        return false;
++    }
++
++    loaded.iter().any(|m| model_matches(m, model))
++}
++
++async fn post_load_model(
++    port: u16,
++    model: &str,
++    context_length: Option<usize>,
++) -> Result<(), String> {
++
+     let url = format!("{}/api/v1/models/load", rest_base(port));
+     let mut body = serde_json::json!({ "model": model });
+     if let Some(ctx) = context_length {
+@@ -427,6 +474,55 @@ async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
+ mod tests {
+     use super::*;
+ 
++    async fn fetch_loaded_context_length(port: u16, model: &str) -> Option<usize> {
++        let url = format!("{}/api/v1/models", rest_base(port));
++        let resp = reqwest::get(&url).await.ok()?;
++        if !resp.status().is_success() {
++            return None;
++        }
++        let json: serde_json::Value = resp.json().await.ok()?;
++        let models = json.get("models")?.as_array()?;
++        for m in models {
++            let key = m.get("key")?.as_str()?;
++            if !model_matches(key, model) {
++                continue;
++            }
++            let instances = m.get("loaded_instances")?.as_array()?;
++            if instances.is_empty() {
++                return None;
++            }
++            return instances
++                .iter()
++                .find_map(|inst| {
++                    inst.get("config")
++                        .and_then(|c| c.get("context_length"))
++                        .and_then(|v| v.as_u64())
++                        .map(|n| n as usize)
++                });
++        }
++        None
++    }
++
++    async fn fetch_max_context_length(port: u16, model: &str) -> Option<usize> {
++        let url = format!("{}/api/v1/models", rest_base(port));
++        let resp = reqwest::get(&url).await.ok()?;
++        if !resp.status().is_success() {
++            return None;
++        }
++        let json: serde_json::Value = resp.json().await.ok()?;
++        let models = json.get("models")?.as_array()?;
++        for m in models {
++            let key = m.get("key")?.as_str()?;
++            if model_matches(key, model) {
++                return m
++                    .get("max_context_length")
++                    .and_then(|v| v.as_u64())
++                    .map(|n| n as usize);
++            }
++        }
++        None
++    }
++
+     // -- is_model_available tests --
+ 
+     #[test]
+@@ -552,4 +648,83 @@ mod tests {
+         assert_eq!(strip_match_suffixes("model-it"), "model");
+         assert_eq!(strip_match_suffixes("plain-model"), "plain-model");
+     }
++
++    #[test]
++    fn test_should_skip_load_when_loaded_and_no_context_requested() {
++        let loaded = vec!["qwen2.5-coder-7b-instruct-mlx".to_string()];
++        assert!(should_skip_load(
++            &loaded,
++            "qwen2.5-coder-7b-instruct-mlx",
++            None
++        ));
++    }
++
++    #[test]
++    fn test_should_not_skip_load_when_context_requested() {
++        let loaded = vec!["qwen2.5-coder-7b-instruct-mlx".to_string()];
++        assert!(!should_skip_load(
++            &loaded,
++            "qwen2.5-coder-7b-instruct-mlx",
++            Some(6144)
++        ));
++    }
++
++    #[test]
++    fn test_model_matches_supports_fuzzy_key_matching() {
++        assert!(model_matches(
++            "qwen/qwen3-4b-thinking-2507",
++            "qwen3-4b-thinking-2507"
++        ));
++        assert!(model_matches(
++            "qwen3-4b-thinking-2507",
++            "qwen/qwen3-4b-thinking-2507"
++        ));
++    }
++
++    #[tokio::test]
++    #[ignore = "requires running LM Studio server and loaded model"]
++    async fn test_reload_model_with_context_updates_loaded_instance_context_live() {
++        let port: u16 = std::env::var("NANOBOT_TEST_LMS_PORT")
++            .ok()
++            .and_then(|s| s.parse().ok())
++            .unwrap_or(1234);
++        let model = std::env::var("NANOBOT_TEST_LOCAL_MODEL")
++            .unwrap_or_else(|_| "qwen/qwen3-4b-thinking-2507".to_string());
++
++        let max_ctx = fetch_max_context_length(port, &model)
++            .await
++            .expect("model not found on LM Studio /api/v1/models");
++
++        let target_a = 4096.min(max_ctx).max(2048);
++        let target_b = 6144.min(max_ctx).max(2048);
++        let original = fetch_loaded_context_length(port, &model).await;
++
++        reload_model_with_context(port, &model, target_a)
++            .await
++            .expect("failed to reload model at target_a context");
++        let observed_a = fetch_loaded_context_length(port, &model)
++            .await
++            .expect("model not loaded after target_a reload");
++        assert_eq!(
++            observed_a, target_a,
++            "LM Studio loaded_instances context_length mismatch after first reload"
++        );
++
++        if target_b != target_a {
++            reload_model_with_context(port, &model, target_b)
++                .await
++                .expect("failed to reload model at target_b context");
++            let observed_b = fetch_loaded_context_length(port, &model)
++                .await
++                .expect("model not loaded after target_b reload");
++            assert_eq!(
++                observed_b, target_b,
++                "LM Studio loaded_instances context_length mismatch after second reload"
++            );
++        }
++
++        if let Some(orig_ctx) = original {
++            let _ = reload_model_with_context(port, &model, orig_ctx).await;
++        }
++    }
+ }
+diff --git a/src/repl/commands.rs b/src/repl/commands.rs
+index 596530a..38aef52 100644
+--- a/src/repl/commands.rs
++++ b/src/repl/commands.rs
+@@ -813,8 +813,8 @@ impl ReplContext {
+             .get_context(&self.session_id, 1)
+             .is_empty();
+         core.working_memory.clear(&self.session_id);
+-        // Also clear conversation history so the next turn starts fresh.
+         core.sessions.clear_history(&self.session_id).await;
++        self.agent_loop.clear_lcm_engine(&self.session_id).await;
+         if had_content {
+             println!("\n  Working memory and conversation cleared for session: {}\n", self.session_id);
+         } else {
+@@ -1424,7 +1424,7 @@ impl ReplContext {
+             if !model_name.is_empty() {
+                 print!("  Reloading {} with {}K context... ", model_name, new_ctx / 1024);
+                 io::stdout().flush().ok();
+-                match crate::lms::load_model(lms_port, &model_name, Some(new_ctx)).await {
++                match crate::lms::reload_model_with_context(lms_port, &model_name, new_ctx).await {
+                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                 }
+diff --git a/src/repl/mod.rs b/src/repl/mod.rs
+index 57014da..b5f7e53 100644
+--- a/src/repl/mod.rs
++++ b/src/repl/mod.rs
+@@ -8,6 +8,7 @@ mod commands;
+ mod incremental;
+ 
+ use std::io::{self, IsTerminal, Write as _};
++use std::collections::BTreeSet;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Arc;
+ use std::time::{Duration, Instant};
+@@ -131,6 +132,81 @@ fn extract_tool_context(tool_name: &str, result_data: &str) -> String {
+     }
+ }
+ 
++async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
++    let base = config.agents.defaults.local_api_base.trim();
++    if base.is_empty() {
++        return;
++    }
++    let native = base.trim_end_matches('/').trim_end_matches("/v1");
++    let url = format!("{}/api/v1/models/load", native);
++
++    let mut models: Vec<(String, Option<usize>)> = Vec::new();
++    if !main_model.trim().is_empty() {
++        models.push((
++            main_model.trim().to_string(),
++            Some(config.agents.defaults.local_max_context_tokens),
++        ));
++    }
++
++    let role_models_enabled = config.trio.enabled
++        || commands::should_auto_activate_trio(
++            true,
++            &config.trio.router_model,
++            &config.trio.specialist_model,
++            config.trio.router_endpoint.is_some(),
++            config.trio.specialist_endpoint.is_some(),
++            &config.tool_delegation.mode,
++        );
++
++    if role_models_enabled {
++        if !config.trio.router_model.trim().is_empty() {
++            models.push((
++                config.trio.router_model.trim().to_string(),
++                Some(config.trio.router_ctx_tokens),
++            ));
++        }
++        if !config.trio.specialist_model.trim().is_empty() {
++            models.push((
++                config.trio.specialist_model.trim().to_string(),
++                Some(config.trio.specialist_ctx_tokens),
++            ));
++        }
++    }
++
++    if config.lcm.enabled {
++        if let Some(ref ep) = config.lcm.compaction_endpoint {
++            if !ep.model.trim().is_empty() {
++                models.push((ep.model.trim().to_string(), Some(config.lcm.compaction_context_size)));
++            }
++        }
++    }
++
++    let mut seen = BTreeSet::new();
++    let client = reqwest::Client::new();
++    for (model, ctx) in models {
++        if !seen.insert(model.clone()) {
++            continue;
++        }
++        let mut body = serde_json::json!({ "model": model });
++        if let Some(c) = ctx {
++            body["context_length"] = serde_json::json!(c);
++        }
++        match client.post(&url).json(&body).send().await {
++            Ok(resp) if resp.status().is_success() => {
++                info!(model = %body["model"].as_str().unwrap_or(""), "remote_lms_prewarm_ok");
++            }
++            Ok(resp) => {
++                let status = resp.status();
++                let text = resp.text().await.unwrap_or_default();
++                warn!(model = %body["model"].as_str().unwrap_or(""), %status, body = %text, "remote_lms_prewarm_failed");
++            }
++            Err(e) => {
++                warn!(model = %body["model"].as_str().unwrap_or(""), error = %e, "remote_lms_prewarm_error");
++            }
++        }
++    }
++}
++
+ /// Parse a `/ctx` argument into a byte count.
+ ///
+ /// Accepts:
+@@ -1039,6 +1115,12 @@ pub(crate) fn cmd_agent(
+         // Recompute has_remote_local after potential lms setup
+         let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
+ 
++        // Remote LM Studio base: proactively prewarm main/router/specialist models
++        // to avoid first-turn latency spikes from JIT loading.
++        if is_local && has_remote_local && !srv.lms_managed {
++            prewarm_remote_lms_models(&config, &local_model_name).await;
++        }
++
+         // Auto-activate trio mode for local sessions when both router and
+         // specialist models are configured.  The downgrade block below will
+         // revert strict flags if the router turns out to be unreachable.
+diff --git a/src/session/manager.rs b/src/session/manager.rs
+index eb061cd..052d5b8 100644
+--- a/src/session/manager.rs
++++ b/src/session/manager.rs
+@@ -72,10 +72,20 @@ impl Session {
+             0
+         };
+ 
++        // Respect logical session clears: ignore everything before the most
++        // recent clear marker. We keep markers on disk for append-only audit,
++        // but runtime history must start fresh after /clear.
++        let clear_start = self
++            .messages
++            .iter()
++            .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("clear"))
++            .map(|i| i + 1)
++            .unwrap_or(0);
++
+         // Advance past any orphaned tool results at the window boundary.
+         // A tool result at the boundary is orphaned because its matching
+         // assistant+tool_calls message was before the window and got dropped.
+-        let mut safe_start = start;
++        let mut safe_start = start.max(clear_start);
+         while safe_start < self.messages.len() {
+             let role = self.messages[safe_start]
+                 .get("role")
+@@ -109,6 +119,8 @@ impl Session {
+             .filter(|m| {
+                 // Skip synthetic router/specialist injections — ephemeral to the turn they were created
+                 !m.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false)
++                    // Skip clear markers in the runtime wire history.
++                    && m.get("role").and_then(|v| v.as_str()) != Some("clear")
+             })
+             .map(|m| {
+                 let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+@@ -294,12 +306,35 @@ impl SessionManager {
+ 
+     /// Clear the in-memory message history for a session key.
+     ///
+-    /// Only clears the cache — the JSONL file on disk is preserved as an
+-    /// audit trail. The next turn will start with an empty conversation.
++    /// Appends a clear marker to the JSONL file. The LCM rebuild respects
++    /// this marker and ignores everything before it. This preserves the
++    /// append-only property while logically clearing the conversation.
+     pub async fn clear_history(&self, key: &str) {
++        let clear_marker = json!({
++            "role": "clear",
++            "timestamp": chrono::Utc::now().to_rfc3339(),
++        });
++        
++        // Append clear marker to the JSONL file.
++        let path = Self::session_path(key, &self.sessions_dir);
++        if let Err(e) = fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(&path)
++            .and_then(|mut f| {
++                use std::io::Write;
++                writeln!(f, "{}", clear_marker)
++            })
++        {
++            warn!("Failed to append clear marker to {}: {}", path.display(), e);
++        }
++        
++        // Clear in-memory cache and add the clear marker so LCM sees it.
+         let mut cache = self.cache.lock().await;
+         if let Some(session) = cache.get_mut(key) {
+             session.messages.clear();
++            session.messages.push(clear_marker);
++            session.updated_at = Local::now();
+         }
+     }
+ 
+@@ -879,4 +914,32 @@ mod tests {
+         assert_eq!(history[2]["content"], "follow up");
+         assert_eq!(history[3]["content"], "follow up answer");
+     }
++
++    #[test]
++    fn test_get_history_respects_last_clear_marker() {
++        let mut session = Session::new("test_clear_marker");
++        session.messages.push(json!({"role": "user", "content": "old question"}));
++        session
++            .messages
++            .push(json!({"role": "assistant", "content": "old answer"}));
++        session
++            .messages
++            .push(json!({"role": "clear", "timestamp": Local::now().to_rfc3339()}));
++        session
++            .messages
++            .push(json!({"role": "user", "content": "new question"}));
++        session
++            .messages
++            .push(json!({"role": "assistant", "content": "new answer"}));
++
++        let history = session.get_history(100, 0);
++        assert_eq!(history.len(), 2);
++        assert_eq!(history[0]["content"], "new question");
++        assert_eq!(history[1]["content"], "new answer");
++        assert!(
++            history
++                .iter()
++                .all(|m| m.get("role").and_then(|r| r.as_str()) != Some("clear"))
++        );
++    }
+ }
+diff --git a/tests/protocol_tests.rs b/tests/protocol_tests.rs
+index 6d62706..8009b85 100644
+--- a/tests/protocol_tests.rs
++++ b/tests/protocol_tests.rs
+@@ -309,9 +309,9 @@ fn local_no_mid_thread_system_messages() {
+ }
+ 
+ #[test]
+-fn local_assistant_tool_calls_converted_to_text_summary() {
++fn local_assistant_preserves_tool_calls_for_lm_studio() {
+     let protocol = LocalProtocol;
+-    // Turn: assistant with tool_calls → must appear as assistant with text (no tool_calls field)
++    // Turn: assistant with tool_calls → tool_calls field is preserved for LM Studio
+     let turns = vec![
+         Turn::User { content: "read file".into(), media: vec![] },
+         Turn::Assistant {
+@@ -328,15 +328,16 @@ fn local_assistant_tool_calls_converted_to_text_summary() {
+     let assistant_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "assistant").collect();
+     // At least one assistant message must exist
+     assert!(!assistant_msgs.is_empty());
+-    // None of them should have a tool_calls field
+-    for msg in &assistant_msgs {
+-        assert!(msg.get("tool_calls").is_none(), "local assistant messages must not have tool_calls");
+-    }
+-    // The assistant message should mention the tool name
+-    let has_tool_mention = assistant_msgs
++    // LocalProtocol now PRESERVES tool_calls for native tool-calling support (LM Studio)
++    let has_tool_calls = assistant_msgs
+         .iter()
+-        .any(|m| m["content"].as_str().unwrap_or("").contains("read_file"));
+-    assert!(has_tool_mention, "local assistant turn should include tool name reference");
++        .any(|m| m.get("tool_calls").is_some());
++    assert!(has_tool_calls, "local assistant should preserve tool_calls for LM Studio compatibility");
++    // Tool results are still converted to user messages
++    let tool_result_as_user = wire
++        .iter()
++        .any(|m| m["role"] == "user" && m["content"].as_str().unwrap_or("").contains("Tool result"));
++    assert!(tool_result_as_user, "tool results should be converted to user messages");
+ }
+ 
+ // ---- CloudProtocol ----

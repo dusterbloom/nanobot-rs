@@ -1,0 +1,456 @@
+diff --git a/src/agent/agent_loop.rs b/src/agent/agent_loop.rs
+index ad6f9e6..31d01bf 100644
+--- a/src/agent/agent_loop.rs
++++ b/src/agent/agent_loop.rs
+@@ -67,6 +67,7 @@ pub struct SwappableCore {
+     pub working_memory: WorkingMemoryStore,
+     pub working_memory_budget: usize,
+     pub brave_api_key: Option<String>,
++    pub web_search_max_results: u32,
+     pub exec_timeout: u64,
+     pub restrict_to_workspace: bool,
+     pub memory_enabled: bool,
+@@ -174,6 +175,18 @@ impl AgentHandle {
+ // Backward-compatibility alias during migration.
+ pub type SharedCoreHandle = AgentHandle;
+ 
++fn api_base_targets_local(base: &str) -> bool {
++    let lower = base.to_ascii_lowercase();
++    lower.contains("localhost") || lower.contains("127.0.0.1") || lower.contains("[::1]")
++}
++
++fn provider_needs_user_continuation(provider: &dyn LLMProvider, fallback_is_local: bool) -> bool {
++    provider
++        .get_api_base()
++        .map(api_base_targets_local)
++        .unwrap_or(fallback_is_local)
++}
++
+ /// Build a `SwappableCore` from the given parameters.
+ ///
+ /// When `is_local` is true, the compactor and memory operations use a dedicated
+@@ -188,6 +201,7 @@ pub fn build_swappable_core(
+     temperature: f64,
+     max_context_tokens: usize,
+     brave_api_key: Option<String>,
++    web_search_max_results: u32,
+     exec_timeout: u64,
+     restrict_to_workspace: bool,
+     memory_config: MemoryConfig,
+@@ -317,6 +331,7 @@ pub fn build_swappable_core(
+             memory_config.working_memory_budget
+         },
+         brave_api_key,
++        web_search_max_results,
+         exec_timeout,
+         restrict_to_workspace,
+         memory_enabled: memory_config.enabled,
+@@ -430,7 +445,10 @@ impl AgentLoopShared {
+         )));
+ 
+         // Web (stateless config).
+-        tools.register(Box::new(WebSearchTool::new(core.brave_api_key.clone(), 5)));
++        tools.register(Box::new(WebSearchTool::new(
++            core.brave_api_key.clone(),
++            core.web_search_max_results,
++        )));
+         tools.register(Box::new(WebFetchTool::new(50_000)));
+ 
+         // Memory recall (stateless config).
+@@ -1278,8 +1296,10 @@ impl AgentLoopShared {
+                         // Local delegation providers (llama-server) require
+                         // user-last messages for tool→generate flow.
+                         // Check delegation provider's locality, not the main model's.
+-                        let needs_user_cont = core.is_local
+-                            || delegation_provider.is_some();
++                        let needs_user_cont = provider_needs_user_continuation(
++                            tr_provider.as_ref(),
++                            core.is_local,
++                        );
+ 
+                         // Detect [VERBATIM] marker: the main model is asking for
+                         // raw tool output instead of a delegation summary.
+@@ -1962,6 +1982,7 @@ impl AgentLoop {
+             bus_inbound_tx.clone(),
+             core.model.clone(),
+             core.brave_api_key.clone(),
++            core.web_search_max_results,
+             core.exec_timeout,
+             core.restrict_to_workspace,
+             core.is_local,
+@@ -2411,11 +2432,22 @@ mod tests {
+     /// Minimal mock LLM provider for wiring tests.
+     struct MockLLM {
+         name: String,
++        api_base: Option<String>,
+     }
+ 
+     impl MockLLM {
+         fn named(name: &str) -> Arc<dyn LLMProvider> {
+-            Arc::new(Self { name: name.to_string() })
++            Arc::new(Self {
++                name: name.to_string(),
++                api_base: None,
++            })
++        }
++
++        fn named_with_base(name: &str, api_base: &str) -> Arc<dyn LLMProvider> {
++            Arc::new(Self {
++                name: name.to_string(),
++                api_base: Some(api_base.to_string()),
++            })
+         }
+     }
+ 
+@@ -2441,6 +2473,10 @@ mod tests {
+         fn get_default_model(&self) -> &str {
+             &self.name
+         }
++
++        fn get_api_base(&self) -> Option<&str> {
++            self.api_base.as_deref()
++        }
+     }
+ 
+     /// Helper to build a SwappableCore with minimal config for wiring tests.
+@@ -2467,6 +2503,7 @@ mod tests {
+             0.7,
+             16384,
+             None,
++            5,
+             30,
+             false,
+             MemoryConfig::default(),
+@@ -2584,6 +2621,7 @@ mod tests {
+             0.7,
+             16384,
+             None,
++            5,
+             30,
+             false,
+             MemoryConfig::default(),
+@@ -2636,6 +2674,7 @@ mod tests {
+             0.7,
+             16384,
+             None,
++            5,
+             30,
+             false,
+             MemoryConfig::default(),
+@@ -2678,6 +2717,7 @@ mod tests {
+             0.7,
+             16384,
+             None,
++            5,
+             30,
+             false,
+             MemoryConfig::default(),
+@@ -2701,4 +2741,29 @@ mod tests {
+             "Tool runner should use delegation provider"
+         );
+     }
++
++    #[test]
++    fn test_provider_needs_user_continuation_localhost_base() {
++        let provider = MockLLM::named_with_base("local", "http://localhost:8080/v1");
++        assert!(provider_needs_user_continuation(provider.as_ref(), false));
++    }
++
++    #[test]
++    fn test_provider_needs_user_continuation_cloud_base() {
++        let provider = MockLLM::named_with_base("cloud", "https://openrouter.ai/api/v1");
++        assert!(!provider_needs_user_continuation(provider.as_ref(), false));
++    }
++
++    #[test]
++    fn test_provider_needs_user_continuation_uses_fallback_without_base() {
++        let provider = MockLLM::named("no-base");
++        assert!(provider_needs_user_continuation(provider.as_ref(), true));
++        assert!(!provider_needs_user_continuation(provider.as_ref(), false));
++    }
++
++    #[test]
++    fn test_build_core_web_search_max_results_wired() {
++        let core = build_test_core(false, None, None);
++        assert_eq!(core.web_search_max_results, 5);
++    }
+ }
+diff --git a/src/agent/subagent.rs b/src/agent/subagent.rs
+index 419ca6e..fcffb31 100644
+--- a/src/agent/subagent.rs
++++ b/src/agent/subagent.rs
+@@ -88,6 +88,7 @@ pub struct SubagentManager {
+     /// Prevents the expensive main model from being used as a worker.
+     default_subagent_model: Option<String>,
+     brave_api_key: Option<String>,
++    web_search_max_results: u32,
+     exec_timeout: u64,
+     restrict_to_workspace: bool,
+     is_local: bool,
+@@ -117,6 +118,7 @@ impl SubagentManager {
+         bus_tx: UnboundedSender<InboundMessage>,
+         model: String,
+         brave_api_key: Option<String>,
++        web_search_max_results: u32,
+         exec_timeout: u64,
+         restrict_to_workspace: bool,
+         is_local: bool,
+@@ -141,6 +143,7 @@ impl SubagentManager {
+             model,
+             default_subagent_model: None,
+             brave_api_key,
++            web_search_max_results,
+             exec_timeout,
+             restrict_to_workspace,
+             is_local,
+@@ -309,6 +312,7 @@ impl SubagentManager {
+         let bus_tx = self.bus_tx.clone();
+         let brave_api_key = self.brave_api_key.clone();
+         let exec_timeout = self.exec_timeout;
++        let web_search_max_results = self.web_search_max_results;
+         let restrict_to_workspace = self.restrict_to_workspace;
+         // Provider-routed subagents: check if the resolved API base is localhost.
+         // A groq/ prefix pointing to localhost:8083 is still a local llama-server
+@@ -330,6 +334,7 @@ impl SubagentManager {
+                 &workspace,
+                 &config,
+                 brave_api_key.as_deref(),
++                web_search_max_results,
+                 exec_timeout,
+                 restrict_to_workspace,
+                 is_local,
+@@ -581,6 +586,7 @@ impl SubagentManager {
+                 &self.workspace,
+                 &config,
+                 self.brave_api_key.as_deref(),
++                self.web_search_max_results,
+                 self.exec_timeout,
+                 self.restrict_to_workspace,
+                 is_local,
+@@ -674,6 +680,7 @@ impl SubagentManager {
+         workspace: &PathBuf,
+         config: &SubagentConfig,
+         brave_api_key: Option<&str>,
++        web_search_max_results: u32,
+         exec_timeout: u64,
+         restrict_to_workspace: bool,
+         is_local: bool,
+@@ -728,7 +735,7 @@ impl SubagentManager {
+         if should_include("web_search") {
+             tools.register(Box::new(WebSearchTool::new(
+                 brave_api_key.map(|s| s.to_string()),
+-                5,
++                web_search_max_results,
+             )));
+         }
+         if should_include("web_fetch") {
+@@ -1111,6 +1118,7 @@ mod tests {
+             &config,
+             None,
+             5,
++            5,
+             false,
+             false, // is_local
+             None,  // exec_working_dir
+@@ -1180,6 +1188,7 @@ mod tests {
+             &config,
+             None,
+             5,
++            5,
+             false,
+             false, // is_local
+             None,  // exec_working_dir
+diff --git a/src/cli.rs b/src/cli.rs
+index c1493ee..c34007c 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -370,6 +370,7 @@ pub(crate) fn build_core_handle(
+         config.agents.defaults.temperature,
+         max_context_tokens,
+         brave_key,
++        config.tools.web.search.max_results,
+         config.tools.exec_.timeout,
+         config.tools.exec_.restrict_to_workspace,
+         config.memory.clone(),
+@@ -460,6 +461,7 @@ pub(crate) fn rebuild_core(
+         config.agents.defaults.temperature,
+         max_context_tokens,
+         brave_key,
++        config.tools.web.search.max_results,
+         config.tools.exec_.timeout,
+         config.tools.exec_.restrict_to_workspace,
+         config.memory.clone(),
+diff --git a/src/config/schema.rs b/src/config/schema.rs
+index 398a624..8338602 100644
+--- a/src/config/schema.rs
++++ b/src/config/schema.rs
+@@ -7,6 +7,11 @@ use std::path::PathBuf;
+ 
+ use serde::{Deserialize, Serialize};
+ 
++fn is_configured_api_key(key: &str) -> bool {
++    let trimmed = key.trim();
++    !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none")
++}
++
+ // ---------------------------------------------------------------------------
+ // Channel configs
+ // ---------------------------------------------------------------------------
+@@ -324,7 +329,7 @@ impl ProvidersConfig {
+         for (prefix, accessor, default_base) in PROVIDER_PREFIXES {
+             if let Some(rest) = model.strip_prefix(prefix) {
+                 let cfg = accessor(self);
+-                if !cfg.api_key.is_empty() {
++                if is_configured_api_key(&cfg.api_key) {
+                     let base = cfg.api_base.as_deref().unwrap_or(default_base);
+                     return Some((
+                         cfg.api_key.clone(),
+@@ -901,7 +906,7 @@ impl Config {
+             &self.providers.vllm.api_key,
+         ];
+         for key in candidates {
+-            if !key.is_empty() && key != "none" && key != "NONE" {
++            if is_configured_api_key(key) {
+                 return Some(key.clone());
+             }
+         }
+@@ -920,7 +925,7 @@ impl Config {
+     /// Detection order matches `get_api_key()` priority so that the key and
+     /// base always refer to the same provider.
+     pub fn get_api_base(&self) -> Option<String> {
+-        if !self.providers.openrouter.api_key.is_empty() {
++        if is_configured_api_key(&self.providers.openrouter.api_key) {
+             return Some(
+                 self.providers
+                     .openrouter
+@@ -929,19 +934,43 @@ impl Config {
+                     .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
+             );
+         }
+-        if !self.providers.deepseek.api_key.is_empty() {
+-            return Some("https://api.deepseek.com".to_string());
++        if is_configured_api_key(&self.providers.deepseek.api_key) {
++            return Some(
++                self.providers
++                    .deepseek
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
++            );
+         }
+-        if !self.providers.anthropic.api_key.is_empty() {
+-            return Some("https://api.anthropic.com/v1".to_string());
++        if is_configured_api_key(&self.providers.anthropic.api_key) {
++            return Some(
++                self.providers
++                    .anthropic
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
++            );
+         }
+-        if !self.providers.openai.api_key.is_empty() {
+-            return Some("https://api.openai.com/v1".to_string());
++        if is_configured_api_key(&self.providers.openai.api_key) {
++            return Some(
++                self.providers
++                    .openai
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
++            );
+         }
+-        if !self.providers.gemini.api_key.is_empty() {
+-            return Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string());
++        if is_configured_api_key(&self.providers.gemini.api_key) {
++            return Some(
++                self.providers
++                    .gemini
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta/openai".to_string()),
++            );
+         }
+-        if !self.providers.zhipu.api_key.is_empty() {
++        if is_configured_api_key(&self.providers.zhipu.api_key) {
+             return Some(
+                 self.providers
+                     .zhipu
+@@ -950,7 +979,7 @@ impl Config {
+                     .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
+             );
+         }
+-        if !self.providers.zhipu_coding.api_key.is_empty() {
++        if is_configured_api_key(&self.providers.zhipu_coding.api_key) {
+             return Some(
+                 self.providers
+                     .zhipu_coding
+@@ -959,10 +988,7 @@ impl Config {
+                     .unwrap_or_else(|| "https://api.z.ai/api/coding/paas/v4".to_string()),
+             );
+         }
+-        if !self.providers.groq.api_key.is_empty()
+-            && self.providers.groq.api_key != "none"
+-            && self.providers.groq.api_key != "NONE"
+-        {
++        if is_configured_api_key(&self.providers.groq.api_key) {
+             return Some(
+                 self.providers
+                     .groq
+@@ -971,8 +997,16 @@ impl Config {
+                     .unwrap_or_else(|| "https://api.groq.com/openai/v1".to_string()),
+             );
+         }
+-        if self.providers.vllm.api_base.is_some() {
+-            return self.providers.vllm.api_base.clone();
++        if is_configured_api_key(&self.providers.vllm.api_key)
++            || self.providers.vllm.api_base.is_some()
++        {
++            return Some(
++                self.providers
++                    .vllm
++                    .api_base
++                    .clone()
++                    .unwrap_or_else(|| "http://localhost:8080/v1".to_string()),
++            );
+         }
+         None
+     }
+@@ -1088,6 +1122,25 @@ mod tests {
+         assert_eq!(cfg.get_api_base(), None);
+     }
+ 
++    #[test]
++    fn test_api_base_ignores_none_sentinel() {
++        let mut cfg = Config::default();
++        cfg.providers.openrouter.api_key = "none".to_string();
++        cfg.providers.openrouter.api_base = Some("https://bad.example".to_string());
++        cfg.providers.openai.api_key = "sk-key".to_string();
++        assert_eq!(
++            cfg.get_api_base(),
++            Some("https://api.openai.com/v1".to_string())
++        );
++    }
++
++    #[test]
++    fn test_resolve_model_prefix_ignores_none_key() {
++        let mut cfg = Config::default();
++        cfg.providers.groq.api_key = "NONE".to_string();
++        assert_eq!(cfg.resolve_provider_for_model("groq/llama-3.3-70b"), None);
++    }
++
+     #[test]
+     fn test_tool_delegation_config_defaults() {
+         let td = ToolDelegationConfig::default();
+diff --git a/src/repl/commands.rs b/src/repl/commands.rs
+index fd4a112..d86141a 100644
+--- a/src/repl/commands.rs
++++ b/src/repl/commands.rs
+@@ -200,6 +200,7 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
+         "/wa" => "/whatsapp",
+         "/tg" => "/telegram",
+         "/p" => "/provenance",
++        "/prov" => "/provenance",
+         "/h" | "/?" => "/help",
+         "/a" => "/agents",
+         "/s" => "/status",

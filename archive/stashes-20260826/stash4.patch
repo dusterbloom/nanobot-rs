@@ -1,0 +1,1366 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ea77f2e..51084b8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -20,7 +20,7 @@ dependencies = [
+  "once_cell",
+  "serde",
+  "version_check",
+- "zerocopy",
++ "zerocopy 0.8.39",
+ ]
+ 
+ [[package]]
+@@ -1817,6 +1817,22 @@ dependencies = [
+  "url",
+ ]
+ 
++[[package]]
++name = "fastembed"
++version = "5.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b4339d45a80579ab8305616a501eacdbf18fb0f7def7fa6e4c0b75941416d5b0"
++dependencies = [
++ "anyhow",
++ "hf-hub",
++ "ndarray 0.17.2",
++ "ort",
++ "safetensors 0.7.0",
++ "serde",
++ "serde_json",
++ "tokenizers 0.22.2",
++]
++
+ [[package]]
+ name = "fastrand"
+ version = "2.3.0"
+@@ -1861,6 +1877,12 @@ version = "0.1.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+ 
++[[package]]
++name = "fixedbitset"
++version = "0.5.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
++
+ [[package]]
+ name = "flagset"
+ version = "0.4.7"
+@@ -2317,7 +2339,7 @@ dependencies = [
+  "num-traits",
+  "rand 0.9.2",
+  "rand_distr 0.5.1",
+- "zerocopy",
++ "zerocopy 0.8.39",
+ ]
+ 
+ [[package]]
+@@ -3525,6 +3547,7 @@ dependencies = [
+  "backon",
+  "base64 0.22.1",
+  "bytes",
++ "candle-core",
+  "chrono",
+  "clap",
+  "cron",
+@@ -3532,6 +3555,7 @@ dependencies = [
+  "dirs 6.0.0",
+  "dom_smoothie",
+  "fast_html2md",
++ "fastembed",
+  "futures-util",
+  "html-escape",
+  "jack-voice",
+@@ -3542,6 +3566,8 @@ dependencies = [
+  "mdns-sd",
+  "mime_guess",
+  "once_cell",
++ "petgraph",
++ "qlora-rs",
+  "regex",
+  "reqwest",
+  "rusqlite",
+@@ -3551,6 +3577,7 @@ dependencies = [
+  "serde_json",
+  "serde_yaml",
+  "sha2",
++ "sqlite-vec",
+  "syntect",
+  "tempfile",
+  "termimad",
+@@ -3567,6 +3594,7 @@ dependencies = [
+  "unicode-width 0.2.2",
+  "url",
+  "uuid",
++ "zerocopy 0.7.35",
+ ]
+ 
+ [[package]]
+@@ -4087,6 +4115,21 @@ version = "1.0.15"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+ 
++[[package]]
++name = "peft-rs"
++version = "1.0.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e4db89d100b24272b59ddb87f4d7c3f12c3d0f10f74b1b663f34f8a3436a92ba"
++dependencies = [
++ "candle-core",
++ "candle-nn",
++ "safetensors 0.7.0",
++ "serde",
++ "serde_json",
++ "thiserror 2.0.18",
++ "tracing",
++]
++
+ [[package]]
+ name = "pem-rfc7468"
+ version = "0.7.0"
+@@ -4145,6 +4188,19 @@ dependencies = [
+  "sha2",
+ ]
+ 
++[[package]]
++name = "petgraph"
++version = "0.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
++dependencies = [
++ "fixedbitset",
++ "hashbrown 0.15.5",
++ "indexmap",
++ "serde",
++ "serde_derive",
++]
++
+ [[package]]
+ name = "phf"
+ version = "0.11.3"
+@@ -4415,7 +4471,7 @@ version = "0.2.21"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+ dependencies = [
+- "zerocopy",
++ "zerocopy 0.8.39",
+ ]
+ 
+ [[package]]
+@@ -4529,6 +4585,24 @@ dependencies = [
+  "pest_derive",
+ ]
+ 
++[[package]]
++name = "qlora-rs"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5f4fa1118653863ee9c49e9827b8c5f8010757f72a9cadf0f6196c66481b76a4"
++dependencies = [
++ "anyhow",
++ "byteorder",
++ "candle-core",
++ "candle-nn",
++ "memmap2",
++ "peft-rs",
++ "serde",
++ "serde_json",
++ "thiserror 2.0.18",
++ "tracing",
++]
++
+ [[package]]
+ name = "quick-xml"
+ version = "0.38.4"
+@@ -5562,6 +5636,15 @@ dependencies = [
+  "unicode-segmentation",
+ ]
+ 
++[[package]]
++name = "sqlite-vec"
++version = "0.1.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4ec77b84fb8dd5f0f8def127226db83b5d1152c5bf367f09af03998b76ba554a"
++dependencies = [
++ "cc",
++]
++
+ [[package]]
+ name = "stable_deref_trait"
+ version = "1.2.1"
+@@ -7484,13 +7567,34 @@ dependencies = [
+  "synstructure",
+ ]
+ 
++[[package]]
++name = "zerocopy"
++version = "0.7.35"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1b9b4fd18abc82b8136838da5d50bae7bdea537c574d8dc1a34ed098d6c166f0"
++dependencies = [
++ "byteorder",
++ "zerocopy-derive 0.7.35",
++]
++
+ [[package]]
+ name = "zerocopy"
+ version = "0.8.39"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "db6d35d663eadb6c932438e763b262fe1a70987f9ae936e60158176d710cae4a"
+ dependencies = [
+- "zerocopy-derive",
++ "zerocopy-derive 0.8.39",
++]
++
++[[package]]
++name = "zerocopy-derive"
++version = "0.7.35"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fa4f8080344d4671fb4e831a13ad1e68092748387dfc4f55e356242fae12ce3e"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index 7ff3a66..74c2947 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -125,6 +125,14 @@ mail-parser = "0.9"
+ arc-swap = "1.8.2"
+ mdns-sd = { version = "0.11", features = ["async"], optional = true }
+ 
++# Semantic search: local ONNX embeddings + SQLite vector search
++fastembed = { version = "5", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
++sqlite-vec = { version = "0.1", optional = true }
++zerocopy = { version = "0.7", features = ["derive"], optional = true }
++
++# Knowledge graph (entity/relation store)
++petgraph = { version = "0.8", features = ["serde-1"], optional = true }
++
+ [dev-dependencies]
+ tempfile = "3"
+ 
+@@ -133,6 +141,9 @@ default = []
+ voice = ["dep:jack-voice", "dep:crossterm", "dep:lingua"]
+ trace-chrome = ["dep:tracing-chrome", "dep:tracing-tree"]
+ cluster = ["dep:mdns-sd"]
++semantic = ["dep:fastembed", "dep:sqlite-vec", "dep:zerocopy"]
++knowledge-graph = ["dep:petgraph"]
++lora = ["dep:qlora-rs", "dep:candle-core"]
+ 
+ [dependencies.jack-voice]
+ path = "../jack-voice/jack-voice"
+@@ -141,3 +152,13 @@ optional = true
+ [dependencies.crossterm]
+ version = "0.28"
+ optional = true
++
++# QLoRA training: 4-bit quantized LoRA fine-tuning with GGUF export
++[dependencies.qlora-rs]
++version = "1.0"
++optional = true
++features = ["gguf-export"]
++
++[dependencies.candle-core]
++version = "0.9"
++optional = true
+diff --git a/src/agent/agent_loop.rs b/src/agent/agent_loop.rs
+index 70dfaef..109de48 100644
+--- a/src/agent/agent_loop.rs
++++ b/src/agent/agent_loop.rs
+@@ -1779,6 +1779,30 @@ impl AgentLoopShared {
+             }
+         }
+ 
++        // Record experience for LoRA training (non-fatal, only when tools were used).
++        if !ctx.used_tools.is_empty() && !ctx.final_content.is_empty() {
++            if let Ok(buf) = crate::agent::lora_bridge::ExperienceBuffer::open_default() {
++                let tool_trace: Vec<serde_json::Value> = ctx.turn_tool_entries.iter().map(|entry| {
++                    json!({
++                        "name": entry.name,
++                        "ok": entry.ok,
++                        "duration_ms": entry.duration_ms,
++                    })
++                }).collect();
++                let trace_json = serde_json::to_string(&tool_trace).unwrap_or_else(|_| "[]".to_string());
++                if let Err(e) = buf.record(
++                    &ctx.user_content,
++                    &trace_json,
++                    &ctx.final_content,
++                    true,
++                    1.0,
++                    &ctx.core.model,
++                ) {
++                    debug!("Experience recording failed: {}", e);
++                }
++            }
++        }
++
+         // Write per-turn audit summary.
+         if ctx.core.provenance_config.enabled && ctx.core.provenance_config.audit_log {
+             let summary = crate::agent::audit::TurnSummary {
+diff --git a/src/agent/context.rs b/src/agent/context.rs
+index fc404bf..8ced5d4 100644
+--- a/src/agent/context.rs
++++ b/src/agent/context.rs
+@@ -245,6 +245,17 @@ impl ContextBuilder {
+             parts.push(format!("# Memory\n\n## Long-term Memory\n{}", long_term));
+         }
+ 
++        // Knowledge graph context (entity/relation summaries).
++        #[cfg(feature = "knowledge-graph")]
++        {
++            if let Ok(kg) = crate::agent::knowledge_graph::KnowledgeGraph::open_default() {
++                let kg_ctx = kg.export_context(30);
++                if !kg_ctx.is_empty() {
++                    parts.push(format!("## Knowledge Graph\n{}", kg_ctx));
++                }
++            }
++        }
++
+         // Skills -- progressive loading (with lazy/RLM mode support).
+         // All skills content is accumulated then capped at skills_budget.
+         let fetch_hint = if self.lazy_skills {
+@@ -1440,4 +1451,27 @@ model_profiles:
+             "Non-matching model profile should NOT be present"
+         );
+     }
++
++    #[test]
++    fn test_developer_context_without_knowledge_graph_feature() {
++        // Without --features knowledge-graph, developer context should still
++        // build correctly and not contain any "Knowledge Graph" section.
++        let tmp = TempDir::new().unwrap();
++        let memory_dir = tmp.path().join("memory");
++        fs::create_dir_all(&memory_dir).unwrap();
++        fs::write(memory_dir.join("MEMORY.md"), "User prefers Rust").unwrap();
++
++        let cb = ContextBuilder::new(tmp.path());
++        let ctx = cb.build_developer_context(None, None);
++
++        assert!(ctx.contains("User prefers Rust"), "Memory should be present");
++
++        // Without the feature flag, no KG section should appear.
++        // (On knowledge-graph builds, it could appear if open_default finds data.)
++        #[cfg(not(feature = "knowledge-graph"))]
++        assert!(
++            !ctx.contains("Knowledge Graph"),
++            "KG section should not appear without knowledge-graph feature"
++        );
++    }
+ }
+diff --git a/src/agent/knowledge_store.rs b/src/agent/knowledge_store.rs
+index 382fe6a..4db1ca1 100644
+--- a/src/agent/knowledge_store.rs
++++ b/src/agent/knowledge_store.rs
+@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
+ use rusqlite::{params, Connection, OptionalExtension};
+ use std::path::{Path, PathBuf};
+ 
++use crate::agent::embedder::{self, Embedding, EMBEDDING_DIM};
++
+ /// Persistent knowledge store backed by SQLite + FTS5.
+ ///
+ /// Stores chunked documents with full-text search (BM25 ranking).
+@@ -53,6 +55,11 @@ impl KnowledgeStore {
+                 .context("Failed to create knowledge store directory")?;
+         }
+ 
++        // Register sqlite-vec extension before opening the connection so that
++        // the vec0 module is available when we create the virtual table.
++        #[cfg(feature = "semantic")]
++        Self::register_vec_extension();
++
+         let conn = Connection::open(db_path).context("Failed to open knowledge database")?;
+ 
+         // Enable WAL mode and mmap for performance
+@@ -102,12 +109,45 @@ impl KnowledgeStore {
+         )
+         .context("Failed to initialize knowledge store schema")?;
+ 
++        // Initialize vector search schema when the semantic feature is enabled.
++        #[cfg(feature = "semantic")]
++        Self::init_vec_schema(&conn)?;
++
+         Ok(Self {
+             conn,
+             db_path: db_path.to_path_buf(),
+         })
+     }
+ 
++    /// Register the sqlite-vec extension globally so vec0 is available on new connections.
++    #[cfg(feature = "semantic")]
++    fn register_vec_extension() {
++        use std::sync::Once;
++        static REGISTER: Once = Once::new();
++        REGISTER.call_once(|| unsafe {
++            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
++                sqlite_vec::sqlite3_vec_init as *const (),
++            )));
++        });
++    }
++
++    /// Create the vec0 virtual table for cosine KNN search.
++    #[cfg(feature = "semantic")]
++    fn init_vec_schema(conn: &Connection) -> Result<()> {
++        // chunk_id maps to chunks.id for joining back to text content.
++        conn.execute_batch(&format!(
++            r#"
++            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
++                chunk_id INTEGER PRIMARY KEY,
++                embedding float[{EMBEDDING_DIM}] distance_metric=cosine
++            );
++            "#,
++        ))
++        .context("Failed to initialize vector search schema")?;
++
++        Ok(())
++    }
++
+     /// Open the knowledge database at the default location (~/.nanobot/knowledge.db).
+     pub fn open_default() -> Result<Self> {
+         let home = dirs::home_dir().context("Failed to determine home directory")?;
+@@ -190,6 +230,161 @@ impl KnowledgeStore {
+         Ok(hits)
+     }
+ 
++    /// Ingest a document with embeddings (requires `semantic` feature).
++    ///
++    /// Same as `ingest()` but also computes and stores vector embeddings for
++    /// each chunk, enabling hybrid BM25+cosine search via `hybrid_search()`.
++    #[cfg(feature = "semantic")]
++    pub fn ingest_with_embeddings(
++        &self,
++        name: &str,
++        path: Option<&str>,
++        text: &str,
++        chunk_size: usize,
++        overlap: usize,
++    ) -> Result<IngestResult> {
++        // First do the normal text ingest (FTS5).
++        let result = self.ingest(name, path, text, chunk_size, overlap)?;
++
++        // Now compute embeddings for all chunks and insert into chunks_vec.
++        // Collect chunk ids + texts.
++        let mut stmt = self.conn.prepare(
++            "SELECT id, content FROM chunks WHERE source_id = ?1 ORDER BY chunk_idx",
++        )?;
++        let rows: Vec<(i64, String)> = stmt
++            .query_map(params![result.source_id], |row| {
++                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
++            })?
++            .collect::<Result<Vec<_>, _>>()?;
++
++        if rows.is_empty() {
++            return Ok(result);
++        }
++
++        // Batch embed all chunk texts.
++        let texts: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
++        let embeddings = embedder::embed_batch(&texts)
++            .context("Failed to embed chunks")?;
++
++        // Insert into vec0 table.
++        let mut insert = self.conn.prepare(
++            "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?1, ?2)",
++        )?;
++        for ((chunk_id, _), emb) in rows.iter().zip(embeddings.iter()) {
++            let bytes = vec_to_bytes(emb);
++            insert.execute(params![chunk_id, bytes])?;
++        }
++
++        Ok(result)
++    }
++
++    /// Hybrid search: fuses BM25 (FTS5) and cosine (vec0) results using
++    /// Reciprocal Rank Fusion (RRF). Returns the top `limit` results.
++    ///
++    /// When the `semantic` feature is disabled, falls back to plain BM25.
++    pub fn hybrid_search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
++        // Always get BM25 results.
++        let bm25_hits = self.search(query, limit * 2)?;
++
++        // Try to get vector results; fall back to BM25-only if unavailable.
++        let vec_hits = self.vector_search(query, limit * 2).unwrap_or_default();
++
++        if vec_hits.is_empty() {
++            // No vector results — just return BM25.
++            return Ok(bm25_hits.into_iter().take(limit).collect());
++        }
++
++        // RRF fusion: score = sum(1 / (k + rank)) across both lists.
++        // k=60 is the standard RRF constant.
++        const K: f64 = 60.0;
++        let mut scores: std::collections::HashMap<(String, i64), (f64, String)> =
++            std::collections::HashMap::new();
++
++        for (rank, hit) in bm25_hits.iter().enumerate() {
++            let key = (hit.source_name.clone(), hit.chunk_idx);
++            let entry = scores.entry(key).or_insert((0.0, hit.snippet.clone()));
++            entry.0 += 1.0 / (K + rank as f64 + 1.0);
++        }
++
++        for (rank, hit) in vec_hits.iter().enumerate() {
++            let key = (hit.source_name.clone(), hit.chunk_idx);
++            let entry = scores.entry(key).or_insert((0.0, hit.snippet.clone()));
++            entry.0 += 1.0 / (K + rank as f64 + 1.0);
++        }
++
++        // Sort by fused score descending.
++        let mut fused: Vec<SearchHit> = scores
++            .into_iter()
++            .map(|((source_name, chunk_idx), (score, snippet))| SearchHit {
++                source_name,
++                chunk_idx,
++                snippet,
++                rank: -score, // negate so lower = better (consistent with BM25)
++            })
++            .collect();
++        fused.sort_by(|a, b| a.rank.partial_cmp(&b.rank).unwrap_or(std::cmp::Ordering::Equal));
++        fused.truncate(limit);
++
++        Ok(fused)
++    }
++
++    /// Vector-only search using sqlite-vec cosine KNN.
++    /// Returns empty vec if semantic feature is disabled or no vectors exist.
++    fn vector_search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
++        #[cfg(not(feature = "semantic"))]
++        {
++            let _ = (query, limit);
++            return Ok(vec![]);
++        }
++
++        #[cfg(feature = "semantic")]
++        {
++            // Check if chunks_vec table exists (may not if DB was created without semantic).
++            let has_vec: bool = self.conn.query_row(
++                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='chunks_vec'",
++                [],
++                |row| row.get(0),
++            )?;
++            if !has_vec {
++                return Ok(vec![]);
++            }
++
++            // Embed the query.
++            let query_vec = embedder::embed_one(query)
++                .context("Failed to embed query")?;
++            let query_bytes = vec_to_bytes(&query_vec);
++
++            let mut stmt = self.conn.prepare(
++                r#"
++                SELECT
++                    s.name,
++                    c.chunk_idx,
++                    substr(c.content, 1, 200) as snippet,
++                    v.distance
++                FROM chunks_vec v
++                JOIN chunks c ON v.chunk_id = c.id
++                JOIN sources s ON c.source_id = s.id
++                WHERE v.embedding MATCH ?1
++                    AND k = ?2
++                ORDER BY v.distance
++                "#,
++            )?;
++
++            let hits = stmt
++                .query_map(params![query_bytes, limit as i64], |row| {
++                    Ok(SearchHit {
++                        source_name: row.get(0)?,
++                        chunk_idx: row.get(1)?,
++                        snippet: row.get(2)?,
++                        rank: row.get(3)?,
++                    })
++                })?
++                .collect::<Result<Vec<_>, _>>()?;
++
++            Ok(hits)
++        }
++    }
++
+     /// Get a specific chunk by source name and chunk index.
+     pub fn get_chunk(&self, source_name: &str, chunk_idx: usize) -> Result<Option<String>> {
+         let mut stmt = self.conn.prepare(
+@@ -274,6 +469,12 @@ impl KnowledgeStore {
+             .optional()?;
+ 
+         if let Some(id) = source_id {
++            // Delete vector entries if table exists.
++            let _ = self.conn.execute(
++                "DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE source_id = ?1)",
++                params![id],
++            );
++
+             // Delete chunks (triggers will handle FTS cleanup)
+             self.conn
+                 .execute("DELETE FROM chunks WHERE source_id = ?1", params![id])?;
+@@ -317,6 +518,11 @@ impl KnowledgeStore {
+     }
+ }
+ 
++/// Convert an f32 embedding vector to raw bytes for sqlite-vec.
++fn vec_to_bytes(vec: &[f32]) -> Vec<u8> {
++    vec.iter().flat_map(|f| f.to_le_bytes()).collect()
++}
++
+ /// Split text into overlapping chunks, avoiding mid-line splits.
+ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+     if text.is_empty() {
+@@ -678,4 +884,83 @@ mod tests {
+         let chunks = chunk_text("", 100, 10);
+         assert_eq!(chunks.len(), 0);
+     }
++
++    #[test]
++    fn test_vec_to_bytes_roundtrip() {
++        let original = vec![1.0f32, -2.5, 0.0, 3.14159];
++        let bytes = vec_to_bytes(&original);
++        assert_eq!(bytes.len(), original.len() * 4);
++        // Roundtrip
++        let recovered: Vec<f32> = bytes
++            .chunks_exact(4)
++            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
++            .collect();
++        assert_eq!(original, recovered);
++    }
++
++    #[test]
++    fn test_hybrid_search_bm25_fallback() {
++        // Without semantic feature, hybrid_search should fall back to BM25.
++        let dir = tempdir().unwrap();
++        let db_path = dir.path().join("test.db");
++        let store = KnowledgeStore::open(&db_path).unwrap();
++
++        store
++            .ingest("doc1", None, "Rust programming language systems", 4096, 256)
++            .unwrap();
++        store
++            .ingest("doc2", None, "Python scripting language interpreted", 4096, 256)
++            .unwrap();
++
++        let results = store.hybrid_search("Rust", 5).unwrap();
++        assert_eq!(results.len(), 1);
++        assert_eq!(results[0].source_name, "doc1");
++    }
++
++    #[test]
++    fn test_hybrid_search_empty_db() {
++        let dir = tempdir().unwrap();
++        let db_path = dir.path().join("test.db");
++        let store = KnowledgeStore::open(&db_path).unwrap();
++
++        let results = store.hybrid_search("anything", 10).unwrap();
++        assert_eq!(results.len(), 0);
++    }
++
++    #[test]
++    fn test_hybrid_search_respects_limit() {
++        let dir = tempdir().unwrap();
++        let db_path = dir.path().join("test.db");
++        let store = KnowledgeStore::open(&db_path).unwrap();
++
++        for i in 0..10 {
++            store
++                .ingest(
++                    &format!("doc{}", i),
++                    None,
++                    &format!("This document number {} discusses Rust systems programming", i),
++                    4096,
++                    256,
++                )
++                .unwrap();
++        }
++
++        let results = store.hybrid_search("Rust", 3).unwrap();
++        assert!(results.len() <= 3);
++    }
++
++    #[test]
++    fn test_vector_search_returns_empty_without_vec_table() {
++        // Without semantic feature, vector_search should return empty.
++        let dir = tempdir().unwrap();
++        let db_path = dir.path().join("test.db");
++        let store = KnowledgeStore::open(&db_path).unwrap();
++
++        store
++            .ingest("doc1", None, "test content", 4096, 256)
++            .unwrap();
++
++        let results = store.vector_search("test", 5).unwrap();
++        assert!(results.is_empty());
++    }
+ }
+diff --git a/src/agent/mod.rs b/src/agent/mod.rs
+index 4d2f741..16cd972 100644
+--- a/src/agent/mod.rs
++++ b/src/agent/mod.rs
+@@ -21,6 +21,8 @@ pub mod context_gate;
+ pub mod context_hygiene;
+ pub mod context_store;
+ pub mod eval;
++pub mod embedder;
++pub mod knowledge_graph;
+ pub mod knowledge_store;
+ pub mod lcm;
+ pub mod learning;
+diff --git a/src/agent/reflector.rs b/src/agent/reflector.rs
+index aef2a42..ec0cd40 100644
+--- a/src/agent/reflector.rs
++++ b/src/agent/reflector.rs
+@@ -18,15 +18,17 @@ use anyhow::Result;
+ use serde_json::json;
+ use tracing::{debug, info, warn};
+ 
++use crate::agent::knowledge_graph::KnowledgeGraph;
+ use crate::agent::memory::MemoryStore;
+ use crate::agent::observer::ObservationStore;
+ use crate::agent::working_memory::{SessionStatus, WorkingMemoryStore};
+ use crate::providers::base::LLMProvider;
+ 
+-/// Prompt sent to the memory model for facts-only reflection.
++/// Prompt sent to the memory model for facts + entity extraction.
+ const REFLECTION_PROMPT: &str = "\
+ You are distilling conversation sessions into permanent factual memory.
+ 
++## Part 1: Facts
+ RULES:
+ - Extract ONLY concrete, reusable facts
+ - NO session logs, task status, or temporary context
+@@ -43,13 +45,29 @@ Bad examples (DO NOT include):
+ - Currently working on memory refactor
+ - Last session discussed file handling
+ 
++## Part 2: Entities & Relations
++After the facts, write a section starting with `## Entities` that lists key entities and their relationships.
++Format each entity as: `- ENTITY_NAME (TYPE): brief description`
++Format each relation as: `- FROM -> LABEL -> TO`
++
++Types: person, tool, project, language, concept, service, file
++Labels: uses, prefers, created, knows, works-on, depends-on, related-to
++
++Example:
++## Entities
++- Alex (person): the user
++- Rust (language): preferred systems programming language
++- nanobot (project): AI assistant framework
++- Alex -> prefers -> Rust
++- nanobot -> depends-on -> Rust
++
+ Current long-term memory:
+ {current_memory}
+ 
+ Recent session summaries:
+ {observations}
+ 
+-Write updated factual memory. Bullet points only. Be concise.";
++Write updated factual memory (bullet points), then ## Entities section. Be concise.";
+ 
+ /// Background reflector that crystallizes sessions into MEMORY.md.
+ pub struct Reflector {
+@@ -160,10 +178,34 @@ impl Reflector {
+             .content
+             .ok_or_else(|| anyhow::anyhow!("Reflection returned no content"))?;
+ 
++        // Split response into facts and entities sections.
++        let (facts, entities_section) = split_entities_section(&updated_memory);
++
+         // Write updated memory (atomic — single write call).
+-        memory_store.write_long_term(&updated_memory);
++        memory_store.write_long_term(&facts);
+         info!("Reflector: MEMORY.md updated");
+ 
++        // Extract entities/relations into knowledge graph.
++        if !entities_section.is_empty() {
++            match KnowledgeGraph::open_default() {
++                Ok(mut kg) => {
++                    let (ent_count, rel_count) =
++                        parse_entities_into_graph(&mut kg, &entities_section);
++                    if ent_count > 0 || rel_count > 0 {
++                        if let Err(e) = kg.save() {
++                            warn!("Failed to save knowledge graph: {}", e);
++                        } else {
++                            info!(
++                                "Reflector: updated knowledge graph ({} entities, {} relations)",
++                                ent_count, rel_count
++                            );
++                        }
++                    }
++                }
++                Err(e) => warn!("Failed to open knowledge graph: {}", e),
++            }
++        }
++
+         // Archive processed working sessions.
+         for session in &completed_sessions {
+             if let Err(e) = wm.archive(&session.session_key) {
+@@ -188,6 +230,56 @@ impl Reflector {
+     }
+ }
+ 
++/// Split LLM response into facts (before `## Entities`) and entities section (after).
++fn split_entities_section(response: &str) -> (String, String) {
++    // Look for "## Entities" marker (case-insensitive).
++    let lower = response.to_lowercase();
++    if let Some(pos) = lower.find("## entities") {
++        let facts = response[..pos].trim().to_string();
++        let entities = response[pos..].to_string();
++        (facts, entities)
++    } else {
++        (response.to_string(), String::new())
++    }
++}
++
++/// Parse the entities section and upsert into the knowledge graph.
++/// Returns (entities_added, relations_added).
++fn parse_entities_into_graph(kg: &mut KnowledgeGraph, section: &str) -> (usize, usize) {
++    let mut ent_count = 0;
++    let mut rel_count = 0;
++
++    for line in section.lines() {
++        let line = line.trim().trim_start_matches('-').trim();
++        if line.is_empty() || line.starts_with('#') {
++            continue;
++        }
++
++        // Try relation format: "FROM -> LABEL -> TO"
++        let parts: Vec<&str> = line.split("->").map(|s| s.trim()).collect();
++        if parts.len() == 3 && !parts[0].is_empty() && !parts[2].is_empty() {
++            kg.add_relation(parts[0], parts[1], parts[2], "reflector");
++            rel_count += 1;
++            continue;
++        }
++
++        // Try entity format: "NAME (TYPE): description"
++        if let Some((name_type, desc)) = line.split_once(':') {
++            let desc = desc.trim();
++            if let Some((name, kind)) = name_type.split_once('(') {
++                let name = name.trim();
++                let kind = kind.trim().trim_end_matches(')').trim();
++                if !name.is_empty() && !kind.is_empty() {
++                    kg.upsert_entity(name, kind, desc);
++                    ent_count += 1;
++                }
++            }
++        }
++    }
++
++    (ent_count, rel_count)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -405,4 +497,60 @@ mod tests {
+             "completed sessions should be preserved on failure"
+         );
+     }
++
++    // --- Entity extraction parsing tests ---
++
++    #[test]
++    fn test_split_entities_section() {
++        let response = "- Fact one\n- Fact two\n\n## Entities\n- Alice (person): the user\n- Alice -> prefers -> Rust";
++        let (facts, entities) = split_entities_section(response);
++        assert!(facts.contains("Fact one"));
++        assert!(!facts.contains("Entities"));
++        assert!(entities.contains("Alice (person)"));
++        assert!(entities.contains("-> prefers ->"));
++    }
++
++    #[test]
++    fn test_split_entities_section_no_entities() {
++        let response = "- Fact one\n- Fact two";
++        let (facts, entities) = split_entities_section(response);
++        assert_eq!(facts, response);
++        assert!(entities.is_empty());
++    }
++
++    #[cfg(feature = "knowledge-graph")]
++    #[test]
++    fn test_parse_entities_into_graph_entities() {
++        let tmp = TempDir::new().unwrap();
++        let section = "## Entities\n- Alice (person): the user\n- Rust (language): systems lang";
++        let mut kg = KnowledgeGraph::open(&tmp.path().join("test_parse_ent.json")).unwrap();
++        let (ent, rel) = parse_entities_into_graph(&mut kg, section);
++        assert_eq!(ent, 2);
++        assert_eq!(rel, 0);
++        assert_eq!(kg.entity_count(), 2);
++    }
++
++    #[cfg(feature = "knowledge-graph")]
++    #[test]
++    fn test_parse_entities_into_graph_relations() {
++        let tmp = TempDir::new().unwrap();
++        let section = "## Entities\n- Alice (person): user\n- Rust (language): lang\n- Alice -> prefers -> Rust\n- Alice -> uses -> nanobot";
++        let mut kg = KnowledgeGraph::open(&tmp.path().join("test_parse_rel.json")).unwrap();
++        let (ent, rel) = parse_entities_into_graph(&mut kg, section);
++        assert_eq!(ent, 2);
++        assert_eq!(rel, 2);
++        // Relations auto-create entities for "nanobot".
++        assert!(kg.entity_count() >= 3);
++    }
++
++    #[cfg(feature = "knowledge-graph")]
++    #[test]
++    fn test_parse_entities_skips_malformed_lines() {
++        let tmp = TempDir::new().unwrap();
++        let section = "## Entities\n- just some text without parens\n- (bad): no name\n- -> -> -> too many arrows";
++        let mut kg = KnowledgeGraph::open(&tmp.path().join("test_parse_bad.json")).unwrap();
++        let (ent, rel) = parse_entities_into_graph(&mut kg, section);
++        assert_eq!(ent, 0);
++        assert_eq!(rel, 0);
++    }
+ }
+diff --git a/src/agent/session_indexer.rs b/src/agent/session_indexer.rs
+index f056737..4979354 100644
+--- a/src/agent/session_indexer.rs
++++ b/src/agent/session_indexer.rs
+@@ -8,7 +8,9 @@ use std::fs;
+ use std::path::Path;
+ 
+ use sha2::{Digest, Sha256};
+-use tracing::warn;
++use tracing::{debug, warn};
++
++use crate::agent::knowledge_store::KnowledgeStore;
+ 
+ /// A single indexed session ready to be written as SESSION_*.md.
+ #[derive(Debug)]
+@@ -239,6 +241,9 @@ pub fn index_sessions(
+             continue;
+         }
+ 
++        // Ingest into knowledge store for hybrid search.
++        ingest_session_to_knowledge_store(&md_filename, &md_content);
++
+         indexed += 1;
+     }
+ 
+@@ -260,6 +265,42 @@ fn extract_session_key_from_content(content: &str, filename: &str) -> String {
+     session_key_from_filename(filename)
+ }
+ 
++/// Ingest a session document into the knowledge store for hybrid search.
++/// Uses `ingest_with_embeddings` when the semantic feature is enabled,
++/// falls back to text-only `ingest` otherwise. Errors are logged but not fatal.
++fn ingest_session_to_knowledge_store(source_name: &str, content: &str) {
++    let store = match KnowledgeStore::open_default() {
++        Ok(s) => s,
++        Err(e) => {
++            warn!("Cannot open knowledge store for session ingestion: {}", e);
++            return;
++        }
++    };
++
++    // Use embeddings when available, fall back to text-only.
++    #[cfg(feature = "semantic")]
++    {
++        match store.ingest_with_embeddings(source_name, None, content, 512, 64) {
++            Ok(r) => debug!(
++                "Ingested {} into knowledge store ({} chunks, with embeddings)",
++                source_name, r.chunks_created
++            ),
++            Err(e) => warn!("Failed to ingest {} with embeddings: {}", source_name, e),
++        }
++    }
++
++    #[cfg(not(feature = "semantic"))]
++    {
++        match store.ingest(source_name, None, content, 512, 64) {
++            Ok(r) => debug!(
++                "Ingested {} into knowledge store ({} chunks)",
++                source_name, r.chunks_created
++            ),
++            Err(e) => warn!("Failed to ingest {}: {}", source_name, e),
++        }
++    }
++}
++
+ // ============================================================================
+ // Tests
+ // ============================================================================
+@@ -507,4 +548,28 @@ mod tests {
+         assert_eq!(indexed, 0);
+         assert_eq!(errors, 1);
+     }
++
++    #[test]
++    fn test_index_ingests_into_knowledge_store() {
++        let sessions_dir = tempdir().unwrap();
++        let memory_dir = tempdir().unwrap();
++
++        let jsonl = r#"{"_type":"metadata","session_key":"cli:ks_test","created_at":"2026-02-01T00:00:00Z","updated_at":"2026-02-01T01:00:00Z"}
++{"role":"user","content":"How does async Rust handle cancellation?"}
++{"role":"assistant","content":"Rust uses drop guards and select! for structured concurrency."}"#;
++        fs::write(sessions_dir.path().join("cli_ks_test_2026-02-01.jsonl"), jsonl).unwrap();
++
++        let (indexed, _skipped, errors) =
++            index_sessions(sessions_dir.path(), memory_dir.path());
++        assert_eq!(indexed, 1);
++        assert_eq!(errors, 0);
++
++        // Verify the session was ingested into the knowledge store.
++        let store = KnowledgeStore::open_default().unwrap();
++        let hits = store.search("async cancellation", 5).unwrap();
++        assert!(
++            !hits.is_empty(),
++            "Knowledge store should have the session content"
++        );
++    }
+ }
+diff --git a/src/agent/tools/recall.rs b/src/agent/tools/recall.rs
+index a008916..f6f8932 100644
+--- a/src/agent/tools/recall.rs
++++ b/src/agent/tools/recall.rs
+@@ -1,16 +1,16 @@
+ //! Recall tool: semantic and keyword search across all memory.
+ //!
+-//! Uses `qmd` (if available) for BM25 and vector search across the memory
+-//! collection, plus a direct grep fallback over session files and MEMORY.md.
++//! Uses in-process `KnowledgeStore` for hybrid BM25+vector search across
++//! indexed documents, plus a direct grep fallback over session files and MEMORY.md.
+ 
+ use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+ 
+ use async_trait::async_trait;
+ use serde_json::{json, Value};
+-use tokio::process::Command;
+ 
+ use super::base::Tool;
++use crate::agent::knowledge_store::KnowledgeStore;
+ 
+ /// Tool that searches across all nanobot memory layers.
+ pub struct RecallTool {
+@@ -24,42 +24,27 @@ impl RecallTool {
+         }
+     }
+ 
+-    /// Try qmd search first (BM25). Returns None if qmd is not available.
+-    async fn qmd_search(&self, query: &str, n: usize) -> Option<String> {
+-        let output = Command::new("qmd")
+-            .args(["search", query, "-n", &n.to_string()])
+-            .output()
+-            .await
+-            .ok()?;
++    /// Search the knowledge store (hybrid BM25 + vector when semantic feature is enabled).
++    fn knowledge_search(&self, query: &str, n: usize, mode: &str) -> Option<String> {
++        let store = KnowledgeStore::open_default().ok()?;
+ 
+-        if !output.status.success() {
+-            return None;
+-        }
+-
+-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+-        if stdout.trim().is_empty() {
+-            return None;
+-        }
+-        Some(stdout)
+-    }
+-
+-    /// Try qmd vsearch (vector/semantic). Returns None if unavailable or no embeddings.
+-    async fn qmd_vsearch(&self, query: &str, n: usize) -> Option<String> {
+-        let output = Command::new("qmd")
+-            .args(["vsearch", query, "-n", &n.to_string()])
+-            .output()
+-            .await
+-            .ok()?;
++        let hits = match mode {
++            "keyword" => store.search(query, n).ok()?,
++            _ => store.hybrid_search(query, n).ok()?,
++        };
+ 
+-        if !output.status.success() {
++        if hits.is_empty() {
+             return None;
+         }
+ 
+-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+-        if stdout.trim().is_empty() || stdout.contains("need embedding") {
+-            return None;
++        let mut output = String::new();
++        for hit in &hits {
++            output.push_str(&format!(
++                "### {} (chunk {})\n{}\n\n",
++                hit.source_name, hit.chunk_idx, hit.snippet
++            ));
+         }
+-        Some(stdout)
++        Some(output.trim_end().to_string())
+     }
+ 
+     /// Fallback: grep through memory files directly.
+@@ -153,8 +138,8 @@ impl Tool for RecallTool {
+                 "mode": {
+                     "type": "string",
+                     "enum": ["auto", "keyword", "semantic"],
+-                    "description": "Search mode: 'auto' tries semantic then keyword (default), \
+-                                   'keyword' for exact matches, 'semantic' for meaning-based search"
++                    "description": "Search mode: 'auto' tries hybrid BM25+semantic (default), \
++                                   'keyword' for BM25-only exact matches, 'semantic' for meaning-based search"
+                 }
+             },
+             "required": ["query"]
+@@ -175,57 +160,38 @@ impl Tool for RecallTool {
+         let n = 5;
+         let mut sections: Vec<String> = Vec::new();
+ 
+-        match mode {
+-            "semantic" => {
+-                if let Some(results) = self.qmd_vsearch(query, n).await {
+-                    sections.push(format!("## Semantic Search Results\n{}", results));
+-                } else {
+-                    // Fallback to grep.
+-                    sections.push(self.grep_memory(query, n).await);
+-                }
+-            }
+-            "keyword" => {
+-                if let Some(results) = self.qmd_search(query, n).await {
+-                    sections.push(format!("## Keyword Search Results\n{}", results));
+-                } else {
+-                    sections.push(self.grep_memory(query, n).await);
+-                }
+-            }
+-            _ => {
+-                // Auto mode: try semantic first, then keyword, fallback to grep.
+-                let mut found = false;
+-
+-                if let Some(results) = self.qmd_vsearch(query, n).await {
+-                    sections.push(format!("## Semantic Search Results\n{}", results));
+-                    found = true;
+-                }
+-
+-                if let Some(results) = self.qmd_search(query, n).await {
+-                    sections.push(format!("## Keyword Search Results\n{}", results));
+-                    found = true;
+-                }
++        // Try knowledge store first (hybrid BM25 + vector search).
++        if let Some(results) = self.knowledge_search(query, n, mode) {
++            let label = match mode {
++                "keyword" => "Keyword Search Results",
++                "semantic" => "Hybrid Search Results",
++                _ => "Search Results",
++            };
++            sections.push(format!("## {}\n{}", label, results));
++        }
+ 
+-                if !found {
+-                    sections.push(self.grep_memory(query, n).await);
+-                }
+-            }
++        // Always supplement with grep over raw memory files (catches un-indexed content).
++        let grep_results = self.grep_memory(query, n).await;
++        if !grep_results.contains("No matches found") && !grep_results.contains("No memory directory") {
++            sections.push(grep_results);
+         }
+ 
++        // If knowledge store had nothing, and grep had nothing, report it.
+         if sections.is_empty() {
+-            format!("No results found for '{}'.", query)
++            sections.push(self.grep_memory(query, n).await);
++        }
++
++        // Truncate total output to avoid blowing context (UTF-8 safe).
++        let output = sections.join("\n\n");
++        if output.len() > 8000 {
++            let truncated: String = output.chars().take(8000).collect();
++            format!(
++                "{}\n\n[truncated — {} total chars]",
++                truncated,
++                output.len()
++            )
+         } else {
+-            // Truncate total output to avoid blowing context (UTF-8 safe).
+-            let output = sections.join("\n\n");
+-            if output.len() > 8000 {
+-                let truncated: String = output.chars().take(8000).collect();
+-                format!(
+-                    "{}\n\n[truncated — {} total chars]",
+-                    truncated,
+-                    output.len()
+-                )
+-            } else {
+-                output
+-            }
++            output
+         }
+     }
+ }
+@@ -309,7 +275,7 @@ mod tests {
+     #[tokio::test]
+     async fn test_recall_grep_no_matches() {
+         let (_tmp, tool) = make_tool();
+-        // Test the grep_memory fallback directly (bypasses qmd).
++        // Test the grep_memory fallback directly (bypasses knowledge store).
+         let result = tool.grep_memory("nonexistent_xyz_123_qqq", 5).await;
+         assert!(result.contains("No matches found"));
+     }
+@@ -325,7 +291,7 @@ mod tests {
+         )
+         .unwrap();
+ 
+-        // Test grep_memory directly to bypass qmd.
++        // Test grep_memory directly to bypass knowledge store.
+         let result = tool.grep_memory("UTF-8", 10).await;
+         assert!(
+             result.contains("UTF-8"),
+@@ -357,4 +323,16 @@ mod tests {
+         let result = tool.execute(params).await;
+         assert!(result.contains("Error"));
+     }
++
++    #[test]
++    fn test_knowledge_search_on_empty_store() {
++        let tool = RecallTool::new(Path::new("/tmp/nonexistent"));
++        // Should gracefully return None when knowledge store has nothing.
++        // (open_default will create an empty DB, hybrid_search returns empty)
++        let result = tool.knowledge_search("test query", 5, "auto");
++        // Either None (no hits) or Some with empty — both are fine.
++        if let Some(ref text) = result {
++            assert!(!text.is_empty());
++        }
++    }
+ }
+diff --git a/src/cli.rs b/src/cli.rs
+index 0a29b90..4dc0e27 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -1315,12 +1315,17 @@ pub(crate) fn check_api_key(config: &Config) {
+ }
+ 
+ /// Check if a model name refers to a Claude/Anthropic model.
++///
++/// Handles both bare names (`claude-opus-4-5`) and prefixed names
++/// (`anthropic/claude-opus-4-5`).
+ fn is_claude_model(model: &str) -> bool {
+     let m = model.to_lowercase();
+-    m.starts_with("claude")
+-        || m.starts_with("opus")
+-        || m.starts_with("sonnet")
+-        || m.starts_with("haiku")
++    // Strip provider prefix if present (e.g. "anthropic/claude-opus-4-5" → "claude-opus-4-5")
++    let base = m.rsplit('/').next().unwrap_or(&m);
++    base.starts_with("claude")
++        || base.starts_with("opus")
++        || base.starts_with("sonnet")
++        || base.starts_with("haiku")
+ }
+ 
+ /// Check if Claude CLI OAuth credentials exist on disk.
+diff --git a/src/lms.rs b/src/lms.rs
+index e03c4cd..8766fd9 100644
+--- a/src/lms.rs
++++ b/src/lms.rs
+@@ -158,15 +158,24 @@ pub(crate) async fn load_model(
+     port: u16,
+     model: &str,
+     context_length: Option<usize>,
++) -> Result<(), String> {
++    load_model_at(&rest_base(port), model, context_length).await
++}
++
++/// Like `load_model` but accepts a full base URL (e.g. `"http://192.168.1.22:1234"`).
++pub(crate) async fn load_model_at(
++    base_url: &str,
++    model: &str,
++    context_length: Option<usize>,
+ ) -> Result<(), String> {
+     // Check if already loaded with matching context
+-    let models = list_models_full(port).await;
++    let models = list_models_full_at(base_url).await;
+     if should_skip_load(&models, model, context_length) {
+         tracing::debug!("lms skip load: model={} already loaded with matching context", model);
+         return Ok(());
+     }
+ 
+-    post_load_model(port, model, context_length).await
++    post_load_model_at(base_url, model, context_length).await
+ }
+ 
+ /// Reload a model with a specific context length.
+@@ -178,13 +187,22 @@ pub(crate) async fn reload_model_with_context(
+     model: &str,
+     context_length: usize,
+ ) -> Result<(), String> {
+-    let models = list_models_full(port).await;
++    reload_model_with_context_at(&rest_base(port), model, context_length).await
++}
++
++/// Like `reload_model_with_context` but accepts a full base URL.
++pub(crate) async fn reload_model_with_context_at(
++    base_url: &str,
++    model: &str,
++    context_length: usize,
++) -> Result<(), String> {
++    let models = list_models_full_at(base_url).await;
+     let loaded_keys: Vec<String> = models.iter()
+         .filter(|m| m.loaded && model_matches(&m.key, model))
+         .map(|m| m.key.clone())
+         .collect();
+     for loaded_model in &loaded_keys {
+-        if let Err(e) = unload_model(port, loaded_model).await {
++        if let Err(e) = unload_model_at(base_url, loaded_model).await {
+             tracing::warn!(
+                 "lms unload before reload failed: model={} loaded_model={} error={}",
+                 model,
+@@ -194,7 +212,7 @@ pub(crate) async fn reload_model_with_context(
+         }
+     }
+ 
+-    post_load_model(port, model, Some(context_length)).await
++    post_load_model_at(base_url, model, Some(context_length)).await
+ }
+ 
+ pub(crate) fn model_matches(loaded: &str, model: &str) -> bool {
+@@ -219,8 +237,16 @@ async fn post_load_model(
+     model: &str,
+     context_length: Option<usize>,
+ ) -> Result<(), String> {
++    post_load_model_at(&rest_base(port), model, context_length).await
++}
++
++async fn post_load_model_at(
++    base_url: &str,
++    model: &str,
++    context_length: Option<usize>,
++) -> Result<(), String> {
+ 
+-    let url = format!("{}/api/v1/models/load", rest_base(port));
++    let url = format!("{}/api/v1/models/load", base_url);
+     let mut body = serde_json::json!({ "model": model });
+     if let Some(ctx) = context_length {
+         body["context_length"] = serde_json::json!(ctx);
+@@ -254,8 +280,13 @@ async fn post_load_model(
+ 
+ /// Unload a single model via the LM Studio REST API.
+ pub(crate) async fn unload_model(port: u16, model: &str) -> Result<(), String> {
+-    let url = format!("{}/api/v1/models/unload", rest_base(port));
+-    let body = serde_json::json!({ "identifier": model });
++    unload_model_at(&rest_base(port), model).await
++}
++
++/// Like `unload_model` but accepts a full base URL.
++pub(crate) async fn unload_model_at(base_url: &str, model: &str) -> Result<(), String> {
++    let url = format!("{}/api/v1/models/unload", base_url);
++    let body = serde_json::json!({ "instance_id": model });
+ 
+     let client = reqwest::Client::new();
+     let resp = client
+@@ -295,7 +326,11 @@ pub(crate) struct ModelInfo {
+ 
+ /// List all models via `GET /api/v1/models`, returning full info.
+ async fn list_models_full(port: u16) -> Vec<ModelInfo> {
+-    let url = format!("{}/api/v1/models", rest_base(port));
++    list_models_full_at(&rest_base(port)).await
++}
++
++async fn list_models_full_at(base_url: &str) -> Vec<ModelInfo> {
++    let url = format!("{}/api/v1/models", base_url);
+     let resp = match reqwest::get(&url).await {
+         Ok(r) if r.status().is_success() => r,
+         _ => return Vec::new(),
