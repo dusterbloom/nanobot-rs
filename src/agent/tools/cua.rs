@@ -303,6 +303,12 @@ impl CuaTool {
                 "Error: cua-driver call '{tool}' failed: {detail}\n\nAvailable cua-driver tools:\n{list}"
             );
         }
+        // Compact driver JSON at the source: raw list_apps (29KB) and AX
+        // window trees blew the result cap, stashed behind a handle whose
+        // excerpt was just "{", forcing an inspect_tool_result round-trip
+        // per cua action (ergonomics fix 1). Plain-text driver replies
+        // (shims, future shapes) pass through untouched.
+        let mut out = compact_driver_output(tool, &out);
         if shot_path.is_file() {
             out.push_str("\n\nScreenshot saved: ");
             out.push_str(&shot_str);
@@ -331,6 +337,197 @@ fn daemon_launch_args(binary: &str, permission_mode: &str, macos: bool) -> Vec<S
             permission_mode.to_string(),
         ]
     }
+}
+
+// ---------------------------------------------------------------------------
+// Driver-output compaction (v0.5 ergonomics fix 1)
+// ---------------------------------------------------------------------------
+
+/// Char ceiling for compacted cua output. Comfortably under the tool-result
+/// cap so compacted output stays INLINE instead of being stashed behind a
+/// handle — the inspect round-trip tax that halved the GUI lease budget
+/// (session 20260826_120633_51cbb8: 7 of 12 slots spent on
+/// `inspect_tool_result` fetches of `cua` handles).
+const COMPACT_MAX_CHARS: usize = 8_000;
+/// Per-element char ceiling for one AX element line.
+const ELEMENT_LINE_MAX: usize = 160;
+/// Max element lines rendered before truncating with a hint.
+const ELEMENT_LINES_MAX: usize = 80;
+
+/// Compact a cua-driver JSON payload into a small model-ready projection.
+/// Pure; non-JSON input passes through unchanged (the stash pipeline still
+/// bounds it).
+///
+/// Known shapes (verified against driver output in the session DB):
+/// - `list_apps`: `{"apps": [{name, bundle_id, pid, running, active, ...}]}`
+///   → one line per app.
+/// - window/desktop state: `{degraded, degraded_reason, element_count,
+///   elements: [...], escalation: {...}, windows: [...]}` → diagnostics kept,
+///   elements rendered as bounded role/name/value lines.
+/// Anything else JSON-shaped keeps scalar diagnostics + any recognized
+/// array, dropping opaque blobs.
+fn compact_driver_output(tool: &str, raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_string();
+    };
+    let Some(obj) = value.as_object() else {
+        // Non-object JSON (rare): leave to the normal bounding pipeline.
+        return raw.to_string();
+    };
+
+    let mut out = String::with_capacity(1024);
+    out.push_str(&format!(
+        "[cua:{tool} compacted from {} chars]\n",
+        raw.chars().count()
+    ));
+
+    // Scalar diagnostics worth teaching the model (truncated hard).
+    for key in ["degraded_reason", "escalation", "error", "message"] {
+        if let Some(text) = obj.get(key).and_then(Value::as_str) {
+            let t: String = text.chars().take(400).collect();
+            out.push_str(&format!("{key}: {t}\n"));
+        }
+    }
+    // The driver also sends escalation as an object ({reason: ...}) on
+    // degraded snapshots — surface its reason the same way.
+    if let Some(reason) = obj
+        .get("escalation")
+        .and_then(Value::as_object)
+        .and_then(|esc| esc.get("reason"))
+        .and_then(Value::as_str)
+    {
+        let t: String = reason.chars().take(400).collect();
+        out.push_str(&format!("escalation: {t}\n"));
+    }
+    for key in [
+        "degraded",
+        "element_count",
+        "elements_complete",
+        "current_space_id",
+    ] {
+        if let Some(v) = obj.get(key) {
+            if !v.is_object() && !v.is_array() {
+                out.push_str(&format!("{key}: {v}\n"));
+            }
+        }
+    }
+    // The driver's _note teaches bounding args — keep one compressed hint.
+    if obj.contains_key("elements") {
+        out.push_str("note: prefer elements; pass max_elements/max_depth to bound large AX trees\n");
+    }
+
+    // Known payload arrays.
+    if let Some(apps) = obj.get("apps").and_then(Value::as_array) {
+        out.push_str(&format!("apps ({}):\n", apps.len()));
+        for app in apps.iter().take(60) {
+            let name = str_field(app, &["name", "app_name"]).unwrap_or_else(|| "?".to_string());
+            let bid = str_field(app, &["bundle_id"]).unwrap_or_default();
+            let pid = app.get("pid").map(|v| v.to_string()).unwrap_or_default();
+            let state = if app.get("active").and_then(Value::as_bool) == Some(true) {
+                "active"
+            } else if app.get("running").and_then(Value::as_bool) == Some(true) {
+                "running"
+            } else {
+                "not-running"
+            };
+            let windows = app
+                .get("windows")
+                .and_then(Value::as_array)
+                .map(|w| w.len())
+                .unwrap_or(0);
+            out.push_str(&format!(
+                "- {name} ({bid}, pid {pid}, {state}, {windows} window(s))\n"
+            ));
+        }
+        if apps.len() > 60 {
+            out.push_str(&format!("… {} more apps not shown\n", apps.len() - 60));
+        }
+    }
+
+    if let Some(windows) = obj.get("windows").and_then(Value::as_array) {
+        out.push_str(&format!("windows ({}):\n", windows.len()));
+        for w in windows.iter().take(40) {
+            let app = str_field(w, &["app_name", "name", "title"]).unwrap_or_else(|| "?".to_string());
+            let on_screen = w.get("is_on_screen").and_then(Value::as_bool);
+            let id = w.get("window_id").map(|v| v.to_string()).unwrap_or_default();
+            let space = w.get("space_id").map(|v| v.to_string()).unwrap_or_default();
+            out.push_str(&format!(
+                "- {app} (id {id}, space {space}, {})\n",
+                if on_screen == Some(true) {
+                    "on-screen"
+                } else {
+                    "off-screen"
+                }
+            ));
+        }
+        if windows.len() > 40 {
+            out.push_str(&format!(
+                "… {} more windows not shown\n",
+                windows.len() - 40
+            ));
+        }
+    }
+
+    if let Some(elements) = obj.get("elements").and_then(Value::as_array) {
+        if elements.is_empty() {
+            out.push_str("elements: none (tree empty — see degraded_reason above)\n");
+        } else {
+            out.push_str("elements:\n");
+            let mut lines = 0;
+            for el in elements {
+                if lines >= ELEMENT_LINES_MAX {
+                    out.push_str(&format!(
+                        "… {} more elements not shown (pass max_elements to narrow)\n",
+                        elements.len() - lines
+                    ));
+                    break;
+                }
+                if let Some(line) = element_line(el) {
+                    out.push_str(&line);
+                    out.push('\n');
+                    lines += 1;
+                }
+            }
+        }
+    }
+
+    // Hard ceiling with an actionable hint.
+    if out.chars().count() > COMPACT_MAX_CHARS {
+        let cut: String = out.chars().take(COMPACT_MAX_CHARS).collect();
+        return format!(
+            "{cut}\n[cua output truncated at {COMPACT_MAX_CHARS} chars — narrow the call with max_elements/max_depth or a more specific tool]"
+        );
+    }
+    out
+}
+
+/// First present string field among candidates.
+fn str_field(obj: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| obj.get(*k).and_then(Value::as_str))
+        .map(|s| s.chars().take(60).collect())
+}
+
+/// One compact line for an AX element: identity fields + child count.
+fn element_line(el: &Value) -> Option<String> {
+    let obj = el.as_object()?;
+    let role = str_field(el, &["role", "role_description"]).unwrap_or_default();
+    let name = str_field(el, &["name", "label", "title", "ax_name"]);
+    let text = str_field(el, &["value", "text", "ax_value"]);
+    let children = obj
+        .get("children")
+        .and_then(Value::as_array)
+        .map(|c| format!(" +{}ch", c.len()))
+        .unwrap_or_default();
+    let mut line = format!("- {role}");
+    if let Some(n) = &name {
+        line.push_str(&format!(" \"{n}\""));
+    }
+    if let Some(t) = &text {
+        line.push_str(&format!(" = \"{t}\""));
+    }
+    line.push_str(&children);
+    Some(line.chars().take(ELEMENT_LINE_MAX).collect())
 }
 
 #[async_trait]
@@ -429,6 +626,113 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+
+    // -------------------------------------------------------------------
+    // Driver-output compaction (ergonomics fix 1)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn compact_list_apps_shrinks_29k_json_to_per_app_lines() {
+        // Shape verified against the real driver output in session
+        // 20260826_120633_51cbb8: per-app objects with windows arrays.
+        let mut apps = Vec::new();
+        for i in 0..40 {
+            apps.push(serde_json::json!({
+                "active": i == 0,
+                "bundle_id": format!("com.example.app{i}"),
+                "kind": "desktop",
+                "last_used": "2026-07-17T05:14:16Z",
+                "launch_path": format!("/Applications/App{i}.app"),
+                "name": format!("App {i}"),
+                "pid": 600 + i,
+                "running": true,
+                "windows": [serde_json::json!({"bounds": {"x": 0.0, "y": 0.0, "width": 800.0, "height": 600.0}, "is_on_screen": i % 2 == 0, "window_id": 1000 + i})]
+            }));
+        }
+        let raw = serde_json::to_string_pretty(&serde_json::json!({"apps": apps})).unwrap();
+        assert!(raw.chars().count() > 10_000, "fixture must be the big shape");
+
+        let out = compact_driver_output("list_apps", &raw);
+        assert!(out.contains("[cua:list_apps compacted from"), "{out}");
+        assert!(out.contains("apps (40):"), "{out}");
+        assert!(out.contains("- App 0 (com.example.app0, pid 600, active, 1 window(s))"), "{out}");
+        assert!(out.contains("- App 1 (com.example.app1, pid 601, running, 1 window(s))"), "{out}");
+        assert!(out.chars().count() < 3_000, "must stay inline-sized, got {}", out.chars().count());
+        // No handle-bait: the raw JSON blob is gone.
+        assert!(!out.contains("\"launch_path\""), "{out}");
+    }
+
+    #[test]
+    fn compact_window_state_keeps_diagnostics_and_bounded_elements() {
+        // Shape from the same session: degraded snapshot with escalation and
+        // routes; elements may be empty or a tree.
+        let raw = serde_json::to_string_pretty(&serde_json::json!({
+            "_note": "Prefer elements — tree_markdown will continue to work. Issue #22865: use max_elements / max_depth to bound the AX walk.",
+            "background_input": {"exact_window": {"pid": 41460, "status": "ax_unresolved", "window_id": 16964}},
+            "degraded": true,
+            "degraded_reason": "ax_window_unresolved: window_id 16964 exists but none of the AXWindow elements report this CGWindowID.",
+            "element_count": 0,
+            "elements": [],
+            "elements_complete": false,
+            "escalation": {"reason": "observation-only: re-snapshot after the app settles, or act with delivery_mode:\"foreground\"."}
+        }))
+        .unwrap();
+
+        let out = compact_driver_output("get_window_state", &raw);
+        assert!(out.contains("degraded: true"), "{out}");
+        assert!(out.contains("degraded_reason: ax_window_unresolved"), "{out}");
+        assert!(out.contains("escalation: observation-only"), "{out}");
+        assert!(out.contains("elements: none"), "{out}");
+        assert!(!out.contains("background_input"), "opaque blob dropped: {out}");
+    }
+
+    #[test]
+    fn compact_elements_renders_identity_lines_and_caps() {
+        let elements: Vec<_> = (0..100)
+            .map(|i| {
+                serde_json::json!({
+                    "role": "AXButton",
+                    "name": format!("button {i}"),
+                    "value": format!("value {i}"),
+                    "children": [{"role": "AXStaticText", "name": "child"}]
+                })
+            })
+            .collect();
+        let raw = serde_json::to_string(&serde_json::json!({
+            "elements": elements, "element_count": 100
+        }))
+        .unwrap();
+
+        let out = compact_driver_output("snapshot", &raw);
+        assert!(out.contains("- AXButton \"button 0\" = \"value 0\" +1ch"), "{out}");
+        assert!(out.contains("more elements not shown (pass max_elements"), "{out}");
+    }
+
+    #[test]
+    fn compact_passes_through_non_json_untouched() {
+        let raw = "OK";
+        assert_eq!(compact_driver_output("click", raw), "OK");
+        let text = "plain driver text\nsecond line";
+        assert_eq!(compact_driver_output("type_text", text), text);
+        // Non-object JSON passes through too.
+        assert_eq!(compact_driver_output("scroll", "[1,2,3]"), "[1,2,3]");
+    }
+
+    #[test]
+    fn compact_hard_ceiling_with_actionable_hint() {
+        // Long name AND value so each element line approaches the 160-char
+        // per-line cap; 80 lines then exceed the 8,000-char hard ceiling and
+        // exercise the truncation hint. (Short values render ~80-char lines
+        // and never reach the ceiling.)
+        let elements: Vec<_> = (0..600)
+            .map(|i| serde_json::json!({"role": "AXRow", "name": "x".repeat(150), "value": format!("row {i} {}", "y".repeat(150))}))
+            .collect();
+        let raw = serde_json::to_string(&serde_json::json!({"elements": elements})).unwrap();
+        let out = compact_driver_output("get_desktop_state", &raw);
+        assert!(out.chars().count() < COMPACT_MAX_CHARS + 200, "ceiling honored");
+        assert!(out.contains("truncated at"), "{out}");
+    }
 
     /// Write an executable `cua-driver` shim into a temp dir. Behavior driven
     /// by marker files: `status` exits 0 when `.running` exists; `call` echoes
