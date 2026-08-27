@@ -46,6 +46,12 @@ const MAX_CONTEXT_LINES: usize = 5;
 /// context even after line-count bounding.
 const MAX_OUTPUT_CHARS: usize = 4000;
 
+/// Headroom reserved inside `MAX_OUTPUT_CHARS` for the loud paging-guidance
+/// footer on sequential pages, so header + body + footer always stays within
+/// the cap. Sized above the longest END/MORE footer (incl. multi-digit
+/// offsets), so pages shrink by at most this much.
+const GUIDANCE_RESERVE: usize = 200;
+
 /// Maximum number of lines a single slice may return.
 const MAX_SLICE_LINES: usize = 2000;
 
@@ -130,7 +136,13 @@ fn render_with_context(
 /// Render a bounded page from an exact body using a zero-based character
 /// offset. This is the recovery path for a physical line that cannot fit on a
 /// line page; `next_char` always advances beyond the visible text.
-fn render_char_page(body: &str, artifact_tool_call_id: &str, start_char: usize) -> String {
+///
+/// `paged` selects the loud sequential-paging guidance: when true, an
+/// unmissable END-OF-SOURCE or MORE-CONTENT footer is appended (and body size
+/// is reduced by `GUIDANCE_RESERVE` to keep the whole page within the cap).
+/// Query-centered pages pass `paged = false` — they answer a search, they are
+/// not a read-through, so "stop paging" guidance would be noise there.
+fn render_char_page(body: &str, artifact_tool_call_id: &str, start_char: usize, paged: bool) -> String {
     let total = body.chars().count();
     if start_char >= total {
         return format!(
@@ -149,12 +161,13 @@ fn render_char_page(body: &str, artifact_tool_call_id: &str, start_char: usize) 
         )
     };
 
+    let page_budget = MAX_OUTPUT_CHARS.saturating_sub(if paged { GUIDANCE_RESERVE } else { 0 });
     let mut text = String::new();
     let mut end_char = start_char;
     for ch in body.chars().skip(start_char) {
         text.push(ch);
         let candidate_end = end_char + 1;
-        if header(candidate_end).chars().count() + text.chars().count() > MAX_OUTPUT_CHARS {
+        if header(candidate_end).chars().count() + text.chars().count() > page_budget {
             text.pop();
             break;
         }
@@ -167,7 +180,19 @@ fn render_char_page(body: &str, artifact_tool_call_id: &str, start_char: usize) 
         );
     }
 
-    format!("{}{text}", header(end_char))
+    if !paged {
+        return format!("{}{text}", header(end_char));
+    }
+
+    let footer = if end_char < total {
+        format!(
+            "\n[MORE CONTENT AHEAD — this page stops mid-source. To read the rest, call again with start_char={end_char}.]"
+        )
+    } else {
+        "\n[END OF SOURCE — you have now read the complete stored output. Do not request further pages of this source; answer from what you have.]".to_string()
+    };
+
+    format!("{}{text}{footer}", header(end_char))
 }
 
 /// Render one self-contained, line-aligned artifact page. The continuation is
@@ -217,7 +242,7 @@ fn render_slice_page(
         let mut candidate_rows = rows.clone();
         candidate_rows.push(row);
         let candidate = format!("{}{}", header(line.number), candidate_rows.join("\n"));
-        if candidate.chars().count() > MAX_OUTPUT_CHARS {
+        if candidate.chars().count() > MAX_OUTPUT_CHARS.saturating_sub(GUIDANCE_RESERVE) {
             break;
         }
         rows = candidate_rows;
@@ -225,7 +250,19 @@ fn render_slice_page(
     }
 
     match last_line {
-        Some(last_line) => format!("{}{}", header(last_line), rows.join("\n")),
+        Some(last_line) => {
+            let footer = if last_line < total {
+                format!(
+                    "\n[MORE CONTENT AHEAD — this page stops at line {last_line} of {total}. To read the rest, call again with start_line={}.]",
+                    last_line + 1
+                )
+            } else {
+                format!(
+                    "\n[END OF SOURCE — you have now read all {total} lines of the stored output. Do not request further pages of this source; answer from what you have.]"
+                )
+            };
+            format!("{}{}{}", header(last_line), rows.join("\n"), footer)
+        }
         None => render_char_page(
             body,
             artifact_tool_call_id,
@@ -233,6 +270,7 @@ fn render_slice_page(
                 .iter()
                 .find(|line| line.number == clamped_start)
                 .map_or(0, |line| line.start_char),
+            true,
         ),
     }
 }
@@ -260,7 +298,9 @@ fn render_query_results(
         .collect();
 
     let Some((first_match, first_match_offset)) = matches.first().copied() else {
-        return format!("No matching lines for '{query}'.");
+        return format!(
+            "No matching lines for '{query}'. Note: query is a literal substring (regex characters are escaped, so patterns like '\\.' search for the backslash-dot text itself). If you meant to read the source by position, omit query and use start_line/end_line or start_char."
+        );
     };
 
     if let Some((wide_match, wide_match_offset)) = matches.iter().copied().find(|(line, _)| {
@@ -273,6 +313,7 @@ fn render_query_results(
             body,
             artifact_tool_call_id,
             wide_match.start_char + wide_match_offset,
+            false,
         );
     }
 
@@ -307,6 +348,7 @@ fn render_query_results(
             body,
             artifact_tool_call_id,
             first_match.start_char + first_match_offset,
+            false,
         );
     }
     if total_matches > shown {
@@ -362,7 +404,7 @@ impl Tool for SearchToolResultTool {
                 },
                 "query": {
                     "type": "string",
-                    "description": "Substring to search for (case-insensitive)."
+                    "description": "Substring to find, case-insensitive. Matched as a LITERAL substring — regex metacharacters like '.', '|', '\\' are escaped, not interpreted; do not write regex patterns. To read by position instead of searching, omit this field and use start_line/end_line (or start_char after a next_char)."
                 },
                 "start_line": {
                     "type": "integer",
@@ -405,7 +447,16 @@ impl Tool for SearchToolResultTool {
             .await;
         let result = if let Some(body) = body {
             let lines = stashed_lines(&body);
-            if let Some(query) = params.get("query").and_then(|v| v.as_str()) {
+            // An empty query is an omitted query: models send `query: ""`
+            // alongside start_line when they mean line paging, and the empty
+            // regex matches EVERY line — the wide-line fallback then returns
+            // the same char window no matter what start_line says, stranding
+            // the caller in a repeat loop (session 20260827_201333_10ec08).
+            let query = params
+                .get("query")
+                .and_then(|v| v.as_str())
+                .filter(|q| !q.trim().is_empty());
+            if let Some(query) = query {
                 let matcher = match RegexBuilder::new(&regex::escape(query))
                     .case_insensitive(true)
                     .build()
@@ -430,7 +481,7 @@ impl Tool for SearchToolResultTool {
                     context_lines,
                 )
             } else if let Some(start_char) = params.get("start_char").and_then(|v| v.as_u64()) {
-                render_char_page(&body, id, start_char as usize)
+                render_char_page(&body, id, start_char as usize, true)
             } else {
                 let start = params
                     .get("start_line")
@@ -579,6 +630,88 @@ mod tests {
         assert!(out.contains("10:data"));
         assert!(out.contains("12:data"));
         assert!(!out.contains("13:data"));
+    }
+
+    #[tokio::test]
+    async fn inspect_empty_query_falls_back_to_line_range() {
+        // Session 20260827_201333_10ec08 trap: models send `query: ""` with
+        // `start_line` meaning line paging. The empty regex matched every
+        // line, and with a wide line present the wide-line fallback returned
+        // the SAME char window for every start_line — an unrecoverable loop.
+        // An empty query must behave like an omitted one.
+        let (_dir, db_path, sid) = make_db().await;
+        let mut body = "x".repeat(MAX_OUTPUT_CHARS + 1000); // one wide line
+        for i in 2..=60 {
+            body.push_str(&format!("\nline-{i}"));
+        }
+        seed(&db_path, &sid, "call_wide", &body).await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        for (start, expected) in [(50, "50:line-50"), (55, "55:line-55")] {
+            let params = HashMap::from([
+                ("tool_call_id".to_string(), json!("call_wide")),
+                ("query".to_string(), json!("")),
+                ("start_line".to_string(), json!(start)),
+                ("max_results".to_string(), json!(80)),
+                ("context_lines".to_string(), json!(3)),
+            ]);
+            let out = crate::agent::tools::base::render_result(
+                tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            );
+            assert!(out.contains(expected), "start_line={start}: {out}");
+            assert!(
+                out.contains(&format!("[source=call_wide lines {start}-")),
+                "start_line={start} must page, not repeat a char window: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_sequential_pages_carry_loud_end_and_more_guidance() {
+        let (_dir, db_path, sid) = make_db().await;
+        // 200 x ~60-char lines ≈ 12K chars: forces a partial first page.
+        let body: Vec<&str> = (0..200).map(|_| "data data data data data data").collect();
+        seed(&db_path, &sid, "call_loud", &body.join("\n")).await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        // Partial page: must point at the exact next line.
+        let partial = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("call_loud")),
+                    ("start_line".to_string(), json!(1)),
+                    ("end_line".to_string(), json!(100)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        assert!(
+            partial.contains("[MORE CONTENT AHEAD"),
+            "partial page must warn there is more: {partial}"
+        );
+
+        // Page reaching the end: must say END OF SOURCE loudly.
+        let last = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("call_loud")),
+                    ("start_line".to_string(), json!(195)),
+                    ("end_line".to_string(), json!(200)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        assert!(
+            last.contains("[END OF SOURCE"),
+            "final page must announce the end: {last}"
+        );
+        assert!(
+            last.chars().count() <= MAX_OUTPUT_CHARS,
+            "guidance must fit inside the output cap"
+        );
     }
 
     #[tokio::test]
