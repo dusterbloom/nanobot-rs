@@ -163,6 +163,12 @@ pub(crate) struct RetryState {
     pub(crate) rescue_attempted: bool,
     /// One-shot: agent-level retry for transient LLM errors (per iteration).
     pub(crate) api_retried: bool,
+    /// Server rejected the request with context_length_exceeded and we
+    /// trimmed + retried this many times already this turn. Capped (see
+    /// MAX_OVERFLOW_RECOVERIES): each attempt must strictly shrink the
+    /// context, but a hard cap bounds the prefill cost of pathological
+    /// shrink-overflow-shrink cycles.
+    pub(crate) overflow_trim_recoveries: u32,
     /// Consecutive lease-renewal rejections (the model emitted a PARTIAL
     /// checkpoint — some labels, missing a field — and was nudged what to
     /// add). Without a cap a small model that keeps emitting partial
@@ -181,6 +187,7 @@ impl RetryState {
             empty_think_retried: false,
             rescue_attempted: false,
             api_retried: false,
+            overflow_trim_recoveries: 0,
             lease_renewal_rejections: 0,
         }
     }

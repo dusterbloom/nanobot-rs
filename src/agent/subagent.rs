@@ -1513,10 +1513,19 @@ mod tests {
             "request (12197 tokens) exceeds the available context size (8192 tokens)"
         );
         let e3 = anyhow::anyhow!("network timeout");
+        // Exact higgs / OpenAI-compat wire shape: the underscored code is NOT
+        // matched by the spaced "context length" pattern (live 400, session
+        // 20260827_164197).
+        let e4 = anyhow::anyhow!(
+            "HTTP request failed: HTTP 400: {{\"error\":{{\"message\":\"Rendered prompt has \
+             3958 tokens, exceeding max_prompt_tokens=3952\",\"type\":\"invalid_request_error\",\
+             \"code\":\"context_length_exceeded\"}}}}"
+        );
 
         assert!(crate::errors::is_context_overflow_error(&e1));
         assert!(crate::errors::is_context_overflow_error(&e2));
         assert!(!crate::errors::is_context_overflow_error(&e3));
+        assert!(crate::errors::is_context_overflow_error(&e4));
     }
 
     /// Mock provider that captures messages and returns a tool call on first

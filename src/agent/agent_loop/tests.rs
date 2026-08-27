@@ -7240,8 +7240,11 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
     );
     assert_eq!(
         provider.call_count(),
-        2,
-        "first read executes; the first cached duplicate must force finalization"
+        3,
+        "first read executes; the first duplicate gets one receipt-informed \
+         retry (the model may answer from context — killing the turn here \
+         stranded a real answer mid-task, session 20260827_071357); the \
+         second consecutive all-blocked round forces finalization"
     );
 
     let _ = std::fs::remove_dir_all(&workspace);

@@ -508,6 +508,13 @@ pub(crate) fn is_side_effect_tool(name: &str) -> bool {
 /// Network tools (`web_search`, `web_fetch`) are deliberately NOT here.
 /// They mutate nothing locally, but they spend money, burn rate limits, and
 /// paginate in loops — bounding exactly that is what the lease is for.
+///
+/// `inspect_tool_result` and `get_tools` ARE here: they only re-read bytes
+/// already stashed in this session / enumerate tool definitions. Blocking
+/// them after exhaustion strands data the turn already paid for — the model
+/// can neither finish the task nor report what it fetched (session
+/// 20260827_064521: headlines fetched, then the turn died on a blocked
+/// inspect of the fetched page).
 pub(crate) fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
@@ -518,6 +525,8 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
             | "file_info"
             | "file_preview"
             | "get_skills"
+            | "inspect_tool_result"
+            | "get_tools"
     )
 }
 
@@ -3237,6 +3246,38 @@ mod tests {
         let data = "Screenshot saved: /tmp/evil.png";
         let got = cua_screenshot_candidate("cua", true, true, data, ws);
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn read_only_classification_bounds_the_post_exhaustion_auto_renewal() {
+        // Auto-renewal after lease exhaustion is keyed to this set: members
+        // keep reading, everything else must checkpoint or answer. Pure local
+        // reads qualify — including re-reading bytes this session already
+        // stashed and enumerating tool definitions. Network and side-effect
+        // tools stay budgeted: bounding their loops is the lease's job.
+        for name in [
+            "read_file",
+            "list_dir",
+            "find_files",
+            "search_files",
+            "file_info",
+            "file_preview",
+            "get_skills",
+            "inspect_tool_result",
+            "get_tools",
+        ] {
+            assert!(is_read_only_tool(name), "{name} must auto-renew");
+        }
+        for name in [
+            "web_search",
+            "web_fetch",
+            "exec",
+            "write_file",
+            "recall",
+            "remember",
+        ] {
+            assert!(!is_read_only_tool(name), "{name} must stay budgeted");
+        }
     }
 
     #[test]

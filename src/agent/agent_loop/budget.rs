@@ -278,3 +278,43 @@ pub(super) fn advertised_tool_names(tool_defs: &[Value]) -> HashSet<String> {
 pub(super) fn should_allow_checkpoint(pressure: f32, tau_hard: f64) -> bool {
     (pressure as f64) >= tau_hard
 }
+
+/// Margin under the server-enforced prompt cap for [`overflow_trim_threshold`].
+/// Sized to absorb the tokenizer-estimate error: the client estimates with
+/// cl100k while local servers tokenize with their own BPE (Qwen), which
+/// measured ~4% higher on live content (session 20260827_102059: cl100k
+/// passed a prompt the server counted at 3972 vs a 3952 cap). Under-trimming
+/// kills the turn with a 400; over-trimming only sheds an old message — so the
+/// margin errs conservative.
+const OVERFLOW_TRIM_MARGIN: f64 = 0.93;
+
+/// Trim target for server-oracle overflow recovery (see
+/// `attempt_overflow_recovery`), as a fraction of the SMALLEST possible
+/// prompt cap (window minus the BASE response budget). The server already
+/// proved the client estimate wrong for this content — the bias measured up
+/// to ~20% on entity-heavy content — so the recovery target sits far enough
+/// under every possible cap that even a badly biased estimate lands safely.
+pub(super) const OVERFLOW_RECOVERY_MARGIN: f64 = 0.80;
+
+/// Headroom under the server-reported cap for the RATIO-based recovery
+/// target (the error carries exact token counts). 10% absorbs the tool-def
+/// count the server renders alongside the messages plus per-message density
+/// variation between the trimmed tail and the kept head.
+pub(super) const OVERFLOW_RECOVERY_HEADROOM: f64 = 0.90;
+
+/// Max server-oracle overflow recoveries per turn. Each attempt strictly
+/// shrinks the context (or gives up), so this only bounds the prefill cost
+/// of pathological grow-overflow-shrink cycles, not correctness.
+pub(super) const MAX_OVERFLOW_RECOVERIES: u32 = 3;
+
+/// Emergency-trim gate for a given prompt cap (context window minus the
+/// response budget the request will actually send — what higgs receives as
+/// `max_prompt_tokens`). Gating on the raw window instead lets a prompt slip
+/// between the client gate and the server cap and die in a
+/// `context_length_exceeded` 400 (session 20260827_083227: ~31,054 estimated
+/// tokens passed `0.95 × 32,768` and hit the 30,720 server cap). The margin
+/// absorbs tokenizer-estimate error — trimming one message early is cheap;
+/// overflowing kills the turn.
+pub(super) fn overflow_trim_threshold(prompt_cap: usize) -> usize {
+    (prompt_cap as f64 * OVERFLOW_TRIM_MARGIN) as usize
+}

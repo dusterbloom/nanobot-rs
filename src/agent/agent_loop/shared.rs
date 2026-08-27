@@ -70,9 +70,11 @@ use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, Control
 use super::budget::{
     advertised_tool_names, attach_higgs_session_control, clear_prompt_cache_state,
     conversation_token_count, divergent_message_digest, invalidate_prompt_cache_for_rewrite,
+    overflow_trim_threshold,
     proactive_grounding_preserves_prefix_cache, send_cache_reset_marker, send_compaction_marker,
     send_retract_reply_marker, should_allow_checkpoint, should_inject_heartbeat_grounding,
-    strip_higgs_session_lease_control,
+    strip_higgs_session_lease_control, OVERFLOW_RECOVERY_HEADROOM, OVERFLOW_RECOVERY_MARGIN,
+    MAX_OVERFLOW_RECOVERIES,
 };
 use super::compaction::execute_lcm_compaction;
 use super::local_stream::{
@@ -1825,6 +1827,124 @@ impl AgentLoopShared {
         StepResult::Next(IterationPhase::PreCall)
     }
 
+    /// Emergency-trim `ctx.messages` so the RENDERED prompt lands under
+    /// `message_budget` (estimated tokens, tool definitions NOT included —
+    /// the caller accounts for them). Emergency mode ignores message age and
+    /// breaks the frozen watermark prefix when it alone exceeds the budget;
+    /// breaking it rotates the prompt-cache identity (sanctioned rewrite).
+    /// Returns `true` when the trim actually shrank the rendered context.
+    async fn apply_emergency_trim(&self, ctx: &mut TurnContext, message_budget: usize) -> bool {
+        let rendered_before = TokenBudget::estimate_tokens(&ctx.rendered_messages);
+        if rendered_before <= message_budget {
+            return false;
+        }
+        // The trimmer estimates RAW messages, but the wire form renders
+        // larger (protocol framing). Scale the raw target by the
+        // raw/rendered ratio so the trim converges on what actually ships.
+        let raw_est = TokenBudget::estimate_tokens(&ctx.messages).max(1);
+        let raw_target =
+            (raw_est as f64 * message_budget as f64 / rendered_before as f64) as usize;
+        let frozen_prefix = ctx
+            .counters
+            .prompt_cache_watermark
+            .lock()
+            .get(&ctx.session_key)
+            .copied()
+            .unwrap_or(0);
+        // `apply_budget`'s Emergency mode hardcodes a zero tool-def reserve
+        // (target `available_budget(0)`), which can sit ABOVE the budget this
+        // call needs — call the trimmer directly with an offset so the trim
+        // lands at `raw_target`.
+        let budget_overhead = ctx
+            .core
+            .token_budget
+            .available_budget(0)
+            .saturating_sub(raw_target);
+        let before_messages = ctx.messages.len();
+        let (trimmed_messages, trim_disposition) = ctx
+            .core
+            .token_budget
+            .trim_to_fit_with_age_preserving_prefix(
+                &ctx.messages,
+                budget_overhead,
+                0,
+                0,
+                frozen_prefix,
+            );
+        let prefix_preserved = matches!(
+            trim_disposition,
+            crate::agent::token_budget::PrefixTrimDisposition::Preserved
+        );
+        if !prefix_preserved && frozen_prefix > 0 {
+            let rotated = invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::EmergencyTrim);
+            warn!(
+                session = %ctx.session_key,
+                frozen_prefix,
+                before_messages,
+                after_messages = trimmed_messages.len(),
+                rotated,
+                "prompt_cache_watermark_invalidated_by_emergency_trim"
+            );
+        }
+        ctx.messages = trimmed_messages;
+        if !prefix_preserved {
+            self.install_pending_compaction(ctx, true).await;
+        }
+        // Re-render after trim to rebuild protocol-correct wire format.
+        ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
+        TokenBudget::estimate_tokens(&ctx.rendered_messages) < rendered_before
+    }
+
+    /// Server-oracle overflow recovery: the provider rejected the request with
+    /// `context_length_exceeded`, which proves the client's tokenizer estimate
+    /// wrong for this content (cl100k under-counts the server's BPE, up to
+    /// ~20% on entity-heavy content). When the error carries the server's
+    /// exact numbers, trim by its overshoot RATIO — a ratio target is
+    /// invariant to the estimator's bias — leaving headroom under the cap.
+    /// Otherwise fall back to the smallest possible prompt cap (window minus
+    /// the base response budget) with a fat margin. One-shot per turn: if the
+    /// retry still overflows, fall through to the normal error path.
+    async fn attempt_overflow_recovery(&self, ctx: &mut TurnContext, error: &anyhow::Error) -> bool {
+        if ctx.flow.retries.overflow_trim_recoveries >= MAX_OVERFLOW_RECOVERIES
+            || !crate::errors::is_context_overflow_error(error)
+        {
+            return false;
+        }
+        let est_rendered = TokenBudget::estimate_tokens(&ctx.rendered_messages).max(1);
+        let parsed = crate::errors::parse_overflow_counts(&error.to_string());
+        let message_budget = match parsed {
+            // The server's count includes tool definitions rendered into the
+            // prompt, which cannot be trimmed. Reserve their server-side cost
+            // (actual minus the rendered-message estimate) and fit messages
+            // into what remains under the cap — a target derived from the
+            // server's own numbers, invariant to the client estimator's bias.
+            Some((actual_tokens, prompt_cap)) => {
+                let tool_cost = actual_tokens.saturating_sub(est_rendered);
+                ((prompt_cap as f64 * OVERFLOW_RECOVERY_HEADROOM) as usize)
+                    .saturating_sub(tool_cost)
+            }
+            None => ((ctx
+                .core
+                .token_budget
+                .max_context()
+                .saturating_sub(ctx.core.max_tokens as usize)) as f64
+                * OVERFLOW_RECOVERY_MARGIN) as usize,
+        };
+        let before_messages = ctx.messages.len();
+        if !self.apply_emergency_trim(ctx, message_budget).await {
+            return false;
+        }
+        ctx.flow.retries.overflow_trim_recoveries += 1;
+        warn!(
+            session = %ctx.session_key,
+            error = %error,
+            before_messages,
+            after_messages = ctx.messages.len(),
+            "context_overflow_recovery_trim"
+        );
+        true
+    }
+
     // -----------------------------------------------------------------------
     // Step 2: PreCall — build tool defs, trim, compaction, repair, preflight
     // -----------------------------------------------------------------------
@@ -1996,57 +2116,6 @@ impl AgentLoopShared {
         // `ctx.rendered_messages` is what gets sent to the provider.
         ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
 
-        // Pre-flight context size check: emergency trim if we're about to
-        // exceed the model's context window. The 95% threshold leaves room
-        // for the response tokens.
-        let estimated = TokenBudget::estimate_tokens(&ctx.rendered_messages);
-        let max_ctx = ctx.core.token_budget.max_context();
-        if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
-            warn!(
-                estimated_tokens = estimated,
-                max_context = max_ctx,
-                model = %ctx.core.model,
-                "context_overflow_emergency_trim"
-            );
-            let frozen_prefix = ctx
-                .counters
-                .prompt_cache_watermark
-                .lock()
-                .get(&ctx.session_key)
-                .copied()
-                .unwrap_or(0);
-            // Emergency mode is conservative (ignores age, trims more aggressively).
-            let (trimmed_messages, trim_disposition) = ctx.core.retention.apply_budget(
-                &ctx.core.token_budget,
-                &ctx.messages,
-                0,
-                crate::agent::retention::BudgetMode::Emergency,
-                frozen_prefix,
-            );
-            let prefix_preserved = matches!(
-                trim_disposition,
-                crate::agent::token_budget::PrefixTrimDisposition::Preserved
-            );
-            if !prefix_preserved && frozen_prefix > 0 {
-                let rotated =
-                    invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::EmergencyTrim);
-                warn!(
-                    session = %ctx.session_key,
-                    frozen_prefix,
-                    before_messages = ctx.messages.len(),
-                    after_messages = trimmed_messages.len(),
-                    rotated,
-                    "prompt_cache_watermark_invalidated_by_emergency_trim"
-                );
-            }
-            ctx.messages = trimmed_messages;
-            if !prefix_preserved {
-                self.install_pending_compaction(ctx, true).await;
-            }
-            // Re-render after trim to rebuild protocol-correct wire format.
-            ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
-        }
-
         // Router-first preflight for strict trio mode. The router can only
         // strip tools when trio is active, so the passthrough-restore below
         // is only meaningful then. When trio is off (the common local
@@ -2079,6 +2148,38 @@ impl AgentLoopShared {
 
         // Adaptive max_tokens: size the response budget to the task.
         let effective_max_tokens = self.compute_adaptive_max_tokens(ctx);
+
+        // Pre-flight overflow check, gated on the EXACT prompt cap this
+        // request will send (context window minus this call's response budget
+        // — what higgs enforces as max_prompt_tokens), not the raw window: a
+        // raw-window gate sits above the server cap and lets the request 400
+        // with context_length_exceeded instead of trimming (session
+        // 20260827_083227: ~31,054 estimated tokens passed 0.95 × 32,768 and
+        // hit the 30,720 cap). The estimate must include tool definitions:
+        // the server renders them into the prompt and counts them.
+        let prompt_cap = ctx
+            .core
+            .token_budget
+            .max_context()
+            .saturating_sub(effective_max_tokens as usize);
+        let trim_threshold = overflow_trim_threshold(prompt_cap);
+        let gate_tool_def_tokens = TokenBudget::estimate_tool_def_tokens(&tool_defs);
+        let estimated =
+            TokenBudget::estimate_tokens(&ctx.rendered_messages) + gate_tool_def_tokens;
+        if trim_threshold > 0 && estimated > trim_threshold {
+            warn!(
+                estimated_tokens = estimated,
+                trim_threshold,
+                prompt_cap,
+                model = %ctx.core.model,
+                "context_overflow_emergency_trim"
+            );
+            // Leave room for the tool definitions the server renders
+            // alongside the messages.
+            let message_budget = trim_threshold.saturating_sub(gate_tool_def_tokens);
+            self.apply_emergency_trim(ctx, message_budget).await;
+        }
+
         self.apply_planned_auto_expansion(ctx, &tool_defs, effective_max_tokens)
             .await;
 
@@ -2635,6 +2736,59 @@ impl AgentLoopShared {
                     &ctx.text_delta_tx,
                     crate::turn_stream::CompactionStatus::Finished,
                 );
+            }
+
+            // LCM ingests only persisted rows (`_db_id`), so a single long
+            // turn grows entirely outside the engine's view: blocking
+            // compaction then summarizes the small pre-turn store and
+            // installs nothing. If we are still over the hard limit, trim
+            // deterministically instead of overflowing into a server 400
+            // (session 20260827_083227). Same rewrite contract as the
+            // pre-flight emergency trim, so rotate the cache identity too.
+            if conversation_token_count(&ctx.messages) > hard_limit {
+                let frozen_prefix = ctx
+                    .counters
+                    .prompt_cache_watermark
+                    .lock()
+                    .get(&ctx.session_key)
+                    .copied()
+                    .unwrap_or(0);
+                // apply_budget's Emergency mode hardcodes a zero tool-def
+                // reserve (target available_budget(0) > hard_limit — a no-op
+                // here), so call the trimmer directly with an offset that
+                // lands the trim at hard_limit.
+                let budget_overhead = ctx
+                    .core
+                    .token_budget
+                    .available_budget(0)
+                    .saturating_sub(hard_limit);
+                let (trimmed_messages, trim_disposition) = ctx
+                    .core
+                    .token_budget
+                    .trim_to_fit_with_age_preserving_prefix(
+                        &ctx.messages,
+                        budget_overhead,
+                        0,
+                        0,
+                        frozen_prefix,
+                    );
+                let prefix_preserved = matches!(
+                    trim_disposition,
+                    crate::agent::token_budget::PrefixTrimDisposition::Preserved
+                );
+                if !prefix_preserved && frozen_prefix > 0 {
+                    let rotated =
+                        invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::EmergencyTrim);
+                    warn!(
+                        session = %ctx.session_key,
+                        frozen_prefix,
+                        before_messages = ctx.messages.len(),
+                        after_messages = trimmed_messages.len(),
+                        rotated,
+                        "in_turn_overflow_trim_invalidated_prompt_cache"
+                    );
+                }
+                ctx.messages = trimmed_messages;
             }
 
             if ctx.is_cancelled() {
@@ -3565,6 +3719,10 @@ impl AgentLoopShared {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
+                        if self.attempt_overflow_recovery(ctx, &e).await {
+                            counters.mark_inference_finished();
+                            return StepResult::Done(IterationOutcome::Continue);
+                        }
                         return Self::handle_llm_error(
                             e,
                             ctx,
@@ -3593,6 +3751,10 @@ impl AgentLoopShared {
                     Err(e) => {
                         Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
                         if Self::handle_retained_route_error(ctx, &e) {
+                            counters.mark_inference_finished();
+                            return StepResult::Done(IterationOutcome::Continue);
+                        }
+                        if self.attempt_overflow_recovery(ctx, &e).await {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
@@ -3801,6 +3963,10 @@ impl AgentLoopShared {
                 Err(e) => {
                     Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
                     if Self::handle_retained_route_error(ctx, &e) {
+                        counters.mark_inference_finished();
+                        return StepResult::Done(IterationOutcome::Continue);
+                    }
+                    if self.attempt_overflow_recovery(ctx, &e).await {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Continue);
                     }
@@ -5958,6 +6124,28 @@ mod cache_pressure_tests {
     fn checkpoint_forced_above_tau_hard() {
         assert!(should_allow_checkpoint(0.90, 0.85));
         assert!(should_allow_checkpoint(1.00, 0.85));
+    }
+
+    // -- overflow_trim_threshold -------------------------------------------
+
+    #[test]
+    fn overflow_trim_threshold_sits_below_the_server_prompt_cap() {
+        // Live shape: 32,768 window minus a 2,048 response budget → the
+        // request enforces max_prompt_tokens = 30,720 on the server.
+        let server_cap = 32_768usize.saturating_sub(2_048);
+        assert_eq!(server_cap, 30_720);
+
+        let threshold = super::overflow_trim_threshold(server_cap);
+        assert!(
+            threshold < server_cap,
+            "gate must trip before the server's max_prompt_tokens 400, \
+             got {threshold} >= {server_cap}"
+        );
+        assert!(
+            threshold > server_cap * 9 / 10,
+            "the margin absorbs estimator error, it is not a second \
+             response reserve: {threshold}"
+        );
     }
 
     #[test]

@@ -150,6 +150,29 @@ pub(crate) fn is_context_overflow_error(err: &anyhow::Error) -> bool {
         || message.contains("exceeds the available context size")
         || message.contains("context size")
         || message.contains("context length")
+        // OpenAI-standard structured code, emitted verbatim by higgs and other
+        // OpenAI-compatible servers (`context_length_exceeded` — underscore,
+        // not matched by the spaced "context length" pattern above).
+        || message.contains("context_length_exceeded")
+}
+
+/// Server-reported prompt size and cap from a context-overflow message, e.g.
+/// higgs/OpenAI's `Rendered prompt has 4143 tokens, exceeding
+/// max_prompt_tokens=3952` → `(4143, 3952)`. Lets overflow recovery trim by
+/// the server's exact overshoot ratio instead of trusting the client's
+/// (biased, different-tokenizer) estimate. `None` for unrecognized shapes —
+/// callers fall back to a conservative absolute target.
+pub(crate) fn parse_overflow_counts(message: &str) -> Option<(usize, usize)> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(\d+)\s*tokens?\b.*?max_prompt_tokens[=:]\s*(\d+)")
+            .expect("static overflow-parse regex")
+    });
+    let caps = re.captures(message)?;
+    let actual = caps.get(1)?.as_str().parse().ok()?;
+    let cap = caps.get(2)?.as_str().parse().ok()?;
+    (actual > 0 && cap > 0).then_some((actual, cap))
 }
 
 /// Check if an HTTP error message indicates a transient/retryable condition.
@@ -423,6 +446,30 @@ pub fn legacy_kind_from_tool_error(e: &ToolError) -> Option<ToolErrorKind> {
 #[allow(clippy::disallowed_methods)] // pins classify_tool_error's mapping for legacy string->typed conversion (kept while ToolExecutionResult lives)
 mod tests {
     use super::*;
+
+    // -- parse_overflow_counts tests --
+
+    #[test]
+    fn parse_overflow_counts_higgs_openai_shape() {
+        let msg = "HTTP request failed: HTTP 400: {\"error\":{\"message\":\"Rendered prompt \
+                   has 4143 tokens, exceeding max_prompt_tokens=3952\",\"type\":\
+                   \"invalid_request_error\",\"code\":\"context_length_exceeded\"}}";
+        assert_eq!(parse_overflow_counts(msg), Some((4143, 3952)));
+    }
+
+    #[test]
+    fn parse_overflow_counts_colon_separator() {
+        assert_eq!(
+            parse_overflow_counts("prompt uses 900 tokens; max_prompt_tokens: 512"),
+            Some((900, 512))
+        );
+    }
+
+    #[test]
+    fn parse_overflow_counts_unrecognized_returns_none() {
+        assert_eq!(parse_overflow_counts("maximum context length exceeded"), None);
+        assert_eq!(parse_overflow_counts("network timeout"), None);
+    }
 
     // -- ProviderError tests --
 

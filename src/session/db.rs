@@ -2301,8 +2301,13 @@ impl SessionDb {
             // These are protocol/infrastructure receipts, not ordinary tool
             // output. Rewriting them would make a live boundary rejection
             // become a handle on the next reload and bust the prefix cache.
+            // `lease exhausted:` receipts are injected raw at exec time (too
+            // small to stash), so a reload-time handle/excerpt rewrite mutates
+            // bytes already cached server-side (session 20260826_201612_93d688:
+            // two `DivergedOrNotGrowing` re-prefills, 68s + 138s on higgs).
             if raw_content.starts_with("response boundary:")
                 || raw_content.starts_with("Error: result for ")
+                || raw_content.starts_with("lease exhausted:")
             {
                 continue;
             }
@@ -4859,6 +4864,78 @@ mod tests {
             !content.contains("RAW_HTML_MUST_STAY_IN_TOOL_RESULTS"),
             "the original HTML-like payload must stay in tool_results"
         );
+    }
+
+    #[tokio::test]
+    async fn get_history_keeps_lease_exhausted_receipts_byte_identical() {
+        // Lease-blocked receipts are injected raw at exec time (below the
+        // stash cap, so no handle is rendered at ingestion). A reload must
+        // replay them byte-identical: rewriting them into a handle/excerpt
+        // mutates a message the provider already cached and busts the
+        // retained KV prefix on the next turn.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:lease-receipt-stability").await;
+        let receipts = [
+            ("lease_exec", "exec", "lease exhausted: exec was not executed — your per-turn tool budget is used up. Write a renewal checkpoint (findings:/next:/will:) to continue with more tools, or write your final answer."),
+            ("lease_inspect", "inspect_tool_result", "lease exhausted: inspect_tool_result was not executed — your per-turn tool budget is used up. Write a renewal checkpoint (findings:/next:/will:) to continue with more tools, or write your final answer."),
+        ];
+
+        for (call_id, tool_name, receipt) in &receipts {
+            db.add_messages(
+                &meta.id,
+                &[
+                    json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": "{}"}
+                        }]
+                    }),
+                    json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                        "ok": false,
+                        "content": receipt
+                    }),
+                ],
+            )
+            .await;
+        }
+
+        for reload in 0..2 {
+            let history = db.get_history(&meta.id, 100, 0).await;
+            for (call_id, _tool_name, receipt) in &receipts {
+                let replayed = history
+                    .iter()
+                    .find(|message| {
+                        message.get("tool_call_id").and_then(Value::as_str) == Some(call_id)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("receipt {call_id} must survive reload {reload}")
+                    });
+                assert_eq!(
+                    replayed["content"].as_str(),
+                    Some(*receipt),
+                    "lease receipt {call_id} must replay byte-identical on reload {reload}"
+                );
+                assert!(
+                    !replayed["content"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER),
+                    "lease receipt {call_id} must not become a handle on reload {reload}"
+                );
+            }
+        }
+
+        // The exemption must not stash as a side effect: the only exact body
+        // for a receipt is the bytes already sent to the provider.
+        for (call_id, _, _) in &receipts {
+            assert_eq!(db.load_tool_result(&meta.id, call_id).await, None);
+        }
     }
 
     #[tokio::test]

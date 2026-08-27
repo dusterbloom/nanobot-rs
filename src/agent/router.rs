@@ -1774,10 +1774,7 @@ pub(crate) async fn route_tool_calls(
             // round as zero progress so cached receipts cannot livelock the
             // agent loop while also bypassing its iteration budget.
             ctx.flow.round_executed_no_tools = true;
-            // Cached duplicate receipts already prove the requested result is
-            // present in context. Do not spend another local-model prefill just
-            // to ask the model to notice the receipt; force a final response.
-            if !blocked_with_result.is_empty() || ctx.flow.consecutive_all_blocked >= 2 {
+            if ctx.flow.consecutive_all_blocked >= 2 {
                 warn!(
                     rounds = ctx.flow.consecutive_all_blocked,
                     "tool_loop_circuit_breaker: model stuck requesting blocked tools, forcing response"
@@ -1789,7 +1786,14 @@ pub(crate) async fn route_tool_calls(
             }
             // Text accompanying a tool call is normally a progress preamble
             // ("let me check ..."), not a final answer. Give the model one
-            // receipt-informed retry instead of exposing that preamble.
+            // receipt-informed retry instead of exposing that preamble — this
+            // applies to cached duplicates too: the receipt instructs "answer
+            // from the prior result", and the evidence is already in context,
+            // so the model usually delivers a real answer on this pass (the
+            // old immediate-Break ended turns with boilerplate mid-task, e.g.
+            // session 20260827_071357). Skipping this pass saved one prefill
+            // and cost the turn; on retained-session backends the pass is a
+            // cheap suffix-only prefill anyway.
             return RouteResult::Continue;
         }
         if let Some(text) = response_content.filter(|s| !s.trim().is_empty()) {
