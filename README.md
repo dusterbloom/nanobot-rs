@@ -425,10 +425,6 @@ Single-binary. No microservices. The agent loop is the core -- it takes a messag
 
 On startup, the TUI clears the terminal, shows an ASCII splash with mode info, and renders LLM responses as styled markdown (headers, code blocks, bold/italic) via termimad. Input uses rustyline with arrow-key history.
 
-## Origin
-
-Originally inspired by [nanobot](https://github.com/HKUDS/nanobot) by [HKUDS](https://github.com/HKUDS) (Python, MIT). Rebuilt from scratch in Rust with a different architecture, feature set, and direction.
-
 ## License
 
 MIT

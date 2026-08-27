@@ -1,5 +1,4 @@
 //! nanobot - A lightweight personal AI assistant framework in Rust.
-//! Based on nanobot by HKUDS (https://github.com/HKUDS/nanobot).
 //!
 //! Local LLM support: Use Ctrl+L or /local to toggle between cloud and local mode.
 

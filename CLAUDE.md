@@ -39,7 +39,7 @@ Before writing or modifying any function, run through these gates. If a gate tri
 
 ## Project
 
-**nanobot** - A lightweight personal AI assistant framework in Rust, ported from [nanobot](https://github.com/HKUDS/nanobot) (Python, MIT). Binary name: `nanobot`.
+**nanobot** - A lightweight personal AI assistant framework in Rust. Binary name: `nanobot`.
 
 ## Build & Test
 
