@@ -7091,16 +7091,15 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
     );
 }
 
-/// A MEDIUM ordinary result must be stored before prompt shaping and reach the
-/// model as a deterministic handle. This closes the raw-replay hole where a
-/// roughly 7KB web/file result was resent on every turn.
+/// Hybrid exposure: a MEDIUM ordinary result (read_file self-caps under the
+/// inline threshold) must be stored losslessly AND injected inline, so the
+/// model reads the content directly with no inspect_tool_result round-trip.
+/// Live and persisted bytes stay identical so the prefix cache remains stable.
 #[tokio::test]
-async fn medium_tool_result_persists_handle_not_body() {
-    use crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER;
-
+async fn medium_tool_result_inlines_body_not_handle() {
     let files_dir = tempfile::tempdir().unwrap();
-    // ~6.4KB: below the old replay-byte gate, but large enough to expose the
-    // raw replay behavior this regression is about.
+    // ~6.4KB source; read_file self-caps its output under the inline
+    // threshold, so the shaped result is small enough to inline.
     let body = "medium_line_one\nmedium_line_two\n".repeat(200);
     let path = files_dir.path().join("medium.txt");
     std::fs::write(&path, &body).unwrap();
@@ -7148,12 +7147,9 @@ async fn medium_tool_result_persists_handle_not_body() {
         .unwrap_or("");
 
     assert!(
-        content.starts_with(TOOL_RESULT_HANDLE_MARKER),
-        "ordinary medium result must be a handle, not raw content; got: {content}"
-    );
-    assert!(
-        !content.contains("medium_line_one"),
-        "ordinary medium result body must stay out of the message; got: {content}"
+        content.contains("medium_line_one"),
+        "hybrid: medium (sub-threshold) result must inline the body so the \
+         model reads it without an inspect round-trip; got: {content}"
     );
 
     let stashed = core
@@ -7181,7 +7177,7 @@ async fn medium_tool_result_persists_handle_not_body() {
         .unwrap_or("");
     assert_eq!(
         live_content, content,
-        "live and persisted medium handles must be byte-identical"
+        "live and persisted inline bytes must be identical (cache-stable)"
     );
 
     let _ = std::fs::remove_dir_all(files_dir);

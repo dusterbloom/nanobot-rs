@@ -277,7 +277,17 @@ pub(crate) async fn store_then_render_tool_result(
 
     Ok(match tool_result_exposure(tool_name) {
         ToolResultExposure::Handle => {
-            render_tool_result_handle(tool_call_id, tool_name, ok, exact_body.as_bytes(), args)
+            // Hybrid exposure (prototype): small results go INLINE — their
+            // bytes are deterministic and immutable once stashed, so they are
+            // just as cache-stable as a handle, and inlining spares the model
+            // an inspect_tool_result round-trip per result. Only genuinely
+            // large results stay handles (context protection). The reload
+            // path in SessionDb::get_history applies the same threshold.
+            if exact_body.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES {
+                exact_body.to_string()
+            } else {
+                render_tool_result_handle(tool_call_id, tool_name, ok, exact_body.as_bytes(), args)
+            }
         }
         ToolResultExposure::ExplicitExcerpt => {
             render_stable_retrieval_excerpt(tool_name, args, exact_body, cap, tool_call_id)
@@ -3033,10 +3043,19 @@ mod tests {
             .await
             .expect("ordinary result must be stored before rendering");
 
-            assert!(
-                rendered.starts_with(TOOL_RESULT_HANDLE_MARKER),
-                "size {size} must use the ordinary handle wire: {rendered}"
-            );
+            // Hybrid exposure: small results inline (cache-stable bytes, no
+            // inspect round-trip), large results stay handles.
+            if size <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES {
+                assert_eq!(
+                    rendered, body,
+                    "size {size} must inline the exact body under the hybrid"
+                );
+            } else {
+                assert!(
+                    rendered.starts_with(TOOL_RESULT_HANDLE_MARKER),
+                    "size {size} must use the ordinary handle wire: {rendered}"
+                );
+            }
             assert_eq!(
                 sessions.load_tool_result(&session.id, &id).await.as_deref(),
                 Some(body.as_str()),

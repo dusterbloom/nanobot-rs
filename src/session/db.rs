@@ -2311,6 +2311,13 @@ impl SessionDb {
             {
                 continue;
             }
+            // Hybrid exposure (prototype): small ordinary results were
+            // injected INLINE at ingestion (see store_then_render_tool_result).
+            // Rewriting them into handles here would mutate bytes already
+            // cached server-side. Same threshold on both paths, by design.
+            if raw_content.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES {
+                continue;
+            }
             let Some(tool_call_id) = message.get("tool_call_id").and_then(Value::as_str) else {
                 continue;
             };
@@ -4936,6 +4943,55 @@ mod tests {
         for (call_id, _, _) in &receipts {
             assert_eq!(db.load_tool_result(&meta.id, call_id).await, None);
         }
+    }
+
+    #[tokio::test]
+    async fn get_history_keeps_small_inline_results_byte_identical() {
+        // Hybrid exposure reload contract: a small ordinary result that went
+        // INLINE at ingestion must replay byte-identical (the same threshold
+        // on both paths). Upgrading it to a handle would mutate bytes already
+        // cached server-side — the retained-KV bust class. A large legacy raw
+        // body still upgrades to a handle.
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:hybrid-reload-stability").await;
+        let small_body = "small result line\n".repeat(50); // 900 bytes
+        let large_body = "y".repeat(6_000);
+        assert!(small_body.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES);
+        assert!(large_body.len() > crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES);
+
+        db.add_messages(
+            &meta.id,
+            &[
+                json!({"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_small", "type": "function", "function": {"name": "exec", "arguments": "{}"}},
+                ]}),
+                json!({"role": "tool", "tool_call_id": "call_small", "name": "exec", "ok": true, "content": small_body}),
+                json!({"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_large", "type": "function", "function": {"name": "exec", "arguments": "{}"}},
+                ]}),
+                json!({"role": "tool", "tool_call_id": "call_large", "name": "exec", "ok": true, "content": large_body}),
+            ],
+        )
+        .await;
+
+        let history = db.get_history(&meta.id, 100, 0).await;
+        let content_of = |call_id: &str| {
+            history
+                .iter()
+                .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some(call_id))
+                .and_then(|m| m.get("content").cloned())
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| panic!("missing tool result {call_id}"))
+        };
+        assert_eq!(
+            content_of("call_small"),
+            small_body,
+            "small inline result must replay byte-identical"
+        );
+        assert!(
+            content_of("call_large").starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER),
+            "large legacy raw body must still upgrade to a handle"
+        );
     }
 
     #[tokio::test]

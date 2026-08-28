@@ -365,6 +365,27 @@ impl AgentLoopShared {
             ),
         ));
 
+        // KISS experiment knob: NANOBOT_TOOLS_ONLY=a,b,c restricts the model's
+        // surface to exactly those tools (drops everything else, stateful
+        // included). Applied here — the single choke point after ALL
+        // registrations — so a "python-only" surface truly means one tool.
+        if let Ok(only) = std::env::var("NANOBOT_TOOLS_ONLY") {
+            let allow: std::collections::HashSet<&str> =
+                only.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            if !allow.is_empty() {
+                for name in tools.tool_names() {
+                    if !allow.contains(name.as_str()) {
+                        tools.unregister(&name);
+                    }
+                }
+                tracing::info!(
+                    tools_only = %only,
+                    remaining = ?tools.tool_names(),
+                    "NANOBOT_TOOLS_ONLY restricted tool surface"
+                );
+            }
+        }
+
         // Get session history. Track count so we know where new messages start.
         // The trim ceiling must stay above LCM's soft
         // compaction threshold, or compaction never fires (see history_limit_lcm).
