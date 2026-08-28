@@ -64,6 +64,16 @@ pub enum ToolBodyPolicy {
 /// (session 20260804_204406_c16eb0) — inside the inline contract.
 pub(crate) const TOOL_RESULT_REPLAY_MAX_BYTES: usize = 12_000;
 
+/// Hybrid exposure threshold (prototype): ordinary tool results up to this
+/// size are injected INLINE (deterministic bytes → cache-stable, and too
+/// small to pressure context); larger results become handles. Kills the
+/// inspect-tax for the common small-result case (kiss/tool-surface bench:
+/// pi-style read/explore needed 13-17 inspect_tool_result calls per task
+/// because every result, however small, was a handle). Both live ingestion
+/// and get_history replay must apply the SAME threshold, or reloads rewrite
+/// inline bodies into handles and bust the retained KV prefix.
+pub(crate) const INLINE_TOOL_RESULT_MAX_BYTES: usize = 4_096;
+
 pub(crate) fn cap_tool_result_for_replay(content: &str) -> String {
     shrink_tool_body(
         content,
