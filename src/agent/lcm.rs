@@ -711,7 +711,10 @@ impl LcmEngine {
         compactor: Option<&ContextCompactor>,
         budget: &TokenBudget,
         tool_def_tokens: usize,
-        failure_mode: CompactionFailureMode,
+        // Retained for call-site intent (soft vs blocking). Since huge blocks
+        // in BOTH modes now take deterministic truncation (the >80 guard no
+        // longer refuses soft blocks), the mode no longer branches here.
+        _failure_mode: CompactionFailureMode,
     ) -> Option<Turn> {
         let available = budget.available_budget(tool_def_tokens);
         let target = (available as f64 * self.config.tau_soft * 0.8) as usize;
@@ -815,24 +818,22 @@ impl LcmEngine {
         );
 
         // Guard: if the block is enormous, skip LLM summarization entirely.
-        // A 0.8B model summarizing 100+ messages produces 60-75+ sequential
-        // LLM calls (chunk + merge rounds), each competing for GPU time with
-        // the main model. Deterministic truncation is instant and sufficient.
+        // The historical rationale (a 0.8B summarizer doing 60-75+ sequential
+        // chunk+merge calls) is dead — summarize_with_prompt makes ONE call.
+        // What matters now: a huge block exceeds the summarizer's transcript
+        // band, and REFUSING to compact it (the old PreserveContext behavior)
+        // left the store in async-band limbo — every turn re-fired Async, hit
+        // this guard, and installed nothing while the prompt grew to the
+        // server's cap (session 20260828_142425: 0 summaries in 83 messages,
+        // then a 16K-token raw re-prefill after the overflow). Large blocks in
+        // soft mode now take the same deterministic truncation the blocking
+        // path uses.
         const MAX_COMPACTION_BLOCK_MESSAGES: usize = 80;
         let (summary_text, fresh_manifest, level) = if block_messages.len()
             > MAX_COMPACTION_BLOCK_MESSAGES
         {
-            if failure_mode == CompactionFailureMode::PreserveContext {
-                debug!(
-                    "LCM: soft block too large ({} msgs > {}), preserving active context",
-                    block_messages.len(),
-                    MAX_COMPACTION_BLOCK_MESSAGES
-                );
-                self.async_compaction_pending = false;
-                return None;
-            }
             info!(
-                "LCM: block too large ({} msgs > {}), using deterministic truncation",
+                "LCM: block too large ({} msgs > {}) for LLM summarization, using deterministic truncation",
                 block_messages.len(),
                 MAX_COMPACTION_BLOCK_MESSAGES
             );
@@ -1012,6 +1013,13 @@ impl LcmEngine {
     /// Mark that async compaction has been requested.
     pub fn request_async_compaction(&mut self) {
         self.async_compaction_pending = true;
+    }
+
+    /// Clear the soft-pending flag on cancelled jobs. Without this, one
+    /// cancelled job permanently disables soft compaction for the session
+    /// (`check_thresholds_with_available` gates Async on `!pending`).
+    pub fn clear_async_compaction_pending(&mut self) {
+        self.async_compaction_pending = false;
     }
 
     /// Retrieve original messages by IDs from the immutable store.
@@ -3190,7 +3198,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn soft_compaction_huge_block_preserves_active_context() {
+    async fn soft_compaction_huge_block_installs_deterministic_truncation() {
+        // Regression pin for the async-band limbo: PreserveContext used to
+        // REFUSE blocks >80 messages outright, so a store sitting in the
+        // soft band re-fired Async every turn and installed nothing while
+        // the prompt grew to the server cap (session 20260828_142425: zero
+        // summaries in 83 messages). Soft mode now takes the same
+        // deterministic truncation the blocking path uses.
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.1,
             tau_hard: 0.3,
@@ -3212,7 +3226,6 @@ mod tests {
                 &format!("Answer {i}: {detail}"),
             );
         }
-        let active_before = engine.active_context();
         engine.request_async_compaction();
 
         let result = engine
@@ -3224,17 +3237,27 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_none());
-        assert_eq!(
-            engine.active_context(),
-            active_before,
-            "soft pressure must not install level-three truncation for huge blocks"
+        let summary = result.expect("huge soft block must install deterministic truncation");
+        let Turn::Summary { text, level, .. } = summary else {
+            panic!("expected a Turn::Summary, got {summary:?}");
+        };
+        assert_eq!(level, 3, "huge block must take the deterministic path");
+        assert!(
+            !text.is_empty(),
+            "deterministic truncation must produce summary text"
         );
-        assert!(engine.dag().is_empty());
-        assert_ne!(
+        assert!(
+            engine.active_context().len() < 201,
+            "block must be replaced by the summary entry"
+        );
+        assert!(
+            !engine.dag().is_empty(),
+            "summary node must be committed to the DAG"
+        );
+        assert_eq!(
             engine.check_thresholds(&TokenBudget::new(32_768, 2048), 0),
             CompactionAction::None,
-            "failed soft compaction must remain retryable"
+            "installed truncation must bring the store back under thresholds"
         );
     }
 

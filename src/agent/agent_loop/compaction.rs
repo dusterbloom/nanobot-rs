@@ -449,7 +449,13 @@ pub(super) async fn execute_lcm_compaction(
     let compactor = core.compactor.with_provider(recorded_provider);
     let summary_turn = tokio::select! {
         biased;
-        () = cancellation.cancelled() => return None,
+        // Cancellation after `request_async_compaction()` must clear the
+        // pending flag, or check_thresholds_with_available stops returning
+        // Async for the whole session life (soft-compaction limbo).
+        () = cancellation.cancelled() => {
+            mutation.engine_mut().clear_async_compaction_pending();
+            None
+        }
         summary = mutation.engine_mut().compact(
             Some(&compactor),
             &core.token_budget,
