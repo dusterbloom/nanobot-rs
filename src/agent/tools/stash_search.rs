@@ -106,6 +106,32 @@ fn clamp_context(requested: Option<u64>) -> usize {
     requested.unwrap_or(0).clamp(0, MAX_CONTEXT_LINES as u64) as usize
 }
 
+/// Parse one line-number argument. Models keep emitting strings — plain
+/// `"76"`, or range notation `"76:149"` / `"76-149"` (sed/awk-style), which
+/// other tool surfaces accept. `Ok(Some(n))` = parsed value; `Ok(None)` =
+/// absent; `Err` = present but unparseable, so the caller can reject loudly
+/// instead of silently paging from line 1 (session 20260828_142425: models
+/// repeatedly sent "76:149", silently got lines 1-51, and looped).
+fn parse_line_param(value: Option<&Value>) -> Result<Option<u64>, String> {
+    let Some(v) = value else { return Ok(None) };
+    if let Some(n) = v.as_u64() {
+        return Ok(Some(n));
+    }
+    let Some(s) = v.as_str() else {
+        return Err(format!("unexpected type {}", v));
+    };
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let head = s.split(|c| c == ':' || c == '-').next().unwrap_or(s);
+    head
+        .trim()
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("'{s}' is not a line number (expected an integer like 76, or a range like 76:149)"))
+}
+
 /// Build `context_lines` worth of surrounding lines, prefixed with the match
 /// line itself. Lines are numbered and contiguous ranges collapse naturally.
 fn render_with_context(
@@ -408,7 +434,7 @@ impl Tool for SearchToolResultTool {
                 },
                 "start_line": {
                     "type": "integer",
-                    "description": "First line to read when query is omitted (default 1)."
+                    "description": "First line to read when query is omitted (default 1). A range string like \"76:149\" or \"76-149\" is also accepted (reads 76..149)."
                 },
                 "end_line": {
                     "type": "integer",
@@ -480,18 +506,22 @@ impl Tool for SearchToolResultTool {
                     max_results,
                     context_lines,
                 )
-            } else if let Some(start_char) = params.get("start_char").and_then(|v| v.as_u64()) {
+            } else if let Some(start_char) = parse_line_param(params.get("start_char"))
+                .map_err(|e| ToolError::InvalidArgs {
+                    message: format!("start_char: {e}. Pass an integer character offset."),
+                })? {
                 render_char_page(&body, id, start_char as usize, true)
             } else {
-                let start = params
-                    .get("start_line")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                let end = params
-                    .get("end_line")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(start as u64 + DEFAULT_SLICE_SPAN as u64)
-                    as usize;
+                let start_line = parse_line_param(params.get("start_line"))
+                    .map_err(|e| ToolError::InvalidArgs {
+                        message: format!("start_line: {e}. Pass an integer like 76, or a range like \"76:149\"."),
+                    })?;
+                let end_line = parse_line_param(params.get("end_line"))
+                    .map_err(|e| ToolError::InvalidArgs {
+                        message: format!("end_line: {e}. Pass an integer like 149."),
+                    })?;
+                let start = start_line.unwrap_or(1) as usize;
+                let end = end_line.unwrap_or(start as u64 + DEFAULT_SLICE_SPAN as u64) as usize;
                 render_slice_page(&body, &lines, id, start, end)
             }
         } else {
@@ -711,6 +741,55 @@ mod tests {
         assert!(
             last.chars().count() <= MAX_OUTPUT_CHARS,
             "guidance must fit inside the output cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_range_string_start_line_is_accepted() {
+        // Session 20260827_142425: models repeatedly send start_line as a
+        // range string ("76:149", "52:72") — sed/awk-style notation. The old
+        // as_u64() parse silently fell back to line 1, so the model kept
+        // re-reading lines 1-51 no matter what it asked for.
+        let (_dir, db_path, sid) = make_db().await;
+        let body: Vec<&str> = (1..=150).map(|_| "row").collect();
+        seed(&db_path, &sid, "call_range", &body.join("\n")).await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let params = HashMap::from([
+            ("tool_call_id".to_string(), json!("call_range")),
+            ("start_line".to_string(), json!("76:149")),
+        ]);
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            out.contains("[source=call_range lines 76-"),
+            "range string must page from line 76: {out}"
+        );
+        assert!(out.contains("76:row"), "{out}");
+        assert!(
+            !out.lines().any(|l| l.starts_with("1:row") || l.starts_with("2:row")),
+            "must not silently read from line 1: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_unparseable_start_line_rejects_loudly() {
+        let (_dir, db_path, sid) = make_db().await;
+        seed(&db_path, &sid, "call_bad", "a\nb\n").await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let params = HashMap::from([
+            ("tool_call_id".to_string(), json!("call_bad")),
+            ("start_line".to_string(), json!("line seventy-six")),
+        ]);
+        let result = tool
+            .execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::InvalidArgs { .. })),
+            "unparseable start_line must be rejected loudly, not silently paged from line 1"
         );
     }
 
