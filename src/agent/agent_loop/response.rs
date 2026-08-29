@@ -574,7 +574,7 @@ impl AgentLoopShared {
                         // emit another text answer instead of tool calls
                         // even though tool_defs are back on the next call.
                         ctx.messages
-                            .push(crate::agent::markers::scaffold_user(format!(
+                            .push_draft(crate::agent::markers::scaffold_user(format!(
                                 "[Lease renewed — {} more tool calls available. \
                                  Proceed with the plan from your checkpoint.]",
                                 ctx.flow.lease.lease_size()
@@ -609,7 +609,7 @@ impl AgentLoopShared {
                                 "tool_lease_renewal_rejected"
                             );
                             ctx.messages
-                                .push(crate::agent::markers::scaffold_user(format!(
+                                .push_draft(crate::agent::markers::scaffold_user(format!(
                                     "[Lease renewal rejected — your checkpoint is missing \
                                      '{}'. Either include all of findings:/next:/will: to \
                                      renew, or write your final answer.]",
@@ -844,7 +844,7 @@ impl AgentLoopShared {
 
         // Keep the fabricated-call text in history so the retry hint below has
         // an antecedent (and the wire keeps alternating roles).
-        ctx.messages.push(json!({
+        ctx.messages.push_draft(json!({
             "role": "assistant",
             "content": raw_content
         }));
@@ -853,7 +853,7 @@ impl AgentLoopShared {
         // session reload byte-identical, otherwise the warm prompt prefix
         // diverges and Higgs re-prefills the whole context.
         ctx.messages
-            .push(crate::agent::markers::scaffold_user(hint));
+            .push_draft(crate::agent::markers::scaffold_user(hint));
         debug!(
             "Injected validation retry hint (retry {}/{})",
             retry_num,
@@ -937,7 +937,7 @@ impl AgentLoopShared {
             // Streaming indicator.
             send_delta(&ctx.text_delta_tx, "\x1b[2m [continuing...]\x1b[0m");
 
-            let mut cont_messages = ctx.messages.clone();
+            let mut cont_messages = ctx.messages.to_vec();
             cont_messages.push(json!({
                 "role": "assistant",
                 "content": &accumulated

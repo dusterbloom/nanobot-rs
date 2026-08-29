@@ -641,7 +641,7 @@ impl AgentLoopShared {
             tool_event_tx,
             cancellation_token,
             priority_rx,
-            messages,
+            messages: crate::agent::agent_loop::MessageLog::committed(messages),
             new_start,
             rendered_messages: Vec::new(),
             protocol,

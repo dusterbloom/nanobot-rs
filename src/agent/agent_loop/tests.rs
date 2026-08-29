@@ -6525,7 +6525,7 @@ async fn pending_compaction_checkpoint_hides_unpublished_dag() {
         .await;
     *first.compaction.slot.lock().await = None;
 
-    let assembled = serde_json::to_string(&second.messages).unwrap();
+    let assembled = serde_json::to_string(&*second.messages).unwrap();
     assert!(
         assembled.contains("raw-source-marker"),
         "raw history remains authoritative while the checkpoint is pending"
@@ -7463,7 +7463,7 @@ async fn test_read_after_write_same_turn_is_not_blocked_by_stale_receipt() {
         .await;
 
     let (messages, read_args, guard) = stale_read_write_context_parts("/tmp/same-turn.txt");
-    ctx.messages = messages;
+    ctx.messages = crate::agent::agent_loop::shared::MessageLog::committed(messages);
     ctx.new_start = 0;
     ctx.flow.tool_guard = guard;
 

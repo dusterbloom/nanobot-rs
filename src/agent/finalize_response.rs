@@ -118,7 +118,7 @@ impl AgentLoopShared {
                             redaction_count
                         );
                         ctx.messages
-                            .push(crate::agent::markers::scaffold_user(warning_content));
+                            .push_draft(crate::agent::markers::scaffold_user(warning_content));
                     }
                 }
             }
@@ -151,7 +151,7 @@ impl AgentLoopShared {
                 // Inject warning for the next turn. Cache-replay tagged;
                 // user role for the same reason as the fabrication warning
                 // above.
-                ctx.messages.push(crate::agent::markers::scaffold_user(
+                ctx.messages.push_draft(crate::agent::markers::scaffold_user(
                     detection.system_warning,
                 ));
             }
@@ -177,21 +177,26 @@ impl AgentLoopShared {
                 })
                 .unwrap_or(false);
             if last_can_absorb_final_text {
-                if let Some(last) = ctx.messages.last_mut() {
-                    let existing = last
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    last["content"] = if existing.trim().is_empty() {
-                        json!(ctx.final_content.clone())
-                    } else {
-                        json!(format!("{}\n\n{}", existing, ctx.final_content))
-                    };
-                }
+                // The last assistant message is this turn's unsent draft (the
+                // final send committed before response processing pushed it),
+                // so the absorb is a draft-tail edit by construction.
+                ctx.messages.with_draft(|draft| {
+                    if let Some(last) = draft.last_mut() {
+                        let existing = last
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        last["content"] = if existing.trim().is_empty() {
+                            json!(ctx.final_content.clone())
+                        } else {
+                            json!(format!("{}\n\n{}", existing, ctx.final_content))
+                        };
+                    }
+                });
             } else {
                 ctx.messages
-                    .push(json!({"role": "assistant", "content": ctx.final_content.clone()}));
+                    .push_draft(json!({"role": "assistant", "content": ctx.final_content.clone()}));
             }
         }
 
@@ -220,6 +225,9 @@ impl AgentLoopShared {
                 }
             }
             // Truncate the messages array to remove the partial response.
+            // The partial assistant message was never durably sent (its
+            // provider call failed/cancelled, so no commit), so this only
+            // ever trims the unsent draft tail.
             ctx.messages.truncate(end);
         }
 

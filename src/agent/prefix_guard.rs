@@ -42,14 +42,18 @@ use std::collections::HashMap;
 use parking_lot::Mutex;
 use serde_json::Value;
 
+use crate::agent::agent_loop::MessageLog;
 use crate::agent::prompt_fingerprint::hash_value;
 
 /// Chars of the mutated head echoed into the warning — enough to identify which
 /// of the six mutation sites fired without dumping a 9k-token prompt into logs.
 const PREVIEW_CHARS: usize = 200;
 
-/// Run `edit` on only the mutable tail (`messages[watermark..]`), leaving the
-/// frozen prefix `messages[..watermark]` byte-identical.
+/// The frozen-prefix mechanism lives on the log itself
+/// ([`MessageLog::edit_tail_from`]); this wrapper exists so the cleanup call
+/// site and the tests can name the *contract* (freeze `messages[..watermark]`,
+/// edit only the tail) rather than the mechanism. See the module doc and the
+/// simulation tests below for why the boundary matters.
 ///
 /// `watermark` is the number of leading messages already sent to the server
 /// (hence warm in its prefix cache). It is always a send-time boundary, so no
@@ -58,21 +62,15 @@ const PREVIEW_CHARS: usize = 200;
 ///
 /// - `watermark == 0` (cold start, or right after a sanctioned re-prefill such
 ///   as an over-budget trim or compaction) → `edit` sees the whole array, i.e.
-///   the unrestricted cleanup behavior.
-/// - `watermark >= messages.len()` → the tail is empty; `edit` is a no-op on an
-///   empty vec and the array is returned unchanged.
-///
-/// The frozen prefix is preserved by ownership, not by a runtime bound check:
-/// `edit` never receives a reference to it.
+///   the unrestricted cleanup behavior. Those warm bytes were already paid
+///   for by the sanctioned reset, so rewriting them costs nothing new.
+/// - `watermark >= messages.len()` → the tail is empty; `edit` is a no-op.
 pub fn with_frozen_prefix(
-    messages: &mut Vec<Value>,
+    messages: &mut MessageLog,
     watermark: usize,
     edit: impl FnOnce(&mut Vec<Value>),
 ) {
-    let w = watermark.min(messages.len());
-    let mut tail = messages.split_off(w);
-    edit(&mut tail);
-    messages.append(&mut tail);
+    messages.edit_tail_from(watermark, edit);
 }
 
 /// Enforce that `messages[0]` is byte-stable across every call in a session.
@@ -192,7 +190,7 @@ mod tests {
         ];
 
         // 0 < w < len: a destructive edit must not reach the frozen prefix.
-        let mut m = original.clone();
+        let mut m = MessageLog::committed(original.clone());
         with_frozen_prefix(&mut m, 3, |tail| {
             tail.clear();
             tail.push(assistant("replaced"));
@@ -206,7 +204,7 @@ mod tests {
         assert_eq!(m[3], assistant("replaced"));
 
         // w == 0: edit sees the whole array (unrestricted, = today's behavior).
-        let mut m0 = original.clone();
+        let mut m0 = MessageLog::committed(original.clone());
         with_frozen_prefix(&mut m0, 0, |all| {
             assert_eq!(all.len(), original.len(), "w==0 exposes the whole array");
             all.clear();
@@ -214,7 +212,7 @@ mod tests {
         assert!(m0.is_empty());
 
         // w > len: clamps; tail is empty; array unchanged.
-        let mut mover = original.clone();
+        let mut mover = MessageLog::committed(original.clone());
         with_frozen_prefix(&mut mover, 999, |tail| {
             assert!(tail.is_empty(), "w>len yields an empty tail");
             tail.push(user("should-not-survive-as-prefix-break"));
@@ -246,7 +244,7 @@ mod tests {
     fn run_simulated_turn(freeze: bool) -> Vec<PromptDelta> {
         let cfg = drift_config();
         let keep_last = 50; // large, so hygiene truncation never fires in-test
-        let mut messages = vec![system("you are nano"), user("what is new about ANE?")];
+        let mut messages = MessageLog::committed(vec![system("you are nano"), user("what is new about ANE?")]);
         let mut prev = None;
         let mut watermark = 0usize;
         let mut deltas = Vec::new();
@@ -264,15 +262,15 @@ mod tests {
             watermark = messages.len(); // the "send"
 
             // "response": identical search call each round → drift loop.
-            messages.push(assistant_call(
+            messages.push_draft(assistant_call(
                 "call_search",
                 "web_search",
                 "{\"q\":\"ANE\"}",
             ));
-            messages.push(tool_result("call_search", "stale generic results again"));
+            messages.push_draft(tool_result("call_search", "stale generic results again"));
             // every other round, a filler (polluted) assistant turn.
             if iter % 2 == 0 {
-                messages.push(assistant(
+                messages.push_draft(assistant(
                     "Certainly! Of course, I'd be happy to help. Absolutely, let me think.",
                 ));
             }
@@ -307,7 +305,7 @@ mod tests {
     fn test_unfrozen_boundary_still_collapses_drift() {
         let cfg = drift_config();
         // Three identical assistant calls = a genuine drift run.
-        let mut messages = vec![
+        let mut messages = MessageLog::committed(vec![
             system("sys"),
             user("go"),
             assistant_call("c1", "web_fetch", "{\"url\":\"x\"}"),
@@ -317,7 +315,7 @@ mod tests {
             assistant_call("c3", "web_fetch", "{\"url\":\"x\"}"),
             tool_result("c3", "r3"),
             user("still nothing"),
-        ];
+        ]);
         with_frozen_prefix(&mut messages, 0, |m| {
             crate::agent::anti_drift::pre_completion_pipeline(m, 1, &cfg, false);
         });
@@ -347,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_tool_pair_in_tail_survives_frozen_cleanup() {
-        let mut messages = vec![
+        let mut messages = MessageLog::committed(vec![
             system("sys"),
             user("research ANE"),
             assistant("earlier answer"),
@@ -355,7 +353,7 @@ mod tests {
             // --- tail (fresh response block) ---
             assistant_call("call_live", "web_fetch", "{\"url\":\"apple.com\"}"),
             tool_result("call_live", "fetched body"),
-        ];
+        ]);
         let watermark = 4; // freeze through the user message; tail = [call, result]
 
         with_frozen_prefix(&mut messages, watermark, |m| {

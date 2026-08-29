@@ -372,7 +372,9 @@ fn abort_turn_on_stash_failure(
         "tool-result stash failed for {tool_id} ({sr:?}) — turn aborted to preserve the exact-bytes invariant"
     ));
     let msg = format!("Error: result for {tool_id} could not be durably stored; turn aborted.");
-    ContextBuilder::add_tool_result_with_status(&mut ctx.messages, tool_id, tool_name, &msg, false);
+    ctx.messages.with_draft(|draft| {
+        ContextBuilder::add_tool_result_with_status(draft, tool_id, tool_name, &msg, false)
+    });
 }
 
 /// Build a head+tail preview of `data` (≤ `cap` chars) with an
@@ -588,11 +590,9 @@ pub(crate) async fn journal_tool_call_carrier(
         .iter()
         .map(ToolCallRequest::to_openai_json)
         .collect();
-    ContextBuilder::add_assistant_message(
-        &mut ctx.messages,
-        response.content.as_deref(),
-        Some(&tc_json),
-    );
+    ctx.messages.with_draft(|draft| {
+        ContextBuilder::add_assistant_message(draft, response.content.as_deref(), Some(&tc_json));
+    });
     ctx.persist_pending_protocol_messages().await;
 }
 
@@ -916,21 +916,15 @@ pub(crate) async fn execute_tools_delegated(
 
         let ok = tool_result_ok(full_data);
         if ctx.core.provenance_config.enabled {
-            ContextBuilder::add_tool_result_immutable_with_status(
-                &mut ctx.messages,
-                &tc.id,
-                &tc.name,
-                &injected,
-                ok,
-            );
+            ctx.messages.with_draft(|draft| {
+                ContextBuilder::add_tool_result_immutable_with_status(
+                    draft, &tc.id, &tc.name, &injected, ok,
+                )
+            });
         } else {
-            ContextBuilder::add_tool_result_with_status(
-                &mut ctx.messages,
-                &tc.id,
-                &tc.name,
-                &injected,
-                ok,
-            );
+            ctx.messages.with_draft(|draft| {
+                ContextBuilder::add_tool_result_with_status(draft, &tc.id, &tc.name, &injected, ok)
+            });
         }
         ctx.flow.tool_guard.record_result_with_status(
             &tc.name,
@@ -1002,7 +996,7 @@ pub(crate) async fn execute_tools_delegated(
                 TOOL_RUNNER_SUMMARY_PREFIX
             };
             ctx.messages
-                .push(crate::agent::markers::scaffold_user(format!(
+                .push_draft(crate::agent::markers::scaffold_user(format!(
                     "{} {}",
                     prefix, summary_text
                 )));
@@ -1549,21 +1543,17 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_
     };
 
     if ctx.core.provenance_config.enabled {
-        ContextBuilder::add_tool_result_immutable_with_status(
-            &mut ctx.messages,
-            &r.tool_id,
-            &r.tool_name,
-            &data,
-            r.result.ok(),
-        );
+        ctx.messages.with_draft(|draft| {
+            ContextBuilder::add_tool_result_immutable_with_status(
+                draft, &r.tool_id, &r.tool_name, &data, r.result.ok(),
+            )
+        });
     } else {
-        ContextBuilder::add_tool_result_with_status(
-            &mut ctx.messages,
-            &r.tool_id,
-            &r.tool_name,
-            &data,
-            r.result.ok(),
-        );
+        ctx.messages.with_draft(|draft| {
+            ContextBuilder::add_tool_result_with_status(
+                draft, &r.tool_id, &r.tool_name, &data, r.result.ok(),
+            )
+        });
     }
     ctx.persist_pending_protocol_messages().await;
     let persisted_message_id = ctx
@@ -1665,7 +1655,9 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_
         r.result.data(),
         &ctx.core.workspace,
     ) {
-        append_cua_screenshot_turn(&mut ctx.messages, path).await;
+        let mut appended = Vec::new();
+        append_cua_screenshot_turn(&mut appended, path).await;
+        ctx.messages.extend_draft(appended);
     }
 
     // NOTE: response-boundary arming is NOT done here. This function sees only
@@ -1728,21 +1720,15 @@ fn inject_boundary_rejection(ctx: &mut TurnContext, tc: &ToolCallRequest) {
         ),
     };
     if ctx.core.provenance_config.enabled {
-        ContextBuilder::add_tool_result_immutable_with_status(
-            &mut ctx.messages,
-            &tc.id,
-            &tc.name,
-            &msg,
-            false,
-        );
+        ctx.messages.with_draft(|draft| {
+            ContextBuilder::add_tool_result_immutable_with_status(
+                draft, &tc.id, &tc.name, &msg, false,
+            )
+        });
     } else {
-        ContextBuilder::add_tool_result_with_status(
-            &mut ctx.messages,
-            &tc.id,
-            &tc.name,
-            &msg,
-            false,
-        );
+        ctx.messages.with_draft(|draft| {
+            ContextBuilder::add_tool_result_with_status(draft, &tc.id, &tc.name, &msg, false)
+        });
     }
     // The model attempted a tool but was prevented — suppress
     // ClaimedButNotExecuted validation for this turn.

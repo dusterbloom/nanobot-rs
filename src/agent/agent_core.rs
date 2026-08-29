@@ -1800,14 +1800,14 @@ impl PendingCompaction {
 }
 
 /// Swap compacted messages into the live conversation, preserving
-/// messages added after the compaction snapshot was taken.
+/// messages added after the compaction snapshot was taken. Returns the
+/// swapped log, or `None` when the live conversation no longer matches the
+/// compaction snapshot's prefix.
 pub(crate) fn apply_compaction_result(
-    messages: &mut Vec<Value>,
+    messages: &[Value],
     pending: PendingCompaction,
-) -> bool {
-    let Some(live_conversation_watermark) = pending.live_conversation_watermark(messages) else {
-        return false;
-    };
+) -> Option<Vec<Value>> {
+    let live_conversation_watermark = pending.live_conversation_watermark(messages)?;
 
     let new_messages = messages[live_conversation_watermark..].to_vec();
     // The result carries the complete snapshot prompt prefix. Preserve the
@@ -1828,23 +1828,7 @@ pub(crate) fn apply_compaction_result(
     swapped.extend_from_slice(&messages[..live_prefix_len]);
     swapped.extend_from_slice(&pending.result.messages[result_prefix_len..]);
     swapped.extend(new_messages);
-    *messages = swapped;
-    true
-}
-
-/// Append a suffix to the first (system) message's content.
-///
-/// Sole remaining caller: agent_shared.rs trio orchestration (Phase 5 scope).
-/// All prepare_context.rs calls have been replaced with typed SectionEntry
-/// values that flow through the PromptAssembler pipeline.
-pub(crate) fn append_to_system_prompt(messages: &mut [Value], suffix: &str) {
-    if let Some(sys) = messages
-        .first()
-        .and_then(|m| m["content"].as_str())
-        .map(|s| s.to_string())
-    {
-        messages[0]["content"] = Value::String(format!("{}{}", sys, suffix));
-    }
+    Some(swapped)
 }
 
 #[cfg(test)]
@@ -2951,11 +2935,11 @@ mod tests {
             summary_node_id: 0,
         };
 
-        assert!(apply_compaction_result(&mut live, pending));
-        assert_eq!(live[0]["content"], "current system");
-        assert_eq!(live[1]["content"], "current working memory");
-        assert_eq!(live[2], summary);
-        assert_eq!(live[3]["content"], "new result");
+        let swapped = apply_compaction_result(&live, pending).expect("swap must apply");
+        assert_eq!(swapped[0]["content"], "current system");
+        assert_eq!(swapped[1]["content"], "current working memory");
+        assert_eq!(swapped[2], summary);
+        assert_eq!(swapped[3]["content"], "new result");
     }
 
     #[test]
@@ -2983,11 +2967,11 @@ mod tests {
             summary_node_id: 0,
         };
 
-        assert!(apply_compaction_result(&mut live, pending));
-        assert_eq!(live[0]["content"], "current system");
-        assert_eq!(live[1]["content"], "new working memory");
-        assert_eq!(live[2], summary);
-        assert_eq!(live[3]["content"], "new tail");
+        let swapped = apply_compaction_result(&live, pending).expect("swap must apply");
+        assert_eq!(swapped[0]["content"], "current system");
+        assert_eq!(swapped[1]["content"], "new working memory");
+        assert_eq!(swapped[2], summary);
+        assert_eq!(swapped[3]["content"], "new tail");
     }
 
     #[test]
@@ -2996,12 +2980,11 @@ mod tests {
             serde_json::json!({"role": "system", "content": "system"}),
             serde_json::json!({"role": "user", "content": "old", "_db_id": 1}),
         ];
-        let mut live = vec![
+        let live = vec![
             serde_json::json!({"role": "system", "content": "current system"}),
             serde_json::json!({"role": "developer", "content": "current working memory"}),
             serde_json::json!({"role": "user", "content": "rewritten", "_db_id": 2}),
         ];
-        let before = live.clone();
         let pending = PendingCompaction {
             result: crate::agent::compaction::CompactionResult {
                 messages: vec![
@@ -3013,8 +2996,8 @@ mod tests {
             summary_node_id: 0,
         };
 
-        assert!(!apply_compaction_result(&mut live, pending));
-        assert_eq!(live, before);
+        // With the input taken by shared reference, rejection cannot mutate.
+        assert!(apply_compaction_result(&live, pending).is_none());
     }
 
     /// A sanctioned reset must be attributable exactly once, per session.

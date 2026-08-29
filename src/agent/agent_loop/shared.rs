@@ -56,7 +56,7 @@ use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
 use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
 
 use crate::agent::agent_core::{
-    append_to_system_prompt, apply_compaction_result, ExpansionCheckpoint, PendingCompaction,
+    apply_compaction_result, ExpansionCheckpoint, PendingCompaction,
     RuntimeCounters, SessionRetirement, SharedCoreHandle, SwappableCore, ToolPresentationMode,
 };
 
@@ -151,6 +151,163 @@ pub(crate) struct AgentLoopShared {
         Option<Arc<parking_lot::Mutex<crate::agent::knowledge_store::KnowledgeStore>>>,
 }
 
+/// The turn's conversation log, split into an already-sent committed prefix
+/// and the current turn's unsent draft tail.
+///
+/// `messages[..committed_len]` holds prompt bytes already shipped to the
+/// provider (warm in its exact-prefix KV cache); `[committed_len..]` is the
+/// draft the current turn is still assembling. The split is enforced by the
+/// type, not by convention:
+///
+/// - `Deref<Target = [Value]>` (read-only) exposes the whole log to the
+///   render/persist/count paths with zero copies — and gives every mutation
+///   method (`push`, `insert`, `truncate`, `last_mut`, `IndexMut`, …) no
+///   route in: there is no `DerefMut`.
+/// - Appends land in the draft only: [`MessageLog::push_draft`],
+///   [`MessageLog::extend_draft`], [`MessageLog::with_draft`].
+/// - Rewriting already-sent bytes requires replacing the whole log through
+///   one of two hatches, both impossible to use silently:
+///   [`TurnContext::rewrite_committed`] swaps the log AND pays the prompt-cache
+///   reset (fingerprint clear + higgs session rotation) in the same operation,
+///   so a caller cannot rewrite sent bytes without funding the cold re-prefill
+///   they just caused; [`MessageLog::install`] is for the identity-managed
+///   callers (LCM checkpoint install, expansion publish/fallback) whose cache
+///   ceremony is their own — retirement snapshots, fingerprint publication —
+///   and therefore not expressible as a plain reset. Both are whole-log
+///   substitutions: in-place edits of `messages[i]` are unrepresentable
+///   outside the draft.
+///
+/// One backing `Vec` + boundary index (rather than two `Vec`s) keeps the
+/// read paths zero-copy: rendering, token estimation, and persistence walk
+/// the full array on every iteration.
+pub(crate) struct MessageLog {
+    messages: Vec<Value>,
+    committed_len: usize,
+}
+
+impl MessageLog {
+    /// Start a log whose entire contents are already-sent history (turn
+    /// start: everything reloaded from the DB/reload projection is frozen by
+    /// construction; the turn's own appends become the draft).
+    pub(crate) fn committed(messages: Vec<Value>) -> Self {
+        let committed_len = messages.len();
+        Self {
+            messages,
+            committed_len,
+        }
+    }
+
+    /// Append an unsent message to the draft tail.
+    pub(crate) fn push_draft(&mut self, message: Value) {
+        self.messages.push(message);
+    }
+
+    /// Append unsent messages to the draft tail.
+    pub(crate) fn extend_draft(&mut self, iter: impl IntoIterator<Item = Value>) {
+        self.messages.extend(iter);
+    }
+
+    /// Run `edit` on the draft tail alone. The committed prefix is split off
+    /// by ownership for the duration, so `edit` cannot see or mutate it.
+    pub(crate) fn with_draft<R>(&mut self, edit: impl FnOnce(&mut Vec<Value>) -> R) -> R {
+        self.edit_tail_from(self.committed_len, edit)
+    }
+
+    /// Run `edit` on everything from index `start` onward; `messages[..start]`
+    /// is split off by ownership and cannot be touched.
+    ///
+    /// `start` is usually the draft boundary (`with_draft`), but the hygiene
+    /// pass calls this with the *cache* watermark, which can legitimately sit
+    /// below the committed boundary after a sanctioned reset cleared it: those
+    /// warm bytes were already paid for, so tail-scoped rewriting there is the
+    /// designed unrestricted-cleanup behavior (see `agent::prefix_guard`).
+    pub(crate) fn edit_tail_from<R>(&mut self, start: usize, edit: impl FnOnce(&mut Vec<Value>) -> R) -> R {
+        let mut tail = self.messages.split_off(start.min(self.messages.len()));
+        let result = edit(&mut tail);
+        self.messages.append(&mut tail);
+        result
+    }
+
+    /// Promote the draft to committed history. Called where a send succeeded
+    /// and the prompt-cache watermark re-anchors: the bytes just shipped are
+    /// the warm prefix the next call must extend.
+    pub(crate) fn commit_drafts(&mut self) {
+        self.committed_len = self.messages.len();
+    }
+
+    /// Replace the whole log with `new`, all of it committed. Whole-log
+    /// substitution hatch for identity-managed callers (LCM install,
+    /// expansion publish/fallback) that run their own cache ceremony — see
+    /// the type doc. Prefer [`TurnContext::rewrite_committed`].
+    pub(crate) fn install(&mut self, new: Vec<Value>) {
+        *self = Self::committed(new);
+    }
+
+    /// Tag message `index` with an internal metadata field (`_db_id`,
+    /// `_lcm_summary`, …). Underscore fields never reach the wire —
+    /// `render_via_protocol` drops them — so this cannot move prompt bytes;
+    /// it exists because plain `log[i][k] = v` is otherwise unrepresentable.
+    pub(crate) fn set_meta(&mut self, index: usize, key: &str, value: Value) {
+        self.messages[index][key] = value;
+    }
+
+    /// Shorten the log to `len` messages. Only ever called on the terminal
+    /// cancellation path, where the removed tail is the failed call's unsent
+    /// draft and no further send happens this turn.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.messages.truncate(len);
+        self.committed_len = self.committed_len.min(len);
+    }
+
+    /// Append `suffix` to the system prompt's content (`messages[0]`).
+    ///
+    /// The one committed-byte mutation that is neither a draft append nor a
+    /// whole-log swap. The system head carries a DIFFERENT invariant from the
+    /// append-only body: it must be byte-stable within a warm session, which
+    /// `prefix_guard::assert_stable_head` enforces at every send, and a
+    /// turn-start head rewrite is priced by the send-time classification as
+    /// `history_reload`. It deliberately does NOT route through
+    /// `rewrite_committed` — an extra mid-prepare reset would double-pay a
+    /// divergence the next send already classifies. Kept narrow and named so
+    /// head mutations stay greppable and cannot happen by accident.
+    pub(crate) fn append_to_system(&mut self, suffix: &str) {
+        if let Some(sys) = self.messages.first().and_then(|m| m["content"].as_str()) {
+            let sys = sys.to_string();
+            self.messages[0]["content"] = Value::String(format!("{sys}{suffix}"));
+        }
+    }
+}
+
+impl std::ops::Deref for MessageLog {
+    type Target = [Value];
+
+    fn deref(&self) -> &[Value] {
+        &self.messages
+    }
+}
+
+impl<'a> IntoIterator for &'a MessageLog {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.messages.iter()
+    }
+}
+
+/// Outcome of a sanctioned committed rewrite; see
+/// [`TurnContext::rewrite_committed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptRewrite {
+    /// The warm prefix is byte-identical — the rewrite stayed inside the
+    /// unsent tail (or was a no-op), so there was no cache to lose.
+    PrefixPreserved,
+    /// Warm bytes changed: fingerprint/watermark cleared, reset recorded for
+    /// the next send's classification, and `rotated` says whether the higgs
+    /// retained session was rotated (full cold start).
+    Reset { rotated: bool },
+}
+
 /// Per-message state that flows through the three processing phases.
 ///
 /// Owns all per-turn mutable state that previously lived as local variables
@@ -181,7 +338,7 @@ pub(crate) struct TurnContext {
     pub(crate) priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 
     // --- Conversation state ---
-    pub(crate) messages: Vec<Value>,
+    pub(crate) messages: MessageLog,
     pub(crate) new_start: usize,
     /// Protocol-rendered wire format, computed in `step_pre_call` and used
     /// exclusively for LLM provider calls. `messages` remains the raw
@@ -516,7 +673,7 @@ impl HiggsSessionRoute {
     fn fallback_from_retained(
         &mut self,
         failure: RetainedExpansionFailure,
-        logical_messages: &mut Vec<Value>,
+        logical_messages: &mut MessageLog,
         rendered_messages: &mut Vec<Value>,
         protocol: &dyn ConversationProtocol,
     ) -> Option<(ExpansionCheckpoint, PromptCacheSnapshot)> {
@@ -546,12 +703,16 @@ impl HiggsSessionRoute {
                 .get(exact_prefix_len..)
                 .unwrap_or_default()
                 .to_vec();
-            *logical_messages = if use_flattened {
+            // Whole-log install, not `rewrite_committed`: the caller restores
+            // the retained session's own `PromptCacheSnapshot` afterwards —
+            // this path manages its cache identity explicitly.
+            let mut restored = if use_flattened {
                 fallback_prefix.unwrap_or(compacted_prefix)
             } else {
                 compacted_prefix
             };
-            logical_messages.extend(tail);
+            restored.extend(tail);
+            logical_messages.install(restored);
             *rendered_messages = render_via_protocol(protocol, logical_messages);
         }
         Some((checkpoint, active_prompt_cache))
@@ -564,13 +725,16 @@ impl CommittedAutoExpansion {
     /// cannot expose reconstructed messages while their summaries stay eligible.
     fn publish(
         self,
-        logical_messages: &mut Vec<Value>,
+        logical_messages: &mut MessageLog,
         rendered_messages: &mut Vec<Value>,
         counters: &RuntimeCounters,
         session_key: &str,
         prompt_fingerprint: crate::agent::prompt_fingerprint::PromptFingerprint,
     ) {
-        *logical_messages = self.0.logical_messages;
+        // Whole-log install: the published expansion IS the new committed
+        // baseline, and this caller publishes its own fingerprint/watermark
+        // below instead of paying a reset. See `MessageLog`'s type doc.
+        *logical_messages = MessageLog::committed(self.0.logical_messages);
         *rendered_messages = self.0.rendered_messages;
         let _transition = counters.lock_prompt_cache_transition();
         counters
@@ -772,6 +936,41 @@ impl TurnContext {
         }
     }
 
+    /// The sanctioned escape hatch for rewriting already-sent prompt bytes:
+    /// replace the whole log with `new` and, when the bytes that are warm
+    /// under the session's prompt-cache watermark actually changed, clear the
+    /// cache identity and record `reason` — atomically, in this one operation.
+    ///
+    /// Rewriting sent bytes without a reset is the mid-turn divergence bug
+    /// this type exists to prevent, so the reset is not the caller's job:
+    /// there is no way to swap the log through here without paying for the
+    /// cold re-prefill the rewrite causes. A cold session (no watermark) and
+    /// a rewrite that left the warm prefix byte-identical (trim stayed inside
+    /// the unsent tail) pay nothing — [`PromptRewrite::PrefixPreserved`].
+    ///
+    /// Identity-managed rewriters (LCM checkpoint install, expansion
+    /// publish/fallback) use [`MessageLog::install`] instead: their cache
+    /// ceremony is custom (retirement snapshots, fingerprint publication).
+    pub(crate) fn rewrite_committed(&mut self, new: Vec<Value>, reason: CacheResetReason) -> PromptRewrite {
+        let warm = self
+            .counters
+            .prompt_cache_watermark
+            .lock()
+            .get(&self.session_key)
+            .copied()
+            .unwrap_or(0);
+        let warm_bytes_changed = warm > 0
+            && (self.messages.len() < warm
+                || new.len() < warm
+                || self.messages[..warm] != new[..warm]);
+        self.messages.install(new);
+        if !warm_bytes_changed {
+            return PromptRewrite::PrefixPreserved;
+        }
+        let rotated = invalidate_prompt_cache_for_rewrite(self, reason);
+        PromptRewrite::Reset { rotated }
+    }
+
     /// Persist every newly appended real protocol message and tag it with its
     /// SQLite row id. Tool-call carriers are flushed before execution and tool
     /// results immediately after injection, so a crash cannot leave a side
@@ -839,7 +1038,7 @@ impl TurnContext {
             }
         };
         for (index, row_id) in pending_indices.into_iter().zip(row_ids) {
-            self.messages[index]["_db_id"] = json!(row_id);
+            self.messages.set_meta(index, "_db_id", json!(row_id));
         }
         self.new_start = self.messages.len();
     }
@@ -1397,7 +1596,7 @@ impl AgentLoopShared {
                     remaining
                 );
                 ctx.messages
-                    .push(crate::agent::markers::scaffold_user(nudge_msg));
+                    .push_draft(crate::agent::markers::scaffold_user(nudge_msg));
                 info!(
                     "iteration_nudge: injected wrap-up nudge at iteration {}/{}",
                     iteration, ctx.core.max_iterations
@@ -1413,7 +1612,7 @@ impl AgentLoopShared {
                         // replay byte-identical on reload or the warm prefix
                         // diverges and Higgs re-prefills.
                         ctx.messages
-                            .push(crate::agent::markers::scaffold_user(format!(
+                            .push_draft(crate::agent::markers::scaffold_user(format!(
                                 "[Current objective] {}",
                                 instruction
                             )));
@@ -1446,7 +1645,7 @@ impl AgentLoopShared {
                 {
                     let mut engine = ctx.reasoning.lock();
                     if let Some(restored) = engine.take_pending_restore() {
-                        ctx.messages = restored;
+                        ctx.messages.install(restored);
                         iteration += 1;
                         ctx.flow.retries.validation = 0;
                         continue;
@@ -1465,7 +1664,7 @@ impl AgentLoopShared {
                             "loop_breaker: {} consecutive non-tool iterations, forcing stop",
                             consecutive_empty
                         );
-                        ctx.messages.push(crate::agent::markers::scaffold_user(format!(
+                        ctx.messages.push_draft(crate::agent::markers::scaffold_user(format!(
                             "[System] Loop detected: you produced {} consecutive responses without executing any tool calls. \
                              Your output may contain leaked thinking (<think> blocks) or text descriptions of actions instead of actual tool calls. \
                              Stop describing what you want to do — either use a tool call or give your final answer as plain text.",
@@ -1561,7 +1760,7 @@ impl AgentLoopShared {
                             warn!(
                                 "tool_loop_breaker: repeated identical tool calls after nudge, forcing stop"
                             );
-                            ctx.messages.push(crate::agent::markers::scaffold_user(
+                            ctx.messages.push_draft(crate::agent::markers::scaffold_user(
                                 "[System] You called the same tool(s) with the same arguments again even though the results are already in your context above. Stopping to avoid an infinite loop — use the results you already have, or give your final answer.".to_string(),
                             ));
                         }
@@ -1570,7 +1769,7 @@ impl AgentLoopShared {
                                 "tool_loop_breaker: {} consecutive identical tool rounds, injecting result-available nudge",
                                 new_rounds + 1
                             );
-                            ctx.messages.push(crate::agent::markers::scaffold_user(
+                            ctx.messages.push_draft(crate::agent::markers::scaffold_user(
                                 "[System] Your tool results are already in the conversation above — you just called the same tool(s) with the same arguments again without using them. The output is present; stop re-calling and either act on the results or give your final answer.".to_string(),
                             ));
                         }
@@ -1588,7 +1787,7 @@ impl AgentLoopShared {
                             engine.mark_current_failed("iteration budget exhausted");
                             if let Some(cp) = engine.pop_checkpoint() {
                                 drop(engine);
-                                ctx.messages = cp.messages;
+                                ctx.messages.install(cp.messages);
                                 continue;
                             }
                         }
@@ -1773,14 +1972,14 @@ impl AgentLoopShared {
                     match signal.priority {
                         AhaPriority::Critical => {
                             ctx.messages
-                                .push(crate::agent::markers::scaffold_user(format!(
+                                .push_draft(crate::agent::markers::scaffold_user(format!(
                                     "[ALERT from subagent {}] {}",
                                     signal.agent_id, signal.message
                                 )));
                         }
                         AhaPriority::High => {
                             ctx.messages
-                                .push(crate::agent::markers::scaffold_user(format!(
+                                .push_draft(crate::agent::markers::scaffold_user(format!(
                                     "[Signal from subagent {}] {}",
                                     signal.agent_id, signal.message
                                 )));
@@ -1808,7 +2007,7 @@ impl AgentLoopShared {
             ) {
                 let grounding = system_state::format_grounding(&state);
                 ctx.messages
-                    .push(crate::agent::markers::scaffold_user(grounding));
+                    .push_draft(crate::agent::markers::scaffold_user(grounding));
             }
         }
 
@@ -1895,7 +2094,7 @@ impl AgentLoopShared {
                 "prompt_cache_watermark_invalidated_by_emergency_trim"
             );
         }
-        ctx.messages = trimmed_messages;
+        ctx.messages.install(trimmed_messages);
         if !prefix_preserved {
             self.install_pending_compaction(ctx, true).await;
         }
@@ -1999,7 +2198,7 @@ impl AgentLoopShared {
             // it is not persisted as a real turn and does not break the prefix
             // cache on the next reload.
             ctx.messages
-                .push(crate::agent::markers::scaffold_user(format!(
+                .push_draft(crate::agent::markers::scaffold_user(format!(
                     "[system] Report what the previous tool results showed before \
                  running more tools. If you created or changed an artifact, do not \
                  claim completion until you validate it with an appropriate tool \
@@ -2060,7 +2259,7 @@ impl AgentLoopShared {
                 "prompt_cache_watermark_invalidated_by_token_trim"
             );
         }
-        ctx.messages = trimmed_messages;
+        ctx.messages.install(trimmed_messages);
         if !prefix_preserved {
             self.install_pending_compaction(ctx, true).await;
         }
@@ -2109,7 +2308,7 @@ impl AgentLoopShared {
                                 estimated_tokens = payload.estimated_tokens,
                                 "proactive_grounding_injected"
                             );
-                            ctx.messages.push(serde_json::json!({
+                            ctx.messages.push_draft(serde_json::json!({
                                 "role": ctx.core.mode().grounding_role(),
                                 "content": text,
                                 "_synthetic": true,
@@ -2226,10 +2425,8 @@ impl AgentLoopShared {
                 .and_then(|m| m["content"].as_str())
                 .is_some_and(|s| s.contains(crate::agent::protocol::TEXTUAL_TOOLS_MARKER));
             if !already_taught && !tool_defs.is_empty() {
-                append_to_system_prompt(
-                    &mut ctx.messages,
-                    &crate::agent::protocol::textual_tools_block(&tool_defs),
-                );
+                let block = crate::agent::protocol::textual_tools_block(&tool_defs);
+                ctx.messages.append_to_system(&block);
             }
             tool_defs.clear();
         }
@@ -2275,9 +2472,7 @@ impl AgentLoopShared {
                 tool_defs.clear();
                 mode = ToolPresentationMode::Trio;
                 // Tell the main model it's in orchestration mode (tools stripped).
-                append_to_system_prompt(
-                    &mut ctx.messages,
-                    concat!(
+                ctx.messages.append_to_system(concat!(
                         "\n\n## Orchestration Mode (Active)\n",
                         "A trio routing system handles tool execution on your behalf.\n",
                         "- You do NOT have direct tool access in this mode.\n",
@@ -2286,8 +2481,7 @@ impl AgentLoopShared {
                         "- If you need additional tool actions, describe them clearly ",
                         "(e.g., \"I need to read src/main.rs\") and the next turn will route it.\n",
                         "- Focus on reasoning, planning, and conversation.\n",
-                    ),
-                );
+                ));
             } else {
                 ctx.counters
                     .set_trio_state(crate::agent::agent_core::TrioState::Degraded);
@@ -2480,9 +2674,13 @@ impl AgentLoopShared {
             TokenBudget::estimate_tokens(&pending.snapshot) as u64,
             TokenBudget::estimate_tokens(&pending.result.messages) as u64,
         );
-        if !apply_compaction_result(&mut ctx.messages, pending) {
+        // Whole-log install, not `rewrite_committed`: this caller manages its
+        // own cache identity (the retirement ceremony above), so the generic
+        // reset would be wrong. See `MessageLog`'s type doc.
+        let Some(swapped) = apply_compaction_result(&ctx.messages, pending) else {
             return false;
-        }
+        };
+        ctx.messages.install(swapped);
         // Compaction rewrites only the in-memory active window. Raw protocol
         // messages remain durable in SQLite and are identified by `_db_id`.
         ctx.new_start = ctx.messages.len();
@@ -2684,7 +2882,7 @@ impl AgentLoopShared {
                 );
                 let core = ctx.core.clone();
                 let session_id = ctx.session_id.clone();
-                let messages = ctx.messages.clone();
+                let messages = ctx.messages.to_vec();
                 // SQLite message_count is a durable, concrete-session sequence.
                 // The process-global learning counter remains telemetry only and
                 // must not order one session's working-memory checkpoints.
@@ -2815,7 +3013,7 @@ impl AgentLoopShared {
                         "in_turn_overflow_trim_invalidated_prompt_cache"
                     );
                 }
-                ctx.messages = trimmed_messages;
+                ctx.messages.install(trimmed_messages);
             }
 
             if ctx.is_cancelled() {
@@ -3724,7 +3922,7 @@ impl AgentLoopShared {
             clear_prompt_cache_state(ctx);
             send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::StalledProviderRequest);
             ctx.messages
-                .push(crate::agent::markers::scaffold_user(
+                .push_draft(crate::agent::markers::scaffold_user(
                     "[system] Context checkpoint: the latest tool round did not change the provider request. Re-read the newest tool result and continue from it."
                 ));
             ctx.rendered_messages.clear();
@@ -4183,6 +4381,10 @@ impl AgentLoopShared {
                     .prompt_cache_watermark
                     .lock()
                     .insert(ctx.session_key.clone(), ctx.messages.len());
+                // The bytes just shipped are the warm prefix the next call
+                // must extend: promote the draft to committed history in
+                // lockstep with the watermark re-anchor above.
+                ctx.messages.commit_drafts();
             }
         } else {
             ctx.staged_auto_expansion = None;
@@ -4488,13 +4690,9 @@ impl AgentLoopShared {
                  (findings:/next:/will:) to continue with more tools, or \
                  write your final answer."
             );
-            ContextBuilder::add_tool_result_immutable_with_status(
-                &mut ctx.messages,
-                id,
-                name,
-                &msg,
-                false,
-            );
+            ctx.messages.with_draft(|draft| {
+                ContextBuilder::add_tool_result_immutable_with_status(draft, id, name, &msg, false)
+            });
         }
         if !blocked_calls.is_empty() {
             ctx.persist_pending_protocol_messages().await;
@@ -4654,7 +4852,7 @@ impl AgentLoopShared {
         // Check for priority user messages injected mid-task.
         if let Some(ref mut rx) = ctx.priority_rx {
             if let Ok(priority_msg) = rx.try_recv() {
-                ctx.messages.push(json!({
+                ctx.messages.push_draft(json!({
                     "role": "user",
                     "content": format!("[PRIORITY USER MESSAGE]: {}", priority_msg)
                 }));
@@ -4712,7 +4910,7 @@ impl AgentLoopShared {
 mod tests {
     use super::{
         advance_response_boundary, apply_auto_expansion_candidates, commit_staged_auto_expansion,
-        divergent_message_digest, materialize_auto_expansion,
+        divergent_message_digest, materialize_auto_expansion, MessageLog,
         proactive_grounding_preserves_prefix_cache, AppliedAutoExpansion,
         AutoExpansionMaterializationKind, HiggsSessionRoute, PromptCacheSnapshot, ResponseBoundary,
         RetainedExpansionFailure,
@@ -5003,8 +5201,8 @@ mod tests {
                 PromptCacheSnapshot::default(),
             );
             route.mark_expansion_published();
-            let mut logical = exact_prefix.clone();
-            logical.extend(tail.clone());
+            let mut logical = MessageLog::committed(exact_prefix.clone());
+            logical.extend_draft(tail.clone());
             let mut rendered = Vec::new();
 
             let retired = route
@@ -5570,8 +5768,9 @@ mod tests {
                 (session_id.to_string(), std::sync::Arc::clone(&engine)),
             ])));
         let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
-        let mut logical = vec![json!({"role": "user", "content": "compacted"})];
-        let mut rendered = logical.clone();
+        let mut logical = MessageLog::committed(vec![json!({"role": "user", "content": "compacted"})]);
+        let rendered_pre = vec![json!({"role": "user", "content": "compacted"})];
+        let mut rendered = rendered_pre.clone();
         let compacted_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&rendered);
         counters
             .prompt_fingerprints
@@ -5590,10 +5789,10 @@ mod tests {
                 .await
                 .expect("known eligible node commits");
         assert_eq!(
-            logical,
-            vec![json!({"role": "user", "content": "compacted"})]
+            &logical[..],
+            &[json!({"role": "user", "content": "compacted"})][..]
         );
-        assert_eq!(rendered, logical);
+        assert_eq!(rendered, rendered_pre);
         assert_eq!(
             counters.prompt_fingerprints.lock().get(session_key),
             Some(&compacted_fingerprint),
@@ -5609,8 +5808,8 @@ mod tests {
         );
 
         assert_eq!(
-            logical,
-            vec![json!({"role": "user", "content": "expanded logical"})]
+            &logical[..],
+            &[json!({"role": "user", "content": "expanded logical"})][..]
         );
         assert_eq!(
             rendered,

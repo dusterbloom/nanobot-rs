@@ -1170,7 +1170,7 @@ pub(crate) async fn router_preflight(
                     // for-byte or the warm prompt prefix shrinks and Higgs's
                     // radix cache diverges (full re-prefill).
                     ctx.messages
-                        .push(crate::agent::markers::scaffold_user(injected));
+                        .push_draft(crate::agent::markers::scaffold_user(injected));
                     specialist_preflight_result(
                         &record.specialist_response,
                         ctx.core.tool_delegation_config.specialist_synthesis,
@@ -1198,7 +1198,7 @@ pub(crate) async fn router_preflight(
                         append_router_decision_trace(&trace);
                     }
                     ctx.messages
-                        .push(crate::agent::markers::scaffold_user(text.clone()));
+                        .push_draft(crate::agent::markers::scaffold_user(text.clone()));
                     subagent_preflight_result(&text)
                 }
                 Err(e) => {
@@ -1235,7 +1235,7 @@ pub(crate) async fn router_preflight(
                     append_router_decision_trace(&trace);
                 }
                 ctx.messages
-                    .push(crate::agent::markers::scaffold_user(format!(
+                    .push_draft(crate::agent::markers::scaffold_user(format!(
                         "[tool-guard] {}",
                         e
                     )));
@@ -1259,7 +1259,7 @@ pub(crate) async fn router_preflight(
             // session reload byte-identical, or the next turn's prompt prefix
             // diverges and the server re-prefills everything.
             ctx.messages
-                .push(crate::agent::markers::scaffold_user(format!(
+                .push_draft(crate::agent::markers::scaffold_user(format!(
                     "[router:tool:{}] The tool returned the following data. \
                  Summarize it concisely for the user:\n\n{}",
                     decision.target, truncated
@@ -1315,7 +1315,7 @@ pub(crate) async fn router_preflight(
                     append_router_decision_trace(&trace);
                 }
                 ctx.messages
-                    .push(crate::agent::markers::scaffold_user(format!(
+                    .push_draft(crate::agent::markers::scaffold_user(format!(
                         "[tool-guard] {}",
                         e
                     )));
@@ -1340,7 +1340,7 @@ pub(crate) async fn router_preflight(
             // Cache-replay tagged: pipeline evidence sent live must replay
             // byte-identical on reload (warm-prefix contract).
             ctx.messages
-                .push(crate::agent::markers::scaffold_user(format!(
+                .push_draft(crate::agent::markers::scaffold_user(format!(
                     "[router:pipeline] Pipeline execution result. \
                  Summarize the completed steps and outcome for the user:\n\n{}",
                     truncated
@@ -1622,7 +1622,7 @@ pub(crate) async fn route_tool_calls(
                         // Cache-replay tagged — same reason as the decision-path
                         // specialist injection above.
                         ctx.messages
-                            .push(crate::agent::markers::scaffold_user(injected));
+                            .push_draft(crate::agent::markers::scaffold_user(injected));
                         return specialist_route_result(&record.specialist_response);
                     }
                     Err(e) => return RouteResult::Break(e),
@@ -1641,7 +1641,7 @@ pub(crate) async fn route_tool_calls(
                 {
                     Ok(text) => {
                         ctx.messages
-                            .push(crate::agent::markers::scaffold_user(text.clone()));
+                            .push_draft(crate::agent::markers::scaffold_user(text.clone()));
                         return subagent_route_result(&text);
                     }
                     Err(e) => return RouteResult::Break(e),
@@ -1751,17 +1751,19 @@ pub(crate) async fn route_tool_calls(
             .iter()
             .map(|(tc, _)| tc.to_openai_json())
             .collect();
-        ContextBuilder::add_assistant_message(&mut ctx.messages, response_content, Some(&tc_json));
-        for (tc, cached_chars) in &blocked_with_result {
-            let receipt = format!(
-                "duplicate {} call blocked; cached result from the earlier identical call \
-                 was {} chars and is already represented in the conversation. Do not replay \
-                 this broad call; answer from the prior result, or use inspect_tool_result \
-                 with a query or line range when the previous output was stashed.",
-                tc.name, cached_chars
-            );
-            ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &receipt);
-        }
+        ctx.messages.with_draft(|draft| {
+            ContextBuilder::add_assistant_message(draft, response_content, Some(&tc_json));
+            for (tc, cached_chars) in &blocked_with_result {
+                let receipt = format!(
+                    "duplicate {} call blocked; cached result from the earlier identical call \
+                     was {} chars and is already represented in the conversation. Do not replay \
+                     this broad call; answer from the prior result, or use inspect_tool_result \
+                     with a query or line range when the previous output was stashed.",
+                    tc.name, cached_chars
+                );
+                ContextBuilder::add_tool_result(draft, &tc.id, &tc.name, &receipt);
+            }
+        });
         ctx.persist_pending_protocol_messages().await;
     }
 
