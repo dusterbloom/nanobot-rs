@@ -339,6 +339,13 @@ pub(crate) struct TurnContext {
 
     // --- Conversation state ---
     pub(crate) messages: MessageLog,
+    /// Persist boundary: index of the first message NOT yet durably written
+    /// to SQLite. Deliberately NOT derived from `MessageLog`'s committed
+    /// boundary — that one tracks bytes SENT to the provider (cache warmth);
+    /// this one tracks bytes PERSISTED (crash safety). The two diverge the
+    /// moment a message is persisted before its send or vice versa; only the
+    /// `_db_id` presence walk in `persist_pending_protocol_messages` is
+    /// authoritative for what still needs writing.
     pub(crate) new_start: usize,
     /// Protocol-rendered wire format, computed in `step_pre_call` and used
     /// exclusively for LLM provider calls. `messages` remains the raw
