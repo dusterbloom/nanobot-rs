@@ -1642,14 +1642,29 @@ impl AgentLoopShared {
 
             // Check for pending backtrack (set by BacktrackTool during tool execution).
             {
-                {
+                let restored = {
                     let mut engine = ctx.reasoning.lock();
-                    if let Some(restored) = engine.take_pending_restore() {
-                        ctx.messages.install(restored);
-                        iteration += 1;
-                        ctx.flow.retries.validation = 0;
-                        continue;
+                    engine.take_pending_restore()
+                };
+                if let Some(restored) = restored {
+                    // The rewind discards already-sent bytes (checkpoints
+                    // are taken post-send), so it MUST pay the reset or
+                    // the next send ships rewound bytes under the warm
+                    // session id — the unsanctioned
+                    // `prompt_prefix_diverged` class this refactor
+                    // removes. rewrite_committed makes that payment
+                    // unavoidable.
+                    let rewrite = ctx.rewrite_committed(restored, CacheResetReason::Backtrack);
+                    if let PromptRewrite::Reset { rotated } = rewrite {
+                        warn!(
+                            session = %ctx.session_key,
+                            rotated,
+                            "backtrack_rewound_sent_history — prompt cache reset"
+                        );
                     }
+                    iteration += 1;
+                    ctx.flow.retries.validation = 0;
+                    continue;
                 }
             }
 
@@ -1787,7 +1802,18 @@ impl AgentLoopShared {
                             engine.mark_current_failed("iteration budget exhausted");
                             if let Some(cp) = engine.pop_checkpoint() {
                                 drop(engine);
-                                ctx.messages.install(cp.messages);
+                                // Same contract as the pending-restore rewind
+                                // above: a checkpoint rewind discards
+                                // already-sent bytes, so pay the reset.
+                                let rewrite =
+                                    ctx.rewrite_committed(cp.messages, CacheResetReason::Backtrack);
+                                if let PromptRewrite::Reset { rotated } = rewrite {
+                                    warn!(
+                                        session = %ctx.session_key,
+                                        rotated,
+                                        "checkpoint_pop_rewound_sent_history — prompt cache reset"
+                                    );
+                                }
                                 continue;
                             }
                         }

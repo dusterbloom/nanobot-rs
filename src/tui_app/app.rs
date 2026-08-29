@@ -2810,6 +2810,7 @@ fn cache_status_label(status: CacheStatus) -> (String, Color) {
             CacheResetReason::HistoryReload => {
                 ("cache reset · history reload".to_string(), WARN_COLOR)
             }
+            CacheResetReason::Backtrack => ("cache reset · backtrack".to_string(), WARN_COLOR),
         },
     }
 }

@@ -445,6 +445,11 @@ pub(crate) enum CacheResetReason {
     /// window advanced / LCM view took over). Expected by design — priced
     /// as a sanctioned reset, not a prompt bug.
     HistoryReload,
+    /// Reasoning backtrack / checkpoint restore rewound the conversation to
+    /// an earlier state, discarding already-sent bytes. Sanctioned like the
+    /// other resets: the rewind is the feature; shipping the rewound prompt
+    /// under the warm session id is the bug it prevents.
+    Backtrack,
 }
 
 impl CacheResetReason {
@@ -456,6 +461,7 @@ impl CacheResetReason {
             CacheResetReason::StalledProviderRequest => "stalled_provider_request",
             CacheResetReason::ToolBlockChange => "tool_block_change",
             CacheResetReason::HistoryReload => "history_reload",
+            CacheResetReason::Backtrack => "backtrack",
         }
     }
 }
