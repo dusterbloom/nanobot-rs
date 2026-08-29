@@ -2451,6 +2451,19 @@ fn build_trio_offline_harness(
     router: Arc<dyn LLMProvider>,
     specialist: Arc<dyn LLMProvider>,
 ) -> (AgentLoop, std::path::PathBuf) {
+    build_trio_offline_harness_with_registry(main, router, specialist, None)
+}
+
+/// Variant wiring a health registry: an EMPTY registry is optimistically
+/// healthy (`is_healthy` defaults true for unknown probes), which arms the
+/// strict-trio strip path (`should_strip_tools_for_trio` needs a healthy
+/// router probe).
+fn build_trio_offline_harness_with_registry(
+    main: Arc<dyn LLMProvider>,
+    router: Arc<dyn LLMProvider>,
+    specialist: Arc<dyn LLMProvider>,
+    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
+) -> (AgentLoop, std::path::PathBuf) {
     use crate::config::schema::LcmSchemaConfig;
 
     let workspace = tempfile::tempdir().unwrap().keep();
@@ -2527,7 +2540,7 @@ fn build_trio_offline_harness(
         None,
         ProprioceptionConfig::default(),
         LcmSchemaConfig::default(),
-        None, // no health_registry — offline tests manage their own
+        health_registry,
     );
 
     (agent_loop, workspace)
@@ -8977,6 +8990,70 @@ async fn test_trio_offline_e2e_health_gate() {
 //   "specialist,coding,{}"
 // `parse_lenient_router_decision` handles this format.
 // -----------------------------------------------------------------------
+
+/// Strict-trio strip path is active (healthy registry) and the turn spans
+/// two iterations (specialist dispatch → respond). The orchestration-mode
+/// block must appear EXACTLY ONCE in the system head on every wire: a
+/// re-append per iteration rewrites sent system bytes and busts the prefix
+/// cache.
+#[tokio::test]
+async fn test_trio_orchestration_block_not_reappended_across_iterations() {
+    use crate::heartbeat::health::HealthRegistry;
+
+    let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
+        "offline-router",
+        vec![
+            r#"{"action":"specialist","target":"coding","args":{"task":"explain loops"},"confidence":0.85}"#,
+            r#"{"action":"specialist","target":"coding","args":{"task":"explain loops"},"confidence":0.85}"#,
+            r#"{"action":"specialist","target":"coding","args":{"task":"explain loops again"},"confidence":0.85}"#,
+            r#"{"action":"respond","target":"main","args":{},"confidence":0.95}"#,
+        ],
+    ));
+    let main_recorder = Arc::new(WireRecordingProvider::new(
+        "offline-main",
+        vec![WireRecordingProvider::text_response("final answer")],
+    ));
+    let main: Arc<dyn LLMProvider> = main_recorder.clone();
+    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+        "offline-specialist",
+        "specialist answer",
+    ));
+
+    let (agent_loop, workspace) = build_trio_offline_harness_with_registry(
+        main,
+        router,
+        specialist,
+        Some(Arc::new(HealthRegistry::new())),
+    );
+
+    let resp = agent_loop
+        .process_direct("Explain for loops", "trio-dedup", "test", "offline")
+        .await;
+    assert!(!resp.is_empty(), "response should be non-empty");
+
+    // The strip path must actually have been armed, or the test is vacuous.
+    assert_eq!(
+        agent_loop.shared.core_handle.counters.get_trio_state(),
+        crate::agent::agent_core::TrioState::Active,
+        "trio must be Active (tools stripped) for this test to exercise the block"
+    );
+
+    let calls = main_recorder.calls();
+    assert!(
+        calls.len() >= 1,
+        "main model must have been called at least once"
+    );
+    for (i, wire) in calls.iter().enumerate() {
+        let system = wire[0]["content"].as_str().unwrap_or("");
+        assert_eq!(
+            system.matches("## Orchestration Mode (Active)").count(),
+            1,
+            "wire {i}: orchestration block must appear exactly once in the system head"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
 
 #[tokio::test]
 async fn test_trio_offline_e2e_parse_fallback_lenient() {

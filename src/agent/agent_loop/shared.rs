@@ -2511,17 +2511,29 @@ impl AgentLoopShared {
                     .set_trio_state(crate::agent::agent_core::TrioState::Active);
                 tool_defs.clear();
                 mode = ToolPresentationMode::Trio;
-                // Tell the main model it's in orchestration mode (tools stripped).
-                ctx.messages.append_to_system(concat!(
-                        "\n\n## Orchestration Mode (Active)\n",
-                        "A trio routing system handles tool execution on your behalf.\n",
-                        "- You do NOT have direct tool access in this mode.\n",
-                        "- If a tool result appears as `[router:tool:X]` or `[specialist:X]`, ",
-                        "incorporate that result into your response.\n",
-                        "- If you need additional tool actions, describe them clearly ",
-                        "(e.g., \"I need to read src/main.rs\") and the next turn will route it.\n",
-                        "- Focus on reasoning, planning, and conversation.\n",
-                ));
+                // Tell the main model it's in orchestration mode (tools
+                // stripped). Deduped: select_tool_definitions runs every
+                // iteration, and re-appending the identical block would
+                // rewrite the sent system head each iteration and bust the
+                // prefix cache (same guard as the textual-tools lesson).
+                const ORCHESTRATION_MODE_MARKER: &str = "## Orchestration Mode (Active)";
+                let already_told = ctx
+                    .messages
+                    .first()
+                    .and_then(|m| m["content"].as_str())
+                    .is_some_and(|s| s.contains(ORCHESTRATION_MODE_MARKER));
+                if !already_told {
+                    ctx.messages.append_to_system(concat!(
+                            "\n\n## Orchestration Mode (Active)\n",
+                            "A trio routing system handles tool execution on your behalf.\n",
+                            "- You do NOT have direct tool access in this mode.\n",
+                            "- If a tool result appears as `[router:tool:X]` or `[specialist:X]`, ",
+                            "incorporate that result into your response.\n",
+                            "- If you need additional tool actions, describe them clearly ",
+                            "(e.g., \"I need to read src/main.rs\") and the next turn will route it.\n",
+                            "- Focus on reasoning, planning, and conversation.\n",
+                    ));
+                }
             } else {
                 ctx.counters
                     .set_trio_state(crate::agent::agent_core::TrioState::Degraded);
