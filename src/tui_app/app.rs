@@ -2807,6 +2807,9 @@ fn cache_status_label(status: CacheStatus) -> (String, Color) {
             CacheResetReason::ToolBlockChange => {
                 ("cache reset · tool block".to_string(), WARN_COLOR)
             }
+            CacheResetReason::HistoryReload => {
+                ("cache reset · history reload".to_string(), WARN_COLOR)
+            }
         },
     }
 }

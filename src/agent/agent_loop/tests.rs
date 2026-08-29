@@ -2858,6 +2858,7 @@ struct WireRecordingProvider {
     name: String,
     responses: std::sync::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
     calls: std::sync::Mutex<Vec<Vec<Value>>>,
+    higgs_capable: bool,
 }
 
 impl WireRecordingProvider {
@@ -2866,6 +2867,17 @@ impl WireRecordingProvider {
             name: name.to_string(),
             responses: std::sync::Mutex::new(responses.into()),
             calls: std::sync::Mutex::new(Vec::new()),
+            higgs_capable: false,
+        }
+    }
+
+    /// Higgs-capable variant: the loop attaches retained-session control
+    /// fields to messages[0], so tests can assert on the session id the wire
+    /// actually carried.
+    fn new_higgs_capable(name: &str, responses: Vec<crate::providers::base::LLMResponse>) -> Self {
+        Self {
+            higgs_capable: true,
+            ..Self::new(name, responses)
         }
     }
 
@@ -2919,6 +2931,10 @@ impl LLMProvider for WireRecordingProvider {
 
     fn get_default_model(&self) -> &str {
         &self.name
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        self.higgs_capable
     }
 }
 
@@ -6663,6 +6679,143 @@ async fn test_local_wire_prompt_prefix_stable_when_second_turn_is_rich_artifact(
     assert!(
         !system.contains("Local Artifact Writer"),
         "rich artifact turns must not mutate the stable system prompt"
+    );
+}
+
+/// THE prompt-cache invariant: when a turn's prompt is not an append-only
+/// extension of the previous call (unsanctioned divergence), the request must
+/// ship under a FRESH higgs session id with the poisoned id queued for drop —
+/// never under the warm id, where the server's exact-token guard rejects it
+/// (`token_mismatch`) and then rejects every follow-up (`not_growing`),
+/// cascading full re-prefills.
+#[tokio::test]
+async fn test_diverged_prompt_ships_under_rotated_higgs_session() {
+    let provider = Arc::new(WireRecordingProvider::new_higgs_capable(
+        "local-qwen-test",
+        vec![
+            WireRecordingProvider::text_response("first reply"),
+            WireRecordingProvider::text_response("second reply"),
+        ],
+    ));
+    let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("diverge-rotate-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("first message", &session_key, "test", "offline")
+        .await;
+
+    // Poison the baseline so turn two's compare cannot be an append-only
+    // extension of what was actually shipped — the unsanctioned-divergence
+    // class the live bug produced.
+    agent_loop
+        .shared
+        .core_handle
+        .counters
+        .prompt_fingerprints
+        .lock()
+        .insert(
+            session_key.clone(),
+            crate::agent::prompt_fingerprint::fingerprint(&[json!({
+                "role": "user",
+                "content": "bogus baseline",
+            })]),
+        );
+
+    agent_loop
+        .process_direct("second message", &session_key, "test", "offline")
+        .await;
+
+    let calls = provider.calls();
+    assert!(calls.len() >= 2, "expected two LLM calls");
+    let session_field = crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD;
+    let drop_field = crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD;
+    let id1 = calls[0][0][session_field].as_u64();
+    let id2 = calls[1][0][session_field].as_u64();
+    let id1 = id1.expect("higgs session id must ride on the first wire");
+    let id2 = id2.expect("higgs session id must ride on the diverged wire");
+    assert_ne!(
+        id1, id2,
+        "diverged prompt must ship under a fresh session id, not the warm one"
+    );
+    assert_eq!(
+        calls[1][0][drop_field].as_u64(),
+        Some(id1),
+        "poisoned session must be queued for drop on the diverged request"
+    );
+    // Turn-start divergence is the reload window advancing — a SANCTIONED
+    // reset, priced as `history_reload`, not as an unsanctioned bug.
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .take_cache_reset(&session_key),
+        Some("history_reload"),
+        "turn-start divergence must be classified as sanctioned history_reload"
+    );
+}
+
+/// The tool block renders at the chat-template head, so byte drift in the
+/// tool array under a warm session is the same hazard as a message
+/// divergence: the request must rotate to a fresh session id (queued drop of
+/// the poisoned one), priced as `tool_block_change`.
+#[tokio::test]
+async fn test_tool_block_change_rotates_higgs_session() {
+    let provider = Arc::new(WireRecordingProvider::new_higgs_capable(
+        "local-qwen-test",
+        vec![
+            WireRecordingProvider::text_response("first reply"),
+            WireRecordingProvider::text_response("second reply"),
+        ],
+    ));
+    let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("tool-drift-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("first message", &session_key, "test", "offline")
+        .await;
+
+    // Poison the tool-hash baseline — the enforcement's view of "the tool
+    // block bytes changed under this warm session".
+    agent_loop
+        .shared
+        .core_handle
+        .counters
+        .prompt_tool_hashes
+        .lock()
+        .insert(session_key.clone(), 0xDEAD_BEEF);
+
+    agent_loop
+        .process_direct("second message", &session_key, "test", "offline")
+        .await;
+
+    let calls = provider.calls();
+    assert!(calls.len() >= 2, "expected two LLM calls");
+    let session_field = crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD;
+    let drop_field = crate::providers::openai_compat::NANOBOT_HIGGS_DROP_SESSION_ID_FIELD;
+    let id1 = calls[0][0][session_field]
+        .as_u64()
+        .expect("higgs session id must ride on the first wire");
+    let id2 = calls[1][0][session_field]
+        .as_u64()
+        .expect("higgs session id must ride on the drifted wire");
+    assert_ne!(
+        id1, id2,
+        "tool-block drift must ship under a fresh session id"
+    );
+    assert_eq!(
+        calls[1][0][drop_field].as_u64(),
+        Some(id1),
+        "poisoned session must be queued for drop on the drifted request"
+    );
+    assert_eq!(
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .take_cache_reset(&session_key),
+        Some("tool_block_change"),
+        "tool-block drift must be classified as tool_block_change"
     );
 }
 

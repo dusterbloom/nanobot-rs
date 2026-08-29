@@ -194,6 +194,39 @@ pub(super) fn attach_higgs_session_marker(
 }
 
 #[cfg(test)]
+mod history_window_near_tests {
+    use super::history_window_near;
+
+    #[test]
+    fn window_is_far_when_messages_and_turns_have_headroom() {
+        // 32.8K context → history_limit_lcm = 32800*7/10/150 = 152 messages.
+        assert!(!history_window_near(100, 5, 32_768, 60));
+    }
+
+    #[test]
+    fn message_window_binds_inside_one_turn_of_headroom() {
+        // 32.8K context → history_limit_lcm = 152 messages, headroom
+        // 152/4 clamped to 16: near from message 136.
+        assert!(history_window_near(136, 5, 32_768, 60));
+        assert!(!history_window_near(135, 5, 32_768, 60));
+    }
+
+    #[test]
+    fn turn_window_binds_one_turn_before_the_limit() {
+        assert!(history_window_near(10, 59, 32_768, 60));
+        assert!(!history_window_near(10, 58, 32_768, 60));
+    }
+
+    #[test]
+    fn tiny_contexts_keep_plain_drop_behavior() {
+        // Harness-sized windows bind every couple of turns; enforcing the
+        // ordering there would block-compact on nearly every turn.
+        assert!(!history_window_near(19, 1, 4_096, 60));
+        assert!(!history_window_near(0, 0, 4_096, 60));
+    }
+}
+
+#[cfg(test)]
 mod lease_control_tests {
     use super::strip_higgs_session_lease_control;
     use serde_json::json;
@@ -277,6 +310,39 @@ pub(super) fn advertised_tool_names(tool_defs: &[Value]) -> HashSet<String> {
 /// starves compaction until the model hits max tokens and fails.
 pub(super) fn should_allow_checkpoint(pressure: f32, tau_hard: f64) -> bool {
     (pressure as f64) >= tau_hard
+}
+
+/// Whether the hard history window (`filter_history`'s max-messages /
+/// max-turns drop at the next reload) is close enough to bind that a
+/// pending compaction must install NOW instead of deferring for the warm
+/// cache. If compaction loses this race, the next reload drops aged-out
+/// turns WITHOUT summarizing them: the same forced cold prefill, plus
+/// permanent content loss — strictly worse than installing now.
+///
+/// Policy invariant: the token-pressure deferral (`should_allow_checkpoint`)
+/// may only hold while the message/turn window cannot bind first.
+pub(super) fn history_window_near(
+    messages_len: usize,
+    turn_count: u64,
+    max_context_tokens: usize,
+    max_history_turns: usize,
+) -> bool {
+    // Tiny contexts (test harnesses, toy profiles) have disposable history:
+    // their message window binds every couple of turns, so a blocking
+    // compaction per turn would be pathological. The ordering invariant only
+    // applies where a compaction round has room to matter.
+    const MIN_ENFORCE_CONTEXT_TOKENS: usize = 8_192;
+    if max_context_tokens < MIN_ENFORCE_CONTEXT_TOKENS {
+        return false;
+    }
+    let max_messages = crate::agent::agent_core::history_limit_lcm(max_context_tokens);
+    // Turn headroom proportional to the window, clamped: enough that "near"
+    // fires while one turn of tool rounds still fits, never so much that it
+    // fences a large window.
+    let turn_headroom = (max_messages / 4).clamp(2, 16);
+    let message_near = messages_len.saturating_add(turn_headroom) >= max_messages;
+    let turn_near = (turn_count as usize).saturating_add(1) >= max_history_turns;
+    message_near || turn_near
 }
 
 /// Margin under the server-enforced prompt cap for [`overflow_trim_threshold`].

@@ -441,6 +441,10 @@ pub(crate) enum CacheResetReason {
     LcmCheckpoint,
     StalledProviderRequest,
     ToolBlockChange,
+    /// Turn-start reload projection rewrote the prefix (filter_history
+    /// window advanced / LCM view took over). Expected by design — priced
+    /// as a sanctioned reset, not a prompt bug.
+    HistoryReload,
 }
 
 impl CacheResetReason {
@@ -451,6 +455,7 @@ impl CacheResetReason {
             CacheResetReason::LcmCheckpoint => "lcm_checkpoint",
             CacheResetReason::StalledProviderRequest => "stalled_provider_request",
             CacheResetReason::ToolBlockChange => "tool_block_change",
+            CacheResetReason::HistoryReload => "history_reload",
         }
     }
 }
@@ -572,6 +577,7 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
                     "lcm_checkpoint" => CacheResetReason::LcmCheckpoint,
                     "stalled_provider_request" => CacheResetReason::StalledProviderRequest,
                     "tool_block_change" => CacheResetReason::ToolBlockChange,
+                    "history_reload" => CacheResetReason::HistoryReload,
                     _ => return None,
                 };
                 Some(ControlMarker::CacheStatus(CacheStatus::Reset { reason }))

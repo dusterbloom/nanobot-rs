@@ -69,8 +69,8 @@ use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, Control
 
 use super::budget::{
     advertised_tool_names, attach_higgs_session_control, clear_prompt_cache_state,
-    conversation_token_count, divergent_message_digest, invalidate_prompt_cache_for_rewrite,
-    overflow_trim_threshold,
+    conversation_token_count, divergent_message_digest, history_window_near,
+    invalidate_prompt_cache_for_rewrite, overflow_trim_threshold,
     proactive_grounding_preserves_prefix_cache, send_cache_reset_marker, send_compaction_marker,
     send_retract_reply_marker, should_allow_checkpoint, should_inject_heartbeat_grounding,
     strip_higgs_session_lease_control, OVERFLOW_RECOVERY_HEADROOM, OVERFLOW_RECOVERY_MARGIN,
@@ -1819,9 +1819,18 @@ impl AgentLoopShared {
         // while the local prefix cache is warm causes the long re-prefill stalls
         // this cache watermark is meant to prevent — UNLESS pressure has crossed
         // `tau_hard`, where deferring any longer guarantees hitting max tokens.
+        // The same force applies when the hard history WINDOW is about to bind
+        // (`history_window_near`): deferring past it means the next reload
+        // drops whole turns un-summarized and cold-prefills anyway — strictly
+        // worse than installing now.
         let state = self.system_state.load_full();
-        let allow_checkpoint =
-            should_allow_checkpoint(state.context_pressure, self.lcm_config.tau_hard);
+        let allow_checkpoint = should_allow_checkpoint(state.context_pressure, self.lcm_config.tau_hard)
+            || history_window_near(
+                ctx.messages.len(),
+                ctx.turn_count,
+                ctx.core.token_budget.max_context(),
+                ctx.core.max_history_turns,
+            );
         self.install_pending_compaction(ctx, allow_checkpoint).await;
 
         StepResult::Next(IterationPhase::PreCall)
@@ -2630,9 +2639,27 @@ impl AgentLoopShared {
             };
 
             let mut raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
-            if raw_hard {
+            // The hard message/turn window binding at the next reload is the
+            // same emergency as the token hard limit: whole turns would be
+            // dropped un-summarized. Force-install a ready pending result and
+            // escalate to blocking compaction below when nothing is
+            // installable (see `history_window_near` for the ordering
+            // invariant).
+            let mut window_near = history_window_near(
+                ctx.messages.len(),
+                ctx.turn_count,
+                budget.max_context(),
+                budget_core.max_history_turns,
+            );
+            if raw_hard || window_near {
                 self.install_pending_compaction(ctx, true).await;
                 raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
+                window_near = history_window_near(
+                    ctx.messages.len(),
+                    ctx.turn_count,
+                    budget.max_context(),
+                    budget_core.max_history_turns,
+                );
                 action = {
                     let engine = lcm_engine.lock().await;
                     engine.check_thresholds_with_available(available)
@@ -2640,7 +2667,7 @@ impl AgentLoopShared {
             }
 
             let has_pending = ctx.compaction.has_pending().await;
-            let must_block = raw_hard || action == CompactionAction::Blocking;
+            let must_block = raw_hard || action == CompactionAction::Blocking || window_near;
             if must_block {
                 ctx.soft_compaction_requested = false;
             }
@@ -3306,64 +3333,13 @@ impl AgentLoopShared {
             ctx.rendered_messages.clone()
         };
 
-        let mut pending_higgs_drop = Vec::new();
-        let mut higgs_control = None;
-        let mut higgs_request_reservation = None;
-        if ctx.core.provider.supports_higgs_session_cache() {
-            let frozen_tool_hash =
-                crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
-            let max_prompt_tokens = ctx
-                .core
-                .token_budget
-                .max_context()
-                .saturating_sub(max_tokens as usize)
-                .min(u32::MAX as usize) as u32;
-            let retained_checkpoint = ctx.higgs_session_route.retained_checkpoint().cloned();
-            let reservation = retained_checkpoint.as_ref().and_then(|checkpoint| {
-                counters.reserve_retained_expansion_request(
-                    &ctx.session_key,
-                    checkpoint,
-                    &ctx.core.model,
-                    frozen_tool_hash,
-                    max_prompt_tokens,
-                    RuntimeCounters::now_epoch_ms(),
-                )
-            });
-            let reservation = if let Some(reservation) = reservation {
-                reservation
-            } else {
-                if retained_checkpoint.is_some() {
-                    Self::fallback_retained_expansion_route(
-                        ctx,
-                        RetainedExpansionFailure::Unavailable,
-                    );
-                    messages_for_llm = if let Some(staged) = &ctx.staged_auto_expansion {
-                        staged.rendered_messages.clone()
-                    } else {
-                        ctx.rendered_messages.clone()
-                    };
-                }
-                counters.reserve_higgs_session_request(
-                    &ctx.session_key,
-                    &ctx.session_id,
-                    &ctx.core.model,
-                    frozen_tool_hash,
-                    max_prompt_tokens,
-                    RuntimeCounters::now_epoch_ms(),
-                )
-            };
-            pending_higgs_drop = reservation.drop_ids().to_vec();
-            higgs_control = Some(reservation.control().clone());
-            higgs_request_reservation = Some(reservation);
-        }
-
         // Prefix-divergence diagnostic: a prompt that is not an append-only
         // extension of this session's previous call forces the server to
         // re-prefill everything past the divergence point (~60s for a 14k
         // local context). Make every such miss a one-line diagnosis.
         use crate::agent::prompt_fingerprint::{self, PromptDelta};
         let diag_t0 = std::time::Instant::now();
-        let prompt_fp = prompt_fingerprint::fingerprint(&messages_for_llm);
+        let mut prompt_fp = prompt_fingerprint::fingerprint(&messages_for_llm);
         // One checked invariant covering the five sites that write the prompt
         // HEAD: prepare_context's continuity note and stable-prompt assignment,
         // agent_core::append_to_system_prompt, context.rs's developer-message
@@ -3386,10 +3362,17 @@ impl AgentLoopShared {
         let prompt_total_estimate =
             TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens);
         ctx.flow.provider_prompt_estimate = Some(prompt_total_estimate);
-        {
+        // Hoisted so the divergence-rotation below the block can read the
+        // verdict (`PromptDelta` is Copy; the fingerprint guard is not — it
+        // must be dropped before `invalidate_prompt_cache` re-locks).
+        let (prompt_delta, prev_fingerprint) = {
             let store = counters.prompt_fingerprints.lock();
-            let prompt_delta = prompt_fingerprint::compare(store.get(&ctx.session_key), &prompt_fp);
-            let prefill_estimate = match prompt_delta {
+            (
+                prompt_fingerprint::compare(store.get(&ctx.session_key), &prompt_fp),
+                store.get(&ctx.session_key).cloned(),
+            )
+        };
+        let prefill_estimate = match prompt_delta {
                 PromptDelta::First => prompt_total_estimate,
                 PromptDelta::AppendOnly { added_msgs } => {
                     let tail_start = prompt_msg_count.saturating_sub(added_msgs);
@@ -3428,8 +3411,7 @@ impl AgentLoopShared {
                     // Diagnostic: dump the full rendered content of the
                     // divergent message and its neighbors so the exact
                     // byte change is visible in the log.
-                    let prev_fp = store.get(&ctx.session_key);
-                    if let Some(prev_fp) = prev_fp {
+                    if let Some(prev_fp) = &prev_fingerprint {
                         let prev_hash = prev_fp.msg_hash_at(first_divergent_msg);
                         let new_hash = messages_for_llm
                             .get(first_divergent_msg)
@@ -3571,36 +3553,154 @@ impl AgentLoopShared {
                         .send(ControlMarker::PrefillEstimate(prefill_estimate as u64).encode());
                 }
             }
-        }
-        // Tool-block divergence diagnostic. The message fingerprint above is
-        // blind to tool schemas by design, yet chat templates render the tool
-        // block at the prompt head — so a tool block that changes between turns
-        // busts the prefix cache invisibly (server re-prefills everything). This
-        // catches that case: WARN when the serialized tool array hash changes.
-        {
-            let tool_count = tool_defs_opt.map_or(0, |t| t.len());
-            let new_tool_hash = prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
-            let _transition = counters.lock_prompt_cache_transition();
-            let mut tool_store = counters.prompt_tool_hashes.lock();
-            if let Some(prev) = tool_store.get(&ctx.session_key) {
-                if *prev != new_tool_hash {
-                    tracing::warn!(
-                        session = %ctx.session_key,
-                        tool_count,
-                        prev_hash = prev,
-                        new_hash = new_tool_hash,
-                        "tool_block_changed — chat template re-renders tool head, busting prefix cache"
-                    );
+            // Tool-block divergence diagnostic. The message fingerprint above is
+            // blind to tool schemas by design, yet chat templates render the tool
+            // block at the prompt head — so a tool block that changes between turns
+            // busts the prefix cache invisibly (server re-prefills everything). This
+            // catches that case: WARN when the serialized tool array hash changes.
+            let mut tool_block_changed = false;
+            {
+                let tool_count = tool_defs_opt.map_or(0, |t| t.len());
+                let new_tool_hash = prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
+                let _transition = counters.lock_prompt_cache_transition();
+                let mut tool_store = counters.prompt_tool_hashes.lock();
+                if let Some(prev) = tool_store.get(&ctx.session_key) {
+                    if *prev != new_tool_hash {
+                        tool_block_changed = true;
+                        tracing::warn!(
+                            session = %ctx.session_key,
+                            tool_count,
+                            prev_hash = prev,
+                            new_hash = new_tool_hash,
+                            "tool_block_changed — chat template re-renders tool head, busting prefix cache"
+                        );
+                    }
                 }
+                tool_store.insert(ctx.session_key.to_string(), new_tool_hash);
             }
-            tool_store.insert(ctx.session_key.to_string(), new_tool_hash);
-        }
+            // The presentation-MODE switch rotates in
+            // `freeze_final_tool_catalog`; this is the backstop for same-mode
+            // byte drift that path cannot see. The tool head renders above
+            // the messages, so under a warm retained session it is the same
+            // hazard as a message divergence: rotate instead of shipping
+            // into the guard. Runs outside the diagnostic block above — its
+            // transition lock is held to the block's end.
+            if tool_block_changed
+                && ctx.core.mode().is_local()
+                && ctx.core.provider.supports_higgs_session_cache()
+            {
+                counters
+                    .note_cache_reset(&ctx.session_key, CacheResetReason::ToolBlockChange.as_wire());
+                send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::ToolBlockChange);
+                counters.invalidate_prompt_cache(&ctx.session_key, true);
+            }
         tracing::info!(
             target: "turn_timing",
             prefix_diag_ms = diag_t0.elapsed().as_millis() as u64,
             msg_count = prompt_msg_count,
             "prefix_diag_timing"
         );
+        // THE prompt-cache invariant, enforced: a prompt that is not an
+        // append-only extension of the previous call must never ship under
+        // the warm retained session id. Higgs's exact-token guard rejects it
+        // (`token_mismatch`), keeps the diverged bytes as the retained
+        // prefix, and then rejects every follow-up (`not_growing`) — a
+        // cascade of full re-prefills. Rotating hands THIS request a fresh
+        // session id (the reservation below folds the bumped epoch) and
+        // queues the poisoned one for drop: exactly one cold prefill, zero
+        // guard rejections. The dumps above still name the divergent message
+        // so the underlying rewrite gets fixed at its source. Must run after
+        // the diagnostic block — the fingerprint guard is held there.
+        //
+        // Classification: at the turn's FIRST send the divergence is the
+        // reload projection having rewritten the prefix — the designed
+        // window advance (filter_history drops aged-out whole turns) or the
+        // LCM view taking over. That is sanctioned by design and priced as
+        // `history_reload`. Mid-turn (iteration > 0) the array is
+        // in-memory append-only, so a divergence is a genuine bug: rotate
+        // unsanctioned; the dumps above name the culprit.
+        if let PromptDelta::Diverged {
+            prev_msgs,
+            new_msgs,
+            ..
+        } = prompt_delta
+        {
+            if ctx.core.mode().is_local()
+                && ctx.core.provider.supports_higgs_session_cache()
+            {
+                if ctx.iterations_used <= 1 {
+                    warn!(
+                        session = %ctx.session_key,
+                        prev_msgs,
+                        new_msgs,
+                        "turn_start_prefix_rewrite — reload window advanced; rotating session (sanctioned history_reload)"
+                    );
+                    counters.note_cache_reset(
+                        &ctx.session_key,
+                        CacheResetReason::HistoryReload.as_wire(),
+                    );
+                    send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::HistoryReload);
+                }
+                counters.invalidate_prompt_cache(&ctx.session_key, true);
+            }
+        }
+
+        // The higgs reservation runs AFTER the divergence rotation above so
+        // the rotated epoch folds into a fresh session id for THIS request.
+        let mut pending_higgs_drop = Vec::new();
+        let mut higgs_control = None;
+        let mut higgs_request_reservation = None;
+        if ctx.core.provider.supports_higgs_session_cache() {
+            let frozen_tool_hash =
+                crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
+            let max_prompt_tokens = ctx
+                .core
+                .token_budget
+                .max_context()
+                .saturating_sub(max_tokens as usize)
+                .min(u32::MAX as usize) as u32;
+            let retained_checkpoint = ctx.higgs_session_route.retained_checkpoint().cloned();
+            let reservation = retained_checkpoint.as_ref().and_then(|checkpoint| {
+                counters.reserve_retained_expansion_request(
+                    &ctx.session_key,
+                    checkpoint,
+                    &ctx.core.model,
+                    frozen_tool_hash,
+                    max_prompt_tokens,
+                    RuntimeCounters::now_epoch_ms(),
+                )
+            });
+            let reservation = if let Some(reservation) = reservation {
+                reservation
+            } else {
+                if retained_checkpoint.is_some() {
+                    Self::fallback_retained_expansion_route(
+                        ctx,
+                        RetainedExpansionFailure::Unavailable,
+                    );
+                    messages_for_llm = if let Some(staged) = &ctx.staged_auto_expansion {
+                        staged.rendered_messages.clone()
+                    } else {
+                        ctx.rendered_messages.clone()
+                    };
+                    // The fallback re-render replaced the wire after the
+                    // fingerprint above was taken — re-hash so the stored
+                    // baseline matches the bytes actually shipped.
+                    prompt_fp = prompt_fingerprint::fingerprint(&messages_for_llm);
+                }
+                counters.reserve_higgs_session_request(
+                    &ctx.session_key,
+                    &ctx.session_id,
+                    &ctx.core.model,
+                    frozen_tool_hash,
+                    max_prompt_tokens,
+                    RuntimeCounters::now_epoch_ms(),
+                )
+            };
+            pending_higgs_drop = reservation.drop_ids().to_vec();
+            higgs_control = Some(reservation.control().clone());
+            higgs_request_reservation = Some(reservation);
+        }
 
         let retry_policy = if higgs_control
             .as_ref()
