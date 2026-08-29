@@ -2079,23 +2079,26 @@ impl AgentLoopShared {
                 0,
                 frozen_prefix,
             );
-        let prefix_preserved = matches!(
-            trim_disposition,
-            crate::agent::token_budget::PrefixTrimDisposition::Preserved
-        );
-        if !prefix_preserved && frozen_prefix > 0 {
-            let rotated = invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::EmergencyTrim);
+        let after_messages = trimmed_messages.len();
+        // One hatch for the whole rewrite: `rewrite_committed` pays the reset
+        // exactly when the trim rewrote warm bytes — a prefix-safe trim (or a
+        // cold session) pays nothing. The disposition no longer gates the
+        // ceremony by hand.
+        let rewrite = ctx.rewrite_committed(trimmed_messages, CacheResetReason::EmergencyTrim);
+        if let PromptRewrite::Reset { rotated } = rewrite {
             warn!(
                 session = %ctx.session_key,
                 frozen_prefix,
                 before_messages,
-                after_messages = trimmed_messages.len(),
+                after_messages,
                 rotated,
                 "prompt_cache_watermark_invalidated_by_emergency_trim"
             );
         }
-        ctx.messages.install(trimmed_messages);
-        if !prefix_preserved {
+        if matches!(
+            trim_disposition,
+            crate::agent::token_budget::PrefixTrimDisposition::ResetRequired
+        ) {
             self.install_pending_compaction(ctx, true).await;
         }
         // Re-render after trim to rebuild protocol-correct wire format.
@@ -2244,23 +2247,27 @@ impl AgentLoopShared {
             },
             frozen_prefix,
         );
-        let prefix_preserved = matches!(
-            trim_disposition,
-            crate::agent::token_budget::PrefixTrimDisposition::Preserved
-        );
-        if !prefix_preserved && frozen_prefix > 0 {
-            let rotated = invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::Trim);
+        let before_messages = ctx.messages.len();
+        let after_messages = trimmed_messages.len();
+        // One hatch for the whole rewrite: `rewrite_committed` pays the reset
+        // exactly when the trim rewrote warm bytes — a prefix-safe trim (or a
+        // cold session) pays nothing. The disposition no longer gates the
+        // ceremony by hand.
+        let rewrite = ctx.rewrite_committed(trimmed_messages, CacheResetReason::Trim);
+        if let PromptRewrite::Reset { rotated } = rewrite {
             warn!(
                 session = %ctx.session_key,
                 frozen_prefix,
-                before_messages = ctx.messages.len(),
-                after_messages = trimmed_messages.len(),
+                before_messages,
+                after_messages,
                 rotated,
                 "prompt_cache_watermark_invalidated_by_token_trim"
             );
         }
-        ctx.messages.install(trimmed_messages);
-        if !prefix_preserved {
+        if matches!(
+            trim_disposition,
+            crate::agent::token_budget::PrefixTrimDisposition::ResetRequired
+        ) {
             self.install_pending_compaction(ctx, true).await;
         }
 
@@ -2987,7 +2994,7 @@ impl AgentLoopShared {
                     .token_budget
                     .available_budget(0)
                     .saturating_sub(hard_limit);
-                let (trimmed_messages, trim_disposition) = ctx
+                let (trimmed_messages, _trim_disposition) = ctx
                     .core
                     .token_budget
                     .trim_to_fit_with_age_preserving_prefix(
@@ -2997,23 +3004,19 @@ impl AgentLoopShared {
                         0,
                         frozen_prefix,
                     );
-                let prefix_preserved = matches!(
-                    trim_disposition,
-                    crate::agent::token_budget::PrefixTrimDisposition::Preserved
-                );
-                if !prefix_preserved && frozen_prefix > 0 {
-                    let rotated =
-                        invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::EmergencyTrim);
+                let before_messages = ctx.messages.len();
+                let after_messages = trimmed_messages.len();
+                let rewrite = ctx.rewrite_committed(trimmed_messages, CacheResetReason::EmergencyTrim);
+                if let PromptRewrite::Reset { rotated } = rewrite {
                     warn!(
                         session = %ctx.session_key,
                         frozen_prefix,
-                        before_messages = ctx.messages.len(),
-                        after_messages = trimmed_messages.len(),
+                        before_messages,
+                        after_messages,
                         rotated,
                         "in_turn_overflow_trim_invalidated_prompt_cache"
                     );
                 }
-                ctx.messages.install(trimmed_messages);
             }
 
             if ctx.is_cancelled() {
