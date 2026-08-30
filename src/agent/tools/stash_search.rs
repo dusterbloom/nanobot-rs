@@ -426,7 +426,7 @@ impl Tool for SearchToolResultTool {
             "properties": {
                 "tool_call_id": {
                     "type": "string",
-                    "description": "The tool_call_id from the [truncated: ...] preview block."
+                    "description": "The id from the id: field of the TOOL_RESULT_HANDLE line you are reading (not an inspect call's own id)."
                 },
                 "query": {
                     "type": "string",

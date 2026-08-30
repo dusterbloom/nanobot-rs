@@ -388,6 +388,8 @@ impl Tool for ExecTool {
 
     fn description(&self) -> &str {
         "Execute a shell command and return its output. \
+         Shell is zsh on macOS with BSD userland: grep has no -P (use -E), \
+         sed is BSD sed, date flags differ from GNU. \
          Skills (installed in the workspace) are invoked through exec. Call get_skills first to read a skill's instructions, then follow its Quick start command. \
          Other patterns: cargo build, git status, python script.py. \
          Blocked: rm -rf, sudo, eval, shred (destructive commands rejected). \

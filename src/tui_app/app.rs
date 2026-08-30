@@ -33,7 +33,7 @@
     clippy::string_add
 )]
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use once_cell::sync::Lazy;
@@ -59,6 +59,9 @@ use crate::session::db::SessionSnapshot;
 use crate::turn_stream::{BackendActivity, CompactionStatus};
 
 const BRAND: &str = "\u{259e}"; // ▞  the nanobot wordmark glyph
+/// Double-Esc cancel window while streaming — same value as the classic
+/// REPL's input watcher (repl/mod.rs) so both UIs cancel identically.
+const ESC_CANCEL_WINDOW: Duration = Duration::from_millis(500);
 const DOT: &str = "\u{2022}"; //   •  status / user marker
 const RUN: &str = "\u{25b6}"; //   ▶
 const OK: &str = "\u{2713}"; //   ✓
@@ -529,6 +532,11 @@ pub(crate) struct App {
     paste_context_tokens: usize,
     /// True while the agent is producing a turn.
     streaming: bool,
+    /// First Esc press time while streaming — a second Esc within 500ms
+    /// cancels the turn (mirrors the classic REPL's input watcher). A lone
+    /// Esc must NOT cancel: terminal escape-sequence noise (OSC/DSR replies
+    /// crossterm parses as bare Esc) otherwise phantom-cancels live streams.
+    esc_cancel_at: Option<Instant>,
     /// True between turn start and the first text/tool output (prefill phase).
     awaiting_first: bool,
     /// Whether any text delta arrived this turn (drives the non-streaming fallback).
@@ -633,6 +641,7 @@ impl App {
             input: configure_input(),
             paste_context_tokens: UNKNOWN_CONTEXT_TOKENS,
             streaming: false,
+            esc_cancel_at: None,
             awaiting_first: false,
             got_text: false,
             turn_produced: false,
@@ -2138,12 +2147,29 @@ impl App {
             Event::Key(k) if is_press(&k) => {
                 let help_open = std::mem::take(&mut self.show_help);
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                // Any non-Esc key disarms the pending Esc-cancel.
+                if k.code != KeyCode::Esc {
+                    self.esc_cancel_at = None;
+                }
                 match k.code {
                     KeyCode::Esc => {
-                        self.clear_input();
-                        StreamingAction::Cancel
+                        let now = Instant::now();
+                        let double = self
+                            .esc_cancel_at
+                            .take()
+                            .is_some_and(|t| now.duration_since(t) < ESC_CANCEL_WINDOW);
+                        if double {
+                            tracing::info!("tui: cancel trigger=Esc+Esc");
+                            self.clear_input();
+                            StreamingAction::Cancel
+                        } else {
+                            self.esc_cancel_at = Some(now);
+                            self.clear_input();
+                            StreamingAction::Continue
+                        }
                     }
                     KeyCode::Char('c') if ctrl => {
+                        tracing::info!("tui: cancel trigger=Ctrl+C");
                         self.clear_input();
                         StreamingAction::CancelOrQuit
                     }
@@ -2174,8 +2200,14 @@ impl App {
                             return StreamingAction::Continue;
                         }
                         match self.submit() {
-                            Action::Submit(turn) => StreamingAction::CancelAndSubmit(turn),
-                            _ => StreamingAction::Cancel,
+                            Action::Submit(turn) => {
+                                tracing::info!("tui: cancel trigger=Enter(resubmit)");
+                                StreamingAction::CancelAndSubmit(turn)
+                            }
+                            _ => {
+                                tracing::info!("tui: cancel trigger=Enter");
+                                StreamingAction::Cancel
+                            }
                         }
                     }
                     KeyCode::PageUp => {
@@ -2355,9 +2387,9 @@ impl App {
         }
         if self.streaming {
             return Some(if self.input_is_empty() && self.attachments.is_empty() {
-                " Type and press Enter or ESC to interrupt ".to_string()
+                " Type and press Enter, or double-Esc to interrupt ".to_string()
             } else {
-                " Enter interrupts and sends · Esc cancels ".to_string()
+                " Enter interrupts and sends · Esc×2 cancels ".to_string()
             });
         }
         if self.attachments.is_empty() {
@@ -5830,30 +5862,33 @@ mod tests {
         let cases = [
             (
                 "Escape",
-                KeyCode::Esc,
-                KeyModifiers::NONE,
+                vec![
+                    (KeyCode::Esc, KeyModifiers::NONE),
+                    (KeyCode::Esc, KeyModifiers::NONE),
+                ],
                 StreamingAction::Cancel,
             ),
             (
                 "Ctrl-C",
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL,
+                vec![(KeyCode::Char('c'), KeyModifiers::CONTROL)],
                 StreamingAction::CancelOrQuit,
             ),
             (
                 "Ctrl-D",
-                KeyCode::Char('d'),
-                KeyModifiers::CONTROL,
+                vec![(KeyCode::Char('d'), KeyModifiers::CONTROL)],
                 StreamingAction::Quit,
             ),
         ];
 
-        for (label, code, modifiers, expected) in cases {
+        for (label, keys, expected) in cases {
             let mut app = App::new();
             app.begin_turn("long task");
             app.show_help = true;
 
-            let action = app.on_streaming_event(Event::Key(KeyEvent::new(code, modifiers)));
+            let mut action = StreamingAction::Continue;
+            for (code, modifiers) in keys {
+                action = app.on_streaming_event(Event::Key(KeyEvent::new(code, modifiers)));
+            }
 
             assert_eq!(
                 std::mem::discriminant(&action),
@@ -5865,16 +5900,34 @@ mod tests {
     }
 
     #[test]
-    fn streaming_escape_cancels_and_clears_draft() {
+    fn streaming_escape_requires_double_tap_to_cancel() {
         let mut app = App::new();
         app.begin_turn("long task");
         app.input.insert_str("draft");
 
+        // Lone Esc: clears the draft but must NOT cancel — terminal escape
+        // noise parses as a bare Esc keypress and would phantom-cancel.
+        assert!(matches!(
+            app.on_streaming_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+            StreamingAction::Continue
+        ));
+        assert_eq!(input_text(&app), "");
+
+        // Any other key disarms the pending Esc-cancel.
+        app.on_streaming_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(
+            app.on_streaming_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+            StreamingAction::Continue
+        ));
+
+        // The re-armed Esc plus one more inside the window cancels.
         assert!(matches!(
             app.on_streaming_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
             StreamingAction::Cancel
         ));
-        assert_eq!(input_text(&app), "");
     }
 
     #[test]
@@ -5985,7 +6038,7 @@ mod tests {
 
         let text = buffer_text(term.backend().buffer());
         assert!(
-            text.contains("Type and press Enter or ESC to interrupt"),
+            text.contains("Type and press Enter, or double-Esc to interrupt"),
             "streaming input border hint missing:\n{text}"
         );
     }

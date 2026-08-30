@@ -182,6 +182,12 @@ impl WorkingMemoryStore {
             .sum())
     }
 
+    /// Number of sessions in `status` — the "how much am I about to distill"
+    /// figure shown before a reflection pass runs.
+    pub async fn count_by_status(&self, status: SessionStatus) -> rusqlite::Result<usize> {
+        Ok(self.list_sessions_by_status(status).await?.len())
+    }
+
     async fn list_sessions_by_status(
         &self,
         status: SessionStatus,

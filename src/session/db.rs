@@ -1913,11 +1913,14 @@ impl SessionDb {
             if max_idle_secs > 0 {
                 let idle = chrono::Utc::now() - meta.updated_at;
                 if idle.num_seconds() > max_idle_secs as i64 {
-                    tracing::info!(
+                    // Rotation is user-visible (the model's context resets), so
+                    // it must survive the default warn-only log filter.
+                    tracing::warn!(
                         session_key = %key,
+                        prior_session_id = %meta.id,
                         idle_secs = idle.num_seconds(),
                         max_idle_secs,
-                        "session_expired: creating fresh session"
+                        "session_expired: rotating to a fresh session (prior context stays in sessions.db; recall can retrieve it)"
                     );
                     let now = Utc::now().to_rfc3339();
                     let conn = self.conn.lock().await;
@@ -3287,6 +3290,55 @@ impl SessionDb {
         })
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
+    }
+
+    /// The most recent prior session under exactly `session_key` (excluding
+    /// `exclude_session_id`), with its last real exchange. This is the
+    /// continuity source for idle-rollover rotations: the fresh session's
+    /// predecessor is the same key's previous row, never an unrelated key's.
+    pub async fn latest_session_tail_for_key(
+        &self,
+        session_key: &str,
+        exclude_session_id: &str,
+    ) -> Option<SessionTail> {
+        const SQL: &str = "\
+            SELECT * FROM ( \
+                SELECT s.id, s.session_key, s.updated_at, \
+                    (SELECT CAST(m.content AS TEXT) FROM messages m \
+                     WHERE m.session_id = s.id AND m.role = 'user' \
+                       AND m.synthetic = 0 AND m.content IS NOT NULL AND m.content != '' \
+                     ORDER BY m.id DESC LIMIT 1) AS last_user, \
+                    (SELECT CAST(m.content AS TEXT) FROM messages m \
+                     WHERE m.session_id = s.id AND m.role = 'assistant' \
+                       AND m.synthetic = 0 AND m.content IS NOT NULL AND m.content != '' \
+                     ORDER BY m.id DESC LIMIT 1) AS last_assistant \
+                FROM sessions s \
+                WHERE s.session_key = ?1 AND s.id != ?2 \
+                ORDER BY s.updated_at DESC \
+            ) WHERE last_user IS NOT NULL OR last_assistant IS NOT NULL \
+            LIMIT 1";
+
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(SQL) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("latest_session_tail_for_key prepare failed: {}", e);
+                return None;
+            }
+        };
+        stmt.query_row(params![session_key, exclude_session_id], |row| {
+            let updated_str: String = row.get(2)?;
+            Ok(SessionTail {
+                session_id: row.get(0)?,
+                session_key: row.get(1)?,
+                updated_at: DateTime::parse_from_rfc3339(&updated_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                last_user: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                last_assistant: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            })
+        })
+        .ok()
     }
 
     pub async fn rebuild_fts_index(&self) {
@@ -5915,6 +5967,53 @@ mod tests {
         assert_eq!(tails.len(), 2);
         assert_eq!(tails[0].session_key, "cli:oneshot-2");
         assert_eq!(tails[1].session_key, "cli:oneshot-1");
+    }
+
+    /// The continuity source for idle-rollover rotations must come from the
+    /// SAME session key: a fresh rotated row's predecessor is its own key's
+    /// previous row, never the most recent session of an unrelated key.
+    #[tokio::test]
+    async fn test_latest_session_tail_for_key_is_same_key_only() {
+        let (db, _dir) = make_db();
+
+        let prior = db.create_session("cli:oneshot-A").await;
+        db.add_messages(
+            &prior.id,
+            &[
+                json!({"role": "user", "content": "openai question"}),
+                json!({"role": "assistant", "content": "openai answer"}),
+            ],
+        )
+        .await;
+
+        // A more recently updated session under a DIFFERENT key must not win.
+        let unrelated = db.create_session("cli:oneshot-B").await;
+        db.add_messages(
+            &unrelated.id,
+            &[
+                json!({"role": "user", "content": "unrelated question"}),
+                json!({"role": "assistant", "content": "unrelated answer"}),
+            ],
+        )
+        .await;
+
+        // The rotated fresh row for key A, empty so far.
+        let fresh = db.create_session("cli:oneshot-A").await;
+
+        let tail = db
+            .latest_session_tail_for_key("cli:oneshot-A", &fresh.id)
+            .await
+            .expect("same-key prior session must be found");
+        assert_eq!(tail.session_id, prior.id);
+        assert_eq!(tail.last_user, "openai question");
+
+        // A key with no prior sessions yields None even though others exist.
+        assert!(
+            db.latest_session_tail_for_key("cli:oneshot-C", &fresh.id)
+                .await
+                .is_none(),
+            "must not leak another key's session as continuity"
+        );
     }
 
     #[tokio::test]

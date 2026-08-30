@@ -44,8 +44,89 @@ const CAPTURE_TEARDOWN: &str = concat!(
 // Tool struct
 // ---------------------------------------------------------------------------
 
+/// Point fd 0 at /dev/null while kernel code runs, restoring it when the
+/// last concurrent shield drops.
+///
+/// User Python executes in-process: `open('/dev/stdin')` or `input()` would
+/// issue a blocking read(2) on the process's real terminal — the same file
+/// the UI's event loop reads — permanently stealing every other keystroke
+/// (the "type each key twice" failure) and wedging the kernel. With the
+/// shield, such reads return EOF instantly.
+///
+/// Refcounted because fd 0 is process-global: concurrent kernel calls (and
+/// the tests that exercise them) would otherwise restore the terminal under
+/// each other's running code. A wedged call simply never drops its count —
+/// fd 0 stays /dev/null, which only makes later stray reads EOF.
+struct KernelStdinShield;
+
+static SHIELD_COUNT: std::sync::Mutex<(usize, Option<i32>)> = std::sync::Mutex::new((0, None));
+
+impl KernelStdinShield {
+    fn new() -> Self {
+        // Poisoning only happens if a holder panicked mid-update; treat that
+        // as "leave the shield on" rather than abort the kernel.
+        let mut state = SHIELD_COUNT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (count, saved_tty) = &mut *state;
+        if *count == 0 {
+            #[allow(unsafe_code)]
+            unsafe {
+                let saved = libc::dup(libc::STDIN_FILENO);
+                if let Ok(null) = std::fs::File::open("/dev/null") {
+                    use std::os::unix::io::AsRawFd;
+                    libc::dup2(null.as_raw_fd(), libc::STDIN_FILENO);
+                    // `null` closes on drop; fd 0 keeps the dup2'd copy.
+                    *saved_tty = (saved >= 0).then_some(saved);
+                } else if saved >= 0 {
+                    libc::close(saved);
+                }
+            }
+        }
+        *count += 1;
+        Self
+    }
+}
+
+impl Drop for KernelStdinShield {
+    fn drop(&mut self) {
+        let mut state = SHIELD_COUNT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (count, saved_tty) = &mut *state;
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            if let Some(saved) = *saved_tty {
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::dup2(saved, libc::STDIN_FILENO);
+                    libc::close(saved);
+                }
+                *saved_tty = None;
+            }
+        }
+    }
+}
+
+/// Process-wide count of wedged kernel threads (grace timeout fired, thread
+/// never returned). Such threads can never be joined: the REPL must not wait
+/// for them at shutdown.
+static WEDGED_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn wedged_thread_count() -> usize {
+    WEDGED_THREADS.load(Ordering::SeqCst)
+}
+
 pub struct PythonKernel {
-    globals: Arc<Mutex<Py<PyDict>>>,
+    /// Held in a `RwLock` so a wedged kernel's globals can be swapped for a
+    /// fresh dict: when a call misses the watchdog, its thread keeps the old
+    /// inner mutex locked forever. Replacing the `Arc` frees later calls;
+    /// the stuck thread is leaked but holds no GIL (blocking file/socket
+    /// reads release it for the duration of the syscall).
+    globals: std::sync::RwLock<Arc<Mutex<Py<PyDict>>>>,
+    /// Set when a call timed out without responding to interruption. The
+    /// next call replaces the globals instead of blocking on the dead mutex.
+    wedged: AtomicBool,
     timeout: Duration,
 }
 
@@ -56,9 +137,23 @@ impl PythonKernel {
             dict.into()
         });
         Self {
-            globals: Arc::new(Mutex::new(globals)),
+            globals: std::sync::RwLock::new(Arc::new(Mutex::new(globals))),
+            wedged: AtomicBool::new(false),
             timeout: Duration::from_secs(timeout_secs),
         }
+    }
+
+    /// Globals for this call, swapping in a fresh dict first if the previous
+    /// call wedged the kernel.
+    fn globals_for_call(&self) -> Arc<Mutex<Py<PyDict>>> {
+        if self.wedged.swap(false, Ordering::SeqCst) {
+            let fresh: Py<PyDict> = Python::with_gil(|py| PyDict::new(py).into());
+            let new = Arc::new(Mutex::new(fresh));
+            let mut slot = self.globals.write().unwrap_or_else(|e| e.into_inner());
+            *slot = Arc::clone(&new);
+            return new;
+        }
+        Arc::clone(&self.globals.read().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -75,7 +170,11 @@ impl Tool for PythonKernel {
     fn description(&self) -> &str {
         "Execute Python code in a persistent kernel. \
          Variables, imports, and functions survive across calls. \
-         Only explicit print() output is returned."
+         Only explicit print() output is returned. \
+         There is no stdin — never read input() or open('/dev/stdin'); \
+         fetch web pages with urllib.request, read files by path. \
+         Each call must finish within its timeout; a blocking call wedges \
+         the kernel (it is then replaced, losing all variables)."
     }
 
     fn parameters(&self) -> Value {
@@ -111,7 +210,7 @@ impl Tool for PythonKernel {
             }
         };
 
-        let globals = Arc::clone(&self.globals);
+        let globals = self.globals_for_call();
         let timeout = self.timeout;
 
         // Watchdog handshake: the blocking thread publishes its CPython thread
@@ -122,6 +221,10 @@ impl Tool for PythonKernel {
         let watchdog = spawn_watchdog(Arc::clone(&thread_id), Arc::clone(&done), timeout);
 
         let result = task::spawn_blocking(move || {
+            // Block terminal-stealing reads for the whole run (setup, user
+            // code, teardown). A blocking user call that never returns keeps
+            // this thread (and the shield) alive — see KernelStdinShield.
+            let _stdin_shield = KernelStdinShield::new();
             Python::with_gil(|py| {
                 // A panic under the GIL would otherwise poison the mutex and
                 // brick every later call.
@@ -177,13 +280,22 @@ impl Tool for PythonKernel {
                 format!("Error: kernel thread panicked: {join_err}")
             }
             Ok(Err(join_err)) => format!("Error: {join_err}"),
-            Err(_) => format!(
-                "Error: kernel did not respond to interruption {}s past its {}s \
-                 timeout — a blocking or native call is holding the GIL. Further \
-                 `python` calls will block until it returns.",
-                grace.as_secs() - timeout.as_secs(),
-                timeout.as_secs()
-            ),
+            Err(_) => {
+                // Mark the kernel wedged: the runner thread never returned and
+                // still holds the old globals mutex. The next call swaps in a
+                // fresh interpreter namespace instead of blocking forever.
+                self.wedged.store(true, Ordering::SeqCst);
+                WEDGED_THREADS.fetch_add(1, Ordering::SeqCst);
+                format!(
+                    "Error: kernel did not respond to interruption {}s past its {}s \
+                     timeout — a blocking or native call is holding the kernel \
+                     (common cause: reading stdin, which does not exist here). \
+                     The kernel will be replaced on the next call; variables \
+                     defined so far are lost.",
+                    grace.as_secs() - timeout.as_secs(),
+                    timeout.as_secs()
+                )
+            }
         };
         watchdog.join().ok();
         // Thread output is a flat string; split the legacy error channel at
@@ -467,6 +579,106 @@ mod tests {
             after.contains("alive"),
             "kernel wedged after timeout: {after}"
         );
+    }
+
+    /// Run one kernel call on a leaked detached runtime. Kernel tests must
+    /// not own a joinable tokio runtime: any lingering blocking-pool thread
+    /// (keep-alive, or a wedged call that can never return) would hang the
+    /// runtime's shutdown and the test with it.
+    fn run_kernel_detached(code: String) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut kernel = PythonKernel::new(30);
+            let mut params = HashMap::new();
+            params.insert("code".to_string(), json!(code));
+            let rendered = {
+                let ctx = crate::agent::tools::base::ToolContext::sandbox();
+                let out = kernel.execute(params, &ctx);
+                crate::agent::tools::base::render_result(rt.block_on(out))
+            };
+            std::mem::forget(rt);
+            tx.send(rendered).unwrap();
+        });
+        rx.recv().expect("detached kernel call must report back")
+    }
+
+    /// `open('/dev/stdin')` must return EOF instantly, not issue a blocking
+    /// read(2) on the process's real terminal — that steal-every-other-key
+    /// failure bricked interactive sessions (2026-08-29). The verdict is
+    /// written to a file: the embedded interpreter's stdout capture is
+    /// process-global and other parallel kernel tests clobber it.
+    #[test]
+    fn stdin_reads_return_eof_instead_of_blocking() {
+        let verdict = std::env::temp_dir().join(format!(
+            "nanobot-kernel-stdin-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&verdict);
+        let path = verdict.to_string_lossy().to_string();
+        let code = format!(
+            "import pathlib\nout = []\nout.append('len %d' % len(open('/dev/stdin').read()))\ntry:\n    input()\n    out.append('input got')\nexcept EOFError:\n    out.append('input eof')\npathlib.Path({path:?}).write_text(' | '.join(out))"
+        );
+        let result = run_kernel_detached(code.clone());
+        let written = std::fs::read_to_string(&verdict)
+            .unwrap_or_else(|_| format!("<no verdict; kernel said: {result}>"));
+        let _ = std::fs::remove_file(&verdict);
+        assert!(
+            written.contains("len 0"),
+            "stdin read must be EOF: {written} (kernel: {result})"
+        );
+        assert!(
+            written.contains("input eof"),
+            "input() must EOF: {written} (kernel: {result})"
+        );
+    }
+
+    /// A call that blocks in a syscall (pipe read with no writer) can neither
+    /// finish nor be interrupted — the grace timeout fires, the kernel is
+    /// marked wedged, and the NEXT call must succeed on a fresh namespace
+    /// instead of blocking on the dead mutex forever. This is the
+    /// `open('/dev/stdin')` production failure: state is lost, the tool is not.
+    ///
+    /// Runs each call on a leaked detached runtime: the wedged blocking
+    /// thread can never be joined, and a normal `#[tokio::test]` runtime
+    /// would hang its own shutdown waiting for it (the zombie-process
+    /// failure this suite exists to prevent).
+    #[test]
+    fn wedged_kernel_is_replaced_on_next_call() {
+        // Both calls share one kernel on one leaked runtime — the wedge and
+        // the recovery must hit the same instance.
+        let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut kernel = PythonKernel::new(1);
+            let run = |code: String| {
+                let mut params = HashMap::new();
+            params.insert("code".to_string(), json!(code.as_str()));
+                let ctx = crate::agent::tools::base::ToolContext::sandbox();
+                let out = kernel.execute(params, &ctx);
+                crate::agent::tools::base::render_result(rt.block_on(out))
+            };
+            let wedged = run(
+                "import os\nprint('sentinel')\nos.read(os.pipe()[0], 1)".to_string(),
+            );
+            let recovered = run("print('recovered')".to_string());
+            // Leaking the runtime keeps its shutdown from joining the wedged
+            // blocking thread.
+            std::mem::forget(rt);
+            tx.send((wedged, recovered)).unwrap();
+        });
+        let (wedged, recovered) = rx.recv().expect("kernel calls must report back");
+
+        assert!(wedged.contains("did not respond"), "got: {wedged}");
+        assert!(wedged.contains("replaced"), "got: {wedged}");
+        assert!(recovered.contains("recovered"), "kernel stayed wedged: {recovered}");
+        assert!(super::wedged_thread_count() >= 1, "wedge counter must record the leak");
     }
 
     /// An exception must not leave sys.stdout redirected or `__capture_result`

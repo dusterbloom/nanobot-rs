@@ -702,7 +702,9 @@ impl Tool for WebFetchTool {
          Only pass a URL that appeared verbatim in a prior tool result or in the\n\
          user's message. Do not guess URLs from memory — Vercel/Cloudflare/news\n\
          site paths change and guessed URLs return 404 or login walls. If you\n\
-         don't have the URL, call web_search first to discover it."
+         don't have the URL, call web_search first to discover it.\n\
+         Large pages return a TOOL_RESULT_HANDLE instead of the text — read it\n\
+         with inspect_tool_result(tool_call_id=<the id: field inside the handle>)."
     }
 
     fn permission(&self) -> PermissionLevel {

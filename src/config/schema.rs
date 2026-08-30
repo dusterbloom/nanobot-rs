@@ -1201,6 +1201,13 @@ pub struct MemoryConfig {
     #[serde(default = "default_reflection_threshold")]
     pub reflection_threshold: usize,
 
+    /// Word cap for the long-term MEMORY.md file. Reflection is instructed to
+    /// curate within this budget — dropping superseded or one-off facts to
+    /// make room is part of the job — and the written file is hard-truncated
+    /// to it as a backstop (default: 1500).
+    #[serde(default = "default_memory_file_max_words")]
+    pub memory_file_max_words: usize,
+
     /// Seconds of inactivity before auto-completing a working memory session (default: 3600).
     #[serde(default = "default_session_complete_after_secs")]
     pub session_complete_after_secs: u64,
@@ -1272,6 +1279,10 @@ fn default_reflection_threshold() -> usize {
     5000
 }
 
+fn default_memory_file_max_words() -> usize {
+    1500
+}
+
 fn default_skill_disclosure() -> String {
     "compact".to_string()
 }
@@ -1285,6 +1296,7 @@ impl Default for MemoryConfig {
             provider: None,
             working_memory_budget: default_working_memory_budget(),
             reflection_threshold: default_reflection_threshold(),
+            memory_file_max_words: default_memory_file_max_words(),
             session_complete_after_secs: default_session_complete_after_secs(),
             max_message_age_turns: default_max_message_age_turns(),
             max_history_turns: default_max_history_turns(),

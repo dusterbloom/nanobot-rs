@@ -70,7 +70,13 @@ Current long-term memory:
 Completed SQLite working-memory summaries:
 {session_summaries}
 
-Write updated factual memory (bullet points), then ## Entities section. Be concise.";
+Write updated factual memory (bullet points), then ## Entities section.
+
+HARD BUDGET: the whole rewritten file must stay under {max_words} words.
+Forgetting is part of your job: drop facts that are outdated, superseded,
+or were one-off task details whenever needed to make room for what is
+durable and useful. Prefer the general over the specific; keep what a
+future conversation would plausibly need.";
 
 /// Background reflector that crystallizes sessions into MEMORY.md.
 pub struct Reflector {
@@ -79,6 +85,8 @@ pub struct Reflector {
     workspace: PathBuf,
     threshold_tokens: usize,
     sessions: Arc<SessionDb>,
+    /// Word budget for the rewritten MEMORY.md — prompted and enforced.
+    max_words: usize,
 }
 
 impl Reflector {
@@ -89,6 +97,7 @@ impl Reflector {
         workspace: &Path,
         threshold: usize,
         sessions: Arc<SessionDb>,
+        max_words: usize,
     ) -> Self {
         Self {
             provider,
@@ -96,6 +105,7 @@ impl Reflector {
             workspace: workspace.to_path_buf(),
             threshold_tokens: threshold,
             sessions,
+            max_words: max_words.max(200),
         }
     }
 
@@ -169,7 +179,8 @@ impl Reflector {
         // Build the reflection prompt.
         let prompt = REFLECTION_PROMPT
             .replace("{current_memory}", &current_memory)
-            .replace("{session_summaries}", &summaries_text);
+            .replace("{session_summaries}", &summaries_text)
+            .replace("{max_words}", &self.max_words.to_string());
 
         let messages = vec![
             json!({"role": "system", "content": "You are a memory management assistant. Extract only permanent facts."}),
@@ -184,6 +195,11 @@ impl Reflector {
         let updated_memory = response
             .content
             .ok_or_else(|| anyhow::anyhow!("Reflection returned no content"))?;
+
+        // Backstop for the prompted budget: the model is told the cap and
+        // does the smart curation, but a runaway rewrite is truncated at a
+        // line boundary rather than written oversized.
+        let updated_memory = truncate_to_word_cap(&updated_memory, self.max_words);
 
         // Split response into facts and entities sections.
         let (facts, entities_section) = split_entities_section(&updated_memory);
@@ -234,6 +250,28 @@ impl Reflector {
 }
 
 /// Split LLM response into facts (before `## Entities`) and entities section (after).
+/// Hard backstop for the reflection word budget: keep whole lines while they
+/// fit, drop the rest. Underscores that the model, not the truncator, is
+/// supposed to decide WHAT to forget — this only bounds the blast radius of
+/// a rewrite that ignored the budget.
+fn truncate_to_word_cap(content: &str, max_words: usize) -> String {
+    if content.split_whitespace().count() <= max_words {
+        return content.to_string();
+    }
+    let mut kept = String::new();
+    let mut words = 0usize;
+    for line in content.lines() {
+        let line_words = line.split_whitespace().count();
+        if words + line_words > max_words && words > 0 {
+            break;
+        }
+        words += line_words;
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept.trim_end().to_string()
+}
+
 fn split_entities_section(response: &str) -> (String, String) {
     // Look for "## Entities" marker (case-insensitive).
     let lower = response.to_lowercase();
@@ -292,6 +330,28 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    /// The word cap is a hard backstop: an oversized rewrite must be cut at a
+    /// line boundary, and a compliant rewrite must pass through untouched.
+    #[test]
+    fn test_truncate_to_word_cap() {
+        let lines: String = (0..50)
+            .map(|i| format!("fact line number {i} with a few words\n"))
+            .collect();
+
+        // Under the cap: byte-identical.
+        assert_eq!(truncate_to_word_cap(&lines, 10_000), lines);
+
+        // Over the cap: whole lines kept, none exceeded, nothing mid-line.
+        let capped = truncate_to_word_cap(&lines, 40);
+        assert!(capped.split_whitespace().count() <= 40);
+        for line in capped.lines() {
+            assert!(lines.contains(line), "truncation split a line: {line}");
+        }
+        assert!(!capped.is_empty());
+        // Single line longer than the cap still survives (never emit empty).
+        assert_eq!(truncate_to_word_cap("one giant line", 3), "one giant line");
+    }
 
     /// Mock provider that returns a fixed response.
     struct MockProvider {
@@ -418,7 +478,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 1, 10).await;
         let provider = Arc::new(MockProvider::new("memory"));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 100_000, sessions);
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 100_000, sessions, 10_000);
         assert!(!reflector.should_reflect().await);
     }
 
@@ -427,7 +487,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 10, 1000).await;
         let provider = Arc::new(MockProvider::new("memory"));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 100, sessions);
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 100, sessions, 10_000);
         assert!(reflector.should_reflect().await);
     }
 
@@ -438,7 +498,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(
             "- User prefers Rust\n- Dark mode enabled",
         ));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions);
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions, 10_000);
 
         reflector.reflect().await.unwrap();
 
@@ -452,7 +512,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 3, 100).await;
         let provider = Arc::new(MockProvider::new("Updated facts."));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone());
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone(), 10_000);
 
         reflector.reflect().await.unwrap();
 
@@ -482,8 +542,9 @@ mod tests {
             &workspace,
             0,
             sessions.clone(),
+            10_000,
         );
-        let second = Reflector::new(provider.clone(), "test".into(), &workspace, 0, sessions);
+        let second = Reflector::new(provider.clone(), "test".into(), &workspace, 0, sessions, 10_000);
 
         let (first_result, second_result) = tokio::join!(first.reflect(), second.reflect());
         first_result.unwrap();
@@ -502,7 +563,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 2, 100).await;
         let provider = Arc::new(FailingProvider);
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone());
+        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone(), 10_000);
 
         let result = reflector.reflect().await;
         assert!(result.is_err());

@@ -957,6 +957,7 @@ fn build_cron_reflect_hook(core_handle: SharedCoreHandle) -> crate::cron::execut
                 &core.workspace,
                 0,
                 core.sessions.clone(),
+                core.memory_file_max_words,
             );
             let result = reflector.reflect().await;
             match result {

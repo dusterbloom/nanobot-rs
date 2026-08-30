@@ -378,7 +378,13 @@ pub fn run() {
             );
             tracing_subscriber::EnvFilter::new(combined)
         }
-        Err(_) => tracing_subscriber::EnvFilter::new(format!("warn{}", noisy_crate_filters)),
+        // Default: warn-level, plus info for the UI input layers so stream
+        // cancel triggers (`input_watcher: cancel trigger=…`, `tui: cancel
+        // trigger=…`) are always diagnosable without setting RUST_LOG.
+        Err(_) => tracing_subscriber::EnvFilter::new(format!(
+            "warn{},nanobot::repl=info,nanobot::tui_app=info",
+            noisy_crate_filters
+        )),
     };
 
     // Chrome tracing: build layer + guard (feature-gated).

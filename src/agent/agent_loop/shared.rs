@@ -1164,6 +1164,11 @@ pub(crate) struct FlowControl {
     /// one-shot (can't re-reject without an intervening successful round) and cached
     /// duplicate receipts force a text response immediately.
     pub(crate) round_executed_no_tools: bool,
+    /// One guaranteed post-exhaustion write per turn: when the lease is gone,
+    /// a write tool is still granted exactly once so a research-heavy turn
+    /// cannot end with its artifact rejected. Fresh per turn (FlowControl is
+    /// rebuilt by prepare_context).
+    pub(crate) emergency_write_used: bool,
     /// Per-turn tool lease. Caps the total tool calls per turn at
     /// `lease_size * (1 + max_renewals)`; after exhaustion, paired rejection
     /// receipts preserve provider protocol and the no-progress breaker bounds
@@ -4692,6 +4697,41 @@ impl AgentLoopShared {
                     session = %ctx.session_key,
                     tool = %tc.name,
                     "tool_lease_auto_renewed_read_only"
+                );
+                allowed_calls.push(tc);
+            } else if tc.name == "exec"
+                && crate::agent::tool_engine::is_read_only_exec_command(
+                    tc.arguments.get("command").and_then(Value::as_str),
+                )
+                && ctx.flow.lease.auto_renew_for_read_only()
+            {
+                // Pure-read shell commands (cat/grep/find/sqlite3 SELECT…)
+                // renew like read-only tools. Models commonly read through
+                // `exec`; metering those as side-effect calls starves the
+                // lease so the turn's actual write gets rejected at the end
+                // (the "unable to finish the HTML file" failure). Commands
+                // with redirects or mutating binaries are classified as
+                // metered by `is_read_only_exec_command`.
+                let _ = ctx.flow.lease.record_tool_call();
+                tracing::info!(
+                    session = %ctx.session_key,
+                    tool = %tc.name,
+                    "tool_lease_auto_renewed_read_only_exec"
+                );
+                allowed_calls.push(tc);
+            } else if crate::agent::tool_engine::is_write_tool(&tc.name)
+                && !ctx.flow.emergency_write_used
+            {
+                // Guarantee the task's payoff: when the lease is exhausted
+                // and the model finally attempts a WRITE, rejecting it turns
+                // the whole turn into wasted research (reads happened, no
+                // artifact). Grant exactly one post-exhaustion write per
+                // turn; a second attempt is still blocked.
+                ctx.flow.emergency_write_used = true;
+                tracing::info!(
+                    session = %ctx.session_key,
+                    tool = %tc.name,
+                    "tool_lease_emergency_write_granted"
                 );
                 allowed_calls.push(tc);
             } else {

@@ -103,7 +103,7 @@ v0.5 E4; revert that commit to restore).
 
 - Config: `~/.nanobot/config.json`
 - Sessions: `~/.nanobot/sessions.db`
-- Workspace (skills, memory): `~/.nanobot/workspace/`
+- Workspace (skills, memory): `~/.nanobot/workspace/` — long-term memory lives at `workspace/memory/MEMORY.md`
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence

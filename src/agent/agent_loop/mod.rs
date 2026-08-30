@@ -247,6 +247,7 @@ impl AgentLoop {
                 &core.workspace,
                 core.reflection_threshold,
                 core.sessions.clone(),
+                core.memory_file_max_words,
             );
             info!("Background: reflecting on completed SQLite working memory...");
             let result = reflector.reflect().await;

@@ -52,17 +52,22 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
 
 /// One-line summary of a past session's final exchange.
 ///
-/// `Previous session (<age>, key <key>): <last user> → <assistant tail>`
+/// Carries the exact handles (`sessions.db` id + session key) so `recall` can
+/// target the prior conversation, plus explicit guidance: the model must not
+/// claim to see history that was rotated out of its context.
 pub(crate) fn format_continuity_line(tail: &SessionTail, now: DateTime<Utc>) -> String {
     let age = humanize_age(now - tail.updated_at);
-    let user = truncate_chars(tail.last_user.trim(), 200);
+    let user = truncate_chars(tail.last_user.trim(), 150);
     let assistant = if tail.last_assistant.trim().is_empty() {
         "(no reply)".to_string()
     } else {
-        truncate_chars(tail.last_assistant.trim(), 200)
+        truncate_chars(tail.last_assistant.trim(), 150)
     };
     format!(
-        "Previous session ({age}, key {key}): {user} → {assistant}",
+        "Prior session {id} (key {key}, ended {age}) — last exchange: {user} → {assistant}. \
+         Those turns are NOT in this context; if the user refers to earlier discussion, \
+         retrieve it with recall before answering, and never claim to see history that is not here.",
+        id = tail.session_id,
         key = tail.session_key
     )
 }
@@ -118,17 +123,21 @@ mod tests {
     // --- format_continuity_line ---
 
     #[test]
-    fn test_format_line_contains_key_age_and_exchange() {
+    fn test_format_line_contains_id_key_age_and_exchange() {
         let tail = make_tail(
             "fix the login bug",
             "Fixed it by adding a guard.",
             Duration::hours(2),
         );
         let line = format_continuity_line(&tail, Utc::now());
+        assert!(line.contains("20260701_000000_abc"), "line: {line}");
         assert!(line.contains("cli:oneshot-123"), "line: {line}");
         assert!(line.contains("2h ago"), "line: {line}");
         assert!(line.contains("fix the login bug"), "line: {line}");
         assert!(line.contains("Fixed it by adding a guard."), "line: {line}");
+        // The point of the note: guidance + an honesty constraint.
+        assert!(line.contains("recall"), "line: {line}");
+        assert!(line.contains("NOT in this context"), "line: {line}");
     }
 
     #[test]

@@ -207,22 +207,55 @@ impl ReplContext {
             println!("\n  Memory system is disabled.\n");
             return;
         }
-        if !crate::agent::reflector::Reflector::should_reflect_sessions(&core.sessions, 0).await {
-            println!("\n  Nothing to learn yet — no completed working sessions accumulated.\n");
+        let wm = crate::agent::working_memory::WorkingMemoryStore::new(core.sessions.clone());
+        let (session_count, wm_tokens) = {
+            use crate::agent::working_memory::SessionStatus;
+            (
+                wm.count_by_status(SessionStatus::Completed).await,
+                wm.total_tokens_by_status(SessionStatus::Completed).await,
+            )
+        };
+        let (session_count, wm_tokens) = match (session_count, wm_tokens) {
+            (Ok(n), Ok(t)) => (n, t),
+            (Err(e), _) | (_, Err(e)) => {
+                println!("\n  Reflection failed: {e}\n");
+                return;
+            }
+        };
+        if session_count == 0 || wm_tokens == 0 {
+            println!("\n  Nothing to learn yet — no completed working sessions accumulated.\n  Sessions become learnable after they idle out (see memory.sessionCompleteAfterSecs).\n");
             return;
         }
-        println!("\n  Reflecting on accumulated sessions...");
+        // Reflection is one long LLM call over the whole completed corpus;
+        // on a local model this runs at decode speed — tell the user up
+        // front so the silence is not read as a hang.
+        println!(
+            "\n  Distilling {session_count} completed session{} (~{wm_tokens} tok) — \
+             this can take a few minutes on a local model...",
+            if session_count == 1 { "" } else { "s" }
+        );
+        let started = std::time::Instant::now();
         let reflector = crate::agent::reflector::Reflector::new(
             core.memory_provider.clone(),
             core.memory_model.clone(),
             &core.workspace,
             0,
             core.sessions.clone(),
+            core.memory_file_max_words,
         );
         let result = reflector.reflect().await;
+        let elapsed = started.elapsed().as_secs();
         match result {
-            Ok(()) => println!("  Learned. MEMORY.md updated.\n"),
-            Err(e) => println!("  Reflection failed: {}\n", e),
+            Ok(()) => println!(
+                "  Learned {} session{} (~{wm_tokens} tok) in {elapsed}s → \
+                 workspace/memory/MEMORY.md updated.\n",
+                session_count,
+                if session_count == 1 { "" } else { "s" },
+            ),
+            Err(e) => println!(
+                "  Reflection failed after {elapsed}s: {e}\n  The completed sessions were NOT \
+                 consumed — try again (e.g. /learn) once the provider is reachable.\n"
+            ),
         }
     }
 

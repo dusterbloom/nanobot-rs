@@ -81,6 +81,8 @@ pub struct SwappableCore {
     pub memory_provider: Arc<dyn LLMProvider>,
     pub memory_model: String,
     pub reflection_threshold: usize,
+    /// Word cap enforced on the long-term MEMORY.md file at reflection time.
+    pub memory_file_max_words: usize,
     /// Typed runtime descriptor. Single source of truth for "is this a local
     /// backend?" via `mode().is_local()`. The legacy `is_local: bool` field was
     /// removed in R6 — it duplicated information already carried by this enum.
@@ -1580,6 +1582,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_provider,
         memory_model,
         reflection_threshold: memory_config.reflection_threshold,
+        memory_file_max_words: memory_config.memory_file_max_words,
         mode,
         lane,
         tool_runner_provider,

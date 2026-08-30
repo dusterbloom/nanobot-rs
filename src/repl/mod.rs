@@ -715,7 +715,7 @@ pub(crate) fn print_help() {
     println!("  /status, /s     - Show current mode, model, and channel info");
     println!("  /context        - Show context breakdown (tokens, messages, memory)");
     println!("  /memory         - Show working memory for current session");
-    println!("  /learn          - Distill accumulated sessions into MEMORY.md now");
+    println!("  /learn          - Distill completed sessions into workspace/memory/MEMORY.md now");
     println!("  /clear, /c      - Clear working memory for current session");
     println!("  /replay         - Show session message history (/replay full | /replay N)");
     println!("  /restart, /rd   - Restart local servers (or delegation in cloud mode)");
@@ -770,7 +770,7 @@ pub(crate) fn spawn_input_watcher(
                     // Enter → cancel + signal "user wants to input/record"
                     if key.code == KeyCode::Enter {
                         enter_interrupted.store(true, Ordering::Relaxed);
-                        debug!("input_watcher: key=Enter, cancelling");
+                        info!("input_watcher: cancel trigger=Enter");
                         cancel_token.cancel();
                         break;
                     }
@@ -779,16 +779,20 @@ pub(crate) fn spawn_input_watcher(
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
-                        debug!("input_watcher: key=Ctrl+C, cancelling");
+                        info!("input_watcher: cancel trigger=Ctrl+C");
                         cancel_token.cancel();
                         break;
                     }
 
                     // ESC double-tap → cancel
+                    // Window is 500ms (matches the doc above): a 2s window let
+                    // unrelated terminal escape noise (OSC/clipboard/focus
+                    // replies crossterm parses as bare Esc) double-fire and
+                    // phantom-cancel live streams.
                     if key.code == KeyCode::Esc {
                         if let Some(prev) = last_esc {
-                            if prev.elapsed() < Duration::from_millis(2000) {
-                                debug!("input_watcher: key=Esc+Esc, cancelling");
+                            if prev.elapsed() < Duration::from_millis(500) {
+                                info!("input_watcher: cancel trigger=Esc+Esc");
                                 cancel_token.cancel();
                                 break;
                             }
@@ -808,7 +812,15 @@ pub(crate) fn spawn_input_watcher(
                         io::stdout().flush().ok();
 
                         let mut line = String::new();
-                        if io::stdin().read_line(&mut line).is_ok() {
+                        // fd 0 is shielded in interactive mode — read the
+                        // real terminal for the injection line.
+                        let read_ok = std::fs::File::open("/dev/tty")
+                            .map(|f| {
+                                use std::io::BufRead;
+                                std::io::BufReader::new(f).read_line(&mut line).is_ok()
+                            })
+                            .unwrap_or(false);
+                        if read_ok {
                             let trimmed = line.trim().to_string();
                             if !trimmed.is_empty() {
                                 let _ = inject_tx.send(trimmed);
@@ -2705,6 +2717,7 @@ pub(crate) fn cmd_agent(
                                 &core.workspace,
                                 0,
                                 core.sessions.clone(),
+                                core.memory_file_max_words,
                             );
                             match reflector.reflect().await {
                                 Ok(()) => info!("Exit reflection complete — MEMORY.md updated"),
@@ -2738,6 +2751,19 @@ pub(crate) fn cmd_agent(
                 if let Some(meta) = meta {
                     eprintln!("Resume this session with: nanobot sessions resume {}", meta.id);
                 }
+            }
+
+            // A wedged python-kernel thread can never be joined; tokio's
+            // blocking-pool shutdown would hang process exit forever (the
+            // zombie-REPL failure). Everything is already persisted — a
+            // wedged kernel means "leave without waiting".
+            #[cfg(feature = "python-kernel")]
+            let wedged = crate::agent::tools::python_kernel::wedged_thread_count();
+            #[cfg(not(feature = "python-kernel"))]
+            let wedged = 0;
+            if wedged > 0 {
+                warn!(wedged, "wedged python kernel thread(s); exiting without joining");
+                std::process::exit(0);
             }
         }
     });

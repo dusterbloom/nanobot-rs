@@ -7011,20 +7011,30 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
     let files_dir = tempfile::tempdir().unwrap();
     let body_a = "alpha\n".repeat(200);
     let body_b = "beta\n".repeat(210);
+    let body_c = "gamma\n".repeat(190);
+    let body_d = "delta\n".repeat(220);
     let path_a = files_dir.path().join("big_a.txt");
     let path_b = files_dir.path().join("big_b.txt");
+    let path_c = files_dir.path().join("big_c.txt");
+    let path_d = files_dir.path().join("big_d.txt");
     std::fs::write(&path_a, &body_a).unwrap();
     std::fs::write(&path_b, &body_b).unwrap();
+    std::fs::write(&path_c, &body_c).unwrap();
+    std::fs::write(&path_d, &body_d).unwrap();
     let path_a_s = path_a.to_string_lossy().to_string();
     let path_b_s = path_b.to_string_lossy().to_string();
+    let path_c_s = path_c.to_string_lossy().to_string();
+    let path_d_s = path_d.to_string_lossy().to_string();
 
     // Two read_file calls so force_stash_raw=true (multi-result batch always
     // stashes, regardless of per-result size). tc_conflict reads file_b
-    // (conflicts with pre-stashed body A); tc_extra reads file_a.
+    // (conflicts with pre-stashed body A); tc_extra reads file_d — a path the
+    // seed turn never touched, so the retained-context tool guard cannot
+    // cache-block either call before the stash sees the reused id.
     let mut a1 = std::collections::HashMap::new();
     a1.insert("path".to_string(), json!(path_b_s));
     let mut a2 = std::collections::HashMap::new();
-    a2.insert("path".to_string(), json!(path_a_s));
+    a2.insert("path".to_string(), json!(path_d_s));
     let conflict_batch = crate::providers::base::LLMResponse {
         content: Some(String::new()),
         tool_calls: vec![
@@ -7058,12 +7068,14 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
 
     // Pre-stash body A under "tc_conflict" by running a PRIOR turn that
     // produces a force-stash for that id (2-call batch reading DIFFERENT
-    // files, so the duplicate-call guard doesn't collapse them).
+    // files, so the duplicate-call guard doesn't collapse them). The extra
+    // call reads file_c: the conflict turn must re-read NEITHER seed path,
+    // or the cross-turn tool guard cache-blocks it before the stash runs.
     {
         let mut pa1 = std::collections::HashMap::new();
         pa1.insert("path".to_string(), json!(path_a_s.clone()));
         let mut pa2 = std::collections::HashMap::new();
-        pa2.insert("path".to_string(), json!(path_b_s.clone()));
+        pa2.insert("path".to_string(), json!(path_c_s.clone()));
         let seed_batch = crate::providers::base::LLMResponse {
             content: Some(String::new()),
             tool_calls: vec![

@@ -12,7 +12,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::agent::agent_core::SwappableCore;
 use crate::agent::agent_loop::{AgentLoopShared, FlowControl, TurnContext};
@@ -61,10 +61,17 @@ fn append_continuity_to_system(messages: &mut [serde_json::Value], note: &str) {
 impl AgentLoopShared {
     /// Resolve the previous-session continuity note for this session.
     ///
-    /// Computed exactly once per session key (on its first turn): a FRESH
+    /// Computed exactly once per session (on its first turn): a FRESH
     /// session (no prior history) gets a one-line tail of the most recent
-    /// other session; a resumed session gets `None`. Later turns replay the
-    /// cached value so the injected system prompt stays byte-identical.
+    /// prior session under the same key — including its exact ids so `recall`
+    /// can target it. Later turns replay the cached value so the injected
+    /// system prompt stays byte-identical across turns.
+    ///
+    /// Applies to local mode too: when the idle rollover rotates a session,
+    /// the fresh row has no history, and without this note the model sees an
+    /// empty context and confabulates ("I can see the full conversation
+    /// history"). The note is one line, injected once — the price is a few
+    /// dozen tokens on an already-cold rotation turn.
     async fn session_continuity_note(
         &self,
         core: &Arc<SwappableCore>,
@@ -74,21 +81,20 @@ impl AgentLoopShared {
     ) -> Option<String> {
         use crate::agent::continuity::{classify_session_start, continuity_note};
 
-        // Local sessions follow a Pi-style progressive context contract: prior
-        // sessions stay durable and searchable, but an unrelated tail is never
-        // resident in every fresh prompt. Cloud behavior remains unchanged.
-        if core.context.local_prompt_mode {
-            return None;
-        }
-
         let mut notes = self.continuity_notes.lock().await;
-        if let Some(cached) = notes.get(session_key) {
+        // Keyed by session id, not session key: a long-lived process can
+        // rotate the same key several times, and each fresh row must get a
+        // note about ITS predecessor, not a stale cached one.
+        if let Some(cached) = notes.get(session_id) {
             return cached.clone();
         }
         let start = classify_session_start(prior_history_len);
-        let tails = core.sessions.latest_session_tails(session_id, 1).await;
-        let note = continuity_note(start, tails.first(), chrono::Utc::now());
-        notes.insert(session_key.to_string(), note.clone());
+        let tails = core
+            .sessions
+            .latest_session_tail_for_key(session_key, session_id)
+            .await;
+        let note = continuity_note(start, tails.as_ref(), chrono::Utc::now());
+        notes.insert(session_id.to_string(), note.clone());
         note
     }
 
@@ -570,6 +576,37 @@ impl AgentLoopShared {
         // Local split-system insertion happens above, so compute this here.
         let new_start = messages.len() - 1;
 
+        // Stale lease receipts from PRIOR turns say "your per-turn tool
+        // budget is used up" — true then, false now (the lease is per-turn).
+        // Left in place they condition the model into not retrying: session
+        // 20260830_144544 refused to re-attempt a blocked write for two full
+        // turns because its own rejection receipts were still in context.
+        // Inject a single tombstone that turns the stale belief off, INSIDE
+        // the persisted window (at `new_start`) so it replays byte-identical
+        // on later turns and never injects twice.
+        let stale_lease_receipt = history.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                && m.get("content").and_then(Value::as_str)
+                    .is_some_and(|c| c.starts_with("lease exhausted:"))
+        });
+        let budget_note_present = messages.iter().any(|m| {
+            m.get("content").and_then(Value::as_str)
+                .is_some_and(|c| {
+                    c.contains("no longer apply — this turn starts with a fresh tool budget")
+                })
+        });
+        if stale_lease_receipt && !budget_note_present {
+            messages.insert(
+                new_start,
+                crate::agent::markers::scaffold_user(
+                    "[system] The 'lease exhausted' receipts above are from a previous turn and \
+                     no longer apply — this turn starts with a fresh tool budget (and one write \
+                     is always granted). Retry any blocked calls, such as a pending file write, \
+                     if they are still needed.",
+                ),
+            );
+        }
+
         // Tag the current user message (last in the array) with turn number
         // for age-based eviction in trim_to_fit.
         if let Some(last) = messages.last_mut() {
@@ -667,6 +704,7 @@ impl AgentLoopShared {
                 consecutive_all_blocked: 0,
                 consecutive_no_progress_rounds: 0,
                 round_executed_no_tools: false,
+                emergency_write_used: false,
                 lease: crate::agent::lease::Lease::new(
                     crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,
                     crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN,
@@ -696,7 +734,7 @@ impl AgentLoopShared {
 mod tests {
     use super::append_continuity_to_system;
     use crate::agent::prompt_fingerprint::{compare, fingerprint, PromptDelta};
-    use serde_json::json;
+use serde_json::json;
 
     /// With no ephemeral local tail, turn N is an exact prefix of turn N+1:
     /// [system + history + current_user] becomes
