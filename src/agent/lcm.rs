@@ -1537,6 +1537,44 @@ pub enum CompactionFailureMode {
 // Three-Level Escalation (Algorithm 3)
 // ---------------------------------------------------------------------------
 
+
+/// Extract one mechanical headline line per message in the eviction span.
+/// No LLM calls — deterministic, zero-latency. Returns (text, manifest).
+/// The manifest is default (no structured extraction) — open_loops and
+/// decisions require model comprehension that this path deliberately avoids.
+fn mechanical_headlines(messages: &[Value]) -> (String, SummaryManifest) {
+    let mut lines = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+        if content.trim().is_empty() || role == "system" {
+            continue;
+        }
+        // For tool results: use the TOOL_RESULT_HANDLE excerpt (first line
+        // after the marker, already truncated to 160 chars at ingestion).
+        let first_line = if role == "tool" {
+            content
+                .lines()
+                .find(|l| !l.trim().is_empty() && !l.starts_with("TOOL_RESULT_HANDLE"))
+                .unwrap_or("")
+                .trim()
+        } else {
+            content.lines().next().unwrap_or("").trim()
+        };
+        if first_line.is_empty() {
+            continue;
+        }
+        let boundary = crate::utils::helpers::floor_char_boundary(first_line, 150);
+        let headline = &first_line[..boundary];
+        match role {
+            "user" => lines.push(format!("· user: {headline}")),
+            "assistant" => lines.push(format!("· assistant: {headline}")),
+            _ => lines.push(format!("· {role}: {headline}")),
+        }
+    }
+    (lines.join("\n"), SummaryManifest::default())
+}
+
 /// Escalated summarization: tries increasingly aggressive LLM strategies.
 ///
 /// Returns `Ok(Some((summary_text, manifest, escalation_level)))` on success,
@@ -1557,6 +1595,28 @@ async fn escalated_summary(
         debug!("LCM escalation: no compactor available, leaving context uncompacted");
         return Ok(None);
     };
+
+    // Level 0: Mechanical headlines — one line per message from the eviction
+    // span. Zero LLM calls, zero latency. Scroll (arXiv:2608.21690 §4.3)
+    // shows lossy LLM summarization degrades accuracy 73→20 while
+    // recoverable eviction (originals in SQLite, lcm_expand) stays ≥86.
+    // Mechanical headlines preserve the same recoverability invariant.
+    // Mechanical headlines only when the eviction span contains tool
+    // results (large stashed outputs — the paging-loop pain point). Pure
+    // conversation messages go through the LLM path for richer summaries.
+    let has_tool_results = messages
+        .iter()
+        .any(|m| m.get("role").and_then(Value::as_str) == Some("tool"));
+    if has_tool_results {
+        let (mech_summary, mech_manifest) = mechanical_headlines(messages);
+        if mech_summary.chars().count() >= 200 {
+            info!(
+                chars = mech_summary.chars().count(),
+                "LCM Level 0: mechanical headlines (zero LLM calls)"
+            );
+            return Ok(Some((mech_summary, mech_manifest, 0)));
+        }
+    }
 
     // Level 1: Preserve details. Only a completed but insufficient summary may
     // escalate. A transport or fidelity-gate error is indeterminate and must
