@@ -72,7 +72,7 @@ pub(crate) const TOOL_RESULT_REPLAY_MAX_BYTES: usize = 12_000;
 /// because every result, however small, was a handle). Both live ingestion
 /// and get_history replay must apply the SAME threshold, or reloads rewrite
 /// inline bodies into handles and bust the retained KV prefix.
-pub(crate) const INLINE_TOOL_RESULT_MAX_BYTES: usize = 4_096;
+pub(crate) const INLINE_TOOL_RESULT_MAX_BYTES: usize = 16_384;
 
 pub(crate) fn cap_tool_result_for_replay(content: &str) -> String {
     shrink_tool_body(

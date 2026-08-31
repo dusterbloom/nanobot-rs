@@ -47,7 +47,7 @@ const MIN_BATCH_TOOL_RESULT_CAP_CHARS: usize = 320;
 /// The sole readable tool-result projection. This is deliberately independent
 /// of user-configured tool output limits so one inspection cannot reintroduce
 /// an oversized prompt suffix.
-const TOOL_RESULT_INSPECTION_MAX_CHARS: usize = 1_024;
+const TOOL_RESULT_INSPECTION_MAX_CHARS: usize = 8_192;
 
 /// Per-tool token threshold above which a raw tool result is replaced by a
 /// summary. Enumerative tools (`exec`, `list_dir`, `web_search`, `read_file`)

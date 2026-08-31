@@ -394,6 +394,8 @@ fn render_query_results(
 pub struct SearchToolResultTool {
     db_path: PathBuf,
     session_id: String,
+    /// Auto-pagination cursor: tool_call_id → char offset of the next read.
+    read_cursors: std::sync::Mutex<HashMap<String, usize>>,
 }
 
 impl SearchToolResultTool {
@@ -401,6 +403,7 @@ impl SearchToolResultTool {
         Self {
             db_path,
             session_id,
+            read_cursors: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -511,6 +514,20 @@ impl Tool for SearchToolResultTool {
                     message: format!("start_char: {e}. Pass an integer character offset."),
                 })? {
                 render_char_page(&body, id, start_char as usize, true)
+            } else if params.get("start_line").is_none() && params.get("end_line").is_none() && params.get("start_char").is_none() {
+                // Auto-pagination: no positioning args → continue from where
+                // the last read left off. The cursor advances automatically,
+                // so each call returns fresh content without the model
+                // needing to track offsets.
+                let cursor_key = format!("{id}");
+                let start_char = {
+                    let cursors = self.read_cursors.lock().unwrap();
+                    cursors.get(&cursor_key).copied().unwrap_or(0)
+                };
+                let result = render_char_page(&body, id, start_char, true);
+                let next = start_char + result.chars().count().max(1);
+                self.read_cursors.lock().unwrap().insert(cursor_key, next);
+                result
             } else {
                 let start_line = parse_line_param(params.get("start_line"))
                     .map_err(|e| ToolError::InvalidArgs {
