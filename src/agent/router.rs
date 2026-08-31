@@ -1776,15 +1776,33 @@ pub(crate) async fn route_tool_calls(
             // round as zero progress so cached receipts cannot livelock the
             // agent loop while also bypassing its iteration budget.
             ctx.flow.round_executed_no_tools = true;
+            if ctx.flow.consecutive_all_blocked >= 4 {
+                warn!(
+                    rounds = ctx.flow.consecutive_all_blocked,
+                    "tool_loop_circuit_breaker: model still looping after scaffold, hard stop"
+                );
+                return RouteResult::Break(
+                    "Tool calls were blocked after repeated duplicates. Please rephrase your request."
+                        .to_string(),
+                );
+            }
             if ctx.flow.consecutive_all_blocked >= 2 {
                 warn!(
                     rounds = ctx.flow.consecutive_all_blocked,
-                    "tool_loop_circuit_breaker: model stuck requesting blocked tools, forcing response"
+                    "tool_loop_circuit_breaker: model stuck on blocked tools, scaffolding final answer"
                 );
-                return RouteResult::Break(
-                    "You repeated an identical tool call with no new arguments, so the loop was stopped. Change the arguments or pick a different tool."
-                        .to_string(),
+                // Scaffold the model to write its answer from the data it
+                // already collected. The model gets one more LLM call with
+                // this instruction; if it still calls tools at >= 4, the
+                // hard break above fires.
+                crate::agent::markers::scaffold_user(
+                    "[system] Your last several tool calls were duplicates or blocked. \
+                     You already have the data you need from your previous tool results. \
+                     Do NOT call any more tools. Write your final answer now using the \
+                     information you gathered."
                 );
+                ctx.persist_pending_protocol_messages().await;
+                return RouteResult::Continue;
             }
             // Text accompanying a tool call is normally a progress preamble
             // ("let me check ..."), not a final answer. Give the model one
