@@ -1,5 +1,5 @@
 findings: Your M4 Base (Mac16,1, 10 cores 4P+6E, 32GB RAM, ~120 GB/s bandwidth) ran higgs benchmarks on 2026-04-03. Key results: Qwen3.5-0.8B decode ~110 tok/s, Qwen3.5-2B ~48 tok/s, Qwen3.5-4B ~39 tok/s, Qwen3.5-27B (~16GB) **~6.8 tok/s**, Qwen3.5-35B-A3B MoE (~14GB) **~55 tok/s**. The 27B dense model is severely bandwidth-bound at 6.8 tok/s — this is the critical bottleneck for your hardware.
 
-next: I need to get mlx-serve's public benchmark numbers and normalize them by the ~3.3x bandwidth ratio between your M4 Base (120 GB/s) and the M4 Max they used (~400 GB/s). Memory-bandwidth-limited models should scale roughly linearly with bandwidth.
+next: Found mlx-serve repo at ddalcu/mlx-serve but no public benchmark numbers with specific tok/s values were found in README, CHANGELOG, issues, or releases. Will try fetching commits to find any benchmark-related PRs, and also check if there are blog posts/articles comparing mlx-serve performance.
 
-will: Present a properly normalized comparison showing what you'd expect on your M4 Base vs their M4 Max, accounting for the 3.3x bandwidth gap and the fact that your 32GB RAM limits which models fit comfortably without swapping.
+will: Present a properly normalized comparison showing what you'd expect on your M4 Base vs their M4 Max, accounting for the 3.3x bandwidth gap and the fact that your 32GB RAM limits which models fit comfortably without swapping. If no verifiable mlx-serve benchmark data can be found, I'll present the analysis based on the +26% geomean claim from the README and explain the limitations.

@@ -4726,8 +4726,10 @@ impl AgentLoopShared {
                 // and the model finally attempts a WRITE, rejecting it turns
                 // the whole turn into wasted research (reads happened, no
                 // artifact). Grant exactly one post-exhaustion write per
-                // turn; a second attempt is still blocked.
+                // turn AND reset the lease so the model can continue after
+                // the checkpoint/write without needing a second grant.
                 ctx.flow.emergency_write_used = true;
+                ctx.flow.lease.auto_renew_for_read_only();
                 tracing::info!(
                     session = %ctx.session_key,
                     tool = %tc.name,
