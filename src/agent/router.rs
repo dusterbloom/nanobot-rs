@@ -1754,13 +1754,26 @@ pub(crate) async fn route_tool_calls(
         ctx.messages.with_draft(|draft| {
             ContextBuilder::add_assistant_message(draft, response_content, Some(&tc_json));
             for (tc, cached_chars) in &blocked_with_result {
-                let receipt = format!(
-                    "duplicate {} call blocked; cached result from the earlier identical call \
-                     was {} chars and is already represented in the conversation. Do not replay \
-                     this broad call; answer from the prior result, or use inspect_tool_result \
-                     with a query or line range when the previous output was stashed.",
-                    tc.name, cached_chars
-                );
+                let key = ToolGuard::key(&tc.name, &tc.arguments);
+                let receipt = match ctx.flow.tool_guard.get_cached_result(&key) {
+                    Some(data) => {
+                        // Give the model the actual cached data — it asked
+                        // for this content and already ran the command.
+                        // Blocking with a rejection turns a helpable loop
+                        // into a dead end.
+                        format!(
+                            "[cached result from earlier identical call — {} chars]\n{}",
+                            cached_chars, data
+                        )
+                    }
+                    None => format!(
+                        "duplicate {} call blocked; cached result from the earlier identical call \
+                         was {} chars and is already represented in the conversation. Do not replay \
+                         this broad call; answer from the prior result, or use inspect_tool_result \
+                         with a query or line range when the previous output was stashed.",
+                        tc.name, cached_chars
+                    ),
+                };
                 ContextBuilder::add_tool_result(draft, &tc.id, &tc.name, &receipt);
             }
         });
