@@ -3228,7 +3228,7 @@ mod tests {
         );
         assert!(rendered.contains("MATCHED_LINE"));
         assert!(
-            rendered.chars().count() <= 1_024,
+            rendered.chars().count() <= TOOL_RESULT_INSPECTION_MAX_CHARS,
             "the configured result limit must not bypass the inspection ceiling"
         );
     }
