@@ -586,6 +586,7 @@ pub(crate) fn is_read_only_exec_command(command: Option<&str>) -> bool {
             | "date"
             | "pwd"
             | "batgrep"
+            | "curl"
     )
 }
 
@@ -1980,7 +1981,7 @@ mod tests {
             );
         }
 
-        // Mutating — stay metered. sqlite3 stays metered entirely: the same
+        // Mutating — stay metered. sqlite3 stays metered: the same
         // binary writes (INSERT/DDL) as readily as it reads.
         for cmd in [
             "sqlite3 /tmp/db.sqlite \"SELECT * FROM t\"",
