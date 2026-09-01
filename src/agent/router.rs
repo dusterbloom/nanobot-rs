@@ -1379,6 +1379,36 @@ pub(crate) fn specialist_route_result(specialist_response: &str) -> RouteResult 
     RouteResult::Break(specialist_response.to_string())
 }
 
+/// Receipt for a blocked duplicate tool call. Pure function — extracted for
+/// testability.
+///
+/// Escalation: the first duplicate replays the cached data (the model asked
+/// for this content and already ran the command; blocking with a rejection
+/// turns a helpable loop into a dead end). From the second duplicate on, the
+/// data is already in context twice — re-dumping it just feeds the loop
+/// (observed live: the model re-rolled identical recall calls until the
+/// breaker fired). Later duplicates get a directive plus the lease progress
+/// signal so the model sees budget state instead of the same bytes.
+pub(crate) fn duplicate_receipt(
+    name: &str,
+    hits: u32,
+    cached: Option<&str>,
+    cached_chars: usize,
+    progress: &str,
+) -> String {
+    match cached {
+        Some(data) if hits <= 1 => {
+            format!("[cached result from earlier identical call — {cached_chars} chars]\n{data}\n{progress}")
+        }
+        _ => format!(
+            "[duplicate {name} call #{hits} this turn — the identical arguments were already \
+             answered above; the cached result is already in this conversation. Do NOT repeat \
+             this call. Vary the query meaningfully, use inspect_tool_result to re-read a \
+             stashed result, or write your final answer from the evidence you have.]\n{progress}"
+        ),
+    }
+}
+
 /// Determine the RouteResult for a successful subagent dispatch in route_tool_calls().
 /// Pure function — extracted for testability.
 pub(crate) fn subagent_route_result(subagent_result: &str) -> RouteResult {
@@ -1755,25 +1785,15 @@ pub(crate) async fn route_tool_calls(
             ContextBuilder::add_assistant_message(draft, response_content, Some(&tc_json));
             for (tc, cached_chars) in &blocked_with_result {
                 let key = ToolGuard::key(&tc.name, &tc.arguments);
-                let receipt = match ctx.flow.tool_guard.get_cached_result(&key) {
-                    Some(data) => {
-                        // Give the model the actual cached data — it asked
-                        // for this content and already ran the command.
-                        // Blocking with a rejection turns a helpable loop
-                        // into a dead end.
-                        format!(
-                            "[cached result from earlier identical call — {} chars]\n{}",
-                            cached_chars, data
-                        )
-                    }
-                    None => format!(
-                        "duplicate {} call blocked; cached result from the earlier identical call \
-                         was {} chars and is already represented in the conversation. Do not replay \
-                         this broad call; answer from the prior result, or use inspect_tool_result \
-                         with a query or line range when the previous output was stashed.",
-                        tc.name, cached_chars
-                    ),
-                };
+                let hits = ctx.flow.tool_guard.cache_hits(&key);
+                let progress = ctx.flow.lease.progress_signal();
+                let receipt = duplicate_receipt(
+                    &tc.name,
+                    hits,
+                    ctx.flow.tool_guard.get_cached_result(&key),
+                    *cached_chars,
+                    &progress,
+                );
                 ContextBuilder::add_tool_result(draft, &tc.id, &tc.name, &receipt);
             }
         });
@@ -1849,6 +1869,28 @@ mod tests {
     use super::*;
     use crate::config::schema::TrioConfig;
     use serde_json::json;
+
+    // Duplicate receipts escalate: hit 1 replays the cached bytes, later
+    // hits switch to a directive + progress signal.
+    #[test]
+    fn test_duplicate_receipt_replays_once_then_directs() {
+        let progress = "[Tool call 5 of 8 this lease — 2 leases remaining]";
+
+        let first = duplicate_receipt("recall", 1, Some("found: PHASEONE data"), 22, progress);
+        assert!(first.contains("[cached result from earlier identical call — 22 chars]"));
+        assert!(first.contains("found: PHASEONE data"));
+        assert!(first.contains(progress));
+
+        let repeat = duplicate_receipt("recall", 2, Some("found: PHASEONE data"), 22, progress);
+        assert!(!repeat.contains("found: PHASEONE data"), "repeat must not re-dump bytes");
+        assert!(repeat.contains("duplicate recall call #2"));
+        assert!(repeat.contains("Do NOT repeat this call"));
+        assert!(repeat.contains(progress));
+
+        // Defensive arm: classified blocked-with-result but cache vanished.
+        let none = duplicate_receipt("recall", 1, None, 0, progress);
+        assert!(none.contains("duplicate recall call #1"));
+    }
 
     // T9 — TrioConfig has specialist_output_schema field, defaults to false
     #[test]

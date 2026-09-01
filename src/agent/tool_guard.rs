@@ -24,6 +24,10 @@ const WEB_TOOLS: &[&str] = &["web_search", "web_fetch"];
 
 pub struct ToolGuard {
     seen: HashMap<String, u32>,
+    /// Times each (name, args) key was blocked via the cache-replay path.
+    /// Drives receipt escalation: the first duplicate replays the cached
+    /// data; later ones get directives instead of re-dumping the same bytes.
+    cache_hits: HashMap<String, u32>,
     max_same_call: u32,
     tool_limits: HashMap<String, u32>,
     results: HashMap<String, String>,
@@ -44,6 +48,7 @@ impl ToolGuard {
         }
         Self {
             seen: HashMap::new(),
+            cache_hits: HashMap::new(),
             max_same_call: max_same_call.max(1),
             tool_limits,
             results: HashMap::new(),
@@ -78,6 +83,7 @@ impl ToolGuard {
     fn invalidate_read_cache(&mut self) {
         self.results.retain(|key, _| !Self::is_read_tool_key(key));
         self.seen.retain(|key, _| !Self::is_read_tool_key(key));
+        self.cache_hits.retain(|key, _| !Self::is_read_tool_key(key));
     }
 
     fn is_read_tool_key(key: &str) -> bool {
@@ -94,6 +100,13 @@ impl ToolGuard {
     /// Retrieve a previously cached result for the given call signature.
     pub fn get_cached_result(&self, key: &str) -> Option<&str> {
         self.results.get(key).map(|s| s.as_str())
+    }
+
+    /// How many times this (name, args) signature was blocked on the cache
+    /// path this turn. 1 = first duplicate, 2+ = the model keeps replaying
+    /// the same call despite the cached receipt.
+    pub fn cache_hits(&self, key: &str) -> u32 {
+        self.cache_hits.get(key).copied().unwrap_or(0)
     }
 
     pub fn key(name: &str, args: &HashMap<String, Value>) -> String {
@@ -114,6 +127,7 @@ impl ToolGuard {
         let key = Self::key(name, args);
         if Self::uses_cached_result(name) && self.results.contains_key(&key) {
             self.had_blocked_calls = true;
+            *self.cache_hits.entry(key).or_insert(0) += 1;
             return Err(format!(
                 "duplicate tool call blocked for '{}': cached result already exists in this turn",
                 name
@@ -416,6 +430,50 @@ mod tests {
         assert!(
             err.contains("exceeded 2 identical calls"),
             "block must come from the count-limit path: {err}"
+        );
+    }
+
+    /// Duplicate receipts must escalate: hit 1 replays the cached data, hits
+    /// 2+ replace the bytes with a directive + progress signal. Regression
+    /// for the live recall loop where the full cached payload was re-dumped
+    /// every round and the model (temp 1.0) re-rolled identical calls until
+    /// the breaker hard-stopped the turn.
+    #[test]
+    fn test_cache_hit_counter_drives_receipt_escalation() {
+        let mut g = ToolGuard::new(2);
+        let recall_args = args(&[("query", "PHASEONE big")]);
+
+        assert!(g.allow("recall", &recall_args).is_ok());
+        g.record_result("recall", &recall_args, "found: ...".to_string());
+
+        // First duplicate: hit 1 → replay data.
+        assert!(g.allow("recall", &recall_args).is_err());
+        assert_eq!(g.cache_hits(&ToolGuard::key("recall", &recall_args)), 1);
+
+        // Second duplicate: hit 2 → escalation threshold.
+        assert!(g.allow("recall", &recall_args).is_err());
+        assert_eq!(g.cache_hits(&ToolGuard::key("recall", &recall_args)), 2);
+    }
+
+    /// The stale-result receipts must not outlive a write: invalidation
+    /// clears hit counters along with the cached bytes.
+    #[test]
+    fn test_cache_hits_reset_on_invalidation() {
+        let mut g = ToolGuard::new(2);
+        let recall_args = args(&[("query", "phase")]);
+        let remember_args = args(&[("fact", "updated")]);
+
+        assert!(g.allow("recall", &recall_args).is_ok());
+        g.record_result("recall", &recall_args, "old".to_string());
+        assert!(g.allow("recall", &recall_args).is_err());
+        assert_eq!(g.cache_hits(&ToolGuard::key("recall", &recall_args)), 1);
+
+        g.record_result("remember", &remember_args, "Remembered".to_string());
+
+        assert_eq!(
+            g.cache_hits(&ToolGuard::key("recall", &recall_args)),
+            0,
+            "invalidation must reset hit counters so fresh calls replay data again"
         );
     }
 }
