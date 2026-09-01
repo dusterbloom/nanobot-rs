@@ -318,6 +318,22 @@ pub(crate) enum PromptRewrite {
 /// Owns all per-turn mutable state that previously lived as local variables
 /// inside `process_message`. No lifetimes needed — values are cloned from the
 /// inbound message where required.
+#[derive(Default)]
+pub(crate) struct RouterSyntheticCallSequence {
+    next: u64,
+}
+
+impl RouterSyntheticCallSequence {
+    pub(crate) fn allocate(&mut self, turn: u64, lane: &str, target: &str) -> String {
+        let sequence = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .expect("router synthetic call id sequence exhausted");
+        format!("router-{turn}-{sequence}-{lane}-{}", target.trim())
+    }
+}
+
 pub(crate) struct TurnContext {
     // --- Config (set during prepare, immutable after) ---
     pub(crate) core: Arc<SwappableCore>,
@@ -371,6 +387,10 @@ pub(crate) struct TurnContext {
     pub(crate) final_content: String,
     pub(crate) turn_outcome: TurnOutcome,
     pub(crate) turn_tool_entries: Vec<crate::agent::audit::TurnToolEntry>,
+    /// Monotonic namespace for tool calls synthesized by the router during
+    /// this turn. Preflight and post-tool routing share it, so neither replay
+    /// lifecycle nor model-visible receipts can collide on a reused id.
+    pub(crate) router_synthetic_call_sequence: RouterSyntheticCallSequence,
     /// Number of LLM iterations consumed in this agent turn (for calibration).
     pub(crate) iterations_used: u32,
     /// Wall-clock start of this agent turn (for duration measurement).
@@ -933,6 +953,11 @@ impl SoftCompactionRequest {
 }
 
 impl TurnContext {
+    pub(crate) fn next_router_tool_call_id(&mut self, lane: &str, target: &str) -> String {
+        self.router_synthetic_call_sequence
+            .allocate(self.turn_count, lane, target)
+    }
+
     /// Check whether this turn has been cancelled (e.g. user pressed Esc in REPL).
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancellation_token
@@ -4756,7 +4781,7 @@ impl AgentLoopShared {
         // actually execute so a no-tool round can't leave a stale key behind.
         ctx.flow.last_round_keys.clear();
 
-        let routed_tool_calls = match crate::agent::router::route_tool_calls(
+        let mut routed_batch = match crate::agent::router::route_tool_calls(
             ctx,
             response.content.as_deref(),
             response.tool_calls.clone(),
@@ -4780,61 +4805,113 @@ impl AgentLoopShared {
                 ctx.emit_pending_request_metrics(0);
                 return StepResult::Done(IterationOutcome::Error(msg));
             }
-            crate::agent::router::RouteResult::Execute(calls) => calls,
-        };
-
-        // Deduplicate identical tool calls within the same batch.
-        // Local models sometimes emit the same call multiple times in a single response.
-        let routed_tool_calls = {
-            let mut seen = std::collections::HashSet::new();
-            let before = routed_tool_calls.len();
-            let deduped: Vec<_> = routed_tool_calls
-                .into_iter()
-                .filter(|tc| {
-                    let key =
-                        crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments);
-                    seen.insert(key)
-                })
-                .collect();
-            if deduped.len() < before {
-                tracing::warn!(
-                    before,
-                    after = deduped.len(),
-                    "Deduplicated identical tool calls in batch"
-                );
-            }
-            deduped
+            crate::agent::router::RouteResult::Execute(batch) => batch,
         };
 
         // Inject working_dir into exec tool calls when missing.
         // Local models often omit working_dir, causing commands to run in
         // the wrong directory. Default to the process's current directory.
-        let routed_tool_calls: Vec<_> = routed_tool_calls
-            .into_iter()
-            .map(|mut tc| {
-                if tc.name == "exec" && !tc.arguments.contains_key("working_dir") {
-                    if let Ok(cwd) = std::env::current_dir() {
-                        tc.arguments.insert(
-                            "working_dir".to_string(),
-                            serde_json::Value::String(cwd.to_string_lossy().to_string()),
-                        );
-                    }
+        for routed in &mut routed_batch.calls {
+            let tc = &mut routed.call;
+            if tc.name == "exec" && !tc.arguments.contains_key("working_dir") {
+                if let Ok(cwd) = std::env::current_dir() {
+                    tc.arguments.insert(
+                        "working_dir".to_string(),
+                        serde_json::Value::String(cwd.to_string_lossy().to_string()),
+                    );
                 }
-                tc
-            })
+            }
+        }
+        let carrier_calls: Vec<_> = routed_batch
+            .calls
+            .iter()
+            .map(|routed| routed.call.clone())
             .collect();
 
-        // One carrier owns every lease disposition below. Persist it before
-        // either execution path can add a result, so rejected proxy calls are
-        // protocol-valid and cache-replayable just like executed calls.
+        // One carrier owns every router and lease disposition below. It is the
+        // first durable artifact: no rejected receipt or allowed side effect
+        // may exist without the complete ordered call batch that owns it.
         if let Err(error) =
-            crate::agent::tool_engine::journal_tool_call_carrier(ctx, &routed_tool_calls, &response)
+            crate::agent::tool_engine::journal_tool_call_carrier(ctx, &carrier_calls, &response)
                 .await
         {
             ctx.emit_pending_request_metrics(0);
             return StepResult::Done(IterationOutcome::Error(format!(
                 "tool-call carrier could not be recorded atomically; no tools were executed: {error}"
             )));
+        }
+
+        let mut routed_tool_calls = Vec::new();
+        let mut router_rejections = 0usize;
+        for routed in routed_batch.calls {
+            match routed.disposition {
+                crate::agent::router::RoutedToolDisposition::Execute => {
+                    routed_tool_calls.push(routed.call);
+                }
+                crate::agent::router::RoutedToolDisposition::Reject { reason, receipt } => {
+                    if let Err(error) = ctx
+                        .core
+                        .sessions
+                        .record_tool_pre_execute(
+                            &ctx.session_id,
+                            &ctx.request_id,
+                            ctx.turn_count,
+                            &routed.call.id,
+                            &routed.call.name,
+                            &routed.call.arguments,
+                            crate::session::db::ToolPreExecuteDecision::Rejected {
+                                reason: format!("tool_guard:{reason}"),
+                            },
+                        )
+                        .await
+                    {
+                        ctx.emit_pending_request_metrics(0);
+                        return StepResult::Done(IterationOutcome::Error(format!(
+                            "tool {} was blocked but its pre-execution decision could not be recorded: {error}",
+                            routed.call.id
+                        )));
+                    }
+                    ctx.messages.with_draft(|draft| {
+                        ContextBuilder::add_tool_result_immutable_with_status(
+                            draft,
+                            &routed.call.id,
+                            &routed.call.name,
+                            &receipt,
+                            false,
+                        )
+                    });
+                    router_rejections += 1;
+                }
+            }
+        }
+        let has_router_scaffold = routed_batch.scaffold_after_rejections.is_some();
+        if let Some(scaffold) = routed_batch.scaffold_after_rejections {
+            ctx.messages
+                .push_draft(crate::agent::markers::scaffold_user(scaffold));
+        }
+        if router_rejections > 0 || has_router_scaffold {
+            if let Err(error) = ctx.persist_pending_protocol_messages().await {
+                ctx.emit_pending_request_metrics(0);
+                return StepResult::Done(IterationOutcome::Error(format!(
+                    "router-rejected tool receipts could not be recorded atomically; no tools were executed: {error}"
+                )));
+            }
+        }
+        if let Some(outcome) = routed_batch.after_rejections {
+            ctx.emit_pending_request_metrics(0);
+            return match outcome {
+                crate::agent::router::RoutedBatchOutcome::Continue => {
+                    ctx.flow.tool_rounds_completed =
+                        ctx.flow.tool_rounds_completed.saturating_add(1);
+                    StepResult::Done(IterationOutcome::Continue)
+                }
+                crate::agent::router::RoutedBatchOutcome::Break(content) => {
+                    StepResult::Done(IterationOutcome::Complete {
+                        content,
+                        outcome: TurnOutcome::Finished,
+                    })
+                }
+            };
         }
 
         // Tool-lease enforcement. Each call is recorded against the per-turn

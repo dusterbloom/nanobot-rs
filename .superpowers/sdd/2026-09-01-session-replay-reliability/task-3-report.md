@@ -6,6 +6,92 @@ Commit: `a8591c22c3fe1f943a3f9ea7d22038026679f74f` (`fix(agent): fail closed and
 
 Deep-review follow-up commit: this commit (`fix(agent): close replay lifecycle gaps`)
 
+Second deep-review follow-up commit: this commit (`fix(agent): preserve routed tool batches`)
+
+## Second deep-review follow-up
+
+The second independent review found two remaining router protocol defects. Both
+were verified against the prior implementation before production changes:
+
+1. Router-generated tool-call ids were derived only from turn and target, so a
+   same-turn preflight/post-tool subagent pair or repeated planned tool target
+   reused one replay lifecycle id. A per-turn monotonic allocator now supplies
+   every synthetic subagent, pipeline, direct-tool, and planned-tool id.
+2. ToolGuard rejections were removed before the common carrier. No-cache
+   rejections disappeared entirely, and mixed batches carried only allowed
+   calls. `RoutedToolBatch` now preserves original order and a typed
+   execute/reject disposition for every routed call. The common hot path first
+   persists one complete assistant carrier, then records every rejection,
+   atomically persists false-status receipts, and only then permits allowed
+   tools to enter lease enforcement/execution. Either persistence failure ends
+   the turn as `Error` before an allowed side effect.
+
+No parallel router pipeline, semantic flag, SQL outcome, or schema change was
+introduced. Repeated blocked rounds emit the scaffold once (at round two)
+rather than duplicating it at round three; this retains the newly mandatory
+carrier/receipt bytes without crossing the history window and preserves the KV
+prefix invariant.
+
+Second follow-up staged paths are exactly:
+
+- `src/agent/agent_loop/shared.rs`
+- `src/agent/agent_loop/tests.rs`
+- `src/agent/prepare_context.rs`
+- `src/agent/router.rs`
+- `.superpowers/sdd/2026-09-01-session-replay-reliability/task-3-report.md`
+
+### Second follow-up RED evidence
+
+- Preflight/post-tool subagent reproduction generated the same
+  `router-7-subagent-spawn` id twice.
+- All-blocked/no-cache reproduction had neither assistant carrier nor tool
+  receipt for `tc_guard_4`.
+- Mixed reproduction carried only the allowed id and dropped the rejected id.
+- The first full release run exposed one prefix regression after mandatory
+  receipts increased durable history: a redundant third-round scaffold pushed
+  reload across the history window. Restricting the scaffold to its intended
+  second round made the prefix regression green.
+
+### Second follow-up GREEN evidence
+
+- Exact-replay synthetic id matrix: 2 passed, 0 failed (same-turn
+  preflight/post subagent; repeated same-target planned tool).
+- Guard protocol matrix: 2 passed, 0 failed (all-blocked/no-cache and mixed
+  allowed/rejected), including full carrier membership, false rejected
+  receipts, allowed execution, provider pairing, and
+  `ReplayAvailability::Exact`.
+- Rejected-receipt fault injection: 1 passed, 0 failed; the allowed member had
+  no pre-execute event, provider call count stopped at four, and terminal
+  outcome was `error`.
+- Router suite: 65 passed, 0 failed, 1 ignored.
+- Prefix circuit-breaker regression: 1 passed, 0 failed.
+- `cargo test --release`: 2,874 passed, 0 failed, 27 ignored across unit,
+  integration, and doc-test targets.
+- `cargo build --release`: passed.
+- `git diff --check`: passed.
+
+GitNexus second-follow-up impacts were LOW for `router_preflight` (3 upstream),
+`route_tool_calls` (4), and `step_execute_tools` (3). `TurnContext` resolved LOW
+for the struct and UNKNOWN for its impl; `RouteResult` and the new allocator
+were UNKNOWN/unindexed. The index was three commits behind. No HIGH or CRITICAL
+impact was returned for this follow-up.
+
+Pre-commit `detect-changes --repo nanobot-rs` reported the expected MEDIUM
+scope: 5 files, 38 indexed symbols, and the two `step_execute_tools` execution
+flows (`Now` and `Commit`).
+
+Second-follow-up residual risks:
+
+- A rejected-receipt database failure can leave the already durable carrier
+  without its receipt, but the turn is terminal `Error` and no allowed tool or
+  later provider call runs; the carrier cannot be safely rolled back after it
+  has become the lifecycle prerequisite.
+- The monotonic id counter uses checked addition and fails before emitting a
+  duplicate if a single turn somehow exhausts all `u64` ids.
+- `scripts/turn_bench.sh` requires a live local provider and was not run in the
+  offline verification environment; the cache-prefix regression directly
+  validates the changed prompt-history behavior.
+
 ## Deep-review follow-up
 
 The independent review found seven additional convergence and replay gaps. All

@@ -22,7 +22,6 @@ use tracing::{debug, info, instrument, warn};
 use super::trace_store::{append_router_decision_trace, RouterDecisionTrace};
 use crate::agent::agent_core::SwappableCore;
 use crate::agent::agent_loop::{ToolRouting, TurnContext};
-use crate::agent::context::ContextBuilder;
 use crate::agent::markers::{
     TOOL_ANALYSIS_FULL_OUTPUT_MARKER, TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
 };
@@ -820,7 +819,7 @@ pub(crate) async fn dispatch_specialist(
 }
 
 fn subagent_tool_call(
-    turn_tag: u64,
+    call_id: String,
     target: &str,
     router_args: &Value,
     user_content: &str,
@@ -843,14 +842,14 @@ fn subagent_tool_call(
         return Err(e);
     }
     Ok(ToolCallRequest {
-        id: format!("router-{turn_tag}-subagent-spawn"),
+        id: call_id,
         name: "spawn".to_string(),
         arguments: params,
     })
 }
 
 fn pipeline_tool_call(
-    turn_tag: u64,
+    call_id: String,
     steps: Value,
     ahead_by_k: Option<Value>,
 ) -> Result<ToolCallRequest, String> {
@@ -865,7 +864,7 @@ fn pipeline_tool_call(
     }
     policy::validate_spawn_args(&params)?;
     Ok(ToolCallRequest {
-        id: format!("router-{turn_tag}-pipeline-spawn"),
+        id: call_id,
         name: "spawn".to_string(),
         arguments: params,
     })
@@ -1167,8 +1166,9 @@ pub(crate) async fn router_preflight(
         }
         "subagent" => {
             tracing::Span::current().record("routing_decision", "subagent");
+            let call_id = ctx.next_router_tool_call_id("subagent", decision.target.as_str());
             match subagent_tool_call(
-                ctx.turn_count,
+                call_id,
                 &decision.target,
                 &decision.args,
                 &ctx.user_content,
@@ -1202,8 +1202,9 @@ pub(crate) async fn router_preflight(
                 })
                 .unwrap_or_default();
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some(decision.target.clone());
+            let call_id = ctx.next_router_tool_call_id("tool", decision.target.as_str());
             PreflightResult::Execute(vec![ToolCallRequest {
-                id: format!("router-{}-tool-{}", ctx.turn_count, decision.target),
+                id: call_id,
                 name: decision.target,
                 arguments: params_map,
             }])
@@ -1240,7 +1241,8 @@ pub(crate) async fn router_preflight(
                 .or_else(|| decision.args.get("aheadByK"))
                 .cloned();
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some("spawn:pipeline".to_string());
-            match pipeline_tool_call(ctx.turn_count, steps, ahead_by_k) {
+            let call_id = ctx.next_router_tool_call_id("pipeline", "spawn");
+            match pipeline_tool_call(call_id, steps, ahead_by_k) {
                 Ok(call) => PreflightResult::Execute(vec![call]),
                 Err(error) => PreflightResult::Break(error),
             }
@@ -1267,8 +1269,31 @@ pub(crate) enum RouteResult {
     Break(String),
     /// Protocol persistence failed; stop the turn as infrastructure error.
     Error(String),
-    /// Filtered tool calls ready for execution.
-    Execute(Vec<ToolCallRequest>),
+    /// One ordered carrier plus the execution/rejection disposition of each
+    /// call. The carrier is persisted before any disposition is acted on.
+    Execute(RoutedToolBatch),
+}
+
+pub(crate) enum RoutedToolDisposition {
+    Execute,
+    Reject { reason: String, receipt: String },
+}
+
+pub(crate) struct RoutedToolCall {
+    pub(crate) call: ToolCallRequest,
+    pub(crate) disposition: RoutedToolDisposition,
+}
+
+pub(crate) enum RoutedBatchOutcome {
+    Continue,
+    Break(String),
+}
+
+pub(crate) struct RoutedToolBatch {
+    pub(crate) calls: Vec<RoutedToolCall>,
+    /// Applies only after every rejection receipt in this batch is durable.
+    pub(crate) after_rejections: Option<RoutedBatchOutcome>,
+    pub(crate) scaffold_after_rejections: Option<String>,
 }
 
 /// Determine the RouteResult for a successful specialist dispatch in route_tool_calls().
@@ -1561,8 +1586,9 @@ pub(crate) async fn route_tool_calls(
                 }
             }
             ToolPlanAction::Subagent => {
+                let call_id = ctx.next_router_tool_call_id("subagent", plan.target.as_str());
                 match subagent_tool_call(
-                    ctx.turn_count,
+                    call_id,
                     &plan.target,
                     &plan.args,
                     &ctx.user_content,
@@ -1592,7 +1618,7 @@ pub(crate) async fn route_tool_calls(
                             })
                             .unwrap_or_default();
                         routed_tool_calls = vec![ToolCallRequest {
-                            id: format!("planned-{}-{}", ctx.turn_count, plan.target),
+                            id: ctx.next_router_tool_call_id("planned-tool", plan.target.as_str()),
                             name: plan.target,
                             arguments: args,
                         }];
@@ -1607,118 +1633,88 @@ pub(crate) async fn route_tool_calls(
         .map(|tc| canonicalize_proxy_execution(&ctx.tools, tc))
         .collect();
 
-    // Deduplicate identical calls before they reach ToolGuard. A single model
-    // response can contain the same call multiple times; counting those as
-    // separate attempts wastes the duplicate allowance before any result exists.
-    let mut seen_in_batch = std::collections::HashSet::new();
-    let before_dedupe = routed_tool_calls.len();
-    routed_tool_calls.retain(|tc| {
-        let key = crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments);
-        seen_in_batch.insert(key)
-    });
-    if routed_tool_calls.len() < before_dedupe {
-        warn!(
-            before = before_dedupe,
-            after = routed_tool_calls.len(),
-            "deduplicated identical routed tool calls before guard"
-        );
-    }
-
-    // Tool guard filtering: split calls into allowed, blocked-with-cache, blocked-without-cache.
+    // Preserve every call in the carrier, including same-batch duplicates and
+    // guard rejections. A model-visible tool call must always receive exactly
+    // one result in its own id slot, even when policy refuses execution.
     let original_count = routed_tool_calls.len();
-    let mut allowed_calls: Vec<ToolCallRequest> = Vec::new();
-    let mut blocked_with_result: Vec<(ToolCallRequest, usize)> = Vec::new();
-    let mut blocked_no_result = 0usize;
+    if original_count == 0 {
+        if let Some(text) = response_content.filter(|s| !s.trim().is_empty()) {
+            return RouteResult::Break(text.to_string());
+        }
+        return RouteResult::Continue;
+    }
 
+    let mut seen_in_batch = std::collections::HashSet::new();
+    let mut calls = Vec::with_capacity(original_count);
+    let mut allowed_count = 0usize;
+    let mut blocked_count = 0usize;
     for tc in routed_tool_calls {
-        match ctx.flow.tool_guard.allow(&tc.name, &tc.arguments) {
-            Ok(()) => allowed_calls.push(tc),
-            Err(e) => {
-                warn!("{}", e);
-                if let Err(record_error) = ctx
-                    .core
-                    .sessions
-                    .record_tool_pre_execute(
-                        &ctx.session_id,
-                        &ctx.request_id,
-                        ctx.turn_count,
-                        &tc.id,
-                        &tc.name,
-                        &tc.arguments,
-                        crate::session::db::ToolPreExecuteDecision::Rejected {
-                            reason: "tool_guard".to_string(),
-                        },
-                    )
-                    .await
-                {
-                    return RouteResult::Error(format!(
-                        "tool {} was blocked but its pre-execution decision could not be recorded: {record_error}",
-                        tc.id
-                    ));
-                }
-                let key = ToolGuard::key(&tc.name, &tc.arguments);
-                if let Some(cached) = ctx.flow.tool_guard.get_cached_result(&key) {
-                    blocked_with_result.push((tc, cached.chars().count()));
-                } else {
-                    blocked_no_result += 1;
-                }
-            }
-        }
-    }
-
-    let total_blocked = blocked_with_result.len() + blocked_no_result;
-
-    // A blocked duplicate still needs a protocol-valid tool result for the
-    // assistant call, but replaying the cached bytes grows the hot prompt for
-    // no new evidence. Keep the result as a fixed-size receipt.
-    if !blocked_with_result.is_empty() && allowed_calls.is_empty() {
-        let tc_json: Vec<Value> = blocked_with_result
-            .iter()
-            .map(|(tc, _)| tc.to_openai_json())
-            .collect();
-        ctx.messages.with_draft(|draft| {
-            ContextBuilder::add_assistant_message(draft, response_content, Some(&tc_json));
-            for (tc, cached_chars) in &blocked_with_result {
-                let key = ToolGuard::key(&tc.name, &tc.arguments);
-                let hits = ctx.flow.tool_guard.cache_hits(&key);
-                let progress = ctx.flow.lease.progress_signal();
-                let receipt = duplicate_receipt(
+        let key = crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments);
+        let rejection = if !seen_in_batch.insert(key) {
+            ctx.flow.tool_guard.had_blocked_calls = true;
+            Some(format!(
+                "duplicate tool call blocked for '{}': repeated in one routed batch",
+                tc.name
+            ))
+        } else {
+            ctx.flow.tool_guard.allow(&tc.name, &tc.arguments).err()
+        };
+        if let Some(reason) = rejection {
+            warn!("{}", reason);
+            blocked_count += 1;
+            let guard_key = ToolGuard::key(&tc.name, &tc.arguments);
+            let cached = ctx.flow.tool_guard.get_cached_result(&guard_key);
+            let receipt = if let Some(cached) = cached {
+                duplicate_receipt(
                     &tc.name,
-                    hits,
-                    ctx.flow.tool_guard.get_cached_result(&key),
-                    *cached_chars,
-                    &progress,
-                );
-                ContextBuilder::add_tool_result(draft, &tc.id, &tc.name, &receipt);
-            }
-        });
-        if let Err(error) = ctx.persist_pending_protocol_messages().await {
-            return RouteResult::Error(format!(
-                "blocked tool receipts could not be recorded atomically: {error}"
-            ));
+                    ctx.flow.tool_guard.cache_hits(&guard_key),
+                    Some(cached),
+                    cached.chars().count(),
+                    &ctx.flow.lease.progress_signal(),
+                )
+            } else {
+                format!(
+                    "tool guard rejected {} without execution: {}",
+                    tc.name, reason
+                )
+            };
+            calls.push(RoutedToolCall {
+                call: tc,
+                disposition: RoutedToolDisposition::Reject { reason, receipt },
+            });
+        } else {
+            allowed_count += 1;
+            calls.push(RoutedToolCall {
+                call: tc,
+                disposition: RoutedToolDisposition::Execute,
+            });
         }
     }
 
-    if allowed_calls.is_empty() {
+    if allowed_count == 0 {
         // All tool calls were blocked.
-        if total_blocked > 0 && total_blocked == original_count {
+        if blocked_count == original_count {
             ctx.flow.consecutive_all_blocked += 1;
             // A cached duplicate produces only a compact protocol receipt; it
             // does not execute a tool or add evidence. Count every all-blocked
             // round as zero progress so cached receipts cannot livelock the
             // agent loop while also bypassing its iteration budget.
             ctx.flow.round_executed_no_tools = true;
-            if ctx.flow.consecutive_all_blocked >= 4 {
+            let (after_rejections, scaffold_after_rejections) = if ctx.flow.consecutive_all_blocked
+                >= 4
+            {
                 warn!(
                     rounds = ctx.flow.consecutive_all_blocked,
                     "tool_loop_circuit_breaker: model still looping after scaffold, hard stop"
                 );
-                return RouteResult::Break(
+                (
+                    RoutedBatchOutcome::Break(
                     "Tool calls were blocked after repeated duplicates. Please rephrase your request."
                         .to_string(),
-                );
-            }
-            if ctx.flow.consecutive_all_blocked >= 2 {
+                    ),
+                    None,
+                )
+            } else if ctx.flow.consecutive_all_blocked == 2 {
                 warn!(
                     rounds = ctx.flow.consecutive_all_blocked,
                     "tool_loop_circuit_breaker: model stuck on blocked tools, scaffolding final answer"
@@ -1727,40 +1723,44 @@ pub(crate) async fn route_tool_calls(
                 // already collected. The model gets one more LLM call with
                 // this instruction; if it still calls tools at >= 4, the
                 // hard break above fires.
-                crate::agent::markers::scaffold_user(
-                    "[system] Your last several tool calls were duplicates or blocked. \
+                (
+                    RoutedBatchOutcome::Continue,
+                    Some(
+                        "[system] Your last several tool calls were duplicates or blocked. \
                      You already have the data you need from your previous tool results. \
                      Do NOT call any more tools. Write your final answer now using the \
-                     information you gathered.",
-                );
-                if let Err(error) = ctx.persist_pending_protocol_messages().await {
-                    return RouteResult::Error(format!(
-                        "tool-loop instruction could not be recorded: {error}"
-                    ));
-                }
-                return RouteResult::Continue;
-            }
-            // Text accompanying a tool call is normally a progress preamble
-            // ("let me check ..."), not a final answer. Give the model one
-            // receipt-informed retry instead of exposing that preamble — this
-            // applies to cached duplicates too: the receipt instructs "answer
-            // from the prior result", and the evidence is already in context,
-            // so the model usually delivers a real answer on this pass (the
-            // old immediate-Break ended turns with boilerplate mid-task, e.g.
-            // session 20260827_071357). Skipping this pass saved one prefill
-            // and cost the turn; on retained-session backends the pass is a
-            // cheap suffix-only prefill anyway.
-            return RouteResult::Continue;
+                     information you gathered."
+                            .to_string(),
+                    ),
+                )
+            } else {
+                // Text accompanying a tool call is normally a progress preamble
+                // ("let me check ..."), not a final answer. Give the model one
+                // receipt-informed retry instead of exposing that preamble — this
+                // applies to cached duplicates too: the receipt instructs "answer
+                // from the prior result", and the evidence is already in context,
+                // so the model usually delivers a real answer on this pass (the
+                // old immediate-Break ended turns with boilerplate mid-task, e.g.
+                // session 20260827_071357). Skipping this pass saved one prefill
+                // and cost the turn; on retained-session backends the pass is a
+                // cheap suffix-only prefill anyway.
+                (RoutedBatchOutcome::Continue, None)
+            };
+            return RouteResult::Execute(RoutedToolBatch {
+                calls,
+                after_rejections: Some(after_rejections),
+                scaffold_after_rejections,
+            });
         }
-        if let Some(text) = response_content.filter(|s| !s.trim().is_empty()) {
-            return RouteResult::Break(text.to_string());
-        }
-        return RouteResult::Continue;
     }
 
     // Reset the consecutive blocked counter when tool calls succeed.
     ctx.flow.consecutive_all_blocked = 0;
-    RouteResult::Execute(allowed_calls)
+    RouteResult::Execute(RoutedToolBatch {
+        calls,
+        after_rejections: None,
+        scaffold_after_rejections: None,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1814,6 +1814,83 @@ mod tests {
         assert_eq!(normalized[0]["prompt"], "fetch weather");
         assert_eq!(normalized[0]["instruction"], "fetch weather");
         assert_eq!(normalized[0]["expected"], "brief forecast");
+    }
+
+    async fn assert_two_synthetic_calls_replay_exact(lane: &str, target: &str) -> Vec<String> {
+        let mut sequence = crate::agent::agent_loop::RouterSyntheticCallSequence::default();
+        let ids = vec![
+            sequence.allocate(7, lane, target),
+            sequence.allocate(7, lane, target),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = crate::session::db::SessionDb::new(&dir.path().join("sessions.db"));
+        let session = sessions.create_session("router-synthetic-id-replay").await;
+        for (index, id) in ids.iter().enumerate() {
+            sessions
+                .record_tool_pre_execute(
+                    &session.id,
+                    "turn-router-ids",
+                    7,
+                    id,
+                    "spawn",
+                    &HashMap::new(),
+                    crate::session::db::ToolPreExecuteDecision::Ready,
+                )
+                .await
+                .unwrap();
+            sessions
+                .record_tool_execute(
+                    &session.id,
+                    "turn-router-ids",
+                    7,
+                    id,
+                    "synthetic result",
+                    true,
+                    1,
+                )
+                .await
+                .unwrap();
+            sessions
+                .record_tool_post_execute(
+                    &session.id,
+                    "turn-router-ids",
+                    7,
+                    id,
+                    "synthetic result",
+                    index as i64 + 1,
+                )
+                .await
+                .unwrap();
+        }
+        sessions
+            .record_turn_finished(&session.id, "turn-router-ids", 7, "finished")
+            .await
+            .unwrap();
+        let replay = sessions.load_session_replay(&session.id).await.unwrap();
+        assert_eq!(
+            replay.availability,
+            crate::session::db::ReplayAvailability::Exact
+        );
+        ids
+    }
+
+    #[tokio::test]
+    async fn preflight_and_post_subagent_ids_are_unique_in_exact_replay() {
+        let ids = assert_two_synthetic_calls_replay_exact("subagent", "reviewer").await;
+        let args = json!({"task": "inspect the replay"});
+        let preflight =
+            subagent_tool_call(ids[0].clone(), "reviewer", &args, "inspect", true).unwrap();
+        let post_tool =
+            subagent_tool_call(ids[1].clone(), "reviewer", &args, "inspect", true).unwrap();
+
+        assert_ne!(preflight.id, post_tool.id);
+    }
+
+    #[tokio::test]
+    async fn repeated_same_target_planned_tool_ids_are_unique_in_exact_replay() {
+        let ids = assert_two_synthetic_calls_replay_exact("planned-tool", "read_file").await;
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids.iter().all(|id| id.ends_with("planned-tool-read_file")));
     }
 
     #[test]
@@ -2516,20 +2593,30 @@ mod tests {
 
     #[test]
     fn test_subagent_selection_builds_spawn_call() {
-        let call =
-            subagent_tool_call(7, "coding", &json!({}), "inspect it", true).expect("spawn call");
+        let call = subagent_tool_call(
+            "router-7-0-subagent-coding".to_string(),
+            "coding",
+            &json!({}),
+            "inspect it",
+            true,
+        )
+        .expect("spawn call");
         assert_eq!(call.name, "spawn");
-        assert_eq!(call.id, "router-7-subagent-spawn");
+        assert_eq!(call.id, "router-7-0-subagent-coding");
         assert_eq!(call.arguments.get("task"), Some(&json!("inspect it")));
         assert_eq!(call.arguments.get("model"), Some(&json!("local")));
     }
 
     #[test]
     fn test_pipeline_selection_builds_spawn_call() {
-        let call = pipeline_tool_call(9, json!([{"instruction": "inspect it"}]), Some(json!(2)))
-            .expect("pipeline spawn call");
+        let call = pipeline_tool_call(
+            "router-9-0-pipeline-spawn".to_string(),
+            json!([{"instruction": "inspect it"}]),
+            Some(json!(2)),
+        )
+        .expect("pipeline spawn call");
         assert_eq!(call.name, "spawn");
-        assert_eq!(call.id, "router-9-pipeline-spawn");
+        assert_eq!(call.id, "router-9-0-pipeline-spawn");
         assert_eq!(call.arguments.get("ahead_by_k"), Some(&json!(2)));
         assert_eq!(call.arguments["steps"][0]["prompt"], "inspect it");
     }

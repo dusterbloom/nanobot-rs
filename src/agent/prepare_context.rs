@@ -687,6 +687,7 @@ impl AgentLoopShared {
             final_content: String::new(),
             turn_outcome: TurnOutcome::LimitExhausted,
             turn_tool_entries: Vec::new(),
+            router_synthetic_call_sequence: Default::default(),
             iterations_used: 0,
             turn_start: std::time::Instant::now(),
             compaction,

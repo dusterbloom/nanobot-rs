@@ -7682,9 +7682,13 @@ async fn test_read_after_write_same_turn_is_not_blocked_by_stale_receipt() {
     .await;
 
     match result {
-        crate::agent::router::RouteResult::Execute(calls) => {
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].id, "tc_read_new");
+        crate::agent::router::RouteResult::Execute(batch) => {
+            assert_eq!(batch.calls.len(), 1);
+            assert_eq!(batch.calls[0].call.id, "tc_read_new");
+            assert!(matches!(
+                batch.calls[0].disposition,
+                crate::agent::router::RoutedToolDisposition::Execute
+            ));
         }
         crate::agent::router::RouteResult::Break(text) => {
             panic!("post-write read was blocked: {text}")
@@ -8723,6 +8727,245 @@ async fn test_tool_call_carrier_persists_before_tool_result() {
             ..
         } if tool_call_id == "tc_list" && *message_id > 0
     ));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+fn guard_probe_call(id: &str) -> crate::providers::base::ToolCallRequest {
+    crate::providers::base::ToolCallRequest {
+        id: id.to_string(),
+        name: "write_file".to_string(),
+        arguments: std::collections::HashMap::from([(
+            "content".to_string(),
+            json!("missing path keeps this side-effect free"),
+        )]),
+    }
+}
+
+fn mixed_guard_responses(
+    blocked_id: &str,
+    allowed_id: &str,
+    final_content: &str,
+) -> Vec<crate::providers::base::LLMResponse> {
+    let mut list_args = std::collections::HashMap::new();
+    list_args.insert("path".to_string(), json!("."));
+    let mut responses = (1..=3)
+        .map(|index| crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![guard_probe_call(&format!("tc_mixed_warmup_{index}"))],
+            finish_reason: FinishReason::ToolCalls,
+            usage: std::collections::HashMap::new(),
+        })
+        .collect::<Vec<_>>();
+    responses.push(crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![
+            guard_probe_call(blocked_id),
+            crate::providers::base::ToolCallRequest {
+                id: allowed_id.to_string(),
+                name: "list_dir".to_string(),
+                arguments: list_args,
+            },
+        ],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    });
+    responses.push(crate::providers::base::LLMResponse {
+        content: Some(final_content.to_string()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: std::collections::HashMap::new(),
+    });
+    responses
+}
+
+#[tokio::test]
+async fn all_guard_blocked_without_cache_keeps_carrier_receipt_and_exact_replay() {
+    let mut responses = (1..=4)
+        .map(|index| crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![guard_probe_call(&format!("tc_guard_{index}"))],
+            finish_reason: FinishReason::ToolCalls,
+            usage: std::collections::HashMap::new(),
+        })
+        .collect::<Vec<_>>();
+    responses.push(crate::providers::base::LLMResponse {
+        content: Some("finished after the guard receipt".to_string()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: std::collections::HashMap::new(),
+    });
+    let main: Arc<dyn LLMProvider> =
+        Arc::new(ResponseSequenceProvider::new("local-main", responses));
+    let (agent_loop, workspace) = build_local_inline_harness_with_iters(main, 6);
+    let session_key = format!("all-guard-blocked-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct("exercise the guard", &session_key, "test", "offline")
+        .await;
+    assert_eq!(response, "finished after the guard receipt");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("guard session");
+    let raw = core.sessions.get_all_messages(&session.id).await;
+    assert!(raw.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls
+                        .iter()
+                        .any(|call| call.get("id").and_then(Value::as_str) == Some("tc_guard_4"))
+                })
+    }));
+    assert!(raw.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("tool")
+            && message.get("tool_call_id").and_then(Value::as_str) == Some("tc_guard_4")
+            && message.get("ok") == Some(&Value::Bool(false))
+    }));
+    let replay = core
+        .sessions
+        .load_session_replay(&session.id)
+        .await
+        .expect("guard replay");
+    assert_eq!(
+        replay.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn mixed_guard_batch_keeps_blocked_carrier_receipt_and_executes_allowed_member() {
+    let responses = mixed_guard_responses(
+        "tc_mixed_blocked",
+        "tc_mixed_allowed",
+        "mixed batch finished",
+    );
+    let main: Arc<dyn LLMProvider> =
+        Arc::new(ResponseSequenceProvider::new("local-main", responses));
+    let (agent_loop, workspace) = build_local_inline_harness_with_iters(main, 6);
+    let session_key = format!("mixed-guard-batch-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct(
+            "exercise a mixed guard batch",
+            &session_key,
+            "test",
+            "offline",
+        )
+        .await;
+    assert_eq!(response, "mixed batch finished");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("mixed guard session");
+    let raw = core.sessions.get_all_messages(&session.id).await;
+    let mixed_carrier = raw
+        .iter()
+        .find(|message| {
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call.get("id").and_then(Value::as_str) == Some("tc_mixed_allowed")
+                    })
+                })
+        })
+        .expect("mixed carrier");
+    let carrier_ids = mixed_carrier["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        carrier_ids,
+        std::collections::HashSet::from(["tc_mixed_blocked", "tc_mixed_allowed"])
+    );
+    for (id, ok) in [("tc_mixed_blocked", false), ("tc_mixed_allowed", true)] {
+        assert!(raw.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some(id)
+                && message.get("ok") == Some(&Value::Bool(ok))
+        }));
+    }
+    let replay = core
+        .sessions
+        .load_session_replay(&session.id)
+        .await
+        .expect("mixed replay");
+    assert_eq!(
+        replay.availability,
+        crate::session::db::ReplayAvailability::Exact
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn mixed_guard_receipt_persistence_failure_prevents_allowed_execution() {
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        mixed_guard_responses(
+            "tc_fault_blocked",
+            "tc_fault_allowed",
+            "must not be reached",
+        ),
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 6);
+    let session_key = format!("mixed-guard-receipt-fault-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_guard_receipt \
+             BEFORE INSERT ON messages \
+             WHEN NEW.role = 'tool' AND NEW.tool_call_id = 'tc_fault_blocked' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic guard receipt failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("fault the mixed receipt", &session_key, "test", "offline")
+        .await;
+    assert!(
+        response.contains("router-rejected tool receipts"),
+        "{response}"
+    );
+    assert_eq!(provider.call_count(), 4);
+
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("receipt fault session");
+    let events = core
+        .sessions
+        .load_session_events(&session.id)
+        .await
+        .unwrap();
+    assert!(!events.iter().any(|event| matches!(
+        &event.payload,
+        crate::session::db::SessionEventPayload::ToolPreExecute { tool_call_id, .. }
+            if tool_call_id == "tc_fault_allowed"
+    )));
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "error"
+    );
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
