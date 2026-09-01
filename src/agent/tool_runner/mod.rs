@@ -149,15 +149,36 @@ impl Budget {
     }
 }
 
-/// One delegated tool outcome. `duration_ms` is the implementation-exit
-/// timing (the tool implementation itself, excluding delegation LLM
-/// iterations), matching the journal schema for `tool_execute` events.
+/// One delegated tool outcome. `ok` is copied at the execution boundary and
+/// remains authoritative even when display text is transformed. `duration_ms`
+/// is the implementation-exit timing (the tool implementation itself,
+/// excluding delegation LLM iterations), matching the journal schema for
+/// `tool_execute` events.
 #[derive(Debug, Clone)]
 pub struct ToolRunOutcome {
     pub tool_call_id: String,
     pub tool_name: String,
     pub data: String,
+    pub ok: bool,
     pub duration_ms: u64,
+}
+
+impl ToolRunOutcome {
+    pub(crate) fn from_execution(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        result: crate::agent::tools::base::ToolExecutionResult,
+        duration_ms: u64,
+    ) -> Self {
+        let ok = result.ok();
+        Self {
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            data: result.data().to_string(),
+            ok,
+            duration_ms,
+        }
+    }
 }
 
 /// Result of a delegated tool execution loop.
@@ -438,6 +459,7 @@ async fn analyze_via_scratch_pad(
                     all_results.push(ToolRunOutcome {
                         tool_call_id: original_id,
                         tool_name: tc.name.clone(),
+                        ok: crate::agent::context_hygiene::tool_result_ok(&result),
                         data: result,
                         duration_ms,
                     });
@@ -458,12 +480,12 @@ async fn analyze_via_scratch_pad(
                     let (_, _metadata) = context_store.store(result.data().to_string());
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
-                    all_results.push(ToolRunOutcome {
-                        tool_call_id: original_id,
-                        tool_name: tc.name.clone(),
-                        data: result.data().to_string(),
+                    all_results.push(ToolRunOutcome::from_execution(
+                        original_id,
+                        tc.name.clone(),
+                        result,
                         duration_ms,
-                    });
+                    ));
                 }
             }
             // Continue to next round — fresh call with updated state.
@@ -784,6 +806,7 @@ pub async fn run_tool_loop(
                             tool_call_id: original_id,
                             tool_name: tc.name.clone(),
                             data: result,
+                            ok: false,
                             // No implementation ran.
                             duration_ms: 0,
                         });
@@ -932,6 +955,7 @@ pub async fn run_tool_loop(
                             tool_call_id: original_id,
                             tool_name: tc.name.clone(),
                             data: result,
+                            ok: false,
                             // Provider failed before any child implementation ran.
                             duration_ms: 0,
                         });
@@ -942,7 +966,7 @@ pub async fn run_tool_loop(
                 // The delegate tool's implementation is the child loop (or
                 // the direct child response) plus its provider call.
                 let started = std::time::Instant::now();
-                let result = if child_response.has_tool_calls() {
+                let (result, ok) = if child_response.has_tool_calls() {
                     // Child wants to use tools — run the tool loop.
                     let child_result = Box::pin(run_tool_loop(
                         &child_config,
@@ -951,8 +975,10 @@ pub async fn run_tool_loop(
                         &child_system,
                     ))
                     .await;
+                    let ok = child_result.error.is_none()
+                        && child_result.tool_results.iter().all(|outcome| outcome.ok);
                     // Return the child's summary, or concatenated results if no summary.
-                    child_result.summary.unwrap_or_else(|| {
+                    let result = child_result.summary.unwrap_or_else(|| {
                         child_result
                             .tool_results
                             .iter()
@@ -965,12 +991,16 @@ pub async fn run_tool_loop(
                             })
                             .collect::<Vec<_>>()
                             .join("\n")
-                    })
+                    });
+                    (result, ok)
                 } else {
                     // Child produced a text response — return it directly.
-                    child_response
-                        .content
-                        .unwrap_or_else(|| "No result from delegate.".to_string())
+                    (
+                        child_response
+                            .content
+                            .unwrap_or_else(|| "No result from delegate.".to_string()),
+                        true,
+                    )
                 };
                 let delegate_duration_ms = started.elapsed().as_millis() as u64;
 
@@ -987,6 +1017,7 @@ pub async fn run_tool_loop(
                     tool_call_id: original_id,
                     tool_name: tc.name.clone(),
                     data: result,
+                    ok,
                     duration_ms: delegate_duration_ms,
                 });
             } else if worker_tools::is_worker_tool(&tc.name) {
@@ -1007,6 +1038,7 @@ pub async fn run_tool_loop(
                 all_results.push(ToolRunOutcome {
                     tool_call_id: original_id,
                     tool_name: tc.name.clone(),
+                    ok: crate::agent::context_hygiene::tool_result_ok(&result),
                     data: result,
                     duration_ms,
                 });
@@ -1068,6 +1100,7 @@ pub async fn run_tool_loop(
                     tool_call_id: original_id,
                     tool_name: tc.name.clone(),
                     data: stripped,
+                    ok: result.ok(),
                     duration_ms,
                 });
 

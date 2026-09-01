@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS tool_results (
     tool_call_id  TEXT NOT NULL,
     tool_name     TEXT NOT NULL,
     content       TEXT NOT NULL,
+    ok            INTEGER,
     created_at    TEXT NOT NULL,
     PRIMARY KEY (session_id, tool_call_id)
 );
@@ -1059,17 +1060,18 @@ impl SessionDb {
 /// stash is keyed by `(session_id, tool_call_id)` and, under the
 /// "handles-not-bodies" invariant, a prompt handle references the body by
 /// digest. A silent overwrite would make that handle lie (point at different
-/// bytes than its `sha256` claims), so storage is IMMUTABLE: identical retries
-/// are accepted; conflicting bytes are rejected; SQLite failures surface
-/// explicitly so the caller can fail the turn rather than show a raw body.
+/// bytes than its `sha256` claims), so storage is IMMUTABLE: retries with the
+/// same tool name, body, and status are accepted; any identity conflict is
+/// rejected; SQLite failures surface explicitly so the caller can fail the
+/// turn rather than show a raw body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredResult {
     /// Newly stored this call.
     Stored { digest: String },
-    /// Key already present with byte-identical content (idempotent retry).
+    /// Key already present with the same tool name, body, and status.
     Identical { digest: String },
-    /// Key already present with DIFFERENT bytes — the body is ambiguous and a
-    /// handle MUST NOT be emitted for it. The caller surfaces this.
+    /// Key already present with a different tool name, body, or status. The
+    /// result is ambiguous and a handle MUST NOT be emitted for it.
     Conflict {
         existing_digest: String,
         attempted_digest: String,
@@ -1107,6 +1109,21 @@ impl SessionDb {
             "ALTER TABLE summary_nodes ADD COLUMN manifest_json TEXT NOT NULL DEFAULT '{}'",
             [],
         );
+        // Pre-status tool-result rows remain readable with NULL status. Every
+        // new write records an immutable boolean beside the exact raw body.
+        // Fresh databases already contain the column, so only SQLite's exact
+        // duplicate-column response is benign; any other migration failure is
+        // a startup error rather than a partially upgraded replay store.
+        if let Err(error) = conn.execute("ALTER TABLE tool_results ADD COLUMN ok INTEGER", []) {
+            let duplicate_ok_column = matches!(
+                &error,
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message == "duplicate column name: ok"
+            );
+            if !duplicate_ok_column {
+                panic!("Failed to migrate tool_results.ok: {error}");
+            }
+        }
 
         // Pre-migration rows (id_kind absent) carry POSITIONAL source_ids
         // that cannot be resolved against the db-id-keyed LCM store. Purge
@@ -2462,6 +2479,26 @@ impl SessionDb {
         .ok()
     }
 
+    /// Load the exact raw body together with its immutable execution status.
+    /// Legacy rows created before the status migration return `None` for `ok`.
+    pub async fn load_tool_result_with_status(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+    ) -> Option<(String, Option<bool>)> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT content, ok FROM tool_results WHERE session_id = ?1 AND tool_call_id = ?2",
+            params![session_id, tool_call_id],
+            |row| {
+                let content: String = row.get(0)?;
+                let ok: Option<i64> = row.get(1)?;
+                Ok((content, ok.map(|value| value != 0)))
+            },
+        )
+        .ok()
+    }
+
     /// Store a tool result IMMUTABLY: never overwrite an existing
     /// `(session_id, tool_call_id)` row. Returns a [`StoredResult`] so the
     /// caller can prove the stash exists (and matches) before emitting a
@@ -2478,6 +2515,24 @@ impl SessionDb {
         tool_call_id: &str,
         tool_name: &str,
         content: &str,
+    ) -> StoredResult {
+        self.store_tool_result_immutable_with_status(
+            session_id,
+            tool_call_id,
+            tool_name,
+            content,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn store_tool_result_immutable_with_status(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        content: &str,
+        ok: bool,
     ) -> StoredResult {
         let attempted_digest = sha256_hex(content.as_bytes());
         let mut conn = self.conn.lock().await;
@@ -2500,13 +2555,14 @@ impl SessionDb {
         // inserted; 0 means the key already existed.
         let inserted_rows = match tx.execute(
             "INSERT OR IGNORE INTO tool_results \
-             (session_id, tool_call_id, tool_name, content, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (session_id, tool_call_id, tool_name, content, ok, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 session_id,
                 tool_call_id,
                 tool_name,
                 content,
+                i64::from(ok),
                 Utc::now().to_rfc3339()
             ],
         ) {
@@ -2521,10 +2577,10 @@ impl SessionDb {
         };
         // Read back what is now stored under the key (either what we just wrote
         // or the pre-existing bytes) — same transaction, no interleave.
-        let stored_content: String = match tx.query_row(
-            "SELECT content FROM tool_results WHERE session_id = ?1 AND tool_call_id = ?2",
+        let (stored_tool_name, stored_content, stored_ok): (String, String, Option<i64>) = match tx.query_row(
+            "SELECT tool_name, content, ok FROM tool_results WHERE session_id = ?1 AND tool_call_id = ?2",
             params![session_id, tool_call_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ) {
             Ok(c) => c,
             Err(error) => {
@@ -2547,7 +2603,10 @@ impl SessionDb {
             StoredResult::Stored {
                 digest: existing_digest,
             }
-        } else if existing_digest == attempted_digest {
+        } else if existing_digest == attempted_digest
+            && stored_tool_name == tool_name
+            && stored_ok == Some(i64::from(ok))
+        {
             StoredResult::Identical {
                 digest: existing_digest,
             }
@@ -5197,6 +5256,11 @@ mod tests {
             other => panic!("first store must be Stored, got {other:?}"),
         };
         assert!(!digest.is_empty());
+        assert_eq!(
+            db.load_tool_result_with_status(&session.id, "call_x").await,
+            Some(("body bytes v1".to_string(), Some(true))),
+            "legacy success-only API must default new rows to success"
+        );
 
         // Second write with IDENTICAL bytes: idempotent — Identical, same digest.
         let again = db
@@ -5235,6 +5299,176 @@ mod tests {
             Some("body bytes v1".to_string()),
             "a conflicting write must not replace the stored body"
         );
+    }
+
+    #[tokio::test]
+    async fn immutable_store_compares_tool_name_body_and_status() {
+        let (db, _dir) = make_db();
+        let session = db.create_session("cli:immutable-status").await;
+
+        assert!(matches!(
+            db.store_tool_result_immutable_with_status(
+                &session.id,
+                "call_status",
+                "exec",
+                "same exact body",
+                false,
+            )
+            .await,
+            StoredResult::Stored { .. }
+        ));
+        assert!(matches!(
+            db.store_tool_result_immutable_with_status(
+                &session.id,
+                "call_status",
+                "exec",
+                "same exact body",
+                false,
+            )
+            .await,
+            StoredResult::Identical { .. }
+        ));
+        assert!(matches!(
+            db.store_tool_result_immutable_with_status(
+                &session.id,
+                "call_status",
+                "exec",
+                "same exact body",
+                true,
+            )
+            .await,
+            StoredResult::Conflict { .. }
+        ));
+        assert!(matches!(
+            db.store_tool_result_immutable_with_status(
+                &session.id,
+                "call_status",
+                "read_file",
+                "same exact body",
+                false,
+            )
+            .await,
+            StoredResult::Conflict { .. }
+        ));
+        assert_eq!(
+            db.load_tool_result_with_status(&session.id, "call_status")
+                .await,
+            Some(("same exact body".to_string(), Some(false)))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_status_survives_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("status-reopen.db");
+        let session_id = {
+            let db = SessionDb::new(&db_path);
+            let session = db.create_session("cli:status-reopen").await;
+            assert!(matches!(
+                db.store_tool_result_immutable_with_status(
+                    &session.id,
+                    "call_failed",
+                    "exec",
+                    "body without an Error prefix",
+                    false,
+                )
+                .await,
+                StoredResult::Stored { .. }
+            ));
+            session.id
+        };
+
+        let reopened = SessionDb::new(&db_path);
+        assert_eq!(
+            reopened
+                .load_tool_result_with_status(&session_id, "call_failed")
+                .await,
+            Some(("body without an Error prefix".to_string(), Some(false)))
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_tool_result_schema_migrates_status_column_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy-sessions.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tool_results (
+                    session_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, tool_call_id)
+                );",
+            )
+            .unwrap();
+        }
+
+        let db = SessionDb::new(&db_path);
+        let has_ok: i64 = {
+            let conn = db.conn.lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tool_results') WHERE name = 'ok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(has_ok, 1);
+
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO tool_results \
+                 (session_id, tool_call_id, tool_name, content, created_at) \
+                 VALUES ('legacy-session', 'legacy-call', 'exec', 'legacy body', 'now')",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.load_tool_result_with_status("legacy-session", "legacy-call")
+                .await,
+            Some(("legacy body".to_string(), None)),
+            "an older binary must still be able to omit the additive status column"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_history_preserves_explicit_tool_failure_status() {
+        let (db, _dir) = make_db();
+        let session = db.create_session("cli:history-tool-status").await;
+        db.add_messages(
+            &session.id,
+            &[
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_failed",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": "{}"}
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call_failed",
+                    "name": "exec",
+                    "content": "body without an Error prefix",
+                    "ok": false
+                }),
+            ],
+        )
+        .await;
+
+        let history = db.get_history(&session.id, 100, 0).await;
+        assert_eq!(history[1].get("ok").and_then(Value::as_bool), Some(false));
+        assert!(matches!(
+            crate::agent::turn::turn_from_legacy(&history[1]),
+            Some(crate::agent::turn::Turn::ToolResult { ok: false, .. })
+        ));
     }
 
     #[tokio::test]

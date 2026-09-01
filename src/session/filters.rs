@@ -238,6 +238,12 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
             if let Some(db_id) = m.get("_db_id") {
                 msg["_db_id"] = db_id.clone();
             }
+            // Execution status is internal replay metadata. Preserve it so
+            // canonical Turn reconstruction never has to infer truth from
+            // display text; protocol rendering strips it before provider I/O.
+            if let Some(ok) = m.get("ok") {
+                msg["ok"] = ok.clone();
+            }
             msg
         })
         .collect();

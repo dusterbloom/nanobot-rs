@@ -242,8 +242,21 @@ fn outcome(id: &str, name: &str, data: &str) -> ToolRunOutcome {
         tool_call_id: id.to_string(),
         tool_name: name.to_string(),
         data: data.to_string(),
+        ok: true,
         duration_ms: 0,
     }
+}
+
+#[test]
+fn delegated_tool_status_is_copied_from_typed_result() {
+    let source = crate::agent::tools::base::ToolExecutionResult::failure_with_kind(
+        "body without an Error prefix".to_string(),
+        crate::errors::ToolErrorKind::InvalidArgs("synthetic test failure".to_string()),
+    );
+    let outcome = ToolRunOutcome::from_execution("call_failed", "exec", source, 7);
+
+    assert!(!outcome.ok);
+    assert_eq!(outcome.data, "body without an Error prefix");
 }
 
 #[tokio::test]

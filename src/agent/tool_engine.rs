@@ -33,7 +33,7 @@ use crate::session::db::{
 use std::sync::Arc;
 
 use super::agent_loop::{ResponseBoundary, TurnContext};
-use crate::agent::context_hygiene::{tool_result_ok, TOOL_RESULT_REPLAY_MAX_BYTES};
+use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
 use crate::agent::tools::base::ToolConcurrency;
 
 #[cfg(test)]
@@ -268,7 +268,13 @@ pub(crate) async fn store_then_render_tool_result(
     use crate::session::db::StoredResult;
 
     match sessions
-        .store_tool_result_immutable(session_id, tool_call_id, tool_name, exact_body)
+        .store_tool_result_immutable_with_status(
+            session_id,
+            tool_call_id,
+            tool_name,
+            exact_body,
+            ok,
+        )
         .await
     {
         StoredResult::Stored { .. } | StoredResult::Identical { .. } => {}
@@ -919,7 +925,7 @@ pub(crate) async fn execute_tools_delegated(
         let full_data = routed_result
             .map(|outcome| outcome.data.as_str())
             .unwrap_or("(no result)");
-        let raw_ok = routed_result.is_some() && tool_result_ok(full_data);
+        let raw_ok = routed_result.map(|outcome| outcome.ok).unwrap_or(false);
         // Implementation-exit timing as measured by the runner; 0 when the
         // runner produced no outcome for this call.
         let routed_duration_ms = routed_result
@@ -976,23 +982,24 @@ pub(crate) async fn execute_tools_delegated(
         let lease_signal = ctx.flow.lease.progress_signal();
         injected = format!("{lease_signal}\n{injected}");
 
-        let ok = tool_result_ok(full_data);
         if ctx.core.provenance_config.enabled {
             ctx.messages.with_draft(|draft| {
                 ContextBuilder::add_tool_result_immutable_with_status(
-                    draft, &tc.id, &tc.name, &injected, ok,
+                    draft, &tc.id, &tc.name, &injected, raw_ok,
                 )
             });
         } else {
             ctx.messages.with_draft(|draft| {
-                ContextBuilder::add_tool_result_with_status(draft, &tc.id, &tc.name, &injected, ok)
+                ContextBuilder::add_tool_result_with_status(
+                    draft, &tc.id, &tc.name, &injected, raw_ok,
+                )
             });
         }
         ctx.flow.tool_guard.record_result_with_status(
             &tc.name,
             &tc.arguments,
             injected.clone(),
-            ok,
+            raw_ok,
         );
         ctx.used_tools.insert(tc.name.clone());
         ctx.persist_pending_protocol_messages().await;
@@ -1069,7 +1076,7 @@ pub(crate) async fn execute_tools_delegated(
     // Record learning + audit for all tool results.
     let executor = format!("tool_runner:{}", tr_model);
     for outcome in &run_result.tool_results {
-        let ok = !outcome.data.starts_with("Error:");
+        let ok = outcome.ok;
         let per_tool_ms = outcome.duration_ms;
 
         // Only render CallEnd in the TUI for results that the caller asked
@@ -2870,6 +2877,72 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(completion_order, vec!["tc-fast", "tc-slow"]);
+    }
+
+    #[tokio::test]
+    async fn delegated_tool_status_reaches_receipt_event_and_session_event() {
+        let source = crate::agent::tools::base::ToolExecutionResult::failure_with_kind(
+            "body without an Error prefix".to_string(),
+            crate::errors::ToolErrorKind::InvalidArgs("synthetic test failure".to_string()),
+        );
+        let outcome = crate::agent::tool_runner::ToolRunOutcome::from_execution(
+            "call_failed",
+            "exec",
+            source,
+            7,
+        );
+
+        let mut receipt = Vec::new();
+        ContextBuilder::add_tool_result_with_status(
+            &mut receipt,
+            &outcome.tool_call_id,
+            &outcome.tool_name,
+            &outcome.data,
+            outcome.ok,
+        );
+        assert_eq!(receipt[0].get("ok").and_then(Value::as_bool), Some(false));
+
+        let event = ToolEvent::CallEnd {
+            tool_name: outcome.tool_name.clone(),
+            tool_call_id: outcome.tool_call_id.clone(),
+            result_data: outcome.data.clone(),
+            ok: outcome.ok,
+            duration_ms: outcome.duration_ms,
+        };
+        assert!(matches!(event, ToolEvent::CallEnd { ok: false, .. }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&dir.path().join("sessions.db"));
+        let session = sessions.create_session("cli:delegated-status").await;
+        sessions
+            .record_tool_pre_execute(
+                &session.id,
+                "request-1",
+                1,
+                &outcome.tool_call_id,
+                &outcome.tool_name,
+                &HashMap::new(),
+                ToolPreExecuteDecision::Ready,
+            )
+            .await
+            .unwrap();
+        sessions
+            .record_tool_execute(
+                &session.id,
+                "request-1",
+                1,
+                &outcome.tool_call_id,
+                &outcome.data,
+                outcome.ok,
+                outcome.duration_ms,
+            )
+            .await
+            .unwrap();
+        let events = sessions.load_session_events(&session.id).await.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event.payload,
+            crate::session::db::SessionEventPayload::ToolExecute { ok: false, .. }
+        )));
     }
 
     #[tokio::test]

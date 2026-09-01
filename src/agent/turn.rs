@@ -485,14 +485,24 @@ mod tests {
 
     #[test]
     fn legacy_tool_result_preserves_explicit_failure_status() {
+        let carrier = json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "tc_abc",
+                "type": "function",
+                "function": {"name": "list_dir", "arguments": "{}"}
+            }]
+        });
         let v = json!({
             "role": "tool",
             "tool_call_id": "tc_abc",
             "name": "list_dir",
             "ok": false,
-            "content": "Error: Directory not found: /bad/path"
+            "content": "directory lookup failed without a legacy prefix"
         });
-        let t = turn_from_legacy(&v).unwrap();
+        let filtered = crate::session::filters::filter_history(&[carrier, v], 100, 0);
+        let t = turn_from_legacy(&filtered[1]).unwrap();
         assert!(matches!(t, Turn::ToolResult { ok: false, .. }));
     }
 
