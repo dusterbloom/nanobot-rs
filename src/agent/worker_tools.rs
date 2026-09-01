@@ -17,8 +17,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-/// Worker-lane param extraction (String protocol — the tool-runner lane,
-/// not the Tool trait; the last require_str! consumer after the trait flip).
+/// Worker-lane parameter extraction with an explicit failed outcome.
 macro_rules! require_str {
     ($params:expr, $key:literal) => {
         require_str!($params, $key, "")
@@ -27,7 +26,9 @@ macro_rules! require_str {
         match $params.get($key).and_then(|v| v.as_str()) {
             Some(v) => v,
             None => {
-                return concat!("Error: '", $key, "' parameter is required", $suffix).to_string()
+                return WorkerToolOutcome::failure(
+                    concat!("Error: '", $key, "' parameter is required", $suffix).to_string(),
+                )
             }
         }
     };
@@ -50,14 +51,6 @@ impl WorkerToolOutcome {
 
     fn failure(data: String) -> Self {
         Self { data, ok: false }
-    }
-
-    /// Transitional adapter for worker helpers that still use the legacy
-    /// `Error: ...` string contract. New worker helpers must return an explicit
-    /// status so non-Error failure receipts cannot be mistaken for success.
-    fn from_legacy(data: String) -> Self {
-        let ok = crate::agent::context_hygiene::tool_result_ok(&data);
-        Self { data, ok }
     }
 }
 
@@ -148,9 +141,9 @@ pub async fn execute_worker_tool(
 ) -> WorkerToolOutcome {
     match name {
         "verify" => execute_verify(args).await,
-        "python_eval" => WorkerToolOutcome::from_legacy(execute_python_eval(args).await),
-        "diff_apply" => WorkerToolOutcome::from_legacy(execute_diff_apply(args, workspace).await),
-        "fmt_convert" => WorkerToolOutcome::from_legacy(execute_fmt_convert(args).await),
+        "python_eval" => execute_python_eval(args).await,
+        "diff_apply" => execute_diff_apply(args, workspace).await,
+        "fmt_convert" => execute_fmt_convert(args).await,
         _ => WorkerToolOutcome::failure(format!("Error: unknown worker tool '{}'.", name)),
     }
 }
@@ -237,7 +230,7 @@ async fn execute_verify(args: &HashMap<String, Value>) -> WorkerToolOutcome {
 }
 
 /// Execute Python code in a sandboxed environment.
-async fn execute_python_eval(args: &HashMap<String, Value>) -> String {
+async fn execute_python_eval(args: &HashMap<String, Value>) -> WorkerToolOutcome {
     let code = require_str!(args, "code", ".");
 
     let output = tokio::time::timeout(
@@ -260,17 +253,17 @@ async fn execute_python_eval(args: &HashMap<String, Value>) -> String {
             if out.status.success() {
                 let result: String = stdout.chars().take(2000).collect();
                 if result.is_empty() {
-                    "(no output)".to_string()
+                    WorkerToolOutcome::success("(no output)".to_string())
                 } else {
-                    result
+                    WorkerToolOutcome::success(result)
                 }
             } else {
                 let err: String = stderr.chars().take(500).collect();
-                format!("Error: {}", err)
+                WorkerToolOutcome::failure(format!("Error: {}", err))
             }
         }
-        Ok(Err(e)) => format!("Error: {}", e),
-        Err(_) => "Error: timeout (5s)".to_string(),
+        Ok(Err(e)) => WorkerToolOutcome::failure(format!("Error: {}", e)),
+        Err(_) => WorkerToolOutcome::failure("Error: timeout (5s)".to_string()),
     }
 }
 
@@ -278,7 +271,7 @@ async fn execute_python_eval(args: &HashMap<String, Value>) -> String {
 async fn execute_diff_apply(
     args: &HashMap<String, Value>,
     workspace: Option<&std::path::Path>,
-) -> String {
+) -> WorkerToolOutcome {
     let path = require_str!(args, "path", ".");
     let diff = require_str!(args, "diff", ".");
 
@@ -287,7 +280,10 @@ async fn execute_diff_apply(
         let resolved = std::path::Path::new(path);
         if let Ok(canonical) = resolved.canonicalize() {
             if !canonical.starts_with(ws) {
-                return format!("Error: path '{}' is outside workspace.", path);
+                return WorkerToolOutcome::failure(format!(
+                    "Error: path '{}' is outside workspace.",
+                    path
+                ));
             }
         }
         // If file doesn't exist yet, check parent.
@@ -295,7 +291,10 @@ async fn execute_diff_apply(
             if let Some(parent) = resolved.parent() {
                 if let Ok(canonical_parent) = parent.canonicalize() {
                     if !canonical_parent.starts_with(ws) {
-                        return format!("Error: path '{}' is outside workspace.", path);
+                        return WorkerToolOutcome::failure(format!(
+                            "Error: path '{}' is outside workspace.",
+                            path
+                        ));
                     }
                 }
             }
@@ -305,7 +304,7 @@ async fn execute_diff_apply(
     // Write diff to temp file.
     let diff_path = format!("/tmp/nanobot_diff_{}.patch", uuid::Uuid::new_v4());
     if let Err(e) = std::fs::write(&diff_path, diff) {
-        return format!("Error: could not write diff file: {}", e);
+        return WorkerToolOutcome::failure(format!("Error: could not write diff file: {}", e));
     }
 
     let output = tokio::time::timeout(
@@ -329,30 +328,30 @@ async fn execute_diff_apply(
     match output {
         Ok(Ok(out)) => {
             if out.status.success() {
-                "Patch applied successfully.".to_string()
+                WorkerToolOutcome::success("Patch applied successfully.".to_string())
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                format!(
+                WorkerToolOutcome::failure(format!(
                     "Patch failed: {}{}",
                     stderr.chars().take(300).collect::<String>(),
                     stdout.chars().take(200).collect::<String>()
-                )
+                ))
             }
         }
-        Ok(Err(e)) => format!("Error: {}", e),
-        Err(_) => "Error: patch timed out (10s)".to_string(),
+        Ok(Err(e)) => WorkerToolOutcome::failure(format!("Error: {}", e)),
+        Err(_) => WorkerToolOutcome::failure("Error: patch timed out (10s)".to_string()),
     }
 }
 
 /// Convert data between formats.
-async fn execute_fmt_convert(args: &HashMap<String, Value>) -> String {
+async fn execute_fmt_convert(args: &HashMap<String, Value>) -> WorkerToolOutcome {
     let input = require_str!(args, "input", ".");
     let from = require_str!(args, "from", ".");
     let to = require_str!(args, "to", ".");
 
     if from == to {
-        return input.to_string();
+        return WorkerToolOutcome::success(input.to_string());
     }
 
     match (from, to) {
@@ -360,26 +359,37 @@ async fn execute_fmt_convert(args: &HashMap<String, Value>) -> String {
         ("csv", "json") => csv_to_json(input),
         ("json", "md_table") => json_to_md_table(input),
         ("md_table", "json") => md_table_to_json(input),
-        _ => format!("Error: unsupported conversion from '{}' to '{}'.", from, to),
+        _ => WorkerToolOutcome::failure(format!(
+            "Error: unsupported conversion from '{}' to '{}'.",
+            from, to
+        )),
     }
 }
 
 /// Convert a JSON array of objects to CSV.
-fn json_to_csv(input: &str) -> String {
+fn json_to_csv(input: &str) -> WorkerToolOutcome {
     let arr: Vec<Value> = match serde_json::from_str(input) {
         Ok(Value::Array(a)) => a,
-        Ok(_) => return "Error: JSON input must be an array of objects.".to_string(),
-        Err(e) => return format!("Error: invalid JSON: {}", e),
+        Ok(_) => {
+            return WorkerToolOutcome::failure(
+                "Error: JSON input must be an array of objects.".to_string(),
+            )
+        }
+        Err(e) => return WorkerToolOutcome::failure(format!("Error: invalid JSON: {}", e)),
     };
 
     if arr.is_empty() {
-        return String::new();
+        return WorkerToolOutcome::success(String::new());
     }
 
     // Extract headers from the first object.
     let headers: Vec<String> = match &arr[0] {
         Value::Object(obj) => obj.keys().cloned().collect(),
-        _ => return "Error: JSON array items must be objects.".to_string(),
+        _ => {
+            return WorkerToolOutcome::failure(
+                "Error: JSON array items must be objects.".to_string(),
+            )
+        }
     };
 
     let mut lines = Vec::new();
@@ -409,15 +419,15 @@ fn json_to_csv(input: &str) -> String {
         }
     }
 
-    lines.join("\n")
+    WorkerToolOutcome::success(lines.join("\n"))
 }
 
 /// Convert CSV to a JSON array of objects.
-fn csv_to_json(input: &str) -> String {
+fn csv_to_json(input: &str) -> WorkerToolOutcome {
     let mut lines = input.lines();
     let header_line = match lines.next() {
         Some(h) => h,
-        None => return "Error: empty CSV input.".to_string(),
+        None => return WorkerToolOutcome::failure("Error: empty CSV input.".to_string()),
     };
 
     let headers: Vec<&str> = parse_csv_line(header_line);
@@ -445,7 +455,10 @@ fn csv_to_json(input: &str) -> String {
         result.push(Value::Object(obj));
     }
 
-    serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e))
+    match serde_json::to_string_pretty(&result) {
+        Ok(data) => WorkerToolOutcome::success(data),
+        Err(error) => WorkerToolOutcome::failure(format!("Error: {}", error)),
+    }
 }
 
 /// Parse a CSV line handling quoted fields.
@@ -474,20 +487,28 @@ fn parse_csv_line(line: &str) -> Vec<&str> {
 }
 
 /// Convert a JSON array of objects to a markdown table.
-fn json_to_md_table(input: &str) -> String {
+fn json_to_md_table(input: &str) -> WorkerToolOutcome {
     let arr: Vec<Value> = match serde_json::from_str(input) {
         Ok(Value::Array(a)) => a,
-        Ok(_) => return "Error: JSON input must be an array of objects.".to_string(),
-        Err(e) => return format!("Error: invalid JSON: {}", e),
+        Ok(_) => {
+            return WorkerToolOutcome::failure(
+                "Error: JSON input must be an array of objects.".to_string(),
+            )
+        }
+        Err(e) => return WorkerToolOutcome::failure(format!("Error: invalid JSON: {}", e)),
     };
 
     if arr.is_empty() {
-        return "| (empty) |\n| --- |".to_string();
+        return WorkerToolOutcome::success("| (empty) |\n| --- |".to_string());
     }
 
     let headers: Vec<String> = match &arr[0] {
         Value::Object(obj) => obj.keys().cloned().collect(),
-        _ => return "Error: JSON array items must be objects.".to_string(),
+        _ => {
+            return WorkerToolOutcome::failure(
+                "Error: JSON array items must be objects.".to_string(),
+            )
+        }
     };
 
     let mut lines = Vec::new();
@@ -518,14 +539,16 @@ fn json_to_md_table(input: &str) -> String {
         }
     }
 
-    lines.join("\n")
+    WorkerToolOutcome::success(lines.join("\n"))
 }
 
 /// Convert a markdown table to a JSON array of objects.
-fn md_table_to_json(input: &str) -> String {
+fn md_table_to_json(input: &str) -> WorkerToolOutcome {
     let lines: Vec<&str> = input.lines().collect();
     if lines.len() < 2 {
-        return "Error: markdown table must have at least header and separator rows.".to_string();
+        return WorkerToolOutcome::failure(
+            "Error: markdown table must have at least header and separator rows.".to_string(),
+        );
     }
 
     // Parse header row.
@@ -536,7 +559,9 @@ fn md_table_to_json(input: &str) -> String {
         .collect();
 
     if headers.is_empty() {
-        return "Error: no headers found in markdown table.".to_string();
+        return WorkerToolOutcome::failure(
+            "Error: no headers found in markdown table.".to_string(),
+        );
     }
 
     // Skip separator row (line 1), parse data rows.
@@ -565,7 +590,10 @@ fn md_table_to_json(input: &str) -> String {
         result.push(Value::Object(obj));
     }
 
-    serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e))
+    match serde_json::to_string_pretty(&result) {
+        Ok(data) => WorkerToolOutcome::success(data),
+        Err(error) => WorkerToolOutcome::failure(format!("Error: {}", error)),
+    }
 }
 
 /// Check command against deny patterns (same as ExecTool).
@@ -694,7 +722,8 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("code".to_string(), json!("print(2 + 3)"));
         let result = execute_python_eval(&args).await;
-        assert_eq!(result.trim(), "5");
+        assert!(result.ok);
+        assert_eq!(result.data.trim(), "5");
     }
 
     #[tokio::test]
@@ -702,10 +731,26 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("code".to_string(), json!("raise ValueError('oops')"));
         let result = execute_python_eval(&args).await;
+        assert!(!result.ok);
         assert!(
-            result.starts_with("Error:"),
+            result.data.starts_with("Error:"),
             "Expected error, got: {}",
-            result
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_python_literal_error_prefix_is_success() {
+        let args = HashMap::from([(
+            "code".to_string(),
+            json!("print('Error: literal output', end='')"),
+        )]);
+        let result = execute_worker_tool("python_eval", &args, None).await;
+
+        assert_eq!(result.data, "Error: literal output");
+        assert!(
+            result.ok,
+            "successful process output is not an execution error"
         );
     }
 
@@ -714,7 +759,8 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("code".to_string(), json!("x = 5"));
         let result = execute_python_eval(&args).await;
-        assert_eq!(result, "(no output)");
+        assert!(result.ok);
+        assert_eq!(result.data, "(no output)");
     }
 
     #[tokio::test]
@@ -722,10 +768,11 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("code".to_string(), json!("print('x' * 5000)"));
         let result = execute_python_eval(&args).await;
+        assert!(result.ok);
         assert!(
-            result.len() <= 2000,
+            result.data.len() <= 2000,
             "Output should be truncated to 2000 chars, got {}",
-            result.len()
+            result.data.len()
         );
     }
 
@@ -742,11 +789,32 @@ mod tests {
         );
         let result = execute_diff_apply(&args, None).await;
         // Patch should fail since file doesn't exist
+        assert!(!result.ok);
         assert!(
-            result.contains("fail") || result.contains("Error") || result.contains("Patch"),
+            result.data.contains("fail")
+                || result.data.contains("Error")
+                || result.data.contains("Patch"),
             "Expected failure for missing file, got: {}",
-            result
+            result.data
         );
+    }
+
+    #[tokio::test]
+    async fn nonzero_patch_exit_is_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "original\n").unwrap();
+        let args = HashMap::from([
+            ("path".to_string(), json!(file_path)),
+            (
+                "diff".to_string(),
+                json!("--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-missing\n+replacement\n"),
+            ),
+        ]);
+        let result = execute_worker_tool("diff_apply", &args, None).await;
+
+        assert!(result.data.starts_with("Patch failed:"), "{}", result.data);
+        assert!(!result.ok, "a nonzero patch exit is a failed execution");
     }
 
     #[tokio::test]
@@ -764,10 +832,11 @@ mod tests {
         args.insert("path".to_string(), json!(file_path.to_str().unwrap()));
         args.insert("diff".to_string(), json!(diff));
         let result = execute_diff_apply(&args, None).await;
+        assert!(result.ok);
         assert!(
-            result.contains("success"),
+            result.data.contains("success"),
             "Expected success, got: {}",
-            result
+            result.data
         );
 
         // Verify file was patched.
@@ -823,8 +892,17 @@ mod tests {
         args.insert("from".to_string(), json!("json"));
         args.insert("to".to_string(), json!("csv"));
         let result = execute_fmt_convert(&args).await;
-        assert!(result.contains("name"), "Should have header: {}", result);
-        assert!(result.contains("Alice"), "Should have data: {}", result);
+        assert!(result.ok);
+        assert!(
+            result.data.contains("name"),
+            "Should have header: {}",
+            result.data
+        );
+        assert!(
+            result.data.contains("Alice"),
+            "Should have data: {}",
+            result.data
+        );
     }
 
     #[tokio::test]
@@ -834,7 +912,8 @@ mod tests {
         args.insert("from".to_string(), json!("csv"));
         args.insert("to".to_string(), json!("json"));
         let result = execute_fmt_convert(&args).await;
-        let parsed: Vec<Value> = serde_json::from_str(&result).expect("Should be valid JSON");
+        assert!(result.ok);
+        let parsed: Vec<Value> = serde_json::from_str(&result.data).expect("Should be valid JSON");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["name"], "Alice");
         assert_eq!(parsed[0]["age"], 30);
@@ -850,13 +929,22 @@ mod tests {
         args.insert("from".to_string(), json!("json"));
         args.insert("to".to_string(), json!("md_table"));
         let result = execute_fmt_convert(&args).await;
+        assert!(result.ok);
         assert!(
-            result.contains("|"),
+            result.data.contains("|"),
             "Should be a markdown table: {}",
-            result
+            result.data
         );
-        assert!(result.contains("---"), "Should have separator: {}", result);
-        assert!(result.contains("Alice"), "Should have data: {}", result);
+        assert!(
+            result.data.contains("---"),
+            "Should have separator: {}",
+            result.data
+        );
+        assert!(
+            result.data.contains("Alice"),
+            "Should have data: {}",
+            result.data
+        );
     }
 
     #[tokio::test]
@@ -867,7 +955,8 @@ mod tests {
         args.insert("from".to_string(), json!("md_table"));
         args.insert("to".to_string(), json!("json"));
         let result = execute_fmt_convert(&args).await;
-        let parsed: Vec<Value> = serde_json::from_str(&result).expect("Should be valid JSON");
+        assert!(result.ok);
+        let parsed: Vec<Value> = serde_json::from_str(&result.data).expect("Should be valid JSON");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["name"], "Alice");
     }
@@ -879,8 +968,9 @@ mod tests {
         args.insert("from".to_string(), json!("csv"));
         args.insert("to".to_string(), json!("csv"));
         let result = execute_fmt_convert(&args).await;
+        assert!(result.ok);
         assert_eq!(
-            result, "some data",
+            result.data, "some data",
             "Identity conversion should return input unchanged"
         );
     }
@@ -892,10 +982,11 @@ mod tests {
         args.insert("from".to_string(), json!("xml"));
         args.insert("to".to_string(), json!("json"));
         let result = execute_fmt_convert(&args).await;
+        assert!(!result.ok);
         assert!(
-            result.contains("unsupported"),
+            result.data.contains("unsupported"),
             "Should report unsupported: {}",
-            result
+            result.data
         );
     }
 

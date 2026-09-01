@@ -259,14 +259,114 @@ fn delegated_tool_status_is_copied_from_typed_result() {
     assert_eq!(outcome.data, "body without an Error prefix");
 }
 
+async fn assert_failed_worker_outcome_reaches_every_sink(
+    outcome: &ToolRunOutcome,
+    call: &ToolCallRequest,
+    session_key: &str,
+) {
+    assert!(!outcome.ok, "worker failure must retain false status");
+
+    let mut receipt = Vec::new();
+    ContextBuilder::add_tool_result_with_status(
+        &mut receipt,
+        &outcome.tool_call_id,
+        &outcome.tool_name,
+        &outcome.data,
+        outcome.ok,
+    );
+    assert_eq!(receipt[0].get("ok").and_then(Value::as_bool), Some(false));
+
+    let event = crate::agent::audit::ToolEvent::CallEnd {
+        tool_name: outcome.tool_name.clone(),
+        tool_call_id: outcome.tool_call_id.clone(),
+        result_data: outcome.data.clone(),
+        ok: outcome.ok,
+        duration_ms: outcome.duration_ms,
+    };
+    assert!(matches!(
+        event,
+        crate::agent::audit::ToolEvent::CallEnd { ok: false, .. }
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = crate::session::SessionDb::new(&dir.path().join("sessions.db"));
+    let session = sessions.create_session(session_key).await;
+    assert!(matches!(
+        sessions
+            .store_tool_result_immutable_with_status(
+                &session.id,
+                &outcome.tool_call_id,
+                &outcome.tool_name,
+                &outcome.data,
+                outcome.ok,
+            )
+            .await,
+        crate::session::db::StoredResult::Stored { .. }
+    ));
+    assert_eq!(
+        sessions
+            .load_tool_result_with_status(&session.id, &outcome.tool_call_id)
+            .await,
+        Some((outcome.data.clone(), Some(false)))
+    );
+
+    sessions
+        .record_tool_pre_execute(
+            &session.id,
+            "request-failed-worker",
+            1,
+            &outcome.tool_call_id,
+            &outcome.tool_name,
+            &call.arguments,
+            crate::session::db::ToolPreExecuteDecision::Ready,
+        )
+        .await
+        .unwrap();
+    sessions
+        .record_tool_execute(
+            &session.id,
+            "request-failed-worker",
+            1,
+            &outcome.tool_call_id,
+            &outcome.data,
+            outcome.ok,
+            outcome.duration_ms,
+        )
+        .await
+        .unwrap();
+    assert!(sessions
+        .load_session_events(&session.id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| matches!(
+            event.payload,
+            crate::session::db::SessionEventPayload::ToolExecute { ok: false, .. }
+        )));
+
+    let audit = crate::agent::audit::AuditLog::new(dir.path(), session_key);
+    audit.record(
+        &outcome.tool_name,
+        &outcome.tool_call_id,
+        &json!({}),
+        &outcome.data,
+        outcome.ok,
+        outcome.duration_ms,
+        "tool_runner:mock",
+    );
+    assert!(!audit.get_entries()[0].result_ok);
+}
+
 #[tokio::test]
 async fn delegated_denied_worker_status_reaches_every_sink() {
-    let provider = Arc::new(MockProvider::new(vec![crate::providers::base::LLMResponse {
-        content: Some("Denied verification recorded.".to_string()),
-        tool_calls: vec![],
-        finish_reason: FinishReason::Stop,
-        usage: HashMap::new(),
-    }]));
+    let provider = Arc::new(MockProvider::new(vec![
+        crate::providers::base::LLMResponse {
+            content: Some("Denied verification recorded.".to_string()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: HashMap::new(),
+        },
+    ]));
     let config = ToolRunnerConfig {
         provider,
         model: "mock".to_string(),
@@ -294,97 +394,59 @@ async fn delegated_denied_worker_status_reaches_every_sink() {
     .await;
     let outcome = &result.tool_results[0];
     assert!(outcome.data.starts_with("BLOCKED:"));
-    assert!(!outcome.ok, "a denied worker command is a failed execution");
+    assert_failed_worker_outcome_reaches_every_sink(outcome, &call, "cli:denied-worker").await;
+}
 
-    let mut receipt = Vec::new();
-    ContextBuilder::add_tool_result_with_status(
-        &mut receipt,
-        &outcome.tool_call_id,
-        &outcome.tool_name,
-        &outcome.data,
-        outcome.ok,
-    );
-    assert_eq!(receipt[0].get("ok").and_then(Value::as_bool), Some(false));
-
-    let event = crate::agent::audit::ToolEvent::CallEnd {
-        tool_name: outcome.tool_name.clone(),
-        tool_call_id: outcome.tool_call_id.clone(),
-        result_data: outcome.data.clone(),
-        ok: outcome.ok,
-        duration_ms: outcome.duration_ms,
-    };
-    assert!(matches!(
-        event,
-        crate::agent::audit::ToolEvent::CallEnd { ok: false, .. }
-    ));
-
+#[tokio::test]
+async fn delegated_diff_apply_failure_reaches_every_sink() {
     let dir = tempfile::tempdir().unwrap();
-    let sessions = crate::session::SessionDb::new(&dir.path().join("sessions.db"));
-    let session = sessions.create_session("cli:denied-worker").await;
-    assert!(matches!(
-        sessions
-            .store_tool_result_immutable_with_status(
-                &session.id,
-                &outcome.tool_call_id,
-                &outcome.tool_name,
-                &outcome.data,
-                outcome.ok,
-            )
-            .await,
-        crate::session::db::StoredResult::Stored { .. }
-    ));
-    assert_eq!(
-        sessions
-            .load_tool_result_with_status(&session.id, &outcome.tool_call_id)
-            .await,
-        Some((outcome.data.clone(), Some(false)))
-    );
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "original\n").unwrap();
+    let call = ToolCallRequest {
+        id: "call_patch_failure".to_string(),
+        name: "diff_apply".to_string(),
+        arguments: HashMap::from([
+            ("path".to_string(), json!(file_path)),
+            (
+                "diff".to_string(),
+                json!("--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-missing\n+replacement\n"),
+            ),
+        ]),
+    };
+    let config = ToolRunnerConfig {
+        provider: Arc::new(MockProvider::new(vec![
+            crate::providers::base::LLMResponse {
+                content: Some("Patch failure recorded.".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: HashMap::new(),
+            },
+        ])),
+        model: "mock".to_string(),
+        max_iterations: 2,
+        max_tokens: 256,
+        max_tool_result_chars: 4096,
+        short_circuit_chars: 0,
+        depth: 0,
+        cancellation_token: None,
+        verbatim: false,
+        budget: None,
+    };
 
-    sessions
-        .record_tool_pre_execute(
-            &session.id,
-            "request-denied",
-            1,
-            &outcome.tool_call_id,
-            &outcome.tool_name,
-            &call.arguments,
-            crate::session::db::ToolPreExecuteDecision::Ready,
-        )
-        .await
-        .unwrap();
-    sessions
-        .record_tool_execute(
-            &session.id,
-            "request-denied",
-            1,
-            &outcome.tool_call_id,
-            &outcome.data,
-            outcome.ok,
-            outcome.duration_ms,
-        )
-        .await
-        .unwrap();
-    assert!(sessions
-        .load_session_events(&session.id)
-        .await
-        .unwrap()
-        .iter()
-        .any(|event| matches!(
-            event.payload,
-            crate::session::db::SessionEventPayload::ToolExecute { ok: false, .. }
-        )));
-
-    let audit = crate::agent::audit::AuditLog::new(dir.path(), "denied-worker");
-    audit.record(
-        &outcome.tool_name,
-        &outcome.tool_call_id,
-        &json!({}),
-        &outcome.data,
-        outcome.ok,
-        outcome.duration_ms,
-        "tool_runner:mock",
+    let result = run_tool_loop(
+        &config,
+        &[call.clone()],
+        &ToolRegistry::new(),
+        "apply patch",
+    )
+    .await;
+    let outcome = &result.tool_results[0];
+    assert!(
+        outcome.data.starts_with("Patch failed:"),
+        "{}",
+        outcome.data
     );
-    assert_eq!(audit.get_entries()[0].result_ok, false);
+    assert_failed_worker_outcome_reaches_every_sink(outcome, &call, "cli:failed-patch").await;
 }
 
 #[tokio::test]
