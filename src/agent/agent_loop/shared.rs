@@ -52,12 +52,12 @@ use crate::cron::service::CronService;
 use crate::errors::{
     classify_retained_session_error, is_retryable_provider_error, RetainedSessionErrorKind,
 };
-use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
+use crate::providers::base::{FinishReason, LLMResponse, StreamChunk, ToolChoice};
 use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
 
 use crate::agent::agent_core::{
-    apply_compaction_result, ExpansionCheckpoint, PendingCompaction,
-    RuntimeCounters, SessionRetirement, SharedCoreHandle, SwappableCore, ToolPresentationMode,
+    apply_compaction_result, ExpansionCheckpoint, PendingCompaction, RuntimeCounters,
+    SessionRetirement, SharedCoreHandle, SwappableCore, ToolPresentationMode,
 };
 
 use super::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
@@ -73,8 +73,8 @@ use super::budget::{
     invalidate_prompt_cache_for_rewrite, overflow_trim_threshold,
     proactive_grounding_preserves_prefix_cache, send_cache_reset_marker, send_compaction_marker,
     send_retract_reply_marker, should_allow_checkpoint, should_inject_heartbeat_grounding,
-    strip_higgs_session_lease_control, OVERFLOW_RECOVERY_HEADROOM, OVERFLOW_RECOVERY_MARGIN,
-    MAX_OVERFLOW_RECOVERIES,
+    strip_higgs_session_lease_control, MAX_OVERFLOW_RECOVERIES, OVERFLOW_RECOVERY_HEADROOM,
+    OVERFLOW_RECOVERY_MARGIN,
 };
 use super::compaction::execute_lcm_compaction;
 use super::local_stream::{
@@ -104,6 +104,7 @@ enum ForcedToolRecoveryOutcome {
         original: LLMResponse,
         error: anyhow::Error,
     },
+    PersistenceError(anyhow::Error),
 }
 
 impl ProviderRequestRetryPolicy {
@@ -221,7 +222,11 @@ impl MessageLog {
     /// below the committed boundary after a sanctioned reset cleared it: those
     /// warm bytes were already paid for, so tail-scoped rewriting there is the
     /// designed unrestricted-cleanup behavior (see `agent::prefix_guard`).
-    pub(crate) fn edit_tail_from<R>(&mut self, start: usize, edit: impl FnOnce(&mut Vec<Value>) -> R) -> R {
+    pub(crate) fn edit_tail_from<R>(
+        &mut self,
+        start: usize,
+        edit: impl FnOnce(&mut Vec<Value>) -> R,
+    ) -> R {
         let mut tail = self.messages.split_off(start.min(self.messages.len()));
         let result = edit(&mut tail);
         self.messages.append(&mut tail);
@@ -959,7 +964,11 @@ impl TurnContext {
     /// Identity-managed rewriters (LCM checkpoint install, expansion
     /// publish/fallback) use [`MessageLog::install`] instead: their cache
     /// ceremony is custom (retirement snapshots, fingerprint publication).
-    pub(crate) fn rewrite_committed(&mut self, new: Vec<Value>, reason: CacheResetReason) -> PromptRewrite {
+    pub(crate) fn rewrite_committed(
+        &mut self,
+        new: Vec<Value>,
+        reason: CacheResetReason,
+    ) -> PromptRewrite {
         let warm = self
             .counters
             .prompt_cache_watermark
@@ -1401,7 +1410,16 @@ pub(crate) enum IterationPhase {
     /// Validate response, rescue pass, error check, token telemetry.
     Processing { response: LLMResponse },
     /// Route and execute tool calls (delegated or inline).
-    Executing { response: LLMResponse },
+    Executing {
+        response: LLMResponse,
+        routing: ToolRouting,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolRouting {
+    NeedsRouting,
+    AlreadyRouted,
 }
 
 /// Outcome of a single iteration, returned to the outer loop.
@@ -1411,8 +1429,12 @@ pub(crate) enum IterationOutcome {
     /// Validation failed and a retry hint was injected. Does NOT consume a
     /// main-loop iteration slot — the outer loop re-runs the same iteration.
     ValidationRetry,
-    /// Agent produced final content — use as response.
-    Finished(String),
+    /// Agent produced terminal content with its semantic outcome. The outer
+    /// loop assigns it only when a plan has no later step to run.
+    Complete {
+        content: String,
+        outcome: TurnOutcome,
+    },
     /// Error occurred — use as final content.
     Error(String),
 }
@@ -1860,7 +1882,7 @@ impl AgentLoopShared {
                     }
                     continue;
                 }
-                IterationOutcome::Finished(content) => {
+                IterationOutcome::Complete { content, outcome } => {
                     ctx.restore_thinking_budget();
                     consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
@@ -1887,10 +1909,8 @@ impl AgentLoopShared {
                     }
                     ctx.turn_outcome = if ctx.is_cancelled() {
                         TurnOutcome::Cancelled
-                    } else if ctx.turn_outcome == TurnOutcome::Empty || content.trim().is_empty() {
-                        TurnOutcome::Empty
                     } else {
-                        TurnOutcome::Finished
+                        outcome
                     };
                     ctx.final_content = content;
                     break;
@@ -1949,8 +1969,8 @@ impl AgentLoopShared {
                 IterationPhase::Processing { response } => {
                     self.step_process_response(ctx, response).await
                 }
-                IterationPhase::Executing { response } => {
-                    self.step_execute_tools(ctx, response).await
+                IterationPhase::Executing { response, routing } => {
+                    self.step_execute_tools(ctx, response, routing).await
                 }
             } {
                 StepResult::Next(next_phase) => phase = next_phase,
@@ -2097,13 +2117,14 @@ impl AgentLoopShared {
         // drops whole turns un-summarized and cold-prefills anyway — strictly
         // worse than installing now.
         let state = self.system_state.load_full();
-        let allow_checkpoint = should_allow_checkpoint(state.context_pressure, self.lcm_config.tau_hard)
-            || history_window_near(
-                ctx.messages.len(),
-                ctx.turn_count,
-                ctx.core.token_budget.max_context(),
-                ctx.core.max_history_turns,
-            );
+        let allow_checkpoint =
+            should_allow_checkpoint(state.context_pressure, self.lcm_config.tau_hard)
+                || history_window_near(
+                    ctx.messages.len(),
+                    ctx.turn_count,
+                    ctx.core.token_budget.max_context(),
+                    ctx.core.max_history_turns,
+                );
         self.install_pending_compaction(ctx, allow_checkpoint).await;
 
         StepResult::Next(IterationPhase::PreCall)
@@ -2124,8 +2145,7 @@ impl AgentLoopShared {
         // larger (protocol framing). Scale the raw target by the
         // raw/rendered ratio so the trim converges on what actually ships.
         let raw_est = TokenBudget::estimate_tokens(&ctx.messages).max(1);
-        let raw_target =
-            (raw_est as f64 * message_budget as f64 / rendered_before as f64) as usize;
+        let raw_target = (raw_est as f64 * message_budget as f64 / rendered_before as f64) as usize;
         let frozen_prefix = ctx
             .counters
             .prompt_cache_watermark
@@ -2189,7 +2209,11 @@ impl AgentLoopShared {
     /// Otherwise fall back to the smallest possible prompt cap (window minus
     /// the base response budget) with a fat margin. One-shot per turn: if the
     /// retry still overflows, fall through to the normal error path.
-    async fn attempt_overflow_recovery(&self, ctx: &mut TurnContext, error: &anyhow::Error) -> bool {
+    async fn attempt_overflow_recovery(
+        &self,
+        ctx: &mut TurnContext,
+        error: &anyhow::Error,
+    ) -> bool {
         if ctx.flow.retries.overflow_trim_recoveries >= MAX_OVERFLOW_RECOVERIES
             || !crate::errors::is_context_overflow_error(error)
         {
@@ -2208,12 +2232,14 @@ impl AgentLoopShared {
                 ((prompt_cap as f64 * OVERFLOW_RECOVERY_HEADROOM) as usize)
                     .saturating_sub(tool_cost)
             }
-            None => ((ctx
-                .core
-                .token_budget
-                .max_context()
-                .saturating_sub(ctx.core.max_tokens as usize)) as f64
-                * OVERFLOW_RECOVERY_MARGIN) as usize,
+            None => {
+                ((ctx
+                    .core
+                    .token_budget
+                    .max_context()
+                    .saturating_sub(ctx.core.max_tokens as usize)) as f64
+                    * OVERFLOW_RECOVERY_MARGIN) as usize
+            }
         };
         let before_messages = ctx.messages.len();
         if !self.apply_emergency_trim(ctx, message_budget).await {
@@ -2348,7 +2374,10 @@ impl AgentLoopShared {
         // Account for compaction pressure; soft work is only requested here.
         self.manage_compaction(ctx, tool_def_tokens).await;
         if ctx.is_cancelled() {
-            return StepResult::Done(IterationOutcome::Finished(String::new()));
+            return StepResult::Done(IterationOutcome::Complete {
+                content: String::new(),
+                outcome: TurnOutcome::Cancelled,
+            });
         }
 
         // Proactive grounding: inject relevant knowledge before LLM call.
@@ -2419,10 +2448,24 @@ impl AgentLoopShared {
                     return StepResult::Done(IterationOutcome::Continue);
                 }
                 crate::agent::router::PreflightResult::Break(msg) => {
-                    return StepResult::Done(IterationOutcome::Finished(msg));
+                    return StepResult::Done(IterationOutcome::Complete {
+                        content: msg,
+                        outcome: TurnOutcome::Finished,
+                    });
                 }
                 crate::agent::router::PreflightResult::Error(msg) => {
                     return StepResult::Done(IterationOutcome::Error(msg));
+                }
+                crate::agent::router::PreflightResult::Execute(tool_calls) => {
+                    return StepResult::Next(IterationPhase::Executing {
+                        response: LLMResponse {
+                            content: None,
+                            tool_calls,
+                            finish_reason: FinishReason::ToolCalls,
+                            usage: std::collections::HashMap::new(),
+                        },
+                        routing: ToolRouting::AlreadyRouted,
+                    });
                 }
                 crate::agent::router::PreflightResult::Passthrough => {
                     if tool_defs.is_empty() && !saved_tool_defs.is_empty() {
@@ -2456,8 +2499,7 @@ impl AgentLoopShared {
             .saturating_sub(effective_max_tokens as usize);
         let trim_threshold = overflow_trim_threshold(prompt_cap);
         let gate_tool_def_tokens = TokenBudget::estimate_tool_def_tokens(&tool_defs);
-        let estimated =
-            TokenBudget::estimate_tokens(&ctx.rendered_messages) + gate_tool_def_tokens;
+        let estimated = TokenBudget::estimate_tokens(&ctx.rendered_messages) + gate_tool_def_tokens;
         if trim_threshold > 0 && estimated > trim_threshold {
             warn!(
                 estimated_tokens = estimated,
@@ -2568,14 +2610,14 @@ impl AgentLoopShared {
                     .is_some_and(|s| s.contains(ORCHESTRATION_MODE_MARKER));
                 if !already_told {
                     ctx.messages.append_to_system(concat!(
-                            "\n\n## Orchestration Mode (Active)\n",
-                            "A trio routing system handles tool execution on your behalf.\n",
-                            "- You do NOT have direct tool access in this mode.\n",
-                            "- If a tool result appears as `[router:tool:X]` or `[specialist:X]`, ",
-                            "incorporate that result into your response.\n",
-                            "- If you need additional tool actions, describe them clearly ",
-                            "(e.g., \"I need to read src/main.rs\") and the next turn will route it.\n",
-                            "- Focus on reasoning, planning, and conversation.\n",
+                        "\n\n## Orchestration Mode (Active)\n",
+                        "A trio routing system handles tool execution on your behalf.\n",
+                        "- You do NOT have direct tool access in this mode.\n",
+                        "- If a tool result appears as `[router:tool:X]` or `[specialist:X]`, ",
+                        "incorporate that result into your response.\n",
+                        "- If you need additional tool actions, describe them clearly ",
+                        "(e.g., \"I need to read src/main.rs\") and the next turn will route it.\n",
+                        "- Focus on reasoning, planning, and conversation.\n",
                     ));
                 }
             } else {
@@ -3095,7 +3137,8 @@ impl AgentLoopShared {
                     );
                 let before_messages = ctx.messages.len();
                 let after_messages = trimmed_messages.len();
-                let rewrite = ctx.rewrite_committed(trimmed_messages, CacheResetReason::EmergencyTrim);
+                let rewrite =
+                    ctx.rewrite_committed(trimmed_messages, CacheResetReason::EmergencyTrim);
                 if let PromptRewrite::Reset { rotated } = rewrite {
                     warn!(
                         session = %ctx.session_key,
@@ -3263,9 +3306,12 @@ impl AgentLoopShared {
     // Step 3: Calling — invoke the LLM (streaming or blocking)
     // -----------------------------------------------------------------------
 
-    async fn persist_model_failure(ctx: &TurnContext, call_id: &str, detail: &str) {
-        if let Err(record_error) = ctx
-            .core
+    async fn persist_model_failure(
+        ctx: &TurnContext,
+        call_id: &str,
+        detail: &str,
+    ) -> anyhow::Result<()> {
+        ctx.core
             .sessions
             .record_model_failure(
                 &ctx.session_id,
@@ -3275,14 +3321,17 @@ impl AgentLoopShared {
                 detail,
             )
             .await
-        {
-            error!(
-                session = %ctx.session_key,
-                call_id,
-                error = %record_error,
-                "model_failure_replay_persist_failed"
-            );
-        }
+            .map_err(|record_error| {
+                error!(
+                    session = %ctx.session_key,
+                    call_id,
+                    error = %record_error,
+                    "model_failure_replay_persist_failed"
+                );
+                anyhow::anyhow!(
+                    "the provider failed, but its failure could not be recorded durably: {record_error}; provider error: {detail}"
+                )
+            })
     }
 
     /// Handle an LLM provider error: retry once if retryable, otherwise return error.
@@ -3396,21 +3445,21 @@ impl AgentLoopShared {
         ctx: &mut TurnContext,
         tool_defs_opt: Option<&[Value]>,
         max_tokens: u32,
-    ) {
+    ) -> anyhow::Result<()> {
         if !ctx.core.provider.supports_higgs_session_cache()
             || !matches!(
                 ctx.higgs_session_route,
                 HiggsSessionRoute::ActiveCompacted { .. }
             )
         {
-            return;
+            return Ok(());
         }
         let Some(plan) = ctx
             .staged_auto_expansion
             .as_ref()
             .and_then(AppliedAutoExpansion::retained_plan)
         else {
-            return;
+            return Ok(());
         };
         let max_prompt_tokens = ctx
             .core
@@ -3433,7 +3482,7 @@ impl AgentLoopShared {
                 &plan.checkpoint,
                 RetainedExpansionFailure::Unavailable,
             );
-            return;
+            return Ok(());
         };
         let sent_drop_ids = reservation.drop_ids().to_vec();
         let mut messages = ctx
@@ -3478,7 +3527,9 @@ impl AgentLoopShared {
                     &plan.checkpoint,
                     RetainedExpansionFailure::Unavailable,
                 );
-                return;
+                return Err(anyhow::anyhow!(
+                    "retained preflight request could not be recorded: {error}"
+                ));
             }
         };
         let result = ctx
@@ -3508,15 +3559,15 @@ impl AgentLoopShared {
                     )
                     .await
                 {
-                    Some(anyhow::anyhow!(
+                    return Err(anyhow::anyhow!(
                         "retained preflight response replay persistence failed: {error}"
-                    ))
+                    ));
                 } else {
                     response.outcome().err().map(anyhow::Error::new)
                 }
             }
             Err(error) => {
-                Self::persist_model_failure(ctx, &call_id, &error.to_string()).await;
+                Self::persist_model_failure(ctx, &call_id, &error.to_string()).await?;
                 Some(error)
             }
         };
@@ -3537,7 +3588,7 @@ impl AgentLoopShared {
                 "retained_expansion_preflight_failed"
             );
             Self::discard_selected_expansion_checkpoint(ctx, &plan.checkpoint, failure);
-            return;
+            return Ok(());
         }
         if !sent_drop_ids.is_empty() {
             ctx.counters
@@ -3563,6 +3614,7 @@ impl AgentLoopShared {
             plan.checkpoint,
             active_prompt_cache,
         );
+        Ok(())
     }
 
     /// Thinking budget calculation, inference_active flag, streaming path
@@ -3610,8 +3662,13 @@ impl AgentLoopShared {
                 None
             }
         };
-        self.prepare_retained_expansion_route(ctx, tool_defs_opt, max_tokens)
-            .await;
+        if let Err(error) = self
+            .prepare_retained_expansion_route(ctx, tool_defs_opt, max_tokens)
+            .await
+        {
+            counters.mark_inference_finished();
+            return StepResult::Done(IterationOutcome::Error(error.to_string()));
+        }
         // Expansion materialization is request-local until this call succeeds;
         // retries continue from the unchanged compacted logical conversation.
         let mut messages_for_llm = if let Some(staged) = &ctx.staged_auto_expansion {
@@ -3663,227 +3720,229 @@ impl AgentLoopShared {
             )
         };
         let prefill_estimate = match prompt_delta {
-                PromptDelta::First => prompt_total_estimate,
-                PromptDelta::AppendOnly { added_msgs } => {
-                    let tail_start = prompt_msg_count.saturating_sub(added_msgs);
-                    TokenBudget::estimate_tokens(&messages_for_llm[tail_start..])
-                }
-                PromptDelta::Diverged {
-                    first_divergent_msg,
-                    ..
-                } => {
-                    let tail_start = first_divergent_msg.min(prompt_msg_count);
-                    TokenBudget::estimate_tokens(&messages_for_llm[tail_start..])
-                }
-            };
-            let cache_marker = match prompt_delta {
-                PromptDelta::Diverged {
-                    first_divergent_msg,
-                    prev_msgs,
-                    new_msgs,
-                } => {
-                    // WARN (not info): the default subscriber filter is `warn`,
-                    // and a prefix divergence costs ~60s/turn on local — this must
-                    // be visible in the log without RUST_LOG=info. Self-suppresses
-                    // once the cause is fixed (the AppendOnly branch stays debug).
-                    //
-                    // After the trim/compaction rotation fixes, every sanctioned
-                    // rewrite clears the prompt fingerprint and returns
-                    // `PromptDelta::First`; reaching this `Diverged` branch means
-                    // the divergence is UNSANCTIONED — a message whose rendered
-                    // bytes changed across turns under the same higgs session id
-                    // (the `token_mismatch` class). `divergent_message_digest`
-                    // names the structural kind so the root cause is obvious.
-                    let digest = messages_for_llm
+            PromptDelta::First => prompt_total_estimate,
+            PromptDelta::AppendOnly { added_msgs } => {
+                let tail_start = prompt_msg_count.saturating_sub(added_msgs);
+                TokenBudget::estimate_tokens(&messages_for_llm[tail_start..])
+            }
+            PromptDelta::Diverged {
+                first_divergent_msg,
+                ..
+            } => {
+                let tail_start = first_divergent_msg.min(prompt_msg_count);
+                TokenBudget::estimate_tokens(&messages_for_llm[tail_start..])
+            }
+        };
+        let cache_marker = match prompt_delta {
+            PromptDelta::Diverged {
+                first_divergent_msg,
+                prev_msgs,
+                new_msgs,
+            } => {
+                // WARN (not info): the default subscriber filter is `warn`,
+                // and a prefix divergence costs ~60s/turn on local — this must
+                // be visible in the log without RUST_LOG=info. Self-suppresses
+                // once the cause is fixed (the AppendOnly branch stays debug).
+                //
+                // After the trim/compaction rotation fixes, every sanctioned
+                // rewrite clears the prompt fingerprint and returns
+                // `PromptDelta::First`; reaching this `Diverged` branch means
+                // the divergence is UNSANCTIONED — a message whose rendered
+                // bytes changed across turns under the same higgs session id
+                // (the `token_mismatch` class). `divergent_message_digest`
+                // names the structural kind so the root cause is obvious.
+                let digest = messages_for_llm
+                    .get(first_divergent_msg)
+                    .map(divergent_message_digest)
+                    .unwrap_or_else(|| "(out of range)".to_string());
+                // Diagnostic: dump the full rendered content of the
+                // divergent message and its neighbors so the exact
+                // byte change is visible in the log.
+                if let Some(prev_fp) = &prev_fingerprint {
+                    let prev_hash = prev_fp.msg_hash_at(first_divergent_msg);
+                    let new_hash = messages_for_llm
                         .get(first_divergent_msg)
-                        .map(divergent_message_digest)
-                        .unwrap_or_else(|| "(out of range)".to_string());
-                    // Diagnostic: dump the full rendered content of the
-                    // divergent message and its neighbors so the exact
-                    // byte change is visible in the log.
-                    if let Some(prev_fp) = &prev_fingerprint {
-                        let prev_hash = prev_fp.msg_hash_at(first_divergent_msg);
-                        let new_hash = messages_for_llm
-                            .get(first_divergent_msg)
-                            .map(prompt_fingerprint::hash_value);
-                        tracing::warn!(
-                            session = %ctx.session_key,
-                            at_msg = first_divergent_msg,
-                            prev_msgs,
-                            new_msgs,
-                            prev_hash = ?prev_hash,
-                            new_hash = ?new_hash,
-                            "divergence_hash_comparison"
-                        );
-                    }
-                    let dump_msg = |idx: usize, label: &str| {
-                        if let Some(m) = messages_for_llm.get(idx) {
-                            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-                            let content = m
-                                .get("content")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("(non-string)");
-                            tracing::warn!(
-                                session = %ctx.session_key,
-                                idx, label, role,
-                                content_len = content.len(),
-                                content_preview = %content.chars().take(200).collect::<String>(),
-                                "divergence_context_dump"
-                            );
-                        }
-                    };
-                    dump_msg(first_divergent_msg.saturating_sub(1), "prev_msg");
-                    dump_msg(first_divergent_msg, "divergent_msg");
-                    dump_msg(first_divergent_msg + 1, "next_msg");
-                    // Coarse class for the TUI footer. Extracted from the
-                    // divergent message's tags so the user sees
-                    // `cache reset · lcm summary @ msg N` instead of the
-                    // generic `cache reset · msg N`. Static strings only.
-                    let divergent_msg = messages_for_llm.get(first_divergent_msg);
-                    let class: &'static str = divergent_msg
-                        .map(|m| {
-                            if m.get("_lcm_summary")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false)
-                            {
-                                "lcm summary"
-                            } else if m.get("tool_call_id").is_some() {
-                                "tool result"
-                            } else if m
-                                .get("_synthetic")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false)
-                            {
-                                "synthetic"
-                            } else if m
-                                .get("_cache_replay")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false)
-                            {
-                                "cache-replay"
-                            } else {
-                                match m.get("role").and_then(|r| r.as_str()).unwrap_or("message") {
-                                    "assistant" => "assistant",
-                                    "user" => "user",
-                                    "system" => "system",
-                                    _ => "message",
-                                }
-                            }
-                        })
-                        .unwrap_or("unknown");
-                    counters.cache_diverged.fetch_add(1, Ordering::Relaxed);
+                        .map(prompt_fingerprint::hash_value);
                     tracing::warn!(
                         session = %ctx.session_key,
                         at_msg = first_divergent_msg,
                         prev_msgs,
                         new_msgs,
-                        prefill_estimate,
-                        class = %class,
-                        digest = %digest,
-                        "prompt_prefix_diverged — unsanctioned token_mismatch class; server re-prefills past this point"
+                        prev_hash = ?prev_hash,
+                        new_hash = ?new_hash,
+                        "divergence_hash_comparison"
                     );
-                    ControlMarker::CacheStatus(CacheStatus::Diverged {
-                        at: first_divergent_msg,
-                        prev: prev_msgs,
-                        messages: new_msgs,
-                        class,
-                    })
-                    .encode()
                 }
-                PromptDelta::AppendOnly { added_msgs } => {
-                    debug!(
-                        session = %ctx.session_key,
-                        added_msgs,
-                        prefill_estimate,
-                        "prompt_append_only"
-                    );
-                    ControlMarker::CacheStatus(CacheStatus::AppendOnly {
-                        added: added_msgs,
-                        messages: prompt_msg_count,
-                    })
-                    .encode()
-                }
-                PromptDelta::First => {
-                    // `First` means "no fingerprint to compare against". That
-                    // is turn one — OR a deliberate mid-session clear, which
-                    // costs exactly the same full re-prefill but used to be
-                    // reported as a fresh start and therefore never appeared
-                    // in the log at all. `take_cache_reset` tells the two
-                    // apart so a sanctioned reset is priced, not hidden.
-                    match counters.take_cache_reset(&ctx.session_key) {
-                        Some(reason) => {
-                            counters
-                                .cache_sanctioned_resets
-                                .fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(
-                                session = %ctx.session_key,
-                                reason,
-                                messages = prompt_msg_count,
-                                prefill_estimate,
-                                "prompt_cache_sanctioned_reset — prefix dropped on purpose; server re-prefills the whole context"
-                            );
-                        }
-                        None => debug!(
-                            session = %ctx.session_key,
-                            messages = prompt_msg_count,
-                            prefill_estimate,
-                            "prompt_cache_cold_start"
-                        ),
-                    }
-                    ControlMarker::CacheStatus(CacheStatus::First {
-                        messages: prompt_msg_count,
-                    })
-                    .encode()
-                }
-            };
-            if let Some(ref delta_tx) = ctx.text_delta_tx {
-                let _ = delta_tx.send(cache_marker);
-                if prefill_estimate > 0 {
-                    let _ = delta_tx
-                        .send(ControlMarker::PrefillEstimate(prefill_estimate as u64).encode());
-                }
-            }
-            // Tool-block divergence diagnostic. The message fingerprint above is
-            // blind to tool schemas by design, yet chat templates render the tool
-            // block at the prompt head — so a tool block that changes between turns
-            // busts the prefix cache invisibly (server re-prefills everything). This
-            // catches that case: WARN when the serialized tool array hash changes.
-            let mut tool_block_changed = false;
-            {
-                let tool_count = tool_defs_opt.map_or(0, |t| t.len());
-                let new_tool_hash = prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
-                let _transition = counters.lock_prompt_cache_transition();
-                let mut tool_store = counters.prompt_tool_hashes.lock();
-                if let Some(prev) = tool_store.get(&ctx.session_key) {
-                    if *prev != new_tool_hash {
-                        tool_block_changed = true;
+                let dump_msg = |idx: usize, label: &str| {
+                    if let Some(m) = messages_for_llm.get(idx) {
+                        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                        let content = m
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("(non-string)");
                         tracing::warn!(
                             session = %ctx.session_key,
-                            tool_count,
-                            prev_hash = prev,
-                            new_hash = new_tool_hash,
-                            "tool_block_changed — chat template re-renders tool head, busting prefix cache"
+                            idx, label, role,
+                            content_len = content.len(),
+                            content_preview = %content.chars().take(200).collect::<String>(),
+                            "divergence_context_dump"
                         );
                     }
+                };
+                dump_msg(first_divergent_msg.saturating_sub(1), "prev_msg");
+                dump_msg(first_divergent_msg, "divergent_msg");
+                dump_msg(first_divergent_msg + 1, "next_msg");
+                // Coarse class for the TUI footer. Extracted from the
+                // divergent message's tags so the user sees
+                // `cache reset · lcm summary @ msg N` instead of the
+                // generic `cache reset · msg N`. Static strings only.
+                let divergent_msg = messages_for_llm.get(first_divergent_msg);
+                let class: &'static str = divergent_msg
+                    .map(|m| {
+                        if m.get("_lcm_summary")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            "lcm summary"
+                        } else if m.get("tool_call_id").is_some() {
+                            "tool result"
+                        } else if m
+                            .get("_synthetic")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            "synthetic"
+                        } else if m
+                            .get("_cache_replay")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            "cache-replay"
+                        } else {
+                            match m.get("role").and_then(|r| r.as_str()).unwrap_or("message") {
+                                "assistant" => "assistant",
+                                "user" => "user",
+                                "system" => "system",
+                                _ => "message",
+                            }
+                        }
+                    })
+                    .unwrap_or("unknown");
+                counters.cache_diverged.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session = %ctx.session_key,
+                    at_msg = first_divergent_msg,
+                    prev_msgs,
+                    new_msgs,
+                    prefill_estimate,
+                    class = %class,
+                    digest = %digest,
+                    "prompt_prefix_diverged — unsanctioned token_mismatch class; server re-prefills past this point"
+                );
+                ControlMarker::CacheStatus(CacheStatus::Diverged {
+                    at: first_divergent_msg,
+                    prev: prev_msgs,
+                    messages: new_msgs,
+                    class,
+                })
+                .encode()
+            }
+            PromptDelta::AppendOnly { added_msgs } => {
+                debug!(
+                    session = %ctx.session_key,
+                    added_msgs,
+                    prefill_estimate,
+                    "prompt_append_only"
+                );
+                ControlMarker::CacheStatus(CacheStatus::AppendOnly {
+                    added: added_msgs,
+                    messages: prompt_msg_count,
+                })
+                .encode()
+            }
+            PromptDelta::First => {
+                // `First` means "no fingerprint to compare against". That
+                // is turn one — OR a deliberate mid-session clear, which
+                // costs exactly the same full re-prefill but used to be
+                // reported as a fresh start and therefore never appeared
+                // in the log at all. `take_cache_reset` tells the two
+                // apart so a sanctioned reset is priced, not hidden.
+                match counters.take_cache_reset(&ctx.session_key) {
+                    Some(reason) => {
+                        counters
+                            .cache_sanctioned_resets
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            session = %ctx.session_key,
+                            reason,
+                            messages = prompt_msg_count,
+                            prefill_estimate,
+                            "prompt_cache_sanctioned_reset — prefix dropped on purpose; server re-prefills the whole context"
+                        );
+                    }
+                    None => debug!(
+                        session = %ctx.session_key,
+                        messages = prompt_msg_count,
+                        prefill_estimate,
+                        "prompt_cache_cold_start"
+                    ),
                 }
-                tool_store.insert(ctx.session_key.to_string(), new_tool_hash);
+                ControlMarker::CacheStatus(CacheStatus::First {
+                    messages: prompt_msg_count,
+                })
+                .encode()
             }
-            // The presentation-MODE switch rotates in
-            // `freeze_final_tool_catalog`; this is the backstop for same-mode
-            // byte drift that path cannot see. The tool head renders above
-            // the messages, so under a warm retained session it is the same
-            // hazard as a message divergence: rotate instead of shipping
-            // into the guard. Runs outside the diagnostic block above — its
-            // transition lock is held to the block's end.
-            if tool_block_changed
-                && ctx.core.mode().is_local()
-                && ctx.core.provider.supports_higgs_session_cache()
-            {
-                counters
-                    .note_cache_reset(&ctx.session_key, CacheResetReason::ToolBlockChange.as_wire());
-                send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::ToolBlockChange);
-                counters.invalidate_prompt_cache(&ctx.session_key, true);
+        };
+        if let Some(ref delta_tx) = ctx.text_delta_tx {
+            let _ = delta_tx.send(cache_marker);
+            if prefill_estimate > 0 {
+                let _ =
+                    delta_tx.send(ControlMarker::PrefillEstimate(prefill_estimate as u64).encode());
             }
+        }
+        // Tool-block divergence diagnostic. The message fingerprint above is
+        // blind to tool schemas by design, yet chat templates render the tool
+        // block at the prompt head — so a tool block that changes between turns
+        // busts the prefix cache invisibly (server re-prefills everything). This
+        // catches that case: WARN when the serialized tool array hash changes.
+        let mut tool_block_changed = false;
+        {
+            let tool_count = tool_defs_opt.map_or(0, |t| t.len());
+            let new_tool_hash = prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
+            let _transition = counters.lock_prompt_cache_transition();
+            let mut tool_store = counters.prompt_tool_hashes.lock();
+            if let Some(prev) = tool_store.get(&ctx.session_key) {
+                if *prev != new_tool_hash {
+                    tool_block_changed = true;
+                    tracing::warn!(
+                        session = %ctx.session_key,
+                        tool_count,
+                        prev_hash = prev,
+                        new_hash = new_tool_hash,
+                        "tool_block_changed — chat template re-renders tool head, busting prefix cache"
+                    );
+                }
+            }
+            tool_store.insert(ctx.session_key.to_string(), new_tool_hash);
+        }
+        // The presentation-MODE switch rotates in
+        // `freeze_final_tool_catalog`; this is the backstop for same-mode
+        // byte drift that path cannot see. The tool head renders above
+        // the messages, so under a warm retained session it is the same
+        // hazard as a message divergence: rotate instead of shipping
+        // into the guard. Runs outside the diagnostic block above — its
+        // transition lock is held to the block's end.
+        if tool_block_changed
+            && ctx.core.mode().is_local()
+            && ctx.core.provider.supports_higgs_session_cache()
+        {
+            counters.note_cache_reset(
+                &ctx.session_key,
+                CacheResetReason::ToolBlockChange.as_wire(),
+            );
+            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::ToolBlockChange);
+            counters.invalidate_prompt_cache(&ctx.session_key, true);
+        }
         tracing::info!(
             target: "turn_timing",
             prefix_diag_ms = diag_t0.elapsed().as_millis() as u64,
@@ -3915,9 +3974,7 @@ impl AgentLoopShared {
             ..
         } = prompt_delta
         {
-            if ctx.core.mode().is_local()
-                && ctx.core.provider.supports_higgs_session_cache()
-            {
+            if ctx.core.mode().is_local() && ctx.core.provider.supports_higgs_session_cache() {
                 if ctx.iterations_used <= 1 {
                     warn!(
                         session = %ctx.session_key,
@@ -4104,7 +4161,14 @@ impl AgentLoopShared {
                 match tokio::time::timeout(timeout, stream_call).await {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
-                        Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
+                        if let Err(record_error) =
+                            Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await
+                        {
+                            counters.mark_inference_finished();
+                            return StepResult::Done(IterationOutcome::Error(
+                                record_error.to_string(),
+                            ));
+                        }
                         if Self::handle_retained_route_error(ctx, &e) {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
@@ -4125,7 +4189,13 @@ impl AgentLoopShared {
                     Err(_) => {
                         counters.mark_inference_finished();
                         let detail = local_no_stream_headers_error(timeout);
-                        Self::persist_model_failure(ctx, &model_call_id, &detail).await;
+                        if let Err(record_error) =
+                            Self::persist_model_failure(ctx, &model_call_id, &detail).await
+                        {
+                            return StepResult::Done(IterationOutcome::Error(
+                                record_error.to_string(),
+                            ));
+                        }
                         error!(
                             model = %ctx.core.model,
                             timeout_secs = timeout.as_secs(),
@@ -4139,7 +4209,14 @@ impl AgentLoopShared {
                 match stream_call.await {
                     Ok(s) => s,
                     Err(e) => {
-                        Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
+                        if let Err(record_error) =
+                            Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await
+                        {
+                            counters.mark_inference_finished();
+                            return StepResult::Done(IterationOutcome::Error(
+                                record_error.to_string(),
+                            ));
+                        }
                         if Self::handle_retained_route_error(ctx, &e) {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
@@ -4204,7 +4281,17 @@ impl AgentLoopShared {
                             None => std::time::Duration::ZERO,
                         };
                         let detail = local_no_stream_progress_error(timeout);
-                        Self::persist_model_failure(ctx, &model_call_id, &detail).await;
+                        if let Err(record_error) =
+                            Self::persist_model_failure(ctx, &model_call_id, &detail).await
+                        {
+                            if ctx.flow.content_was_streamed {
+                                send_retract_reply_marker(&ctx.text_delta_tx);
+                                ctx.flow.content_was_streamed = false;
+                            }
+                            return StepResult::Done(IterationOutcome::Error(
+                                record_error.to_string(),
+                            ));
+                        }
                         error!(
                             model = %ctx.core.model,
                             timeout_secs = timeout.as_secs(),
@@ -4305,25 +4392,44 @@ impl AgentLoopShared {
                     // Stream ended without Done — either cancelled or genuine error.
                     if ctx.is_cancelled() {
                         // Cancelled mid-stream — exit cleanly.
-                        Self::persist_model_failure(
+                        if let Err(record_error) = Self::persist_model_failure(
                             ctx,
                             &model_call_id,
                             "stream cancelled before terminal response",
                         )
-                        .await;
+                        .await
+                        {
+                            if ctx.flow.content_was_streamed {
+                                send_retract_reply_marker(&ctx.text_delta_tx);
+                                ctx.flow.content_was_streamed = false;
+                            }
+                            return StepResult::Done(IterationOutcome::Error(
+                                record_error.to_string(),
+                            ));
+                        }
                         emit_stream_abort_metrics(
                             ctx,
                             "The stream was cancelled before the backend returned a final response.",
                         );
-                        return StepResult::Done(IterationOutcome::Finished(String::new()));
+                        return StepResult::Done(IterationOutcome::Complete {
+                            content: String::new(),
+                            outcome: TurnOutcome::Cancelled,
+                        });
                     }
                     error!("LLM stream ended without Done");
-                    Self::persist_model_failure(
+                    if let Err(record_error) = Self::persist_model_failure(
                         ctx,
                         &model_call_id,
                         "stream ended without terminal response",
                     )
-                    .await;
+                    .await
+                    {
+                        if ctx.flow.content_was_streamed {
+                            send_retract_reply_marker(&ctx.text_delta_tx);
+                            ctx.flow.content_was_streamed = false;
+                        }
+                        return StepResult::Done(IterationOutcome::Error(record_error.to_string()));
+                    }
                     emit_stream_abort_metrics(
                         ctx,
                         "The LLM stream ended without a final response.",
@@ -4351,7 +4457,12 @@ impl AgentLoopShared {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await;
+                    if let Err(record_error) =
+                        Self::persist_model_failure(ctx, &model_call_id, &e.to_string()).await
+                    {
+                        counters.mark_inference_finished();
+                        return StepResult::Done(IterationOutcome::Error(record_error.to_string()));
+                    }
                     if Self::handle_retained_route_error(ctx, &e) {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Continue);
@@ -4385,6 +4496,10 @@ impl AgentLoopShared {
                 error = %record_error,
                 "model_response_replay_persist_failed"
             );
+            if ctx.flow.content_was_streamed {
+                send_retract_reply_marker(&ctx.text_delta_tx);
+                ctx.flow.content_was_streamed = false;
+            }
             return StepResult::Done(IterationOutcome::Error(
                 "I received a model response but could not record it durably, so I stopped before acting on it."
                     .to_string(),
@@ -4427,6 +4542,13 @@ impl AgentLoopShared {
             .await;
         let response = match recovery {
             ForcedToolRecoveryOutcome::Response(response) => response,
+            ForcedToolRecoveryOutcome::PersistenceError(error) => {
+                if ctx.flow.content_was_streamed {
+                    send_retract_reply_marker(&ctx.text_delta_tx);
+                    ctx.flow.content_was_streamed = false;
+                }
+                return StepResult::Done(IterationOutcome::Error(error.to_string()));
+            }
             ForcedToolRecoveryOutcome::ProviderError { original, error } => {
                 if Self::handle_retained_route_error(ctx, &error) {
                     if ctx.flow.content_was_streamed {
@@ -4543,12 +4665,9 @@ impl AgentLoopShared {
         {
             Ok(call_id) => call_id,
             Err(error) => {
-                return ForcedToolRecoveryOutcome::ProviderError {
-                    original: response,
-                    error: anyhow::anyhow!(
-                        "forced-tool recovery was not sent because replay persistence failed: {error}"
-                    ),
-                };
+                return ForcedToolRecoveryOutcome::PersistenceError(anyhow::anyhow!(
+                    "forced-tool recovery was not sent because replay persistence failed: {error}"
+                ));
             }
         };
         let recovered = ctx
@@ -4579,12 +4698,9 @@ impl AgentLoopShared {
                     )
                     .await
                 {
-                    return ForcedToolRecoveryOutcome::ProviderError {
-                        original: response,
-                        error: anyhow::anyhow!(
-                            "forced-tool recovery response could not be recorded: {error}"
-                        ),
-                    };
+                    return ForcedToolRecoveryOutcome::PersistenceError(anyhow::anyhow!(
+                        "forced-tool recovery response could not be recorded: {error}"
+                    ));
                 }
                 if !recovered.has_tool_calls() {
                     return ForcedToolRecoveryOutcome::Response(response);
@@ -4596,7 +4712,11 @@ impl AgentLoopShared {
                 ForcedToolRecoveryOutcome::Response(recovered)
             }
             Err(error) => {
-                Self::persist_model_failure(ctx, &call_id, &error.to_string()).await;
+                if let Err(record_error) =
+                    Self::persist_model_failure(ctx, &call_id, &error.to_string()).await
+                {
+                    return ForcedToolRecoveryOutcome::PersistenceError(record_error);
+                }
                 ForcedToolRecoveryOutcome::ProviderError {
                     original: response,
                     error,
@@ -4625,7 +4745,12 @@ impl AgentLoopShared {
         delegation_enabled = ctx.core.tool_delegation_config.enabled,
         n_tool_calls = response.tool_calls.len(),
     ))]
-    async fn step_execute_tools(&self, ctx: &mut TurnContext, response: LLMResponse) -> StepResult {
+    async fn step_execute_tools(
+        &self,
+        ctx: &mut TurnContext,
+        response: LLMResponse,
+        routing: ToolRouting,
+    ) -> StepResult {
         let counters = &self.core_handle.counters;
         // Reset the per-round dispatched-key record; set again only when tools
         // actually execute so a no-tool round can't leave a stale key behind.
@@ -4635,6 +4760,7 @@ impl AgentLoopShared {
             ctx,
             response.content.as_deref(),
             response.tool_calls.clone(),
+            routing,
         )
         .await
         {
@@ -4645,7 +4771,10 @@ impl AgentLoopShared {
             }
             crate::agent::router::RouteResult::Break(msg) => {
                 ctx.emit_pending_request_metrics(0);
-                return StepResult::Done(IterationOutcome::Finished(msg));
+                return StepResult::Done(IterationOutcome::Complete {
+                    content: msg,
+                    outcome: TurnOutcome::Finished,
+                });
             }
             crate::agent::router::RouteResult::Error(msg) => {
                 ctx.emit_pending_request_metrics(0);
@@ -5007,7 +5136,10 @@ impl AgentLoopShared {
 
         // Check cancellation between tool call iterations.
         if ctx.is_cancelled() {
-            return StepResult::Done(IterationOutcome::Finished(String::new()));
+            return StepResult::Done(IterationOutcome::Complete {
+                content: String::new(),
+                outcome: TurnOutcome::Cancelled,
+            });
         }
 
         ctx.flow.last_round_keys = dispatched_keys.clone();
@@ -5055,10 +5187,10 @@ impl AgentLoopShared {
 mod tests {
     use super::{
         advance_response_boundary, apply_auto_expansion_candidates, commit_staged_auto_expansion,
-        divergent_message_digest, materialize_auto_expansion, MessageLog,
+        divergent_message_digest, materialize_auto_expansion,
         proactive_grounding_preserves_prefix_cache, AppliedAutoExpansion,
-        AutoExpansionMaterializationKind, HiggsSessionRoute, PromptCacheSnapshot, ResponseBoundary,
-        RetainedExpansionFailure,
+        AutoExpansionMaterializationKind, HiggsSessionRoute, MessageLog, PromptCacheSnapshot,
+        ResponseBoundary, RetainedExpansionFailure,
     };
     use crate::agent::agent_core::{
         stable_higgs_session_id, ExpansionCheckpoint, RuntimeCounters, SessionRetirement,
@@ -5913,7 +6045,8 @@ mod tests {
                 (session_id.to_string(), std::sync::Arc::clone(&engine)),
             ])));
         let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
-        let mut logical = MessageLog::committed(vec![json!({"role": "user", "content": "compacted"})]);
+        let mut logical =
+            MessageLog::committed(vec![json!({"role": "user", "content": "compacted"})]);
         let rendered_pre = vec![json!({"role": "user", "content": "compacted"})];
         let mut rendered = rendered_pre.clone();
         let compacted_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&rendered);

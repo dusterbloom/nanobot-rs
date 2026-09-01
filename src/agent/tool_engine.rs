@@ -13,23 +13,17 @@
 //!
 //! Extracted from `agent_loop.rs` to isolate tool execution logic.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
-use tracing::{debug, info, instrument, warn, Instrument};
+use tracing::{debug, instrument, warn, Instrument};
 
 use crate::agent::agent_core::RuntimeCounters;
 use crate::agent::audit::ToolEvent;
 use crate::agent::context::ContextBuilder;
-use crate::agent::markers::{TOOL_RUNNER_OUTPUT_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX};
-use crate::agent::role_policy;
-use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
-use crate::providers::base::{LLMProvider, LLMResponse, ToolCallRequest};
-use crate::session::db::{
-    ModelCallPurpose, ReplayRecordingProvider, ToolPreExecuteDecision, TurnReplayRecorder,
-};
+use crate::providers::base::{LLMResponse, ToolCallRequest};
+use crate::session::db::ToolPreExecuteDecision;
 use std::sync::Arc;
 
 use super::agent_loop::{ResponseBoundary, TurnContext};
@@ -562,9 +556,7 @@ pub(crate) fn is_read_only_exec_command(command: Option<&str>) -> bool {
         ">", "tee ", "mv ", "cp ", "rm ", "dd ", "chmod", "chown", "mkdir", "touch", "sed -i",
         "sh ", "sh -c", "bash ", "eval ", "install ", "ln ",
     ];
-    let normalized: String = cmd
-        .replace("2>/dev/null", "")
-        .replace("2>&1", "");
+    let normalized: String = cmd.replace("2>/dev/null", "").replace("2>&1", "");
     if MUTATING_MARKERS
         .iter()
         .any(|marker| normalized.contains(marker))
@@ -664,13 +656,22 @@ pub(crate) async fn journal_tool_call_carrier(
     ctx.persist_pending_protocol_messages().await
 }
 
-/// Execute tool calls via the delegation (tool-runner) path.
+/// Route configured delegation through the same durable execution chokepoint.
 ///
-/// Returns `true` if delegation was used (caller should `continue` the main loop).
-/// Returns `false` if delegation couldn't proceed (caller should fall through to inline).
+/// Delegation used to run an independent tool loop that could execute an entire
+/// batch before raw/post-result persistence was checked. Keeping one executor
+/// makes every provider-initiated call obey the same carrier → pre → raw → post
+/// lifecycle and prevents later calls after a persistence failure.
 #[instrument(
     name = "execute_tools_delegated",
-    skip(ctx, counters, routed_tool_calls, response, delegation_provider, delegation_model),
+    skip(
+        ctx,
+        _counters,
+        routed_tool_calls,
+        response,
+        _delegation_provider,
+        _delegation_model
+    ),
     fields(
         tools = tracing::field::Empty,
         outcome = tracing::field::Empty,
@@ -678,482 +679,29 @@ pub(crate) async fn journal_tool_call_carrier(
 )]
 pub(crate) async fn execute_tools_delegated(
     ctx: &mut TurnContext,
-    counters: &RuntimeCounters,
+    _counters: &RuntimeCounters,
     routed_tool_calls: &[ToolCallRequest],
     response: &LLMResponse,
-    delegation_provider: &Option<Arc<dyn crate::providers::base::LLMProvider>>,
-    delegation_model: &Option<String>,
+    _delegation_provider: &Option<Arc<dyn crate::providers::base::LLMProvider>>,
+    _delegation_model: &Option<String>,
 ) -> bool {
-    let (tr_provider, tr_model) = match (delegation_provider.as_ref(), delegation_model.as_ref()) {
-        (Some(p), Some(m)) => (p.clone(), m.clone()),
-        _ => {
-            tracing::Span::current().record("outcome", "skipped_no_provider");
-            return false;
-        }
-    };
-    let replay = TurnReplayRecorder::new(
-        Arc::clone(&ctx.core.sessions),
-        ctx.session_id.clone(),
-        ctx.request_id.clone(),
-        ctx.turn_count,
-    );
-    let tr_provider: Arc<dyn LLMProvider> = Arc::new(ReplayRecordingProvider::new(
-        tr_provider,
-        replay,
-        ModelCallPurpose::ToolRunner,
-    ));
-
-    let tool_names_summary: String = routed_tool_calls
+    let tool_names_summary = routed_tool_calls
         .iter()
-        .map(|tc| tc.name.as_str())
+        .map(|call| call.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     tracing::Span::current().record("tools", &tool_names_summary.as_str());
 
-    debug!(
-        "Delegating {} tool calls to tool runner (model: {})",
-        routed_tool_calls.len(),
-        tr_model
-    );
-
-    // Detect [VERBATIM] marker: the main model is asking for
-    // raw tool output instead of a delegation summary.
-    let verbatim = response
-        .content
-        .as_ref()
-        .map(|c| c.contains("[VERBATIM]"))
-        .unwrap_or(false);
-    let same_local_model = ctx.core.mode().is_local()
-        && local_model_key(&tr_model) == local_model_key(&ctx.core.model);
-    let verbatim = verbatim || same_local_model;
-    if same_local_model {
-        debug!(
-            "Delegation model is the main local model ({}); skipping scratch-pad LLM analysis",
-            tr_model
-        );
-    }
-
-    // Delegation models (Qwen, Nemotron, Claude) typically have 8K+ context.
-    // Cap tool results to ~2000 tokens (~8000 chars) to allow meaningful content
-    // while leaving room for system prompt, tool calls, and response.
-    // Use the main model's limit only if it's already smaller.
-    let delegation_result_limit = ctx.core.max_tool_result_chars.min(8000);
-
-    let runner_config = ToolRunnerConfig {
-        provider: tr_provider.clone(),
-        model: tr_model.clone(),
-        max_iterations: ctx.core.tool_delegation_config.max_iterations,
-        max_tokens: ctx.core.tool_delegation_config.max_tokens,
-
-        max_tool_result_chars: delegation_result_limit,
-        short_circuit_chars: 200,
-        depth: 0,
-        cancellation_token: ctx.cancellation_token.clone(),
-        verbatim,
-        budget: {
-            let cost_budget = ctx.core.tool_delegation_config.cost_budget;
-            if cost_budget > 0.0 {
-                let prices = crate::agent::model_prices::ModelPrices::load().await;
-                Some(Budget::root_with_cost(
-                    ctx.core.tool_delegation_config.max_iterations,
-                    2,
-                    cost_budget,
-                    std::sync::Arc::new(prices),
-                ))
-            } else {
-                Some(Budget::root(
-                    ctx.core.tool_delegation_config.max_iterations,
-                    2,
-                ))
-            }
+    execute_tools_inline(ctx, routed_tool_calls, response).await;
+    tracing::Span::current().record(
+        "outcome",
+        if ctx.flow.infra_error.is_some() {
+            "persistence_error"
+        } else {
+            "ok"
         },
-    };
-
-    // Emit tool call start events for delegated calls.
-    if let Some(ref tx) = ctx.tool_event_tx {
-        for tc in routed_tool_calls {
-            // Keep enough of the arguments JSON that the REPL can recover the
-            // command/path for the persistent tool line (e.g. exec's command).
-            let preview: String = serde_json::to_string(&tc.arguments)
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect();
-            let _ = tx.send(ToolEvent::CallStart {
-                tool_name: tc.name.clone(),
-                tool_call_id: tc.id.clone(),
-                arguments_preview: preview,
-            });
-        }
-    }
-
-    // Build task description for the delegation model.
-    let tool_names: Vec<&str> = routed_tool_calls
-        .iter()
-        .map(|tc| tc.name.as_str())
-        .collect();
-    let instructions = response
-        .content
-        .as_deref()
-        .filter(|c| !c.trim().is_empty())
-        .map(|c| c.chars().take(400).collect::<String>())
-        .unwrap_or_else(|| ctx.user_content.chars().take(300).collect::<String>());
-    let task_desc = if ctx.core.tool_delegation_config.role_scoped_context_packs {
-        let task_state = format!(
-            "Tool lane execution\nPlanned tools: {}",
-            tool_names.join(", ")
-        );
-        role_policy::build_context_pack(
-            role_policy::Role::Main,
-            &instructions,
-            "(live turn; summary omitted)",
-            &task_state,
-            &ctx.tools.tool_names(),
-            2500,
-        )
-    } else {
-        format!(
-            "Instructions: {}\nTools to execute: {}",
-            instructions,
-            tool_names.join(", ")
-        )
-    };
-
-    // Taint pre-check: warn if any delegated call is sensitive while context is tainted.
-    for tc in routed_tool_calls {
-        if let Some(_spans) = ctx.taint_state.check_sensitive(&tc.name) {
-            warn!(
-                "TAINT WARNING: Executing sensitive tool '{}' (delegated) with tainted context from: {}",
-                tc.name,
-                ctx.taint_state.taint_summary()
-            );
-        }
-    }
-
-    let delegation_start = std::time::Instant::now();
-
-    for tc in routed_tool_calls {
-        if let Err(error) = ctx
-            .core
-            .sessions
-            .record_tool_pre_execute(
-                &ctx.session_id,
-                &ctx.request_id,
-                ctx.turn_count,
-                &tc.id,
-                &tc.name,
-                &tc.arguments,
-                ToolPreExecuteDecision::Ready,
-            )
-            .await
-        {
-            ctx.flow.infra_error = Some(format!(
-                "delegated tool {} was not started because its pre-execution decision could not be recorded: {error}",
-                tc.id
-            ));
-            return true;
-        }
-    }
-
-    let run_result =
-        tool_runner::run_tool_loop(&runner_config, routed_tool_calls, &ctx.tools, &task_desc).await;
-    let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
-
-    // Only mark unhealthy on actual provider/tool-runner errors.
-    let is_hard_failure = run_result.error.is_some();
-    if is_hard_failure && !run_result.tool_results.is_empty() {
-        let reason = format!(
-            "delegation model errored: {}",
-            run_result.error.as_deref().unwrap_or("unknown error")
-        );
-        let results_preview: String = run_result
-            .tool_results
-            .first()
-            .map(|outcome| {
-                format!(
-                    "[{}]: {}",
-                    outcome.tool_name,
-                    outcome.data.chars().take(200).collect::<String>()
-                )
-            })
-            .unwrap_or_default();
-        warn!(
-            "Delegation failed — {}. model={}, iterations={}, results={}, preview={}. \
-             Marking unhealthy. Restart servers or toggle /local to recover.",
-            reason,
-            tr_model,
-            run_result.iterations_used,
-            run_result.tool_results.len(),
-            results_preview,
-        );
-        counters.delegation_healthy.store(false, Ordering::Relaxed);
-    } else if delegation_elapsed_ms > 30_000 {
-        debug!(
-            "Delegation run was slow ({} ms) but succeeded — keeping provider healthy",
-            delegation_elapsed_ms,
-        );
-    } else if run_result.summary.is_none() && !run_result.tool_results.is_empty() {
-        debug!(
-            "Delegation returned no summary (model={}, iters={}), using results inline",
-            tr_model, run_result.iterations_used,
-        );
-    } else if !counters.delegation_healthy.load(Ordering::Relaxed) {
-        // Re-probe succeeded — server recovered!
-        info!("Delegation provider recovered — re-enabling delegation");
-        counters.delegation_healthy.store(true, Ordering::Relaxed);
-        counters
-            .delegation_retry_counter
-            .store(0, Ordering::Relaxed);
-    }
-
-    debug!(
-        "Tool runner completed: {} results in {} iterations",
-        run_result.tool_results.len(),
-        run_result.iterations_used
     );
-
-    // Add tool results from the runner to the main context.
-    let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
-    let routed_result_cap =
-        inline_hot_prompt_result_cap_for_ctx_batch(ctx, routed_tool_calls.len());
-
-    for tc in routed_tool_calls {
-        let routed_result = run_result
-            .tool_results
-            .iter()
-            .find(|outcome| outcome.tool_call_id == tc.id);
-        let full_data = routed_result
-            .map(|outcome| outcome.data.as_str())
-            .unwrap_or("(no result)");
-        let raw_ok = routed_result.map(|outcome| outcome.ok).unwrap_or(false);
-        // Implementation-exit timing as measured by the runner; 0 when the
-        // runner produced no outcome for this call.
-        let routed_duration_ms = routed_result
-            .map(|outcome| outcome.duration_ms)
-            .unwrap_or(0);
-        if let Err(error) = ctx
-            .core
-            .sessions
-            .record_tool_execute(
-                &ctx.session_id,
-                &ctx.request_id,
-                ctx.turn_count,
-                &tc.id,
-                full_data,
-                raw_ok,
-                routed_duration_ms,
-            )
-            .await
-        {
-            ctx.flow.infra_error = Some(format!(
-                "delegated tool execution result for {} could not be recorded: {error}",
-                tc.id
-            ));
-            return true;
-        }
-
-        let cap = routed_result_cap;
-        let mut injected = match store_then_render_tool_result(
-            &ctx.core.sessions,
-            &ctx.session_id,
-            &tc.id,
-            &tc.name,
-            &tc.arguments,
-            full_data,
-            raw_ok,
-            cap,
-        )
-        .await
-        {
-            Ok(rendered) => ctx.content_gate.admit_simple(&rendered).into_text(),
-            Err(sr) => {
-                abort_turn_on_stash_failure(ctx, &tc.id, &tc.name, &sr);
-                // Skip this iteration's post-stash shaping (the abort helper
-                // already pushed an ok:false receipt). The loop-level
-                // infra_error check in step_execute_tools finalizes the turn.
-                continue;
-            }
-        };
-        // Prepend the per-lease progress signal so the model can see
-        // remaining budget inline (B3 of the lease design — visible,
-        // deterministic, helps the model self-regulate instead of being
-        // interrupted). Recorded calls already incremented the counter,
-        // so this describes the call that produced this result.
-        let lease_signal = ctx.flow.lease.progress_signal();
-        injected = format!("{lease_signal}\n{injected}");
-
-        if ctx.core.provenance_config.enabled {
-            ctx.messages.with_draft(|draft| {
-                ContextBuilder::add_tool_result_immutable_with_status(
-                    draft, &tc.id, &tc.name, &injected, raw_ok,
-                )
-            });
-        } else {
-            ctx.messages.with_draft(|draft| {
-                ContextBuilder::add_tool_result_with_status(
-                    draft, &tc.id, &tc.name, &injected, raw_ok,
-                )
-            });
-        }
-        ctx.flow.tool_guard.record_result_with_status(
-            &tc.name,
-            &tc.arguments,
-            injected.clone(),
-            raw_ok,
-        );
-        ctx.used_tools.insert(tc.name.clone());
-        if let Err(error) = ctx.persist_pending_protocol_messages().await {
-            ctx.flow.infra_error = Some(format!(
-                "model-visible delegated tool result for {} could not be recorded: {error}",
-                tc.id
-            ));
-            return true;
-        }
-        let persisted_message_id = ctx
-            .messages
-            .iter()
-            .rev()
-            .find(|message| {
-                message.get("tool_call_id").and_then(Value::as_str) == Some(tc.id.as_str())
-            })
-            .and_then(|message| message.get("_db_id"))
-            .and_then(Value::as_i64);
-        let Some(persisted_message_id) = persisted_message_id else {
-            ctx.flow.infra_error = Some(format!(
-                "model-visible delegated tool result for {} was not durably persisted",
-                tc.id
-            ));
-            return true;
-        };
-        if let Err(error) = ctx
-            .core
-            .sessions
-            .record_tool_post_execute(
-                &ctx.session_id,
-                &ctx.request_id,
-                ctx.turn_count,
-                &tc.id,
-                &injected,
-                persisted_message_id,
-            )
-            .await
-        {
-            ctx.flow.infra_error = Some(format!(
-                "delegated tool post-execution result for {} could not be recorded: {error}",
-                tc.id
-            ));
-            return true;
-        }
-    }
-
-    // Inject the runner's summary so the main LLM knows what
-    // the tools found without needing full output.
-    let has_extra = run_result.tool_results.len() > routed_tool_calls.len();
-    if run_result.summary.is_some() || has_extra {
-        let summary_text = if has_extra {
-            let extra = tool_runner::format_results_for_context(
-                &run_result,
-                preview_max,
-                Some(&mut ctx.content_gate), // Wire ContentGate for budget-aware truncation
-            );
-            format!(
-                "[Tool runner executed {} additional calls]\n{}",
-                run_result.tool_results.len() - routed_tool_calls.len(),
-                extra
-            )
-        } else {
-            run_result.summary.clone().unwrap_or_default()
-        };
-        if !summary_text.is_empty() {
-            let prefix = if verbatim {
-                TOOL_RUNNER_OUTPUT_PREFIX
-            } else {
-                TOOL_RUNNER_SUMMARY_PREFIX
-            };
-            ctx.messages
-                .push_draft(crate::agent::markers::scaffold_user(format!(
-                    "{} {}",
-                    prefix, summary_text
-                )));
-            if let Err(error) = ctx.persist_pending_protocol_messages().await {
-                ctx.flow.infra_error = Some(format!(
-                    "delegated tool-runner summary could not be recorded: {error}"
-                ));
-                return true;
-            }
-        }
-    }
-
-    // Record learning + audit for all tool results.
-    let executor = format!("tool_runner:{}", tr_model);
-    for outcome in &run_result.tool_results {
-        let ok = outcome.ok;
-        let per_tool_ms = outcome.duration_ms;
-
-        // Only render CallEnd in the TUI for results that the caller asked
-        // for. Internal scratchpad calls the runner made on their own already
-        // roll up into the runner-summary user message — emitting a CallEnd
-        // for them produces a duplicate identical-duration block per tool.
-        if let Some(ref tx) = ctx.tool_event_tx {
-            if is_routed_call(&outcome.tool_call_id, routed_tool_calls) {
-                let _ = tx.send(ToolEvent::CallEnd {
-                    tool_name: outcome.tool_name.clone(),
-                    tool_call_id: outcome.tool_call_id.clone(),
-                    result_data: outcome.data.clone(),
-                    ok,
-                    duration_ms: per_tool_ms,
-                });
-            }
-        }
-
-        if let Some(ref audit) = ctx.audit {
-            let _ = audit.record(
-                &outcome.tool_name,
-                &outcome.tool_call_id,
-                &json!({}),
-                &outcome.data,
-                ok,
-                per_tool_ms,
-                &executor,
-            );
-        }
-
-        ctx.used_tools.insert(outcome.tool_name.clone());
-        ctx.turn_tool_entries
-            .push(crate::agent::audit::TurnToolEntry {
-                name: outcome.tool_name.clone(),
-                id: outcome.tool_call_id.clone(),
-                ok,
-                duration_ms: per_tool_ms,
-                result_chars: outcome.data.len(),
-            });
-
-        // Taint tracking: mark context tainted when a web tool ran via delegation.
-        // We don't have the original arguments here, so pass None for detail.
-        ctx.taint_state.mark_tainted(&outcome.tool_name, None);
-    }
-
-    // Behavioral response-boundary arming (mirrors execute_tools_inline).
-    // `response` is the main-model response that requested delegation.
-    let executed: Vec<&str> = run_result
-        .tool_results
-        .iter()
-        .map(|outcome| outcome.tool_name.as_str())
-        .collect();
-    if should_arm_boundary(response.content.as_deref(), &executed) {
-        ctx.flow.boundary = ResponseBoundary::Pending;
-    }
-
-    tracing::Span::current().record("outcome", "ok");
     true
-}
-
-/// Returns `true` when a delegated tool result corresponds to one of the
-/// caller's routed tool calls (rather than an internal scratchpad call the
-/// tool runner made on its own). The TUI should only render `CallEnd` for
-/// these — internal extras already roll up into the runner summary message.
-fn is_routed_call(tool_call_id: &str, routed_tool_calls: &[ToolCallRequest]) -> bool {
-    routed_tool_calls.iter().any(|tc| tc.id == tool_call_id)
 }
 
 /// Collects everything produced by a single tool execution, ready for
@@ -1449,9 +997,72 @@ async fn execute_single_tool(
     .await
 }
 
-/// Execute calls in provider order. Adjacent `ParallelSafe` runs overlap with
-/// bounded fan-out; every sequential tool is an ordering barrier. Each bounded
-/// `join_all` preserves carrier order even when calls complete out of order.
+fn tool_call_chunk_end(
+    calls: &[&ToolCallRequest],
+    start: usize,
+    tools: &crate::agent::tools::registry::ToolRegistry,
+) -> usize {
+    if tools.concurrency(&calls[start].name) != ToolConcurrency::ParallelSafe {
+        return start + 1;
+    }
+    let mut end = start + 1;
+    while end < calls.len()
+        && tools.concurrency(&calls[end].name) == ToolConcurrency::ParallelSafe
+        && end - start < MAX_PARALLEL_TOOL_CALLS
+    {
+        end += 1;
+    }
+    end
+}
+
+/// Execute exactly one lifecycle chunk: one sequential call or one bounded
+/// run of adjacent `ParallelSafe` calls. The caller persists every result
+/// before asking for the next chunk.
+async fn execute_tool_call_chunk(
+    calls: &[&ToolCallRequest],
+    start: usize,
+    tools: &crate::agent::tools::registry::ToolRegistry,
+    tool_event_tx: &Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
+    cancellation_token: &Option<tokio_util::sync::CancellationToken>,
+    tool_heartbeat_secs: u64,
+    taints: &[Option<String>],
+    replay_recorder: Option<&ToolReplayRecorder>,
+) -> (Vec<SingleToolResult>, usize) {
+    let end = tool_call_chunk_end(calls, start, tools);
+    if end == start + 1 && tools.concurrency(&calls[start].name) != ToolConcurrency::ParallelSafe {
+        let result = execute_single_tool(
+            calls[start],
+            tools,
+            tool_event_tx,
+            cancellation_token,
+            tool_heartbeat_secs,
+            taints[start].clone(),
+            replay_recorder,
+        )
+        .await;
+        return (vec![result], start + 1);
+    }
+
+    let futures = calls[start..end]
+        .iter()
+        .zip(taints[start..end].iter().cloned())
+        .map(|(tc, taint)| {
+            execute_single_tool(
+                tc,
+                tools,
+                tool_event_tx,
+                cancellation_token,
+                tool_heartbeat_secs,
+                taint,
+                replay_recorder,
+            )
+        });
+    (futures_util::future::join_all(futures).await, end)
+}
+
+/// Execute calls in provider order. Retained for focused concurrency tests;
+/// production uses the same chunk primitive and persists between chunks.
+#[cfg(test)]
 async fn execute_tool_calls_ordered(
     calls: &[&ToolCallRequest],
     tools: &crate::agent::tools::registry::ToolRegistry,
@@ -1465,47 +1076,19 @@ async fn execute_tool_calls_ordered(
     let mut start = 0;
 
     while start < calls.len() {
-        if tools.concurrency(&calls[start].name) == ToolConcurrency::ParallelSafe {
-            let mut end = start + 1;
-            while end < calls.len()
-                && tools.concurrency(&calls[end].name) == ToolConcurrency::ParallelSafe
-            {
-                end += 1;
-            }
-            for chunk_start in (start..end).step_by(MAX_PARALLEL_TOOL_CALLS) {
-                let chunk_end = (chunk_start + MAX_PARALLEL_TOOL_CALLS).min(end);
-                let futures = calls[chunk_start..chunk_end]
-                    .iter()
-                    .zip(taints[chunk_start..chunk_end].iter().cloned())
-                    .map(|(tc, taint)| {
-                        execute_single_tool(
-                            tc,
-                            tools,
-                            tool_event_tx,
-                            cancellation_token,
-                            tool_heartbeat_secs,
-                            taint,
-                            replay_recorder,
-                        )
-                    });
-                results.extend(futures_util::future::join_all(futures).await);
-            }
-            start = end;
-        } else {
-            results.push(
-                execute_single_tool(
-                    calls[start],
-                    tools,
-                    tool_event_tx,
-                    cancellation_token,
-                    tool_heartbeat_secs,
-                    taints[start].clone(),
-                    replay_recorder,
-                )
-                .await,
-            );
-            start += 1;
-        }
+        let (chunk, next) = execute_tool_call_chunk(
+            calls,
+            start,
+            tools,
+            tool_event_tx,
+            cancellation_token,
+            tool_heartbeat_secs,
+            &taints,
+            replay_recorder,
+        )
+        .await;
+        results.extend(chunk);
+        start = next;
     }
 
     results
@@ -1640,13 +1223,21 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_
     if ctx.core.provenance_config.enabled {
         ctx.messages.with_draft(|draft| {
             ContextBuilder::add_tool_result_immutable_with_status(
-                draft, &r.tool_id, &r.tool_name, &data, r.result.ok(),
+                draft,
+                &r.tool_id,
+                &r.tool_name,
+                &data,
+                r.result.ok(),
             )
         });
     } else {
         ctx.messages.with_draft(|draft| {
             ContextBuilder::add_tool_result_with_status(
-                draft, &r.tool_id, &r.tool_name, &data, r.result.ok(),
+                draft,
+                &r.tool_id,
+                &r.tool_name,
+                &data,
+                r.result.ok(),
             )
         });
     }
@@ -1926,51 +1517,61 @@ pub(crate) async fn execute_tools_inline(
         })
         .collect();
 
-    // All policy checks are complete and the assistant carrier is already
-    // durable. Record each ready decision before any tool implementation can
-    // produce a side effect. A storage failure aborts the batch fail-closed.
-    for tc in &allowed {
-        if let Err(record_error) = ctx
-            .core
-            .sessions
-            .record_tool_pre_execute(
-                &ctx.session_id,
-                &ctx.request_id,
-                ctx.turn_count,
-                &tc.id,
-                &tc.name,
-                &tc.arguments,
-                ToolPreExecuteDecision::Ready,
-            )
-            .await
-        {
-            ctx.flow.infra_error = Some(format!(
-                "tool {} was not started because its pre-execution decision could not be recorded: {record_error}",
-                tc.id
-            ));
-            return;
-        }
-    }
-
     let replay_recorder = ToolReplayRecorder {
         sessions: Arc::clone(&ctx.core.sessions),
         session_id: ctx.session_id.clone(),
         turn_request_id: ctx.request_id.clone(),
         turn_tag: ctx.turn_count,
     };
-    let ordered_results = execute_tool_calls_ordered(
-        &allowed,
-        &ctx.tools,
-        &ctx.tool_event_tx,
-        &ctx.cancellation_token,
-        ctx.core.tool_heartbeat_secs,
-        taints,
-        Some(&replay_recorder),
-    )
-    .await;
-    let result_cap = inline_hot_prompt_result_cap_for_ctx_batch(ctx, ordered_results.len());
-    for result in &ordered_results {
-        inject_tool_result(ctx, result, result_cap).await;
+    let result_cap = inline_hot_prompt_result_cap_for_ctx_batch(ctx, allowed.len());
+    let mut ordered_results = Vec::with_capacity(allowed.len());
+    let mut start = 0;
+    while start < allowed.len() {
+        let end = tool_call_chunk_end(&allowed, start, &ctx.tools);
+        // Record only the next execution chunk as Ready. If an earlier
+        // chunk's raw/model-visible/post result cannot be persisted, later
+        // sequential calls and later parallel chunks remain untouched.
+        for tc in &allowed[start..end] {
+            if let Err(record_error) = ctx
+                .core
+                .sessions
+                .record_tool_pre_execute(
+                    &ctx.session_id,
+                    &ctx.request_id,
+                    ctx.turn_count,
+                    &tc.id,
+                    &tc.name,
+                    &tc.arguments,
+                    ToolPreExecuteDecision::Ready,
+                )
+                .await
+            {
+                ctx.flow.infra_error = Some(format!(
+                    "tool {} was not started because its pre-execution decision could not be recorded: {record_error}",
+                    tc.id
+                ));
+                return;
+            }
+        }
+        let (chunk_results, next) = execute_tool_call_chunk(
+            &allowed,
+            start,
+            &ctx.tools,
+            &ctx.tool_event_tx,
+            &ctx.cancellation_token,
+            ctx.core.tool_heartbeat_secs,
+            &taints,
+            Some(&replay_recorder),
+        )
+        .await;
+        for result in &chunk_results {
+            inject_tool_result(ctx, result, result_cap).await;
+            if ctx.flow.infra_error.is_some() {
+                return;
+            }
+        }
+        ordered_results.extend(chunk_results);
+        start = next;
     }
 
     // Behavioral response-boundary arming. `parallel`/`sequential` hold only the
@@ -3153,33 +2754,6 @@ mod tests {
         assert!(results
             .iter()
             .all(|result| result.result.data().contains("cancelled")));
-    }
-
-    #[test]
-    fn test_is_routed_call_matches_routed_id() {
-        // A result whose id matches a routed tool call must be considered
-        // routed (so the TUI gets a CallEnd for it).
-        let routed = vec![make_tc("read_file", "tc_routed_1")];
-        assert!(is_routed_call("tc_routed_1", &routed));
-    }
-
-    #[test]
-    fn test_is_routed_call_skips_runner_scratchpad_id() {
-        // Tool runner internal scratchpad calls use synthetic ids like
-        // "sp0000001" (see tool_runner.rs). They must NOT be considered
-        // routed — otherwise every delegated tool call produces a duplicate
-        // CallEnd block in the TUI.
-        let routed = vec![make_tc("read_file", "tc_routed_1")];
-        assert!(!is_routed_call("sp0000001", &routed));
-        assert!(!is_routed_call("tc_other", &routed));
-    }
-
-    #[test]
-    fn test_is_routed_call_handles_multiple_routed() {
-        let routed = vec![make_tc("read_file", "id_a"), make_tc("exec", "id_b")];
-        assert!(is_routed_call("id_a", &routed));
-        assert!(is_routed_call("id_b", &routed));
-        assert!(!is_routed_call("id_c", &routed));
     }
 
     /// STEP 1 invariant test: the tool-result stash must be IMMUTABLE — a

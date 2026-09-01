@@ -21,7 +21,7 @@ use tracing::{debug, info, instrument, warn};
 
 use super::trace_store::{append_router_decision_trace, RouterDecisionTrace};
 use crate::agent::agent_core::SwappableCore;
-use crate::agent::agent_loop::TurnContext;
+use crate::agent::agent_loop::{ToolRouting, TurnContext};
 use crate::agent::context::ContextBuilder;
 use crate::agent::markers::{
     TOOL_ANALYSIS_FULL_OUTPUT_MARKER, TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
@@ -43,6 +43,16 @@ const ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS: usize = 220;
 const ROUTER_USER_MSG_TRACE_PREVIEW_CHARS: usize = 80;
 const ROUTER_TAIL_MAX_PAIRS: usize = 5;
 const SCRATCH_PAD_LOOKBACK_MESSAGES: usize = 10;
+
+/// Distinguishes a provider/router failure from loss of replay durability.
+/// Callers may recover from the former, but must fail closed on the latter.
+#[derive(Debug, thiserror::Error)]
+pub enum AuxiliaryCallError {
+    #[error("{0}")]
+    Persistence(String),
+    #[error("{0}")]
+    Call(String),
+}
 
 /// Per-domain ring buffer for specialist multi-turn memory.
 /// Stores compressed summaries of past specialist outputs so subsequent
@@ -210,37 +220,6 @@ pub fn build_conversation_tail(
     out
 }
 
-/// Truncate a tool result to fit in small model context windows.
-///
-/// If `data` exceeds `max_chars`, it is cut to that length and an annotation
-/// indicating the total size is appended. Short data is returned unchanged.
-pub(crate) fn truncate_tool_result(data: &str, max_chars: usize) -> String {
-    if data.len() > max_chars {
-        let truncated: String = data.chars().take(max_chars).collect();
-        format!(
-            "{}... [truncated, {} total chars]",
-            truncated,
-            data.chars().count()
-        )
-    } else {
-        data.to_string()
-    }
-}
-
-/// Extract semantic content from a tool result.
-///
-/// Tools like web_fetch return a JSON envelope with metadata (`status`,
-/// `extractor`, etc.) wrapping the actual content in a `text` field.
-/// Strip the envelope so the main model sees only readable content.
-fn extract_tool_content(data: &str) -> String {
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-        if let Some(text) = parsed.get("text").and_then(|t| t.as_str()) {
-            return text.to_string();
-        }
-    }
-    data.to_string()
-}
-
 /// Extract the first top-level JSON object from raw text.
 ///
 /// This tolerates wrappers like markdown fences while still requiring the
@@ -378,19 +357,13 @@ pub(crate) fn parse_lenient_router_decision(raw: &str) -> Option<role_policy::Ro
     }
 }
 
-const AUXILIARY_PERSISTENCE_ERROR: &str = "auxiliary replay persistence failed";
-
-fn is_auxiliary_persistence_error(error: &str) -> bool {
-    error.contains(AUXILIARY_PERSISTENCE_ERROR)
-}
-
 /// Router/specialist calls are part of the same replayable turn. Refuse the
 /// provider side effect when its exact request cannot be recorded first.
 async fn journal_aux_request(
     replay: Option<&TurnReplayRecorder>,
     purpose: ModelCallPurpose,
     request: &RecordedProviderRequest,
-) -> anyhow::Result<Option<String>> {
+) -> Result<Option<String>, AuxiliaryCallError> {
     let Some(replay) = replay else {
         return Ok(None);
     };
@@ -398,7 +371,7 @@ async fn journal_aux_request(
         .request(purpose, request)
         .await
         .map(Some)
-        .map_err(|error| anyhow::anyhow!("{AUXILIARY_PERSISTENCE_ERROR}: {error}"))
+        .map_err(|error| AuxiliaryCallError::Persistence(error.to_string()))
 }
 
 /// Close an auxiliary-lane journal entry after its provider call resolved.
@@ -406,7 +379,7 @@ async fn journal_aux_terminal(
     replay: &TurnReplayRecorder,
     call_id: &str,
     result: &anyhow::Result<crate::providers::base::LLMResponse>,
-) -> anyhow::Result<()> {
+) -> Result<(), AuxiliaryCallError> {
     match result {
         Ok(response) => {
             replay
@@ -415,7 +388,7 @@ async fn journal_aux_terminal(
         }
         Err(error) => replay.failure(call_id, &error.to_string()).await,
     }
-    .map_err(|error| anyhow::anyhow!("{AUXILIARY_PERSISTENCE_ERROR}: {error}"))
+    .map_err(|error| AuxiliaryCallError::Persistence(error.to_string()))
 }
 
 #[instrument(name = "request_strict_router_decision", skip(provider, router_pack, tool_names, replay), fields(
@@ -433,7 +406,7 @@ pub async fn request_strict_router_decision(
     tool_names: &str,
     max_tokens: u32,
     replay: Option<&TurnReplayRecorder>,
-) -> Result<role_policy::RouterDecision, String> {
+) -> Result<role_policy::RouterDecision, AuxiliaryCallError> {
     info!(role = "router", model = %model, "router_decision_start");
     // action=/target= are bare tokens ended by whitespace or a comma.
     fn take_token(pack: &str, key: &str) -> Option<String> {
@@ -551,8 +524,7 @@ pub async fn request_strict_router_decision(
             streaming: false,
         },
     )
-    .await
-    .map_err(|error| format!("router auxiliary request could not be recorded: {error}"))?;
+    .await?;
     let tool_result = provider
         .chat_with_tool_choice(
             &tool_messages,
@@ -569,9 +541,7 @@ pub async fn request_strict_router_decision(
         )
         .await;
     if let (Some(replay), Some(call_id)) = (replay, tool_call_id.as_deref()) {
-        journal_aux_terminal(replay, call_id, &tool_result)
-            .await
-            .map_err(|error| format!("router auxiliary result could not be recorded: {error}"))?;
+        journal_aux_terminal(replay, call_id, &tool_result).await?;
     }
     if let Ok(tool_resp) = tool_result {
         if let Some(tc) = tool_resp.tool_calls.first() {
@@ -640,8 +610,7 @@ pub async fn request_strict_router_decision(
             streaming: false,
         },
     )
-    .await
-    .map_err(|error| format!("router auxiliary request could not be recorded: {error}"))?;
+    .await?;
     let router_result = provider
         .chat(
             &router_messages,
@@ -654,11 +623,10 @@ pub async fn request_strict_router_decision(
         )
         .await;
     if let (Some(replay), Some(call_id)) = (replay, fallback_call_id.as_deref()) {
-        journal_aux_terminal(replay, call_id, &router_result)
-            .await
-            .map_err(|error| format!("router auxiliary result could not be recorded: {error}"))?;
+        journal_aux_terminal(replay, call_id, &router_result).await?;
     }
-    let router_resp = router_result.map_err(|e| format!("strict router call failed: {}", e))?;
+    let router_resp = router_result
+        .map_err(|e| AuxiliaryCallError::Call(format!("strict router call failed: {e}")))?;
     let raw_router_content = router_resp.content.unwrap_or_default();
     let raw = crate::agent::sanitize::sanitize_reasoning_output(&raw_router_content);
     let parsed = role_policy::parse_router_decision_strict(&raw)
@@ -694,13 +662,13 @@ pub async fn request_strict_router_decision(
             if let Some(from_pack) = parse_router_directive_pack(router_pack) {
                 return Ok(from_pack);
             }
-            Err(format!(
+            Err(AuxiliaryCallError::Call(format!(
                 "strict router parse failed: {}. raw={}",
                 e,
                 raw.chars()
                     .take(ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS)
                     .collect::<String>()
-            ))
+            )))
         }
     }
 }
@@ -730,7 +698,7 @@ pub(crate) async fn dispatch_specialist(
     messages: &[Value],
     schema_enabled: bool,
     replay: Option<&TurnReplayRecorder>,
-) -> Result<super::trace_store::DispatchRecord, String> {
+) -> Result<super::trace_store::DispatchRecord, AuxiliaryCallError> {
     let start = std::time::Instant::now();
     info!(role = "specialist", target = %target, "dispatch_specialist_start");
     let (specialist_provider, specialist_model) = match (
@@ -740,17 +708,19 @@ pub(crate) async fn dispatch_specialist(
         (Some(p), Some(m)) => (p.clone(), m.to_string()),
         _ => {
             tracing::Span::current().record("outcome", "error");
-            return Err(
+            return Err(AuxiliaryCallError::Call(
                 "Specialist lane requested by router but no specialist server is configured."
                     .to_string(),
-            );
+            ));
         }
     };
 
     let cb_key = format!("specialist:{}", specialist_model);
     if !counters.trio_circuit_breaker.lock().is_available(&cb_key) {
         tracing::Span::current().record("outcome", "error");
-        return Err(format!("circuit breaker open for {}", cb_key));
+        return Err(AuxiliaryCallError::Call(format!(
+            "circuit breaker open for {cb_key}"
+        )));
     }
     let conv_tail = build_conversation_tail(
         messages,
@@ -800,8 +770,7 @@ pub(crate) async fn dispatch_specialist(
             streaming: false,
         },
     )
-    .await
-    .map_err(|error| format!("specialist request could not be recorded: {error}"))?;
+    .await?;
     let specialist_result = specialist_provider
         .chat(
             &specialist_messages,
@@ -814,9 +783,7 @@ pub(crate) async fn dispatch_specialist(
         )
         .await;
     if let (Some(replay), Some(call_id)) = (replay, call_id.as_deref()) {
-        journal_aux_terminal(replay, call_id, &specialist_result)
-            .await
-            .map_err(|error| format!("specialist result could not be recorded: {error}"))?;
+        journal_aux_terminal(replay, call_id, &specialist_result).await?;
     }
     match specialist_result {
         Ok(sp_resp) => {
@@ -845,22 +812,20 @@ pub(crate) async fn dispatch_specialist(
         Err(e) => {
             counters.trio_circuit_breaker.lock().record_failure(&cb_key);
             tracing::Span::current().record("outcome", "error");
-            Err(format!("Specialist lane failed: {}", e))
+            Err(AuxiliaryCallError::Call(format!(
+                "Specialist lane failed: {e}"
+            )))
         }
     }
 }
 
-/// Dispatch a router decision to spawn a subagent.
-///
-/// Returns the formatted result string to inject as a user message.
-pub(crate) async fn dispatch_subagent(
-    tools: &ToolRegistry,
+fn subagent_tool_call(
+    turn_tag: u64,
     target: &str,
     router_args: &Value,
     user_content: &str,
     strict_local_only: bool,
-    tool_guard: &mut ToolGuard,
-) -> Result<String, String> {
+) -> Result<ToolCallRequest, String> {
     let mut params: HashMap<String, Value> = HashMap::new();
     params.insert("action".to_string(), json!("spawn"));
     if let Some(task) = router_args.get("task").and_then(|v| v.as_str()) {
@@ -877,12 +842,33 @@ pub(crate) async fn dispatch_subagent(
     if let Err(e) = policy::validate_spawn_args(&params) {
         return Err(e);
     }
-    if let Err(e) = tool_guard.allow("spawn", &params) {
-        warn!("{}", e);
-        return Ok(format!("[tool-guard] {}", e));
+    Ok(ToolCallRequest {
+        id: format!("router-{turn_tag}-subagent-spawn"),
+        name: "spawn".to_string(),
+        arguments: params,
+    })
+}
+
+fn pipeline_tool_call(
+    turn_tag: u64,
+    steps: Value,
+    ahead_by_k: Option<Value>,
+) -> Result<ToolCallRequest, String> {
+    let mut params = HashMap::new();
+    params.insert("action".to_string(), json!("pipeline"));
+    params.insert(
+        "steps".to_string(),
+        normalize_pipeline_steps_for_spawn(steps),
+    );
+    if let Some(value) = ahead_by_k {
+        params.insert("ahead_by_k".to_string(), value);
     }
-    let spawn_result = tools.execute("spawn", params).await;
-    Ok(format!("[router:subagent] {}", spawn_result.data()))
+    policy::validate_spawn_args(&params)?;
+    Ok(ToolCallRequest {
+        id: format!("router-{turn_tag}-pipeline-spawn"),
+        name: "spawn".to_string(),
+        arguments: params,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -899,24 +885,6 @@ pub(crate) fn specialist_preflight_result(
         PreflightResult::Continue
     } else {
         PreflightResult::Break(specialist_response.to_string())
-    }
-}
-
-/// Determine the PreflightResult for a successful subagent dispatch.
-/// Pure function — extracted for testability.
-pub(crate) fn subagent_preflight_result(subagent_result: &str) -> PreflightResult {
-    PreflightResult::Break(subagent_result.to_string())
-}
-
-/// Determine the PreflightResult for a successful tool dispatch.
-///
-/// If `specialist_synthesis` is `Some`, use the specialist's synthesized
-/// response. If `None` (specialist unavailable), fall back to the raw tool
-/// result. Pure function — extracted for testability.
-pub(crate) fn tool_preflight_result(specialist_synthesis: Option<String>) -> PreflightResult {
-    match specialist_synthesis {
-        Some(synthesized) => PreflightResult::Break(synthesized),
-        None => PreflightResult::Continue,
     }
 }
 
@@ -949,6 +917,9 @@ pub(crate) enum PreflightResult {
     Break(String),
     /// Replay infrastructure failed; terminate the turn as an error.
     Error(String),
+    /// Router selected ordinary registry calls; execute them through the
+    /// carrier and tool-engine lifecycle without routing them a second time.
+    Execute(Vec<ToolCallRequest>),
     /// No router intervention — fall through to normal processing.
     Passthrough,
 }
@@ -1092,10 +1063,10 @@ pub(crate) async fn router_preflight(
                 .record_success(&cb_key);
             d
         }
-        Err(e) => {
-            if is_auxiliary_persistence_error(&e) {
-                return PreflightResult::Error(e);
-            }
+        Err(AuxiliaryCallError::Persistence(error)) => {
+            return PreflightResult::Error(error);
+        }
+        Err(AuxiliaryCallError::Call(e)) => {
             warn!("[router] router call failed: {} — recording failure and falling through to main model", e);
             ctx.counters
                 .trio_circuit_breaker
@@ -1190,31 +1161,20 @@ pub(crate) async fn router_preflight(
                         ctx.core.tool_delegation_config.specialist_synthesis,
                     )
                 }
-                Err(e) => PreflightResult::Break(e),
+                Err(AuxiliaryCallError::Persistence(error)) => PreflightResult::Error(error),
+                Err(AuxiliaryCallError::Call(error)) => PreflightResult::Break(error),
             }
         }
         "subagent" => {
             tracing::Span::current().record("routing_decision", "subagent");
-            match dispatch_subagent(
-                &ctx.tools,
+            match subagent_tool_call(
+                ctx.turn_count,
                 &decision.target,
                 &decision.args,
                 &ctx.user_content,
                 ctx.strict_local_only,
-                &mut ctx.flow.tool_guard,
-            )
-            .await
-            {
-                Ok(text) => {
-                    if ctx.core.trace_log {
-                        let mut trace = base_trace.clone();
-                        trace.outcome = Some(text.clone());
-                        append_router_decision_trace(&trace);
-                    }
-                    ctx.messages
-                        .push_draft(crate::agent::markers::scaffold_user(text.clone()));
-                    subagent_preflight_result(&text)
-                }
+            ) {
+                Ok(call) => PreflightResult::Execute(vec![call]),
                 Err(e) => {
                     if ctx.core.trace_log {
                         let mut trace = base_trace.clone();
@@ -1241,46 +1201,12 @@ pub(crate) async fn router_preflight(
                         .collect::<HashMap<String, Value>>()
                 })
                 .unwrap_or_default();
-            if let Err(e) = ctx.flow.tool_guard.allow(&decision.target, &params_map) {
-                warn!("{}", e);
-                if ctx.core.trace_log {
-                    let mut trace = base_trace.clone();
-                    trace.outcome = Some(format!("BLOCKED: {}", e));
-                    append_router_decision_trace(&trace);
-                }
-                ctx.messages
-                    .push_draft(crate::agent::markers::scaffold_user(format!(
-                        "[tool-guard] {}",
-                        e
-                    )));
-                return PreflightResult::Continue;
-            }
-            let tr = ctx.tools.execute(&decision.target, params_map).await;
-            if ctx.core.trace_log {
-                let mut trace = base_trace.clone();
-                trace.outcome = Some(tr.data().to_string());
-                append_router_decision_trace(&trace);
-            }
-            let content = extract_tool_content(tr.data());
-            let truncated = truncate_tool_result(
-                &content,
-                ctx.core
-                    .tool_delegation_config
-                    .router_tuning
-                    .max_tool_result_chars,
-            );
-            // Cache-replay tagged: tool evidence sent to the model must survive
-            // session reload byte-identical, or the next turn's prompt prefix
-            // diverges and the server re-prefills everything.
-            ctx.messages
-                .push_draft(crate::agent::markers::scaffold_user(format!(
-                    "[router:tool:{}] The tool returned the following data. \
-                 Summarize it concisely for the user:\n\n{}",
-                    decision.target, truncated
-                )));
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some(decision.target.clone());
-            ctx.used_tools.insert(decision.target.clone());
-            tool_preflight_result(None)
+            PreflightResult::Execute(vec![ToolCallRequest {
+                id: format!("router-{}-tool-{}", ctx.turn_count, decision.target),
+                name: decision.target,
+                arguments: params_map,
+            }])
         }
         "respond" => {
             tracing::Span::current().record("routing_decision", "respond");
@@ -1308,60 +1234,16 @@ pub(crate) async fn router_preflight(
                 );
             };
 
-            let steps = normalize_pipeline_steps_for_spawn(steps);
-            let mut params = HashMap::new();
-            params.insert("action".to_string(), json!("pipeline"));
-            params.insert("steps".to_string(), steps);
-            if let Some(k) = decision
+            let ahead_by_k = decision
                 .args
                 .get("ahead_by_k")
                 .or_else(|| decision.args.get("aheadByK"))
-                .cloned()
-            {
-                params.insert("ahead_by_k".to_string(), k);
-            }
-
-            if let Err(e) = ctx.flow.tool_guard.allow("spawn", &params) {
-                warn!("{}", e);
-                if ctx.core.trace_log {
-                    let mut trace = base_trace.clone();
-                    trace.outcome = Some(format!("BLOCKED: {}", e));
-                    append_router_decision_trace(&trace);
-                }
-                ctx.messages
-                    .push_draft(crate::agent::markers::scaffold_user(format!(
-                        "[tool-guard] {}",
-                        e
-                    )));
-                return PreflightResult::Continue;
-            }
-
-            info!("[trio] pipeline action selected by router, executing spawn pipeline");
-            let tr = ctx.tools.execute("spawn", params).await;
-            if ctx.core.trace_log {
-                let mut trace = base_trace.clone();
-                trace.outcome = Some(tr.data().to_string());
-                append_router_decision_trace(&trace);
-            }
-            let content = extract_tool_content(tr.data());
-            let truncated = truncate_tool_result(
-                &content,
-                ctx.core
-                    .tool_delegation_config
-                    .router_tuning
-                    .max_tool_result_chars,
-            );
-            // Cache-replay tagged: pipeline evidence sent live must replay
-            // byte-identical on reload (warm-prefix contract).
-            ctx.messages
-                .push_draft(crate::agent::markers::scaffold_user(format!(
-                    "[router:pipeline] Pipeline execution result. \
-                 Summarize the completed steps and outcome for the user:\n\n{}",
-                    truncated
-                )));
+                .cloned();
             *ctx.counters.trio_metrics.tool_dispatched.lock() = Some("spawn:pipeline".to_string());
-            ctx.used_tools.insert("spawn".to_string());
-            PreflightResult::Continue
+            match pipeline_tool_call(ctx.turn_count, steps, ahead_by_k) {
+                Ok(call) => PreflightResult::Execute(vec![call]),
+                Err(error) => PreflightResult::Break(error),
+            }
         }
         _ => {
             tracing::Span::current().record("routing_decision", "unknown_passthrough");
@@ -1425,12 +1307,6 @@ pub(crate) fn duplicate_receipt(
     }
 }
 
-/// Determine the RouteResult for a successful subagent dispatch in route_tool_calls().
-/// Pure function — extracted for testability.
-pub(crate) fn subagent_route_result(subagent_result: &str) -> RouteResult {
-    RouteResult::Break(subagent_result.to_string())
-}
-
 fn canonicalize_proxy_execution(
     registry: &ToolRegistry,
     mut tc: ToolCallRequest,
@@ -1451,13 +1327,16 @@ pub(crate) async fn route_tool_calls(
     ctx: &mut TurnContext,
     response_content: Option<&str>,
     mut routed_tool_calls: Vec<ToolCallRequest>,
+    routing: ToolRouting,
 ) -> RouteResult {
     let mut router_decision: Option<role_policy::RouterDecision> = None;
     let mut router_decision_valid = false;
     let mut selected_plan: Option<toolplan::ToolPlan> = None;
     let available_tools = ctx.tools.tool_names();
 
-    if ctx.core.tool_delegation_config.strict_router_schema() {
+    if matches!(routing, ToolRouting::NeedsRouting)
+        && ctx.core.tool_delegation_config.strict_router_schema()
+    {
         let task_state = format!(
             "Main content: {}\nCandidate tool calls: {}",
             response_content.unwrap_or("(empty)"),
@@ -1537,10 +1416,10 @@ pub(crate) async fn route_tool_calls(
                     }
                     router_decision = Some(decision);
                 }
-                Err(e) => {
-                    if is_auxiliary_persistence_error(&e) {
-                        return RouteResult::Error(e);
-                    }
+                Err(AuxiliaryCallError::Persistence(error)) => {
+                    return RouteResult::Error(error);
+                }
+                Err(AuxiliaryCallError::Call(e)) => {
                     warn!("{}", e);
                 }
             }
@@ -1573,7 +1452,8 @@ pub(crate) async fn route_tool_calls(
     }
 
     // migrated from swappable().is_local — phase 09-03
-    if ctx.core.mode().is_local()
+    if matches!(routing, ToolRouting::NeedsRouting)
+        && ctx.core.mode().is_local()
         && role_policy::should_block_main_tool_calls(&ctx.core.tool_delegation_config.mode, true)
         && !router_decision_valid
     {
@@ -1674,28 +1554,21 @@ pub(crate) async fn route_tool_calls(
                             .push_draft(crate::agent::markers::scaffold_user(injected));
                         return specialist_route_result(&record.specialist_response);
                     }
-                    Err(e) if is_auxiliary_persistence_error(&e) => {
-                        return RouteResult::Error(e)
+                    Err(AuxiliaryCallError::Persistence(error)) => {
+                        return RouteResult::Error(error)
                     }
-                    Err(e) => return RouteResult::Break(e),
+                    Err(AuxiliaryCallError::Call(error)) => return RouteResult::Break(error),
                 }
             }
             ToolPlanAction::Subagent => {
-                match dispatch_subagent(
-                    &ctx.tools,
+                match subagent_tool_call(
+                    ctx.turn_count,
                     &plan.target,
                     &plan.args,
                     &ctx.user_content,
                     ctx.strict_local_only,
-                    &mut ctx.flow.tool_guard,
-                )
-                .await
-                {
-                    Ok(text) => {
-                        ctx.messages
-                            .push_draft(crate::agent::markers::scaffold_user(text.clone()));
-                        return subagent_route_result(&text);
-                    }
+                ) {
+                    Ok(call) => routed_tool_calls = vec![call],
                     Err(e) => return RouteResult::Break(e),
                 }
             }
@@ -1858,7 +1731,7 @@ pub(crate) async fn route_tool_calls(
                     "[system] Your last several tool calls were duplicates or blocked. \
                      You already have the data you need from your previous tool results. \
                      Do NOT call any more tools. Write your final answer now using the \
-                     information you gathered."
+                     information you gathered.",
                 );
                 if let Err(error) = ctx.persist_pending_protocol_messages().await {
                     return RouteResult::Error(format!(
@@ -1912,7 +1785,10 @@ mod tests {
         assert!(first.contains(progress));
 
         let repeat = duplicate_receipt("recall", 2, Some("found: PHASEONE data"), 22, progress);
-        assert!(!repeat.contains("found: PHASEONE data"), "repeat must not re-dump bytes");
+        assert!(
+            !repeat.contains("found: PHASEONE data"),
+            "repeat must not re-dump bytes"
+        );
         assert!(repeat.contains("duplicate recall call #2"));
         assert!(repeat.contains("Do NOT repeat this call"));
         assert!(repeat.contains(progress));
@@ -2616,56 +2492,6 @@ mod tests {
         assert_eq!(d.target, "write_file");
     }
 
-    // ── Tool result truncation ─────────────────────────────────────────────────
-
-    // RED: truncate_tool_result must cap long results to the provided max_chars limit.
-    // Use the router default value so preflight cannot stuff large tool output into the prompt.
-    #[test]
-    fn test_tool_result_truncation() {
-        let long_input: String = "x".repeat(20_000);
-        let result = truncate_tool_result(&long_input, 2400);
-        assert!(
-            result.len() <= 2500,
-            "truncated result must be at most ~2500 chars (2400 + annotation), got {}",
-            result.len()
-        );
-        assert!(
-            result.contains("truncated"),
-            "truncated result must contain the word 'truncated'"
-        );
-        assert!(
-            result.contains("20000 total chars"),
-            "truncated result must report original char count, got: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_tool_result_no_truncation_when_short() {
-        let short_input = "short result";
-        let result = truncate_tool_result(short_input, 2400);
-        assert_eq!(
-            result, short_input,
-            "short input must be returned unchanged"
-        );
-    }
-
-    #[test]
-    fn test_tool_result_truncation_custom_limit() {
-        let input: String = "a".repeat(500);
-        let result = truncate_tool_result(&input, 100);
-        assert!(
-            result.len() <= 200,
-            "truncated result must be at most ~200 chars (100 + annotation), got {}",
-            result.len()
-        );
-        assert!(result.contains("truncated"), "must contain 'truncated'");
-        assert!(
-            result.contains("500 total chars"),
-            "must report original size"
-        );
-    }
-
     // ── Turn isolation: preflight arms must return Break, not Continue ─────────
 
     #[test]
@@ -2689,38 +2515,23 @@ mod tests {
     }
 
     #[test]
-    fn test_subagent_arm_returns_break_not_continue() {
-        let result = subagent_preflight_result("Subagent research results...");
-        match result {
-            PreflightResult::Break(msg) => {
-                assert_eq!(msg, "Subagent research results...");
-            }
-            _ => panic!("subagent arm must return Break"),
-        }
+    fn test_subagent_selection_builds_spawn_call() {
+        let call =
+            subagent_tool_call(7, "coding", &json!({}), "inspect it", true).expect("spawn call");
+        assert_eq!(call.name, "spawn");
+        assert_eq!(call.id, "router-7-subagent-spawn");
+        assert_eq!(call.arguments.get("task"), Some(&json!("inspect it")));
+        assert_eq!(call.arguments.get("model"), Some(&json!("local")));
     }
 
     #[test]
-    fn test_tool_arm_returns_continue_when_no_synthesis() {
-        // Tool arm: when specialist is unavailable (None), should return Continue so the
-        // main LLM loop can summarize the injected tool result rather than returning raw JSON.
-        let result = tool_preflight_result(None);
-        assert!(
-            matches!(result, PreflightResult::Continue),
-            "tool arm with no synthesis must return Continue, not Break"
-        );
-    }
-
-    #[test]
-    fn test_tool_arm_with_specialist_returns_synthesized() {
-        let specialist_response = Some("Here are the top 5 HN stories...".to_string());
-        let result = tool_preflight_result(specialist_response);
-        match result {
-            PreflightResult::Break(msg) => {
-                assert_eq!(msg, "Here are the top 5 HN stories...");
-                assert!(!msg.contains("<html>"), "should NOT contain raw HTML");
-            }
-            _ => panic!("tool arm with specialist must return Break"),
-        }
+    fn test_pipeline_selection_builds_spawn_call() {
+        let call = pipeline_tool_call(9, json!([{"instruction": "inspect it"}]), Some(json!(2)))
+            .expect("pipeline spawn call");
+        assert_eq!(call.name, "spawn");
+        assert_eq!(call.id, "router-9-pipeline-spawn");
+        assert_eq!(call.arguments.get("ahead_by_k"), Some(&json!(2)));
+        assert_eq!(call.arguments["steps"][0]["prompt"], "inspect it");
     }
 
     // ── Turn isolation: route_tool_calls arms must return Break, not Continue ──
@@ -2743,27 +2554,6 @@ mod tests {
             }
             RouteResult::Error(error) => {
                 panic!("specialist route helper returned infrastructure error: {error}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_subagent_route_result_returns_break_not_continue() {
-        // The subagent arm in route_tool_calls() should return Break with the
-        // subagent result, NOT Continue.
-        let result = subagent_route_result("Subagent completed the research task...");
-        match result {
-            RouteResult::Break(msg) => {
-                assert_eq!(msg, "Subagent completed the research task...");
-            }
-            RouteResult::Continue => {
-                panic!("subagent route_tool_calls arm must return Break, not Continue");
-            }
-            RouteResult::Execute(_) => {
-                panic!("subagent route_tool_calls arm must return Break, not Execute");
-            }
-            RouteResult::Error(error) => {
-                panic!("subagent route helper returned infrastructure error: {error}");
             }
         }
     }
@@ -2808,44 +2598,6 @@ mod tests {
         assert_eq!(msg["_synthetic"], true);
         assert_eq!(msg["role"], "user");
         assert!(msg["content"].as_str().unwrap().starts_with("[specialist:"));
-    }
-
-    // ── extract_tool_content ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_extract_tool_content_json_with_text() {
-        let json = "{\"extractor\":\"readability\",\"status\":200,\"text\":\"# Hello World\\n\\nSome content here.\"}";
-        let result = extract_tool_content(json);
-        assert_eq!(result, "# Hello World\n\nSome content here.");
-    }
-
-    #[test]
-    fn test_extract_tool_content_plain_string() {
-        let plain = "Just a plain string result";
-        let result = extract_tool_content(plain);
-        assert_eq!(result, "Just a plain string result");
-    }
-
-    #[test]
-    fn test_extract_tool_content_json_without_text() {
-        let json = r#"{"status":200,"data":"something"}"#;
-        let result = extract_tool_content(json);
-        assert_eq!(result, json);
-    }
-
-    #[test]
-    fn test_tool_preflight_result_no_synthesis_returns_continue() {
-        let result = tool_preflight_result(None);
-        assert!(matches!(result, PreflightResult::Continue));
-    }
-
-    #[test]
-    fn test_tool_preflight_result_with_synthesis_returns_break() {
-        let result = tool_preflight_result(Some("Summary here".into()));
-        match result {
-            PreflightResult::Break(text) => assert_eq!(text, "Summary here"),
-            _ => panic!("Expected Break with synthesis text"),
-        }
     }
 
     // ── SpecialistMemory ──────────────────────────────────────────────────────

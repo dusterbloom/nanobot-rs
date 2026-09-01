@@ -22,6 +22,7 @@ use crate::agent::anti_drift;
 use crate::agent::protocol::{
     parse_textual_tool_calls, parse_xml_tool_calls, strip_textual_tool_calls, strip_xml_tool_calls,
 };
+use crate::agent::router::AuxiliaryCallError;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::validation;
 use crate::errors::ProviderError;
@@ -30,7 +31,8 @@ use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProv
 use crate::turn_stream::ControlMarker;
 
 use super::{
-    AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnContext, TurnOutcome,
+    AgentLoopShared, IterationOutcome, IterationPhase, StepResult, ToolRouting, TurnContext,
+    TurnOutcome,
 };
 
 async fn recorded_auxiliary_chat(
@@ -39,7 +41,7 @@ async fn recorded_auxiliary_chat(
     messages: &[Value],
     max_tokens: u32,
     temperature: f64,
-) -> anyhow::Result<LLMResponse> {
+) -> Result<LLMResponse, AuxiliaryCallError> {
     let request = RecordedProviderRequest {
         messages: messages.to_vec(),
         tools: None,
@@ -62,7 +64,11 @@ async fn recorded_auxiliary_chat(
             &request,
         )
         .await
-        .map_err(|error| anyhow::anyhow!("auxiliary model request was not recorded: {error}"))?;
+        .map_err(|error| {
+            AuxiliaryCallError::Persistence(format!(
+                "auxiliary model request was not recorded: {error}"
+            ))
+        })?;
     let result = ctx
         .core
         .provider
@@ -89,7 +95,9 @@ async fn recorded_auxiliary_chat(
                 )
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!("auxiliary model response was not recorded: {error}")
+                    AuxiliaryCallError::Persistence(format!(
+                        "auxiliary model response was not recorded: {error}"
+                    ))
                 })?;
             Ok(response)
         }
@@ -105,11 +113,11 @@ async fn recorded_auxiliary_chat(
                 )
                 .await
                 .map_err(|record_error| {
-                    anyhow::anyhow!(
+                    AuxiliaryCallError::Persistence(format!(
                         "auxiliary model failure was not recorded: {record_error}; provider error: {error}"
-                    )
+                    ))
                 })?;
-            Err(error)
+            Err(AuxiliaryCallError::Call(error.to_string()))
         }
     }
 }
@@ -549,7 +557,10 @@ impl AgentLoopShared {
                         *content = stripped;
                     }
                 }
-                StepResult::Next(IterationPhase::Executing { response })
+                StepResult::Next(IterationPhase::Executing {
+                    response,
+                    routing: ToolRouting::NeedsRouting,
+                })
             }
 
             ResponseKind::Text(content) => {
@@ -667,7 +678,10 @@ impl AgentLoopShared {
                     ctx.flow.content_was_streamed = true;
                 }
                 send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
-                StepResult::Done(IterationOutcome::Finished(content))
+                StepResult::Done(IterationOutcome::Complete {
+                    content,
+                    outcome: TurnOutcome::Finished,
+                })
             }
 
             ResponseKind::ValidationError { error, raw_content } => {
@@ -694,15 +708,27 @@ impl AgentLoopShared {
             }
 
             ResponseKind::Truncated(partial) => {
-                let full = self.handle_truncated(ctx, &response, partial).await;
-                match full.trim() {
-                    "" => {
-                        ctx.turn_outcome = TurnOutcome::Empty;
-                        StepResult::Done(IterationOutcome::Finished(String::new()))
+                let full = match self.handle_truncated(ctx, &response, partial).await {
+                    Ok(full) => full,
+                    Err(error) => {
+                        if ctx.flow.content_was_streamed {
+                            send_retract_reply(&ctx.text_delta_tx);
+                            ctx.flow.content_was_streamed = false;
+                        }
+                        return StepResult::Done(IterationOutcome::Error(error.to_string()));
                     }
+                };
+                match full.trim() {
+                    "" => StepResult::Done(IterationOutcome::Complete {
+                        content: String::new(),
+                        outcome: TurnOutcome::Empty,
+                    }),
                     _ => {
                         send_finish_reason(&ctx.text_delta_tx, "stop");
-                        StepResult::Done(IterationOutcome::Finished(full))
+                        StepResult::Done(IterationOutcome::Complete {
+                            content: full,
+                            outcome: TurnOutcome::Finished,
+                        })
                     }
                 }
             }
@@ -719,9 +745,11 @@ impl AgentLoopShared {
                 );
                 let content =
                     "I couldn't produce a response in this turn. Please try again.".to_string();
-                ctx.turn_outcome = TurnOutcome::Empty;
                 send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
-                StepResult::Done(IterationOutcome::Finished(content))
+                StepResult::Done(IterationOutcome::Complete {
+                    content,
+                    outcome: TurnOutcome::Empty,
+                })
             }
         }
     }
@@ -902,14 +930,14 @@ impl AgentLoopShared {
         ctx: &mut TurnContext,
         original_response: &LLMResponse,
         mut accumulated: String,
-    ) -> String {
+    ) -> Result<String, AuxiliaryCallError> {
         let counters = &self.core_handle.counters;
         if ctx.core.mode().is_local() {
             info!(
                 finish_reason = %original_response.finish_reason,
                 "auto_continue_skipped_local: preserving prefix cache instead of issuing hidden Continue prompt"
             );
-            return accumulated;
+            return Ok(accumulated);
         }
 
         // Voice/TTS turns cap continuations hard: a rambling local model would
@@ -988,14 +1016,17 @@ impl AgentLoopShared {
                     accumulated.push_str(&continuation);
                     finish_reason = cont_response.finish_reason;
                 }
-                Err(e) => {
-                    warn!("auto_continue: continuation call failed: {}", e);
+                Err(AuxiliaryCallError::Persistence(error)) => {
+                    return Err(AuxiliaryCallError::Persistence(error));
+                }
+                Err(AuxiliaryCallError::Call(error)) => {
+                    warn!("auto_continue: continuation call failed: {}", error);
                     break;
                 }
             }
         }
 
-        accumulated
+        Ok(accumulated)
     }
 
     // -----------------------------------------------------------------------
@@ -1033,12 +1064,18 @@ impl AgentLoopShared {
                     let content = r.content.unwrap_or_default();
                     if !content.trim().is_empty() {
                         send_finish_reason(&ctx.text_delta_tx, r.finish_reason.wire_str());
-                        return StepResult::Done(IterationOutcome::Finished(content));
+                        return StepResult::Done(IterationOutcome::Complete {
+                            content,
+                            outcome: TurnOutcome::Finished,
+                        });
                     }
                     // Rescue also empty — fall through to thinking-off retry.
                 }
-                Err(e) => {
-                    warn!("Finalize rescue call failed: {}", e);
+                Err(AuxiliaryCallError::Persistence(error)) => {
+                    return StepResult::Done(IterationOutcome::Error(error));
+                }
+                Err(AuxiliaryCallError::Call(error)) => {
+                    warn!("Finalize rescue call failed: {}", error);
                 }
             }
         }
@@ -1063,9 +1100,11 @@ impl AgentLoopShared {
             "empty_llm_response: all recovery attempts exhausted, injecting fallback"
         );
         let content = "I couldn't produce a response in this turn. Please try again.".to_string();
-        ctx.turn_outcome = TurnOutcome::Empty;
         send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
-        StepResult::Done(IterationOutcome::Finished(content))
+        StepResult::Done(IterationOutcome::Complete {
+            content,
+            outcome: TurnOutcome::Empty,
+        })
     }
 
     // -----------------------------------------------------------------------

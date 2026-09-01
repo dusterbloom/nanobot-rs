@@ -259,10 +259,109 @@ async fn router_journal_failure_prevents_auxiliary_provider_call() {
     )
     .await;
 
-    assert!(decision
-        .expect_err("routing must fail closed when its request cannot be recorded")
-        .contains("could not be recorded"));
+    assert!(matches!(
+        decision,
+        Err(crate::agent::router::AuxiliaryCallError::Persistence(_))
+    ));
     assert_eq!(llm.call_count(), 0);
+}
+
+#[tokio::test]
+async fn provider_error_with_persistence_words_remains_call_error() {
+    // The former string-prefix classifier treated provider-controlled text as
+    // an infrastructure failure. The typed carrier must classify by origin.
+    let provider = RetryableFailureProvider {
+        name: "router".to_string(),
+        message: "auxiliary replay persistence failed: provider-authored text".to_string(),
+        call_count: std::sync::atomic::AtomicU32::new(0),
+    };
+
+    let result = request_strict_router_decision(
+        &provider,
+        "router",
+        "route this",
+        false,
+        0.2,
+        1.0,
+        "read_file",
+        128,
+        None,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(crate::agent::router::AuxiliaryCallError::Call(error))
+            if error.contains("auxiliary replay persistence failed")
+    ));
+    assert_eq!(
+        provider
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+#[tokio::test]
+async fn strict_router_preflight_tool_uses_durable_tool_lifecycle() {
+    let side_effect_dir = tempfile::tempdir().unwrap();
+    let side_effect_path = side_effect_dir.path().join("router-must-not-write.txt");
+    let router_body = json!({
+        "action": "tool",
+        "target": "write_file",
+        "args": {
+            "path": side_effect_path.to_string_lossy().to_string(),
+            "content": "forbidden"
+        },
+        "confidence": 0.99
+    })
+    .to_string();
+    let main = Arc::new(SequenceProvider::new("offline-main", vec!["must not run"]));
+    // SequenceProvider emits content rather than native tool calls, so the
+    // strict router consumes its text-fallback response on the second call.
+    let router = Arc::new(SequenceProvider::new(
+        "offline-router",
+        vec![&router_body, &router_body],
+    ));
+    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+        "offline-specialist",
+        "specialist unused",
+    ));
+    let (agent_loop, workspace) = build_trio_offline_harness(
+        main.clone() as Arc<dyn LLMProvider>,
+        router.clone() as Arc<dyn LLMProvider>,
+        specialist,
+    );
+    let session_key = format!("router-tool-lifecycle-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_router_tool_pre_execute \
+             BEFORE INSERT ON session_events WHEN NEW.event_kind = 'tool_pre_execute' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic router tool pre-execute failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("write the routed file", &session_key, "test", "offline")
+        .await;
+
+    assert!(response.contains("pre-execution"), "{response:?}");
+    assert_eq!(router.call_count(), 2);
+    assert_eq!(main.call_count(), 0);
+    assert!(!side_effect_path.exists());
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("router lifecycle session");
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "error"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 /// Real-provider trio probe.
@@ -2312,6 +2411,38 @@ struct FailOnceThenResponseProvider {
     call_count: std::sync::atomic::AtomicU32,
 }
 
+struct RetryableFailureProvider {
+    name: String,
+    message: String,
+    call_count: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait]
+impl LLMProvider for RetryableFailureProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(crate::errors::ProviderError::ServerError {
+            status: 503,
+            message: self.message.clone(),
+        }
+        .into())
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+}
+
 impl FailOnceThenResponseProvider {
     fn new(name: &str, response: crate::providers::base::LLMResponse) -> Self {
         Self {
@@ -2586,6 +2717,22 @@ fn build_local_inline_harness_with_iters(
     main: Arc<dyn LLMProvider>,
     max_iterations: u32,
 ) -> (AgentLoop, std::path::PathBuf) {
+    build_local_harness_with_runtime_options(
+        main,
+        max_iterations,
+        crate::config::schema::ReasoningConfig::default(),
+        ToolDelegationConfig::default(),
+        None,
+    )
+}
+
+fn build_local_harness_with_runtime_options(
+    main: Arc<dyn LLMProvider>,
+    max_iterations: u32,
+    reasoning_config: crate::config::schema::ReasoningConfig,
+    tool_delegation: ToolDelegationConfig,
+    delegation_provider: Option<Arc<dyn LLMProvider>>,
+) -> (AgentLoop, std::path::PathBuf) {
     let workspace = tempfile::tempdir().unwrap().keep();
     let core = build_swappable_core(SwappableCoreConfig {
         provider: main,
@@ -2606,14 +2753,14 @@ fn build_local_inline_harness_with_iters(
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        tool_delegation: ToolDelegationConfig::default(),
+        tool_delegation,
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider: None,
+        delegation_provider,
         specialist_provider: None,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        reasoning_config,
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
@@ -7530,6 +7677,7 @@ async fn test_read_after_write_same_turn_is_not_blocked_by_stale_receipt() {
             name: "read_file".to_string(),
             arguments: read_args,
         }],
+        crate::agent::agent_loop::ToolRouting::NeedsRouting,
     )
     .await;
 
@@ -7754,6 +7902,11 @@ async fn turn_finish_journal_failure_still_returns_the_reply() {
         }),
         "the reply must remain in persisted history despite the journal failure"
     );
+    let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
+    assert!(matches!(
+        replay.availability,
+        crate::session::db::ReplayAvailability::Incomplete { .. }
+    ));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -7769,8 +7922,7 @@ async fn empty_provider_content_persists_empty_outcome() {
             usage: HashMap::new(),
         }],
     ));
-    let (agent_loop, workspace) =
-        build_local_inline_harness(provider as Arc<dyn LLMProvider>);
+    let (agent_loop, workspace) = build_local_inline_harness(provider as Arc<dyn LLMProvider>);
     let session_key = format!("empty-outcome-{}", uuid::Uuid::new_v4());
 
     let response = agent_loop
@@ -7832,6 +7984,206 @@ async fn cancelled_turn_persists_cancelled_outcome_without_provider_call() {
 }
 
 #[tokio::test]
+async fn empty_plan_step_does_not_poison_later_success() {
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: None,
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: HashMap::new(),
+            },
+            WireRecordingProvider::text_response("plan eventually succeeded"),
+        ],
+    ));
+    let reasoning = crate::config::schema::ReasoningConfig {
+        enabled: true,
+        auto_decompose: true,
+        ..Default::default()
+    };
+    let (agent_loop, workspace) = build_local_harness_with_runtime_options(
+        provider.clone() as Arc<dyn LLMProvider>,
+        5,
+        reasoning,
+        ToolDelegationConfig::default(),
+        None,
+    );
+    let session_key = format!("empty-then-success-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct(
+            "1. inspect the request\n2. give the final answer",
+            &session_key,
+            "test",
+            "offline",
+        )
+        .await;
+
+    assert_eq!(response, "plan eventually succeeded");
+    assert_eq!(provider.call_count(), 2);
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("empty-then-success session");
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "finished"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn model_failure_journal_failure_prevents_retry() {
+    let provider = Arc::new(RetryableFailureProvider {
+        name: "local-main".to_string(),
+        message: "synthetic retryable failure".to_string(),
+        call_count: std::sync::atomic::AtomicU32::new(0),
+    });
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("failure-journal-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_model_failure_event \
+             BEFORE INSERT ON session_events WHEN NEW.event_kind = 'model_failed' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic model failure journal fault'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("fail once only", &session_key, "test", "offline")
+        .await;
+
+    assert!(
+        response.contains("could not be recorded durably"),
+        "{response:?}"
+    );
+    assert_eq!(
+        provider
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "journal failure must stop before retrying the provider"
+    );
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("failure-journal session");
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "error"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn empty_rescue_journal_failure_prevents_thinking_off_retry() {
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: None,
+                tool_calls: vec![],
+                finish_reason: FinishReason::Length,
+                usage: HashMap::new(),
+            },
+            WireRecordingProvider::text_response("undurable rescue"),
+            WireRecordingProvider::text_response("must not retry"),
+        ],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("empty-rescue-journal-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_second_model_response \
+             BEFORE INSERT ON session_events \
+             WHEN NEW.event_kind = 'model_response' \
+              AND (SELECT COUNT(*) FROM session_events WHERE event_kind = 'model_response') >= 1 \
+             BEGIN SELECT RAISE(ABORT, 'synthetic rescue response journal fault'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("answer after thinking", &session_key, "test", "offline")
+        .await;
+
+    assert!(response.contains("was not recorded"), "{response:?}");
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "undurable rescue result must stop before the thinking-off retry"
+    );
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("empty-rescue journal session");
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "error"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn streamed_response_journal_failure_retracts_before_error() {
+    let provider = Arc::new(SequenceProvider::new(
+        "local-main",
+        vec!["visible but undurable"],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("stream-response-journal-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    core.sessions.fail_model_response_writes_for_tests(1);
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let response = agent_loop
+        .process_direct_streaming(
+            "stream it",
+            &session_key,
+            "test",
+            "offline",
+            None,
+            delta_tx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert!(
+        response.contains("could not record it durably"),
+        "{response:?}"
+    );
+    let mut deltas = Vec::new();
+    while let Ok(delta) = delta_rx.try_recv() {
+        deltas.push(delta);
+    }
+    let streamed = deltas.join("");
+    let retract = crate::turn_stream::ControlMarker::RetractReply.encode();
+    let retract_at = streamed
+        .find(&retract)
+        .expect("undurable streamed response must be retracted");
+    assert!(streamed[..retract_at].contains("visible but undurable"));
+    let tail = &streamed[retract_at + retract.len()..];
+    assert!(tail.contains("could not record it durably"), "{tail:?}");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn iteration_limit_persists_limit_exhausted_outcome() {
     let provider = Arc::new(ResponseSequenceProvider::new(
         "local-main",
@@ -7846,10 +8198,8 @@ async fn iteration_limit_persists_limit_exhausted_outcome() {
             usage: HashMap::new(),
         }],
     ));
-    let (agent_loop, workspace) = build_local_inline_harness_with_iters(
-        provider.clone() as Arc<dyn LLMProvider>,
-        1,
-    );
+    let (agent_loop, workspace) =
+        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
     let session_key = format!("limit-outcome-{}", uuid::Uuid::new_v4());
 
     let response = agent_loop
@@ -7893,7 +8243,10 @@ async fn inbound_persistence_failure_prevents_provider_call() {
         .process_direct("must be durable", &session_key, "test", "offline")
         .await;
 
-    assert!(response.contains("could not durably record"), "{response:?}");
+    assert!(
+        response.contains("could not durably record"),
+        "{response:?}"
+    );
     assert_eq!(provider.call_count(), 0);
     assert_eq!(
         persisted_turn_outcome(&core.sessions, &session.id).await,
@@ -7940,7 +8293,10 @@ async fn tool_carrier_persistence_failure_prevents_tool_side_effect() {
         .process_direct("write it", &session_key, "test", "offline")
         .await;
 
-    assert!(response.contains("tool-call carrier could not be recorded"), "{response:?}");
+    assert!(
+        response.contains("tool-call carrier could not be recorded"),
+        "{response:?}"
+    );
     assert_eq!(provider.call_count(), 1);
     assert!(!workspace.join("carrier-must-not-exist.txt").exists());
     assert_eq!(
@@ -7954,22 +8310,36 @@ async fn tool_carrier_persistence_failure_prevents_tool_side_effect() {
 async fn raw_result_persistence_failure_prevents_subsequent_provider_call() {
     let side_effect_dir = tempfile::tempdir().unwrap();
     let side_effect_path = side_effect_dir.path().join("raw-result-ran.txt");
+    let forbidden_path = side_effect_dir.path().join("raw-result-must-not-run.txt");
     let provider = Arc::new(ResponseSequenceProvider::new(
         "local-main",
         vec![
             crate::providers::base::LLMResponse {
                 content: Some(String::new()),
-                tool_calls: vec![crate::providers::base::ToolCallRequest {
-                    id: "tc-raw-fault".to_string(),
-                    name: "write_file".to_string(),
-                    arguments: HashMap::from([
-                        (
-                            "path".to_string(),
-                            json!(side_effect_path.to_string_lossy().to_string()),
-                        ),
-                        ("content".to_string(), json!("ran once")),
-                    ]),
-                }],
+                tool_calls: vec![
+                    crate::providers::base::ToolCallRequest {
+                        id: "tc-raw-fault".to_string(),
+                        name: "write_file".to_string(),
+                        arguments: HashMap::from([
+                            (
+                                "path".to_string(),
+                                json!(side_effect_path.to_string_lossy().to_string()),
+                            ),
+                            ("content".to_string(), json!("ran once")),
+                        ]),
+                    },
+                    crate::providers::base::ToolCallRequest {
+                        id: "tc-raw-forbidden".to_string(),
+                        name: "write_file".to_string(),
+                        arguments: HashMap::from([
+                            (
+                                "path".to_string(),
+                                json!(forbidden_path.to_string_lossy().to_string()),
+                            ),
+                            ("content".to_string(), json!("must not run")),
+                        ]),
+                    },
+                ],
                 finish_reason: FinishReason::ToolCalls,
                 usage: HashMap::new(),
             },
@@ -7998,6 +8368,10 @@ async fn raw_result_persistence_failure_prevents_subsequent_provider_call() {
     assert!(response.contains("execution result"), "{response:?}");
     assert_eq!(provider.call_count(), 1);
     assert!(side_effect_path.exists());
+    assert!(
+        !forbidden_path.exists(),
+        "later sequential tool ran after raw-result persistence failed"
+    );
     assert_eq!(
         persisted_turn_outcome(&core.sessions, &session.id).await,
         "error"
@@ -8009,22 +8383,36 @@ async fn raw_result_persistence_failure_prevents_subsequent_provider_call() {
 async fn post_result_persistence_failure_prevents_subsequent_provider_call() {
     let side_effect_dir = tempfile::tempdir().unwrap();
     let side_effect_path = side_effect_dir.path().join("post-result-ran.txt");
+    let forbidden_path = side_effect_dir.path().join("post-result-must-not-run.txt");
     let provider = Arc::new(ResponseSequenceProvider::new(
         "local-main",
         vec![
             crate::providers::base::LLMResponse {
                 content: Some(String::new()),
-                tool_calls: vec![crate::providers::base::ToolCallRequest {
-                    id: "tc-post-fault".to_string(),
-                    name: "write_file".to_string(),
-                    arguments: HashMap::from([
-                        (
-                            "path".to_string(),
-                            json!(side_effect_path.to_string_lossy().to_string()),
-                        ),
-                        ("content".to_string(), json!("ran once")),
-                    ]),
-                }],
+                tool_calls: vec![
+                    crate::providers::base::ToolCallRequest {
+                        id: "tc-post-fault".to_string(),
+                        name: "write_file".to_string(),
+                        arguments: HashMap::from([
+                            (
+                                "path".to_string(),
+                                json!(side_effect_path.to_string_lossy().to_string()),
+                            ),
+                            ("content".to_string(), json!("ran once")),
+                        ]),
+                    },
+                    crate::providers::base::ToolCallRequest {
+                        id: "tc-post-forbidden".to_string(),
+                        name: "write_file".to_string(),
+                        arguments: HashMap::from([
+                            (
+                                "path".to_string(),
+                                json!(forbidden_path.to_string_lossy().to_string()),
+                            ),
+                            ("content".to_string(), json!("must not run")),
+                        ]),
+                    },
+                ],
                 finish_reason: FinishReason::ToolCalls,
                 usage: HashMap::new(),
             },
@@ -8050,12 +8438,98 @@ async fn post_result_persistence_failure_prevents_subsequent_provider_call() {
         .process_direct("write once", &session_key, "test", "offline")
         .await;
 
-    assert!(response.contains("model-visible tool result"), "{response:?}");
+    assert!(
+        response.contains("model-visible tool result"),
+        "{response:?}"
+    );
     assert_eq!(provider.call_count(), 1);
     assert!(side_effect_path.exists());
+    assert!(
+        !forbidden_path.exists(),
+        "later sequential tool ran after model-visible result persistence failed"
+    );
     assert_eq!(
         persisted_turn_outcome(&core.sessions, &session.id).await,
         "error"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn delegated_batch_routes_through_inline_persistence_chokepoint() {
+    let side_effect_dir = tempfile::tempdir().unwrap();
+    let first_path = side_effect_dir.path().join("delegated-first.txt");
+    let forbidden_path = side_effect_dir.path().join("delegated-must-not-run.txt");
+    let main = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![
+                crate::providers::base::ToolCallRequest {
+                    id: "tc-delegated-first".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: HashMap::from([
+                        (
+                            "path".to_string(),
+                            json!(first_path.to_string_lossy().to_string()),
+                        ),
+                        ("content".to_string(), json!("ran once")),
+                    ]),
+                },
+                crate::providers::base::ToolCallRequest {
+                    id: "tc-delegated-forbidden".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: HashMap::from([
+                        (
+                            "path".to_string(),
+                            json!(forbidden_path.to_string_lossy().to_string()),
+                        ),
+                        ("content".to_string(), json!("must not run")),
+                    ]),
+                },
+            ],
+            finish_reason: FinishReason::ToolCalls,
+            usage: HashMap::new(),
+        }],
+    ));
+    let delegation = Arc::new(SequenceProvider::new("delegation-model", vec!["summary"]));
+    let tool_delegation = ToolDelegationConfig {
+        enabled: true,
+        model: "delegation-model".to_string(),
+        max_iterations: 1,
+        ..Default::default()
+    };
+    let (agent_loop, workspace) = build_local_harness_with_runtime_options(
+        main.clone() as Arc<dyn LLMProvider>,
+        5,
+        crate::config::schema::ReasoningConfig::default(),
+        tool_delegation,
+        Some(delegation.clone() as Arc<dyn LLMProvider>),
+    );
+    let session_key = format!("delegated-inline-chokepoint-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_delegated_raw_result \
+             BEFORE INSERT ON session_events WHEN NEW.event_kind = 'tool_execute' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic delegated raw result failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("write both", &session_key, "test", "offline")
+        .await;
+
+    assert!(response.contains("execution result"), "{response:?}");
+    assert!(first_path.exists());
+    assert!(!forbidden_path.exists());
+    assert_eq!(main.call_count(), 1);
+    assert_eq!(
+        delegation.call_count(),
+        0,
+        "delegated selection must not create an alternate execution pipeline"
     );
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -8083,7 +8557,10 @@ async fn final_assistant_persistence_failure_records_error_outcome() {
         .process_direct("answer", &session_key, "test", "offline")
         .await;
 
-    assert!(response.contains("could not durably record"), "{response:?}");
+    assert!(
+        response.contains("could not durably record"),
+        "{response:?}"
+    );
     assert_eq!(provider.call_count(), 1);
     assert_eq!(
         persisted_turn_outcome(&core.sessions, &session.id).await,
