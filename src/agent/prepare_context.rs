@@ -15,7 +15,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::agent::agent_core::SwappableCore;
-use crate::agent::agent_loop::{AgentLoopShared, FlowControl, TurnContext};
+use crate::agent::agent_loop::{AgentLoopShared, FlowControl, TurnContext, TurnOutcome};
 use crate::agent::audit::AuditLog;
 use crate::agent::context::PromptBlock;
 use crate::agent::context_gate::ContentGate;
@@ -685,6 +685,7 @@ impl AgentLoopShared {
             advertised_tool_names: None,
             used_tools: std::collections::HashSet::new(),
             final_content: String::new(),
+            turn_outcome: TurnOutcome::LimitExhausted,
             turn_tool_entries: Vec::new(),
             iterations_used: 0,
             turn_start: std::time::Instant::now(),

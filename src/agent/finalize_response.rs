@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use serde_json::json;
 use tracing::{info, instrument, warn};
 
-use crate::agent::agent_loop::{AgentLoopShared, TurnContext};
+use crate::agent::agent_loop::{AgentLoopShared, TurnContext, TurnOutcome};
 use crate::agent::token_budget::TokenBudget;
 use crate::bus::events::OutboundMessage;
 
@@ -234,17 +234,23 @@ impl AgentLoopShared {
         // Final text is the only normal message that has not already been
         // checkpointed in the active tool path. This also retries any earlier
         // SQLite failure without double-inserting successful rows.
-        ctx.persist_pending_protocol_messages().await;
+        if let Err(error) = ctx.persist_pending_protocol_messages().await {
+            if ctx.turn_outcome != TurnOutcome::Error {
+                ctx.turn_outcome = TurnOutcome::Error;
+                ctx.final_content = format!(
+                    "[Session Error] I could not durably record the final assistant response: {error}"
+                );
+            } else {
+                warn!(
+                    %error,
+                    session = %ctx.session_key,
+                    "terminal_error_message_persist_failed; preserving primary error"
+                );
+            }
+        }
 
         ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
 
-        let turn_outcome = if ctx.is_cancelled() {
-            "cancelled"
-        } else if ctx.final_content.is_empty() {
-            "empty"
-        } else {
-            "finished"
-        };
         // The reply is already generated and persisted by this point. A
         // failed turn-finish journal write must not discard it: warn and
         // deliver, letting the session's replay degrade to Incomplete.
@@ -255,7 +261,7 @@ impl AgentLoopShared {
                 &ctx.session_id,
                 &ctx.request_id,
                 ctx.turn_count,
-                turn_outcome,
+                ctx.turn_outcome.wire_str(),
             )
             .await
         {

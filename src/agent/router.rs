@@ -378,44 +378,44 @@ pub(crate) fn parse_lenient_router_decision(raw: &str) -> Option<role_policy::Ro
     }
 }
 
-/// Router/specialist lanes are auxiliary boundaries: a transient replay-journal
-/// write failure must not take routing down with it. The model call proceeds
-/// unjournaled and the session's replay degrades to `Incomplete`. The main
-/// agent-loop provider boundary stays fail-closed; only these lanes soften.
+const AUXILIARY_PERSISTENCE_ERROR: &str = "auxiliary replay persistence failed";
+
+fn is_auxiliary_persistence_error(error: &str) -> bool {
+    error.contains(AUXILIARY_PERSISTENCE_ERROR)
+}
+
+/// Router/specialist calls are part of the same replayable turn. Refuse the
+/// provider side effect when its exact request cannot be recorded first.
 async fn journal_aux_request(
     replay: Option<&TurnReplayRecorder>,
     purpose: ModelCallPurpose,
     request: &RecordedProviderRequest,
-) -> Option<String> {
-    let replay = replay?;
-    match replay.request(purpose, request).await {
-        Ok(call_id) => Some(call_id),
-        Err(error) => {
-            warn!(%error, "aux lane replay request persistence failed; continuing unjournaled");
-            None
-        }
-    }
+) -> anyhow::Result<Option<String>> {
+    let Some(replay) = replay else {
+        return Ok(None);
+    };
+    replay
+        .request(purpose, request)
+        .await
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("{AUXILIARY_PERSISTENCE_ERROR}: {error}"))
 }
 
 /// Close an auxiliary-lane journal entry after its provider call resolved.
-/// Callers skip this when the request itself could not be journaled — there
-/// is then nothing to close and replay already degraded.
 async fn journal_aux_terminal(
     replay: &TurnReplayRecorder,
     call_id: &str,
     result: &anyhow::Result<crate::providers::base::LLMResponse>,
-) {
-    let journaled = match result {
+) -> anyhow::Result<()> {
+    match result {
         Ok(response) => {
             replay
                 .response(call_id, &RecordedProviderResponse::from(response))
                 .await
         }
         Err(error) => replay.failure(call_id, &error.to_string()).await,
-    };
-    if let Err(error) = journaled {
-        warn!(%error, "aux lane replay terminal persistence failed; replay degrades to incomplete");
     }
+    .map_err(|error| anyhow::anyhow!("{AUXILIARY_PERSISTENCE_ERROR}: {error}"))
 }
 
 #[instrument(name = "request_strict_router_decision", skip(provider, router_pack, tool_names, replay), fields(
@@ -551,7 +551,8 @@ pub async fn request_strict_router_decision(
             streaming: false,
         },
     )
-    .await;
+    .await
+    .map_err(|error| format!("router auxiliary request could not be recorded: {error}"))?;
     let tool_result = provider
         .chat_with_tool_choice(
             &tool_messages,
@@ -568,7 +569,9 @@ pub async fn request_strict_router_decision(
         )
         .await;
     if let (Some(replay), Some(call_id)) = (replay, tool_call_id.as_deref()) {
-        journal_aux_terminal(replay, call_id, &tool_result).await;
+        journal_aux_terminal(replay, call_id, &tool_result)
+            .await
+            .map_err(|error| format!("router auxiliary result could not be recorded: {error}"))?;
     }
     if let Ok(tool_resp) = tool_result {
         if let Some(tc) = tool_resp.tool_calls.first() {
@@ -637,7 +640,8 @@ pub async fn request_strict_router_decision(
             streaming: false,
         },
     )
-    .await;
+    .await
+    .map_err(|error| format!("router auxiliary request could not be recorded: {error}"))?;
     let router_result = provider
         .chat(
             &router_messages,
@@ -650,7 +654,9 @@ pub async fn request_strict_router_decision(
         )
         .await;
     if let (Some(replay), Some(call_id)) = (replay, fallback_call_id.as_deref()) {
-        journal_aux_terminal(replay, call_id, &router_result).await;
+        journal_aux_terminal(replay, call_id, &router_result)
+            .await
+            .map_err(|error| format!("router auxiliary result could not be recorded: {error}"))?;
     }
     let router_resp = router_result.map_err(|e| format!("strict router call failed: {}", e))?;
     let raw_router_content = router_resp.content.unwrap_or_default();
@@ -794,7 +800,8 @@ pub(crate) async fn dispatch_specialist(
             streaming: false,
         },
     )
-    .await;
+    .await
+    .map_err(|error| format!("specialist request could not be recorded: {error}"))?;
     let specialist_result = specialist_provider
         .chat(
             &specialist_messages,
@@ -807,7 +814,9 @@ pub(crate) async fn dispatch_specialist(
         )
         .await;
     if let (Some(replay), Some(call_id)) = (replay, call_id.as_deref()) {
-        journal_aux_terminal(replay, call_id, &specialist_result).await;
+        journal_aux_terminal(replay, call_id, &specialist_result)
+            .await
+            .map_err(|error| format!("specialist result could not be recorded: {error}"))?;
     }
     match specialist_result {
         Ok(sp_resp) => {
@@ -938,6 +947,8 @@ pub(crate) enum PreflightResult {
     Continue,
     /// Router decided to break — set final_content.
     Break(String),
+    /// Replay infrastructure failed; terminate the turn as an error.
+    Error(String),
     /// No router intervention — fall through to normal processing.
     Passthrough,
 }
@@ -1082,6 +1093,9 @@ pub(crate) async fn router_preflight(
             d
         }
         Err(e) => {
+            if is_auxiliary_persistence_error(&e) {
+                return PreflightResult::Error(e);
+            }
             warn!("[router] router call failed: {} — recording failure and falling through to main model", e);
             ctx.counters
                 .trio_circuit_breaker
@@ -1369,6 +1383,8 @@ pub(crate) enum RouteResult {
     Continue,
     /// Break with final_content.
     Break(String),
+    /// Protocol persistence failed; stop the turn as infrastructure error.
+    Error(String),
     /// Filtered tool calls ready for execution.
     Execute(Vec<ToolCallRequest>),
 }
@@ -1522,6 +1538,9 @@ pub(crate) async fn route_tool_calls(
                     router_decision = Some(decision);
                 }
                 Err(e) => {
+                    if is_auxiliary_persistence_error(&e) {
+                        return RouteResult::Error(e);
+                    }
                     warn!("{}", e);
                 }
             }
@@ -1655,6 +1674,9 @@ pub(crate) async fn route_tool_calls(
                             .push_draft(crate::agent::markers::scaffold_user(injected));
                         return specialist_route_result(&record.specialist_response);
                     }
+                    Err(e) if is_auxiliary_persistence_error(&e) => {
+                        return RouteResult::Error(e)
+                    }
                     Err(e) => return RouteResult::Break(e),
                 }
             }
@@ -1756,7 +1778,7 @@ pub(crate) async fn route_tool_calls(
                     )
                     .await
                 {
-                    return RouteResult::Break(format!(
+                    return RouteResult::Error(format!(
                         "tool {} was blocked but its pre-execution decision could not be recorded: {record_error}",
                         tc.id
                     ));
@@ -1797,7 +1819,11 @@ pub(crate) async fn route_tool_calls(
                 ContextBuilder::add_tool_result(draft, &tc.id, &tc.name, &receipt);
             }
         });
-        ctx.persist_pending_protocol_messages().await;
+        if let Err(error) = ctx.persist_pending_protocol_messages().await {
+            return RouteResult::Error(format!(
+                "blocked tool receipts could not be recorded atomically: {error}"
+            ));
+        }
     }
 
     if allowed_calls.is_empty() {
@@ -1834,7 +1860,11 @@ pub(crate) async fn route_tool_calls(
                      Do NOT call any more tools. Write your final answer now using the \
                      information you gathered."
                 );
-                ctx.persist_pending_protocol_messages().await;
+                if let Err(error) = ctx.persist_pending_protocol_messages().await {
+                    return RouteResult::Error(format!(
+                        "tool-loop instruction could not be recorded: {error}"
+                    ));
+                }
                 return RouteResult::Continue;
             }
             // Text accompanying a tool call is normally a progress preamble
@@ -2711,6 +2741,9 @@ mod tests {
             RouteResult::Execute(_) => {
                 panic!("specialist route_tool_calls arm must return Break, not Execute");
             }
+            RouteResult::Error(error) => {
+                panic!("specialist route helper returned infrastructure error: {error}");
+            }
         }
     }
 
@@ -2728,6 +2761,9 @@ mod tests {
             }
             RouteResult::Execute(_) => {
                 panic!("subagent route_tool_calls arm must return Break, not Execute");
+            }
+            RouteResult::Error(error) => {
+                panic!("subagent route helper returned infrastructure error: {error}");
             }
         }
     }

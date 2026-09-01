@@ -653,7 +653,7 @@ pub(crate) async fn journal_tool_call_carrier(
     ctx: &mut TurnContext,
     routed_tool_calls: &[ToolCallRequest],
     response: &LLMResponse,
-) {
+) -> anyhow::Result<()> {
     let tc_json: Vec<Value> = routed_tool_calls
         .iter()
         .map(ToolCallRequest::to_openai_json)
@@ -661,7 +661,7 @@ pub(crate) async fn journal_tool_call_carrier(
     ctx.messages.with_draft(|draft| {
         ContextBuilder::add_assistant_message(draft, response.content.as_deref(), Some(&tc_json));
     });
-    ctx.persist_pending_protocol_messages().await;
+    ctx.persist_pending_protocol_messages().await
 }
 
 /// Execute tool calls via the delegation (tool-runner) path.
@@ -1002,7 +1002,13 @@ pub(crate) async fn execute_tools_delegated(
             raw_ok,
         );
         ctx.used_tools.insert(tc.name.clone());
-        ctx.persist_pending_protocol_messages().await;
+        if let Err(error) = ctx.persist_pending_protocol_messages().await {
+            ctx.flow.infra_error = Some(format!(
+                "model-visible delegated tool result for {} could not be recorded: {error}",
+                tc.id
+            ));
+            return true;
+        }
         let persisted_message_id = ctx
             .messages
             .iter()
@@ -1069,7 +1075,12 @@ pub(crate) async fn execute_tools_delegated(
                     "{} {}",
                     prefix, summary_text
                 )));
-            ctx.persist_pending_protocol_messages().await;
+            if let Err(error) = ctx.persist_pending_protocol_messages().await {
+                ctx.flow.infra_error = Some(format!(
+                    "delegated tool-runner summary could not be recorded: {error}"
+                ));
+                return true;
+            }
         }
     }
 
@@ -1639,7 +1650,13 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_
             )
         });
     }
-    ctx.persist_pending_protocol_messages().await;
+    if let Err(error) = ctx.persist_pending_protocol_messages().await {
+        ctx.flow.infra_error = Some(format!(
+            "model-visible tool result for {} could not be recorded: {error}",
+            r.tool_id
+        ));
+        return;
+    }
     let persisted_message_id = ctx
         .messages
         .iter()
@@ -1890,7 +1907,12 @@ pub(crate) async fn execute_tools_inline(
         }
         inject_boundary_rejection(ctx, tc);
     }
-    ctx.persist_pending_protocol_messages().await;
+    if let Err(error) = ctx.persist_pending_protocol_messages().await {
+        ctx.flow.infra_error = Some(format!(
+            "tool rejection receipts could not be recorded: {error}"
+        ));
+        return;
+    }
 
     // Build taint warnings up-front (immutable borrow of ctx.taint_state).
     let taints: Vec<Option<String>> = allowed

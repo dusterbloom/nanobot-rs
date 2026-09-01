@@ -364,6 +364,7 @@ pub(crate) struct TurnContext {
     // --- Tracking ---
     pub(crate) used_tools: std::collections::HashSet<String>,
     pub(crate) final_content: String,
+    pub(crate) turn_outcome: TurnOutcome,
     pub(crate) turn_tool_entries: Vec<crate::agent::audit::TurnToolEntry>,
     /// Number of LLM iterations consumed in this agent turn (for calibration).
     pub(crate) iterations_used: u32,
@@ -983,7 +984,7 @@ impl TurnContext {
     /// results immediately after injection, so a crash cannot leave a side
     /// effect without the conversation bytes that caused and described it.
     /// The row ids also make same-turn messages visible to the LCM ingester.
-    pub(crate) async fn persist_pending_protocol_messages(&mut self) {
+    pub(crate) async fn persist_pending_protocol_messages(&mut self) -> anyhow::Result<()> {
         // Do not rely solely on `new_start`: token trimming can remove old
         // history and shift every index during the turn. Persist by durable-id
         // presence instead; DB-loaded history already carries `_db_id`.
@@ -1018,36 +1019,32 @@ impl TurnContext {
 
         if pending_messages.is_empty() {
             self.new_start = self.messages.len();
-            return;
+            return Ok(());
         }
 
         // One checked transaction — replay must observe the whole protocol
         // group (carrier + receipts) or none of it. A per-message loop that
         // breaks mid-group silently truncates protocol history (see main
         // a05fc81).
-        let row_ids = match self
+        let row_ids = self
             .core
             .sessions
             .add_messages_checked(&self.session_id, &pending_messages)
             .await
-        {
-            Ok(row_ids) => row_ids,
-            Err(error) => {
+            .map_err(|error| {
                 warn!(
                     session = %self.session_key,
                     pending = pending_messages.len(),
                     %error,
                     "active_turn_protocol_group_persist_failed"
                 );
-                // Leave the messages untagged (no `_db_id`) so the next
-                // persist retries the whole group; do not advance new_start.
-                return;
-            }
-        };
+                error
+            })?;
         for (index, row_id) in pending_indices.into_iter().zip(row_ids) {
             self.messages.set_meta(index, "_db_id", json!(row_id));
         }
         self.new_start = self.messages.len();
+        Ok(())
     }
 }
 
@@ -1420,6 +1417,27 @@ pub(crate) enum IterationOutcome {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnOutcome {
+    Finished,
+    Error,
+    Cancelled,
+    Empty,
+    LimitExhausted,
+}
+
+impl TurnOutcome {
+    pub(crate) const fn wire_str(self) -> &'static str {
+        match self {
+            Self::Finished => "finished",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+            Self::Empty => "empty",
+            Self::LimitExhausted => "limit_exhausted",
+        }
+    }
+}
+
 /// What a step function produces: either the next phase or a terminal outcome.
 pub(crate) enum StepResult {
     /// Transition to the next phase within this iteration.
@@ -1530,9 +1548,16 @@ impl AgentLoopShared {
         );
 
         // Make the inbound user turn durable before the first provider call.
-        ctx.persist_pending_protocol_messages().await;
-
-        self.run_agent_loop(&mut ctx).await;
+        // An undurable user prefix has no replay-safe provider request, so the
+        // turn stops here instead of asking the model to act on lost input.
+        if let Err(error) = ctx.persist_pending_protocol_messages().await {
+            ctx.turn_outcome = TurnOutcome::Error;
+            ctx.final_content = format!(
+                "[Session Error] I could not durably record the inbound message, so no model or tool call was made: {error}"
+            );
+        } else {
+            self.run_agent_loop(&mut ctx).await;
+        }
         let soft_compaction = SoftCompactionRequest::take(&mut ctx);
         let response = self.finalize_response(ctx).await;
         if let Some(request) = soft_compaction {
@@ -1552,6 +1577,7 @@ impl AgentLoopShared {
         streaming = ctx.streaming,
     ))]
     async fn run_agent_loop(&self, ctx: &mut TurnContext) {
+        ctx.turn_outcome = TurnOutcome::LimitExhausted;
         // Auto-decompose: detect numbered steps in user message and build a plan.
         // This helps small models that can't call the plan tool themselves.
         if ctx.core.reasoning_config.enabled && ctx.core.reasoning_config.auto_decompose {
@@ -1596,6 +1622,7 @@ impl AgentLoopShared {
             // Early exit if cancelled (e.g. user pressed Esc/Enter in REPL).
             if ctx.is_cancelled() {
                 debug!("agent loop: cancelled before iteration {}", iteration);
+                ctx.turn_outcome = TurnOutcome::Cancelled;
                 break;
             }
 
@@ -1752,6 +1779,7 @@ impl AgentLoopShared {
                                 "I was looping on blocked tool requests without making progress, \
                                  so I stopped. Rephrase the request or restart the turn."
                                     .to_string();
+                            ctx.turn_outcome = TurnOutcome::LimitExhausted;
                             break;
                         }
                         debug!(
@@ -1857,6 +1885,13 @@ impl AgentLoopShared {
                         // More plan steps to execute — don't break.
                         continue;
                     }
+                    ctx.turn_outcome = if ctx.is_cancelled() {
+                        TurnOutcome::Cancelled
+                    } else if ctx.turn_outcome == TurnOutcome::Empty || content.trim().is_empty() {
+                        TurnOutcome::Empty
+                    } else {
+                        TurnOutcome::Finished
+                    };
                     ctx.final_content = content;
                     break;
                 }
@@ -1868,6 +1903,7 @@ impl AgentLoopShared {
                             engine.mark_current_failed(&msg);
                         }
                     }
+                    ctx.turn_outcome = TurnOutcome::Error;
                     ctx.final_content = msg;
                     break;
                 }
@@ -2384,6 +2420,9 @@ impl AgentLoopShared {
                 }
                 crate::agent::router::PreflightResult::Break(msg) => {
                     return StepResult::Done(IterationOutcome::Finished(msg));
+                }
+                crate::agent::router::PreflightResult::Error(msg) => {
+                    return StepResult::Done(IterationOutcome::Error(msg));
                 }
                 crate::agent::router::PreflightResult::Passthrough => {
                     if tool_defs.is_empty() && !saved_tool_defs.is_empty() {
@@ -4608,6 +4647,10 @@ impl AgentLoopShared {
                 ctx.emit_pending_request_metrics(0);
                 return StepResult::Done(IterationOutcome::Finished(msg));
             }
+            crate::agent::router::RouteResult::Error(msg) => {
+                ctx.emit_pending_request_metrics(0);
+                return StepResult::Done(IterationOutcome::Error(msg));
+            }
             crate::agent::router::RouteResult::Execute(calls) => calls,
         };
 
@@ -4655,8 +4698,15 @@ impl AgentLoopShared {
         // One carrier owns every lease disposition below. Persist it before
         // either execution path can add a result, so rejected proxy calls are
         // protocol-valid and cache-replayable just like executed calls.
-        crate::agent::tool_engine::journal_tool_call_carrier(ctx, &routed_tool_calls, &response)
-            .await;
+        if let Err(error) =
+            crate::agent::tool_engine::journal_tool_call_carrier(ctx, &routed_tool_calls, &response)
+                .await
+        {
+            ctx.emit_pending_request_metrics(0);
+            return StepResult::Done(IterationOutcome::Error(format!(
+                "tool-call carrier could not be recorded atomically; no tools were executed: {error}"
+            )));
+        }
 
         // Tool-lease enforcement. Each call is recorded against the per-turn
         // lease; calls that exceed the lease budget are NOT executed — they
@@ -4785,7 +4835,12 @@ impl AgentLoopShared {
             });
         }
         if !blocked_calls.is_empty() {
-            ctx.persist_pending_protocol_messages().await;
+            if let Err(error) = ctx.persist_pending_protocol_messages().await {
+                ctx.emit_pending_request_metrics(0);
+                return StepResult::Done(IterationOutcome::Error(format!(
+                    "rejected tool receipts could not be recorded atomically; no tools were executed: {error}"
+                )));
+            }
         }
         let routed_tool_calls = allowed_calls;
         if routed_tool_calls.is_empty() && !blocked_calls.is_empty() {

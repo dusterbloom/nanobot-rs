@@ -227,10 +227,9 @@ async fn test_request_strict_router_decision_action_matrix() {
 }
 
 #[tokio::test]
-async fn router_journal_failure_degrades_instead_of_failing_routing() {
-    // Break caught: a transient replay-journal write failure aborted the
-    // strict router before the provider was even called, turning any
-    // SQLite stutter into a routing outage.
+async fn router_journal_failure_prevents_auxiliary_provider_call() {
+    // The router decision is a provider side effect just like the main call:
+    // its exact request must be durable before it leaves the process.
     let dir = tempfile::tempdir().unwrap();
     let sessions =
         std::sync::Arc::new(crate::session::db::SessionDb::new(&dir.path().join("s.db")));
@@ -242,9 +241,9 @@ async fn router_journal_failure_degrades_instead_of_failing_routing() {
         "turn-1".to_string(),
         1,
     );
-    let llm = StaticResponseLLM::plain(
+    let llm = SequenceProvider::new(
         "router",
-        r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#,
+        vec![r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#],
     );
 
     let decision = request_strict_router_decision(
@@ -258,10 +257,12 @@ async fn router_journal_failure_degrades_instead_of_failing_routing() {
         256,
         Some(&replay),
     )
-    .await
-    .expect("routing must survive a transient journal write failure");
+    .await;
 
-    assert_eq!(decision.action, "respond");
+    assert!(decision
+        .expect_err("routing must fail closed when its request cannot be recorded")
+        .contains("could not be recorded"));
+    assert_eq!(llm.call_count(), 0);
 }
 
 /// Real-provider trio probe.
@@ -2158,6 +2159,16 @@ async fn plain_text_response_is_final_answer() {
         1,
         "plain text must terminate on the first response — no retries"
     );
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("finished session");
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "finished"
+    );
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -2243,6 +2254,23 @@ impl ResponseSequenceProvider {
     fn call_count(&self) -> u32 {
         self.call_count.load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+async fn persisted_turn_outcome(
+    sessions: &crate::session::db::SessionDb,
+    session_id: &str,
+) -> String {
+    sessions
+        .load_session_events(session_id)
+        .await
+        .expect("load session events")
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.payload {
+            crate::session::db::SessionEventPayload::TurnFinished { outcome } => Some(outcome),
+            _ => None,
+        })
+        .expect("turn_finished outcome")
 }
 
 #[async_trait]
@@ -7513,6 +7541,9 @@ async fn test_read_after_write_same_turn_is_not_blocked_by_stale_receipt() {
         crate::agent::router::RouteResult::Break(text) => {
             panic!("post-write read was blocked: {text}")
         }
+        crate::agent::router::RouteResult::Error(text) => {
+            panic!("post-write read hit infrastructure error: {text}")
+        }
         crate::agent::router::RouteResult::Continue => panic!("post-write read should execute"),
     }
     assert!(!ctx.flow.tool_guard.had_blocked_calls);
@@ -7724,6 +7755,340 @@ async fn turn_finish_journal_failure_still_returns_the_reply() {
         "the reply must remain in persisted history despite the journal failure"
     );
 
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn empty_provider_content_persists_empty_outcome() {
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![crate::providers::base::LLMResponse {
+            content: None,
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: HashMap::new(),
+        }],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider as Arc<dyn LLMProvider>);
+    let session_key = format!("empty-outcome-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct("return nothing", &session_key, "test", "offline")
+        .await;
+    assert!(response.contains("couldn't produce a response"));
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("empty session");
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "empty"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn cancelled_turn_persists_cancelled_outcome_without_provider_call() {
+    let provider = Arc::new(SequenceProvider::new("local-main", vec!["must not run"]));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("cancelled-outcome-{}", uuid::Uuid::new_v4());
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    let (delta_tx, _delta_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let response = agent_loop
+        .process_direct_streaming(
+            "cancel now",
+            &session_key,
+            "test",
+            "offline",
+            None,
+            delta_tx,
+            None,
+            Some(cancellation),
+            None,
+            None,
+        )
+        .await;
+    assert!(response.is_empty());
+    assert_eq!(provider.call_count(), 0);
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("cancelled session");
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "cancelled"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn iteration_limit_persists_limit_exhausted_outcome() {
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: "tc-limit".to_string(),
+                name: "list_dir".to_string(),
+                arguments: HashMap::from([("path".to_string(), json!("."))]),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: HashMap::new(),
+        }],
+    ));
+    let (agent_loop, workspace) = build_local_inline_harness_with_iters(
+        provider.clone() as Arc<dyn LLMProvider>,
+        1,
+    );
+    let session_key = format!("limit-outcome-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct("list once", &session_key, "test", "offline")
+        .await;
+
+    assert!(!response.is_empty());
+    assert_eq!(provider.call_count(), 1);
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .expect("limit-exhausted session");
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "limit_exhausted"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn inbound_persistence_failure_prevents_provider_call() {
+    let provider = Arc::new(SequenceProvider::new("local-main", vec!["must not run"]));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("inbound-persist-failure-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_inbound_message \
+             BEFORE INSERT ON messages WHEN NEW.role = 'user' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic inbound persistence failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("must be durable", &session_key, "test", "offline")
+        .await;
+
+    assert!(response.contains("could not durably record"), "{response:?}");
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "error"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn tool_carrier_persistence_failure_prevents_tool_side_effect() {
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: "tc-carrier-fault".to_string(),
+                name: "write_file".to_string(),
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("carrier-must-not-exist.txt")),
+                    ("content".to_string(), json!("forbidden")),
+                ]),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: HashMap::new(),
+        }],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("carrier-persist-failure-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_tool_carrier \
+             BEFORE INSERT ON messages \
+             WHEN NEW.role = 'assistant' AND NEW.tool_calls IS NOT NULL \
+             BEGIN SELECT RAISE(ABORT, 'synthetic carrier persistence failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("write it", &session_key, "test", "offline")
+        .await;
+
+    assert!(response.contains("tool-call carrier could not be recorded"), "{response:?}");
+    assert_eq!(provider.call_count(), 1);
+    assert!(!workspace.join("carrier-must-not-exist.txt").exists());
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "error"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn raw_result_persistence_failure_prevents_subsequent_provider_call() {
+    let side_effect_dir = tempfile::tempdir().unwrap();
+    let side_effect_path = side_effect_dir.path().join("raw-result-ran.txt");
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc-raw-fault".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: HashMap::from([
+                        (
+                            "path".to_string(),
+                            json!(side_effect_path.to_string_lossy().to_string()),
+                        ),
+                        ("content".to_string(), json!("ran once")),
+                    ]),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: HashMap::new(),
+            },
+            WireRecordingProvider::text_response("must not run"),
+        ],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("raw-result-persist-failure-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_raw_tool_result \
+             BEFORE INSERT ON session_events WHEN NEW.event_kind = 'tool_execute' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic raw result persistence failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("write once", &session_key, "test", "offline")
+        .await;
+
+    assert!(response.contains("execution result"), "{response:?}");
+    assert_eq!(provider.call_count(), 1);
+    assert!(side_effect_path.exists());
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "error"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn post_result_persistence_failure_prevents_subsequent_provider_call() {
+    let side_effect_dir = tempfile::tempdir().unwrap();
+    let side_effect_path = side_effect_dir.path().join("post-result-ran.txt");
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc-post-fault".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: HashMap::from([
+                        (
+                            "path".to_string(),
+                            json!(side_effect_path.to_string_lossy().to_string()),
+                        ),
+                        ("content".to_string(), json!("ran once")),
+                    ]),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: HashMap::new(),
+            },
+            WireRecordingProvider::text_response("must not run"),
+        ],
+    ));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("post-result-persist-failure-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_model_tool_result \
+             BEFORE INSERT ON messages WHEN NEW.role = 'tool' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic post-result persistence failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("write once", &session_key, "test", "offline")
+        .await;
+
+    assert!(response.contains("model-visible tool result"), "{response:?}");
+    assert_eq!(provider.call_count(), 1);
+    assert!(side_effect_path.exists());
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "error"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn final_assistant_persistence_failure_records_error_outcome() {
+    let provider = Arc::new(SequenceProvider::new("local-main", vec!["generated reply"]));
+    let (agent_loop, workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let session_key = format!("final-persist-failure-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    {
+        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_final_assistant \
+             BEFORE INSERT ON messages \
+             WHEN NEW.role = 'assistant' AND NEW.tool_calls IS NULL \
+             BEGIN SELECT RAISE(ABORT, 'synthetic final persistence failure'); END;",
+        )
+        .unwrap();
+    }
+
+    let response = agent_loop
+        .process_direct("answer", &session_key, "test", "offline")
+        .await;
+
+    assert!(response.contains("could not durably record"), "{response:?}");
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &session.id).await,
+        "error"
+    );
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
@@ -8353,6 +8718,11 @@ async fn test_failed_local_call_does_not_seed_prompt_cache_marker() {
         .is_some_and(|bytes| bytes
             .windows("synthetic provider failure".len())
             .any(|window| { window == "synthetic provider failure".as_bytes() })));
+    assert_eq!(
+        persisted_turn_outcome(&core.sessions, &failed_session.id).await,
+        "error",
+        "provider failure text must not make the turn look successful"
+    );
 
     let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let second = agent_loop

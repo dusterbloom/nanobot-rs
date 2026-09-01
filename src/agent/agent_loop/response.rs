@@ -29,7 +29,9 @@ use crate::providers::base::{FinishReason, LLMResponse, ToolCallRequest};
 use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
 use crate::turn_stream::ControlMarker;
 
-use super::{AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnContext};
+use super::{
+    AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnContext, TurnOutcome,
+};
 
 async fn recorded_auxiliary_chat(
     ctx: &TurnContext,
@@ -92,8 +94,7 @@ async fn recorded_auxiliary_chat(
             Ok(response)
         }
         Err(error) => {
-            if let Err(record_error) = ctx
-                .core
+            ctx.core
                 .sessions
                 .record_model_failure(
                     &ctx.session_id,
@@ -103,9 +104,11 @@ async fn recorded_auxiliary_chat(
                     &error.to_string(),
                 )
                 .await
-            {
-                warn!(%record_error, "auxiliary_model_failure_replay_persist_failed");
-            }
+                .map_err(|record_error| {
+                    anyhow::anyhow!(
+                        "auxiliary model failure was not recorded: {record_error}; provider error: {error}"
+                    )
+                })?;
             Err(error)
         }
     }
@@ -693,7 +696,10 @@ impl AgentLoopShared {
             ResponseKind::Truncated(partial) => {
                 let full = self.handle_truncated(ctx, &response, partial).await;
                 match full.trim() {
-                    "" => StepResult::Done(IterationOutcome::Finished(String::new())),
+                    "" => {
+                        ctx.turn_outcome = TurnOutcome::Empty;
+                        StepResult::Done(IterationOutcome::Finished(String::new()))
+                    }
                     _ => {
                         send_finish_reason(&ctx.text_delta_tx, "stop");
                         StepResult::Done(IterationOutcome::Finished(full))
@@ -713,6 +719,7 @@ impl AgentLoopShared {
                 );
                 let content =
                     "I couldn't produce a response in this turn. Please try again.".to_string();
+                ctx.turn_outcome = TurnOutcome::Empty;
                 send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
                 StepResult::Done(IterationOutcome::Finished(content))
             }
@@ -873,10 +880,11 @@ impl AgentLoopShared {
         if ctx.core.mode().is_local() {
             if let Some(base) = ctx.core.provider.get_api_base() {
                 if !crate::server::check_health(base, ctx.core.health_check_timeout_secs).await {
-                    error!("Local LLM server is down!");
+                    error!("Local LLM backend health endpoint was unavailable");
                     return StepResult::Done(IterationOutcome::Error(
-                        "[LLM Error] Local server crashed. Use /restart or /local to recover."
-                            .into(),
+                        format!(
+                            "[LLM Error] {err_msg}\n\nThe local backend health endpoint was unavailable during the follow-up probe."
+                        ),
                     ));
                 }
             }
@@ -1055,6 +1063,7 @@ impl AgentLoopShared {
             "empty_llm_response: all recovery attempts exhausted, injecting fallback"
         );
         let content = "I couldn't produce a response in this turn. Please try again.".to_string();
+        ctx.turn_outcome = TurnOutcome::Empty;
         send_finish_reason(&ctx.text_delta_tx, response.finish_reason.wire_str());
         StepResult::Done(IterationOutcome::Finished(content))
     }
