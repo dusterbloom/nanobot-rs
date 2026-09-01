@@ -32,11 +32,11 @@ static RE_WIN_PATH: LazyLock<Regex> =
 
 const PIPEFAIL_SHELL_WRAPPER: &str = r#"
 if (set -o pipefail) 2>/dev/null; then
-    exec "$0" -o pipefail -c "$1"
+    exec "$0" -o pipefail -c "$1" "$0"
 elif command -v bash >/dev/null 2>&1; then
-    exec bash -o pipefail -c "$1"
+    exec bash -o pipefail -c "$1" "$0"
 elif command -v zsh >/dev/null 2>&1; then
-    exec zsh -o pipefail -c "$1"
+    exec zsh -o pipefail -c "$1" "$0"
 else
     printf '%s\n' 'nanobot: no pipefail-capable shell found' >&2
     exit 126
@@ -589,6 +589,42 @@ impl Tool for ExecTool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn available_dash() -> Option<PathBuf> {
+        [
+            PathBuf::from("/bin/dash"),
+            PathBuf::from("/usr/bin/dash"),
+            PathBuf::from("/opt/homebrew/bin/dash"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    }
+
+    #[cfg(unix)]
+    fn available_pipefail_shell() -> Option<PathBuf> {
+        [
+            PathBuf::from("/bin/bash"),
+            PathBuf::from("/usr/bin/bash"),
+            PathBuf::from("/opt/homebrew/bin/bash"),
+            PathBuf::from("/bin/zsh"),
+            PathBuf::from("/usr/bin/zsh"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).expect("write executable fixture");
+        let mut permissions = std::fs::metadata(path)
+            .expect("fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make fixture executable");
+    }
+
     /// Bridge for String-shaped assertions: render the typed result exactly
     /// as the model would see it.
     fn render_result(r: ToolResult) -> String {
@@ -769,6 +805,87 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipefail_runner_preserves_argv0_through_real_dash_fallback() {
+        let Some(dash) = available_dash() else {
+            return;
+        };
+        let dash = dash.to_string_lossy().to_string();
+        let output = pipefail_shell_command(&dash, "printf '%s' \"$0\"; exit 7 | cat")
+            .output()
+            .await
+            .expect("pipefail shell wrapper should start");
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), dash);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipefail_runner_without_capable_shell_fails_closed_without_side_effect() {
+        let Some(dash) = available_dash() else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("isolated PATH");
+        let sentinel = temp.path().join("must-not-exist");
+        let mut process = pipefail_shell_command(
+            dash.to_string_lossy().as_ref(),
+            "printf ran > \"$NANOBOT_PIPEFAIL_SENTINEL\"",
+        );
+        let output = process
+            .env("PATH", temp.path())
+            .env("NANOBOT_PIPEFAIL_SENTINEL", &sentinel)
+            .output()
+            .await
+            .expect("dash wrapper should start");
+        assert_eq!(output.status.code(), Some(126));
+        assert!(!sentinel.exists(), "user command must not run");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("no pipefail-capable shell found"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipefail_runner_executes_user_command_once_through_fallback() {
+        let (Some(dash), Some(real_shell)) = (available_dash(), available_pipefail_shell()) else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("isolated PATH");
+        let fake_bash = temp.path().join("bash");
+        write_executable(
+            &fake_bash,
+            &format!(
+                "#!{}\nprintf x >> \"$NANOBOT_FALLBACK_TRACE\"\nexec \"$NANOBOT_REAL_SHELL\" \"$@\"\n",
+                real_shell.display()
+            ),
+        );
+        let sentinel = temp.path().join("user-command-runs");
+        let trace = temp.path().join("fallback-runs");
+        let argv0 = temp.path().join("argv0");
+        let dash = dash.to_string_lossy().to_string();
+        let mut process = pipefail_shell_command(
+            &dash,
+            "printf x >> \"$NANOBOT_PIPEFAIL_SENTINEL\"; printf '%s' \"$0\" > \"$NANOBOT_PIPEFAIL_ARGV0\"; exit 7 | :",
+        );
+        let output = process
+            .env("PATH", temp.path())
+            .env("NANOBOT_PIPEFAIL_SENTINEL", &sentinel)
+            .env("NANOBOT_PIPEFAIL_ARGV0", &argv0)
+            .env("NANOBOT_FALLBACK_TRACE", &trace)
+            .env("NANOBOT_REAL_SHELL", &real_shell)
+            .output()
+            .await
+            .expect("dash wrapper should start");
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "x");
+        assert_eq!(std::fs::read_to_string(&trace).unwrap(), "x");
+        assert_eq!(std::fs::read_to_string(&argv0).unwrap(), dash);
     }
 
     // -----------------------------------------------------------------------
