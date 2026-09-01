@@ -64,8 +64,10 @@ rewording.
 
 Other scaffolds are judged by their own purpose rather than by final-answer
 rate. Lease renewal restored intended tool use in 11 of 17 observed cases and
-remains bounded by the existing two-renewal cap. Repeat-result nudges produced
-no observed convergence and are replaced by deterministic limits.
+remains bounded by `DEFAULT_MAX_LEASES_PER_TURN = 3`; malformed-renewal
+corrections are separately capped at `MAX_LEASE_RENEWAL_REJECTIONS = 2`.
+Repeat-result nudges produced no observed convergence and are replaced by
+deterministic limits.
 
 ## Invariants
 
@@ -215,7 +217,8 @@ The existing `FlowControl` hot path remains the single authority for:
 - successfully executed tools per turn;
 - consecutive zero-progress rounds;
 - consecutive repeated normalized call batches;
-- lease use and at most two renewals.
+- lease use, at most three successful checkpoint renewals, and at most two
+  malformed-renewal corrections.
 
 No new guard module or protocol mode is introduced. Each counter is initialized
 with the turn and reset only by its documented evidence event. A failed or
@@ -311,7 +314,8 @@ mechanical gate.
 
 - No response-boundary or repeat-result scaffold is persisted.
 - `curl` consumes the normal lease and cannot auto-renew it.
-- Lease renewal remains capped at two.
+- Successful checkpoint renewal remains capped at three and malformed-renewal
+  correction remains capped at two.
 - Limit exhaustion performs at most one `tool_choice: none` call.
 - A provider that ignores `none` causes no tool execution and ends as
   `limit_exhausted`.
