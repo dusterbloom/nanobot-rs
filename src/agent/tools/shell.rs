@@ -455,6 +455,8 @@ impl Tool for ExecTool {
 
         let result = tokio::time::timeout(timeout_dur, async {
             let mut child = match Command::new("sh")
+                .arg("-o")
+                .arg("pipefail")
                 .arg("-c")
                 .arg(command)
                 .current_dir(&cwd)
@@ -683,6 +685,36 @@ mod tests {
             "{:?}",
             result.data()
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_pipeline_failure_is_structured_failure() {
+        let tool = make_exec_tool(false);
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("printf nope >&2; exit 7 | cat".to_string()),
+        );
+        let result = crate::agent::tools::base::ToolExecutionResult::from(
+            tool.execute(params, &ToolContext::sandbox()).await,
+        );
+        assert!(!result.ok());
+        assert!(result.data().contains("Exit code: 7"), "{}", result.data());
+    }
+
+    #[tokio::test]
+    async fn successful_pipeline_remains_successful() {
+        let tool = make_exec_tool(false);
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("printf ok | cat".to_string()),
+        );
+        let result = crate::agent::tools::base::ToolExecutionResult::from(
+            tool.execute(params, &ToolContext::sandbox()).await,
+        );
+        assert!(result.ok());
+        assert_eq!(result.data(), "ok");
     }
 
     // -----------------------------------------------------------------------
