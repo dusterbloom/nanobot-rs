@@ -30,6 +30,31 @@ static RE_POSIX_PATH: LazyLock<Regex> =
 static RE_WIN_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).expect("static regex"));
 
+const PIPEFAIL_SHELL_WRAPPER: &str = r#"
+if (set -o pipefail) 2>/dev/null; then
+    exec "$0" -o pipefail -c "$1"
+elif command -v bash >/dev/null 2>&1; then
+    exec bash -o pipefail -c "$1"
+elif command -v zsh >/dev/null 2>&1; then
+    exec zsh -o pipefail -c "$1"
+else
+    printf '%s\n' 'nanobot: no pipefail-capable shell found' >&2
+    exit 126
+fi
+"#;
+
+fn pipefail_shell_command(shell: &str, command: &str) -> Command {
+    // The user command remains one argv value (`$1`) and is never interpolated
+    // into the probe. `exec` runs it exactly once under a shell with pipefail.
+    let mut process = Command::new(shell);
+    process
+        .arg("-c")
+        .arg(PIPEFAIL_SHELL_WRAPPER)
+        .arg(shell)
+        .arg(command);
+    process
+}
+
 use super::base::{require_param, PermissionLevel, Tool, ToolContext, ToolResult};
 use crate::agent::audit::ToolEvent;
 use crate::errors::ToolError;
@@ -454,11 +479,7 @@ impl Tool for ExecTool {
         let timeout_dur = Duration::from_secs(timeout);
 
         let result = tokio::time::timeout(timeout_dur, async {
-            let mut child = match Command::new("sh")
-                .arg("-o")
-                .arg("pipefail")
-                .arg("-c")
-                .arg(command)
+            let mut child = match pipefail_shell_command("sh", command)
                 .current_dir(&cwd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -715,6 +736,39 @@ mod tests {
         );
         assert!(result.ok());
         assert_eq!(result.data(), "ok");
+    }
+
+    #[test]
+    fn pipefail_runner_preserves_command_as_one_argument() {
+        let command = r#"printf '%s' '$HOME `uname` \"quoted\"'"#;
+        let built = pipefail_shell_command("dash", command);
+        let args: Vec<_> = built.as_std().get_args().collect();
+        assert_eq!(args.last().and_then(|arg| arg.to_str()), Some(command));
+    }
+
+    #[tokio::test]
+    async fn pipefail_runner_falls_back_from_dash_when_available() {
+        let dash_available = Command::new("dash")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .await;
+        let Ok(status) = dash_available else {
+            return;
+        };
+        assert!(status.success(), "dash probe failed: {status}");
+
+        let output = pipefail_shell_command("dash", "printf ok; exit 7 | cat")
+            .output()
+            .await
+            .expect("pipefail shell wrapper should start");
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("Illegal option"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // -----------------------------------------------------------------------
