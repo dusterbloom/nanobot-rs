@@ -2361,10 +2361,9 @@ impl SessionDb {
             ) {
                 continue;
             }
-            let ok = message
-                .get("ok")
-                .and_then(Value::as_bool)
-                .unwrap_or(!exact_body.starts_with("Error:"));
+            let explicit_ok = message.get("ok").and_then(Value::as_bool);
+            let ok = explicit_ok
+                .unwrap_or_else(|| crate::agent::context_hygiene::tool_result_ok(&exact_body));
             match crate::agent::tool_engine::store_then_render_tool_result(
                 self,
                 session_id,
@@ -2377,7 +2376,12 @@ impl SessionDb {
             )
             .await
             {
-                Ok(rendered) => message["content"] = Value::String(rendered),
+                Ok(rendered) => {
+                    message["content"] = Value::String(rendered);
+                    if explicit_ok.is_none() {
+                        message["ok"] = Value::Bool(ok);
+                    }
+                }
                 Err(error) => warn!(
                     session_id,
                     tool_call_id,
@@ -5469,6 +5473,49 @@ mod tests {
             crate::agent::turn::turn_from_legacy(&history[1]),
             Some(crate::agent::turn::Turn::ToolResult { ok: false, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn large_wrapped_error_replay_upgrade_preserves_failure_status() {
+        let (db, _dir) = make_db();
+        let session = db.create_session("cli:wrapped-error-upgrade").await;
+        let body = format!(
+            "[VERBATIM TOOL OUTPUT — do not paraphrase]\nError: denied by policy\n{}",
+            "context line\n".repeat(500)
+        );
+        db.add_messages(
+            &session.id,
+            &[
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_wrapped",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": "{}"}
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call_wrapped",
+                    "name": "exec",
+                    "content": body
+                }),
+            ],
+        )
+        .await;
+
+        let history = db.get_history(&session.id, 100, 0).await;
+        assert_eq!(history[1].get("ok").and_then(Value::as_bool), Some(false));
+        assert!(matches!(
+            crate::agent::turn::turn_from_legacy(&history[1]),
+            Some(crate::agent::turn::Turn::ToolResult { ok: false, .. })
+        ));
+        assert_eq!(
+            db.load_tool_result_with_status(&session.id, "call_wrapped")
+                .await,
+            Some((body, Some(false)))
+        );
     }
 
     #[tokio::test]

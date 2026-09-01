@@ -36,6 +36,31 @@ macro_rules! require_str {
 /// Names of async worker tools.
 pub const WORKER_TOOLS: &[&str] = &["verify", "python_eval", "diff_apply", "fmt_convert"];
 
+/// A worker result whose execution status is independent of its display text.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerToolOutcome {
+    pub(crate) data: String,
+    pub(crate) ok: bool,
+}
+
+impl WorkerToolOutcome {
+    fn success(data: String) -> Self {
+        Self { data, ok: true }
+    }
+
+    fn failure(data: String) -> Self {
+        Self { data, ok: false }
+    }
+
+    /// Transitional adapter for worker helpers that still use the legacy
+    /// `Error: ...` string contract. New worker helpers must return an explicit
+    /// status so non-Error failure receipts cannot be mistaken for success.
+    fn from_legacy(data: String) -> Self {
+        let ok = crate::agent::context_hygiene::tool_result_ok(&data);
+        Self { data, ok }
+    }
+}
+
 /// Check if a tool name is an async worker tool.
 pub fn is_worker_tool(name: &str) -> bool {
     WORKER_TOOLS.contains(&name)
@@ -115,28 +140,30 @@ pub fn worker_tool_definitions() -> Vec<Value> {
     ]
 }
 
-/// Execute a worker tool by name. Returns the tool result as a string.
+/// Execute a worker tool by name with status captured at the worker boundary.
 pub async fn execute_worker_tool(
     name: &str,
     args: &HashMap<String, Value>,
     workspace: Option<&std::path::Path>,
-) -> String {
+) -> WorkerToolOutcome {
     match name {
         "verify" => execute_verify(args).await,
-        "python_eval" => execute_python_eval(args).await,
-        "diff_apply" => execute_diff_apply(args, workspace).await,
-        "fmt_convert" => execute_fmt_convert(args).await,
-        _ => format!("Error: unknown worker tool '{}'.", name),
+        "python_eval" => WorkerToolOutcome::from_legacy(execute_python_eval(args).await),
+        "diff_apply" => WorkerToolOutcome::from_legacy(execute_diff_apply(args, workspace).await),
+        "fmt_convert" => WorkerToolOutcome::from_legacy(execute_fmt_convert(args).await),
+        _ => WorkerToolOutcome::failure(format!("Error: unknown worker tool '{}'.", name)),
     }
 }
 
 /// Run a command and check output against expectations.
-async fn execute_verify(args: &HashMap<String, Value>) -> String {
-    let command = require_str!(args, "command", ".");
+async fn execute_verify(args: &HashMap<String, Value>) -> WorkerToolOutcome {
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return WorkerToolOutcome::failure("Error: 'command' parameter is required.".to_string());
+    };
 
     // Safety: apply the same deny patterns as ExecTool.
     if let Some(reason) = check_deny_patterns(command) {
-        return format!("BLOCKED: {}", reason);
+        return WorkerToolOutcome::failure(format!("BLOCKED: {}", reason));
     }
 
     let expect_contains: Vec<String> = args
@@ -194,18 +221,18 @@ async fn execute_verify(args: &HashMap<String, Value>) -> String {
                 } else {
                     format!(", all {} patterns found", expect_contains.len())
                 };
-                format!("PASS: exit code {}{}", exit_code, pattern_msg)
+                WorkerToolOutcome::success(format!("PASS: exit code {}{}", exit_code, pattern_msg))
             } else {
                 let preview: String = combined.chars().take(500).collect();
-                format!(
+                WorkerToolOutcome::failure(format!(
                     "FAIL:\n{}\n\nOutput preview:\n{}",
                     failures.join("\n"),
                     preview
-                )
+                ))
             }
         }
-        Ok(Err(e)) => format!("FAIL: command error: {}", e),
-        Err(_) => "FAIL: command timed out (30s)".to_string(),
+        Ok(Err(e)) => WorkerToolOutcome::failure(format!("FAIL: command error: {}", e)),
+        Err(_) => WorkerToolOutcome::failure("FAIL: command timed out (30s)".to_string()),
     }
 }
 
@@ -584,7 +611,12 @@ mod tests {
         args.insert("command".to_string(), json!("echo hello"));
         args.insert("expect_contains".to_string(), json!(["hello"]));
         let result = execute_verify(&args).await;
-        assert!(result.starts_with("PASS"), "Expected PASS, got: {}", result);
+        assert!(result.ok);
+        assert!(
+            result.data.starts_with("PASS"),
+            "Expected PASS, got: {}",
+            result.data
+        );
     }
 
     #[tokio::test]
@@ -593,8 +625,13 @@ mod tests {
         args.insert("command".to_string(), json!("echo hello"));
         args.insert("expect_contains".to_string(), json!(["goodbye"]));
         let result = execute_verify(&args).await;
-        assert!(result.starts_with("FAIL"), "Expected FAIL, got: {}", result);
-        assert!(result.contains("Missing pattern: 'goodbye'"));
+        assert!(!result.ok);
+        assert!(
+            result.data.starts_with("FAIL"),
+            "Expected FAIL, got: {}",
+            result.data
+        );
+        assert!(result.data.contains("Missing pattern: 'goodbye'"));
     }
 
     #[tokio::test]
@@ -603,8 +640,13 @@ mod tests {
         args.insert("command".to_string(), json!("false")); // exit code 1
         args.insert("expect_exit_code".to_string(), json!(0));
         let result = execute_verify(&args).await;
-        assert!(result.starts_with("FAIL"), "Expected FAIL, got: {}", result);
-        assert!(result.contains("Exit code: got 1"));
+        assert!(!result.ok);
+        assert!(
+            result.data.starts_with("FAIL"),
+            "Expected FAIL, got: {}",
+            result.data
+        );
+        assert!(result.data.contains("Exit code: got 1"));
     }
 
     #[tokio::test]
@@ -613,10 +655,11 @@ mod tests {
         args.insert("command".to_string(), json!("false")); // exit code 1
         args.insert("expect_exit_code".to_string(), json!(1));
         let result = execute_verify(&args).await;
+        assert!(result.ok);
         assert!(
-            result.starts_with("PASS"),
+            result.data.starts_with("PASS"),
             "Expected PASS with exit 1, got: {}",
-            result
+            result.data
         );
     }
 
@@ -625,10 +668,11 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("command".to_string(), json!("rm -rf /"));
         let result = execute_verify(&args).await;
+        assert!(!result.ok);
         assert!(
-            result.starts_with("BLOCKED"),
+            result.data.starts_with("BLOCKED"),
             "Expected BLOCKED, got: {}",
-            result
+            result.data
         );
     }
 
@@ -637,10 +681,11 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("command".to_string(), json!("echo test"));
         let result = execute_verify(&args).await;
+        assert!(result.ok);
         assert!(
-            result.starts_with("PASS"),
+            result.data.starts_with("PASS"),
             "Expected PASS with no expectations, got: {}",
-            result
+            result.data
         );
     }
 

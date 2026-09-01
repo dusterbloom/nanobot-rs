@@ -453,14 +453,14 @@ async fn analyze_via_scratch_pad(
                     let result =
                         worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
-                    let (_, _metadata) = context_store.store(result.clone());
+                    let (_, _metadata) = context_store.store(result.data.clone());
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
                     all_results.push(ToolRunOutcome {
                         tool_call_id: original_id,
                         tool_name: tc.name.clone(),
-                        ok: crate::agent::context_hygiene::tool_result_ok(&result),
-                        data: result,
+                        ok: result.ok,
+                        data: result.data,
                         duration_ms,
                     });
                 } else {
@@ -1027,19 +1027,19 @@ pub async fn run_tool_loop(
                 let result = worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
                 let duration_ms = started.elapsed().as_millis() as u64;
                 // Store result in ContextStore for subsequent micro-tool access.
-                let (_, metadata) = context_store.store(result.clone());
-                let delegation_data = if result.len() > config.max_tool_result_chars {
+                let (_, metadata) = context_store.store(result.data.clone());
+                let delegation_data = if result.data.len() > config.max_tool_result_chars {
                     metadata
                 } else {
-                    result.clone()
+                    result.data.clone()
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
                 all_results.push(ToolRunOutcome {
                     tool_call_id: original_id,
                     tool_name: tc.name.clone(),
-                    ok: crate::agent::context_hygiene::tool_result_ok(&result),
-                    data: result,
+                    ok: result.ok,
+                    data: result.data,
                     duration_ms,
                 });
 

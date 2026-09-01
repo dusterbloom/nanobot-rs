@@ -260,6 +260,134 @@ fn delegated_tool_status_is_copied_from_typed_result() {
 }
 
 #[tokio::test]
+async fn delegated_denied_worker_status_reaches_every_sink() {
+    let provider = Arc::new(MockProvider::new(vec![crate::providers::base::LLMResponse {
+        content: Some("Denied verification recorded.".to_string()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: HashMap::new(),
+    }]));
+    let config = ToolRunnerConfig {
+        provider,
+        model: "mock".to_string(),
+        max_iterations: 2,
+        max_tokens: 256,
+        max_tool_result_chars: 4096,
+        short_circuit_chars: 0,
+        depth: 0,
+        cancellation_token: None,
+        verbatim: false,
+        budget: None,
+    };
+    let call = ToolCallRequest {
+        id: "call_denied".to_string(),
+        name: "verify".to_string(),
+        arguments: HashMap::from([("command".to_string(), json!("rm -rf /"))]),
+    };
+
+    let result = run_tool_loop(
+        &config,
+        &[call.clone()],
+        &ToolRegistry::new(),
+        "verify safely",
+    )
+    .await;
+    let outcome = &result.tool_results[0];
+    assert!(outcome.data.starts_with("BLOCKED:"));
+    assert!(!outcome.ok, "a denied worker command is a failed execution");
+
+    let mut receipt = Vec::new();
+    ContextBuilder::add_tool_result_with_status(
+        &mut receipt,
+        &outcome.tool_call_id,
+        &outcome.tool_name,
+        &outcome.data,
+        outcome.ok,
+    );
+    assert_eq!(receipt[0].get("ok").and_then(Value::as_bool), Some(false));
+
+    let event = crate::agent::audit::ToolEvent::CallEnd {
+        tool_name: outcome.tool_name.clone(),
+        tool_call_id: outcome.tool_call_id.clone(),
+        result_data: outcome.data.clone(),
+        ok: outcome.ok,
+        duration_ms: outcome.duration_ms,
+    };
+    assert!(matches!(
+        event,
+        crate::agent::audit::ToolEvent::CallEnd { ok: false, .. }
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = crate::session::SessionDb::new(&dir.path().join("sessions.db"));
+    let session = sessions.create_session("cli:denied-worker").await;
+    assert!(matches!(
+        sessions
+            .store_tool_result_immutable_with_status(
+                &session.id,
+                &outcome.tool_call_id,
+                &outcome.tool_name,
+                &outcome.data,
+                outcome.ok,
+            )
+            .await,
+        crate::session::db::StoredResult::Stored { .. }
+    ));
+    assert_eq!(
+        sessions
+            .load_tool_result_with_status(&session.id, &outcome.tool_call_id)
+            .await,
+        Some((outcome.data.clone(), Some(false)))
+    );
+
+    sessions
+        .record_tool_pre_execute(
+            &session.id,
+            "request-denied",
+            1,
+            &outcome.tool_call_id,
+            &outcome.tool_name,
+            &call.arguments,
+            crate::session::db::ToolPreExecuteDecision::Ready,
+        )
+        .await
+        .unwrap();
+    sessions
+        .record_tool_execute(
+            &session.id,
+            "request-denied",
+            1,
+            &outcome.tool_call_id,
+            &outcome.data,
+            outcome.ok,
+            outcome.duration_ms,
+        )
+        .await
+        .unwrap();
+    assert!(sessions
+        .load_session_events(&session.id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| matches!(
+            event.payload,
+            crate::session::db::SessionEventPayload::ToolExecute { ok: false, .. }
+        )));
+
+    let audit = crate::agent::audit::AuditLog::new(dir.path(), "denied-worker");
+    audit.record(
+        &outcome.tool_name,
+        &outcome.tool_call_id,
+        &json!({}),
+        &outcome.data,
+        outcome.ok,
+        outcome.duration_ms,
+        "tool_runner:mock",
+    );
+    assert_eq!(audit.get_entries()[0].result_ok, false);
+}
+
+#[tokio::test]
 async fn test_run_tool_loop_executes_tools() {
     let provider = Arc::new(MockProvider::new(vec![
         // After initial tool execution, model says "done".
