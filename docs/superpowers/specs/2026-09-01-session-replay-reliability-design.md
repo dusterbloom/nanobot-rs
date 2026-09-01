@@ -84,8 +84,9 @@ no observed convergence and are replaced by deterministic limits.
 7. All convergence limits have explicit units and per-turn reset semantics.
 8. A rejected tool call still receives its matching protocol-valid result
    receipt before the turn stops.
-9. SQLite replay remains readable by the previously installed binary; the
-   release does not require a destructive database downgrade on rollback.
+9. SQLite replay remains readable by the previously installed binary. Any
+   schema evolution is additive and ignored safely by that binary; the release
+   does not require a destructive database downgrade on rollback.
 10. Tests may provide fixtures and scripted providers, but no alternate replay
     pipeline or protocol mode enters production.
 
@@ -200,8 +201,8 @@ probe may add evidence such as "the backend health endpoint was unavailable",
 but it does not replace the provider's precise error with "server crashed".
 
 These outcomes use the existing string field in replay events and require no
-SQL schema change. Compatibility verification loads newly written events through
-the prior installed binary before deployment.
+outcome-schema change. Compatibility verification loads newly written events
+through the prior installed binary before deployment.
 
 ### Deterministic convergence
 
@@ -221,11 +222,18 @@ with the turn and reset only by its documented evidence event. A failed or
 rejected tool is zero progress.
 
 When a hard convergence limit is reached, the loop makes at most one terminal
-provider request using the unchanged tool array and `tool_choice: none`. The
-request is recorded as a distinct replay purpose so exact replay can distinguish
-ordinary inference from terminal recovery. Providers that cannot enforce tool
-choice are still safe because returned tool calls are rejected rather than
-executed.
+provider request using the unchanged tool array and `tool_choice: none`. It
+reuses the existing `Continuation` replay purpose and is distinguished by the
+recorded `tool_choice: "none"`; adding a new serialized enum variant would make
+the rollback binary reject the event. Providers that cannot enforce tool choice
+are still safe because returned tool calls are rejected rather than executed.
+
+The physical `tool_results` table regains its nullable `ok` column through the
+prior additive migration pattern. Fresh databases create it directly; existing
+databases use `ALTER TABLE ... ADD COLUMN` only when absent. The status-aware
+immutable store treats status as part of the stored result. Older binaries ignore
+the extra column, so this is compatible in both directions and requires no
+destructive migration or historical backfill.
 
 ### Replay and compaction integrity
 
@@ -312,8 +320,8 @@ mechanical gate.
 
 - The deterministic compound replay passes through the production agent loop.
 - The fresh local-model replay returns the complete correct final answer.
-- `cargo test --release` passes.
 - `cargo build --release` passes.
+- `cargo test --release` passes.
 - A matched 20-turn `scripts/turn_bench.sh` comparison has zero additional
   failures. Median wall time and median TTFT may not regress by more than 10%; a
   larger first result is rerun twice under the same machine/model/power state and
@@ -343,11 +351,11 @@ candidate is installed through a temporary sibling followed by atomic rename.
 The agent is restarted, its health is checked, and one bounded smoke turn is
 queried from SQLite before declaring the release live.
 
-A normal release failure rolls back only the binary and restarts it. The design
-intentionally avoids a schema migration, so restoring the database would discard
-new user messages without benefit. The database backup is restored only for
-demonstrated corruption or a compatibility failure, and only after the affected
-processes are stopped.
+A normal release failure rolls back only the binary and restarts it. The only
+schema change is an additive column the prior binary ignores, so restoring the
+database would discard new user messages without benefit. The database backup is
+restored only for demonstrated corruption or a compatibility failure, and only
+after the affected processes are stopped.
 
 ## Code Touch Points
 
@@ -363,12 +371,12 @@ Expected production files, subject to impact analysis before each symbol edit:
 - `src/agent/tools/stash_search.rs` — retain and verify query-range fallback;
 - `src/providers/openai_compat.rs` and provider trait code only as required to
   carry a terminal `ToolChoice::None`; remove the dirty prompt dump;
-- `src/session/db.rs` — populate truthful `ok` values and fault-injection/replay
-  coverage;
+- `src/session/db.rs` — restore the rollback-safe additive `tool_results.ok`
+  migration, populate truthful values, and add fault-injection/replay coverage;
 - existing agent-loop, provider, session, and LCM test modules for regressions.
 
-No production replay module, new feature flag, parallel agent loop, or SQL
-schema migration is planned.
+No production replay module, new feature flag, parallel agent loop, or
+incompatible/destructive SQL migration is planned.
 
 ## Explicit Non-Goals
 
