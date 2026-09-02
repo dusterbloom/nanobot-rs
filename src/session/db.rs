@@ -837,6 +837,7 @@ impl crate::providers::base::LLMProvider for ReplayRecordingProvider {
         });
         Ok(crate::providers::base::StreamHandle {
             rx,
+            terminal_error_rx: None,
             abort_on_drop: Some(forward),
         })
     }
@@ -4102,6 +4103,7 @@ mod tests {
             });
             Ok(crate::providers::base::StreamHandle {
                 rx,
+                terminal_error_rx: None,
                 abort_on_drop: Some(task),
             })
         }

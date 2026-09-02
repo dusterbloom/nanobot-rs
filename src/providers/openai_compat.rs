@@ -35,6 +35,13 @@ use super::constants::{
 };
 use super::jit_gate::JitGate;
 use super::retry;
+use crate::agent::capacity::HiggsCapacityProfile;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HiggsCapacityFetch {
+    Profile(HiggsCapacityProfile),
+    Legacy,
+}
 
 /// An LLM provider that talks to any OpenAI-compatible chat completions endpoint.
 pub struct OpenAICompatProvider {
@@ -203,6 +210,58 @@ impl OpenAICompatProvider {
     pub fn with_higgs_session_cache(mut self, enabled: bool) -> Self {
         self.higgs_session_cache = enabled;
         self
+    }
+
+    /// Fetch Higgs' live capacity extension without widening `LLMProvider`.
+    /// Non-Higgs OpenAI-compatible providers never receive this request.
+    pub(crate) async fn fetch_higgs_capacity(
+        &self,
+        model: &str,
+    ) -> Result<Option<HiggsCapacityFetch>, crate::errors::ProviderError> {
+        use crate::errors::ProviderError;
+
+        if !self.higgs_session_cache {
+            return Ok(None);
+        }
+
+        let response = self
+            .client
+            .get(crate::higgs::capacity_url_from_base(&self.api_base))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .query(&[("model", model)])
+            .send()
+            .await
+            .map_err(|error| ProviderError::HttpError(error.to_string()))?;
+        let status = response.status().as_u16();
+        let has_content_type = response
+            .headers()
+            .contains_key(reqwest::header::CONTENT_TYPE);
+        let response_text = response
+            .text()
+            .await
+            .map_err(|error| ProviderError::ResponseReadError(error.to_string()))?;
+
+        if status == 404 && response_text.is_empty() && !has_content_type {
+            return Ok(Some(HiggsCapacityFetch::Legacy));
+        }
+        if !(200..300).contains(&status) {
+            return Err(
+                parse_higgs_capacity_error(status, &response_text).unwrap_or_else(|| {
+                    map_status_to_provider_error(
+                        status,
+                        response_text,
+                        &self.api_base,
+                        &serde_json::json!({}),
+                        model,
+                    )
+                }),
+            );
+        }
+
+        serde_json::from_str(&response_text)
+            .map(HiggsCapacityFetch::Profile)
+            .map(Some)
+            .map_err(|error| ProviderError::JsonParseError(error.to_string()))
     }
 
     /// Attach OpenAI-compatible sampling penalties.
@@ -807,6 +866,85 @@ enum RequestKind {
     Streaming,
 }
 
+fn parse_higgs_capacity_error(
+    status_code: u16,
+    response_text: &str,
+) -> Option<crate::errors::ProviderError> {
+    use crate::errors::ProviderError;
+
+    let value: serde_json::Value = serde_json::from_str(response_text).ok()?;
+    let error = value.get("error")?.as_object()?;
+    let error_type = error.get("type")?.as_str()?;
+    let code = error.get("code")?.as_str()?;
+    if (status_code, error_type, code) == (404, "higgs_capacity_model_not_found", "model_not_found")
+    {
+        return Some(ProviderError::HttpStatus {
+            status: status_code,
+            code: Some(code.to_owned()),
+            message: response_text.to_owned(),
+        });
+    }
+    let boot_id = error.get("bootId")?.as_str()?;
+    if boot_id.trim().is_empty() {
+        return None;
+    }
+    let generation = error.get("generation")?.as_u64()?;
+
+    match (status_code, error_type, code) {
+        (413, "higgs_capacity_exceeded", "compact_and_retry") => {
+            let safe_prompt_tokens = error.get("safePromptTokens")?.as_u64()?;
+            let safe_total_tokens = error.get("safeTotalTokens")?.as_u64()?;
+            if safe_prompt_tokens == 0
+                || safe_total_tokens == 0
+                || safe_prompt_tokens > safe_total_tokens
+            {
+                return None;
+            }
+            Some(ProviderError::HiggsCapacityExceeded {
+                safe_prompt_tokens,
+                safe_total_tokens,
+                boot_id: boot_id.to_owned(),
+                generation,
+            })
+        }
+        (503, "higgs_capacity_unavailable", "capacity_unavailable") => {
+            let retry_after_ms = error.get("retryAfterMs")?.as_u64()?;
+            if retry_after_ms != 5_000 {
+                return None;
+            }
+            Some(ProviderError::HiggsCapacityUnavailable {
+                boot_id: boot_id.to_owned(),
+                generation,
+                retry_after_ms,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_higgs_capacity_interruption(
+    data: &str,
+    partial_stream_bytes: Vec<u8>,
+) -> Option<crate::errors::ProviderError> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let error = value.get("error")?.as_object()?;
+    if error.get("type")?.as_str()? != "higgs_capacity_interrupted"
+        || error.get("code")?.as_str()? != "capacity_interrupted"
+    {
+        return None;
+    }
+    let boot_id = error.get("bootId")?.as_str()?;
+    if boot_id.trim().is_empty() {
+        return None;
+    }
+    Some(crate::errors::ProviderError::HiggsCapacityInterrupted {
+        boot_id: boot_id.to_owned(),
+        generation: error.get("generation")?.as_u64()?,
+        partial_output_tokens: error.get("partialOutputTokens")?.as_u64()?,
+        partial_stream_bytes,
+    })
+}
+
 /// Map a non-success chat/completions response to a [`crate::errors::ProviderError`].
 ///
 /// Shared by `chat_impl` and `chat_stream` so streaming and non-streaming can
@@ -1137,6 +1275,10 @@ impl OpenAICompatProvider {
                     .map_err(|e| ProviderError::ResponseReadError(e.to_string()))?;
 
                 if !status.is_success() {
+                    if let Some(error) = parse_higgs_capacity_error(status.as_u16(), &response_text)
+                    {
+                        return Err(error);
+                    }
                     return Err(map_status_to_provider_error(
                         status.as_u16(),
                         response_text,
@@ -1316,6 +1458,9 @@ impl LLMProvider for OpenAICompatProvider {
                 let status = response.status();
                 if !status.is_success() {
                     let error_text = response.text().await.unwrap_or_default();
+                    if let Some(error) = parse_higgs_capacity_error(status.as_u16(), &error_text) {
+                        return Err(error);
+                    }
                     return Err(map_status_to_provider_error(
                         status.as_u16(),
                         error_text,
@@ -1354,19 +1499,24 @@ impl LLMProvider for OpenAICompatProvider {
         );
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (terminal_error_tx, terminal_error_rx) = tokio::sync::oneshot::channel();
 
         // Spawn a task to parse the SSE stream.
         // The JIT permit is moved into the task and held until the stream ends,
         // preventing other providers from switching models mid-stream.
         let byte_stream = response.bytes_stream();
         let abort_on_drop = tokio::spawn(async move {
-            parse_sse_stream(byte_stream, tx).await;
+            if let Err(error) = parse_sse_stream(byte_stream, tx).await {
+                warn!(%error, "provider_stream_terminal_error");
+                let _ = terminal_error_tx.send(error);
+            }
             // Permit drops here when the stream is fully consumed.
             drop(jit_permit);
         });
 
         Ok(StreamHandle {
             rx,
+            terminal_error_rx: Some(terminal_error_rx),
             abort_on_drop: Some(abort_on_drop),
         })
     }
@@ -1849,7 +1999,7 @@ fn extract_usage_numbers(
 async fn parse_sse_stream(
     byte_stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
-) {
+) -> Result<(), crate::errors::ProviderError> {
     let mut line_buffer = String::new();
     let mut full_content = String::new();
     let mut full_reasoning = String::new(); // API reasoning_content field only
@@ -1857,6 +2007,7 @@ async fn parse_sse_stream(
     let mut split_state = ThinkSplitState::default();
     let mut finish_reason = FinishReason::Stop;
     let mut usage: HashMap<String, i64> = HashMap::new();
+    let mut partial_stream_bytes = Vec::new();
 
     // Tool call accumulation: index → (id, name, arguments_json_str)
     let mut tool_calls_acc: HashMap<u64, (String, String, String)> = HashMap::new();
@@ -1872,6 +2023,7 @@ async fn parse_sse_stream(
             }
         };
 
+        partial_stream_bytes.extend_from_slice(&bytes);
         let text = String::from_utf8_lossy(&bytes);
         line_buffer.push_str(&text);
 
@@ -1995,7 +2147,7 @@ async fn parse_sse_stream(
                     finish_reason: finish_reason.clone(),
                     usage: usage.clone(),
                 }));
-                return;
+                return Ok(());
             }
 
             // Parse JSON chunk
@@ -2006,6 +2158,12 @@ async fn parse_sse_stream(
                     continue;
                 }
             };
+
+            if let Some(error) =
+                parse_higgs_capacity_interruption(data, partial_stream_bytes.clone())
+            {
+                return Err(error);
+            }
 
             // Prefill progress (llama.cpp/higgs `return_progress`): these
             // chunks have empty choices and carry only prompt_progress.
@@ -2145,7 +2303,7 @@ async fn parse_sse_stream(
             finish_reason: FinishReason::ProviderFailure,
             usage,
         }));
-        return;
+        return Ok(());
     }
     // Fallback chain: API reasoning_content first, then inline <think> blocks.
     let content = if !full_content.is_empty() {
@@ -2214,6 +2372,7 @@ async fn parse_sse_stream(
         finish_reason,
         usage,
     }));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4083,6 +4242,474 @@ mod tests {
             .collect()
     }
 
+    async fn spawn_capacity_server(
+        status: &'static str,
+        content_type: Option<&'static str>,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind capacity server");
+        let address = listener.local_addr().expect("capacity server address");
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept capacity request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read capacity request");
+                assert_ne!(read, 0, "capacity request ended before headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let content_type = content_type
+                .map(|value| format!("Content-Type: {value}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write capacity response");
+            String::from_utf8(request).expect("capacity request is HTTP text")
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn available_capacity_body() -> &'static str {
+        r#"{"schemaVersion":1,"model":"escha model/#1","modelFingerprint":"sha256:abc","bootId":"boot-1","generation":7,"availability":"available","pressure":"normal","safeTotalTokens":53248,"recommendedOutputTokens":4096,"maxPromptTokens":49152,"retainedSessionTokens":49152,"retainedBytes":2147483648,"prefixCacheBytes":1073741824,"basis":"learned"}"#
+    }
+
+    #[tokio::test]
+    async fn higgs_capacity_fetch_normalizes_base_authenticates_and_encodes_model() {
+        let (base, server) = spawn_capacity_server(
+            "200 OK",
+            Some("application/json"),
+            available_capacity_body(),
+        )
+        .await;
+        let provider = OpenAICompatProvider::new(
+            "capacity-secret",
+            Some(&format!("{base}/v1/")),
+            Some("escha model/#1"),
+        )
+        .with_higgs_session_cache(true);
+
+        let result = provider
+            .fetch_higgs_capacity("escha model/#1")
+            .await
+            .expect("valid capacity profile")
+            .expect("Higgs capability enabled");
+        let HiggsCapacityFetch::Profile(profile) = result else {
+            panic!("new Higgs must not select legacy fallback");
+        };
+        assert_eq!(profile.model(), "escha model/#1");
+
+        let request = server.await.expect("capacity server task");
+        let request_line = request.lines().next().unwrap();
+        let request_target = request_line.split_whitespace().nth(1).unwrap();
+        assert!(request_target.starts_with("/v1/capacity?model="));
+        assert!(
+            !request_target.contains(' '),
+            "model query must be percent-safe"
+        );
+        assert!(
+            request_target.contains("escha+model%2F%231")
+                || request_target.contains("escha%20model%2F%231"),
+            "unexpected encoded query: {request_line}"
+        );
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer capacity-secret")),
+            "capacity authentication must match chat authentication"
+        );
+    }
+
+    #[tokio::test]
+    async fn higgs_capacity_fetch_keeps_known_unloaded_profile() {
+        let body = r#"{"schemaVersion":1,"model":"escha","modelFingerprint":"sha256:abc","bootId":"boot-1","generation":8,"availability":"unavailable","pressure":"critical","safeTotalTokens":0,"recommendedOutputTokens":0,"maxPromptTokens":0,"retainedSessionTokens":0,"retainedBytes":0,"prefixCacheBytes":0,"basis":"conservative"}"#;
+        let (base, server) = spawn_capacity_server("200 OK", Some("application/json"), body).await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"))
+            .with_higgs_session_cache(true);
+
+        let result = provider
+            .fetch_higgs_capacity("escha")
+            .await
+            .unwrap()
+            .unwrap();
+        let HiggsCapacityFetch::Profile(profile) = result else {
+            panic!("known unloaded model is a profile, not legacy Higgs");
+        };
+        assert_eq!(
+            profile.availability(),
+            crate::agent::capacity::CapacityAvailability::Unavailable
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_exact_empty_content_type_less_404_selects_legacy_higgs() {
+        let (base, server) = spawn_capacity_server("404 Not Found", None, "").await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"))
+            .with_higgs_session_cache(true);
+        assert!(matches!(
+            provider.fetch_higgs_capacity("escha").await.unwrap(),
+            Some(HiggsCapacityFetch::Legacy)
+        ));
+        server.await.unwrap();
+
+        let typed = r#"{"error":{"type":"higgs_capacity_model_not_found","code":"model_not_found","model":"missing"}}"#;
+        let (base, server) =
+            spawn_capacity_server("404 Not Found", Some("application/json"), typed).await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("missing"))
+            .with_higgs_session_cache(true);
+        assert!(matches!(
+            provider.fetch_higgs_capacity("missing").await,
+            Err(crate::errors::ProviderError::HttpStatus {
+                status: 404,
+                code: Some(code),
+                ..
+            }) if code == "model_not_found"
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_capacity_profile_is_rejected() {
+        let malformed = r#"{"schemaVersion":1,"model":"escha"}"#;
+        let (base, server) =
+            spawn_capacity_server("200 OK", Some("application/json"), malformed).await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"))
+            .with_higgs_session_cache(true);
+        assert!(matches!(
+            provider.fetch_higgs_capacity("escha").await,
+            Err(crate::errors::ProviderError::JsonParseError(_))
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_higgs_provider_never_fetches_capacity() {
+        let provider =
+            OpenAICompatProvider::new("cloud", Some("http://127.0.0.1:9/v1"), Some("model"));
+
+        assert!(matches!(
+            provider.fetch_higgs_capacity("model").await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_exact_route_absence_does_not_select_legacy_higgs() {
+        for (content_type, body) in [(Some("application/json"), ""), (None, "{}")] {
+            let (base, server) = spawn_capacity_server("404 Not Found", content_type, body).await;
+            let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"))
+                .with_higgs_session_cache(true);
+
+            assert!(matches!(
+                provider.fetch_higgs_capacity("escha").await,
+                Err(crate::errors::ProviderError::HttpStatus { status: 404, .. })
+            ));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_and_streaming_http_paths_return_exact_capacity_errors() {
+        let exceeded = r#"{"error":{"type":"higgs_capacity_exceeded","code":"compact_and_retry","safePromptTokens":36864,"safeTotalTokens":40960,"bootId":"boot-1","generation":8}}"#;
+        let (base, server) =
+            spawn_capacity_server("413 Content Too Large", Some("application/json"), exceeded)
+                .await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"));
+        let error = provider
+            .chat(
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                16,
+                0.0,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<crate::errors::ProviderError>(),
+            Some(crate::errors::ProviderError::HiggsCapacityExceeded {
+                safe_prompt_tokens: 36_864,
+                safe_total_tokens: 40_960,
+                generation: 8,
+                ..
+            })
+        ));
+        server.await.unwrap();
+
+        let unavailable = r#"{"error":{"type":"higgs_capacity_unavailable","code":"capacity_unavailable","bootId":"boot-2","generation":9,"retryAfterMs":5000}}"#;
+        let (base, server) = spawn_capacity_server(
+            "503 Service Unavailable",
+            Some("application/json"),
+            unavailable,
+        )
+        .await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"));
+        let error = match provider
+            .chat_stream(
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                16,
+                0.0,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("typed unavailable response must fail before streaming"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.downcast_ref::<crate::errors::ProviderError>(),
+            Some(crate::errors::ProviderError::HiggsCapacityUnavailable {
+                generation: 9,
+                retry_after_ms: 5_000,
+                ..
+            })
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_capacity_413_keeps_generic_http_error() {
+        let malformed = r#"{"error":{"type":"higgs_capacity_exceeded","code":"compact_and_retry","safePromptTokens":"36864","safeTotalTokens":40960,"bootId":"boot-1","generation":8}}"#;
+        let (base, server) =
+            spawn_capacity_server("413 Content Too Large", Some("application/json"), malformed)
+                .await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"));
+        let error = provider
+            .chat(
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                16,
+                0.0,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<crate::errors::ProviderError>(),
+            Some(crate::errors::ProviderError::HttpStatus { status: 413, .. })
+        ));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn exact_higgs_capacity_http_errors_are_structural() {
+        let exceeded = r#"{"error":{"type":"higgs_capacity_exceeded","code":"compact_and_retry","safePromptTokens":36864,"safeTotalTokens":40960,"bootId":"boot-1","generation":8}}"#;
+        assert!(matches!(
+            parse_higgs_capacity_error(413, exceeded),
+            Some(crate::errors::ProviderError::HiggsCapacityExceeded {
+                safe_prompt_tokens: 36_864,
+                safe_total_tokens: 40_960,
+                boot_id,
+                generation: 8,
+            }) if boot_id == "boot-1"
+        ));
+
+        let unavailable = r#"{"error":{"type":"higgs_capacity_unavailable","code":"capacity_unavailable","bootId":"boot-2","generation":9,"retryAfterMs":5000}}"#;
+        assert!(matches!(
+            parse_higgs_capacity_error(503, unavailable),
+            Some(crate::errors::ProviderError::HiggsCapacityUnavailable {
+                boot_id,
+                generation: 9,
+                retry_after_ms: 5_000,
+            }) if boot_id == "boot-2"
+        ));
+
+        let not_found = r#"{"error":{"type":"higgs_capacity_model_not_found","code":"model_not_found","model":"missing"}}"#;
+        assert!(matches!(
+            parse_higgs_capacity_error(404, not_found),
+            Some(crate::errors::ProviderError::HttpStatus {
+                status: 404,
+                code: Some(code),
+                message,
+            }) if code == "model_not_found" && message == not_found
+        ));
+    }
+
+    #[test]
+    fn capacity_unavailable_requires_schema_v1_retry_delay() {
+        for body in [
+            r#"{"error":{"type":"higgs_capacity_unavailable","code":"capacity_unavailable","bootId":"boot-2","generation":9,"retryAfterMs":4999}}"#,
+            r#"{"error":{"type":"higgs_capacity_unavailable","code":"capacity_unavailable","bootId":"boot-2","generation":9,"retryAfterMs":5001}}"#,
+        ] {
+            assert!(
+                parse_higgs_capacity_error(503, body).is_none(),
+                "only the frozen schema-v1 retryAfterMs is typed"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_or_malformed_capacity_status_preserves_generic_mapping() {
+        for body in [
+            r#"{"error":{"type":"context_length_exceeded","code":"compact_and_retry"}}"#,
+            r#"{"error":{"type":"context_length_exceeded","code":"compact_and_retry","safePromptTokens":36864,"safeTotalTokens":40960,"bootId":"boot-1","generation":8}}"#,
+            r#"{"error":{"type":"higgs_capacity_exceeded","code":"wrong_code","safePromptTokens":36864,"safeTotalTokens":40960,"bootId":"boot-1","generation":8}}"#,
+            r#"{"error":{"type":"higgs_capacity_exceeded","code":"compact_and_retry","safePromptTokens":"36864","safeTotalTokens":40960,"bootId":"boot-1","generation":8}}"#,
+        ] {
+            assert!(parse_higgs_capacity_error(413, body).is_none());
+            assert!(matches!(
+                map_status_to_provider_error(
+                    413,
+                    body.to_owned(),
+                    "http://local/v1",
+                    &serde_json::json!({}),
+                    "escha"
+                ),
+                crate::errors::ProviderError::HttpStatus { status: 413, .. }
+            ));
+        }
+        let body = r#"{"error":{"type":"higgs_capacity_exceeded","code":"compact_and_retry","safePromptTokens":1,"safeTotalTokens":2,"bootId":"boot","generation":1}}"#;
+        assert!(parse_higgs_capacity_error(400, body).is_none());
+
+        for body in [
+            r#"{"error":{"type":"server_error","code":"capacity_unavailable","bootId":"boot-2","generation":9,"retryAfterMs":5000}}"#,
+            r#"{"error":{"type":"higgs_capacity_unavailable","code":"wrong_code","bootId":"boot-2","generation":9,"retryAfterMs":5000}}"#,
+            r#"{"error":{"type":"higgs_capacity_unavailable","code":"capacity_unavailable","bootId":"boot-2","generation":9,"retryAfterMs":"5000"}}"#,
+        ] {
+            assert!(parse_higgs_capacity_error(503, body).is_none());
+            assert!(matches!(
+                map_status_to_provider_error(
+                    503,
+                    body.to_owned(),
+                    "http://local/v1",
+                    &serde_json::json!({}),
+                    "escha"
+                ),
+                crate::errors::ProviderError::ServerError { status: 503, .. }
+            ));
+        }
+        let body = r#"{"error":{"type":"higgs_capacity_unavailable","code":"capacity_unavailable","bootId":"boot-2","generation":9,"retryAfterMs":5000}}"#;
+        assert!(parse_higgs_capacity_error(413, body).is_none());
+
+        for body in [
+            r#"{"error":{"type":"other","code":"model_not_found","model":"missing"}}"#,
+            r#"{"error":{"type":"higgs_capacity_model_not_found","code":"other","model":"missing"}}"#,
+        ] {
+            assert!(parse_higgs_capacity_error(404, body).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_higgs_capacity_sse_returns_typed_error_without_done() {
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}]}",
+            "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"capacity_interrupted\",\"bootId\":\"boot-3\",\"generation\":10,\"partialOutputTokens\":3}}",
+            "data: [DONE]",
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = parse_sse_stream(futures_util::stream::iter(chunks), tx)
+            .await
+            .expect_err("typed terminal event must fail the stream");
+
+        assert!(matches!(
+            error,
+            crate::errors::ProviderError::HiggsCapacityInterrupted {
+                boot_id,
+                generation: 10,
+                partial_output_tokens: 3,
+                ref partial_stream_bytes,
+            } if boot_id == "boot-3" && partial_stream_bytes.windows(7).any(|w| w == b"partial")
+        ));
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .all(|chunk| !matches!(chunk, StreamChunk::Done(_))),
+            "typed terminal interruption must never become a successful response"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_higgs_stream_exposes_typed_terminal_error_without_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}]}\n\n",
+            "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"capacity_interrupted\",\"bootId\":\"boot-3\",\"generation\":10,\"partialOutputTokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, server) = spawn_capacity_server("200 OK", Some("text/event-stream"), body).await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"));
+        let mut stream = provider
+            .chat_stream(
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                16,
+                0.0,
+                None,
+                None,
+            )
+            .await
+            .expect("stream headers succeed");
+        let terminal_error = stream
+            .take_terminal_error_receiver()
+            .expect("OpenAI-compatible streams expose terminal parser errors");
+
+        let mut saw_done = false;
+        while let Some(chunk) = stream.rx.recv().await {
+            saw_done |= matches!(chunk, StreamChunk::Done(_));
+        }
+        let error = terminal_error
+            .await
+            .expect("typed terminal parser error must be delivered");
+
+        assert!(!saw_done, "interrupted stream must not report success");
+        assert!(matches!(
+            error,
+            crate::errors::ProviderError::HiggsCapacityInterrupted {
+                boot_id,
+                generation: 10,
+                partial_output_tokens: 3,
+                ref partial_stream_bytes,
+            } if boot_id == "boot-3" && partial_stream_bytes.windows(7).any(|w| w == b"partial")
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unrelated_or_malformed_sse_errors_keep_normal_stream_semantics() {
+        for error_event in [
+            "data: {\"error\":{\"type\":\"server_error\",\"code\":\"capacity_interrupted\",\"bootId\":\"boot-3\",\"generation\":10,\"partialOutputTokens\":3}}",
+            "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"wrong_code\",\"bootId\":\"boot-3\",\"generation\":10,\"partialOutputTokens\":3}}",
+            "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"capacity_interrupted\",\"bootId\":\"\",\"generation\":10,\"partialOutputTokens\":3}}",
+        ] {
+            let chunks = sse_bytes(&[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}]}",
+                error_event,
+                "data: [DONE]",
+            ]);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+            parse_sse_stream(futures_util::stream::iter(chunks), tx)
+                .await
+                .expect("non-exact error event keeps the legacy parser path");
+
+            assert!(
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .any(|chunk| matches!(chunk, StreamChunk::Done(_))),
+                "non-exact event must not become a typed interruption"
+            );
+        }
+    }
+
     async fn spawn_timed_sse_server(
         frames: Vec<(std::time::Duration, &'static str)>,
     ) -> (String, tokio::task::JoinHandle<()>) {
@@ -4574,7 +5201,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await;
+        parse_sse_stream(stream, tx).await.unwrap();
 
         let mut saw_transport_progress = false;
         while let Ok(chunk) = rx.try_recv() {
@@ -4602,7 +5229,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await;
+        parse_sse_stream(stream, tx).await.unwrap();
 
         // Collect all chunks.
         let mut deltas = Vec::new();
@@ -4645,7 +5272,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await;
+        parse_sse_stream(stream, tx).await.unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {
@@ -4675,7 +5302,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await;
+        parse_sse_stream(stream, tx).await.unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {
@@ -4706,7 +5333,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await;
+        parse_sse_stream(stream, tx).await.unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {
@@ -4740,7 +5367,7 @@ mod tests {
 
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        parse_sse_stream(stream, tx).await;
+        parse_sse_stream(stream, tx).await.unwrap();
 
         let mut received = Vec::new();
         while let Ok(chunk) = rx.try_recv() {
@@ -4774,7 +5401,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await;
+        parse_sse_stream(stream, tx).await.unwrap();
 
         let mut done_response = None;
         let mut tool_call_deltas = 0usize;
@@ -4817,7 +5444,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await;
+        parse_sse_stream(stream, tx).await.unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {
@@ -4846,7 +5473,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await;
+        parse_sse_stream(stream, tx).await.unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {

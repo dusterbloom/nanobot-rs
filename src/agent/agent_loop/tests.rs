@@ -2544,6 +2544,7 @@ impl LLMProvider for StreamingThinkingProvider {
         ));
         Ok(crate::providers::base::StreamHandle {
             rx,
+            terminal_error_rx: None,
             abort_on_drop: None,
         })
     }

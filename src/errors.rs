@@ -42,6 +42,36 @@ pub enum ProviderError {
     #[error("Server error (status {status}): {message}")]
     ServerError { status: u16, message: String },
 
+    #[error(
+        "Higgs capacity exceeded (safe prompt {safe_prompt_tokens}, safe total {safe_total_tokens}, boot {boot_id}, generation {generation})"
+    )]
+    HiggsCapacityExceeded {
+        safe_prompt_tokens: u64,
+        safe_total_tokens: u64,
+        boot_id: String,
+        generation: u64,
+    },
+
+    #[error(
+        "Higgs capacity unavailable (boot {boot_id}, generation {generation}, retry after {retry_after_ms}ms)"
+    )]
+    HiggsCapacityUnavailable {
+        boot_id: String,
+        generation: u64,
+        retry_after_ms: u64,
+    },
+
+    #[error(
+        "Higgs capacity interrupted generation (boot {boot_id}, generation {generation}, partial output {partial_output_tokens} tokens)"
+    )]
+    HiggsCapacityInterrupted {
+        boot_id: String,
+        generation: u64,
+        partial_output_tokens: u64,
+        /// Raw incomplete SSE bytes retained for the durable replay wiring.
+        partial_stream_bytes: Vec<u8>,
+    },
+
     #[error("Request cancelled")]
     Cancelled,
 
@@ -64,6 +94,9 @@ impl ProviderError {
             Self::ResponseReadError(_)
             | Self::JsonParseError(_)
             | Self::AuthError { .. }
+            | Self::HiggsCapacityExceeded { .. }
+            | Self::HiggsCapacityUnavailable { .. }
+            | Self::HiggsCapacityInterrupted { .. }
             | Self::Cancelled
             | Self::EmptyStream(_) => false,
         }

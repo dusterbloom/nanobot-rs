@@ -155,10 +155,21 @@ pub enum StreamChunk {
 /// Handle to a streaming LLM response.
 pub struct StreamHandle {
     pub rx: tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+    /// Provider parser failure delivered after the chunk channel closes.
+    /// Kept separate so terminal failures can never masquerade as `Done`.
+    pub(crate) terminal_error_rx: Option<tokio::sync::oneshot::Receiver<ProviderError>>,
     /// Provider-owned parser/read task. Dropping the handle aborts it so local
     /// streams that stop making progress release their HTTP request and JIT
     /// permit immediately instead of lingering until the backend timeout.
     pub abort_on_drop: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StreamHandle {
+    pub(crate) fn take_terminal_error_receiver(
+        &mut self,
+    ) -> Option<tokio::sync::oneshot::Receiver<ProviderError>> {
+        self.terminal_error_rx.take()
+    }
 }
 
 impl Drop for StreamHandle {
@@ -272,6 +283,7 @@ pub trait LLMProvider: Send + Sync {
         let _ = tx.send(StreamChunk::Done(response));
         Ok(StreamHandle {
             rx,
+            terminal_error_rx: None,
             abort_on_drop: None,
         })
     }

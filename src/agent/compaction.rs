@@ -749,6 +749,7 @@ mod tests {
             });
             Ok(StreamHandle {
                 rx,
+                terminal_error_rx: None,
                 abort_on_drop: Some(task),
             })
         }

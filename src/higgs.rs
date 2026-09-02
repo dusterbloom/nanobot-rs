@@ -629,6 +629,15 @@ fn models_url_from_base(api_base: &str) -> String {
     }
 }
 
+pub(crate) fn capacity_url_from_base(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/capacity")
+    } else {
+        format!("{base}/v1/capacity")
+    }
+}
+
 fn health_url_from_base(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     let base = base.strip_suffix("/v1").unwrap_or(base);
@@ -1204,6 +1213,22 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_url_normalizes_root_and_v1_bases() {
+        assert_eq!(
+            capacity_url_from_base("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/v1/capacity"
+        );
+        assert_eq!(
+            capacity_url_from_base("http://127.0.0.1:8080/"),
+            "http://127.0.0.1:8080/v1/capacity"
+        );
+        assert_eq!(
+            capacity_url_from_base("http://127.0.0.1:8080/v1/"),
+            "http://127.0.0.1:8080/v1/capacity"
+        );
+    }
 
     #[test]
     fn test_pid_path_under_nanobot_dir() {
