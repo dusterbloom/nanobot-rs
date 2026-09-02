@@ -14,6 +14,7 @@ pub(crate) mod agent_profiles;
 pub(crate) mod anti_drift;
 pub(crate) mod audit;
 pub(crate) mod capabilities;
+pub(crate) mod capacity;
 pub(crate) mod circuit_breaker;
 pub mod compaction;
 pub(crate) mod context;

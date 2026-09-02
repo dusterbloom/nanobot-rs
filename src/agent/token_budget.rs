@@ -249,6 +249,11 @@ impl TokenBudget {
         self.max_context
     }
 
+    /// Return the configured absolute response reserve.
+    pub(crate) fn response_reserve(&self) -> usize {
+        self.reserve_response
+    }
+
     /// Tokens available for new content (accounting for reserve and usage).
     pub fn available(&self) -> usize {
         let ceiling = if let Some(reserve) = self.output_reserve {
