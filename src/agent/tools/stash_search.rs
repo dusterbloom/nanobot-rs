@@ -702,9 +702,7 @@ impl Tool for SearchToolResultTool {
                 render_slice_page(&body, &lines, id, start, end)
             }
         } else {
-            // Success channel by design: teaches the model why nothing was
-            // stashed instead of a bare error.
-            Self::not_found(id)
+            return Err(ToolError::NotFound(Self::not_found(id)));
         };
         Ok(result.into())
     }
@@ -945,11 +943,16 @@ mod tests {
             ("tool_call_id".to_string(), json!("ghost")),
             ("query".to_string(), json!("x")),
         ]);
-        let out = crate::agent::tools::base::render_result(
-            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
-                .await,
+        let result = tool
+            .execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+            .await;
+        assert!(
+            matches!(&result, Err(ToolError::NotFound(message)) if message.contains("No stored output")),
+            "missing artifact must be a typed failure: {result:?}"
         );
+        let out = crate::agent::tools::base::render_result(result);
         assert!(out.contains("No stored output"));
+        assert!(out.starts_with("Error: "), "{out}");
     }
 
     #[tokio::test]
