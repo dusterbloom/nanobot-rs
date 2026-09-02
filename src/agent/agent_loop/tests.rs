@@ -8910,6 +8910,20 @@ async fn mixed_guard_batch_keeps_blocked_carrier_receipt_and_executes_allowed_me
                 && message.get("ok") == Some(&Value::Bool(ok))
         }));
     }
+    let blocked_receipt = raw
+        .iter()
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_mixed_blocked")
+        })
+        .and_then(|message| message.get("content").and_then(Value::as_str))
+        .expect("mixed guard blocked receipt content");
+    let (blocked_row, blocked_ok) = core
+        .sessions
+        .load_tool_result_with_status(&session.id, "tc_mixed_blocked")
+        .await
+        .expect("mixed guard rejected call raw row");
+    assert_eq!(blocked_ok, Some(false));
+    assert_eq!(blocked_row, blocked_receipt);
     let replay = core
         .sessions
         .load_session_replay(&session.id)
@@ -8975,6 +8989,13 @@ async fn mixed_guard_receipt_persistence_failure_prevents_allowed_execution() {
     assert_eq!(
         persisted_turn_outcome(&core.sessions, &session.id).await,
         "error"
+    );
+    assert_eq!(
+        core.sessions
+            .load_tool_result_with_status(&session.id, "tc_fault_blocked")
+            .await,
+        None,
+        "failed router receipt transaction must roll back its raw row"
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
@@ -11285,6 +11306,16 @@ mod runtime_mode_parity_tests {
                 && message.get("tool_call_id").and_then(Value::as_str) == Some("tc_ignored_none")
                 && message.get("ok").and_then(Value::as_bool) == Some(false)
         }));
+        let (stored_receipt, stored_ok) = core
+            .sessions
+            .load_tool_result_with_status(&session.id, "tc_ignored_none")
+            .await
+            .expect("terminal rejected call raw row");
+        assert_eq!(stored_ok, Some(false));
+        assert_eq!(
+            stored_receipt,
+            "terminal tool_choice=none: tool call was rejected and not executed"
+        );
         assert_eq!(
             persisted_turn_outcome(&core.sessions, &session.id).await,
             "limit_exhausted"
@@ -11345,6 +11376,13 @@ mod runtime_mode_parity_tests {
         assert!(!messages.iter().any(|message| {
             message.get("tool_call_id").and_then(Value::as_str) == Some("tc_terminal_receipt_fault")
         }));
+        assert_eq!(
+            core.sessions
+                .load_tool_result_with_status(&session.id, "tc_terminal_receipt_fault")
+                .await,
+            None,
+            "failed terminal protocol transaction must roll back its raw row"
+        );
         let replay = core
             .sessions
             .load_session_replay(&session.id)
@@ -11417,6 +11455,16 @@ mod runtime_mode_parity_tests {
                 && message.get("ok").and_then(Value::as_bool) == Some(false)
         });
         assert_eq!((has_carrier, has_receipt), (true, true));
+        let (stored_receipt, stored_ok) = core
+            .sessions
+            .load_tool_result_with_status(&session.id, "tc_terminal_decision_fault")
+            .await
+            .expect("terminal rejection row survives later decision-journal fault");
+        assert_eq!(stored_ok, Some(false));
+        assert_eq!(
+            stored_receipt,
+            "terminal tool_choice=none: tool call was rejected and not executed"
+        );
         let replay = core
             .sessions
             .load_session_replay(&session.id)
@@ -11778,7 +11826,7 @@ mod runtime_mode_parity_tests {
         assert!(secondary.contains("secondary rate limit"), "{secondary}");
 
         let messages = core.sessions.get_all_messages(&successful_session.id).await;
-        let carrier_ids: std::collections::HashSet<String> = messages
+        let carrier_ids: Vec<String> = messages
             .iter()
             .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
             .flat_map(|message| {
@@ -11795,13 +11843,47 @@ mod runtime_mode_parity_tests {
             .iter()
             .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
             .collect();
-        assert!(receipts.iter().all(|message| {
-            message
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| carrier_ids.contains(id))
-        }));
-        assert_eq!(carrier_ids.len(), receipts.len());
+        let receipt_ids: Vec<String> = receipts
+            .iter()
+            .map(|message| {
+                message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("tool receipt lacks tool_call_id: {message}"))
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            carrier_ids.len(),
+            receipt_ids.len(),
+            "assistant carrier call count must equal tool receipt count; carriers={carrier_ids:?}, receipts={receipt_ids:?}"
+        );
+        let carrier_counts = carrier_ids.iter().fold(
+            std::collections::HashMap::<String, usize>::new(),
+            |mut counts, id| {
+                *counts.entry(id.clone()).or_default() += 1;
+                counts
+            },
+        );
+        let receipt_counts = receipt_ids.iter().fold(
+            std::collections::HashMap::<String, usize>::new(),
+            |mut counts, id| {
+                *counts.entry(id.clone()).or_default() += 1;
+                counts
+            },
+        );
+        assert!(
+            carrier_counts.values().all(|count| *count == 1),
+            "assistant carrier IDs must be unique and appear exactly once: {carrier_counts:?}"
+        );
+        assert!(
+            receipt_counts.values().all(|count| *count == 1),
+            "tool receipt IDs must be unique and appear exactly once: {receipt_counts:?}"
+        );
+        assert_eq!(
+            carrier_counts, receipt_counts,
+            "assistant carrier and tool receipt ID multisets must match exactly"
+        );
         for tool_call_id in failed_execution_ids {
             assert!(receipts.iter().any(|message| {
                 message.get("tool_call_id").and_then(Value::as_str) == Some(tool_call_id)
@@ -11815,14 +11897,41 @@ mod runtime_mode_parity_tests {
             "tc_compound_blocked_distinct_2",
         ];
         for tool_call_id in blocked_ids {
-            assert!(receipts.iter().any(|message| {
-                message.get("tool_call_id").and_then(Value::as_str) == Some(tool_call_id)
-                    && message.get("ok").and_then(Value::as_bool) == Some(false)
-                    && message
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .is_some_and(|content| content.starts_with("lease exhausted:"))
-            }));
+            let receipt = receipts
+                .iter()
+                .find(|message| {
+                    message.get("tool_call_id").and_then(Value::as_str) == Some(tool_call_id)
+                })
+                .unwrap_or_else(|| panic!("blocked call lacks a durable receipt: {tool_call_id}"));
+            assert_eq!(
+                receipt.get("ok").and_then(Value::as_bool),
+                Some(false),
+                "blocked receipt must persist ok=false: {tool_call_id}"
+            );
+            let receipt_content = receipt
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("blocked receipt lacks content: {tool_call_id}"));
+            assert!(
+                receipt_content.starts_with("lease exhausted:"),
+                "blocked receipt must explain lease exhaustion for {tool_call_id}: {receipt_content:?}"
+            );
+            let (stored_content, stored_ok) = core
+                .sessions
+                .load_tool_result_with_status(&successful_session.id, tool_call_id)
+                .await
+                .unwrap_or_else(|| {
+                    panic!("blocked call lacks durable raw tool_results row: {tool_call_id}")
+                });
+            assert_eq!(
+                stored_ok,
+                Some(false),
+                "blocked raw tool_results row must persist ok=false: {tool_call_id}"
+            );
+            assert_eq!(
+                stored_content, receipt_content,
+                "blocked raw row and model-visible receipt must match: {tool_call_id}"
+            );
             assert!(successful_replay.events.iter().any(|event| matches!(
                 &event.payload,
                 crate::session::db::SessionEventPayload::ToolPreExecute {

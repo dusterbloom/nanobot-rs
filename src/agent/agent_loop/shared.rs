@@ -430,6 +430,12 @@ pub(crate) struct TurnContext {
     pub(crate) reasoning: SharedEngine,
 }
 
+#[derive(Clone, Copy)]
+enum ProtocolGroupPersistence {
+    MessagesOnly,
+    MessagesWithRejectedResults,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutoExpansionMaterializationKind {
     ExactCheckpoint,
@@ -1019,6 +1025,22 @@ impl TurnContext {
     /// effect without the conversation bytes that caused and described it.
     /// The row ids also make same-turn messages visible to the LCM ingester.
     pub(crate) async fn persist_pending_protocol_messages(&mut self) -> anyhow::Result<()> {
+        self.persist_pending_protocol_group(ProtocolGroupPersistence::MessagesOnly)
+            .await
+    }
+
+    /// Persist rejected tool receipts together with their immutable false raw
+    /// rows. This is a separate typed mode because ordinary executed results
+    /// already stash exact bytes before rendering their model-visible message.
+    pub(crate) async fn persist_pending_rejected_tool_messages(&mut self) -> anyhow::Result<()> {
+        self.persist_pending_protocol_group(ProtocolGroupPersistence::MessagesWithRejectedResults)
+            .await
+    }
+
+    async fn persist_pending_protocol_group(
+        &mut self,
+        persistence: ProtocolGroupPersistence,
+    ) -> anyhow::Result<()> {
         // Do not rely solely on `new_start`: token trimming can remove old
         // history and shift every index during the turn. Persist by durable-id
         // presence instead; DB-loaded history already carries `_db_id`.
@@ -1060,20 +1082,29 @@ impl TurnContext {
         // group (carrier + receipts) or none of it. A per-message loop that
         // breaks mid-group silently truncates protocol history (see main
         // a05fc81).
-        let row_ids = self
-            .core
-            .sessions
-            .add_messages_checked(&self.session_id, &pending_messages)
-            .await
-            .map_err(|error| {
-                warn!(
-                    session = %self.session_key,
-                    pending = pending_messages.len(),
-                    %error,
-                    "active_turn_protocol_group_persist_failed"
-                );
-                error
-            })?;
+        let row_ids = match persistence {
+            ProtocolGroupPersistence::MessagesOnly => {
+                self.core
+                    .sessions
+                    .add_messages_checked(&self.session_id, &pending_messages)
+                    .await
+            }
+            ProtocolGroupPersistence::MessagesWithRejectedResults => {
+                self.core
+                    .sessions
+                    .add_rejected_tool_messages_checked(&self.session_id, &pending_messages)
+                    .await
+            }
+        }
+        .map_err(|error| {
+            warn!(
+                session = %self.session_key,
+                pending = pending_messages.len(),
+                %error,
+                "active_turn_protocol_group_persist_failed"
+            );
+            error
+        })?;
         for (index, row_id) in pending_indices.into_iter().zip(row_ids) {
             self.messages.set_meta(index, "_db_id", json!(row_id));
         }
@@ -3695,7 +3726,7 @@ impl AgentLoopShared {
                     )
                 });
             }
-            if let Err(error) = ctx.persist_pending_protocol_messages().await {
+            if let Err(error) = ctx.persist_pending_rejected_tool_messages().await {
                 return IterationOutcome::Error(format!(
                     "terminal tool rejection receipts could not be recorded: {error}"
                 ));
@@ -4999,7 +5030,12 @@ impl AgentLoopShared {
                 .push_draft(crate::agent::markers::scaffold_user(scaffold));
         }
         if router_rejections > 0 || has_router_scaffold {
-            if let Err(error) = ctx.persist_pending_protocol_messages().await {
+            let persistence = if router_rejections > 0 {
+                ctx.persist_pending_rejected_tool_messages().await
+            } else {
+                ctx.persist_pending_protocol_messages().await
+            };
+            if let Err(error) = persistence {
                 ctx.emit_pending_request_metrics(0);
                 return StepResult::Done(IterationOutcome::Error(format!(
                     "router-rejected tool receipts could not be recorded atomically; no tools were executed: {error}"
@@ -5150,7 +5186,7 @@ impl AgentLoopShared {
             });
         }
         if !blocked_calls.is_empty() {
-            if let Err(error) = ctx.persist_pending_protocol_messages().await {
+            if let Err(error) = ctx.persist_pending_rejected_tool_messages().await {
                 ctx.emit_pending_request_metrics(0);
                 return StepResult::Done(IterationOutcome::Error(format!(
                     "rejected tool receipts could not be recorded atomically; no tools were executed: {error}"

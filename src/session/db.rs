@@ -2454,12 +2454,58 @@ impl SessionDb {
         // One transaction so the whole batch is atomic and the session's
         // `updated_at` / `message_count` are updated once.
         let tx = conn.transaction()?;
-        let mut row_ids = Vec::with_capacity(msgs.len());
-        for msg in msgs {
-            let row_id = insert_message_locked(&tx, session_id, msg).ok_or_else(|| {
-                anyhow::anyhow!("failed to insert message in atomic protocol batch")
-            })?;
-            row_ids.push(row_id);
+        let row_ids = insert_messages_locked_checked(&tx, session_id, msgs)?;
+        tx.commit()?;
+        Ok(row_ids)
+    }
+
+    /// Persist a protocol group and every rejected tool receipt's exact bytes
+    /// in one transaction. A receipt is a `role=tool`, `ok=false` message;
+    /// ordinary executed results use the existing store-before-render path.
+    /// Keeping the raw row beside the carrier/receipt commit means replay sees
+    /// all three artifacts or none, including under SQLite trigger faults.
+    pub(crate) async fn add_rejected_tool_messages_checked(
+        &self,
+        session_id: &str,
+        msgs: &[Value],
+    ) -> anyhow::Result<Vec<i64>> {
+        if msgs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        let row_ids = insert_messages_locked_checked(&tx, session_id, msgs)?;
+        for msg in msgs.iter().filter(|msg| {
+            msg.get("role").and_then(Value::as_str) == Some("tool")
+                && msg.get("ok").and_then(Value::as_bool) == Some(false)
+        }) {
+            let tool_call_id = msg
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("rejected tool receipt lacks tool_call_id"))?;
+            let tool_name = msg
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("rejected tool receipt lacks tool name"))?;
+            let content = msg
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("rejected tool receipt lacks string content"))?;
+            match store_tool_result_immutable_locked(
+                &tx,
+                session_id,
+                tool_call_id,
+                tool_name,
+                content,
+                false,
+            ) {
+                StoredResult::Stored { .. } | StoredResult::Identical { .. } => {}
+                outcome => {
+                    return Err(anyhow::anyhow!(
+                        "rejected tool receipt raw row conflict for {tool_call_id}: {outcome:?}"
+                    ));
+                }
+            }
         }
         tx.commit()?;
         Ok(row_ids)
@@ -2538,7 +2584,6 @@ impl SessionDb {
         content: &str,
         ok: bool,
     ) -> StoredResult {
-        let attempted_digest = sha256_hex(content.as_bytes());
         let mut conn = self.conn.lock().await;
         // Real transaction (BEGIN…COMMIT) so the insert+read-back is atomic
         // ACROSS connections — recall_tool_result and subagents open their own
@@ -2555,46 +2600,17 @@ impl SessionDb {
                 return StoredResult::Failed;
             }
         };
-        // INSERT OR IGNORE: never overwrite. rows_affected == 1 means newly
-        // inserted; 0 means the key already existed.
-        let inserted_rows = match tx.execute(
-            "INSERT OR IGNORE INTO tool_results \
-             (session_id, tool_call_id, tool_name, content, ok, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                session_id,
-                tool_call_id,
-                tool_name,
-                content,
-                i64::from(ok),
-                Utc::now().to_rfc3339()
-            ],
-        ) {
-            Ok(n) => n,
-            Err(error) => {
-                warn!(
-                    "Failed to persist tool result (immutable) session={} call={}: {}",
-                    session_id, tool_call_id, error
-                );
-                return StoredResult::Failed;
-            }
-        };
-        // Read back what is now stored under the key (either what we just wrote
-        // or the pre-existing bytes) — same transaction, no interleave.
-        let (stored_tool_name, stored_content, stored_ok): (String, String, Option<i64>) = match tx.query_row(
-            "SELECT tool_name, content, ok FROM tool_results WHERE session_id = ?1 AND tool_call_id = ?2",
-            params![session_id, tool_call_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ) {
-            Ok(c) => c,
-            Err(error) => {
-                warn!(
-                    "Stored row vanished after insert session={} call={}: {}",
-                    session_id, tool_call_id, error
-                );
-                return StoredResult::Failed;
-            }
-        };
+        let outcome = store_tool_result_immutable_locked(
+            &tx,
+            session_id,
+            tool_call_id,
+            tool_name,
+            content,
+            ok,
+        );
+        if matches!(outcome, StoredResult::Failed) {
+            return outcome;
+        }
         if let Err(error) = tx.commit() {
             warn!(
                 "Failed to commit tool-result store tx session={} call={}: {}",
@@ -2602,24 +2618,7 @@ impl SessionDb {
             );
             return StoredResult::Failed;
         }
-        let existing_digest = sha256_hex(stored_content.as_bytes());
-        if inserted_rows == 1 {
-            StoredResult::Stored {
-                digest: existing_digest,
-            }
-        } else if existing_digest == attempted_digest
-            && stored_tool_name == tool_name
-            && stored_ok == Some(i64::from(ok))
-        {
-            StoredResult::Identical {
-                digest: existing_digest,
-            }
-        } else {
-            StoredResult::Conflict {
-                existing_digest,
-                attempted_digest,
-            }
-        }
+        outcome
     }
 
     /// Append a `role: "clear"` marker to `session_id`.
@@ -3648,6 +3647,94 @@ fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
 
 fn parse_json_vec(json: String) -> Vec<String> {
     serde_json::from_str(&json).unwrap_or_default()
+}
+
+fn insert_messages_locked_checked(
+    conn: &Connection,
+    session_id: &str,
+    msgs: &[Value],
+) -> anyhow::Result<Vec<i64>> {
+    let mut row_ids = Vec::with_capacity(msgs.len());
+    for msg in msgs {
+        let row_id = insert_message_locked(conn, session_id, msg)
+            .ok_or_else(|| anyhow::anyhow!("failed to insert message in atomic protocol batch"))?;
+        row_ids.push(row_id);
+    }
+    Ok(row_ids)
+}
+
+/// Insert or verify one immutable raw tool result on the caller's transaction.
+/// The outcome and digest rules are shared by ordinary executed results and
+/// rejected receipts; transaction ownership stays with the caller so a
+/// carrier/receipt batch can commit or roll back with its false raw rows.
+fn store_tool_result_immutable_locked(
+    conn: &Connection,
+    session_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    content: &str,
+    ok: bool,
+) -> StoredResult {
+    let attempted_digest = sha256_hex(content.as_bytes());
+    // INSERT OR IGNORE: never overwrite. rows_affected == 1 means newly
+    // inserted; 0 means the key already existed.
+    let inserted_rows = match conn.execute(
+        "INSERT OR IGNORE INTO tool_results \
+         (session_id, tool_call_id, tool_name, content, ok, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            session_id,
+            tool_call_id,
+            tool_name,
+            content,
+            i64::from(ok),
+            Utc::now().to_rfc3339()
+        ],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(
+                "Failed to persist tool result (immutable) session={} call={}: {}",
+                session_id, tool_call_id, error
+            );
+            return StoredResult::Failed;
+        }
+    };
+    // Read back what is now stored under the key (either what we just wrote
+    // or the pre-existing bytes) — same transaction, no interleave.
+    let (stored_tool_name, stored_content, stored_ok): (String, String, Option<i64>) =
+        match conn.query_row(
+            "SELECT tool_name, content, ok FROM tool_results WHERE session_id = ?1 AND tool_call_id = ?2",
+            params![session_id, tool_call_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ) {
+            Ok(stored) => stored,
+            Err(error) => {
+                warn!(
+                    "Stored row vanished after insert session={} call={}: {}",
+                    session_id, tool_call_id, error
+                );
+                return StoredResult::Failed;
+            }
+        };
+    let existing_digest = sha256_hex(stored_content.as_bytes());
+    if inserted_rows == 1 {
+        StoredResult::Stored {
+            digest: existing_digest,
+        }
+    } else if existing_digest == attempted_digest
+        && stored_tool_name == tool_name
+        && stored_ok == Some(i64::from(ok))
+    {
+        StoredResult::Identical {
+            digest: existing_digest,
+        }
+    } else {
+        StoredResult::Conflict {
+            existing_digest,
+            attempted_digest,
+        }
+    }
 }
 
 /// Insert a single message into the DB using an already-locked connection.
@@ -5215,6 +5302,58 @@ mod tests {
         assert!(
             db.get_all_messages(&meta.id).await.is_empty(),
             "a failed protocol group must leave no partial carrier or receipts"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_message_batch_rolls_back_when_raw_row_conflicts() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:atomic-rejected-conflict").await;
+        assert!(matches!(
+            db.store_tool_result_immutable_with_status(
+                &meta.id,
+                "tc_conflict",
+                "exec",
+                "original rejection",
+                false,
+            )
+            .await,
+            StoredResult::Stored { .. }
+        ));
+
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "tc_conflict",
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "content": "different rejection",
+                "tool_call_id": "tc_conflict",
+                "name": "exec",
+                "ok": false
+            }),
+        ];
+
+        let result = db
+            .add_rejected_tool_messages_checked(&meta.id, &messages)
+            .await;
+
+        assert!(result.is_err(), "conflicting immutable row must fail batch");
+        assert!(
+            db.get_all_messages(&meta.id).await.is_empty(),
+            "raw-row conflict must roll back carrier and receipt messages"
+        );
+        assert_eq!(
+            db.load_tool_result_with_status(&meta.id, "tc_conflict")
+                .await,
+            Some(("original rejection".to_string(), Some(false))),
+            "conflict must preserve the original immutable raw row"
         );
     }
 
