@@ -728,8 +728,6 @@ impl AgentLoopShared {
                 consecutive_repeat_rounds: 0,
                 provider_call_mode: ProviderCallMode::Normal,
                 terminal_attempted: false,
-                last_provider_tool_defs: Vec::new(),
-                last_provider_max_tokens: None,
                 infra_error: None,
             },
             health_registry: self.health_registry.clone(),

@@ -2,7 +2,9 @@
 
 Status: complete
 
-Commit: this commit (`fix(agent): replace convergence prompts with typed limit`)
+Initial commit: `7c33d81` (`fix(agent): replace convergence prompts with typed limit`)
+
+Review follow-up: this commit (`fix(agent): close terminal replay gaps`)
 
 ## Result
 
@@ -16,7 +18,9 @@ Terminal mode calls the provider directly. It does not re-enter preparation,
 strict-trio router preflight, response processing, validation, forced-tool
 recovery, continuation, routing, or tool execution. It freshly renders the
 current message tail and reuses the exact frozen tool catalog and response
-budget from the last normal provider request. The OpenAI-compatible HTTP path
+budget from the last durably recorded, actually issued normal provider request.
+If no normal request was issued, terminal mode fails closed to the bounded
+limit outcome without inventing a provider contract. The OpenAI-compatible HTTP path
 disables its retry wrapper for `ToolChoice::None`; normal and required calls
 retain their prior retry behavior.
 
@@ -36,12 +40,20 @@ production changes.
 - The provider-body characterization was corrected to compare the normal and
   terminal serialized catalogs after the existing schema normalization; this
   pins byte-stable tool arrays rather than the unnormalized test input.
+- The independent follow-up review reproduced three additional failures before
+  the fixes: prior streamed normal prose suppressed the blocking terminal prose;
+  `ForceCheckpoint` could leave a pre-admission catalog cached as if issued; and
+  a synthetic receipt-insert failure left the terminal assistant carrier
+  durable without its matching rejected receipt.
 
 ## GREEN evidence
 
-- `terminal_no_tools`: 5 passed, 0 failed. This covers prose, ignored tool
-  calls, provider error/empty, stable serialized tools, and strict-trio router
-  bypass.
+- `terminal_no_tools`: 8 passed, 0 failed. This covers prose, prose after a
+  prior streamed tool round, ignored tool calls, atomic receipt rollback,
+  decision-journal failure pairing, provider error/empty, stable serialized
+  tools, and strict-trio router bypass without a prior contract.
+- `force_checkpoint_keeps_the_last_durably_issued_contract`: passed; admission
+  rejection cannot replace the last issued terminal contract.
 - `terminal_none_request_is_not_retried_after_retryable_http_failure`: passed;
   the capture server observed exactly one HTTP request.
 - `convergence_loop_terminates_without_mutating_tool_catalog`: passed and now
@@ -53,7 +65,7 @@ production changes.
 - Cancellation regressions for pre-provider cancellation, soft compaction, and
   hard compaction: 3 passed, 0 failed.
 - Protocol integration suites: 6 passed and 24 passed, 0 failed.
-- Final unrestricted `cargo test --release`: 2,835 passed, 0 failed, 23 ignored
+- Final unrestricted `cargo test --release`: 2,839 passed, 0 failed, 23 ignored
   in the library target; every integration and doc-test target also completed
   with zero failures.
 - `cargo build --release`: passed.
@@ -70,10 +82,15 @@ warnings outside the Task 4 paths).
 | Provider returns tool calls despite `None` | complete assistant carrier, rejected pre-execute decision, and matching `ok:false` tool receipt for every call | none | `limit_exhausted` |
 | Empty content or provider-declared failed response | request + response | none | `limit_exhausted` |
 | Provider call error | request + model failure | none; no HTTP/loop retry | `limit_exhausted` |
-| Request/response/carrier/rejection/receipt persistence fault | stops at the failed durable boundary | none | `error` |
+| No previously issued normal contract | no fabricated terminal request | none | `limit_exhausted` |
+| Carrier/receipt batch persistence fault | atomic rollback leaves neither carrier nor receipt | none | `error` |
+| Rejection-decision persistence fault | carrier and every matching `ok:false` receipt remain paired | none | `error` |
+| Other request/response persistence fault | stops at the failed durable boundary | none | `error` |
 | Cancellation before terminal authority | no terminal request | none | `cancelled` |
 
-Terminal prose is emitted through the existing final delta path exactly once.
+Terminal prose is emitted directly exactly once, independently of prose streamed
+during earlier normal tool rounds; finalization observes the streamed flag and
+does not duplicate it.
 Ignored terminal tool calls never enter the router, guard, lease, delegated, or
 inline executors.
 
@@ -85,10 +102,13 @@ the response-boundary wording. The three retired synthetic prompt strings
 remain only as negative assertions over persisted messages.
 
 The terminal request records the same final `tools` array used by the last
-normal call. The provider-body test also compares the fully serialized normal
-and terminal arrays. Strict-trio terminal mode bypasses router preflight; a
-dedicated regression starts directly at the limit and proves router call count
-remains zero while the main provider receives one terminal `None` call.
+actually issued normal call. The issued contract is an `Option` written only
+after the normal `ModelRequest` is durable; `ForceCheckpoint` and other
+pre-provider exits cannot replace it. The provider-body test also compares the
+fully serialized normal and terminal arrays. Strict-trio terminal mode bypasses
+router preflight. A no-prior-contract regression starts directly at the limit
+and proves both router and provider call counts remain zero; the normal terminal
+regression proves one prior issued contract produces exactly one `None` call.
 
 Lease behavior is unchanged:
 
@@ -104,6 +124,14 @@ The final implementation directly invokes the terminal provider boundary over
 fresh messages and the cached frozen catalog. The follow-up review confirmed
 the critical issue closed; its two stale-comment findings were also removed.
 
+A later independent review found the three Important streaming, issued-contract,
+and receipt-atomicity gaps recorded in the RED evidence. The follow-up uses the
+existing atomic protocol-message batch, records the contract only at the durable
+normal request boundary, and emits blocking terminal prose independently. New
+fault-injection and streaming regressions close all three findings.
+The final independent re-review reported Spec PASS and Quality PASS with no
+remaining findings.
+
 Pre-edit impact results included:
 
 - `run_agent_loop`: HIGH, 17 upstream / 1 direct / 4 processes
@@ -112,6 +140,9 @@ Pre-edit impact results included:
 - `step_call_llm`: LOW, 3 upstream
 - `should_arm_boundary`: LOW, 4 upstream
 - `step_pre_call`: LOW, 3 upstream
+- `persist_pending_protocol_messages`: CRITICAL, 27 upstream / 8 direct / 8
+  processes; its implementation was not changed, only its existing atomic batch
+  was reused
 - tool-engine and provider helpers: LOW or UNKNOWN where newly introduced
 
 The GitNexus index was three commits behind. Two refresh attempts generated an
@@ -119,7 +150,9 @@ index but could not finalize the worktree registry, so all impacts and the
 pre-commit scope check retain that staleness caveat. The mandatory final
 `detect-changes --repo nanobot-rs` reported the expected CRITICAL hot-path
 scope: 6 source files, 49 indexed symbols, and 133 affected flows. No unrelated
-source path was changed.
+source path was changed. The review follow-up's final detection reported HIGH
+scope: 5 source files, 16 indexed symbols, and 10 affected processes, all in the
+same expected Task 4 hot path.
 
 ## Files
 
@@ -139,9 +172,10 @@ the router entirely.
 - The blocking provider trait has no mid-request cancellation primitive.
   Cancellation is checked before terminal authority is consumed, but a cancel
   arriving after the terminal HTTP call starts cannot abort that one attempt.
-- A persistence failure after the assistant carrier is durable can leave that
-  carrier without every rejected receipt. The turn fails closed as `error`, and
-  no terminal tool or later provider call executes.
+- A rejection-decision journal failure occurs after the atomic protocol batch,
+  so the turn fails closed with a paired carrier and rejected receipt but no
+  durable per-call decision event. No terminal tool or later provider call
+  executes.
 - Terminal failure deliberately has no retry, recovery, validation, or
   continuation path. Availability is traded for the required hard convergence
   bound.

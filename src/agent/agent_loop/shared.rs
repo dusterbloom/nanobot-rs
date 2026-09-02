@@ -1208,11 +1208,6 @@ pub(crate) struct FlowControl {
     pub(crate) provider_call_mode: ProviderCallMode,
     /// Shared at-most-once authority for every convergence trigger.
     pub(crate) terminal_attempted: bool,
-    /// Exact frozen catalog and response budget used by the most recent normal
-    /// provider request. Terminal mode reuses these without re-entering the
-    /// preflight/router state machine.
-    pub(crate) last_provider_tool_defs: Vec<Value>,
-    pub(crate) last_provider_max_tokens: Option<u32>,
     /// Infrastructure error surfaced by the tool engine when the
     /// "handles-not-bodies" invariant cannot be honored — i.e. the immutable
     /// tool-result stash rejected a write (`Conflict` / `Failed`). When set
@@ -1243,6 +1238,13 @@ enum ProviderRequestAdmission {
 pub(crate) struct ProviderRequestState {
     last_hash: Option<u64>,
     last_tool_round: u32,
+    issued_contract: Option<IssuedProviderContract>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct IssuedProviderContract {
+    tool_defs: Vec<Value>,
+    max_tokens: u32,
 }
 
 impl ProviderRequestState {
@@ -1253,6 +1255,14 @@ impl ProviderRequestState {
         self.last_hash = Some(request_hash);
         self.last_tool_round = tool_round;
         ProviderRequestAdmission::Proceed
+    }
+
+    fn record_issued(&mut self, contract: IssuedProviderContract) {
+        self.issued_contract = Some(contract);
+    }
+
+    fn issued_contract(&self) -> Option<&IssuedProviderContract> {
+        self.issued_contract.as_ref()
     }
 }
 
@@ -1915,24 +1925,23 @@ impl AgentLoopShared {
         {
             ctx.flow.terminal_attempted = true;
             ctx.flow.provider_call_mode = ProviderCallMode::TerminalNoTools;
-            let tool_defs = ctx.flow.last_provider_tool_defs.clone();
-            let max_tokens = ctx
-                .flow
-                .last_provider_max_tokens
-                .unwrap_or_else(|| self.compute_adaptive_max_tokens(ctx));
-            match self
-                .step_call_terminal_no_tools(ctx, &tool_defs, max_tokens)
-                .await
-            {
-                IterationOutcome::Complete { content, outcome } => {
-                    ctx.final_content = content;
-                    ctx.turn_outcome = outcome;
+            if let Some(contract) = ctx.flow.provider_request.issued_contract().cloned() {
+                match self
+                    .step_call_terminal_no_tools(ctx, &contract.tool_defs, contract.max_tokens)
+                    .await
+                {
+                    IterationOutcome::Complete { content, outcome } => {
+                        ctx.final_content = content;
+                        ctx.turn_outcome = outcome;
+                    }
+                    IterationOutcome::Error(error) => {
+                        ctx.final_content = error;
+                        ctx.turn_outcome = TurnOutcome::Error;
+                    }
+                    IterationOutcome::Continue | IterationOutcome::ValidationRetry => {}
                 }
-                IterationOutcome::Error(error) => {
-                    ctx.final_content = error;
-                    ctx.turn_outcome = TurnOutcome::Error;
-                }
-                IterationOutcome::Continue | IterationOutcome::ValidationRetry => {}
+            } else {
+                ctx.final_content = LIMIT_EXHAUSTED_REPLY.to_string();
             }
         }
 
@@ -2482,9 +2491,6 @@ impl AgentLoopShared {
 
         self.apply_planned_auto_expansion(ctx, &tool_defs, effective_max_tokens)
             .await;
-
-        ctx.flow.last_provider_tool_defs = tool_defs.clone();
-        ctx.flow.last_provider_max_tokens = Some(effective_max_tokens);
 
         StepResult::Next(IterationPhase::Calling {
             tool_defs,
@@ -3673,15 +3679,25 @@ impl AgentLoopShared {
         }
 
         if response.has_tool_calls() {
-            if let Err(error) = crate::agent::tool_engine::journal_tool_call_carrier(
+            crate::agent::tool_engine::append_tool_call_carrier(
                 ctx,
                 &response.tool_calls,
                 &response,
-            )
-            .await
-            {
+            );
+            for tool_call in &response.tool_calls {
+                ctx.messages.with_draft(|draft| {
+                    ContextBuilder::add_tool_result_immutable_with_status(
+                        draft,
+                        &tool_call.id,
+                        &tool_call.name,
+                        "terminal tool_choice=none: tool call was rejected and not executed",
+                        false,
+                    )
+                });
+            }
+            if let Err(error) = ctx.persist_pending_protocol_messages().await {
                 return IterationOutcome::Error(format!(
-                    "terminal tool-call carrier could not be recorded: {error}"
+                    "terminal tool rejection receipts could not be recorded: {error}"
                 ));
             }
             for tool_call in &response.tool_calls {
@@ -3705,20 +3721,6 @@ impl AgentLoopShared {
                         "terminal tool rejection could not be recorded: {error}"
                     ));
                 }
-                ctx.messages.with_draft(|draft| {
-                    ContextBuilder::add_tool_result_immutable_with_status(
-                        draft,
-                        &tool_call.id,
-                        &tool_call.name,
-                        "terminal tool_choice=none: tool call was rejected and not executed",
-                        false,
-                    )
-                });
-            }
-            if let Err(error) = ctx.persist_pending_protocol_messages().await {
-                return IterationOutcome::Error(format!(
-                    "terminal tool rejection receipts could not be recorded: {error}"
-                ));
             }
             return IterationOutcome::Complete {
                 content: LIMIT_EXHAUSTED_REPLY.to_string(),
@@ -3733,6 +3735,10 @@ impl AgentLoopShared {
                 content: LIMIT_EXHAUSTED_REPLY.to_string(),
                 outcome: TurnOutcome::LimitExhausted,
             };
+        }
+        if let Some(delta_tx) = &ctx.text_delta_tx {
+            let _ = delta_tx.send(content.clone());
+            ctx.flow.content_was_streamed = true;
         }
         IterationOutcome::Complete {
             content,
@@ -4257,6 +4263,12 @@ impl AgentLoopShared {
                 ));
             }
         };
+        ctx.flow
+            .provider_request
+            .record_issued(IssuedProviderContract {
+                tool_defs: recorded_request.tools.clone().unwrap_or_default(),
+                max_tokens: recorded_request.max_tokens,
+            });
 
         let no_progress_timeout = local_stream_no_progress_timeout(ctx);
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
@@ -6787,8 +6799,8 @@ mod forced_recovery_tests {
 #[cfg(test)]
 mod cache_pressure_tests {
     use super::{
-        should_allow_checkpoint, should_inject_heartbeat_grounding, ProviderRequestAdmission,
-        ProviderRequestState,
+        should_allow_checkpoint, should_inject_heartbeat_grounding, IssuedProviderContract,
+        ProviderRequestAdmission, ProviderRequestState,
     };
 
     #[test]
@@ -6806,6 +6818,23 @@ mod cache_pressure_tests {
             "new tool progress must change the exact provider request"
         );
         assert_eq!(state.admit(43, 1), ProviderRequestAdmission::Proceed);
+    }
+
+    #[test]
+    fn force_checkpoint_keeps_the_last_durably_issued_contract() {
+        let mut state = ProviderRequestState::default();
+        let issued = IssuedProviderContract {
+            tool_defs: vec![serde_json::json!({"name": "issued"})],
+            max_tokens: 128,
+        };
+        assert_eq!(state.admit(42, 0), ProviderRequestAdmission::Proceed);
+        state.record_issued(issued.clone());
+
+        assert_eq!(
+            state.admit(42, 1),
+            ProviderRequestAdmission::ForceCheckpoint
+        );
+        assert_eq!(state.issued_contract(), Some(&issued));
     }
 
     // -- should_inject_heartbeat_grounding --------------------------------

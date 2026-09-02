@@ -602,14 +602,14 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
     )
 }
 
-/// Persist the one assistant carrier that owns a routed batch before policy or
+/// Append the one assistant carrier that owns a routed batch before policy or
 /// execution can settle any member. Callers pass the complete batch, including
 /// calls that a lease will reject, so a tool result can never become orphaned.
-pub(crate) async fn journal_tool_call_carrier(
+pub(crate) fn append_tool_call_carrier(
     ctx: &mut TurnContext,
     routed_tool_calls: &[ToolCallRequest],
     response: &LLMResponse,
-) -> anyhow::Result<()> {
+) {
     let tc_json: Vec<Value> = routed_tool_calls
         .iter()
         .map(ToolCallRequest::to_openai_json)
@@ -617,6 +617,16 @@ pub(crate) async fn journal_tool_call_carrier(
     ctx.messages.with_draft(|draft| {
         ContextBuilder::add_assistant_message(draft, response.content.as_deref(), Some(&tc_json));
     });
+}
+
+pub(crate) async fn journal_tool_call_carrier(
+    ctx: &mut TurnContext,
+    routed_tool_calls: &[ToolCallRequest],
+    response: &LLMResponse,
+) -> anyhow::Result<()> {
+    // Normal routing persists the carrier immediately. Terminal rejection uses
+    // the append helper so its carrier and immutable receipts commit together.
+    append_tool_call_carrier(ctx, routed_tool_calls, response);
     ctx.persist_pending_protocol_messages().await
 }
 

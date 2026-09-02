@@ -11120,7 +11120,53 @@ mod runtime_mode_parity_tests {
     }
 
     #[tokio::test]
-    async fn terminal_no_tools_strict_trio_bypasses_router_preflight() {
+    async fn terminal_no_tools_prose_streams_once_after_prior_tool_round_text() {
+        let mut scripted = TerminalNoToolsProvider::new(terminal_text(Some("terminal summary")));
+        scripted.normal.content = Some("normal streamed setup".to_string());
+        let provider = Arc::new(scripted);
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider as Arc<dyn LLMProvider>, 1);
+        let session_key = format!("terminal-streamed-{}", uuid::Uuid::new_v4());
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = agent_loop
+            .process_direct_streaming(
+                "inspect once then finish",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                delta_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(response, "terminal summary");
+        let mut deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            deltas.push(delta);
+        }
+        assert!(
+            deltas.iter().any(|delta| delta == "normal streamed setup"),
+            "normal streamed setup missing: {deltas:?}"
+        );
+        assert_eq!(
+            deltas
+                .iter()
+                .filter(|delta| delta.as_str() == "terminal summary")
+                .count(),
+            1,
+            "terminal prose must be emitted exactly once after prior streamed text: {deltas:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn terminal_no_tools_without_prior_contract_bypasses_strict_router() {
         let main = Arc::new(TerminalNoToolsProvider::new(terminal_text(Some(
             "strict terminal summary",
         ))));
@@ -11146,7 +11192,8 @@ mod runtime_mode_parity_tests {
             .process_direct("What is 2+2?", &session_key, "test", "offline")
             .await;
 
-        assert_eq!(response, "strict terminal summary");
+        assert!(!response.is_empty(), "{response:?}");
+        assert_ne!(response, "strict terminal summary");
         assert_eq!(
             router.call_count(),
             0,
@@ -11154,12 +11201,20 @@ mod runtime_mode_parity_tests {
         );
         assert!(main.normal_tools.lock().is_empty());
         let terminal_calls = main.terminal_calls.lock();
-        assert_eq!(terminal_calls.len(), 1);
-        assert_eq!(
-            terminal_calls[0].0,
-            crate::providers::base::ToolChoice::None
+        assert!(
+            terminal_calls.is_empty(),
+            "without an issued normal contract, terminal mode must not invent one"
         );
-        assert_eq!(terminal_calls[0].1, None);
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted_turn_outcome(&core.sessions, &session.id).await,
+            "limit_exhausted"
+        );
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -11234,6 +11289,144 @@ mod runtime_mode_parity_tests {
             persisted_turn_outcome(&core.sessions, &session.id).await,
             "limit_exhausted"
         );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn terminal_no_tools_receipt_batch_failure_rolls_back_carrier() {
+        let mut arguments = std::collections::HashMap::new();
+        arguments.insert("command".to_string(), json!("printf should-not-run"));
+        let provider = Arc::new(TerminalNoToolsProvider::new(TerminalScript::Response(
+            crate::providers::base::LLMResponse {
+                content: None,
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_terminal_receipt_fault".to_string(),
+                    name: "exec".to_string(),
+                    arguments,
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            },
+        )));
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
+        let session_key = format!("terminal-receipt-fault-{}", uuid::Uuid::new_v4());
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core.sessions.get_or_resume(&session_key).await;
+        {
+            let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_terminal_receipt \
+                 BEFORE INSERT ON messages \
+                 WHEN NEW.tool_call_id = 'tc_terminal_receipt_fault' \
+                 BEGIN SELECT RAISE(ABORT, 'synthetic terminal receipt failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let response = agent_loop
+            .process_direct("inspect once then finish", &session_key, "test", "offline")
+            .await;
+
+        assert!(response.contains("rejection receipts"), "{response:?}");
+        assert_eq!(provider.terminal_calls.lock().len(), 1);
+        let messages = core.sessions.get_all_messages(&session.id).await;
+        assert!(!messages.iter().any(|message| {
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call.get("id").and_then(Value::as_str) == Some("tc_terminal_receipt_fault")
+                    })
+                })
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some("tc_terminal_receipt_fault")
+        }));
+        let replay = core
+            .sessions
+            .load_session_replay(&session.id)
+            .await
+            .unwrap();
+        assert!(!replay.events.iter().any(|event| match &event.payload {
+            crate::session::db::SessionEventPayload::ToolPreExecute { tool_call_id, .. }
+            | crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. } => {
+                tool_call_id == "tc_terminal_receipt_fault"
+            }
+            _ => false,
+        }));
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn terminal_no_tools_decision_failure_keeps_carrier_receipt_pair() {
+        let mut arguments = std::collections::HashMap::new();
+        arguments.insert("command".to_string(), json!("printf should-not-run"));
+        let provider = Arc::new(TerminalNoToolsProvider::new(TerminalScript::Response(
+            crate::providers::base::LLMResponse {
+                content: None,
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_terminal_decision_fault".to_string(),
+                    name: "exec".to_string(),
+                    arguments,
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            },
+        )));
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
+        let session_key = format!("terminal-decision-fault-{}", uuid::Uuid::new_v4());
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core.sessions.get_or_resume(&session_key).await;
+        {
+            let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_terminal_decision \
+                 BEFORE INSERT ON session_events \
+                 WHEN NEW.event_kind = 'tool_pre_execute' \
+                   AND NEW.payload_json LIKE '%tc_terminal_decision_fault%' \
+                 BEGIN SELECT RAISE(ABORT, 'synthetic terminal decision failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let response = agent_loop
+            .process_direct("inspect once then finish", &session_key, "test", "offline")
+            .await;
+
+        assert!(response.contains("tool rejection"), "{response:?}");
+        assert_eq!(provider.terminal_calls.lock().len(), 1);
+        let messages = core.sessions.get_all_messages(&session.id).await;
+        let has_carrier = messages.iter().any(|message| {
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call.get("id").and_then(Value::as_str) == Some("tc_terminal_decision_fault")
+                    })
+                })
+        });
+        let has_receipt = messages.iter().any(|message| {
+            message.get("tool_call_id").and_then(Value::as_str)
+                == Some("tc_terminal_decision_fault")
+                && message.get("ok").and_then(Value::as_bool) == Some(false)
+        });
+        assert_eq!((has_carrier, has_receipt), (true, true));
+        let replay = core
+            .sessions
+            .load_session_replay(&session.id)
+            .await
+            .unwrap();
+        assert!(!replay.events.iter().any(|event| matches!(
+            &event.payload,
+            crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. }
+                if tool_call_id == "tc_terminal_decision_fault"
+        )));
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
