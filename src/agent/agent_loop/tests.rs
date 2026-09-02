@@ -2623,6 +2623,16 @@ fn build_trio_offline_harness_with_registry(
     specialist: Arc<dyn LLMProvider>,
     health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 ) -> (AgentLoop, std::path::PathBuf) {
+    build_trio_offline_harness_with_iters(main, router, specialist, health_registry, 5)
+}
+
+fn build_trio_offline_harness_with_iters(
+    main: Arc<dyn LLMProvider>,
+    router: Arc<dyn LLMProvider>,
+    specialist: Arc<dyn LLMProvider>,
+    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
+    max_iterations: u32,
+) -> (AgentLoop, std::path::PathBuf) {
     use crate::config::schema::LcmSchemaConfig;
 
     let workspace = tempfile::tempdir().unwrap().keep();
@@ -2647,7 +2657,7 @@ fn build_trio_offline_harness_with_registry(
         provider: main,
         workspace: workspace.clone(),
         model: "offline-main".to_string(),
-        max_iterations: 5,
+        max_iterations,
         max_continuations: 2,
         max_tokens: 512,
         temperature: 0.3,
@@ -7704,14 +7714,8 @@ async fn test_read_after_write_same_turn_is_not_blocked_by_stale_receipt() {
 }
 
 /// Regression (prod, session cli:oneshot, bonsai-27b): a turn that runs a
-/// side-effect tool (exec) arms the response boundary, which injects a
-/// synthetic `scaffold_user` nudge into the conversation. That nudge is
-/// rendered into the wire but never persisted. When a later tool round appends
-/// after it, the nudge sits MID-history; on the NEXT turn the reloaded history
-/// no longer contains it, so turn N+1's wire is no longer a byte-prefix of
-/// turn N's last wire — the local server re-prefills the whole context
-/// (`prompt_prefix_diverged`, ~30-200s on a 27B). This is the observed 38→32
-/// wire shrink diverging at an empty `[assistant]` carrier.
+/// A side-effect round followed by another legitimate tool must remain an
+/// append-only wire prefix without synthetic boundary messages.
 #[tokio::test]
 async fn test_wire_prefix_stable_across_turn_after_side_effect_boundary_nudge() {
     let mut exec_args = std::collections::HashMap::new();
@@ -7738,9 +7742,8 @@ async fn test_wire_prefix_stable_across_turn_after_side_effect_boundary_nudge() 
         finish_reason: FinishReason::ToolCalls,
         usage: std::collections::HashMap::new(),
     };
-    // Turn 1: exec (arms boundary → nudge injected before the next call) then a
-    // second tool round (list_dir) that lands AFTER the nudge, then a final
-    // text reply. Turn 2: a plain text reply.
+    // Turn 1: exec, then a second legitimate tool round, then a final text
+    // reply. Turn 2: a plain text reply.
     let provider = Arc::new(WireRecordingProvider::new(
         "local-qwen-test",
         vec![
@@ -7840,13 +7843,12 @@ async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
         .await
         .expect("boundary session should exist");
     let replay = core.sessions.load_session_replay(&meta.id).await.unwrap();
-    assert!(replay.events.iter().any(|event| matches!(
+    assert!(!replay.events.iter().any(|event| matches!(
         &event.payload,
         crate::session::db::SessionEventPayload::ToolPreExecute {
-            tool_call_id,
             decision: crate::session::db::ToolPreExecuteDecision::Rejected { reason },
             ..
-        } if tool_call_id == "tc_exec_2" && reason == "response_boundary"
+        } if reason == "response_boundary"
     )));
 
     tokio::time::timeout(
@@ -8191,16 +8193,24 @@ async fn streamed_response_journal_failure_retracts_before_error() {
 async fn iteration_limit_persists_limit_exhausted_outcome() {
     let provider = Arc::new(ResponseSequenceProvider::new(
         "local-main",
-        vec![crate::providers::base::LLMResponse {
-            content: Some(String::new()),
-            tool_calls: vec![crate::providers::base::ToolCallRequest {
-                id: "tc-limit".to_string(),
-                name: "list_dir".to_string(),
-                arguments: HashMap::from([("path".to_string(), json!("."))]),
-            }],
-            finish_reason: FinishReason::ToolCalls,
-            usage: HashMap::new(),
-        }],
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc-limit".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments: HashMap::from([("path".to_string(), json!("."))]),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: HashMap::new(),
+            },
+            crate::providers::base::LLMResponse {
+                content: None,
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: HashMap::new(),
+            },
+        ],
     ));
     let (agent_loop, workspace) =
         build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
@@ -8211,7 +8221,7 @@ async fn iteration_limit_persists_limit_exhausted_outcome() {
         .await;
 
     assert!(!response.is_empty());
-    assert_eq!(provider.call_count(), 1);
+    assert_eq!(provider.call_count(), 2);
     let core = agent_loop.shared.core_handle.swappable();
     let session = core
         .sessions
@@ -10955,12 +10965,320 @@ mod runtime_mode_parity_tests {
     // termination. They guard schema churn, phantom tool narration, and
     // repeated tool-call loops.
 
+    #[derive(Clone)]
+    enum TerminalScript {
+        Response(crate::providers::base::LLMResponse),
+        Error(String),
+    }
+
+    struct TerminalNoToolsProvider {
+        normal: crate::providers::base::LLMResponse,
+        terminal: TerminalScript,
+        normal_tools: parking_lot::Mutex<Vec<Option<Vec<Value>>>>,
+        terminal_calls:
+            parking_lot::Mutex<Vec<(crate::providers::base::ToolChoice, Option<Vec<Value>>)>>,
+    }
+
+    impl TerminalNoToolsProvider {
+        fn new(terminal: TerminalScript) -> Self {
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("path".to_string(), json!("."));
+            Self {
+                normal: crate::providers::base::LLMResponse {
+                    content: Some(String::new()),
+                    tool_calls: vec![crate::providers::base::ToolCallRequest {
+                        id: "tc_normal".to_string(),
+                        name: "list_dir".to_string(),
+                        arguments,
+                    }],
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: std::collections::HashMap::new(),
+                },
+                terminal,
+                normal_tools: parking_lot::Mutex::new(Vec::new()),
+                terminal_calls: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for TerminalNoToolsProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.normal_tools.lock().push(tools.map(<[Value]>::to_vec));
+            Ok(self.normal.clone())
+        }
+
+        async fn chat_with_tool_choice(
+            &self,
+            _messages: &[Value],
+            tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+            tool_choice: crate::providers::base::ToolChoice,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            assert_eq!(thinking_budget, None, "terminal call must disable thinking");
+            self.terminal_calls
+                .lock()
+                .push((tool_choice, tools.map(<[Value]>::to_vec)));
+            match &self.terminal {
+                TerminalScript::Response(response) => Ok(response.clone()),
+                TerminalScript::Error(message) => anyhow::bail!(message.clone()),
+            }
+        }
+
+        fn get_default_model(&self) -> &str {
+            "local-main"
+        }
+    }
+
+    fn terminal_text(content: Option<&str>) -> TerminalScript {
+        TerminalScript::Response(crate::providers::base::LLMResponse {
+            content: content.map(str::to_string),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: std::collections::HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn terminal_no_tools_prose_uses_one_stable_recorded_call() {
+        let provider = Arc::new(TerminalNoToolsProvider::new(terminal_text(Some(
+            "terminal summary",
+        ))));
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
+        let session_key = format!("terminal-prose-{}", uuid::Uuid::new_v4());
+
+        let response = agent_loop
+            .process_direct("inspect once then finish", &session_key, "test", "offline")
+            .await;
+
+        assert_eq!(response, "terminal summary");
+        let terminal_calls = provider.terminal_calls.lock();
+        assert_eq!(terminal_calls.len(), 1);
+        assert_eq!(
+            terminal_calls[0].0,
+            crate::providers::base::ToolChoice::None
+        );
+        assert_eq!(provider.normal_tools.lock()[0], terminal_calls[0].1);
+        drop(terminal_calls);
+
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .unwrap();
+        let replay = core
+            .sessions
+            .load_session_replay(&session.id)
+            .await
+            .unwrap();
+        let terminal = replay
+            .model_calls
+            .iter()
+            .find(|call| call.purpose == crate::session::db::ModelCallPurpose::Continuation)
+            .expect("terminal request must be recorded as a continuation");
+        let request: crate::session::db::RecordedProviderRequest =
+            serde_json::from_slice(&terminal.request).unwrap();
+        assert_eq!(request.tool_choice, "none");
+        assert!(!request.streaming);
+        assert_eq!(
+            persisted_turn_outcome(&core.sessions, &session.id).await,
+            "finished"
+        );
+        let persisted = core.sessions.get_all_messages(&session.id).await;
+        let persisted_text = persisted
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for scaffold in [
+            "Report what the previous tool results showed",
+            "Your tool results are already in the conversation above",
+            "You called the same tool(s) with the same arguments again",
+        ] {
+            assert!(
+                !persisted_text.contains(scaffold),
+                "persisted scaffold: {scaffold}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn terminal_no_tools_strict_trio_bypasses_router_preflight() {
+        let main = Arc::new(TerminalNoToolsProvider::new(terminal_text(Some(
+            "strict terminal summary",
+        ))));
+        let router_body = r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#;
+        let router = Arc::new(SequenceProvider::new(
+            "offline-router",
+            vec![router_body, router_body, router_body, router_body],
+        ));
+        let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+            "offline-specialist",
+            "specialist unused",
+        ));
+        let (agent_loop, workspace) = build_trio_offline_harness_with_iters(
+            main.clone() as Arc<dyn LLMProvider>,
+            router.clone() as Arc<dyn LLMProvider>,
+            specialist,
+            None,
+            0,
+        );
+        let session_key = format!("terminal-strict-trio-{}", uuid::Uuid::new_v4());
+
+        let response = agent_loop
+            .process_direct("What is 2+2?", &session_key, "test", "offline")
+            .await;
+
+        assert_eq!(response, "strict terminal summary");
+        assert_eq!(
+            router.call_count(),
+            0,
+            "terminal mode reran router preflight"
+        );
+        assert!(main.normal_tools.lock().is_empty());
+        let terminal_calls = main.terminal_calls.lock();
+        assert_eq!(terminal_calls.len(), 1);
+        assert_eq!(
+            terminal_calls[0].0,
+            crate::providers::base::ToolChoice::None
+        );
+        assert_eq!(terminal_calls[0].1, None);
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn terminal_no_tools_ignored_tool_call_is_rejected_without_execution() {
+        let mut arguments = std::collections::HashMap::new();
+        arguments.insert("command".to_string(), json!("printf should-not-run"));
+        let provider = Arc::new(TerminalNoToolsProvider::new(TerminalScript::Response(
+            crate::providers::base::LLMResponse {
+                content: None,
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_ignored_none".to_string(),
+                    name: "exec".to_string(),
+                    arguments,
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            },
+        )));
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
+        let session_key = format!("terminal-ignored-{}", uuid::Uuid::new_v4());
+
+        agent_loop
+            .process_direct("inspect once then finish", &session_key, "test", "offline")
+            .await;
+
+        assert_eq!(provider.terminal_calls.lock().len(), 1);
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .unwrap();
+        let replay = core
+            .sessions
+            .load_session_replay(&session.id)
+            .await
+            .unwrap();
+        assert!(!replay.events.iter().any(|event| matches!(
+            &event.payload,
+            crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. }
+                if tool_call_id == "tc_ignored_none"
+        )));
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.payload,
+            crate::session::db::SessionEventPayload::ToolPreExecute {
+                tool_call_id,
+                decision: crate::session::db::ToolPreExecuteDecision::Rejected { reason },
+                ..
+            } if tool_call_id == "tc_ignored_none" && reason == "terminal_no_tools"
+        )));
+        let messages = core.sessions.get_all_messages(&session.id).await;
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| {
+                        calls.iter().any(|call| {
+                            call.get("id").and_then(Value::as_str) == Some("tc_ignored_none")
+                        })
+                    })
+        }));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some("tc_ignored_none")
+                && message.get("ok").and_then(Value::as_bool) == Some(false)
+        }));
+        assert_eq!(
+            persisted_turn_outcome(&core.sessions, &session.id).await,
+            "limit_exhausted"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn terminal_no_tools_error_and_empty_do_not_retry() {
+        for (label, terminal) in [
+            (
+                "error",
+                TerminalScript::Error("terminal unavailable".to_string()),
+            ),
+            ("empty", terminal_text(None)),
+        ] {
+            let provider = Arc::new(TerminalNoToolsProvider::new(terminal));
+            let (agent_loop, workspace) =
+                build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
+            let session_key = format!("terminal-{label}-{}", uuid::Uuid::new_v4());
+
+            agent_loop
+                .process_direct("inspect once then finish", &session_key, "test", "offline")
+                .await;
+
+            assert_eq!(provider.terminal_calls.lock().len(), 1, "{label}");
+            let core = agent_loop.shared.core_handle.swappable();
+            let session = core
+                .sessions
+                .get_latest_session(&session_key)
+                .await
+                .unwrap();
+            assert_eq!(
+                persisted_turn_outcome(&core.sessions, &session.id).await,
+                "limit_exhausted",
+                "{label}"
+            );
+            let _ = std::fs::remove_dir_all(&workspace);
+        }
+    }
+
     /// A provider that emits a distinct side-effect tool call on every turn.
     /// The session replay records the main-call catalogs for the lease
     /// convergence assertion.
     struct LoopingProvider {
         name: String,
         call_count: std::sync::atomic::AtomicU32,
+        terminal_choices: parking_lot::Mutex<Vec<crate::providers::base::ToolChoice>>,
     }
 
     impl LoopingProvider {
@@ -10968,6 +11286,7 @@ mod runtime_mode_parity_tests {
             Self {
                 name: name.to_string(),
                 call_count: std::sync::atomic::AtomicU32::new(0),
+                terminal_choices: parking_lot::Mutex::new(Vec::new()),
             }
         }
         fn call_count(&self) -> u32 {
@@ -11004,6 +11323,26 @@ mod runtime_mode_parity_tests {
                     arguments: args,
                 }],
                 finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        async fn chat_with_tool_choice(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+            tool_choice: crate::providers::base::ToolChoice,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.terminal_choices.lock().push(tool_choice);
+            Ok(crate::providers::base::LLMResponse {
+                content: Some("bounded terminal response".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
                 usage: std::collections::HashMap::new(),
             })
         }
@@ -11150,6 +11489,11 @@ mod runtime_mode_parity_tests {
         assert!(
             calls < 25,
             "loop made {calls} provider calls — did not converge (termination guard regressed)"
+        );
+        assert_eq!(
+            provider.terminal_choices.lock().as_slice(),
+            &[crate::providers::base::ToolChoice::None],
+            "the repeated loop must share the one terminal no-tools authority"
         );
 
         let core = agent_loop.shared.core_handle.swappable();

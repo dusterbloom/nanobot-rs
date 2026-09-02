@@ -1112,44 +1112,6 @@ async fn await_compaction_with_cancellation(
     }
 }
 
-/// Response-boundary lifecycle. After a side-effect tool (exec/write_file)
-/// runs, the next LLM call is nudged to report results as text.
-///
-/// Enforcement happens at execution time (side-effect calls are rejected
-/// with an error result), NOT by stripping tools from the schema: the tool
-/// array renders at the head of the prompt, and any change there invalidates
-/// server-side prefix caches — a full re-prefill of a 14k-token local
-/// context costs ~60s at ~250 tok/s prefill speed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) enum ResponseBoundary {
-    /// No boundary in effect.
-    #[default]
-    Off,
-    /// A side-effect tool just ran; arm the boundary on the next call.
-    Pending,
-    /// This call was nudged to respond; side-effect tool calls are rejected
-    /// unless the response also carries a text report (compliance is
-    /// behavioral — see `tool_engine::boundary_blocks_side_effects`).
-    Armed,
-}
-
-/// Advance the response-boundary state machine at the start of an LLM call.
-/// Returns the new state plus whether the wrap-up nudge should be injected.
-///
-/// One-shot by construction: `Armed` never carries into the next call, so a
-/// model that insists on calling exec gets exactly one rejection nudge and
-/// may proceed on the call after — no livelock.
-fn advance_response_boundary(
-    state: ResponseBoundary,
-    cfg_enabled: bool,
-) -> (ResponseBoundary, bool) {
-    match state {
-        ResponseBoundary::Pending if cfg_enabled => (ResponseBoundary::Armed, true),
-        ResponseBoundary::Pending | ResponseBoundary::Armed => (ResponseBoundary::Off, false),
-        ResponseBoundary::Off => (ResponseBoundary::Off, false),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Loop convergence bounds
 // ---------------------------------------------------------------------------
@@ -1159,18 +1121,24 @@ fn advance_response_boundary(
 // that participates in the server-side prompt prefix.
 pub(crate) const NO_PROGRESS_HARD_STOP: u32 = 4;
 pub(crate) const MAX_LEASE_RENEWAL_REJECTIONS: u32 = 2;
+const LIMIT_EXHAUSTED_REPLY: &str =
+    "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderCallMode {
+    Normal,
+    TerminalNoTools,
+}
 
 /// Per-turn flow control flags.
 ///
 /// These are orthogonal fields (not a linear state machine):
-/// - `boundary`: response-boundary lifecycle, set by exec/write_file tools
 /// - `router_preflight_done`: one-shot, set after router runs
 /// - `content_was_streamed`: one-shot, set when TextDelta chunks are sent
 /// - `iterations_since_compaction`: counter, reset when compaction swaps in
 /// - `tool_guard`: per-turn tool call policy enforcement
 /// - `retries`: typed per-failure counters (validation, continuation, rescue, etc.)
 pub(crate) struct FlowControl {
-    pub(crate) boundary: ResponseBoundary,
     pub(crate) router_preflight_done: bool,
     pub(crate) tool_guard: ToolGuard,
     pub(crate) iterations_since_compaction: u32,
@@ -1179,7 +1147,7 @@ pub(crate) struct FlowControl {
     /// When this reaches the threshold, the loop forces a text response.
     pub(crate) consecutive_all_blocked: u32,
     /// Consecutive rounds that executed zero tools (for ANY reason: lease
-    /// exhausted, coarse-family cap, boundary reject, duplicate block). Such
+    /// exhausted, lease rejection, duplicate block). Such
     /// rounds are "not counted" against `max_iterations` so they cannot silently
     /// eat the model's budget — but without a hard cap a model that keeps
     /// emitting blocked tool calls (e.g. lease exhausted but still emitting
@@ -1189,11 +1157,10 @@ pub(crate) struct FlowControl {
     /// on; the per-reason counters above feed into it but do not replace it.
     pub(crate) consecutive_no_progress_rounds: u32,
     /// Set during tool execution when a round executed ZERO tools — every call
-    /// was boundary-rejected or duplicate-blocked. Such a round made no progress,
+    /// was lease-rejected or duplicate-blocked. Such a round made no progress,
     /// so the main loop does not spend a real iteration on it. Reset at the start
-    /// of each iteration. Bounded by construction: the response boundary is
-    /// one-shot (can't re-reject without an intervening successful round) and cached
-    /// duplicate receipts force a text response immediately.
+    /// of each iteration. Cached duplicate receipts and lease rejections feed
+    /// the single bounded terminal call.
     pub(crate) round_executed_no_tools: bool,
     /// One guaranteed post-exhaustion write per turn: when the lease is gone,
     /// a write tool is still granted exactly once so a research-heavy turn
@@ -1236,9 +1203,16 @@ pub(crate) struct FlowControl {
     /// Consecutive executed rounds that dispatched the identical tool calls as
     /// the previous round. Drives the repeated-tool-call loop breaker.
     pub(crate) consecutive_repeat_rounds: u32,
-    /// True once we've already nudged about a repeating tool call; the next
-    /// repeat forces a stop instead of nudging again.
-    pub(crate) repeat_nudged: bool,
+    /// Provider mode for the next call. Terminal mode is entered only after a
+    /// convergence limit and never returns to the normal loop.
+    pub(crate) provider_call_mode: ProviderCallMode,
+    /// Shared at-most-once authority for every convergence trigger.
+    pub(crate) terminal_attempted: bool,
+    /// Exact frozen catalog and response budget used by the most recent normal
+    /// provider request. Terminal mode reuses these without re-entering the
+    /// preflight/router state machine.
+    pub(crate) last_provider_tool_defs: Vec<Value>,
+    pub(crate) last_provider_max_tokens: Option<u32>,
     /// Infrastructure error surfaced by the tool engine when the
     /// "handles-not-bodies" invariant cannot be honored — i.e. the immutable
     /// tool-result stash rejected a write (`Conflict` / `Failed`). When set
@@ -1423,9 +1397,8 @@ pub(crate) enum IterationPhase {
     /// Pre-LLM housekeeping: context hygiene, proprioception, aha channel,
     /// heartbeat injection, compaction check.
     Preparing,
-    /// Response boundary injection, tool definition filtering, message
-    /// trimming, compaction spawn, protocol repair, pre-flight check,
-    /// router preflight, adaptive max_tokens.
+    /// Tool definition filtering, message trimming, compaction spawn,
+    /// protocol repair, pre-flight check, router preflight, adaptive max_tokens.
     PreCall,
     /// Call LLM (streaming or blocking).
     Calling {
@@ -1665,7 +1638,7 @@ impl AgentLoopShared {
         // the previous round. The model is firing tools without consuming their
         // results; two in a row means it never "sees" the output that came back.
         const MAX_CONSECUTIVE_REPEAT_ROUNDS: u32 = 2;
-        while iteration < ctx.core.max_iterations {
+        'agent: while iteration < ctx.core.max_iterations {
             // Early exit if cancelled (e.g. user pressed Esc/Enter in REPL).
             if ctx.is_cancelled() {
                 debug!("agent loop: cancelled before iteration {}", iteration);
@@ -1822,12 +1795,8 @@ impl AgentLoopShared {
                                 rounds = ctx.flow.consecutive_no_progress_rounds,
                                 "no_progress_hard_stop: repeated zero-tool rounds, forcing final answer"
                             );
-                            ctx.final_content =
-                                "I was looping on blocked tool requests without making progress, \
-                                 so I stopped. Rephrase the request or restart the turn."
-                                    .to_string();
                             ctx.turn_outcome = TurnOutcome::LimitExhausted;
-                            break;
+                            break 'agent;
                         }
                         debug!(
                             rounds = ctx.flow.consecutive_no_progress_rounds,
@@ -1843,37 +1812,23 @@ impl AgentLoopShared {
 
                     // Repeated successful tool-call breaker: the model fires
                     // tools without consuming their results when it dispatches
-                    // the identical calls two rounds in a row. Nudge once that
-                    // the results are already in context; stop if it repeats
-                    // again after the nudge.
-                    let (action, new_rounds, new_nudged) = evaluate_repeated_tool_round(
+                    // identical calls past the grace threshold.
+                    let (action, new_rounds) = evaluate_repeated_tool_round(
                         &ctx.flow.last_round_keys,
                         &ctx.flow.prev_round_keys,
                         ctx.flow.consecutive_repeat_rounds,
-                        ctx.flow.repeat_nudged,
                         MAX_CONSECUTIVE_REPEAT_ROUNDS,
                     );
                     ctx.flow.consecutive_repeat_rounds = new_rounds;
-                    ctx.flow.repeat_nudged = new_nudged;
                     ctx.flow.prev_round_keys = ctx.flow.last_round_keys.clone();
 
                     match action {
                         RepeatBreakerAction::Stop => {
                             warn!(
-                                "tool_loop_breaker: repeated identical tool calls after nudge, forcing stop"
+                                "tool_loop_breaker: repeated identical tool calls, requesting terminal response"
                             );
-                            ctx.messages.push_draft(crate::agent::markers::scaffold_user(
-                                "[System] You called the same tool(s) with the same arguments again even though the results are already in your context above. Stopping to avoid an infinite loop — use the results you already have, or give your final answer.".to_string(),
-                            ));
-                        }
-                        RepeatBreakerAction::Nudge => {
-                            warn!(
-                                "tool_loop_breaker: {} consecutive identical tool rounds, injecting result-available nudge",
-                                new_rounds + 1
-                            );
-                            ctx.messages.push_draft(crate::agent::markers::scaffold_user(
-                                "[System] Your tool results are already in the conversation above — you just called the same tool(s) with the same arguments again without using them. The output is present; stop re-calling and either act on the results or give your final answer.".to_string(),
-                            ));
+                            ctx.turn_outcome = TurnOutcome::LimitExhausted;
+                            break 'agent;
                         }
                         RepeatBreakerAction::Continue => {}
                     }
@@ -1913,7 +1868,6 @@ impl AgentLoopShared {
                     ctx.flow.retries.validation = 0;
                     // A finished turn breaks any repeating-tool-call streak.
                     ctx.flow.consecutive_repeat_rounds = 0;
-                    ctx.flow.repeat_nudged = false;
                     ctx.flow.prev_round_keys.clear();
                     ctx.flow.last_round_keys.clear();
                     iteration += 1;
@@ -1952,6 +1906,33 @@ impl AgentLoopShared {
                     ctx.final_content = msg;
                     break;
                 }
+            }
+        }
+
+        if ctx.turn_outcome == TurnOutcome::LimitExhausted
+            && !ctx.flow.terminal_attempted
+            && !ctx.is_cancelled()
+        {
+            ctx.flow.terminal_attempted = true;
+            ctx.flow.provider_call_mode = ProviderCallMode::TerminalNoTools;
+            let tool_defs = ctx.flow.last_provider_tool_defs.clone();
+            let max_tokens = ctx
+                .flow
+                .last_provider_max_tokens
+                .unwrap_or_else(|| self.compute_adaptive_max_tokens(ctx));
+            match self
+                .step_call_terminal_no_tools(ctx, &tool_defs, max_tokens)
+                .await
+            {
+                IterationOutcome::Complete { content, outcome } => {
+                    ctx.final_content = content;
+                    ctx.turn_outcome = outcome;
+                }
+                IterationOutcome::Error(error) => {
+                    ctx.final_content = error;
+                    ctx.turn_outcome = TurnOutcome::Error;
+                }
+                IterationOutcome::Continue | IterationOutcome::ValidationRetry => {}
             }
         }
 
@@ -2286,54 +2267,14 @@ impl AgentLoopShared {
     // -----------------------------------------------------------------------
 
     /// Pre-LLM-call orchestrator: delegates to [`select_tool_definitions`],
-    /// [`manage_compaction`], and [`compute_adaptive_max_tokens`], with
-    /// inline steps for response boundary, trimming, grounding, rendering,
-    /// emergency trim, and router preflight.
+    /// [`manage_compaction`], and [`compute_adaptive_max_tokens`], with inline
+    /// trimming, grounding, rendering, emergency trim, and router preflight.
     #[instrument(name = "step_pre_call", skip(self, ctx), fields(
         iteration,
         trio_mode = ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main(),
-        boundary = ?ctx.flow.boundary,
         msg_count = ctx.messages.len(),
     ))]
     async fn step_pre_call(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
-        // Response boundary: after exec/write_file, nudge the model to report
-        // results as text. Tool definitions stay byte-stable across calls —
-        // enforcement happens at execution time (execute_tools_inline rejects
-        // side-effect calls while Armed) so the prompt head never changes and
-        // server-side prefix caches survive the boundary.
-        let boundary_cfg =
-            ctx.core.provenance_config.enabled && ctx.core.provenance_config.response_boundary;
-        let (new_boundary, inject_nudge) =
-            advance_response_boundary(ctx.flow.boundary, boundary_cfg);
-        ctx.flow.boundary = new_boundary;
-        if inject_nudge {
-            // Use "user" role, not "system". The Anthropic OpenAI-compat
-            // endpoint strips mid-conversation system messages, which would
-            // leave the conversation ending with an assistant message and
-            // trigger a "does not support assistant message prefill" error.
-            let remaining = ctx.core.max_iterations.saturating_sub(iteration as u32 + 1);
-            let budget_note = if remaining <= 5 {
-                format!(
-                    " [Budget: {}/{} iterations remaining — wrap up soon]",
-                    remaining, ctx.core.max_iterations
-                )
-            } else {
-                String::new()
-            };
-            // Behavioral boundary: this nudge fires only when the model ran a
-            // side-effect tool without reporting. Tell it what to do (report
-            // first) instead of a bare acknowledgement. Marked `_synthetic` so
-            // it is not persisted as a real turn and does not break the prefix
-            // cache on the next reload.
-            ctx.messages
-                .push_draft(crate::agent::markers::scaffold_user(format!(
-                    "[system] Report what the previous tool results showed before \
-                 running more tools. If you created or changed an artifact, do not \
-                 claim completion until you validate it with an appropriate tool \
-                 and fix any errors.{budget_note}"
-                )));
-        }
-
         // Select and filter tool definitions for this turn. Tool-lease
         // enforcement happens at execution time: rejections remain paired
         // protocol messages and never change the schema Higgs caches.
@@ -2542,6 +2483,9 @@ impl AgentLoopShared {
         self.apply_planned_auto_expansion(ctx, &tool_defs, effective_max_tokens)
             .await;
 
+        ctx.flow.last_provider_tool_defs = tool_defs.clone();
+        ctx.flow.last_provider_max_tokens = Some(effective_max_tokens);
+
         StepResult::Next(IterationPhase::Calling {
             tool_defs,
             max_tokens: effective_max_tokens,
@@ -2651,10 +2595,6 @@ impl AgentLoopShared {
                 debug!("trio degraded — keeping tools for main model fallback");
             }
         }
-        // NOTE: the response boundary deliberately does NOT filter tool_defs.
-        // Schema changes invalidate server-side prefix caches (full re-prefill);
-        // side-effect calls are rejected at execution time instead.
-        //
         // Tool gating runs for cloud models only. Local models already get
         // condensed tool descriptions (~350 tokens for 12 tools, <1.1% of 32K
         // context) and real availability is enforced by `is_available()`, so
@@ -3642,6 +3582,164 @@ impl AgentLoopShared {
         Ok(())
     }
 
+    async fn step_call_terminal_no_tools(
+        &self,
+        ctx: &mut TurnContext,
+        tool_defs: &[Value],
+        max_tokens: u32,
+    ) -> IterationOutcome {
+        debug_assert_eq!(
+            ctx.flow.provider_call_mode,
+            ProviderCallMode::TerminalNoTools
+        );
+        let messages_for_llm = render_via_protocol(&*ctx.protocol, &ctx.messages);
+        let tool_defs_opt = (!tool_defs.is_empty()).then_some(tool_defs);
+        let request = RecordedProviderRequest {
+            messages: messages_for_llm.clone(),
+            tools: tool_defs_opt.map(<[Value]>::to_vec),
+            model: ctx.core.model.clone(),
+            max_tokens,
+            temperature: ctx.core.temperature,
+            thinking_budget: None,
+            top_p: None,
+            tool_choice: "none".to_string(),
+            streaming: false,
+        };
+        let call_id = match ctx
+            .core
+            .sessions
+            .record_model_request(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                ModelCallPurpose::Continuation,
+                &request,
+            )
+            .await
+        {
+            Ok(call_id) => call_id,
+            Err(error) => {
+                return IterationOutcome::Error(format!(
+                    "terminal request was not sent because replay persistence failed: {error}"
+                ));
+            }
+        };
+
+        self.core_handle.counters.mark_inference_started();
+        let response = ctx
+            .core
+            .provider
+            .chat_with_tool_choice(
+                &messages_for_llm,
+                tool_defs_opt,
+                Some(&ctx.core.model),
+                max_tokens,
+                ctx.core.temperature,
+                None,
+                None,
+                ToolChoice::None,
+            )
+            .await;
+        self.core_handle.counters.mark_inference_finished();
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if let Err(record_error) =
+                    Self::persist_model_failure(ctx, &call_id, &error.to_string()).await
+                {
+                    return IterationOutcome::Error(record_error.to_string());
+                }
+                return IterationOutcome::Complete {
+                    content: LIMIT_EXHAUSTED_REPLY.to_string(),
+                    outcome: TurnOutcome::LimitExhausted,
+                };
+            }
+        };
+        if let Err(error) = ctx
+            .core
+            .sessions
+            .record_model_response(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                &call_id,
+                &RecordedProviderResponse::from(&response),
+            )
+            .await
+        {
+            return IterationOutcome::Error(format!(
+                "terminal response could not be recorded: {error}"
+            ));
+        }
+
+        if response.has_tool_calls() {
+            if let Err(error) = crate::agent::tool_engine::journal_tool_call_carrier(
+                ctx,
+                &response.tool_calls,
+                &response,
+            )
+            .await
+            {
+                return IterationOutcome::Error(format!(
+                    "terminal tool-call carrier could not be recorded: {error}"
+                ));
+            }
+            for tool_call in &response.tool_calls {
+                if let Err(error) = ctx
+                    .core
+                    .sessions
+                    .record_tool_pre_execute(
+                        &ctx.session_id,
+                        &ctx.request_id,
+                        ctx.turn_count,
+                        &tool_call.id,
+                        &tool_call.name,
+                        &tool_call.arguments,
+                        crate::session::db::ToolPreExecuteDecision::Rejected {
+                            reason: "terminal_no_tools".to_string(),
+                        },
+                    )
+                    .await
+                {
+                    return IterationOutcome::Error(format!(
+                        "terminal tool rejection could not be recorded: {error}"
+                    ));
+                }
+                ctx.messages.with_draft(|draft| {
+                    ContextBuilder::add_tool_result_immutable_with_status(
+                        draft,
+                        &tool_call.id,
+                        &tool_call.name,
+                        "terminal tool_choice=none: tool call was rejected and not executed",
+                        false,
+                    )
+                });
+            }
+            if let Err(error) = ctx.persist_pending_protocol_messages().await {
+                return IterationOutcome::Error(format!(
+                    "terminal tool rejection receipts could not be recorded: {error}"
+                ));
+            }
+            return IterationOutcome::Complete {
+                content: LIMIT_EXHAUSTED_REPLY.to_string(),
+                outcome: TurnOutcome::LimitExhausted,
+            };
+        }
+
+        let response_failed = response.outcome().is_err();
+        let content = response.content.unwrap_or_default();
+        if response_failed || content.trim().is_empty() {
+            return IterationOutcome::Complete {
+                content: LIMIT_EXHAUSTED_REPLY.to_string(),
+                outcome: TurnOutcome::LimitExhausted,
+            };
+        }
+        IterationOutcome::Complete {
+            content,
+            outcome: TurnOutcome::Finished,
+        }
+    }
+
     /// Thinking budget calculation, inference_active flag, streaming path
     /// (with cancellation support) or blocking path.
     #[instrument(name = "step_call_llm", skip(self, ctx, tool_defs), fields(
@@ -3662,7 +3760,6 @@ impl AgentLoopShared {
         } else {
             Some(&tool_defs)
         };
-
         let thinking_budget = {
             let stored = counters.thinking_budget.load(Ordering::Relaxed);
             // Reasoning params are user-controlled via /think — any model can receive them.
@@ -5052,7 +5149,7 @@ impl AgentLoopShared {
         if routed_tool_calls.is_empty() && !blocked_calls.is_empty() {
             // Every call this round was blocked by the lease — flag it
             // so the loop machinery doesn't count this as a real
-            // iteration (matches the response_boundary pattern).
+            // iteration (the shared no-progress/lease rejection pattern).
             ctx.flow.round_executed_no_tools = true;
             ctx.flow.tool_guard.had_blocked_calls = true;
         }
@@ -5103,12 +5200,6 @@ impl AgentLoopShared {
                 );
             }
         }
-        // A boundary-armed call must not delegate batches containing
-        // side-effect tools — the inline path below rejects them in-protocol.
-        let boundary_blocks_batch = ctx.flow.boundary == ResponseBoundary::Armed
-            && routed_tool_calls
-                .iter()
-                .any(|tc| crate::agent::tool_engine::requires_result_report(&tc.name));
         // Resolve provider+model from explicit config.
         let delegation_provider = ctx.core.tool_runner_provider.clone();
         let delegation_model = ctx.core.tool_runner_model.clone();
@@ -5134,7 +5225,6 @@ impl AgentLoopShared {
         }
         let should_delegate = ctx.core.tool_delegation_config.enabled
             && delegation_alive
-            && !boundary_blocks_batch
             && !delegation_reuses_main_model;
 
         let tool_entries_before = ctx.turn_tool_entries.len();
@@ -5263,11 +5353,10 @@ impl AgentLoopShared {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_response_boundary, apply_auto_expansion_candidates, commit_staged_auto_expansion,
-        divergent_message_digest, materialize_auto_expansion,
-        proactive_grounding_preserves_prefix_cache, AppliedAutoExpansion,
-        AutoExpansionMaterializationKind, HiggsSessionRoute, MessageLog, PromptCacheSnapshot,
-        ResponseBoundary, RetainedExpansionFailure,
+        apply_auto_expansion_candidates, commit_staged_auto_expansion, divergent_message_digest,
+        materialize_auto_expansion, proactive_grounding_preserves_prefix_cache,
+        AppliedAutoExpansion, AutoExpansionMaterializationKind, HiggsSessionRoute, MessageLog,
+        PromptCacheSnapshot, RetainedExpansionFailure,
     };
     use crate::agent::agent_core::{
         stable_higgs_session_id, ExpansionCheckpoint, RuntimeCounters, SessionRetirement,
@@ -6251,23 +6340,6 @@ mod tests {
             digest.matches('x').count() <= 70,
             "snippet must be truncated: {digest}"
         );
-    }
-
-    /// The response boundary is one-shot: Pending → Armed (with nudge) → Off.
-    /// Schema never changes; a model that insists on exec gets exactly one
-    /// rejection and may proceed on the following call — no livelock.
-    #[test]
-    fn test_response_boundary_lifecycle() {
-        use ResponseBoundary::{Armed, Off, Pending};
-        // Pending + feature on → Armed, inject the wrap-up nudge.
-        assert_eq!(advance_response_boundary(Pending, true), (Armed, true));
-        // Armed never carries into the next call (one rejection max).
-        assert_eq!(advance_response_boundary(Armed, true), (Off, false));
-        // Feature off: Pending is dropped silently.
-        assert_eq!(advance_response_boundary(Pending, false), (Off, false));
-        // Off is stable regardless of config.
-        assert_eq!(advance_response_boundary(Off, true), (Off, false));
-        assert_eq!(advance_response_boundary(Off, false), (Off, false));
     }
 
     #[test]

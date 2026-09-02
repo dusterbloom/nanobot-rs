@@ -26,7 +26,7 @@ use crate::providers::base::{LLMResponse, ToolCallRequest};
 use crate::session::db::ToolPreExecuteDecision;
 use std::sync::Arc;
 
-use super::agent_loop::{ResponseBoundary, TurnContext};
+use super::agent_loop::TurnContext;
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
 use crate::agent::tools::base::ToolConcurrency;
 
@@ -507,7 +507,7 @@ pub(crate) fn delegation_reuses_main_local_model(
     is_local && delegation_model.map(local_model_key) == Some(local_model_key(main_model))
 }
 
-/// Side-effect tools that arm (and are rejected by) the response boundary.
+/// Tools that receive a reasoning checkpoint before execution when configured.
 pub(crate) fn is_side_effect_tool(name: &str) -> bool {
     matches!(name, "exec" | "write_file" | "edit_file" | "apply_patch")
 }
@@ -600,42 +600,6 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
             | "inspect_tool_result"
             | "get_tools"
     )
-}
-
-/// Tools whose result must be consumed and reported before another call of
-/// the same class. Memory reads/writes are included because silently chaining
-/// them was observed to leave a turn with no final answer and to amplify bad
-/// recall/remember output.
-pub(crate) fn requires_result_report(name: &str) -> bool {
-    is_side_effect_tool(name) || matches!(name, "recall" | "remember")
-}
-
-/// Decide whether to arm the response boundary after a tool-execution round.
-///
-/// Behavioral, not positional: arm ONLY when a side-effect/write tool
-/// actually ran AND the assistant produced no text report. A model that narrates
-/// each step is not fabricating results, so it must not be throttled. Arming
-/// blindly after every side-effect call (the prior behavior) rejected ~1/3 of
-/// legitimate consecutive write/exec calls. `executed_tools` must contain
-/// only the tools that actually executed — never boundary-rejected calls — so a
-/// rejected call cannot re-arm the boundary.
-fn should_arm_boundary(assistant_content: Option<&str>, executed_tools: &[&str]) -> bool {
-    let reported = assistant_content.is_some_and(|c| !c.trim().is_empty());
-    let ran_reportable_tool = executed_tools.iter().any(|n| requires_result_report(n));
-    ran_reportable_tool && !reported
-}
-
-/// Decide whether an armed boundary blocks this response's side-effect calls.
-///
-/// Behavioral, mirroring [`should_arm_boundary`]: the armed call was nudged to
-/// report as text. A response that carries a text report HAS complied — its
-/// side-effect calls run normally. Only a silent armed response is rejected.
-/// (The prior check was positional — Armed rejected every side-effect call,
-/// so a model that narrated AND acted in one response ate a guaranteed
-/// spurious rejection: the "always a bad exec before a good one" pattern.)
-fn boundary_blocks_side_effects(armed: bool, assistant_content: Option<&str>) -> bool {
-    let reported = assistant_content.is_some_and(|c| !c.trim().is_empty());
-    armed && !reported
 }
 
 /// Persist the one assistant carrier that owns a routed batch before policy or
@@ -813,22 +777,6 @@ async fn record_completed_tool(
         }
     }
     result
-}
-
-fn completed_reportable_tool(result: &SingleToolResult) -> Option<&str> {
-    if !result.result.ok() || !requires_result_report(&result.tool_name) {
-        return None;
-    }
-    if result.tool_name == "write_file"
-        && result
-            .arguments
-            .get("state")
-            .and_then(Value::as_str)
-            .is_some_and(|state| state.trim().eq_ignore_ascii_case("more"))
-    {
-        return None;
-    }
-    Some(&result.tool_name)
 }
 
 /// Execute one tool call: emit CallStart, run heartbeat, call the tool,
@@ -1351,103 +1299,6 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_
         append_cua_screenshot_turn(&mut appended, path).await;
         ctx.messages.extend_draft(appended);
     }
-
-    // NOTE: response-boundary arming is NOT done here. This function sees only
-    // one tool result and cannot tell whether the model reported its work in the
-    // assistant turn. Arming is decided once, behaviorally, by the caller
-    // (execute_tools_inline / execute_tools_delegated) which holds the assistant
-    // `response`. Arming here (per-tool, unconditionally) was positional, not
-    // behavioral — it throttled legitimate narrated side-effect chains.
-}
-
-/// First `max_chars` of the most recent real tool result in `messages`.
-///
-/// Skips prior boundary rejections (they are tool-role messages too — quoting
-/// one back would nudge the model toward the rejection text instead of the
-/// actual result). Returns `None` when no tool result exists yet.
-fn last_tool_result_snippet(messages: &[Value], max_chars: usize) -> Option<String> {
-    let content = messages.iter().rev().find_map(|m| {
-        if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
-            return None;
-        }
-        let c = m.get("content").and_then(|c| c.as_str())?;
-        if c.starts_with("response boundary:") {
-            return None;
-        }
-        Some(c)
-    })?;
-    let cleaned = content
-        .trim_start_matches("[VERBATIM TOOL OUTPUT — do not paraphrase]")
-        .trim();
-    if cleaned.is_empty() {
-        return None;
-    }
-    let end = crate::utils::helpers::floor_char_boundary(cleaned, max_chars);
-    Some(cleaned[..end].replace('\n', " "))
-}
-
-/// Inject an error result for a side-effect tool call rejected by the
-/// response boundary.
-///
-/// Deliberately narrower than `inject_tool_result`: no learning record, no
-/// taint, no audit, and — critically — it does NOT re-arm the boundary (a
-/// rejected call must not extend its own boundary, or the loop would
-/// livelock: nudge → reject → nudge → …).
-fn inject_boundary_rejection(ctx: &mut TurnContext, tc: &ToolCallRequest) {
-    // Quote the prior result inline: small local models don't reliably look
-    // back through context to find what they should report on, so give them
-    // the material to comply with right here at the tail.
-    let prior = last_tool_result_snippet(&ctx.messages, 160);
-    let msg = match prior {
-        Some(snippet) => format!(
-            "response boundary: {} was not executed — first respond with what the \
-             previous tool results showed (last result began: \"{}\"); it can run \
-             in a later step.",
-            tc.name, snippet
-        ),
-        None => format!(
-            "response boundary: {} was not executed — first respond with what the \
-             previous tool results showed; it can run in a later step.",
-            tc.name
-        ),
-    };
-    if ctx.core.provenance_config.enabled {
-        ctx.messages.with_draft(|draft| {
-            ContextBuilder::add_tool_result_immutable_with_status(
-                draft, &tc.id, &tc.name, &msg, false,
-            )
-        });
-    } else {
-        ctx.messages.with_draft(|draft| {
-            ContextBuilder::add_tool_result_with_status(draft, &tc.id, &tc.name, &msg, false)
-        });
-    }
-    // The model attempted a tool but was prevented — suppress
-    // ClaimedButNotExecuted validation for this turn.
-    ctx.flow.tool_guard.had_blocked_calls = true;
-    if let Some(ref tx) = ctx.tool_event_tx {
-        // Emit CallStart too (same as execute_single_tool): renderers key the
-        // tool row off CallStart's arguments preview, and an orphan CallEnd
-        // both drops the command text and breaks the renderer's expectation
-        // that new tool rows only appear at CallStart.
-        let preview: String = serde_json::to_string(&tc.arguments)
-            .unwrap_or_default()
-            .chars()
-            .take(200)
-            .collect();
-        let _ = tx.send(ToolEvent::CallStart {
-            tool_name: tc.name.clone(),
-            tool_call_id: tc.id.clone(),
-            arguments_preview: preview,
-        });
-        let _ = tx.send(ToolEvent::CallEnd {
-            tool_name: tc.name.clone(),
-            tool_call_id: tc.id.clone(),
-            result_data: msg,
-            ok: false,
-            duration_ms: 0,
-        });
-    }
 }
 
 /// Execute tool calls via the inline (direct) path.
@@ -1459,51 +1310,9 @@ fn inject_boundary_rejection(ctx: &mut TurnContext, tc: &ToolCallRequest) {
 pub(crate) async fn execute_tools_inline(
     ctx: &mut TurnContext,
     routed_tool_calls: &[ToolCallRequest],
-    response: &LLMResponse,
+    _response: &LLMResponse,
 ) {
-    // Response boundary enforcement: when this call was nudged to respond,
-    // side-effect tools are rejected with an error result instead of having
-    // been stripped from the schema (schema churn changes the prompt head
-    // and breaks server-side prefix caching; an error result appends at the
-    // tail and is cache-safe).
-    let blocks = boundary_blocks_side_effects(
-        ctx.flow.boundary == ResponseBoundary::Armed,
-        response.content.as_deref(),
-    );
-    let (blocked, allowed): (Vec<&ToolCallRequest>, Vec<&ToolCallRequest>) = routed_tool_calls
-        .iter()
-        .partition(|tc| blocks && requires_result_report(&tc.name));
-    for tc in &blocked {
-        if let Err(record_error) = ctx
-            .core
-            .sessions
-            .record_tool_pre_execute(
-                &ctx.session_id,
-                &ctx.request_id,
-                ctx.turn_count,
-                &tc.id,
-                &tc.name,
-                &tc.arguments,
-                ToolPreExecuteDecision::Rejected {
-                    reason: "response_boundary".to_string(),
-                },
-            )
-            .await
-        {
-            ctx.flow.infra_error = Some(format!(
-                "tool {} rejection could not be recorded: {record_error}",
-                tc.id
-            ));
-            return;
-        }
-        inject_boundary_rejection(ctx, tc);
-    }
-    if let Err(error) = ctx.persist_pending_protocol_messages().await {
-        ctx.flow.infra_error = Some(format!(
-            "tool rejection receipts could not be recorded: {error}"
-        ));
-        return;
-    }
+    let allowed: Vec<&ToolCallRequest> = routed_tool_calls.iter().collect();
 
     // Build taint warnings up-front (immutable borrow of ctx.taint_state).
     let taints: Vec<Option<String>> = allowed
@@ -1524,7 +1333,6 @@ pub(crate) async fn execute_tools_inline(
         turn_tag: ctx.turn_count,
     };
     let result_cap = inline_hot_prompt_result_cap_for_ctx_batch(ctx, allowed.len());
-    let mut ordered_results = Vec::with_capacity(allowed.len());
     let mut start = 0;
     while start < allowed.len() {
         let end = tool_call_chunk_end(&allowed, start, &ctx.tools);
@@ -1570,30 +1378,7 @@ pub(crate) async fn execute_tools_inline(
                 return;
             }
         }
-        ordered_results.extend(chunk_results);
         start = next;
-    }
-
-    // Behavioral response-boundary arming. `parallel`/`sequential` hold only the
-    // EXECUTED (non-blocked) calls, so a boundary-rejected call cannot re-arm.
-    // Failed side-effect calls (timeouts, errors) don't arm either: there is no
-    // result to report, so retrying is the model's legitimate next move — the
-    // duplicate-call guard still bounds runaway retries.
-    // A staged write has not changed its target and must be allowed to receive
-    // the next piece. Only the final/one-call write arms the report boundary.
-    let executed: Vec<&str> = ordered_results
-        .iter()
-        .filter_map(completed_reportable_tool)
-        .collect();
-
-    // No tool actually ran this round — every call was boundary-rejected. The
-    // round made no progress, so the loop should not count it as an iteration.
-    if executed.is_empty() && !blocked.is_empty() {
-        ctx.flow.round_executed_no_tools = true;
-    }
-
-    if should_arm_boundary(response.content.as_deref(), &executed) {
-        ctx.flow.boundary = ResponseBoundary::Pending;
     }
 }
 
@@ -2216,98 +2001,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_last_tool_result_snippet_skips_rejections_and_truncates() {
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "hi"}),
-            serde_json::json!({"role": "tool", "name": "exec", "content": "[VERBATIM TOOL OUTPUT — do not paraphrase] line one\nline two"}),
-            serde_json::json!({"role": "tool", "name": "exec", "content": "response boundary: exec was not executed"}),
-        ];
-        // Boundary rejection is skipped; the real result is found, marker
-        // stripped, newlines flattened.
-        let s = last_tool_result_snippet(&messages, 160).unwrap();
-        assert_eq!(s, "line one line two");
-        // Truncation respects char boundaries.
-        let s = last_tool_result_snippet(&messages, 4).unwrap();
-        assert_eq!(s, "line");
-        // No tool results at all → None.
-        assert!(last_tool_result_snippet(&messages[..1], 160).is_none());
-    }
-
-    #[test]
-    fn test_should_arm_boundary_behavioral_matrix() {
-        // The response boundary is BEHAVIORAL: it arms only when a side-effect
-        // tool (exec/write/edit_file) actually ran AND the assistant produced no text
-        // report. This is the whole point of the fix — a model that narrates its
-        // work must not be throttled.
-
-        // ran side-effect + no report -> ARM (force a report next call)
-        assert!(should_arm_boundary(None, &["exec"]));
-        assert!(should_arm_boundary(Some(""), &["write_file"]));
-        assert!(should_arm_boundary(None, &["edit_file"]));
-        assert!(should_arm_boundary(Some("  \n\t "), &["exec", "read_file"]));
-
-        // ran side-effect + reported -> do NOT arm (the regression being fixed:
-        // narrated consecutive exec/write/edit chains were being rejected ~1/3
-        // of the time)
-        assert!(!should_arm_boundary(
-            Some("Running wc -l to size the files."),
-            &["exec"]
-        ));
-        assert!(!should_arm_boundary(
-            Some("Writing the summary now."),
-            &["write_file"]
-        ));
-        assert!(!should_arm_boundary(
-            Some("Updating the file now."),
-            &["edit_file"]
-        ));
-
-        // ordinary read tools do not arm
-        assert!(!should_arm_boundary(None, &["read_file", "list_dir"]));
-        assert!(!should_arm_boundary(
-            Some("here are the files"),
-            &["read_file"]
-        ));
-        assert!(!should_arm_boundary(None, &[]));
-
-        // Memory operations must be consumed before another memory call. This
-        // ensures a recall/remember round gets a clean answer attempt.
-        assert!(should_arm_boundary(None, &["recall"]));
-        assert!(should_arm_boundary(None, &["remember"]));
-        assert!(!should_arm_boundary(
-            Some("I found the requested preference."),
-            &["recall"]
-        ));
-    }
-
-    #[test]
-    fn staged_write_does_not_arm_boundary_until_publish() {
-        let result = |state: Option<&str>| {
-            let mut arguments = HashMap::new();
-            if let Some(state) = state {
-                arguments.insert("state".to_string(), json!(state));
-            }
-            SingleToolResult {
-                tool_name: "write_file".to_string(),
-                tool_id: "call_write".to_string(),
-                arguments,
-                result: crate::agent::tools::base::ToolExecutionResult::success("ok".to_string()),
-                duration_ms: 0,
-                replay_error: None,
-            }
-        };
-
-        assert_eq!(completed_reportable_tool(&result(Some("more"))), None);
-        assert_eq!(completed_reportable_tool(&result(Some(" MORE "))), None);
-        assert_eq!(completed_reportable_tool(&result(Some("MoRe"))), None);
-        assert_eq!(
-            completed_reportable_tool(&result(Some("complete"))),
-            Some("write_file")
-        );
-        assert_eq!(completed_reportable_tool(&result(None)), Some("write_file"));
-    }
-
     #[tokio::test]
     async fn inline_write_redelivery_is_idempotent_without_event_subscriber() {
         let dir = tempfile::tempdir().unwrap();
@@ -2343,26 +2036,6 @@ mod tests {
             execute_single_tool(&final_piece, &registry, &None, &None, 60, None, None).await;
         assert!(result.result.ok(), "{:?}", result.result.error());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "once-done");
-    }
-
-    #[test]
-    fn test_boundary_blocks_side_effects_is_behavioral() {
-        // Armed + silent response -> block (the nudge was ignored).
-        assert!(boundary_blocks_side_effects(true, None));
-        assert!(boundary_blocks_side_effects(true, Some("")));
-        assert!(boundary_blocks_side_effects(true, Some("  \n ")));
-
-        // Armed + text report in the same response -> the model complied;
-        // its side-effect calls must run (no spurious "bad exec before a
-        // good one").
-        assert!(!boundary_blocks_side_effects(
-            true,
-            Some("Empty response — let me check the service.")
-        ));
-
-        // Not armed -> never blocks.
-        assert!(!boundary_blocks_side_effects(false, None));
-        assert!(!boundary_blocks_side_effects(false, Some("hi")));
     }
 
     #[tokio::test]

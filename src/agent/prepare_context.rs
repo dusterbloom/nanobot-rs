@@ -15,7 +15,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::agent::agent_core::SwappableCore;
-use crate::agent::agent_loop::{AgentLoopShared, FlowControl, TurnContext, TurnOutcome};
+use crate::agent::agent_loop::{
+    AgentLoopShared, FlowControl, ProviderCallMode, TurnContext, TurnOutcome,
+};
 use crate::agent::audit::AuditLog;
 use crate::agent::context::PromptBlock;
 use crate::agent::context_gate::ContentGate;
@@ -376,8 +378,11 @@ impl AgentLoopShared {
         // included). Applied here — the single choke point after ALL
         // registrations — so a "python-only" surface truly means one tool.
         if let Ok(only) = std::env::var("NANOBOT_TOOLS_ONLY") {
-            let allow: std::collections::HashSet<&str> =
-                only.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let allow: std::collections::HashSet<&str> = only
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
             if !allow.is_empty() {
                 for name in tools.tool_names() {
                     if !allow.contains(name.as_str()) {
@@ -586,14 +591,14 @@ impl AgentLoopShared {
         // on later turns and never injects twice.
         let stale_lease_receipt = history.iter().any(|m| {
             m.get("role").and_then(Value::as_str) == Some("tool")
-                && m.get("content").and_then(Value::as_str)
+                && m.get("content")
+                    .and_then(Value::as_str)
                     .is_some_and(|c| c.starts_with("lease exhausted:"))
         });
         let budget_note_present = messages.iter().any(|m| {
-            m.get("content").and_then(Value::as_str)
-                .is_some_and(|c| {
-                    c.contains("no longer apply — this turn starts with a fresh tool budget")
-                })
+            m.get("content").and_then(Value::as_str).is_some_and(|c| {
+                c.contains("no longer apply — this turn starts with a fresh tool budget")
+            })
         });
         if stale_lease_receipt && !budget_note_present {
             messages.insert(
@@ -698,7 +703,6 @@ impl AgentLoopShared {
             content_gate,
             counters: self.core_handle.counters.clone(),
             flow: FlowControl {
-                boundary: crate::agent::agent_loop::ResponseBoundary::Off,
                 router_preflight_done: false,
                 tool_guard,
                 iterations_since_compaction: 0,
@@ -722,7 +726,10 @@ impl AgentLoopShared {
                 last_round_keys: Vec::new(),
                 prev_round_keys: Vec::new(),
                 consecutive_repeat_rounds: 0,
-                repeat_nudged: false,
+                provider_call_mode: ProviderCallMode::Normal,
+                terminal_attempted: false,
+                last_provider_tool_defs: Vec::new(),
+                last_provider_max_tokens: None,
                 infra_error: None,
             },
             health_registry: self.health_registry.clone(),
@@ -736,7 +743,7 @@ impl AgentLoopShared {
 mod tests {
     use super::append_continuity_to_system;
     use crate::agent::prompt_fingerprint::{compare, fingerprint, PromptDelta};
-use serde_json::json;
+    use serde_json::json;
 
     /// With no ephemeral local tail, turn N is an exact prefix of turn N+1:
     /// [system + history + current_user] becomes

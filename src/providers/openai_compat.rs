@@ -1080,6 +1080,7 @@ impl OpenAICompatProvider {
         );
         let url = format!("{}/chat/completions", self.api_base);
         let carries_one_shot_lease = body.get("session_lease").is_some();
+        let allow_retry = tool_choice != ToolChoice::None && !carries_one_shot_lease;
 
         // JIT gate: serialise access to JIT-loading servers.
         // Measure JIT wait separately from the actual API call.
@@ -1155,7 +1156,7 @@ impl OpenAICompatProvider {
             }
         })
         .retry(backoff)
-        .when(|e| !carries_one_shot_lease && e.is_retryable())
+        .when(|e| allow_retry && e.is_retryable())
         .notify(|e, dur: std::time::Duration| {
             warn!(error = %e, delay_ms = dur.as_millis() as u64, "provider_retry");
         })
@@ -2273,6 +2274,50 @@ mod tests {
             obj.remove("return_progress");
         }
         assert_eq!(blocking, streaming);
+    }
+
+    #[test]
+    fn terminal_no_tools_request_keeps_the_stable_tool_catalog() {
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:1234/v1"), Some("qwen3-8b"));
+        let messages = vec![serde_json::json!({"role": "user", "content": "finish"})];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "read",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+
+        let (_, normal_body) = provider.build_chat_request(
+            &messages,
+            Some(&tools),
+            Some("qwen3-8b"),
+            128,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+        let (_, body) = provider.build_chat_request(
+            &messages,
+            Some(&tools),
+            Some("qwen3-8b"),
+            128,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::None,
+            },
+        );
+
+        assert_eq!(body["tool_choice"], serde_json::json!("none"));
+        assert_eq!(body["tools"], normal_body["tools"]);
+        assert_eq!(body["stream"], serde_json::json!(false));
     }
 
     #[test]
@@ -4152,6 +4197,82 @@ mod tests {
             "a one-shot lease request must be attempted exactly once"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_none_request_is_not_retried_after_retryable_http_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind terminal retry capture server");
+        let address = listener.local_addr().expect("terminal retry address");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = Arc::clone(&request_count);
+        let server = tokio::spawn(async move {
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+            {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket
+                        .read(&mut buffer)
+                        .await
+                        .expect("read terminal request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                server_count.fetch_add(1, Ordering::SeqCst);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\n\
+                          Content-Length: 11\r\n\
+                          Connection: close\r\n\
+                          \r\n\
+                          unavailable",
+                    )
+                    .await
+                    .expect("write terminal retry response");
+            }
+        });
+        let provider = OpenAICompatProvider::new(
+            "local",
+            Some(&format!("http://{address}/v1")),
+            Some("bonsai"),
+        )
+        .with_retry_config(0, 0, 0, 0);
+        let messages = vec![serde_json::json!({"role": "user", "content": "finish"})];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+
+        let result = provider
+            .chat_with_tool_choice(
+                &messages,
+                Some(&tools),
+                None,
+                16,
+                0.0,
+                None,
+                None,
+                ToolChoice::None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.abort();
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
