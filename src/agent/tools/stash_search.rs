@@ -58,6 +58,12 @@ const MAX_SLICE_LINES: usize = 2000;
 /// Default line span when an inspection omits `end_line`.
 const DEFAULT_SLICE_SPAN: usize = 50;
 
+/// Diagnostic query labels are evidence pointers, not another copy of the
+/// caller's potentially enormous input. Eight bounded labels plus counts stay
+/// comfortably below the result cap and leave room for a requested page.
+const MAX_DIAGNOSTIC_TOKENS: usize = 8;
+const MAX_DIAGNOSTIC_TOKEN_CHARS: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Shared line-query helper (DRY).
 // ---------------------------------------------------------------------------
@@ -148,6 +154,29 @@ fn parse_range(params: &HashMap<String, Value>) -> Result<(usize, usize), ToolEr
     Ok((start, end))
 }
 
+/// Keep query diagnostics recognizable without echoing unbounded model input.
+/// Controls are replaced so one label cannot forge extra diagnostic lines.
+fn bounded_diagnostic_label(token: &str) -> String {
+    let mut chars = token.chars();
+    let mut label: String = chars
+        .by_ref()
+        .take(MAX_DIAGNOSTIC_TOKEN_CHARS)
+        .map(|ch| {
+            if ch.is_control() {
+                '�'
+            } else if ch.is_whitespace() {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    if chars.next().is_some() {
+        label.push('…');
+    }
+    label
+}
+
 /// Explain a grep-style pipe query after the complete literal has missed.
 /// The search contract stays literal; the counts point at a useful one-token
 /// retry without silently changing the query into a regex.
@@ -156,7 +185,7 @@ fn alternation_hint(query: &str, lines: &[StashedLine<'_>]) -> String {
         .split('|')
         .map(str::trim)
         .filter(|token| !token.is_empty())
-        .take(8)
+        .take(MAX_DIAGNOSTIC_TOKENS)
         .collect();
     if tokens.len() < 2 {
         return String::new();
@@ -174,7 +203,8 @@ fn alternation_hint(query: &str, lines: &[StashedLine<'_>]) -> String {
                         .count()
                 })
                 .unwrap_or(0);
-            format!("'{token}' matched {matched} line(s)")
+            let label = bounded_diagnostic_label(token);
+            format!("'{label}' matched {matched} line(s)")
         })
         .collect::<Vec<_>>();
     format!(
@@ -225,11 +255,34 @@ fn render_char_page(
     start_char: usize,
     paged: bool,
 ) -> String {
+    render_char_page_with_budget(
+        body,
+        artifact_tool_call_id,
+        start_char,
+        paged,
+        MAX_OUTPUT_CHARS,
+    )
+}
+
+/// Character-page renderer with an explicit share of the tool output budget.
+/// Query-miss diagnostics reserve their bytes before asking this helper to
+/// render the remaining source window.
+fn render_char_page_with_budget(
+    body: &str,
+    artifact_tool_call_id: &str,
+    start_char: usize,
+    paged: bool,
+    max_chars: usize,
+) -> String {
+    let max_chars = max_chars.min(MAX_OUTPUT_CHARS);
     let total = body.chars().count();
     if start_char >= total {
         return format!(
             "[source={artifact_tool_call_id} chars {start_char} out of range (output has {total} chars)]"
-        );
+        )
+        .chars()
+        .take(max_chars)
+        .collect();
     }
 
     let header = |end_char: usize| {
@@ -243,7 +296,7 @@ fn render_char_page(
         )
     };
 
-    let page_budget = MAX_OUTPUT_CHARS.saturating_sub(if paged { GUIDANCE_RESERVE } else { 0 });
+    let page_budget = max_chars.saturating_sub(if paged { GUIDANCE_RESERVE } else { 0 });
     let mut text = String::new();
     let mut end_char = start_char;
     for ch in body.chars().skip(start_char) {
@@ -258,8 +311,11 @@ fn render_char_page(
 
     if text.is_empty() {
         return format!(
-            "[source={artifact_tool_call_id} char page at {start_char} cannot fit within the {MAX_OUTPUT_CHARS}-char limit]"
-        );
+            "[source={artifact_tool_call_id} char page at {start_char} cannot fit within the {max_chars}-char limit]"
+        )
+        .chars()
+        .take(max_chars)
+        .collect();
     }
 
     if !paged {
@@ -288,6 +344,26 @@ fn render_slice_page(
     start: usize,
     end: usize,
 ) -> String {
+    render_slice_page_with_budget(
+        body,
+        lines,
+        artifact_tool_call_id,
+        start,
+        end,
+        MAX_OUTPUT_CHARS,
+    )
+}
+
+/// Line-page renderer with an explicit share of the tool output budget.
+fn render_slice_page_with_budget(
+    body: &str,
+    lines: &[StashedLine<'_>],
+    artifact_tool_call_id: &str,
+    start: usize,
+    end: usize,
+    max_chars: usize,
+) -> String {
+    let max_chars = max_chars.min(MAX_OUTPUT_CHARS);
     let total = lines.len();
     let clamped_start = start.max(1);
     let clamped_end = end
@@ -308,7 +384,10 @@ fn render_slice_page(
     if clamped_start > total {
         return format!(
             "[source={artifact_tool_call_id} lines {clamped_start}-{clamped_end} out of range (file has {total} lines)]"
-        );
+        )
+        .chars()
+        .take(max_chars)
+        .collect();
     }
 
     let mut rows = Vec::new();
@@ -324,7 +403,7 @@ fn render_slice_page(
         let mut candidate_rows = rows.clone();
         candidate_rows.push(row);
         let candidate = format!("{}{}", header(line.number), candidate_rows.join("\n"));
-        if candidate.chars().count() > MAX_OUTPUT_CHARS.saturating_sub(GUIDANCE_RESERVE) {
+        if candidate.chars().count() > max_chars.saturating_sub(GUIDANCE_RESERVE) {
             break;
         }
         rows = candidate_rows;
@@ -345,7 +424,7 @@ fn render_slice_page(
             };
             format!("{}{}{}", header(last_line), rows.join("\n"), footer)
         }
-        None => render_char_page(
+        None => render_char_page_with_budget(
             body,
             artifact_tool_call_id,
             lines
@@ -353,6 +432,7 @@ fn render_slice_page(
                 .find(|line| line.number == clamped_start)
                 .map_or(0, |line| line.start_char),
             true,
+            max_chars,
         ),
     }
 }
@@ -568,20 +648,27 @@ impl Tool for SearchToolResultTool {
                     )
                 } else {
                     let hint = alternation_hint(query, &lines);
+                    let query_label = bounded_diagnostic_label(query);
                     if params.get("start_line").is_some() || params.get("end_line").is_some() {
                         let (start, end) = parse_range(&params)?;
-                        let page = render_slice_page(&body, &lines, id, start, end);
-                        let result = format!(
-                            "No match for '{query}'. {hint}Showing the requested lines instead:\n{page}"
+                        let diagnostic = format!(
+                            "No match for '{query_label}'. {hint}Showing the requested lines instead:"
                         );
-                        if result.chars().count() <= MAX_OUTPUT_CHARS {
-                            result
-                        } else {
-                            page
-                        }
+                        let page_budget = MAX_OUTPUT_CHARS
+                            .saturating_sub(diagnostic.chars().count())
+                            .saturating_sub(1);
+                        let page = render_slice_page_with_budget(
+                            &body,
+                            &lines,
+                            id,
+                            start,
+                            end,
+                            page_budget,
+                        );
+                        format!("{diagnostic}\n{page}")
                     } else {
                         format!(
-                            "No matching lines for '{query}'. {hint}Query is a literal substring (no \
+                            "No matching lines for '{query_label}'. {hint}Query is a literal substring (no \
                              regex); for a positional read, omit query and use start_line/end_line or \
                              start_char."
                         )
@@ -736,6 +823,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn huge_pipe_query_miss_without_range_stays_bounded() {
+        let (_dir, db_path, sid) = make_db().await;
+        seed(&db_path, &sid, "call_huge_alt", "small body\n").await;
+        let first = format!("first-token-{}", "a".repeat(MAX_OUTPUT_CHARS * 2));
+        let second = format!("second-token-{}", "b".repeat(MAX_OUTPUT_CHARS * 2));
+        let query = format!("{first}|{second}");
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let params = HashMap::from([
+            ("tool_call_id".to_string(), json!("call_huge_alt")),
+            ("query".to_string(), json!(query)),
+        ]);
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+
+        assert!(out.chars().count() <= MAX_OUTPUT_CHARS, "{out}");
+        assert_eq!(out.matches("matched 0 line(s)").count(), 2, "{out}");
+        assert!(out.contains("first-token-"), "{out}");
+        assert!(out.contains("second-token-"), "{out}");
+        assert!(
+            !out.contains(&first),
+            "full token must not be repeated: {out}"
+        );
+        assert!(
+            !out.contains(&second),
+            "full token must not be repeated: {out}"
+        );
+    }
+
+    #[tokio::test]
     async fn query_miss_falls_back_to_requested_line_range() {
         let (_dir, db_path, sid) = make_db().await;
         let body = (1..=100).map(|_| "data").collect::<Vec<_>>().join("\n");
@@ -757,6 +876,40 @@ mod tests {
         assert!(out.contains("10:data"), "{out}");
         assert!(out.contains("12:data"), "{out}");
         assert!(!out.contains("13:data"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn near_cap_range_fallback_keeps_pipe_counts_and_page_bounded() {
+        let (_dir, db_path, sid) = make_db().await;
+        let body = (1..=100)
+            .map(|line| format!("row-{line}-{}", "x".repeat(80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        seed(&db_path, &sid, "call_near_cap", &body).await;
+        let query = format!(
+            "missing-token-{}|absent-token-{}",
+            "q".repeat(400),
+            "z".repeat(400)
+        );
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let params = HashMap::from([
+            ("tool_call_id".to_string(), json!("call_near_cap")),
+            ("query".to_string(), json!(query)),
+            ("start_line".to_string(), json!(1)),
+            ("end_line".to_string(), json!(100)),
+        ]);
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+
+        assert!(out.chars().count() <= MAX_OUTPUT_CHARS, "{out}");
+        assert_eq!(out.matches("matched 0 line(s)").count(), 2, "{out}");
+        assert!(out.contains("missing-token-"), "{out}");
+        assert!(out.contains("absent-token-"), "{out}");
+        assert!(out.contains("1:row-1-"), "{out}");
+        assert!(out.contains("[MORE CONTENT AHEAD"), "{out}");
     }
 
     #[tokio::test]
