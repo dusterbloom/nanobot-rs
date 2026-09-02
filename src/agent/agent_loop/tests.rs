@@ -2542,11 +2542,7 @@ impl LLMProvider for StreamingThinkingProvider {
                 usage: std::collections::HashMap::new(),
             },
         ));
-        Ok(crate::providers::base::StreamHandle {
-            rx,
-            terminal_error_rx: None,
-            abort_on_drop: None,
-        })
+        Ok(crate::providers::base::StreamHandle::new(rx, None))
     }
 
     fn get_default_model(&self) -> &str {

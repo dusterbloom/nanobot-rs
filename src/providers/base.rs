@@ -165,6 +165,34 @@ pub struct StreamHandle {
 }
 
 impl StreamHandle {
+    /// Construct an ordinary stream for external provider implementations.
+    ///
+    /// Use this instead of a struct literal: the provider-terminal channel is
+    /// intentionally crate-private so it can evolve without widening the
+    /// public provider contract.
+    pub fn new(
+        rx: tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+        abort_on_drop: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            rx,
+            terminal_error_rx: None,
+            abort_on_drop,
+        }
+    }
+
+    pub(crate) fn with_terminal_error(
+        rx: tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+        terminal_error_rx: tokio::sync::oneshot::Receiver<ProviderError>,
+        abort_on_drop: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            rx,
+            terminal_error_rx: Some(terminal_error_rx),
+            abort_on_drop,
+        }
+    }
+
     pub(crate) fn take_terminal_error_receiver(
         &mut self,
     ) -> Option<tokio::sync::oneshot::Receiver<ProviderError>> {
@@ -281,11 +309,7 @@ pub trait LLMProvider: Send + Sync {
             let _ = tx.send(StreamChunk::TextDelta(content.clone()));
         }
         let _ = tx.send(StreamChunk::Done(response));
-        Ok(StreamHandle {
-            rx,
-            terminal_error_rx: None,
-            abort_on_drop: None,
-        })
+        Ok(StreamHandle::new(rx, None))
     }
 
     /// Get the default model for this provider.
@@ -309,7 +333,15 @@ pub trait LLMProvider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::FinishReason;
+    use super::{FinishReason, StreamHandle};
+
+    #[test]
+    fn public_stream_handle_constructor_has_no_private_terminal_channel() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handle = StreamHandle::new(rx, None);
+
+        assert!(handle.take_terminal_error_receiver().is_none());
+    }
 
     /// Wire-stability guard (error-protocol doc §2.3 / §4): every wire string
     /// the streaming layer can produce must parse and re-serialize to the

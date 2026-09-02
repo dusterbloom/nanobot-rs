@@ -621,21 +621,20 @@ fn model_name(id: &str) -> String {
 }
 
 fn models_url_from_base(api_base: &str) -> String {
+    versioned_endpoint_url(api_base, "models")
+}
+
+fn versioned_endpoint_url(api_base: &str, endpoint: &str) -> String {
     let base = api_base.trim_end_matches('/');
     if base.ends_with("/v1") {
-        format!("{base}/models")
+        format!("{base}/{endpoint}")
     } else {
-        format!("{base}/v1/models")
+        format!("{base}/v1/{endpoint}")
     }
 }
 
 pub(crate) fn capacity_url_from_base(api_base: &str) -> String {
-    let base = api_base.trim_end_matches('/');
-    if base.ends_with("/v1") {
-        format!("{base}/capacity")
-    } else {
-        format!("{base}/v1/capacity")
-    }
+    versioned_endpoint_url(api_base, "capacity")
 }
 
 fn health_url_from_base(api_base: &str) -> String {
@@ -1227,6 +1226,10 @@ mod tests {
         assert_eq!(
             capacity_url_from_base("http://127.0.0.1:8080/v1/"),
             "http://127.0.0.1:8080/v1/capacity"
+        );
+        assert_eq!(
+            models_url_from_base("http://127.0.0.1:8080/v1/"),
+            "http://127.0.0.1:8080/v1/models"
         );
     }
 

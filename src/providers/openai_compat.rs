@@ -258,10 +258,16 @@ impl OpenAICompatProvider {
             );
         }
 
-        serde_json::from_str(&response_text)
-            .map(HiggsCapacityFetch::Profile)
-            .map(Some)
-            .map_err(|error| ProviderError::JsonParseError(error.to_string()))
+        let profile: HiggsCapacityProfile = serde_json::from_str(&response_text)
+            .map_err(|error| ProviderError::JsonParseError(error.to_string()))?;
+        if profile.model() != model {
+            return Err(ProviderError::JsonParseError(format!(
+                "Higgs capacity profile model {:?} does not match requested model {:?}",
+                profile.model(),
+                model
+            )));
+        }
+        Ok(Some(HiggsCapacityFetch::Profile(profile)))
     }
 
     /// Attach OpenAI-compatible sampling penalties.
@@ -866,6 +872,12 @@ enum RequestKind {
     Streaming,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SseParserMode {
+    Standard,
+    HiggsCapacity,
+}
+
 fn parse_higgs_capacity_error(
     status_code: u16,
     response_text: &str,
@@ -878,10 +890,9 @@ fn parse_higgs_capacity_error(
     let code = error.get("code")?.as_str()?;
     if (status_code, error_type, code) == (404, "higgs_capacity_model_not_found", "model_not_found")
     {
-        return Some(ProviderError::HttpStatus {
-            status: status_code,
-            code: Some(code.to_owned()),
-            message: response_text.to_owned(),
+        let model = error.get("model")?.as_str()?;
+        return (!model.trim().is_empty()).then(|| ProviderError::HiggsCapacityModelNotFound {
+            model: model.to_owned(),
         });
     }
     let boot_id = error.get("bootId")?.as_str()?;
@@ -922,27 +933,47 @@ fn parse_higgs_capacity_error(
     }
 }
 
-fn parse_higgs_capacity_interruption(
-    data: &str,
-    partial_stream_bytes: Vec<u8>,
-) -> Option<crate::errors::ProviderError> {
-    let value: serde_json::Value = serde_json::from_str(data).ok()?;
-    let error = value.get("error")?.as_object()?;
-    if error.get("type")?.as_str()? != "higgs_capacity_interrupted"
-        || error.get("code")?.as_str()? != "capacity_interrupted"
+enum HiggsCapacityInterruption {
+    NotCapacity,
+    Valid {
+        boot_id: String,
+        generation: u64,
+        partial_output_tokens: u64,
+    },
+    MalformedExact,
+}
+
+fn classify_higgs_capacity_interruption(value: &serde_json::Value) -> HiggsCapacityInterruption {
+    use HiggsCapacityInterruption::{MalformedExact, NotCapacity, Valid};
+
+    let Some(error) = value.get("error").and_then(serde_json::Value::as_object) else {
+        return NotCapacity;
+    };
+    if error.get("type").and_then(serde_json::Value::as_str) != Some("higgs_capacity_interrupted")
+        || error.get("code").and_then(serde_json::Value::as_str) != Some("capacity_interrupted")
     {
-        return None;
+        return NotCapacity;
     }
-    let boot_id = error.get("bootId")?.as_str()?;
+    let Some(boot_id) = error.get("bootId").and_then(serde_json::Value::as_str) else {
+        return MalformedExact;
+    };
     if boot_id.trim().is_empty() {
-        return None;
+        return MalformedExact;
     }
-    Some(crate::errors::ProviderError::HiggsCapacityInterrupted {
+    let Some(generation) = error.get("generation").and_then(serde_json::Value::as_u64) else {
+        return MalformedExact;
+    };
+    let Some(partial_output_tokens) = error
+        .get("partialOutputTokens")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return MalformedExact;
+    };
+    Valid {
         boot_id: boot_id.to_owned(),
-        generation: error.get("generation")?.as_u64()?,
-        partial_output_tokens: error.get("partialOutputTokens")?.as_u64()?,
-        partial_stream_bytes,
-    })
+        generation,
+        partial_output_tokens,
+    }
 }
 
 /// Map a non-success chat/completions response to a [`crate::errors::ProviderError`].
@@ -1246,6 +1277,7 @@ impl OpenAICompatProvider {
         let api_key = self.api_key.clone();
         let api_base = self.api_base.clone();
         let model_owned = model.clone();
+        let higgs_capacity = self.higgs_session_cache;
 
         use crate::errors::ProviderError;
         let result: Result<LLMResponse, ProviderError> = (|| {
@@ -1275,9 +1307,12 @@ impl OpenAICompatProvider {
                     .map_err(|e| ProviderError::ResponseReadError(e.to_string()))?;
 
                 if !status.is_success() {
-                    if let Some(error) = parse_higgs_capacity_error(status.as_u16(), &response_text)
-                    {
-                        return Err(error);
+                    if higgs_capacity {
+                        if let Some(error) =
+                            parse_higgs_capacity_error(status.as_u16(), &response_text)
+                        {
+                            return Err(error);
+                        }
                     }
                     return Err(map_status_to_provider_error(
                         status.as_u16(),
@@ -1437,6 +1472,7 @@ impl LLMProvider for OpenAICompatProvider {
         let api_key = self.api_key.clone();
         let api_base = self.api_base.clone();
         let model_owned = model.clone();
+        let higgs_capacity = self.higgs_session_cache;
 
         let response: Result<reqwest::Response, ProviderError> = (|| {
             let client = client.clone();
@@ -1458,8 +1494,12 @@ impl LLMProvider for OpenAICompatProvider {
                 let status = response.status();
                 if !status.is_success() {
                     let error_text = response.text().await.unwrap_or_default();
-                    if let Some(error) = parse_higgs_capacity_error(status.as_u16(), &error_text) {
-                        return Err(error);
+                    if higgs_capacity {
+                        if let Some(error) =
+                            parse_higgs_capacity_error(status.as_u16(), &error_text)
+                        {
+                            return Err(error);
+                        }
                     }
                     return Err(map_status_to_provider_error(
                         status.as_u16(),
@@ -1505,8 +1545,13 @@ impl LLMProvider for OpenAICompatProvider {
         // The JIT permit is moved into the task and held until the stream ends,
         // preventing other providers from switching models mid-stream.
         let byte_stream = response.bytes_stream();
+        let parser_mode = if self.higgs_session_cache {
+            SseParserMode::HiggsCapacity
+        } else {
+            SseParserMode::Standard
+        };
         let abort_on_drop = tokio::spawn(async move {
-            if let Err(error) = parse_sse_stream(byte_stream, tx).await {
+            if let Err(error) = parse_sse_stream(byte_stream, tx, parser_mode).await {
                 warn!(%error, "provider_stream_terminal_error");
                 let _ = terminal_error_tx.send(error);
             }
@@ -1514,11 +1559,11 @@ impl LLMProvider for OpenAICompatProvider {
             drop(jit_permit);
         });
 
-        Ok(StreamHandle {
+        Ok(StreamHandle::with_terminal_error(
             rx,
-            terminal_error_rx: Some(terminal_error_rx),
-            abort_on_drop: Some(abort_on_drop),
-        })
+            terminal_error_rx,
+            Some(abort_on_drop),
+        ))
     }
 
     fn get_default_model(&self) -> &str {
@@ -1999,15 +2044,19 @@ fn extract_usage_numbers(
 async fn parse_sse_stream(
     byte_stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+    mode: SseParserMode,
 ) -> Result<(), crate::errors::ProviderError> {
-    let mut line_buffer = String::new();
+    let mut line_buffer = std::collections::VecDeque::new();
     let mut full_content = String::new();
     let mut full_reasoning = String::new(); // API reasoning_content field only
     let mut full_inline_thinking = String::new(); // inline <think> tags — fallback when content empty
     let mut split_state = ThinkSplitState::default();
     let mut finish_reason = FinishReason::Stop;
     let mut usage: HashMap<String, i64> = HashMap::new();
-    let mut partial_stream_bytes = Vec::new();
+    let mut partial_stream_bytes = match mode {
+        SseParserMode::Standard => None,
+        SseParserMode::HiggsCapacity => Some(Vec::new()),
+    };
 
     // Tool call accumulation: index → (id, name, arguments_json_str)
     let mut tool_calls_acc: HashMap<u64, (String, String, String)> = HashMap::new();
@@ -2023,16 +2072,19 @@ async fn parse_sse_stream(
             }
         };
 
-        partial_stream_bytes.extend_from_slice(&bytes);
-        let text = String::from_utf8_lossy(&bytes);
-        line_buffer.push_str(&text);
+        if let Some(partial_stream_bytes) = &mut partial_stream_bytes {
+            partial_stream_bytes.extend_from_slice(&bytes);
+        }
+        line_buffer.extend(&bytes);
 
         // Process complete lines
-        while let Some(newline_pos) = line_buffer.find('\n') {
-            let line = line_buffer[..newline_pos]
-                .trim_end_matches('\r')
-                .to_string();
-            line_buffer = line_buffer[newline_pos + 1..].to_string();
+        while let Some(newline_pos) = line_buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line_bytes: Vec<u8> = line_buffer.drain(..=newline_pos).collect();
+            line_bytes.pop();
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
+            let line = String::from_utf8_lossy(&line_bytes);
 
             if line.is_empty() {
                 continue;
@@ -2159,10 +2211,45 @@ async fn parse_sse_stream(
                 }
             };
 
-            if let Some(error) =
-                parse_higgs_capacity_interruption(data, partial_stream_bytes.clone())
-            {
-                return Err(error);
+            if mode == SseParserMode::HiggsCapacity {
+                match classify_higgs_capacity_interruption(&chunk) {
+                    HiggsCapacityInterruption::NotCapacity => {}
+                    HiggsCapacityInterruption::Valid {
+                        boot_id,
+                        generation,
+                        partial_output_tokens,
+                    } => {
+                        let trailing_len = line_buffer.len().saturating_sub(
+                            if line_buffer.front() == Some(&b'\n') {
+                                1
+                            } else if line_buffer.front() == Some(&b'\r')
+                                && line_buffer.get(1) == Some(&b'\n')
+                            {
+                                2
+                            } else {
+                                0
+                            },
+                        );
+                        let partial_stream_bytes = partial_stream_bytes
+                            .as_mut()
+                            .expect("Higgs parser mode retains raw stream bytes");
+                        partial_stream_bytes
+                            .truncate(partial_stream_bytes.len().saturating_sub(trailing_len));
+                        return Err(crate::errors::ProviderError::HiggsCapacityInterrupted {
+                            boot_id,
+                            generation,
+                            partial_output_tokens,
+                            partial_stream_bytes: crate::errors::PartialStreamBytes::new(
+                                std::mem::take(partial_stream_bytes),
+                            ),
+                        });
+                    }
+                    HiggsCapacityInterruption::MalformedExact => {
+                        return Err(crate::errors::ProviderError::JsonParseError(
+                            "malformed Higgs capacity interruption metadata".to_string(),
+                        ));
+                    }
+                }
             }
 
             // Prefill progress (llama.cpp/higgs `return_progress`): these
@@ -4371,11 +4458,8 @@ mod tests {
             .with_higgs_session_cache(true);
         assert!(matches!(
             provider.fetch_higgs_capacity("missing").await,
-            Err(crate::errors::ProviderError::HttpStatus {
-                status: 404,
-                code: Some(code),
-                ..
-            }) if code == "model_not_found"
+            Err(crate::errors::ProviderError::HiggsCapacityModelNotFound { model })
+                if model == "missing"
         ));
         server.await.unwrap();
     }
@@ -4427,6 +4511,7 @@ mod tests {
             spawn_capacity_server("413 Content Too Large", Some("application/json"), exceeded)
                 .await;
         let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"));
+        let provider = provider.with_higgs_session_cache(true);
         let error = provider
             .chat(
                 &[serde_json::json!({"role": "user", "content": "hi"})],
@@ -4458,6 +4543,7 @@ mod tests {
         )
         .await;
         let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"));
+        let provider = provider.with_higgs_session_cache(true);
         let error = match provider
             .chat_stream(
                 &[serde_json::json!({"role": "user", "content": "hi"})],
@@ -4511,6 +4597,36 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn cloud_capacity_lookalike_keeps_generic_http_error() {
+        let body = r#"{"error":{"type":"higgs_capacity_exceeded","code":"compact_and_retry","safePromptTokens":36864,"safeTotalTokens":40960,"bootId":"boot-1","generation":8}}"#;
+        let (base, server) =
+            spawn_capacity_server("413 Content Too Large", Some("application/json"), body).await;
+        let provider = OpenAICompatProvider::new("cloud", Some(&base), Some("escha"));
+        let error = provider
+            .chat(
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                16,
+                0.0,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<crate::errors::ProviderError>(),
+            Some(crate::errors::ProviderError::HttpStatus {
+                status: 413,
+                code: Some(code),
+                message,
+            }) if code == "compact_and_retry" && message == body
+        ));
+        server.await.unwrap();
+    }
+
     #[test]
     fn exact_higgs_capacity_http_errors_are_structural() {
         let exceeded = r#"{"error":{"type":"higgs_capacity_exceeded","code":"compact_and_retry","safePromptTokens":36864,"safeTotalTokens":40960,"bootId":"boot-1","generation":8}}"#;
@@ -4537,11 +4653,8 @@ mod tests {
         let not_found = r#"{"error":{"type":"higgs_capacity_model_not_found","code":"model_not_found","model":"missing"}}"#;
         assert!(matches!(
             parse_higgs_capacity_error(404, not_found),
-            Some(crate::errors::ProviderError::HttpStatus {
-                status: 404,
-                code: Some(code),
-                message,
-            }) if code == "model_not_found" && message == not_found
+            Some(crate::errors::ProviderError::HiggsCapacityModelNotFound { model })
+                if model == "missing"
         ));
     }
 
@@ -4604,9 +4717,72 @@ mod tests {
         for body in [
             r#"{"error":{"type":"other","code":"model_not_found","model":"missing"}}"#,
             r#"{"error":{"type":"higgs_capacity_model_not_found","code":"other","model":"missing"}}"#,
+            r#"{"error":{"type":"higgs_capacity_model_not_found","code":"model_not_found"}}"#,
+            r#"{"error":{"type":"higgs_capacity_model_not_found","code":"model_not_found","model":"  "}}"#,
         ] {
             assert!(parse_higgs_capacity_error(404, body).is_none());
+            assert!(matches!(
+                map_status_to_provider_error(
+                    404,
+                    body.to_owned(),
+                    "http://local/v1",
+                    &serde_json::json!({}),
+                    "escha"
+                ),
+                crate::errors::ProviderError::HttpStatus {
+                    status: 404,
+                    code: Some(code),
+                    message,
+                } if code == body
+                    .parse::<serde_json::Value>()
+                    .unwrap()
+                    .pointer("/error/code")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    && message == body
+            ));
         }
+    }
+
+    #[tokio::test]
+    async fn higgs_interruption_retains_exact_raw_bytes_across_transport_boundaries() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}]}\n\n",
+            "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"capacity_interrupted\",\"bootId\":\"boot-3\",\"generation\":10,\"partialOutputTokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes();
+        let split_points = [1, 7, 19, 64, 93, raw.len() - 3];
+        let mut start = 0;
+        let mut chunks = Vec::new();
+        for end in split_points.into_iter().chain(std::iter::once(raw.len())) {
+            chunks.push(Ok(bytes::Bytes::copy_from_slice(&raw[start..end])));
+            start = end;
+        }
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = parse_sse_stream(
+            futures_util::stream::iter(chunks),
+            tx,
+            SseParserMode::HiggsCapacity,
+        )
+        .await
+        .expect_err("terminal interruption must stop parsing");
+
+        let crate::errors::ProviderError::HiggsCapacityInterrupted {
+            partial_stream_bytes,
+            ..
+        } = error
+        else {
+            panic!("expected typed interruption");
+        };
+        let done_frame = b"data: [DONE]";
+        let done_start = raw
+            .windows(done_frame.len())
+            .position(|window| window == done_frame)
+            .unwrap();
+        assert_eq!(partial_stream_bytes.as_slice(), &raw[..done_start]);
     }
 
     #[tokio::test]
@@ -4618,9 +4794,13 @@ mod tests {
         ]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let error = parse_sse_stream(futures_util::stream::iter(chunks), tx)
-            .await
-            .expect_err("typed terminal event must fail the stream");
+        let error = parse_sse_stream(
+            futures_util::stream::iter(chunks),
+            tx,
+            SseParserMode::HiggsCapacity,
+        )
+        .await
+        .expect_err("typed terminal event must fail the stream");
 
         assert!(matches!(
             error,
@@ -4629,7 +4809,7 @@ mod tests {
                 generation: 10,
                 partial_output_tokens: 3,
                 ref partial_stream_bytes,
-            } if boot_id == "boot-3" && partial_stream_bytes.windows(7).any(|w| w == b"partial")
+            } if boot_id == "boot-3" && partial_stream_bytes.as_slice().windows(7).any(|w| w == b"partial")
         ));
         assert!(
             std::iter::from_fn(|| rx.try_recv().ok())
@@ -4646,7 +4826,8 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let (base, server) = spawn_capacity_server("200 OK", Some("text/event-stream"), body).await;
-        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"));
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"))
+            .with_higgs_session_cache(true);
         let mut stream = provider
             .chat_stream(
                 &[serde_json::json!({"role": "user", "content": "hi"})],
@@ -4679,17 +4860,16 @@ mod tests {
                 generation: 10,
                 partial_output_tokens: 3,
                 ref partial_stream_bytes,
-            } if boot_id == "boot-3" && partial_stream_bytes.windows(7).any(|w| w == b"partial")
+            } if boot_id == "boot-3" && partial_stream_bytes.as_slice().windows(7).any(|w| w == b"partial")
         ));
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn unrelated_or_malformed_sse_errors_keep_normal_stream_semantics() {
+    async fn unrelated_sse_errors_keep_normal_stream_semantics() {
         for error_event in [
             "data: {\"error\":{\"type\":\"server_error\",\"code\":\"capacity_interrupted\",\"bootId\":\"boot-3\",\"generation\":10,\"partialOutputTokens\":3}}",
             "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"wrong_code\",\"bootId\":\"boot-3\",\"generation\":10,\"partialOutputTokens\":3}}",
-            "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"capacity_interrupted\",\"bootId\":\"\",\"generation\":10,\"partialOutputTokens\":3}}",
         ] {
             let chunks = sse_bytes(&[
                 "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}]}",
@@ -4698,7 +4878,11 @@ mod tests {
             ]);
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-            parse_sse_stream(futures_util::stream::iter(chunks), tx)
+            parse_sse_stream(
+                futures_util::stream::iter(chunks),
+                tx,
+                SseParserMode::HiggsCapacity,
+            )
                 .await
                 .expect("non-exact error event keeps the legacy parser path");
 
@@ -4708,6 +4892,120 @@ mod tests {
                 "non-exact event must not become a typed interruption"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_exact_higgs_interruption_fails_closed_without_done() {
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}]}",
+            "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"capacity_interrupted\",\"bootId\":\"\",\"generation\":10,\"partialOutputTokens\":3}}",
+            "data: [DONE]",
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = parse_sse_stream(
+            futures_util::stream::iter(chunks),
+            tx,
+            SseParserMode::HiggsCapacity,
+        )
+        .await
+        .expect_err("exact interruption with malformed metadata must stop the stream");
+
+        assert!(matches!(
+            error,
+            crate::errors::ProviderError::JsonParseError(_)
+        ));
+        assert!(std::iter::from_fn(|| rx.try_recv().ok())
+            .all(|chunk| !matches!(chunk, StreamChunk::Done(_))));
+    }
+
+    #[tokio::test]
+    async fn public_malformed_exact_higgs_interruption_fails_closed_without_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}]}\n\n",
+            "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"capacity_interrupted\",\"bootId\":\"\",\"generation\":10,\"partialOutputTokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, server) = spawn_capacity_server("200 OK", Some("text/event-stream"), body).await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"))
+            .with_higgs_session_cache(true);
+        let mut stream = provider
+            .chat_stream(
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                16,
+                0.0,
+                None,
+                None,
+            )
+            .await
+            .expect("stream headers succeed");
+        let terminal_error = stream.take_terminal_error_receiver().unwrap();
+
+        assert!(
+            stream.rx.recv().await.is_some(),
+            "prefix delta remains observable"
+        );
+        while let Some(chunk) = stream.rx.recv().await {
+            assert!(!matches!(chunk, StreamChunk::Done(_)));
+        }
+        assert!(matches!(
+            terminal_error.await.unwrap(),
+            crate::errors::ProviderError::JsonParseError(_)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloud_sse_capacity_lookalike_remains_an_ordinary_stream() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}]}\n\n",
+            "data: {\"error\":{\"type\":\"higgs_capacity_interrupted\",\"code\":\"capacity_interrupted\",\"bootId\":\"boot-3\",\"generation\":10,\"partialOutputTokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, server) = spawn_capacity_server("200 OK", Some("text/event-stream"), body).await;
+        let provider = OpenAICompatProvider::new("cloud", Some(&base), Some("escha"));
+        let mut stream = provider
+            .chat_stream(
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                None,
+                None,
+                16,
+                0.0,
+                None,
+                None,
+            )
+            .await
+            .expect("stream headers succeed");
+
+        let mut saw_done = false;
+        while let Some(chunk) = stream.rx.recv().await {
+            saw_done |= matches!(chunk, StreamChunk::Done(_));
+        }
+        assert!(
+            saw_done,
+            "cloud lookalike must preserve ordinary Done semantics"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capacity_profile_model_must_match_request() {
+        let (base, server) = spawn_capacity_server(
+            "200 OK",
+            Some("application/json"),
+            available_capacity_body(),
+        )
+        .await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("other-model"))
+            .with_higgs_session_cache(true);
+
+        assert!(matches!(
+            provider.fetch_higgs_capacity("other-model").await,
+            Err(crate::errors::ProviderError::JsonParseError(_))
+        ));
+        server.await.unwrap();
     }
 
     async fn spawn_timed_sse_server(
@@ -5201,7 +5499,9 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await.unwrap();
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
 
         let mut saw_transport_progress = false;
         while let Ok(chunk) = rx.try_recv() {
@@ -5229,7 +5529,9 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await.unwrap();
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
 
         // Collect all chunks.
         let mut deltas = Vec::new();
@@ -5272,7 +5574,9 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await.unwrap();
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {
@@ -5302,7 +5606,9 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await.unwrap();
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {
@@ -5333,7 +5639,9 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await.unwrap();
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {
@@ -5367,7 +5675,9 @@ mod tests {
 
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        parse_sse_stream(stream, tx).await.unwrap();
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
 
         let mut received = Vec::new();
         while let Ok(chunk) = rx.try_recv() {
@@ -5401,7 +5711,9 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await.unwrap();
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
 
         let mut done_response = None;
         let mut tool_call_deltas = 0usize;
@@ -5444,7 +5756,9 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await.unwrap();
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {
@@ -5473,7 +5787,9 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        parse_sse_stream(stream, tx).await.unwrap();
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
 
         let mut done_response = None;
         while let Ok(chunk) = rx.try_recv() {

@@ -747,11 +747,7 @@ mod tests {
                     usage: HashMap::new(),
                 }));
             });
-            Ok(StreamHandle {
-                rx,
-                terminal_error_rx: None,
-                abort_on_drop: Some(task),
-            })
+            Ok(StreamHandle::new(rx, Some(task)))
         }
 
         fn get_default_model(&self) -> &str {

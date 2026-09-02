@@ -774,6 +774,13 @@ impl crate::providers::base::LLMProvider for ReplayRecordingProvider {
                 return Err(error);
             }
         };
+        let inner_terminal_error = inner_stream.take_terminal_error_receiver();
+        let (terminal_error_tx, terminal_error_rx) = if inner_terminal_error.is_some() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let replay = self.replay.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let forward = tokio::spawn(async move {
@@ -829,16 +836,33 @@ impl crate::providers::base::LLMProvider for ReplayRecordingProvider {
                 }
             }
             if !saw_terminal {
+                if let Some(inner_terminal_error) = inner_terminal_error {
+                    if let Ok(error) = inner_terminal_error.await {
+                        cancel_guard.armed = false;
+                        if let Err(record_error) =
+                            replay.failure(&call_id, &error.to_string()).await
+                        {
+                            warn!(%record_error, "stream terminal error replay persistence failed");
+                        }
+                        if let Some(terminal_error_tx) = terminal_error_tx {
+                            let _ = terminal_error_tx.send(error);
+                        }
+                        return;
+                    }
+                }
                 cancel_guard.armed = false;
                 let _ = replay
                     .failure(&call_id, "stream ended without terminal response")
                     .await;
             }
         });
-        Ok(crate::providers::base::StreamHandle {
-            rx,
-            terminal_error_rx: None,
-            abort_on_drop: Some(forward),
+        Ok(match terminal_error_rx {
+            Some(terminal_error_rx) => crate::providers::base::StreamHandle::with_terminal_error(
+                rx,
+                terminal_error_rx,
+                Some(forward),
+            ),
+            None => crate::providers::base::StreamHandle::new(rx, Some(forward)),
         })
     }
 
@@ -4041,6 +4065,61 @@ mod tests {
         hang_after_first: bool,
     }
 
+    struct TerminalErrorStreamFakeProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::LLMProvider for TerminalErrorStreamFakeProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            unreachable!("stream fake only supports chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::StreamHandle> {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (error_tx, error_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = tx.send(crate::providers::base::StreamChunk::TextDelta(
+                    "partial".to_string(),
+                ));
+                drop(tx);
+                let _ = error_tx.send(crate::errors::ProviderError::HiggsCapacityInterrupted {
+                    boot_id: "boot-replay".to_string(),
+                    generation: 12,
+                    partial_output_tokens: 4,
+                    partial_stream_bytes: crate::errors::PartialStreamBytes::new(
+                        b"private replay bytes".to_vec(),
+                    ),
+                });
+            });
+            Ok(crate::providers::base::StreamHandle::with_terminal_error(
+                rx,
+                error_rx,
+                Some(task),
+            ))
+        }
+
+        fn get_default_model(&self) -> &str {
+            "terminal-error-model"
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::providers::base::LLMProvider for SequencedStreamFakeProvider {
         async fn chat(
@@ -4101,11 +4180,7 @@ mod tests {
                     },
                 ));
             });
-            Ok(crate::providers::base::StreamHandle {
-                rx,
-                terminal_error_rx: None,
-                abort_on_drop: Some(task),
-            })
+            Ok(crate::providers::base::StreamHandle::new(rx, Some(task)))
         }
 
         fn get_default_model(&self) -> &str {
@@ -4135,6 +4210,61 @@ mod tests {
             }
         }
         None
+    }
+
+    #[tokio::test]
+    async fn replay_wrapper_records_and_propagates_typed_stream_failure() {
+        let dir = tempdir().expect("tempdir");
+        let db = std::sync::Arc::new(SessionDb::new(&dir.path().join("sessions.db")));
+        let meta = db.create_session("cli:typed-stream-failure").await;
+        let provider = ReplayRecordingProvider::new(
+            std::sync::Arc::new(TerminalErrorStreamFakeProvider),
+            TurnReplayRecorder::new(
+                std::sync::Arc::clone(&db),
+                meta.id.clone(),
+                "turn-1".to_string(),
+                1,
+            ),
+            ModelCallPurpose::ToolRunner,
+        );
+        let mut handle = provider
+            .chat_stream(
+                &[json!({"role":"user","content":"hi"})],
+                None,
+                None,
+                8,
+                0.1,
+                None,
+                None,
+            )
+            .await
+            .expect("wrapper stream starts");
+        let terminal_error = handle
+            .take_terminal_error_receiver()
+            .expect("wrapper must propagate the inner terminal receiver");
+
+        let mut saw_done = false;
+        while let Some(chunk) = handle.rx.recv().await {
+            saw_done |= matches!(chunk, crate::providers::base::StreamChunk::Done(_));
+        }
+        let error = terminal_error.await.expect("typed failure is propagated");
+        assert!(!saw_done);
+        assert!(matches!(
+            error,
+            crate::errors::ProviderError::HiggsCapacityInterrupted {
+                boot_id,
+                generation: 12,
+                partial_output_tokens: 4,
+                ref partial_stream_bytes,
+            } if boot_id == "boot-replay"
+                && partial_stream_bytes.as_slice() == b"private replay bytes"
+        ));
+
+        let (_, recorded) = recorded_stream_failure_text(&db, &meta.id)
+            .await
+            .expect("typed failure is journaled");
+        assert!(recorded.contains("boot boot-replay"));
+        assert!(!recorded.contains("private replay bytes"));
     }
 
     #[tokio::test]

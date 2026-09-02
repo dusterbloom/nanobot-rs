@@ -6,6 +6,28 @@
 #![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use thiserror::Error;
 
+/// Opaque retained bytes from an interrupted provider stream.
+///
+/// The payload is intentionally crate-private: replay code may preserve it,
+/// while logs and external callers can only observe that private bytes exist.
+pub struct PartialStreamBytes(pub(crate) Vec<u8>);
+
+impl PartialStreamBytes {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PartialStreamBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<redacted {} bytes>", self.0.len())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Provider errors
 // ---------------------------------------------------------------------------
@@ -61,6 +83,9 @@ pub enum ProviderError {
         retry_after_ms: u64,
     },
 
+    #[error("Higgs capacity model not found ({model})")]
+    HiggsCapacityModelNotFound { model: String },
+
     #[error(
         "Higgs capacity interrupted generation (boot {boot_id}, generation {generation}, partial output {partial_output_tokens} tokens)"
     )]
@@ -69,7 +94,7 @@ pub enum ProviderError {
         generation: u64,
         partial_output_tokens: u64,
         /// Raw incomplete SSE bytes retained for the durable replay wiring.
-        partial_stream_bytes: Vec<u8>,
+        partial_stream_bytes: PartialStreamBytes,
     },
 
     #[error("Request cancelled")]
@@ -96,6 +121,7 @@ impl ProviderError {
             | Self::AuthError { .. }
             | Self::HiggsCapacityExceeded { .. }
             | Self::HiggsCapacityUnavailable { .. }
+            | Self::HiggsCapacityModelNotFound { .. }
             | Self::HiggsCapacityInterrupted { .. }
             | Self::Cancelled
             | Self::EmptyStream(_) => false,
@@ -479,6 +505,26 @@ pub fn legacy_kind_from_tool_error(e: &ToolError) -> Option<ToolErrorKind> {
 #[allow(clippy::disallowed_methods)] // pins classify_tool_error's mapping for legacy string->typed conversion (kept while ToolExecutionResult lives)
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_stream_bytes_debug_is_redacted() {
+        let secret = b"private incomplete stream payload".to_vec();
+        let bytes = PartialStreamBytes::new(secret.clone());
+        let error = ProviderError::HiggsCapacityInterrupted {
+            boot_id: "boot-1".to_string(),
+            generation: 7,
+            partial_output_tokens: 3,
+            partial_stream_bytes: bytes,
+        };
+
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("private incomplete stream payload"));
+        assert!(!debug.contains(&format!("{secret:?}")));
+        assert!(debug.contains("<redacted"));
+        assert!(!error
+            .to_string()
+            .contains("private incomplete stream payload"));
+    }
 
     // -- parse_overflow_counts tests --
 
