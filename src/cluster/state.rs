@@ -256,7 +256,12 @@ mod tests {
     async fn mark_unhealthy_flips_flag_and_ignores_unknown_endpoints() {
         let state = ClusterState::new();
         state
-            .update_peer(make_peer("http://10.0.0.2:1234", PeerType::LMStudio, vec!["m"], true))
+            .update_peer(make_peer(
+                "http://10.0.0.2:1234",
+                PeerType::LMStudio,
+                vec!["m"],
+                true,
+            ))
             .await;
         state.mark_unhealthy("http://nonexistent:9").await; // no panic, no change
         assert_eq!(state.get_healthy_peers().await.len(), 1);

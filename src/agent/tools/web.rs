@@ -339,7 +339,10 @@ fn searxng_throttled_message(
         .filter_map(|e| {
             let arr = e.as_array()?;
             let name = arr.first()?.as_str().unwrap_or("?");
-            let why = arr.get(1).and_then(|v| v.as_str()).unwrap_or("unresponsive");
+            let why = arr
+                .get(1)
+                .and_then(|v| v.as_str())
+                .unwrap_or("unresponsive");
             Some(format!("{name} ({why})"))
         })
         .collect();
@@ -449,33 +452,33 @@ impl WebSearchTool {
                     );
                 }
 
-                        match response.json::<serde_json::Value>().await {
-                            Ok(data) => {
-                                let results = data
-                                    .get("results")
-                                    .and_then(|r| r.as_array())
-                                    .cloned()
-                                    .unwrap_or_default();
+                match response.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        let results = data
+                            .get("results")
+                            .and_then(|r| r.as_array())
+                            .cloned()
+                            .unwrap_or_default();
 
-                                // Empty results is ambiguous: either genuinely
-                                // nothing matched, OR the upstream engines are
-                                // throttling/blocking this IP (SearXNG still
-                                // returns HTTP 200 with an empty `results` array
-                                // and a populated `unresponsive_engines` list).
-                                // The latter is rate-limiting, not "nothing
-                                // found" — telling the model "No results" makes
-                                // it loop the same doomed query. Surface it as a
-                                // distinct, retry-later Error so the agent stops.
-                                if results.is_empty() {
-                                    if let Some(msg) =
-                                        searxng_throttled_message(&data, query, &self.searxng_url)
-                                    {
-                                        return msg;
-                                    }
-                                    return format!("No results for: {}", query);
-                                }
+                        // Empty results is ambiguous: either genuinely
+                        // nothing matched, OR the upstream engines are
+                        // throttling/blocking this IP (SearXNG still
+                        // returns HTTP 200 with an empty `results` array
+                        // and a populated `unresponsive_engines` list).
+                        // The latter is rate-limiting, not "nothing
+                        // found" — telling the model "No results" makes
+                        // it loop the same doomed query. Surface it as a
+                        // distinct, retry-later Error so the agent stops.
+                        if results.is_empty() {
+                            if let Some(msg) =
+                                searxng_throttled_message(&data, query, &self.searxng_url)
+                            {
+                                return msg;
+                            }
+                            return format!("No results for: {}", query);
+                        }
 
-                                let mut lines = vec![format!("Results for: {}\n", query)];
+                        let mut lines = vec![format!("Results for: {}\n", query)];
                         for (i, item) in results.iter().take(count as usize).enumerate() {
                             let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
                             let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -1637,10 +1640,22 @@ mod tests {
         });
         let msg = searxng_throttled_message(&data, "qwen3.8 mlx", "http://127.0.0.1:0");
         let msg = msg.expect("throttled response must produce a message");
-        assert!(msg.starts_with("Error:"), "must read as failure, got: {msg}");
-        assert!(msg.contains("throttling"), "must name rate-limiting, got: {msg}");
-        assert!(msg.contains("duckduckgo"), "must list the blocked engines, got: {msg}");
-        assert!(msg.contains("60s"), "must tell the agent to wait, got: {msg}");
+        assert!(
+            msg.starts_with("Error:"),
+            "must read as failure, got: {msg}"
+        );
+        assert!(
+            msg.contains("throttling"),
+            "must name rate-limiting, got: {msg}"
+        );
+        assert!(
+            msg.contains("duckduckgo"),
+            "must list the blocked engines, got: {msg}"
+        );
+        assert!(
+            msg.contains("60s"),
+            "must tell the agent to wait, got: {msg}"
+        );
     }
 
     #[test]

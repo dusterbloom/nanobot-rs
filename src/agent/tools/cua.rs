@@ -413,7 +413,9 @@ fn compact_driver_output(tool: &str, raw: &str) -> String {
     }
     // The driver's _note teaches bounding args — keep one compressed hint.
     if obj.contains_key("elements") {
-        out.push_str("note: prefer elements; pass max_elements/max_depth to bound large AX trees\n");
+        out.push_str(
+            "note: prefer elements; pass max_elements/max_depth to bound large AX trees\n",
+        );
     }
 
     // Known payload arrays.
@@ -447,9 +449,13 @@ fn compact_driver_output(tool: &str, raw: &str) -> String {
     if let Some(windows) = obj.get("windows").and_then(Value::as_array) {
         out.push_str(&format!("windows ({}):\n", windows.len()));
         for w in windows.iter().take(40) {
-            let app = str_field(w, &["app_name", "name", "title"]).unwrap_or_else(|| "?".to_string());
+            let app =
+                str_field(w, &["app_name", "name", "title"]).unwrap_or_else(|| "?".to_string());
             let on_screen = w.get("is_on_screen").and_then(Value::as_bool);
-            let id = w.get("window_id").map(|v| v.to_string()).unwrap_or_default();
+            let id = w
+                .get("window_id")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             let space = w.get("space_id").map(|v| v.to_string()).unwrap_or_default();
             out.push_str(&format!(
                 "- {app} (id {id}, space {space}, {})\n",
@@ -627,7 +633,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-
     // -------------------------------------------------------------------
     // Driver-output compaction (ergonomics fix 1)
     // -------------------------------------------------------------------
@@ -651,14 +656,27 @@ mod tests {
             }));
         }
         let raw = serde_json::to_string_pretty(&serde_json::json!({"apps": apps})).unwrap();
-        assert!(raw.chars().count() > 10_000, "fixture must be the big shape");
+        assert!(
+            raw.chars().count() > 10_000,
+            "fixture must be the big shape"
+        );
 
         let out = compact_driver_output("list_apps", &raw);
         assert!(out.contains("[cua:list_apps compacted from"), "{out}");
         assert!(out.contains("apps (40):"), "{out}");
-        assert!(out.contains("- App 0 (com.example.app0, pid 600, active, 1 window(s))"), "{out}");
-        assert!(out.contains("- App 1 (com.example.app1, pid 601, running, 1 window(s))"), "{out}");
-        assert!(out.chars().count() < 3_000, "must stay inline-sized, got {}", out.chars().count());
+        assert!(
+            out.contains("- App 0 (com.example.app0, pid 600, active, 1 window(s))"),
+            "{out}"
+        );
+        assert!(
+            out.contains("- App 1 (com.example.app1, pid 601, running, 1 window(s))"),
+            "{out}"
+        );
+        assert!(
+            out.chars().count() < 3_000,
+            "must stay inline-sized, got {}",
+            out.chars().count()
+        );
         // No handle-bait: the raw JSON blob is gone.
         assert!(!out.contains("\"launch_path\""), "{out}");
     }
@@ -681,10 +699,16 @@ mod tests {
 
         let out = compact_driver_output("get_window_state", &raw);
         assert!(out.contains("degraded: true"), "{out}");
-        assert!(out.contains("degraded_reason: ax_window_unresolved"), "{out}");
+        assert!(
+            out.contains("degraded_reason: ax_window_unresolved"),
+            "{out}"
+        );
         assert!(out.contains("escalation: observation-only"), "{out}");
         assert!(out.contains("elements: none"), "{out}");
-        assert!(!out.contains("background_input"), "opaque blob dropped: {out}");
+        assert!(
+            !out.contains("background_input"),
+            "opaque blob dropped: {out}"
+        );
     }
 
     #[test]
@@ -705,8 +729,14 @@ mod tests {
         .unwrap();
 
         let out = compact_driver_output("snapshot", &raw);
-        assert!(out.contains("- AXButton \"button 0\" = \"value 0\" +1ch"), "{out}");
-        assert!(out.contains("more elements not shown (pass max_elements"), "{out}");
+        assert!(
+            out.contains("- AXButton \"button 0\" = \"value 0\" +1ch"),
+            "{out}"
+        );
+        assert!(
+            out.contains("more elements not shown (pass max_elements"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -730,7 +760,10 @@ mod tests {
             .collect();
         let raw = serde_json::to_string(&serde_json::json!({"elements": elements})).unwrap();
         let out = compact_driver_output("get_desktop_state", &raw);
-        assert!(out.chars().count() < COMPACT_MAX_CHARS + 200, "ceiling honored");
+        assert!(
+            out.chars().count() < COMPACT_MAX_CHARS + 200,
+            "ceiling honored"
+        );
         assert!(out.contains("truncated at"), "{out}");
     }
 

@@ -83,7 +83,8 @@ impl ToolGuard {
     fn invalidate_read_cache(&mut self) {
         self.results.retain(|key, _| !Self::is_read_tool_key(key));
         self.seen.retain(|key, _| !Self::is_read_tool_key(key));
-        self.cache_hits.retain(|key, _| !Self::is_read_tool_key(key));
+        self.cache_hits
+            .retain(|key, _| !Self::is_read_tool_key(key));
     }
 
     fn is_read_tool_key(key: &str) -> bool {

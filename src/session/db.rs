@@ -5126,9 +5126,7 @@ mod tests {
                     .find(|message| {
                         message.get("tool_call_id").and_then(Value::as_str) == Some(call_id)
                     })
-                    .unwrap_or_else(|| {
-                        panic!("receipt {call_id} must survive reload {reload}")
-                    });
+                    .unwrap_or_else(|| panic!("receipt {call_id} must survive reload {reload}"));
                 assert_eq!(
                     replayed["content"].as_str(),
                     Some(*receipt),
@@ -5195,7 +5193,8 @@ mod tests {
             "small inline result must replay byte-identical"
         );
         assert!(
-            content_of("call_large").starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER),
+            content_of("call_large")
+                .starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER),
             "large legacy raw body must still upgrade to a handle"
         );
     }

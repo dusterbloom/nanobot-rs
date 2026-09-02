@@ -2643,10 +2643,9 @@ mod tests {
         let bare: Config = serde_json::from_str("{}").unwrap();
         assert!(bare.cluster.idle_models.is_empty(), "default off");
 
-        let parsed: Config = serde_json::from_str(
-            r#"{"cluster": {"enabled": true, "idleModels": ["qwen3-4b"]}}"#,
-        )
-        .unwrap();
+        let parsed: Config =
+            serde_json::from_str(r#"{"cluster": {"enabled": true, "idleModels": ["qwen3-4b"]}}"#)
+                .unwrap();
         assert_eq!(parsed.cluster.idle_models, vec!["qwen3-4b".to_string()]);
         assert!(parsed.cluster.enabled);
     }
@@ -2779,7 +2778,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.providers.anthropic.api_key = "sk-ant-key".to_string();
         cfg.providers.anthropic.api_base = Some("http://higgs.local/v1".to_string());
-        assert_eq!(cfg.get_api_base(), Some("http://higgs.local/v1".to_string()));
+        assert_eq!(
+            cfg.get_api_base(),
+            Some("http://higgs.local/v1".to_string())
+        );
 
         let mut cfg = Config::default();
         cfg.providers.openai.api_key = "sk-key".to_string();

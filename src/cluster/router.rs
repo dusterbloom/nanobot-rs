@@ -251,7 +251,10 @@ mod tests {
             ..Default::default()
         };
         let router = ClusterRouter::new(state.clone(), cfg);
-        let decision = router.route_idle().await.expect("peer serves allowlisted model");
+        let decision = router
+            .route_idle()
+            .await
+            .expect("peer serves allowlisted model");
         match decision {
             RoutingDecision::Cluster { endpoint, model } => {
                 assert_eq!(endpoint, "http://10.0.0.5:1234");

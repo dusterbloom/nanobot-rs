@@ -478,7 +478,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 1, 10).await;
         let provider = Arc::new(MockProvider::new("memory"));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 100_000, sessions, 10_000);
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            100_000,
+            sessions,
+            10_000,
+        );
         assert!(!reflector.should_reflect().await);
     }
 
@@ -512,7 +519,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 3, 100).await;
         let provider = Arc::new(MockProvider::new("Updated facts."));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone(), 10_000);
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
 
         reflector.reflect().await.unwrap();
 
@@ -544,7 +558,14 @@ mod tests {
             sessions.clone(),
             10_000,
         );
-        let second = Reflector::new(provider.clone(), "test".into(), &workspace, 0, sessions, 10_000);
+        let second = Reflector::new(
+            provider.clone(),
+            "test".into(),
+            &workspace,
+            0,
+            sessions,
+            10_000,
+        );
 
         let (first_result, second_result) = tokio::join!(first.reflect(), second.reflect());
         first_result.unwrap();
@@ -563,7 +584,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 2, 100).await;
         let provider = Arc::new(FailingProvider);
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone(), 10_000);
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
 
         let result = reflector.reflect().await;
         assert!(result.is_err());

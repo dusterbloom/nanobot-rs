@@ -244,7 +244,8 @@ mod tests {
     fn run_simulated_turn(freeze: bool) -> Vec<PromptDelta> {
         let cfg = drift_config();
         let keep_last = 50; // large, so hygiene truncation never fires in-test
-        let mut messages = MessageLog::committed(vec![system("you are nano"), user("what is new about ANE?")]);
+        let mut messages =
+            MessageLog::committed(vec![system("you are nano"), user("what is new about ANE?")]);
         let mut prev = None;
         let mut watermark = 0usize;
         let mut deltas = Vec::new();

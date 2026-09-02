@@ -65,9 +65,7 @@ impl KernelStdinShield {
     fn new() -> Self {
         // Poisoning only happens if a holder panicked mid-update; treat that
         // as "leave the shield on" rather than abort the kernel.
-        let mut state = SHIELD_COUNT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = SHIELD_COUNT.lock().unwrap_or_else(|e| e.into_inner());
         let (count, saved_tty) = &mut *state;
         if *count == 0 {
             #[allow(unsafe_code)]
@@ -90,9 +88,7 @@ impl KernelStdinShield {
 
 impl Drop for KernelStdinShield {
     fn drop(&mut self) {
-        let mut state = SHIELD_COUNT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = SHIELD_COUNT.lock().unwrap_or_else(|e| e.into_inner());
         let (count, saved_tty) = &mut *state;
         *count = count.saturating_sub(1);
         if *count == 0 {
@@ -613,10 +609,8 @@ mod tests {
     /// process-global and other parallel kernel tests clobber it.
     #[test]
     fn stdin_reads_return_eof_instead_of_blocking() {
-        let verdict = std::env::temp_dir().join(format!(
-            "nanobot-kernel-stdin-{}.txt",
-            std::process::id()
-        ));
+        let verdict =
+            std::env::temp_dir().join(format!("nanobot-kernel-stdin-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&verdict);
         let path = verdict.to_string_lossy().to_string();
         let code = format!(
@@ -659,14 +653,12 @@ mod tests {
             let mut kernel = PythonKernel::new(1);
             let run = |code: String| {
                 let mut params = HashMap::new();
-            params.insert("code".to_string(), json!(code.as_str()));
+                params.insert("code".to_string(), json!(code.as_str()));
                 let ctx = crate::agent::tools::base::ToolContext::sandbox();
                 let out = kernel.execute(params, &ctx);
                 crate::agent::tools::base::render_result(rt.block_on(out))
             };
-            let wedged = run(
-                "import os\nprint('sentinel')\nos.read(os.pipe()[0], 1)".to_string(),
-            );
+            let wedged = run("import os\nprint('sentinel')\nos.read(os.pipe()[0], 1)".to_string());
             let recovered = run("print('recovered')".to_string());
             // Leaking the runtime keeps its shutdown from joining the wedged
             // blocking thread.
@@ -677,8 +669,14 @@ mod tests {
 
         assert!(wedged.contains("did not respond"), "got: {wedged}");
         assert!(wedged.contains("replaced"), "got: {wedged}");
-        assert!(recovered.contains("recovered"), "kernel stayed wedged: {recovered}");
-        assert!(super::wedged_thread_count() >= 1, "wedge counter must record the leak");
+        assert!(
+            recovered.contains("recovered"),
+            "kernel stayed wedged: {recovered}"
+        );
+        assert!(
+            super::wedged_thread_count() >= 1,
+            "wedge counter must record the leak"
+        );
     }
 
     /// An exception must not leave sys.stdout redirected or `__capture_result`

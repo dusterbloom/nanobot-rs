@@ -467,7 +467,10 @@ mod tests {
 
     #[test]
     fn parse_overflow_counts_unrecognized_returns_none() {
-        assert_eq!(parse_overflow_counts("maximum context length exceeded"), None);
+        assert_eq!(
+            parse_overflow_counts("maximum context length exceeded"),
+            None
+        );
         assert_eq!(parse_overflow_counts("network timeout"), None);
     }
 

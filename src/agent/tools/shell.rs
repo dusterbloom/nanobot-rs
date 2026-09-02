@@ -784,11 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipefail_runner_falls_back_from_dash_when_available() {
-        let dash_available = Command::new("dash")
-            .arg("-c")
-            .arg("true")
-            .status()
-            .await;
+        let dash_available = Command::new("dash").arg("-c").arg("true").status().await;
         let Ok(status) = dash_available else {
             return;
         };
@@ -843,8 +839,7 @@ mod tests {
         assert_eq!(output.status.code(), Some(126));
         assert!(!sentinel.exists(), "user command must not run");
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("no pipefail-capable shell found"),
+            String::from_utf8_lossy(&output.stderr).contains("no pipefail-capable shell found"),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );

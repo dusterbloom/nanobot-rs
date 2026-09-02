@@ -225,14 +225,7 @@ impl ReplContext {
                 let main_ctx = Some(self.config.agents.defaults.local_max_context_tokens);
                 print!("  Loading {}... ", main_model);
                 io::stdout().flush().ok();
-                match crate::lms::load_model(
-                    "",
-                    lms_port,
-                    &main_model,
-                    main_ctx,
-                )
-                .await
-                {
+                match crate::lms::load_model("", lms_port, &main_model, main_ctx).await {
                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
@@ -350,13 +343,8 @@ impl ReplContext {
                     new_ctx / 1024
                 );
                 io::stdout().flush().ok();
-                match crate::lms::reload_model_with_context(
-                    "",
-                    lms_port,
-                    &model_name,
-                    new_ctx,
-                )
-                .await
+                match crate::lms::reload_model_with_context("", lms_port, &model_name, new_ctx)
+                    .await
                 {
                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
@@ -455,14 +443,9 @@ impl ReplContext {
                 }
 
                 let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
-                crate::lms::load_model(
-                    "",
-                    port,
-                    &selected_id,
-                    ctx,
-                )
-                .await
-                .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
+                crate::lms::load_model("", port, &selected_id, ctx)
+                    .await
+                    .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
                 report.note(format!("loaded {selected_id}"));
 
                 self.config.agents.defaults.local_model = selected_id.clone();
@@ -520,14 +503,9 @@ impl ReplContext {
                     }
 
                     let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
-                    crate::lms::load_model(
-                        &remote_host,
-                        port,
-                        &selected_id,
-                        ctx,
-                    )
-                    .await
-                    .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
+                    crate::lms::load_model(&remote_host, port, &selected_id, ctx)
+                        .await
+                        .map_err(|e| format!("failed to load {selected_id}: {e}"))?;
                     report.note(format!("loaded {selected_id}"));
                 }
 
@@ -1164,14 +1142,7 @@ impl ReplContext {
             };
             print!("  Loading {}... ", model);
             io::stdout().flush().ok();
-            match crate::lms::load_model(
-                "",
-                lms_port,
-                model,
-                ctx,
-            )
-            .await
-            {
+            match crate::lms::load_model("", lms_port, model, ctx).await {
                 Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                 Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
             }
@@ -1429,13 +1400,8 @@ impl ReplContext {
                                     Some(self.config.agents.defaults.local_max_context_tokens);
                                 print!("  Loading {}... ", main_model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model(
-                                    "",
-                                    lms_port,
-                                    &main_model,
-                                    main_ctx,
-                                )
-                                .await
+                                match crate::lms::load_model("", lms_port, &main_model, main_ctx)
+                                    .await
                                 {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => {

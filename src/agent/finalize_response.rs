@@ -151,9 +151,10 @@ impl AgentLoopShared {
                 // Inject warning for the next turn. Cache-replay tagged;
                 // user role for the same reason as the fabrication warning
                 // above.
-                ctx.messages.push_draft(crate::agent::markers::scaffold_user(
-                    detection.system_warning,
-                ));
+                ctx.messages
+                    .push_draft(crate::agent::markers::scaffold_user(
+                        detection.system_warning,
+                    ));
             }
         }
 
