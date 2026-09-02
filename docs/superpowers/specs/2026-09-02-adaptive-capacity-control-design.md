@@ -1,7 +1,7 @@
 # Adaptive Model Capacity and Thrash Prevention
 
 Date: 2026-09-02
-Status: Approved design; awaiting written-spec review
+Status: Approved design; implementation planned
 Scope: Higgs local inference capacity, Nanobot context admission, and automatic compaction
 
 ## Problem
@@ -145,10 +145,15 @@ capacity cached from an older process whose retained state no longer exists.
 `basis` is `conservative` until enough real observations exist for the exact
 fingerprint, then `learned` after the first prompt-size band satisfies the
 three-clean-observation rule below. The capacity endpoint requires the same
-authentication policy as chat completion and returns 404 for an unknown or
-unloaded model. `schemaVersion` is `1`; `availability` is `available` or
-`unavailable`; `pressure` is `normal`, `constrained`, or `critical`; and `basis`
-is `conservative` or `learned`. `retainedSessionTokens` is the effective
+authentication policy as chat completion. A loaded model returns an available
+profile. A model known to the server but not currently loaded returns HTTP 200
+with `availability: "unavailable"` and zero token fields. An unknown model name
+returns a typed 404 `higgs_capacity_model_not_found`; Nanobot must not interpret
+that error as an old server. Only a generic route-not-found response for
+`/v1/capacity`, after ordinary Higgs model discovery succeeded, selects the
+legacy compatibility envelope. `schemaVersion` is `1`; `availability` is
+`available` or `unavailable`; `pressure` is `normal`, `constrained`, or
+`critical`; and `basis` is `conservative` or `learned`. `retainedSessionTokens` is the effective
 per-session cap, while `retainedBytes` and `prefixCacheBytes` are process-wide
 effective byte caps.
 
@@ -510,8 +515,10 @@ and Higgs returns HTTP 503 with this body before model allocation:
 }
 ```
 
-Nanobot does not compact repeatedly. It keeps the turn durable and polls after
-5 seconds, backing off to at most 30 seconds. Once the same endpoint reports an
+Nanobot does not compact repeatedly. In schema version 1 Higgs returns
+`retryAfterMs: 5000`. Nanobot honors that initial delay, clamps any future
+compatible value to the 5-to-30-second range, and exponentially backs off to at
+most 30 seconds. Once the same endpoint reports an
 available profile that fits the minimum request, Nanobot resumes the pending
 turn automatically unless the user cancelled it.
 
