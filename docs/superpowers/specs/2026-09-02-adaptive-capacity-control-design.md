@@ -117,8 +117,12 @@ The response is an extension API, not part of standard OpenAI compatibility:
 
 ```json
 {
+  "schemaVersion": 1,
   "model": "escha-35b-a3b",
+  "modelFingerprint": "sha256:7b2f5c8ae91a5b1d83f1364c2023e5e53b5530d0461a4193cf9bd37f4e70d821",
+  "bootId": "01993654-8af2-7b31-a420-c52ebc349287",
   "generation": 7,
+  "availability": "available",
   "pressure": "normal",
   "safeTotalTokens": 53248,
   "recommendedOutputTokens": 4096,
@@ -134,19 +138,26 @@ The response is an extension API, not part of standard OpenAI compatibility:
 recommended split for ordinary chat turns. Higgs still validates the actual
 requested output reserve for every request. `generation` increases whenever a
 field that affects admission changes, allowing Nanobot to ignore identical
-polls cheaply.
+polls cheaply. Higgs creates a random `bootId` for every process. A generation
+is comparable only within one boot ID, so a restart cannot make Nanobot reuse a
+capacity cached from an older process whose retained state no longer exists.
 
 `basis` is `conservative` until enough real observations exist for the exact
 fingerprint, then `learned` after the first prompt-size band satisfies the
 three-clean-observation rule below. The capacity endpoint requires the same
 authentication policy as chat completion and returns 404 for an unknown or
-unloaded model.
+unloaded model. `schemaVersion` is `1`; `availability` is `available` or
+`unavailable`; `pressure` is `normal`, `constrained`, or `critical`; and `basis`
+is `conservative` or `learned`. `retainedSessionTokens` is the effective
+per-session cap, while `retainedBytes` and `prefixCacheBytes` are process-wide
+effective byte caps.
 
 ### Fingerprint and persistence
 
 The learned profile key includes:
 
 - hardware identifier and physical memory;
+- operating-system version and build;
 - Metal recommended working-set size;
 - Higgs build identity and profile schema version;
 - model content identity, not only its display name;
@@ -154,11 +165,13 @@ The learned profile key includes:
 - KV representation and relevant cache settings;
 - draft/prefill model identities when present.
 
-Profiles are written atomically beneath Higgs's state directory. A missing,
-corrupt, incomplete, or mismatched profile restores the conservative cold-start
-envelope. A clean process restart may reuse a matching profile only after
-checking that current startup headroom is at least as large as the persisted
-observation baseline.
+Profiles are written atomically beneath Higgs's state directory. They persist
+model cost observations, not a promise of currently available capacity. Higgs
+recomputes the live envelope from current pressure and working-set headroom on
+every start. A missing, corrupt, incomplete, or mismatched profile restores the
+conservative cold-start cost model. A clean process restart may reuse a matching
+profile only after checking that current startup headroom is at least as large
+as the persisted observation baseline.
 
 ## Capacity Controller
 
@@ -186,14 +199,92 @@ level below which GPU runtime performance should remain unaffected:
 <https://developer.apple.com/documentation/metal/mtldevice/recommendedmaxworkingsetsize>.
 It is the hardware ceiling input, not total physical RAM.
 
-The cold envelope must reserve enough space for the requested completion and a
-conservative transient-prefill estimate. If exact KV geometry is unavailable,
-Higgs uses an intentionally high bytes-per-token estimate until real
-measurements replace it.
+The cold envelope reserves space for the requested completion and a conservative
+transient-prefill estimate. If exact KV geometry is unavailable, the loader uses
+the representation's documented upper bound; if that is also unavailable, it
+publishes only the minimum working request until real measurements replace it.
+
+Before loading weights, Higgs compares an artifact-specific resident estimate
+plus a loader-path workspace bound with the safe process envelope. Each known
+loader reports its largest simultaneous shard/conversion allocation; an unknown
+loader uses twice the artifact weight bytes as its workspace bound. A model that
+is definitely too large fails before allocation. Loading proceeds at bounded shard
+boundaries with pressure checks; warning stops optional prefetch and critical
+pressure aborts the load. After load, Higgs replaces the estimate with measured
+MLX residency. If measured residency plus Nanobot's immutable system/tool prefix
+and a 1024-token completion reserve cannot fit, loading fails with typed
+`insufficient_capacity` and releases the model. Higgs never publishes a positive
+`safeTotalTokens` below that minimum working request.
+
+### Worked EschaMoE cold-start tiers
+
+The selected Qwen3.6 35B-A3B Escha artifact contains 12,296,952,480 bytes of
+safetensors and Higgs documents roughly 11 GiB native residency. It is a hybrid
+model: ten of forty layers use full attention, with two KV heads of width 256.
+Its dense full-attention fp16 KV term is therefore:
+
+```text
+10 layers * 2 (K,V) * 2 KV heads * 256 width * 2 bytes
+= 20,480 bytes/token
+```
+
+Linear-attention recurrent state is charged as a fixed per-session term by the
+engine cost model rather than hidden inside this token slope. At 49,152 tokens,
+the dense KV term is 960 MiB.
+
+For an illustrative 32 GiB tier whose Metal API reports a 24 GiB recommended
+working set, the starting process envelope is `24 * 0.8 = 19.2 GiB`. After an
+11 GiB loaded-model baseline and a conservative 4 GiB prefill transient bound,
+4.2 GiB remains for live/output KV, recurrent state, retained sessions, and
+prefix cache. The controller can admit a 49,152-token dense KV term only if its
+measured fixed state and automatically reduced cache budgets fit the remaining
+approximately 3.26 GiB; otherwise it publishes a smaller token envelope.
+
+For an illustrative 64 GiB tier whose Metal API reports 48 GiB, the process
+envelope is `48 * 0.8 = 38.4 GiB`, leaving 23.4 GiB after the same model and
+transient terms. These are examples of the calculation, not hardcoded hardware
+tables. Release Gate 1 records the actual Metal limit, measured residency,
+fixed-state cost, transient bound, cache allocation, and resulting token limit
+for each tested Mac tier.
+
+### One byte-domain cost model
+
+Admission comparisons use bytes only. Every Higgs engine path supplies one
+memory cost model from its real cache and execution geometry:
+
+- loaded model/sidecar baseline bytes;
+- fixed bytes per live session, including recurrent state;
+- persistent bytes per prompt and output token for the selected KV
+  representation;
+- retained/radix duplication or sharing from existing cache `estimated_bytes`
+  accounting;
+- decode/sampling workspace;
+- worst-case transient bytes for `(full_prompt_tokens, prefill_chunk_tokens)`.
+
+For conventional attention, the initial persistent slope is the sum across
+cache-bearing layers of K and V elements multiplied by actual storage width.
+Hybrid, MLA, TurboQuant, and paired-drafter paths report their own fixed and
+token-linear components rather than being forced through a dense-transformer
+formula. Runtime high-water observations raise any underestimated coefficient
+immediately; lowering a coefficient requires the normal clean-evidence window.
+
+The controller selects a bounded prefill chunk whose predicted transient peak
+fits the remaining byte envelope. The initial transient function comes from
+model/engine geometry and is replaced conservatively by the maximum observed
+high-water value in each prompt/chunk band. If an engine path cannot provide a
+safe initial bound, it exposes only the minimum working request until real
+allocation-bearing requests establish one.
+
+Published token fields are derived from this byte solver by finding the largest
+1024-token-aligned value that satisfies the byte inequality after output and
+fixed-state reserves. Request admission calls the same solver; there is no
+separate token heuristic. All byte arithmetic is checked `u64` arithmetic and
+overflow produces `capacity_unavailable`.
 
 ### Learning from real turns
 
-Every successful real request contributes a content-free observation:
+Every successful real request contributes a content-free observation tagged by
+its `cold`, `retained_suffix`, or `radix_hit` execution path:
 
 - prompt, suffix, and requested-output token counts;
 - peak MLX allocation during prefill and generation;
@@ -202,12 +293,26 @@ Every successful real request contributes a content-free observation:
 - pressure state plus compressor and swap deltas over the request.
 
 The controller maintains a conservative upper envelope rather than trusting an
-average. It may raise capacity only after three clean cold-prefill observations
-in the relevant power-of-two prompt-size band and five continuous minutes with
-normal pressure and no new swap-outs. One increase is the smaller of 4096 tokens
-or 12.5% of the current total-token envelope, rounded down to 1024 tokens. It
-never raises beyond the next unobserved size band, and it does not learn upward
-from a cache hit that avoided the allocation being estimated.
+average. Cold observations are banded by full logical prompt size and train
+transient-prefill cost. Retained/radix hits are also banded by full prompt size;
+they train actual persistent/retained residency and suffix cost but cannot lower
+the cold-prefill coefficient. This prevents a cheap suffix turn from teaching
+Higgs that a later cache-reset bootstrap will also be cheap.
+
+Capacity may rise only after three clean allocation-bearing observations in the
+current power-of-two prompt-size band, spanning five continuous minutes with
+normal pressure and no new swap-outs. Idle time before the first or after the
+last observation does not count. One increase is the smaller of 4096 tokens or
+12.5% of the current total-token envelope, rounded down to 1024 tokens. Clean
+cold observations at the current boundary may open one step into the next band
+using the conservative static slope; no observation permits a jump over an
+entire unobserved band.
+
+A single prefix-heavy session cannot raise its cold-bootstrap limit from cache
+hits. The learning-liveness replay therefore uses genuine agent sessions with
+repeated warm tool turns and at least three naturally cold session starts in the
+boundary band. It must demonstrate upward movement without synthetic prompts
+while preserving the colder transient-prefill coefficient.
 
 Slow prefill alone is not classified as thrashing. A reduction requires memory
 evidence such as system pressure, swap growth, compressor growth, working-set
@@ -225,31 +330,51 @@ memory-pressure events. Apple provides these through
 `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`:
 <https://developer.apple.com/documentation/dispatch/dispatch_source_type_memorypressure>.
 It also samples VM compressor and swap counters as deltas; a historical nonzero
-swap total is not itself a failure.
+swap total is not itself a failure. System-wide pressure from another process
+reduces the current live envelope and freezes upward learning, but does not
+persistently rewrite learned model-cost coefficients.
 
 The controller has three observable states:
 
 - `normal`: admit within the envelope and cautiously collect upward evidence.
 - `constrained`: stop upward learning, evict unleased optional radix/prefix
-  entries, lower the next-turn envelope, and request Nanobot compaction.
+  entries, increase the protected reserve from 20% to 30%, and recompute the
+  next-turn envelope.
 - `critical`: clear optional caches, reject new expensive admission, and retain
   only the minimum state needed for durable recovery.
 
 Downshifts are immediate. Recovery uses the five-minute/three-observation rule
 above, preventing limits from oscillating as memory pressure moves around a
-threshold.
+threshold. After eviction and byte-ledger recomputation, warning commits the
+smaller of the recomputed total or 75% of the previous token envelope. Critical
+commits the smaller of the recomputed total or 50% of the previous envelope,
+then returns `capacity_unavailable` while critical pressure remains. Values are
+rounded down to 1024 tokens. Any new swap-out is critical for new admission
+until pressure is normal and swap-out counters remain unchanged for one minute.
+An unexpected allocator peak raises the matching cost coefficient to the
+observed high-water value plus 10% and recomputes capacity immediately.
 
 ### Admission and reservations
 
-Higgs evaluates:
+Higgs applies the same admission path to local `/v1/chat/completions`,
+`/v1/completions`, and `/v1/messages` requests. It converts request requirements
+to bytes and evaluates:
 
 ```text
-prompt
-+ requested output reserve
-+ predicted retained-session growth
-+ predicted transient prefill peak
-<= current safe working envelope
+committed bytes
++ request reservation bytes
+<= usable process envelope bytes
 ```
+
+`usable` is the smaller nonzero MLX/Metal working limit minus the protected OS
+reserve. `committed` is non-evictable loaded-model residency, retained/leased KV,
+radix residency after permitted eviction, all active reservation bytes, and the
+positive difference between measured MLX active memory and all accounted
+residency. A request reservation is the larger of the static
+cost model and the learned high-water estimate for its execution path. It
+includes KV for prompt plus requested output, uncached-suffix prefill workspace,
+decode/sampling workspace, and only actual post-turn retained duplication not
+already charged in the KV term.
 
 Admission reserves the predicted peak before model execution. Cache eviction is
 attempted before rejection, but active leased session state is not silently
@@ -258,12 +383,24 @@ between allocations. If an unrelated process creates critical pressure after
 admission, Higgs reclaims optional state and terminates at the next safe
 boundary instead of continuing unchecked allocation.
 
-Reservations are global to the loaded model, not per HTTP connection. Concurrent
-Nanobot agents therefore cannot each admit against the same free bytes. Higgs
-atomically subtracts an in-flight reservation before execution and releases it
-on success, error, or cancellation. A request that is individually safe but
-temporarily blocked by another reservation waits in the existing cancellable
-request lifecycle; it is not compacted merely because the model is busy.
+Reservations are process-wide, not per model or HTTP connection, because Higgs
+may keep multiple engines resident while MLX and Metal memory are global.
+Concurrent Nanobot agents therefore cannot each admit against the same bytes.
+"Individually safe" means the request fits after persistent process/model/cache
+bytes but before other in-flight reservations. If it is individually safe yet
+does not fit after outstanding reservations, it waits in a FIFO cancellable
+admission queue instead of receiving a compaction error. A waiter rechecks
+pressure, boot ID, generation, persistent bytes, and its prediction at dequeue.
+
+An in-process RAII guard owned by the actual inference worker holds every byte
+reservation and releases it only when that worker returns on success, engine
+error, unwind, or acknowledged cancellation. There is no TTL that can free
+bytes while a kernel still uses them. Client disconnect, server timeout, or a
+no-progress watchdog using the configured request timeout signals cancellation;
+simple and batch engines check it
+before each bounded prefill chunk and decode step. The worker drops its guard
+only after allocation has stopped. Model unload/switch waits for guards to drain
+or cancels and joins their workers before releasing weights.
 
 The existing retained-session token, retained-byte, prefix-cache-byte, session
 count, and suffix-prefill limits become effective outputs of this same
@@ -280,8 +417,11 @@ Nanobot reads capacity:
   compaction requests;
 - after any typed capacity rejection.
 
-The endpoint is local and content-free. Nanobot reuses the installed budget when
-the returned generation is unchanged.
+The endpoint is local and content-free. Nanobot keys its cache by endpoint,
+schema version, boot ID, and model fingerprint, then reuses the installed budget
+only when that tuple and generation are unchanged. A boot-ID change invalidates
+the old capacity snapshot and rotates Nanobot's retained-session epoch because
+the restarted Higgs process cannot own the previous retained KV.
 
 The effective local token budget is the minimum of the Higgs profile and user
 ceilings. Nanobot reserves the planned completion and protocol overhead before
@@ -303,6 +443,7 @@ An over-budget request returns HTTP 413 with an OpenAI-shaped typed body:
     "code": "compact_and_retry",
     "safePromptTokens": 36864,
     "safeTotalTokens": 40960,
+    "bootId": "01993654-8af2-7b31-a420-c52ebc349287",
     "generation": 8
   }
 }
@@ -319,7 +460,22 @@ Nanobot handles only this exact error as automatic capacity recovery:
 
 The retry receives a stable logical-turn identifier so persistence and tool
 execution cannot duplicate side effects. A second capacity rejection does not
-loop. Nanobot leaves the turn pending and reports the current safe budget.
+loop. Nanobot leaves the turn pending and reports the current safe budget. The
+typed provider error retains `safePromptTokens`, `safeTotalTokens`, `bootId`,
+and `generation`; recovery never parses numbers from an error message.
+
+The 413 values are computed after permitted eviction. For the same boot ID and
+generation, a rewritten request at or below both published token limits is
+individually admissible by construction. If another request temporarily owns
+the remaining bytes, it queues rather than receiving another 413. Only a newer
+capacity generation or worsened pressure may invalidate the figures; that case
+may produce the one terminal second rejection described above.
+
+Capacity recovery retries only the current provider request and is allowed only
+before response processing reaches tool execution. It never restarts the outer
+user-turn loop. No `ToolPreExecute` or `ToolExecute` journal entry may precede a
+capacity 413; completed tool calls from earlier iterations remain committed and
+are not replayed.
 
 ### Capacity-safe compaction
 
@@ -338,14 +494,41 @@ summary marker with durable source IDs so later recall/expansion can recover the
 original material.
 
 The minimum working request is Nanobot's immutable system/tool prefix plus a
-1024-token completion reserve. If even that request cannot fit, Higgs returns a
-distinct `capacity_unavailable` error. Nanobot does not compact repeatedly. It
-keeps the turn durable until pressure recovers or the user cancels it.
+1024-token completion reserve. If even that request cannot fit, the capacity
+endpoint reports `availability: "unavailable"` with zero prompt/output fields
+and Higgs returns HTTP 503 with this body before model allocation:
+
+```json
+{
+  "error": {
+    "type": "higgs_capacity_unavailable",
+    "code": "capacity_unavailable",
+    "bootId": "01993654-8af2-7b31-a420-c52ebc349287",
+    "generation": 9,
+    "retryAfterMs": 5000
+  }
+}
+```
+
+Nanobot does not compact repeatedly. It keeps the turn durable and polls after
+5 seconds, backing off to at most 30 seconds. Once the same endpoint reports an
+available profile that fits the minimum request, Nanobot resumes the pending
+turn automatically unless the user cancelled it.
 
 If critical pressure occurs after streaming begins, Higgs emits a typed terminal
-stream error with the generated-token count. Nanobot stores partial output as
-incomplete rather than presenting it as a final answer. Recovery resumes from
-durable turn state; partial prose is not silently promoted to success.
+SSE event followed by the normal `[DONE]` terminator:
+
+```text
+data: {"error":{"type":"higgs_capacity_interrupted","code":"capacity_interrupted","bootId":"01993654-8af2-7b31-a420-c52ebc349287","generation":10,"partialOutputTokens":317}}
+
+data: [DONE]
+```
+
+Nanobot records the partial bytes in its model-failure journal as an incomplete
+artifact, retracts any transient TUI rendering, and does not commit them as a
+successful assistant message. After pressure recovery it regenerates from the
+last committed conversation state. Version 1 does not claim exact continuation
+from an arbitrary generated-token boundary.
 
 ### Compatibility
 
@@ -394,8 +577,9 @@ capacity 49K -> 36K · memory pressure warning · compacting and retrying
 
 Metrics expose controller state, capacity generation, current effective limits,
 downshift count, capacity rejection count, automatic compaction count, retry
-outcomes, peak MLX allocation, and swap/compressor deltas. They contain no
-prompt content.
+outcomes, peak MLX allocation, swap/compressor deltas, outstanding reservation
+count/bytes/oldest age, queued waiters, and cancellation/watchdog outcomes. They
+contain no prompt content.
 
 ## Expected Code Boundaries
 
@@ -423,11 +607,17 @@ Implementation is test-first and covers four layers.
 - Missing configuration yields a conservative automatic envelope.
 - Numeric configuration can lower but never raise the safe result.
 - Prompt plus output and transient reserves are accounted together.
+- The token fields published by `/v1/capacity` resolve through the same byte
+  ledger used by request admission.
 - Pressure and swap deltas downshift immediately.
+- Warning and critical downshift formulas round and floor exactly as specified.
 - Recovery requires hysteresis and raises only one bounded step.
-- Cache hits cannot train an unsafe cold-prefill estimate.
+- Cache hits may train observed retained residency but cannot lower an unsafe
+  cold-prefill estimate.
 - Overflow, missing metadata, and corrupt learned profiles fail conservative.
 - Fingerprint changes invalidate persisted observations.
+- A repeated generation under a new boot ID invalidates the Nanobot snapshot.
+- The 32/64 GiB Escha examples reproduce from injected measurement inputs.
 
 ### Higgs integration tests
 
@@ -440,6 +630,13 @@ working-set budget. Tests do not force the development Mac into real swapping.
 - Admission reservations include requested output.
 - Concurrent requests cannot reserve the same working-set bytes, and cancelled
   requests release their reservations.
+- Individually safe contention waits without returning 413, then revalidates at
+  dequeue.
+- Client disconnect while queued, mid-prefill, and mid-decode releases the RAII
+  reservation only after the worker stops allocating.
+- Engine error, unwind, and stall-watchdog cancellation cannot leak or expire a
+  live reservation.
+- Model switch waits for or joins reservation-owning workers.
 - Mid-prefill critical pressure stops at a bounded safe checkpoint.
 - `/v1/capacity`, metrics, and typed errors report the same effective values.
 
@@ -454,7 +651,10 @@ working-set budget. Tests do not force the development Mac into real swapping.
   one durable user turn and one final assistant result.
 - Tool calls completed before recovery are not executed twice.
 - A second rejection converges without an infinite retry loop.
+- A same-generation 413 retry at the published limits is admitted; concurrent
+  busyness queues instead of causing another compaction.
 - `capacity_unavailable` leaves the work durable and visibly pending.
+- Capacity recovery never reruns the outer user turn or a committed tool call.
 - A terminal streaming capacity error stores partial output as incomplete.
 - An old Higgs endpoint selects the conservative compatibility budget.
 
@@ -463,6 +663,11 @@ working-set budget. Tests do not force the development Mac into real swapping.
 Run progressively larger genuine agent sessions against EschaMoE on the target
 Mac. Synthetic prompts may support diagnostics but cannot be the only shipping
 evidence.
+
+The learning-liveness replay interleaves prefix-cache-heavy tool turns with
+three genuine cold session starts in the boundary band and proves a bounded
+upward step. A cache-only variant proves cold-prefill cost never becomes more
+optimistic without cold evidence.
 
 Measure request-scoped deltas for MLX allocation, VM compression, swap-ins,
 swap-outs, TTFT, prefill rate, and decode rate. Existing historical swap usage is
@@ -480,12 +685,14 @@ pressure.
 7. Explicit context/cache settings act as ceilings.
 8. A matching learned profile survives restart; any fingerprint change
    invalidates it.
-9. Logs and TUI explain every reduction, eviction, compaction, wait, and retry.
-10. Ordinary warm turns show no material regression in the matched turn
+9. Reusing a generation number under a new boot ID cannot reuse old capacity or
+   retained-session state.
+10. Logs and TUI explain every reduction, eviction, compaction, wait, and retry.
+11. Ordinary warm turns show no material regression in the matched turn
     benchmark.
-11. Higgs release checks and `higgs doctor` validate all changed configuration
+12. Higgs release checks and `higgs doctor` validate all changed configuration
     semantics.
-12. Nanobot passes release build, regression tests, matched turn benchmark, and
+13. Nanobot passes release build, regression tests, matched turn benchmark, and
     end-to-end replay against the synchronized Higgs build.
 
 Higgs and Nanobot ship this contract in synchronized releases. Temporary
