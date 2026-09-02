@@ -619,17 +619,6 @@ pub(crate) fn append_tool_call_carrier(
     });
 }
 
-pub(crate) async fn journal_tool_call_carrier(
-    ctx: &mut TurnContext,
-    routed_tool_calls: &[ToolCallRequest],
-    response: &LLMResponse,
-) -> anyhow::Result<()> {
-    // Normal routing persists the carrier immediately. Terminal rejection uses
-    // the append helper so its carrier and immutable receipts commit together.
-    append_tool_call_carrier(ctx, routed_tool_calls, response);
-    ctx.persist_pending_protocol_messages().await
-}
-
 /// Route configured delegation through the same durable execution chokepoint.
 ///
 /// Delegation used to run an independent tool loop that could execute an entire

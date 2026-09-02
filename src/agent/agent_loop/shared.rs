@@ -1082,7 +1082,7 @@ impl TurnContext {
         // group (carrier + receipts) or none of it. A per-message loop that
         // breaks mid-group silently truncates protocol history (see main
         // a05fc81).
-        let row_ids = match persistence {
+        let persisted = match persistence {
             ProtocolGroupPersistence::MessagesOnly => {
                 self.core
                     .sessions
@@ -1095,16 +1095,30 @@ impl TurnContext {
                     .add_rejected_tool_messages_checked(&self.session_id, &pending_messages)
                     .await
             }
-        }
-        .map_err(|error| {
-            warn!(
-                session = %self.session_key,
-                pending = pending_messages.len(),
-                %error,
-                "active_turn_protocol_group_persist_failed"
-            );
-            error
-        })?;
+        };
+        let row_ids = match persisted {
+            Ok(row_ids) => row_ids,
+            Err(error) => {
+                warn!(
+                    session = %self.session_key,
+                    pending = pending_messages.len(),
+                    %error,
+                    "active_turn_protocol_group_persist_failed"
+                );
+                // The DB transaction rolled the entire group back. Discard
+                // the same pending messages in memory so finalization cannot
+                // later retry them through a messages-only path and leak a
+                // carrier or receipt without its immutable raw row.
+                for index in pending_indices.iter().rev().copied() {
+                    self.messages.messages.remove(index);
+                    if index < self.messages.committed_len {
+                        self.messages.committed_len -= 1;
+                    }
+                }
+                self.new_start = self.messages.len();
+                return Err(error);
+            }
+        };
         for (index, row_id) in pending_indices.into_iter().zip(row_ids) {
             self.messages.set_meta(index, "_db_id", json!(row_id));
         }
@@ -4968,20 +4982,15 @@ impl AgentLoopShared {
             .map(|routed| routed.call.clone())
             .collect();
 
-        // One carrier owns every router and lease disposition below. It is the
-        // first durable artifact: no rejected receipt or allowed side effect
-        // may exist without the complete ordered call batch that owns it.
-        if let Err(error) =
-            crate::agent::tool_engine::journal_tool_call_carrier(ctx, &carrier_calls, &response)
-                .await
-        {
-            ctx.emit_pending_request_metrics(0);
-            return StepResult::Done(IterationOutcome::Error(format!(
-                "tool-call carrier could not be recorded atomically; no tools were executed: {error}"
-            )));
-        }
-
+        // Keep the complete carrier pending until router and lease policy have
+        // classified every member. If either policy rejects a call, the
+        // carrier, every false receipt, and every immutable raw row commit in
+        // one transaction before any decision event or allowed side effect.
+        crate::agent::tool_engine::append_tool_call_carrier(ctx, &carrier_calls, &response);
+        let return_after_router_rejections = routed_batch.return_after_rejections;
         let mut routed_tool_calls = Vec::new();
+        let mut rejected_calls: Vec<(crate::providers::base::ToolCallRequest, String, String)> =
+            Vec::new();
         let mut router_rejections = 0usize;
         for routed in routed_batch.calls {
             match routed.disposition {
@@ -4989,74 +4998,10 @@ impl AgentLoopShared {
                     routed_tool_calls.push(routed.call);
                 }
                 crate::agent::router::RoutedToolDisposition::Reject { reason, receipt } => {
-                    if let Err(error) = ctx
-                        .core
-                        .sessions
-                        .record_tool_pre_execute(
-                            &ctx.session_id,
-                            &ctx.request_id,
-                            ctx.turn_count,
-                            &routed.call.id,
-                            &routed.call.name,
-                            &routed.call.arguments,
-                            crate::session::db::ToolPreExecuteDecision::Rejected {
-                                reason: format!("tool_guard:{reason}"),
-                            },
-                        )
-                        .await
-                    {
-                        ctx.emit_pending_request_metrics(0);
-                        return StepResult::Done(IterationOutcome::Error(format!(
-                            "tool {} was blocked but its pre-execution decision could not be recorded: {error}",
-                            routed.call.id
-                        )));
-                    }
-                    ctx.messages.with_draft(|draft| {
-                        ContextBuilder::add_tool_result_immutable_with_status(
-                            draft,
-                            &routed.call.id,
-                            &routed.call.name,
-                            &receipt,
-                            false,
-                        )
-                    });
                     router_rejections += 1;
+                    rejected_calls.push((routed.call, format!("tool_guard:{reason}"), receipt));
                 }
             }
-        }
-        let has_router_scaffold = routed_batch.scaffold_after_rejections.is_some();
-        if let Some(scaffold) = routed_batch.scaffold_after_rejections {
-            ctx.messages
-                .push_draft(crate::agent::markers::scaffold_user(scaffold));
-        }
-        if router_rejections > 0 || has_router_scaffold {
-            let persistence = if router_rejections > 0 {
-                ctx.persist_pending_rejected_tool_messages().await
-            } else {
-                ctx.persist_pending_protocol_messages().await
-            };
-            if let Err(error) = persistence {
-                ctx.emit_pending_request_metrics(0);
-                return StepResult::Done(IterationOutcome::Error(format!(
-                    "router-rejected tool receipts could not be recorded atomically; no tools were executed: {error}"
-                )));
-            }
-        }
-        if let Some(outcome) = routed_batch.after_rejections {
-            ctx.emit_pending_request_metrics(0);
-            return match outcome {
-                crate::agent::router::RoutedBatchOutcome::Continue => {
-                    ctx.flow.tool_rounds_completed =
-                        ctx.flow.tool_rounds_completed.saturating_add(1);
-                    StepResult::Done(IterationOutcome::Continue)
-                }
-                crate::agent::router::RoutedBatchOutcome::Break(content) => {
-                    StepResult::Done(IterationOutcome::Complete {
-                        content,
-                        outcome: TurnOutcome::Finished,
-                    })
-                }
-            };
         }
 
         // Tool-lease enforcement. Each call is recorded against the per-turn
@@ -5072,7 +5017,7 @@ impl AgentLoopShared {
         // — it over-fired on legitimate exploration and busted the cache).
         // Identical-call loops are bounded by `ToolGuard`'s per-key counter.
         let mut allowed_calls: Vec<_> = Vec::with_capacity(routed_tool_calls.len());
-        let mut blocked_calls: Vec<(String, String, &'static str)> = Vec::new();
+        let mut lease_rejections = 0usize;
         for tc in routed_tool_calls {
             // `lease.record_tool_call` returns `lease_exhausted` when the
             // per-lease budget is gone. We do NOT pre-check `is_exhausted`
@@ -5139,62 +5084,88 @@ impl AgentLoopShared {
                 allowed_calls.push(tc);
             } else {
                 let reason = result.reason.unwrap_or("lease_blocked");
-                if let Err(error) = ctx
-                    .core
-                    .sessions
-                    .record_tool_pre_execute(
-                        &ctx.session_id,
-                        &ctx.request_id,
-                        ctx.turn_count,
-                        &tc.id,
-                        &tc.name,
-                        &tc.arguments,
-                        crate::session::db::ToolPreExecuteDecision::Rejected {
-                            reason: format!("lease:{reason}"),
-                        },
-                    )
-                    .await
-                {
-                    return StepResult::Done(IterationOutcome::Error(format!(
-                        "tool {} was rejected but its pre-execution decision could not be recorded: {error}",
-                        tc.id
-                    )));
-                }
-                let name = tc.name.clone();
-                let id = tc.id.clone();
-                blocked_calls.push((name, id, reason));
-            }
-        }
-        // Inject rejection receipts for blocked calls. Each receipt
-        // carries the tool_call_id the model emitted, so the wire's
-        // assistant-tool_calls → tool-results pairing stays intact.
-        for (name, id, reason) in &blocked_calls {
-            tracing::info!(
-                session = %ctx.session_key,
-                tool = %name,
-                reason,
-                "tool_lease_blocked_call"
-            );
-            let msg = format!(
-                "lease exhausted: {name} was not executed — your per-turn \
+                tracing::info!(
+                    session = %ctx.session_key,
+                    tool = %tc.name,
+                    reason,
+                    "tool_lease_blocked_call"
+                );
+                let receipt = format!(
+                    "lease exhausted: {} was not executed — your per-turn \
                  tool budget is used up. Write a renewal checkpoint \
                  (findings:/next:/will:) to continue with more tools, or \
-                 write your final answer."
-            );
+                 write your final answer.",
+                    tc.name
+                );
+                lease_rejections += 1;
+                rejected_calls.push((tc, format!("lease:{reason}"), receipt));
+            }
+        }
+
+        // Rejected calls become model-visible receipts before persistence so
+        // this pending group contains the complete carrier/receipt/raw-row
+        // protocol prefix. No decision event is written until it commits.
+        for (call, _, receipt) in &rejected_calls {
             ctx.messages.with_draft(|draft| {
-                ContextBuilder::add_tool_result_immutable_with_status(draft, id, name, &msg, false)
+                ContextBuilder::add_tool_result_immutable_with_status(
+                    draft, &call.id, &call.name, receipt, false,
+                )
             });
         }
-        if !blocked_calls.is_empty() {
-            if let Err(error) = ctx.persist_pending_rejected_tool_messages().await {
+        let persistence = if rejected_calls.is_empty() {
+            ctx.persist_pending_protocol_messages().await
+        } else {
+            ctx.persist_pending_rejected_tool_messages().await
+        };
+        if let Err(error) = persistence {
+            ctx.emit_pending_request_metrics(0);
+            let boundary = if router_rejections > 0 {
+                "router-rejected tool receipts"
+            } else if lease_rejections > 0 {
+                "rejected tool receipts"
+            } else {
+                "tool-call carrier"
+            };
+            return StepResult::Done(IterationOutcome::Error(format!(
+                "{boundary} could not be recorded atomically; no tools were executed: {error}"
+            )));
+        }
+
+        // Decisions are durable only after their protocol bytes are paired.
+        // A later decision fault leaves a replayable carrier/receipt/raw group
+        // while still preventing every allowed member from reaching Ready.
+        for (call, reason, _) in &rejected_calls {
+            if let Err(error) = ctx
+                .core
+                .sessions
+                .record_tool_pre_execute(
+                    &ctx.session_id,
+                    &ctx.request_id,
+                    ctx.turn_count,
+                    &call.id,
+                    &call.name,
+                    &call.arguments,
+                    crate::session::db::ToolPreExecuteDecision::Rejected {
+                        reason: reason.clone(),
+                    },
+                )
+                .await
+            {
                 ctx.emit_pending_request_metrics(0);
                 return StepResult::Done(IterationOutcome::Error(format!(
-                    "rejected tool receipts could not be recorded atomically; no tools were executed: {error}"
+                    "tool {} was rejected but its pre-execution decision could not be recorded: {error}",
+                    call.id
                 )));
             }
         }
+
+        if return_after_router_rejections {
+            ctx.emit_pending_request_metrics(0);
+            ctx.flow.tool_rounds_completed = ctx.flow.tool_rounds_completed.saturating_add(1);
+            return StepResult::Done(IterationOutcome::Continue);
+        }
         let routed_tool_calls = allowed_calls;
-        if routed_tool_calls.is_empty() && !blocked_calls.is_empty() {
+        if routed_tool_calls.is_empty() && lease_rejections > 0 {
             // Every call this round was blocked by the lease — flag it
             // so the loop machinery doesn't count this as a real
             // iteration (the shared no-progress/lease rejection pattern).

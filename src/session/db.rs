@@ -3724,7 +3724,11 @@ fn store_tool_result_immutable_locked(
         }
     } else if existing_digest == attempted_digest
         && stored_tool_name == tool_name
-        && stored_ok == Some(i64::from(ok))
+        // Rows written by the rollback binary legitimately have NULL here.
+        // Matching name/body bytes are replay-compatible with an inferred
+        // in-memory status, but the historical row stays untouched. Explicit
+        // true/false rows remain immutable and conflict with the opposite.
+        && (stored_ok.is_none() || stored_ok == Some(i64::from(ok)))
     {
         StoredResult::Identical {
             digest: existing_digest,
@@ -5576,6 +5580,76 @@ mod tests {
                 .await,
             Some(("legacy body".to_string(), None)),
             "an older binary must still be able to omit the additive status column"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_null_status_replays_large_failure_as_typed_handle_without_backfill() {
+        // Break caught: a status-aware replay treated an otherwise identical
+        // pre-status raw row (`ok IS NULL`) as an immutable conflict. The
+        // large failed body then stayed inline and lost its inferred status.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy-null-status.db");
+        let body = format!("Error: legacy command failed\n{}", "evidence\n".repeat(900));
+        let session_id = {
+            let db = SessionDb::new(&db_path);
+            let session = db.create_session("cli:legacy-null-status").await;
+            db.add_messages(
+                &session.id,
+                &[
+                    json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "legacy-null-failure",
+                            "type": "function",
+                            "function": {"name": "exec", "arguments": "{}"}
+                        }]
+                    }),
+                    json!({
+                        "role": "tool",
+                        "tool_call_id": "legacy-null-failure",
+                        "name": "exec",
+                        "content": body
+                    }),
+                ],
+            )
+            .await;
+            {
+                // Simulate an older binary: the additive column exists, but
+                // its INSERT omits `ok`, leaving the historical row NULL.
+                let conn = db.conn.lock().await;
+                conn.execute(
+                    "INSERT INTO tool_results \
+                     (session_id, tool_call_id, tool_name, content, created_at) \
+                     VALUES (?1, 'legacy-null-failure', 'exec', ?2, 'now')",
+                    params![session.id, body],
+                )
+                .unwrap();
+            }
+            session.id
+        };
+
+        let reopened = SessionDb::new(&db_path);
+        let history = reopened.get_history(&session_id, 100, 0).await;
+        let tool = history
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .expect("legacy tool receipt");
+        assert_eq!(tool.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(
+            tool["content"]
+                .as_str()
+                .is_some_and(|content| content
+                    .starts_with(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER)),
+            "large legacy body must replay as a bounded handle: {tool}"
+        );
+        assert_eq!(
+            reopened
+                .load_tool_result_with_status(&session_id, "legacy-null-failure")
+                .await,
+            Some((body, None)),
+            "replay inference must not backfill or rewrite an old binary's NULL status"
         );
     }
 

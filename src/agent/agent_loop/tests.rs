@@ -7546,8 +7546,61 @@ async fn medium_tool_result_inlines_body_not_handle() {
     let _ = std::fs::remove_dir_all(files_dir);
 }
 
+struct DuplicateTerminalProvider {
+    responses: parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
+    terminal_choices: parking_lot::Mutex<Vec<crate::providers::base::ToolChoice>>,
+}
+
+#[async_trait]
+impl LLMProvider for DuplicateTerminalProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        Ok(self
+            .responses
+            .lock()
+            .pop_front()
+            .expect("scripted response"))
+    }
+
+    async fn chat_with_tool_choice(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+        thinking_budget: Option<u32>,
+        top_p: Option<f64>,
+        tool_choice: crate::providers::base::ToolChoice,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.terminal_choices.lock().push(tool_choice);
+        self.chat(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            thinking_budget,
+            top_p,
+        )
+        .await
+    }
+
+    fn get_default_model(&self) -> &str {
+        "local-duplicate-terminal"
+    }
+}
+
 #[tokio::test]
-async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
+async fn cached_duplicate_rounds_use_one_terminal_none_without_scaffold_or_static_break() {
     let duplicate_call = |id: usize| {
         let mut arguments = std::collections::HashMap::new();
         arguments.insert("path".to_string(), json!("."));
@@ -7562,18 +7615,22 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
             usage: std::collections::HashMap::new(),
         }
     };
-    let provider = Arc::new(ResponseSequenceProvider::new(
-        "local-qwen-test",
-        vec![
-            duplicate_call(1),
-            duplicate_call(2),
-            duplicate_call(3),
-            duplicate_call(4),
-            WireRecordingProvider::text_response("breaker failed"),
-        ],
-    ));
+    let provider = Arc::new(DuplicateTerminalProvider {
+        responses: parking_lot::Mutex::new(
+            vec![
+                duplicate_call(1),
+                duplicate_call(2),
+                duplicate_call(3),
+                duplicate_call(4),
+                duplicate_call(5),
+                WireRecordingProvider::text_response("terminal duplicate summary"),
+            ]
+            .into(),
+        ),
+        terminal_choices: parking_lot::Mutex::new(Vec::new()),
+    });
     let (agent_loop, workspace) =
-        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 10);
     let session_key = format!("cached-duplicate-breaker-{}", uuid::Uuid::new_v4());
 
     let response = tokio::time::timeout(
@@ -7583,30 +7640,39 @@ async fn test_cached_duplicate_tool_receipts_trip_loop_circuit_breaker() {
     .await
     .expect("cached duplicate loop must terminate");
 
-    // The forced Break message must be CORRECTIVE (why + what to change), not a
-    // false "result already available" claim — that framing is wrong for
-    // meta-tools like get_tools whose cached result (a flat name list) is NOT
-    // what the model's repeated empty-arg call was trying to reach. See
-    // .planning/debug/get-tools-dedup-drop.md defect 2 (option B).
-    // The two-stage breaker scaffolds at 2 blocked rounds and hard-stops at 4.
-    // The response is the Break message (the mocked model always calls tools).
-    assert!(
-        !response.is_empty(),
-        "dedup loop must terminate with a response: {response}"
-    );
-    assert!(
-        !response.contains("result was already available"),
-        "dedup Break must not falsely claim the cached result satisfied the \
-         request (wrong for meta-tools like get_tools): {response}"
-    );
+    assert_eq!(response, "terminal duplicate summary");
     assert_eq!(
-        provider.call_count(),
-        5,
-        "first read executes; the first duplicate gets one receipt-informed \
-         retry; the scaffold at 2 blocked rounds gives the model two more \
-         chances to produce text before the hard stop (the two-stage breaker \
-         scaffolds at 2 and hard-stops at 4)"
+        provider.terminal_choices.lock().as_slice(),
+        &[crate::providers::base::ToolChoice::None],
+        "one shared terminal authority must own duplicate-loop convergence"
     );
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    let replay = core
+        .sessions
+        .load_session_replay(&session.id)
+        .await
+        .unwrap();
+    let terminal_calls = replay
+        .model_calls
+        .iter()
+        .filter(|call| call.purpose == crate::session::db::ModelCallPurpose::Continuation)
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_calls.len(), 1);
+    let terminal_request: crate::session::db::RecordedProviderRequest =
+        serde_json::from_slice(&terminal_calls[0].request).unwrap();
+    assert_eq!(terminal_request.tool_choice, "none");
+    let persisted_text = core
+        .sessions
+        .get_all_messages(&session.id)
+        .await
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!persisted_text.contains("Your last several tool calls were duplicates or blocked"));
+    assert!(!persisted_text.contains("Tool calls were blocked after repeated duplicates"));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -8789,6 +8855,52 @@ fn mixed_guard_responses(
     responses
 }
 
+fn mixed_guard_side_effect_responses(
+    blocked_id: &str,
+    allowed_id: &str,
+    allowed_path: &std::path::Path,
+) -> Vec<crate::providers::base::LLMResponse> {
+    let mut responses = (1..=3)
+        .map(|index| crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![guard_probe_call(&format!("tc_side_effect_warmup_{index}"))],
+            finish_reason: FinishReason::ToolCalls,
+            usage: std::collections::HashMap::new(),
+        })
+        .collect::<Vec<_>>();
+    responses.push(crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![
+            guard_probe_call(blocked_id),
+            crate::providers::base::ToolCallRequest {
+                id: allowed_id.to_string(),
+                name: "write_file".to_string(),
+                arguments: std::collections::HashMap::from([
+                    (
+                        "path".to_string(),
+                        json!(allowed_path.to_string_lossy().to_string()),
+                    ),
+                    ("content".to_string(), json!("must not be written")),
+                ]),
+            },
+        ],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    });
+    responses
+}
+
+fn message_has_tool_call(message: &Value, tool_call_id: &str) -> bool {
+    message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|call| call.get("id").and_then(Value::as_str) == Some(tool_call_id))
+        })
+}
+
 #[tokio::test]
 async fn all_guard_blocked_without_cache_keeps_carrier_receipt_and_exact_replay() {
     let mut responses = (1..=4)
@@ -8976,6 +9088,16 @@ async fn mixed_guard_receipt_persistence_failure_prevents_allowed_execution() {
         .get_latest_session(&session_key)
         .await
         .expect("receipt fault session");
+    let messages = core.sessions.get_all_messages(&session.id).await;
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message_has_tool_call(message, "tc_fault_blocked")),
+        "message fault must roll back the complete carrier"
+    );
+    assert!(!messages.iter().any(|message| {
+        message.get("tool_call_id").and_then(Value::as_str) == Some("tc_fault_blocked")
+    }));
     let events = core
         .sessions
         .load_session_events(&session.id)
@@ -8984,7 +9106,7 @@ async fn mixed_guard_receipt_persistence_failure_prevents_allowed_execution() {
     assert!(!events.iter().any(|event| matches!(
         &event.payload,
         crate::session::db::SessionEventPayload::ToolPreExecute { tool_call_id, .. }
-            if tool_call_id == "tc_fault_allowed"
+            if tool_call_id == "tc_fault_allowed" || tool_call_id == "tc_fault_blocked"
     )));
     assert_eq!(
         persisted_turn_outcome(&core.sessions, &session.id).await,
@@ -8999,6 +9121,208 @@ async fn mixed_guard_receipt_persistence_failure_prevents_allowed_execution() {
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn router_rejection_raw_and_decision_faults_preserve_transaction_order() {
+    for fault in ["raw", "decision"] {
+        let side_effect_dir = tempfile::tempdir().unwrap();
+        let side_effect_path = side_effect_dir.path().join(format!("router-{fault}.txt"));
+        let blocked_id = format!("tc_router_{fault}_blocked");
+        let allowed_id = format!("tc_router_{fault}_allowed");
+        let provider = Arc::new(ResponseSequenceProvider::new(
+            "local-main",
+            mixed_guard_side_effect_responses(&blocked_id, &allowed_id, &side_effect_path),
+        ));
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider as Arc<dyn LLMProvider>, 6);
+        let session_key = format!("router-{fault}-fault-{}", uuid::Uuid::new_v4());
+        let core = agent_loop.shared.core_handle.swappable();
+        {
+            let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+            let sql = if fault == "raw" {
+                format!(
+                    "CREATE TRIGGER fail_router_raw BEFORE INSERT ON tool_results \
+                     WHEN NEW.tool_call_id = '{blocked_id}' \
+                     BEGIN SELECT RAISE(ABORT, 'synthetic router raw failure'); END;"
+                )
+            } else {
+                format!(
+                    "CREATE TRIGGER fail_router_decision BEFORE INSERT ON session_events \
+                     WHEN NEW.event_kind = 'tool_pre_execute' \
+                       AND NEW.payload_json LIKE '%{blocked_id}%' \
+                     BEGIN SELECT RAISE(ABORT, 'synthetic router decision failure'); END;"
+                )
+            };
+            conn.execute_batch(&sql).unwrap();
+        }
+
+        agent_loop
+            .process_direct(
+                "exercise router transaction ordering",
+                &session_key,
+                "test",
+                "offline",
+            )
+            .await;
+
+        let session = core.sessions.get_or_resume(&session_key).await;
+        let messages = core.sessions.get_all_messages(&session.id).await;
+        let has_carrier = messages
+            .iter()
+            .any(|message| message_has_tool_call(message, &blocked_id));
+        let has_receipt = messages.iter().any(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some(blocked_id.as_str())
+                && message.get("ok").and_then(Value::as_bool) == Some(false)
+        });
+        let raw = core
+            .sessions
+            .load_tool_result_with_status(&session.id, &blocked_id)
+            .await;
+        if fault == "raw" {
+            assert_eq!(
+                (has_carrier, has_receipt, raw.is_some()),
+                (false, false, false)
+            );
+        } else {
+            assert_eq!((has_carrier, has_receipt), (true, true));
+            assert!(matches!(raw, Some((_, Some(false)))));
+        }
+        assert!(
+            !side_effect_path.exists(),
+            "allowed router member ran after {fault} fault"
+        );
+        let events = core
+            .sessions
+            .load_session_events(&session.id)
+            .await
+            .unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            &event.payload,
+            crate::session::db::SessionEventPayload::ToolPreExecute { tool_call_id, .. }
+                if tool_call_id == &allowed_id
+        )));
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+}
+
+fn lease_fault_response(
+    prefix: &str,
+    side_effect_dir: &std::path::Path,
+) -> crate::providers::base::LLMResponse {
+    let tool_calls = (1..=13)
+        .map(|index| crate::providers::base::ToolCallRequest {
+            id: format!("{prefix}_{index}"),
+            name: "exec".to_string(),
+            arguments: std::collections::HashMap::from([(
+                "command".to_string(),
+                json!(format!(
+                    "printf ran > {}",
+                    side_effect_dir.join(format!("ran-{index}.txt")).display()
+                )),
+            )]),
+        })
+        .collect();
+    crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls,
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    }
+}
+
+#[tokio::test]
+async fn lease_rejection_message_raw_and_decision_faults_preserve_transaction_order() {
+    for fault in ["message", "raw", "decision"] {
+        let side_effect_dir = tempfile::tempdir().unwrap();
+        let prefix = format!("tc_lease_{fault}");
+        let blocked_id = format!("{prefix}_13");
+        let provider = Arc::new(ResponseSequenceProvider::new(
+            "local-main",
+            vec![lease_fault_response(&prefix, side_effect_dir.path())],
+        ));
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider as Arc<dyn LLMProvider>, 3);
+        let session_key = format!("lease-{fault}-fault-{}", uuid::Uuid::new_v4());
+        let core = agent_loop.shared.core_handle.swappable();
+        {
+            let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
+            let sql = match fault {
+                "message" => format!(
+                    "CREATE TRIGGER fail_lease_message BEFORE INSERT ON messages \
+                     WHEN NEW.tool_call_id = '{blocked_id}' \
+                     BEGIN SELECT RAISE(ABORT, 'synthetic lease message failure'); END;"
+                ),
+                "raw" => format!(
+                    "CREATE TRIGGER fail_lease_raw BEFORE INSERT ON tool_results \
+                     WHEN NEW.tool_call_id = '{blocked_id}' \
+                     BEGIN SELECT RAISE(ABORT, 'synthetic lease raw failure'); END;"
+                ),
+                "decision" => format!(
+                    "CREATE TRIGGER fail_lease_decision BEFORE INSERT ON session_events \
+                     WHEN NEW.event_kind = 'tool_pre_execute' \
+                       AND NEW.payload_json LIKE '%{blocked_id}%' \
+                     BEGIN SELECT RAISE(ABORT, 'synthetic lease decision failure'); END;"
+                ),
+                _ => unreachable!(),
+            };
+            conn.execute_batch(&sql).unwrap();
+        }
+
+        agent_loop
+            .process_direct(
+                "exercise lease transaction ordering",
+                &session_key,
+                "test",
+                "offline",
+            )
+            .await;
+
+        let session = core.sessions.get_or_resume(&session_key).await;
+        let messages = core.sessions.get_all_messages(&session.id).await;
+        let has_carrier = messages
+            .iter()
+            .any(|message| message_has_tool_call(message, &blocked_id));
+        let has_receipt = messages.iter().any(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some(blocked_id.as_str())
+                && message.get("ok").and_then(Value::as_bool) == Some(false)
+        });
+        let raw = core
+            .sessions
+            .load_tool_result_with_status(&session.id, &blocked_id)
+            .await;
+        if fault == "decision" {
+            assert_eq!((has_carrier, has_receipt), (true, true));
+            assert!(matches!(raw, Some((_, Some(false)))));
+        } else {
+            assert_eq!(
+                (has_carrier, has_receipt, raw.is_some()),
+                (false, false, false)
+            );
+        }
+        assert!(
+            std::fs::read_dir(side_effect_dir.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "allowed lease members ran after {fault} fault"
+        );
+        let events = core
+            .sessions
+            .load_session_events(&session.id)
+            .await
+            .unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            &event.payload,
+            crate::session::db::SessionEventPayload::ToolPreExecute {
+                decision: crate::session::db::ToolPreExecuteDecision::Ready,
+                ..
+            }
+        )));
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
 }
 
 #[tokio::test]

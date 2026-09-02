@@ -1284,16 +1284,10 @@ pub(crate) struct RoutedToolCall {
     pub(crate) disposition: RoutedToolDisposition,
 }
 
-pub(crate) enum RoutedBatchOutcome {
-    Continue,
-    Break(String),
-}
-
 pub(crate) struct RoutedToolBatch {
     pub(crate) calls: Vec<RoutedToolCall>,
     /// Applies only after every rejection receipt in this batch is durable.
-    pub(crate) after_rejections: Option<RoutedBatchOutcome>,
-    pub(crate) scaffold_after_rejections: Option<String>,
+    pub(crate) return_after_rejections: bool,
 }
 
 /// Determine the RouteResult for a successful specialist dispatch in route_tool_calls().
@@ -1700,56 +1694,9 @@ pub(crate) async fn route_tool_calls(
             // round as zero progress so cached receipts cannot livelock the
             // agent loop while also bypassing its iteration budget.
             ctx.flow.round_executed_no_tools = true;
-            let (after_rejections, scaffold_after_rejections) = if ctx.flow.consecutive_all_blocked
-                >= 4
-            {
-                warn!(
-                    rounds = ctx.flow.consecutive_all_blocked,
-                    "tool_loop_circuit_breaker: model still looping after scaffold, hard stop"
-                );
-                (
-                    RoutedBatchOutcome::Break(
-                    "Tool calls were blocked after repeated duplicates. Please rephrase your request."
-                        .to_string(),
-                    ),
-                    None,
-                )
-            } else if ctx.flow.consecutive_all_blocked == 2 {
-                warn!(
-                    rounds = ctx.flow.consecutive_all_blocked,
-                    "tool_loop_circuit_breaker: model stuck on blocked tools, scaffolding final answer"
-                );
-                // Scaffold the model to write its answer from the data it
-                // already collected. The model gets one more LLM call with
-                // this instruction; if it still calls tools at >= 4, the
-                // hard break above fires.
-                (
-                    RoutedBatchOutcome::Continue,
-                    Some(
-                        "[system] Your last several tool calls were duplicates or blocked. \
-                     You already have the data you need from your previous tool results. \
-                     Do NOT call any more tools. Write your final answer now using the \
-                     information you gathered."
-                            .to_string(),
-                    ),
-                )
-            } else {
-                // Text accompanying a tool call is normally a progress preamble
-                // ("let me check ..."), not a final answer. Give the model one
-                // receipt-informed retry instead of exposing that preamble — this
-                // applies to cached duplicates too: the receipt instructs "answer
-                // from the prior result", and the evidence is already in context,
-                // so the model usually delivers a real answer on this pass (the
-                // old immediate-Break ended turns with boilerplate mid-task, e.g.
-                // session 20260827_071357). Skipping this pass saved one prefill
-                // and cost the turn; on retained-session backends the pass is a
-                // cheap suffix-only prefill anyway.
-                (RoutedBatchOutcome::Continue, None)
-            };
             return RouteResult::Execute(RoutedToolBatch {
                 calls,
-                after_rejections: Some(after_rejections),
-                scaffold_after_rejections,
+                return_after_rejections: true,
             });
         }
     }
@@ -1758,8 +1705,7 @@ pub(crate) async fn route_tool_calls(
     ctx.flow.consecutive_all_blocked = 0;
     RouteResult::Execute(RoutedToolBatch {
         calls,
-        after_rejections: None,
-        scaffold_after_rejections: None,
+        return_after_rejections: false,
     })
 }
 
