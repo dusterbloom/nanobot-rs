@@ -125,11 +125,62 @@ fn parse_line_param(value: Option<&Value>) -> Result<Option<u64>, String> {
         return Ok(None);
     }
     let head = s.split(|c| c == ':' || c == '-').next().unwrap_or(s);
-    head
-        .trim()
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|_| format!("'{s}' is not a line number (expected an integer like 76, or a range like 76:149)"))
+    head.trim().parse::<u64>().map(Some).map_err(|_| {
+        format!("'{s}' is not a line number (expected an integer like 76, or a range like 76:149)")
+    })
+}
+
+/// Parse the optional line pair with the same defaults used by positional
+/// inspection, whether it is the primary request or a query-miss fallback.
+fn parse_range(params: &HashMap<String, Value>) -> Result<(usize, usize), ToolError> {
+    let start_line =
+        parse_line_param(params.get("start_line")).map_err(|e| ToolError::InvalidArgs {
+            message: format!(
+                "start_line: {e}. Pass an integer like 76, or a range like \"76:149\"."
+            ),
+        })?;
+    let end_line =
+        parse_line_param(params.get("end_line")).map_err(|e| ToolError::InvalidArgs {
+            message: format!("end_line: {e}. Pass an integer like 149."),
+        })?;
+    let start = start_line.unwrap_or(1) as usize;
+    let end = end_line.unwrap_or(start as u64 + DEFAULT_SLICE_SPAN as u64) as usize;
+    Ok((start, end))
+}
+
+/// Explain a grep-style pipe query after the complete literal has missed.
+/// The search contract stays literal; the counts point at a useful one-token
+/// retry without silently changing the query into a regex.
+fn alternation_hint(query: &str, lines: &[StashedLine<'_>]) -> String {
+    let tokens: Vec<&str> = query
+        .split('|')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .take(8)
+        .collect();
+    if tokens.len() < 2 {
+        return String::new();
+    }
+    let counts = tokens
+        .iter()
+        .map(|token| {
+            let matched = RegexBuilder::new(&regex::escape(token))
+                .case_insensitive(true)
+                .build()
+                .map(|matcher| {
+                    lines
+                        .iter()
+                        .filter(|line| matcher.find(line.text).is_some())
+                        .count()
+                })
+                .unwrap_or(0);
+            format!("'{token}' matched {matched} line(s)")
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "'|' is not alternation here — the whole query was matched as one literal string. Per token: {}. Retry with one plain word. ",
+        counts.join(", ")
+    )
 }
 
 /// Build `context_lines` worth of surrounding lines, prefixed with the match
@@ -168,7 +219,12 @@ fn render_with_context(
 /// is reduced by `GUIDANCE_RESERVE` to keep the whole page within the cap).
 /// Query-centered pages pass `paged = false` — they answer a search, they are
 /// not a read-through, so "stop paging" guidance would be noise there.
-fn render_char_page(body: &str, artifact_tool_call_id: &str, start_char: usize, paged: bool) -> String {
+fn render_char_page(
+    body: &str,
+    artifact_tool_call_id: &str,
+    start_char: usize,
+    paged: bool,
+) -> String {
     let total = body.chars().count();
     if start_char >= total {
         return format!(
@@ -500,21 +556,47 @@ impl Tool for SearchToolResultTool {
                 let max_results = clamp_results(params.get("max_results").and_then(|v| v.as_u64()));
                 let context_lines =
                     clamp_context(params.get("context_lines").and_then(|v| v.as_u64()));
-                render_query_results(
-                    &body,
-                    &lines,
-                    id,
-                    query,
-                    &matcher,
-                    max_results,
-                    context_lines,
-                )
-            } else if let Some(start_char) = parse_line_param(params.get("start_char"))
-                .map_err(|e| ToolError::InvalidArgs {
+                if lines.iter().any(|line| matcher.find(line.text).is_some()) {
+                    render_query_results(
+                        &body,
+                        &lines,
+                        id,
+                        query,
+                        &matcher,
+                        max_results,
+                        context_lines,
+                    )
+                } else {
+                    let hint = alternation_hint(query, &lines);
+                    if params.get("start_line").is_some() || params.get("end_line").is_some() {
+                        let (start, end) = parse_range(&params)?;
+                        let page = render_slice_page(&body, &lines, id, start, end);
+                        let result = format!(
+                            "No match for '{query}'. {hint}Showing the requested lines instead:\n{page}"
+                        );
+                        if result.chars().count() <= MAX_OUTPUT_CHARS {
+                            result
+                        } else {
+                            page
+                        }
+                    } else {
+                        format!(
+                            "No matching lines for '{query}'. {hint}Query is a literal substring (no \
+                             regex); for a positional read, omit query and use start_line/end_line or \
+                             start_char."
+                        )
+                    }
+                }
+            } else if let Some(start_char) =
+                parse_line_param(params.get("start_char")).map_err(|e| ToolError::InvalidArgs {
                     message: format!("start_char: {e}. Pass an integer character offset."),
-                })? {
+                })?
+            {
                 render_char_page(&body, id, start_char as usize, true)
-            } else if params.get("start_line").is_none() && params.get("end_line").is_none() && params.get("start_char").is_none() {
+            } else if params.get("start_line").is_none()
+                && params.get("end_line").is_none()
+                && params.get("start_char").is_none()
+            {
                 // Auto-pagination: no positioning args → continue from where
                 // the last read left off. The cursor advances automatically,
                 // so each call returns fresh content without the model
@@ -529,16 +611,7 @@ impl Tool for SearchToolResultTool {
                 self.read_cursors.lock().unwrap().insert(cursor_key, next);
                 result
             } else {
-                let start_line = parse_line_param(params.get("start_line"))
-                    .map_err(|e| ToolError::InvalidArgs {
-                        message: format!("start_line: {e}. Pass an integer like 76, or a range like \"76:149\"."),
-                    })?;
-                let end_line = parse_line_param(params.get("end_line"))
-                    .map_err(|e| ToolError::InvalidArgs {
-                        message: format!("end_line: {e}. Pass an integer like 149."),
-                    })?;
-                let start = start_line.unwrap_or(1) as usize;
-                let end = end_line.unwrap_or(start as u64 + DEFAULT_SLICE_SPAN as u64) as usize;
+                let (start, end) = parse_range(&params)?;
                 render_slice_page(&body, &lines, id, start, end)
             }
         } else {
@@ -640,6 +713,75 @@ mod tests {
                 .await,
         );
         assert!(out.contains("No matching lines"));
+    }
+
+    #[tokio::test]
+    async fn pipe_query_miss_reports_per_token_counts() {
+        let (_dir, db_path, sid) = make_db().await;
+        seed(&db_path, &sid, "call_alt", "alpha\nbeta\nerror here\n").await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let params = HashMap::from([
+            ("tool_call_id".to_string(), json!("call_alt")),
+            ("query".to_string(), json!("zzz|error")),
+        ]);
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+
+        assert!(out.contains("not alternation"), "{out}");
+        assert!(out.contains("'zzz' matched 0 line(s)"), "{out}");
+        assert!(out.contains("'error' matched 1 line(s)"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn query_miss_falls_back_to_requested_line_range() {
+        let (_dir, db_path, sid) = make_db().await;
+        let body = (1..=100).map(|_| "data").collect::<Vec<_>>().join("\n");
+        seed(&db_path, &sid, "call_f", &body).await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let params = HashMap::from([
+            ("tool_call_id".to_string(), json!("call_f")),
+            ("query".to_string(), json!("zzz")),
+            ("start_line".to_string(), json!(10)),
+            ("end_line".to_string(), json!(12)),
+        ]);
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+
+        assert!(out.contains("No match for 'zzz'"), "{out}");
+        assert!(out.contains("10:data"), "{out}");
+        assert!(out.contains("12:data"), "{out}");
+        assert!(!out.contains("13:data"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn query_hit_does_not_fall_back_to_range() {
+        let (_dir, db_path, sid) = make_db().await;
+        seed(&db_path, &sid, "call_hit", "needle\nsecond line\n").await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let params = HashMap::from([
+            ("tool_call_id".to_string(), json!("call_hit")),
+            ("query".to_string(), json!("needle")),
+            ("start_line".to_string(), json!(1)),
+            ("end_line".to_string(), json!(2)),
+        ]);
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+
+        assert!(out.contains("needle"), "{out}");
+        assert!(
+            !out.contains("Showing the requested lines instead"),
+            "{out}"
+        );
+        assert!(!out.contains("[source=call_hit lines 1-2"), "{out}");
     }
 
     #[tokio::test]
@@ -786,7 +928,8 @@ mod tests {
         );
         assert!(out.contains("76:row"), "{out}");
         assert!(
-            !out.lines().any(|l| l.starts_with("1:row") || l.starts_with("2:row")),
+            !out.lines()
+                .any(|l| l.starts_with("1:row") || l.starts_with("2:row")),
             "must not silently read from line 1: {out}"
         );
     }

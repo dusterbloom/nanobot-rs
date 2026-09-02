@@ -1537,12 +1537,14 @@ pub enum CompactionFailureMode {
 // Three-Level Escalation (Algorithm 3)
 // ---------------------------------------------------------------------------
 
-
 /// Extract one mechanical headline line per message in the eviction span.
 /// No LLM calls — deterministic, zero-latency. Returns (text, manifest).
 /// The manifest is default (no structured extraction) — open_loops and
 /// decisions require model comprehension that this path deliberately avoids.
 fn mechanical_headlines(messages: &[Value]) -> (String, SummaryManifest) {
+    const HANDLE_HEADLINE_MAX_CHARS: usize = 512;
+    let handle_marker = crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER;
+
     let mut lines = Vec::new();
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
@@ -1550,21 +1552,34 @@ fn mechanical_headlines(messages: &[Value]) -> (String, SummaryManifest) {
         if content.trim().is_empty() || role == "system" {
             continue;
         }
-        // For tool results: use the TOOL_RESULT_HANDLE excerpt (first line
-        // after the marker, already truncated to 160 chars at ingestion).
+        // Prefer a separate body line when one exists. Canonical handles are
+        // deliberately one line, so retain a bounded copy of that line rather
+        // than dropping the only durable lookup key from the summary.
         let first_line = if role == "tool" {
-            content
+            let separate_body_line = content
                 .lines()
-                .find(|l| !l.trim().is_empty() && !l.starts_with("TOOL_RESULT_HANDLE"))
+                .find(|line| !line.trim().is_empty() && !line.starts_with(handle_marker))
+                .map(str::trim);
+            separate_body_line
+                .or_else(|| {
+                    content
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .map(str::trim)
+                })
                 .unwrap_or("")
-                .trim()
         } else {
             content.lines().next().unwrap_or("").trim()
         };
         if first_line.is_empty() {
             continue;
         }
-        let boundary = crate::utils::helpers::floor_char_boundary(first_line, 150);
+        let headline_max = if first_line.starts_with(handle_marker) {
+            HANDLE_HEADLINE_MAX_CHARS
+        } else {
+            150
+        };
+        let boundary = crate::utils::helpers::floor_char_boundary(first_line, headline_max);
         let headline = &first_line[..boundary];
         match role {
             "user" => lines.push(format!("· user: {headline}")),
@@ -2051,6 +2066,39 @@ mod tests {
 
     struct CountingFailingMock {
         calls: Arc<AtomicUsize>,
+    }
+
+    #[tokio::test]
+    async fn mechanical_headlines_keeps_one_line_tool_result_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("cli:lcm-handle-headline").await;
+        let call_id = "call_lcm_evidence";
+        let body = format!("bounded evidence excerpt\n{}", "x".repeat(5_000));
+        let handle = crate::agent::tool_engine::store_then_render_tool_result(
+            &sessions,
+            &session.id,
+            call_id,
+            "exec",
+            &std::collections::HashMap::new(),
+            &body,
+            true,
+            4_096,
+        )
+        .await
+        .expect("large result must be stored before rendering its canonical handle");
+        assert_eq!(
+            handle.lines().count(),
+            1,
+            "the regression requires the real one-line handle shape"
+        );
+
+        let messages = vec![json!({"role": "tool", "content": handle})];
+        let (summary, _) = mechanical_headlines(&messages);
+
+        assert!(summary.contains("TOOL_RESULT_HANDLE"), "{summary}");
+        assert!(summary.contains(call_id), "{summary}");
+        assert!(summary.contains("bounded evidence excerpt"), "{summary}");
     }
 
     #[async_trait]
