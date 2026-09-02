@@ -11465,6 +11465,447 @@ mod runtime_mode_parity_tests {
         }
     }
 
+    /// One deterministic replay of the failure cluster recovered from the
+    /// 2026-09-01 session: truthful shell/API failures, a metered network
+    /// lease, paired blocked calls, bounded terminal prose, and a later empty
+    /// model turn. The provider and HTTP fixture are both in-process so this
+    /// gate exercises the production loop without external state.
+    #[tokio::test]
+    async fn compound_session_failure_replay() {
+        struct CompoundReplayProvider {
+            responses:
+                parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
+            terminal_calls:
+                parking_lot::Mutex<Vec<(crate::providers::base::ToolChoice, Option<Vec<Value>>)>>,
+            empty_turn_armed: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait]
+        impl LLMProvider for CompoundReplayProvider {
+            async fn chat(
+                &self,
+                _messages: &[Value],
+                _tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+                _thinking_budget: Option<u32>,
+                _top_p: Option<f64>,
+            ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+                if let Some(response) = self.responses.lock().pop_front() {
+                    return Ok(response);
+                }
+                assert!(
+                    self.empty_turn_armed
+                        .swap(false, std::sync::atomic::Ordering::SeqCst),
+                    "compound provider sequence exhausted before terminal recovery"
+                );
+                Ok(crate::providers::base::LLMResponse {
+                    content: None,
+                    tool_calls: vec![],
+                    finish_reason: FinishReason::Stop,
+                    usage: std::collections::HashMap::new(),
+                })
+            }
+
+            async fn chat_with_tool_choice(
+                &self,
+                _messages: &[Value],
+                tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+                thinking_budget: Option<u32>,
+                _top_p: Option<f64>,
+                tool_choice: crate::providers::base::ToolChoice,
+            ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+                assert_eq!(thinking_budget, None);
+                self.terminal_calls
+                    .lock()
+                    .push((tool_choice, tools.map(<[Value]>::to_vec)));
+                self.empty_turn_armed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::providers::base::LLMResponse {
+                    content: Some(
+                        "The evidence was collected and the failures were preserved.".to_string(),
+                    ),
+                    tool_calls: vec![],
+                    finish_reason: FinishReason::Stop,
+                    usage: std::collections::HashMap::new(),
+                })
+            }
+
+            fn get_default_model(&self) -> &str {
+                "local-main"
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let network_paths = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let recorded_paths = Arc::clone(&network_paths);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let paths = Arc::clone(&recorded_paths);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let mut request = [0_u8; 2048];
+                    let read = socket.read(&mut request).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    paths.lock().push(path.clone());
+                    let body = match path.as_str() {
+                        "/primary" => {
+                            r#"{"message":"API rate limit exceeded for 127.0.0.1.","documentation_url":"https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api"}"#
+                        }
+                        "/secondary" => {
+                            r#"{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again.","documentation_url":"https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api"}"#
+                        }
+                        _ => r#"{"evidence":"confirmed"}"#,
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let tool_response = |id: String, command: String| {
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("command".to_string(), json!(command));
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id,
+                    name: "exec".to_string(),
+                    arguments,
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            }
+        };
+        let base_url = format!("http://127.0.0.1:{port}");
+        let mut responses = vec![
+            tool_response(
+                "tc_compound_evidence".to_string(),
+                format!("curl -sS {base_url}/evidence"),
+            ),
+            tool_response(
+                "tc_compound_pipeline".to_string(),
+                format!("false | curl -sS {base_url}/pipeline"),
+            ),
+            tool_response(
+                "tc_compound_primary".to_string(),
+                format!("curl -sS {base_url}/primary"),
+            ),
+            tool_response(
+                "tc_compound_secondary".to_string(),
+                format!("curl -sS {base_url}/secondary"),
+            ),
+        ];
+        for index in 0..8 {
+            responses.push(tool_response(
+                format!("tc_compound_metered_{index}"),
+                format!("curl -sS {base_url}/metered/{index}"),
+            ));
+        }
+        for (id, path) in [
+            ("tc_compound_blocked_repeat_1", "blocked/repeat"),
+            ("tc_compound_blocked_repeat_2", "blocked/repeat"),
+            ("tc_compound_blocked_distinct_1", "blocked/distinct/1"),
+            ("tc_compound_blocked_distinct_2", "blocked/distinct/2"),
+        ] {
+            responses.push(tool_response(
+                id.to_string(),
+                format!("curl -sS {base_url}/{path}"),
+            ));
+        }
+        let provider = Arc::new(CompoundReplayProvider {
+            responses: parking_lot::Mutex::new(responses.into()),
+            terminal_calls: parking_lot::Mutex::new(Vec::new()),
+            empty_turn_armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 20);
+        let session_key = format!("compound-replay-{}", uuid::Uuid::new_v4());
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent_loop.process_direct_streaming(
+                "collect evidence and report every failure",
+                &session_key,
+                "test",
+                "offline",
+                None,
+                delta_tx,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("compound replay must terminate");
+
+        assert_eq!(
+            response,
+            "The evidence was collected and the failures were preserved."
+        );
+        let mut deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            deltas.push(delta);
+        }
+        assert_eq!(
+            deltas
+                .iter()
+                .filter(|delta| {
+                    delta.as_str() == "The evidence was collected and the failures were preserved."
+                })
+                .count(),
+            1,
+            "terminal prose must stream exactly once: {deltas:?}"
+        );
+        let terminal_calls = provider.terminal_calls.lock();
+        assert_eq!(terminal_calls.len(), 1);
+        assert_eq!(
+            terminal_calls[0].0,
+            crate::providers::base::ToolChoice::None
+        );
+        drop(terminal_calls);
+
+        let core = agent_loop.shared.core_handle.swappable();
+        let successful_session = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .expect("compound session");
+        let successful_replay = core
+            .sessions
+            .load_session_replay(&successful_session.id)
+            .await
+            .expect("compound replay");
+        assert_eq!(
+            persisted_turn_outcome(&core.sessions, &successful_session.id).await,
+            "finished"
+        );
+
+        let terminal_call = successful_replay
+            .model_calls
+            .iter()
+            .find(|call| call.purpose == crate::session::db::ModelCallPurpose::Continuation)
+            .expect("terminal continuation call");
+        let terminal_request: crate::session::db::RecordedProviderRequest =
+            serde_json::from_slice(&terminal_call.request).unwrap();
+        let prior_main_call = successful_replay
+            .model_calls
+            .iter()
+            .rev()
+            .find(|call| call.purpose == crate::session::db::ModelCallPurpose::Main)
+            .expect("prior main call");
+        let prior_main_request: crate::session::db::RecordedProviderRequest =
+            serde_json::from_slice(&prior_main_call.request).unwrap();
+        assert_eq!(terminal_request.tool_choice, "none");
+        assert!(!terminal_request.streaming);
+        assert!(prior_main_request.streaming);
+        assert_eq!(
+            serde_json::to_vec(&terminal_request.tools).unwrap(),
+            serde_json::to_vec(&prior_main_request.tools).unwrap(),
+            "terminal call must preserve the exact main tool catalog bytes"
+        );
+
+        let failed_execution_ids = [
+            "tc_compound_pipeline",
+            "tc_compound_primary",
+            "tc_compound_secondary",
+        ];
+        for tool_call_id in failed_execution_ids {
+            let event_ok = successful_replay
+                .events
+                .iter()
+                .find_map(|event| match &event.payload {
+                    crate::session::db::SessionEventPayload::ToolExecute {
+                        tool_call_id: event_id,
+                        ok,
+                        ..
+                    } if event_id == tool_call_id => Some(*ok),
+                    _ => None,
+                });
+            assert_eq!(event_ok, Some(false), "event status for {tool_call_id}");
+            let (_, row_ok) = core
+                .sessions
+                .load_tool_result_with_status(&successful_session.id, tool_call_id)
+                .await
+                .unwrap_or_else(|| panic!("raw tool row for {tool_call_id}"));
+            assert_eq!(row_ok, Some(false), "raw row status for {tool_call_id}");
+        }
+        let (evidence, evidence_ok) = core
+            .sessions
+            .load_tool_result_with_status(&successful_session.id, "tc_compound_evidence")
+            .await
+            .expect("evidence row");
+        assert!(evidence.contains("confirmed"));
+        assert_eq!(evidence_ok, Some(true));
+        let (pipeline, _) = core
+            .sessions
+            .load_tool_result_with_status(&successful_session.id, "tc_compound_pipeline")
+            .await
+            .expect("pipeline row");
+        assert!(pipeline.contains("Exit code: 1"), "{pipeline}");
+        let (primary, _) = core
+            .sessions
+            .load_tool_result_with_status(&successful_session.id, "tc_compound_primary")
+            .await
+            .expect("primary rate-limit row");
+        assert!(primary.contains("API rate limit exceeded"), "{primary}");
+        let (secondary, _) = core
+            .sessions
+            .load_tool_result_with_status(&successful_session.id, "tc_compound_secondary")
+            .await
+            .expect("secondary rate-limit row");
+        assert!(secondary.contains("secondary rate limit"), "{secondary}");
+
+        let messages = core.sessions.get_all_messages(&successful_session.id).await;
+        let carrier_ids: std::collections::HashSet<String> = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            .flat_map(|message| {
+                message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+            .collect();
+        let receipts: Vec<&Value> = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .collect();
+        assert!(receipts.iter().all(|message| {
+            message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| carrier_ids.contains(id))
+        }));
+        assert_eq!(carrier_ids.len(), receipts.len());
+        for tool_call_id in failed_execution_ids {
+            assert!(receipts.iter().any(|message| {
+                message.get("tool_call_id").and_then(Value::as_str) == Some(tool_call_id)
+                    && message.get("ok").and_then(Value::as_bool) == Some(false)
+            }));
+        }
+        let blocked_ids = [
+            "tc_compound_blocked_repeat_1",
+            "tc_compound_blocked_repeat_2",
+            "tc_compound_blocked_distinct_1",
+            "tc_compound_blocked_distinct_2",
+        ];
+        for tool_call_id in blocked_ids {
+            assert!(receipts.iter().any(|message| {
+                message.get("tool_call_id").and_then(Value::as_str) == Some(tool_call_id)
+                    && message.get("ok").and_then(Value::as_bool) == Some(false)
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.starts_with("lease exhausted:"))
+            }));
+            assert!(successful_replay.events.iter().any(|event| matches!(
+                &event.payload,
+                crate::session::db::SessionEventPayload::ToolPreExecute {
+                    tool_call_id: event_id,
+                    decision: crate::session::db::ToolPreExecuteDecision::Rejected { reason },
+                    ..
+                } if event_id == tool_call_id && reason == "lease:lease_exhausted"
+            )));
+            assert!(!successful_replay.events.iter().any(|event| matches!(
+                &event.payload,
+                crate::session::db::SessionEventPayload::ToolExecute {
+                    tool_call_id: event_id,
+                    ..
+                } if event_id == tool_call_id
+            )));
+        }
+
+        let paths = network_paths.lock().clone();
+        assert_eq!(
+            paths.len(),
+            crate::agent::lease::DEFAULT_TOOLS_PER_LEASE as usize
+        );
+        assert!(
+            paths.len()
+                <= (crate::agent::lease::DEFAULT_TOOLS_PER_LEASE
+                    * (1 + crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN))
+                    as usize
+        );
+        assert!(!paths.iter().any(|path| path.starts_with("/blocked/")));
+        let persisted_text = messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for retired_scaffold in [
+            "Report what the previous tool results showed",
+            "Your tool results are already in the conversation above",
+            "You called the same tool(s) with the same arguments again",
+        ] {
+            assert!(!persisted_text.contains(retired_scaffold));
+        }
+
+        let empty_session_key = format!("compound-empty-{}", uuid::Uuid::new_v4());
+        let (empty_tx, _empty_rx) = tokio::sync::mpsc::unbounded_channel();
+        let empty_response = agent_loop
+            .process_direct_streaming(
+                "return an empty stream",
+                &empty_session_key,
+                "test",
+                "offline",
+                None,
+                empty_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(empty_response.contains("couldn't produce a response"));
+        let empty_session = core
+            .sessions
+            .get_latest_session(&empty_session_key)
+            .await
+            .expect("empty session");
+        let empty_stream_replay = core
+            .sessions
+            .load_session_replay(&empty_session.id)
+            .await
+            .expect("empty replay");
+        assert_eq!(
+            persisted_turn_outcome(&core.sessions, &empty_session.id).await,
+            "empty"
+        );
+        assert!(matches!(
+            empty_stream_replay.availability,
+            crate::session::db::ReplayAvailability::Exact
+        ));
+        assert_eq!(provider.terminal_calls.lock().len(), 1);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     /// A provider that emits a distinct side-effect tool call on every turn.
     /// The session replay records the main-call catalogs for the lease
     /// convergence assertion.
