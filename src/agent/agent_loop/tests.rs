@@ -13655,3 +13655,211 @@ mod capacity_preflight {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task 5: exactly one typed-413 retry, no turn/tool replay
+// ---------------------------------------------------------------------------
+
+mod capacity_exceeded {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Capacity413Provider {
+        requests: AtomicU64,
+        typed_failures: u32,
+    }
+
+    #[async_trait]
+    impl LLMProvider for Capacity413Provider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            let n = self.requests.fetch_add(1, Ordering::SeqCst);
+            if (n as u32) < self.typed_failures {
+                return Err(crate::errors::ProviderError::HiggsCapacityExceeded {
+                    safe_prompt_tokens: 800,
+                    safe_total_tokens: 1_024,
+                    boot_id: "boot-1".to_string(),
+                    generation: 3,
+                }
+                .into());
+            }
+            Ok(crate::providers::base::LLMResponse {
+                content: Some("recovered answer".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+        fn get_default_model(&self) -> &str {
+            "local-model"
+        }
+        fn get_api_base(&self) -> Option<&str> {
+            Some("http://127.0.0.1:9000")
+        }
+        fn supports_higgs_session_cache(&self) -> bool {
+            true
+        }
+    }
+
+    struct TurnRecord {
+        provider_calls: u64,
+        event_kinds: Vec<&'static str>,
+        outcome: String,
+        reply: String,
+    }
+
+    async fn drive_typed_turn(typed_failures: u32, prompt: &str) -> TurnRecord {
+        let provider = Arc::new(Capacity413Provider {
+            requests: AtomicU64::new(0),
+            typed_failures,
+        });
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: Arc::clone(&provider) as Arc<dyn LLMProvider>,
+            workspace: workspace.clone(),
+            model: "local-model".to_string(),
+            max_iterations: 3,
+            max_continuations: 1,
+            max_tokens: 512,
+            temperature: 0.0,
+            max_context_tokens: 4_096,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            crw_url: String::new(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            lane: Lane::default(),
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-413-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
+        });
+        let counters = test_runtime_counters(4_096);
+        let core_handle = AgentHandle::new(core, counters);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+        let agent_loop = AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None,
+            1,
+            None,
+            None,
+            None,
+            ProprioceptionConfig::default(),
+            LcmSchemaConfig::default(),
+            None,
+        );
+        let session_key = "cap-413";
+        let reply = agent_loop
+            .process_direct(prompt, session_key, "test", "capacity-413")
+            .await;
+
+        let sessions = agent_loop.shared.core_handle.swappable().sessions.clone();
+        let concrete = sessions
+            .get_latest_session(session_key)
+            .await
+            .expect("session exists");
+        let events = sessions.load_session_events(&concrete.id).await.unwrap();
+        // The final turn is the LAST turn_started window.
+        let last_start = events
+            .iter()
+            .rposition(|event| event.payload.kind() == "turn_started")
+            .expect("turn_started");
+        let turn_events = &events[last_start..];
+        let event_kinds = turn_events
+            .iter()
+            .map(|event| event.payload.kind())
+            .collect();
+        let outcome = turn_events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.payload {
+                crate::session::db::SessionEventPayload::TurnFinished { outcome } => {
+                    Some(outcome.clone())
+                }
+                _ => None,
+            })
+            .expect("turn_finished");
+        TurnRecord {
+            provider_calls: provider.requests.load(Ordering::SeqCst),
+            event_kinds,
+            outcome,
+            reply,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_typed_413_retries_once_without_turn_or_tool_replay() {
+        let record = drive_typed_turn(1, "what is the answer?").await;
+
+        assert_eq!(record.provider_calls, 2, "exactly one reissued request");
+        assert!(
+            record.reply.contains("recovered answer"),
+            "retry response becomes the turn reply: {}",
+            record.reply
+        );
+        assert_eq!(
+            record.event_kinds,
+            vec![
+                "turn_started",
+                "model_request",
+                "model_failed",
+                "model_request",
+                "model_response",
+                "turn_finished",
+            ],
+            "one logical turn: request -> failed(413) -> request -> response -> finished"
+        );
+        assert_eq!(record.outcome, "finished");
+    }
+
+    #[tokio::test]
+    async fn second_typed_413_is_terminal_pending_with_no_third_request() {
+        let record = drive_typed_turn(2, "try twice").await;
+
+        assert_eq!(
+            record.provider_calls, 2,
+            "no third request after the retry was rejected"
+        );
+        assert!(
+            record.reply.contains("[Capacity Unavailable]"),
+            "turn must end visibly pending: {}",
+            record.reply
+        );
+        assert_eq!(record.outcome, "capacity_unavailable");
+        let model_requests = record
+            .event_kinds
+            .iter()
+            .filter(|kind| **kind == "model_request")
+            .count();
+        assert_eq!(model_requests, 2, "exactly two journaled requests");
+    }
+}

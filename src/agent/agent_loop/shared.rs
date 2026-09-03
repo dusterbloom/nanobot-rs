@@ -1564,7 +1564,20 @@ impl TurnOutcome {
     }
 }
 
-/// What a step function produces: either the next phase or a terminal outcome.
+/// Result of the typed 413 recovery attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapacityExceededRecovery {
+    /// The error was not a typed Higgs capacity rejection.
+    NotApplicable,
+    /// The turn compacted to the server-provided safe budget; re-enter the
+    /// pre-call phase once.
+    RetryScheduled,
+    /// The one retry was already consumed: end the turn as pending
+    /// capacity-unavailable work.
+    TurnPending,
+}
+
+/// What a step function produces: either the next phase or a terminal outcome./// What a step function produces: either the next phase or a terminal outcome.
 pub(crate) enum StepResult {
     /// Transition to the next phase within this iteration.
     Next(IterationPhase),
@@ -2396,7 +2409,130 @@ impl AgentLoopShared {
         TokenBudget::estimate_tokens(&ctx.rendered_messages) < rendered_before
     }
 
-    /// Server-oracle overflow recovery: the provider rejected the request with
+    /// Typed Higgs 413 recovery (Task 5). The rejection carries the
+    /// server's CURRENT safe numbers, which are authoritative for the retry
+    /// compaction. Exactly one retry per turn: the second typed rejection
+    /// ends the turn as capacity-unavailable pending work. Never re-runs
+    /// `process_message`, never appends the user message, never reruns
+    /// tools — re-entry is the pre-call phase only, and the per-request
+    /// Higgs session reservation drops with this stack frame before the
+    /// retry is issued.
+    async fn attempt_capacity_exceeded_recovery(
+        &self,
+        ctx: &mut TurnContext,
+        error: &anyhow::Error,
+    ) -> CapacityExceededRecovery {
+        use crate::errors::ProviderError;
+
+        let Some(exceeded) = error
+            .downcast_ref::<ProviderError>()
+            .and_then(|provider_error| match provider_error {
+                ProviderError::HiggsCapacityExceeded {
+                    safe_prompt_tokens,
+                    safe_total_tokens,
+                    ..
+                } => Some((*safe_prompt_tokens, *safe_total_tokens)),
+                _ => None,
+            })
+        else {
+            return CapacityExceededRecovery::NotApplicable;
+        };
+        let (safe_prompt_tokens, safe_total_tokens) = (
+            usize::try_from(exceeded.0).unwrap_or(usize::MAX),
+            usize::try_from(exceeded.1).unwrap_or(usize::MAX),
+        );
+        let generation = match ctx.capacity_recovery {
+            TurnCapacityRecovery::Idle => 0,
+            TurnCapacityRecovery::PreflightCompacted { generation }
+            | TurnCapacityRecovery::RetryIssued { generation }
+            | TurnCapacityRecovery::Terminal { generation } => generation,
+        };
+        if matches!(
+            ctx.capacity_recovery,
+            TurnCapacityRecovery::RetryIssued { .. } | TurnCapacityRecovery::Terminal { .. }
+        ) {
+            // One-retry boundary: the retry itself was rejected. End as
+            // visibly pending work with the server's current safe values.
+            warn!(
+                session = %ctx.session_key,
+                generation,
+                safe_prompt_tokens,
+                safe_total_tokens,
+                "higgs_capacity_exceeded_retry_terminal"
+            );
+            ctx.capacity_recovery = TurnCapacityRecovery::Terminal {
+                generation: generation.saturating_add(1),
+            };
+            return CapacityExceededRecovery::TurnPending;
+        }
+
+        // Compact to the typed safe prompt budget. The server's numbers are
+        // the oracle; the client estimator only decides WHICH messages fall
+        // off. Tool-definition tokens count against the prompt room, exactly
+        // like the preflight gate.
+        warn!(
+            session = %ctx.session_key,
+            generation,
+            safe_prompt_tokens,
+            safe_total_tokens,
+            "higgs_capacity_exceeded_compacting_for_retry"
+        );
+        let frozen_prefix = ctx
+            .counters
+            .prompt_cache_watermark
+            .lock()
+            .get(&ctx.session_key)
+            .copied()
+            .unwrap_or(0);
+        let trim_budget = TokenBudget::new(
+            safe_total_tokens.max(1),
+            safe_total_tokens.saturating_sub(safe_prompt_tokens).max(1),
+        );
+        let (trimmed_messages, trim_disposition) = ctx.core.retention.apply_budget(
+            &trim_budget,
+            &ctx.messages,
+            // The caller re-selects tool definitions in pre-call; reserve
+            // nothing here — the preflight gate re-checks the full request
+            // against the refreshed budget before the retry flies.
+            0,
+            crate::agent::retention::BudgetMode::Normal {
+                turn_count: ctx.turn_count,
+            },
+            frozen_prefix,
+        );
+        let before_messages = ctx.messages.len();
+        let after_messages = trimmed_messages.len();
+        // Sanctioned rewrite: rotates the retained epoch (fresh server-side
+        // session for the retry) and queues the old one for drop exactly when
+        // the trim rewrote warm bytes.
+        let rewrite = ctx.rewrite_committed(trimmed_messages, CacheResetReason::Trim);
+        if let PromptRewrite::Reset { rotated } = rewrite {
+            warn!(
+                session = %ctx.session_key,
+                frozen_prefix,
+                before_messages,
+                after_messages,
+                rotated,
+                "prompt_cache_watermark_invalidated_by_capacity_retry_trim"
+            );
+        }
+        if matches!(
+            trim_disposition,
+            crate::agent::token_budget::PrefixTrimDisposition::ResetRequired
+        ) {
+            self.install_pending_compaction(ctx, true).await;
+        }
+        // Re-render so the retry request is protocol-correct, and refresh
+        // the effective budget from the live endpoint before the re-entry.
+        ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
+        self.resolve_effective_budget(ctx).await;
+        ctx.capacity_recovery = TurnCapacityRecovery::RetryIssued {
+            generation: generation.saturating_add(1),
+        };
+        CapacityExceededRecovery::RetryScheduled
+    }
+
+    /// Server-oracle overflow recovery: the provider rejected the request with    /// Server-oracle overflow recovery: the provider rejected the request with
     /// `context_length_exceeded`, which proves the client's tokenizer estimate
     /// wrong for this content (cl100k under-counts the server's BPE, up to
     /// ~20% on entity-heavy content). When the error carries the server's
@@ -4541,6 +4677,25 @@ impl AgentLoopShared {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
+                        match self.attempt_capacity_exceeded_recovery(ctx, &e).await {
+                            CapacityExceededRecovery::NotApplicable => {}
+                            CapacityExceededRecovery::RetryScheduled => {
+                                counters.mark_inference_finished();
+                                return StepResult::Done(IterationOutcome::Continue);
+                            }
+                            CapacityExceededRecovery::TurnPending => {
+                                counters.mark_inference_finished();
+                                return StepResult::Done(IterationOutcome::Complete {
+                                    content: format!(
+                                        "[Capacity Unavailable] The live capacity window shrank \
+                                         (safe prompt {safe} tokens). This turn is saved as pending \
+                                         work; retry once capacity recovers.",
+                                        safe = ctx.effective_budget.max_context()
+                                    ),
+                                    outcome: TurnOutcome::CapacityUnavailable,
+                                });
+                            }
+                        }
                         if self.attempt_overflow_recovery(ctx, &e).await {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
@@ -4588,6 +4743,25 @@ impl AgentLoopShared {
                         if Self::handle_retained_route_error(ctx, &e) {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
+                        }
+                        match self.attempt_capacity_exceeded_recovery(ctx, &e).await {
+                            CapacityExceededRecovery::NotApplicable => {}
+                            CapacityExceededRecovery::RetryScheduled => {
+                                counters.mark_inference_finished();
+                                return StepResult::Done(IterationOutcome::Continue);
+                            }
+                            CapacityExceededRecovery::TurnPending => {
+                                counters.mark_inference_finished();
+                                return StepResult::Done(IterationOutcome::Complete {
+                                    content: format!(
+                                        "[Capacity Unavailable] The live capacity window shrank \
+                                         (safe prompt {safe} tokens). This turn is saved as pending \
+                                         work; retry once capacity recovers.",
+                                        safe = ctx.effective_budget.max_context()
+                                    ),
+                                    outcome: TurnOutcome::CapacityUnavailable,
+                                });
+                            }
                         }
                         if self.attempt_overflow_recovery(ctx, &e).await {
                             counters.mark_inference_finished();
@@ -4834,6 +5008,20 @@ impl AgentLoopShared {
                     if Self::handle_retained_route_error(ctx, &e) {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Continue);
+                    }
+                    match self.attempt_capacity_exceeded_recovery(ctx, &e).await {
+                        CapacityExceededRecovery::NotApplicable => {}
+                        CapacityExceededRecovery::RetryScheduled => {
+                            counters.mark_inference_finished();
+                            return StepResult::Done(IterationOutcome::Continue);
+                        }
+                        CapacityExceededRecovery::TurnPending => {
+                            counters.mark_inference_finished();
+                            return StepResult::Done(IterationOutcome::Complete {
+                                content: "[Capacity Unavailable] The live capacity window shrank; this turn is saved as pending work.".to_string(),
+                                outcome: TurnOutcome::CapacityUnavailable,
+                            });
+                        }
                     }
                     if self.attempt_overflow_recovery(ctx, &e).await {
                         counters.mark_inference_finished();
